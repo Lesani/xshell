@@ -96,9 +96,18 @@ xshell/
 
 ## Testing
 
-xshell does not yet have an automated test suite. Contributions to set one up — Vitest for the React side, `cargo test` for Rust — are very welcome.
+Run the automated tests before opening a PR:
 
-In the meantime, please manually test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
+```bash
+npm test                      # Vitest (frontend unit tests)
+cd src-tauri && cargo test    # Rust unit tests
+```
+
+Building the desktop crate needs the Tauri system dependencies (see Prerequisites).
+
+CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
+
+Automated tests do not replace a manual pass: please also test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
 
 Manual checklist:
 

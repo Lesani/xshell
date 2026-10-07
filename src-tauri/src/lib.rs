@@ -5290,3 +5290,104 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_project_name_replaces_every_non_alphanumeric() {
+        assert_eq!(
+            encode_project_name(r"C:\Users\alex\my-app"),
+            "C--Users-alex-my-app"
+        );
+        assert_eq!(
+            encode_project_name("/home/u/CalcApps.Framework"),
+            "-home-u-CalcApps-Framework"
+        );
+        assert_eq!(encode_project_name("SSY2_Lab"), "SSY2-Lab");
+    }
+
+    #[test]
+    fn system_time_to_iso_formats_epoch_and_leap_day() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(
+            system_time_to_iso(SystemTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            system_time_to_iso(at(1_709_210_096)),
+            "2024-02-29T12:34:56Z"
+        );
+        // 2000 is a leap year (divisible by 400): Feb 29 exists, so 2000-03-01 is day 60.
+        assert_eq!(system_time_to_iso(at(951_868_800)), "2000-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn unix_ms_to_iso_drops_milliseconds() {
+        assert_eq!(unix_ms_to_iso(1_709_210_096_999), "2024-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn parse_porcelain_reads_branch_tracking_and_files() {
+        let out = "## main...origin/main [ahead 2, behind 1]\n M src/a.rs\nA  b.rs\n?? new file.txt\nR  old.rs -> new.rs\n";
+        let s = parse_porcelain(out);
+        assert!(s.is_repo);
+        assert_eq!(s.branch, "main");
+        assert!(s.has_upstream);
+        assert_eq!(s.ahead, 2);
+        assert_eq!(s.behind, 1);
+        let files: Vec<(&str, &str, &str)> = s
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.staged.as_str(), f.unstaged.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("src/a.rs", " ", "M"),
+                ("b.rs", "A", " "),
+                ("new file.txt", "?", "?"),
+                // The rename target is extracted later, by normalize_git_path.
+                ("old.rs -> new.rs", "R", " "),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_porcelain_without_upstream() {
+        let s = parse_porcelain("## HEAD (no branch)");
+        assert_eq!(s.branch, "HEAD (no branch)");
+        assert!(!s.has_upstream);
+        assert_eq!((s.ahead, s.behind), (0, 0));
+        assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn normalize_git_path_takes_rename_target() {
+        assert_eq!(normalize_git_path("a -> b"), "b");
+        assert_eq!(normalize_git_path("c"), "c");
+    }
+
+    #[test]
+    fn decode_base64_handles_padding_and_whitespace() {
+        assert_eq!(decode_base64("aGVs\nbG8="), b"hello");
+    }
+
+    #[test]
+    fn parse_jsonc_strips_comments_and_trailing_commas_outside_strings() {
+        let src = "{\"u\": \"http://x\", // c\n \"a\": [1,2,], /* b */ \"k\": 3,\n}";
+        assert_eq!(
+            parse_jsonc(src),
+            Some(serde_json::json!({"u": "http://x", "a": [1, 2], "k": 3}))
+        );
+    }
+
+    #[test]
+    fn parse_jsonc_comment_after_trailing_comma_is_none_today() {
+        // Pins current behaviour: the trailing-comma check looks at the next raw character, so
+        // a comment between the comma and the closing brace leaves the comma in place and the
+        // final parse fails. Not fixed here on purpose.
+        assert_eq!(parse_jsonc("{\"a\": 1, /* b */}"), None);
+    }
+}
