@@ -186,6 +186,10 @@ fn stats_path_for(session_id: &str) -> Option<PathBuf> {
     )
 }
 
+// `BufRead::lines` yields `Err` for a line that is not valid UTF-8 and then keeps going, so
+// `flatten` skips just that line. clippy's suggestion (`map_while(Result::ok)`) would stop
+// parsing at the first such line, which changes behaviour.
+#[allow(clippy::lines_filter_map_ok)]
 fn parse_session(
     path: &std::path::Path,
     project_name: &str,
@@ -604,11 +608,11 @@ fn codex_rollout_files() -> Vec<std::path::PathBuf> {
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
             let p = entry.path();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(p);
                 continue;
             }
-            if p.extension().map_or(false, |ext| ext == "jsonl") {
+            if p.extension().is_some_and(|ext| ext == "jsonl") {
                 files.push(p);
             }
         }
@@ -842,7 +846,7 @@ fn list_claude_projects() -> Vec<ProjectInfo> {
         .flatten()
         .flatten()
     {
-        if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
 
@@ -861,14 +865,14 @@ fn list_claude_projects() -> Vec<ProjectInfo> {
             .flatten()
         {
             let p = jsonl_entry.path();
-            if p.extension().map_or(true, |ext| ext != "jsonl") {
+            if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             session_count += 1;
 
             if let Ok(meta) = fs::metadata(&p) {
                 if let Ok(modified) = meta.modified() {
-                    if latest_modified.map_or(true, |prev| modified > prev) {
+                    if latest_modified.is_none_or(|prev| modified > prev) {
                         latest_modified = Some(modified);
                     }
                 }
@@ -932,7 +936,7 @@ fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
                 .flatten()
             {
                 let p = e.path();
-                if p.extension().map_or(true, |ext| ext != "jsonl") {
+                if p.extension().is_none_or(|ext| ext != "jsonl") {
                     continue;
                 }
                 if let Ok(file) = fs::File::open(&p) {
@@ -962,7 +966,7 @@ fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
                     .flatten()
                     .filter_map(|e| {
                         let p = e.path();
-                        if p.extension().map_or(true, |ext| ext != "jsonl") {
+                        if p.extension().is_none_or(|ext| ext != "jsonl") {
                             return None;
                         }
                         parse_session(&p, &project_name, &project_path)
@@ -1021,7 +1025,7 @@ fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
         .iter()
         .flat_map(|d| fs::read_dir(d).ok().into_iter().flatten().flatten())
     {
-        if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
 
@@ -1037,7 +1041,7 @@ fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
             .flatten()
         {
             let p = jsonl.path();
-            if p.extension().map_or(true, |ext| ext != "jsonl") {
+            if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             if let Ok(file) = fs::File::open(&p) {
@@ -1070,7 +1074,7 @@ fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
             .flatten()
         {
             let p = jsonl.path();
-            if p.extension().map_or(true, |ext| ext != "jsonl") {
+            if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             if let Some(session) = parse_session(&p, &project_name, &project_path) {
@@ -1115,6 +1119,10 @@ pub struct MessagePreview {
 }
 
 #[tauri::command]
+// `BufRead::lines` yields `Err` for a line that is not valid UTF-8 and then keeps going, so
+// `flatten` skips just that line. clippy's suggestion (`map_while(Result::ok)`) would stop
+// parsing at the first such line, which changes behaviour.
+#[allow(clippy::lines_filter_map_ok)]
 fn get_session_messages(
     encoded_name: String,
     session_id: String,
@@ -1454,7 +1462,7 @@ fn scan_skills_dir(dir: &std::path::Path, scope: &str) -> Vec<Skill> {
         return out;
     }
     for entry in fs::read_dir(dir).ok().into_iter().flatten().flatten() {
-        if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
         let p = entry.path();
@@ -1470,7 +1478,7 @@ fn scan_skills_dir(dir: &std::path::Path, scope: &str) -> Vec<Skill> {
             path: p.to_string_lossy().to_string(),
         });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -1483,12 +1491,7 @@ fn scan_md_entries(dir: &std::path::Path, scope: &str) -> Vec<(String, String, O
     if !dir.exists() {
         return out;
     }
-    fn walk(
-        base: &std::path::Path,
-        cur: &std::path::Path,
-        prefix: &str,
-        out: &mut Vec<(String, String, Option<String>)>,
-    ) {
+    fn walk(cur: &std::path::Path, prefix: &str, out: &mut Vec<(String, String, Option<String>)>) {
         for entry in fs::read_dir(cur).ok().into_iter().flatten().flatten() {
             let p = entry.path();
             let Ok(ft) = entry.file_type() else {
@@ -1501,7 +1504,7 @@ fn scan_md_entries(dir: &std::path::Path, scope: &str) -> Vec<(String, String, O
                 } else {
                     format!("{}/{}", prefix, name)
                 };
-                walk(base, &p, &new_prefix, out);
+                walk(&p, &new_prefix, out);
             } else if ft.is_file() && p.extension().map(|e| e == "md").unwrap_or(false) {
                 let stem = p
                     .file_stem()
@@ -1517,9 +1520,9 @@ fn scan_md_entries(dir: &std::path::Path, scope: &str) -> Vec<(String, String, O
             }
         }
     }
-    walk(dir, dir, "", &mut out);
+    walk(dir, "", &mut out);
     let _ = scope;
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|a| a.0.to_lowercase());
     out
 }
 
@@ -1768,7 +1771,7 @@ fn parse_mcp_servers(
             source: source.to_string(),
         });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -2084,7 +2087,7 @@ fn get_project_memories(project_path: String) -> ProjectMemories {
     let mut items: Vec<Memory> = Vec::new();
     for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "md") {
+        if path.extension().is_none_or(|e| e != "md") {
             continue;
         }
         let filename = path
@@ -2482,7 +2485,7 @@ fn git_root(cwd: &str) -> String {
 
 #[tauri::command]
 async fn get_git_log(cwd: String, limit: Option<u32>) -> Vec<GitCommit> {
-    let n = limit.unwrap_or(20).max(1).min(200);
+    let n = limit.unwrap_or(20).clamp(1, 200);
     // Use a rare-in-normal-text separator between fields so we don't collide with subjects.
     let mut cmd = git_cmd(&cwd);
     cmd.arg("log")
@@ -2626,7 +2629,7 @@ fn list_project_session_ids(cwd: String) -> Vec<String> {
     if let Ok(entries) = fs::read_dir(&project_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().map_or(true, |e| e != "jsonl") {
+            if p.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
             if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
@@ -2661,7 +2664,7 @@ fn detect_session_branch(
     // If it matches our current session id, it's definitively our fork. No heuristics needed.
     for entry in fs::read_dir(&project_dir).ok()?.flatten() {
         let p = entry.path();
-        if p.extension().map_or(true, |e| e != "jsonl") {
+        if p.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
         let stem = p
@@ -2875,6 +2878,8 @@ const MAX_PENDING: usize = 4 * 1024 * 1024;
 const OVERFLOW_NOTICE: &[u8] =
     b"\x1bc\x1b[2m[xshell: dropped output due to backpressure]\x1b[0m\r\n";
 
+// The argument list is the frontend IPC contract (`invoke('spawn_terminal', {...})`).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn spawn_terminal(
     state: State<'_, AppState>,
@@ -2998,12 +3003,10 @@ fn spawn_terminal(
     }
     let mut cmd = if mode == "raw" {
         // Raw shell: spawn the chosen shell directly (no claude wrapping).
-        let shell = effective_shell.unwrap_or_else(|| {
-            if cfg!(windows) {
-                "powershell.exe"
-            } else {
-                "bash"
-            }
+        let shell = effective_shell.unwrap_or(if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "bash"
         });
         CommandBuilder::new(shell)
     } else if let Some(shell) = effective_shell.filter(|s| !s.is_empty()) {
@@ -3310,11 +3313,11 @@ fn probe_statusline_setup() -> StatuslineProbe {
             .flatten()
             .flatten()
         {
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_file()) {
                 stats_session_count += 1;
                 if let Ok(meta) = entry.metadata() {
                     if let Ok(modified) = meta.modified() {
-                        if last_modified.map_or(true, |m| modified > m) {
+                        if last_modified.is_none_or(|m| modified > m) {
                             last_modified = Some(modified);
                         }
                     }
@@ -3377,10 +3380,10 @@ fn get_global_rate_limits() -> GlobalRateLimits {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
 
     for (mtime, path) in &files {
         let Ok(content) = fs::read_to_string(path) else {
@@ -3489,7 +3492,7 @@ fn get_codex_context(project_path: String) -> CodexContext {
             .flatten()
             .filter_map(|e| {
                 let p = e.path();
-                if p.extension().map_or(true, |ext| ext != "md") {
+                if p.extension().is_none_or(|ext| ext != "md") {
                     return None;
                 }
                 let stem = p.file_stem()?.to_string_lossy().into_owned();
@@ -3537,7 +3540,7 @@ fn get_codex_context(project_path: String) -> CodexContext {
                 }
                 if current_section.starts_with("mcp_servers.") && line.starts_with("command") {
                     if let (Some(last), Some(v)) =
-                        (mcp_items.last_mut(), line.splitn(2, '=').nth(1))
+                        (mcp_items.last_mut(), line.split_once('=').map(|(_, v)| v))
                     {
                         if last.detail.is_empty() {
                             last.detail = unquote(v);
@@ -3549,7 +3552,7 @@ fn get_codex_context(project_path: String) -> CodexContext {
                         .trim_end_matches('\\')
                         .to_lowercase();
                     if key == norm_project && line.starts_with("trust_level") {
-                        if let Some(v) = line.splitn(2, '=').nth(1) {
+                        if let Some(v) = line.split_once('=').map(|(_, v)| v) {
                             let v = unquote(v);
                             if !v.is_empty() {
                                 trust_level = Some(v);
@@ -3597,13 +3600,11 @@ fn get_cursor_context(project_path: String) -> CursorContext {
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
             let p = entry.path();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(p);
                 continue;
             }
-            if p.extension()
-                .map_or(true, |ext| ext != "mdc" && ext != "md")
-            {
+            if p.extension().is_none_or(|ext| ext != "mdc" && ext != "md") {
                 continue;
             }
             let name = p
@@ -3730,7 +3731,7 @@ fn get_claude_cost_summary() -> ClaudeCostSummary {
         .flatten()
         .flatten()
     {
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
             continue;
         }
         let Ok(content) = fs::read_to_string(entry.path()) else {
@@ -3806,11 +3807,11 @@ fn get_codex_usage() -> CodexUsage {
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
             let p = entry.path();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(p);
                 continue;
             }
-            if p.extension().map_or(true, |ext| ext != "jsonl") {
+            if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             let date = (|| {
@@ -3852,7 +3853,7 @@ fn get_codex_usage() -> CodexUsage {
 
     // Rate limits: the last token_count event of the most recently touched rollout that has
     // one (a just-started session may not have emitted any yet — fall back to the next file).
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
     let parse_window = |w: &serde_json::Value| CodexRateWindow {
         used_percent: w.get("used_percent").and_then(|v| v.as_f64()),
         window_minutes: w.get("window_minutes").and_then(|v| v.as_u64()),
@@ -3881,8 +3882,8 @@ fn get_codex_usage() -> CodexUsage {
         let Some(rl) = payload.get("rate_limits") else {
             continue;
         };
-        out.primary = rl.get("primary").map(|w| parse_window(w));
-        out.secondary = rl.get("secondary").map(|w| parse_window(w));
+        out.primary = rl.get("primary").map(parse_window);
+        out.secondary = rl.get("secondary").map(parse_window);
         out.plan_type = rl
             .get("plan_type")
             .and_then(|v| v.as_str())
@@ -3924,11 +3925,11 @@ fn list_codex_projects() -> Vec<CodexProjectInfo> {
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
             let p = entry.path();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(p);
                 continue;
             }
-            if p.extension().map_or(true, |ext| ext != "jsonl") {
+            if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
 
@@ -3950,7 +3951,7 @@ fn list_codex_projects() -> Vec<CodexProjectInfo> {
             let slot = by_cwd.entry(cwd).or_insert((0, None));
             slot.0 += 1;
             if let Some(modified) = fs::metadata(&p).ok().and_then(|m| m.modified().ok()) {
-                if slot.1.map_or(true, |prev| modified > prev) {
+                if slot.1.is_none_or(|prev| modified > prev) {
                     slot.1 = Some(modified);
                 }
             }
@@ -4159,11 +4160,11 @@ fn cursor_chat_dirs() -> Vec<PathBuf> {
         return dirs;
     };
     for ws in fs::read_dir(&chats).ok().into_iter().flatten().flatten() {
-        if !ws.file_type().map_or(false, |ft| ft.is_dir()) {
+        if !ws.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
         for chat in fs::read_dir(ws.path()).ok().into_iter().flatten().flatten() {
-            if chat.file_type().map_or(false, |ft| ft.is_dir()) {
+            if chat.file_type().is_ok_and(|ft| ft.is_dir()) {
                 dirs.push(chat.path());
             }
         }
@@ -4587,11 +4588,11 @@ fn get_opencode_context(project_path: String) -> OpencodeContext {
             while let Some(d) = stack.pop() {
                 for entry in fs::read_dir(&d).ok().into_iter().flatten().flatten() {
                     let p = entry.path();
-                    if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                         stack.push(p);
                         continue;
                     }
-                    if p.extension().map_or(true, |ext| ext != "md") {
+                    if p.extension().is_none_or(|ext| ext != "md") {
                         continue;
                     }
                     items.push(AgentContextItem {
@@ -4939,7 +4940,7 @@ fn parse_antigravity_sessions() -> Vec<SessionInfo> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "db"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "db"))
         .filter_map(|p| parse_antigravity_conversation(&p, &names))
         .collect()
 }
@@ -4992,11 +4993,11 @@ fn get_antigravity_context(project_path: String) -> AntigravityContext {
         while let Some(d) = stack.pop() {
             for entry in fs::read_dir(&d).ok().into_iter().flatten().flatten() {
                 let p = entry.path();
-                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                     stack.push(p);
                     continue;
                 }
-                if p.extension().map_or(true, |ext| ext != "md") {
+                if p.extension().is_none_or(|ext| ext != "md") {
                     continue;
                 }
                 items.push(AgentContextItem {
