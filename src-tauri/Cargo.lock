@@ -5491,9 +5491,7 @@ name = "xshell"
 version = "1.5.0"
 dependencies = [
  "dirs",
- "md5",
  "portable-pty",
- "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -5503,6 +5501,20 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-plugin-updater",
  "uuid",
+ "xshell-core",
+]
+
+[[package]]
+name = "xshell-core"
+version = "0.0.0"
+dependencies = [
+ "dirs",
+ "md5",
+ "portable-pty",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
