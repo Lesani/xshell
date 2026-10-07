@@ -1,3 +1,4 @@
+use crate::ctx::HostCtx;
 use crate::time::system_time_to_iso;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,8 +27,8 @@ pub struct StatuslineProbe {
     pub stats_dir_path: String,
 }
 
-pub fn probe_statusline_setup() -> StatuslineProbe {
-    let home = dirs::home_dir().unwrap_or_default();
+pub fn probe_statusline_setup(ctx: &HostCtx) -> StatuslineProbe {
+    let home = ctx.home.clone().unwrap_or_default();
     let stats_dir = home.join(".claude").join("xshell-stats");
     let settings_path = home.join(".claude").join("settings.json");
 
@@ -91,7 +92,7 @@ pub struct GlobalRateLimits {
     pub source_session_id: Option<String>,
 }
 
-pub fn get_global_rate_limits() -> GlobalRateLimits {
+pub fn get_global_rate_limits(ctx: &HostCtx) -> GlobalRateLimits {
     let mut out = GlobalRateLimits {
         five_hour_pct: None,
         seven_day_pct: None,
@@ -100,7 +101,7 @@ pub fn get_global_rate_limits() -> GlobalRateLimits {
         last_update_iso: None,
         source_session_id: None,
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ctx.home.clone() else {
         return out;
     };
     let stats_dir = home.join(".claude").join("xshell-stats");
@@ -183,8 +184,8 @@ pub struct ClaudeCostSummary {
     pub daily: Vec<DailyUsd>, // ascending by date; today/this-week math happens client-side
 }
 
-pub fn get_claude_cost_summary() -> ClaudeCostSummary {
-    let Some(home) = dirs::home_dir() else {
+pub fn get_claude_cost_summary(ctx: &HostCtx) -> ClaudeCostSummary {
+    let Some(home) = ctx.home.clone() else {
         return ClaudeCostSummary {
             connected: false,
             daily: vec![],
@@ -225,4 +226,115 @@ pub fn get_claude_cost_summary() -> ClaudeCostSummary {
         .collect();
     daily.sort_by(|a, b| a.date.cmp(&b.date));
     ClaudeCostSummary { connected, daily }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::Fixture;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn probe_statusline_setup_reports_command_and_stats() {
+        let fx = Fixture::new();
+        fx.write(
+            "home/.claude/settings.json",
+            json!({"statusLine": {"type": "command", "command": "~/bin/sl.sh"}}).to_string(),
+        );
+        let a = fx.write("home/.claude/xshell-stats/a.json", "{}");
+        let b = fx.write("home/.claude/xshell-stats/b.json", "{}");
+        fx.set_mtime(&a, at(1_700_000_000));
+        fx.set_mtime(&b, at(1_700_000_500));
+        let p = probe_statusline_setup(&fx.ctx());
+        assert!(p.has_statusline);
+        assert_eq!(p.existing_command.as_deref(), Some("~/bin/sl.sh"));
+        assert!(p.stats_dir_present);
+        assert_eq!(p.stats_session_count, 2);
+        assert_eq!(
+            p.last_update_iso,
+            Some(system_time_to_iso(at(1_700_000_500)))
+        );
+        assert_eq!(p.home_dir, fx.home().to_string_lossy());
+        assert_eq!(
+            std::path::PathBuf::from(&p.stats_dir_path),
+            fx.home().join(".claude").join("xshell-stats")
+        );
+
+        // Nothing set up.
+        let empty = Fixture::new();
+        let p = probe_statusline_setup(&empty.ctx());
+        assert!(!p.has_statusline && !p.stats_dir_present);
+        assert_eq!(
+            (p.existing_command, p.stats_session_count, p.last_update_iso),
+            (None, 0, None)
+        );
+    }
+
+    #[test]
+    fn get_global_rate_limits_falls_back_to_older_snapshot() {
+        let fx = Fixture::new();
+        let newest = fx.write(
+            "home/.claude/xshell-stats/newest.json",
+            json!({"cost": {"total_cost_usd": 1.0}}).to_string(),
+        );
+        let middle = fx.write(
+            "home/.claude/xshell-stats/middle.json",
+            json!({"rate_limits": {
+                "five_hour": {"used_percentage": 42.5, "resets_at": 1_700_003_600u64},
+                "seven_day": {"used_percentage": 10.0, "resets_at": 1_700_600_000u64}
+            }})
+            .to_string(),
+        );
+        let oldest = fx.write(
+            "home/.claude/xshell-stats/oldest.json",
+            json!({"rate_limits": {"five_hour": {"used_percentage": 99.0}}}).to_string(),
+        );
+        fx.set_mtime(&newest, at(1_700_000_300));
+        fx.set_mtime(&middle, at(1_700_000_200));
+        fx.set_mtime(&oldest, at(1_700_000_100));
+        let r = get_global_rate_limits(&fx.ctx());
+        assert_eq!(r.five_hour_pct, Some(42.5));
+        assert_eq!(r.five_hour_resets_at, Some(1_700_003_600));
+        assert_eq!(r.seven_day_pct, Some(10.0));
+        assert_eq!(r.seven_day_resets_at, Some(1_700_600_000));
+        assert_eq!(r.source_session_id.as_deref(), Some("middle"));
+        assert_eq!(
+            r.last_update_iso,
+            Some(system_time_to_iso(at(1_700_000_200)))
+        );
+    }
+
+    #[test]
+    fn get_claude_cost_summary_sums_daily_costs() {
+        let fx = Fixture::new();
+        fx.write(
+            "home/.claude/xshell-stats/a.json",
+            json!({"xshell_daily_cost": {"2026-01-02": 1.5, "2026-01-01": 0.25}}).to_string(),
+        );
+        fx.write(
+            "home/.claude/xshell-stats/b.json",
+            json!({"xshell_daily_cost": {"2026-01-02": 2.25, "2026-01-03": "n/a"}}).to_string(),
+        );
+        fx.write("home/.claude/xshell-stats/broken.json", "not json");
+        let s = get_claude_cost_summary(&fx.ctx());
+        assert!(s.connected);
+        let daily: Vec<(String, f64)> = s.daily.into_iter().map(|d| (d.date, d.usd)).collect();
+        assert_eq!(
+            daily,
+            [
+                ("2026-01-01".to_string(), 0.25),
+                ("2026-01-02".to_string(), 3.75)
+            ]
+        );
+
+        let s = get_claude_cost_summary(&Fixture::new().ctx());
+        assert!(!s.connected);
+        assert!(s.daily.is_empty());
+    }
 }

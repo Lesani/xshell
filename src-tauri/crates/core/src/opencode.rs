@@ -1,4 +1,5 @@
 use crate::agent_context::{AgentContextItem, AgentContextSection};
+use crate::ctx::HostCtx;
 use crate::sessions::{CodexProjectInfo, SessionInfo};
 use crate::time::unix_ms_to_iso;
 use serde::{Deserialize, Serialize};
@@ -16,12 +17,14 @@ use std::path::PathBuf;
 // is_authoritative_stats is true so the context bar renders: the numbers come from opencode
 // itself, not an estimate.
 
-pub fn opencode_data_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local").join("share").join("opencode"))
+pub fn opencode_data_dir(ctx: &HostCtx) -> Option<PathBuf> {
+    ctx.home
+        .clone()
+        .map(|h| h.join(".local").join("share").join("opencode"))
 }
 
-pub fn opencode_open_db() -> Option<rusqlite::Connection> {
-    let db = opencode_data_dir()?.join("opencode.db");
+pub fn opencode_open_db(ctx: &HostCtx) -> Option<rusqlite::Connection> {
+    let db = opencode_data_dir(ctx)?.join("opencode.db");
     if !db.exists() {
         return None;
     }
@@ -31,9 +34,9 @@ pub fn opencode_open_db() -> Option<rusqlite::Connection> {
 // Context window per "providerID/modelID" from ~/.cache/opencode/models.json (opencode's
 // snapshot of the models.dev catalog). A model missing from the cache leaves the limit at 0,
 // which hides the context bar — better than guessing a wrong budget.
-pub fn opencode_context_limits() -> HashMap<String, u64> {
+pub fn opencode_context_limits(ctx: &HostCtx) -> HashMap<String, u64> {
     let mut map = HashMap::new();
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ctx.home.clone() else {
         return map;
     };
     let Ok(content) = fs::read_to_string(home.join(".cache").join("opencode").join("models.json"))
@@ -62,11 +65,11 @@ pub fn opencode_context_limits() -> HashMap<String, u64> {
     map
 }
 
-pub fn parse_opencode_sessions() -> Vec<SessionInfo> {
-    let Some(conn) = opencode_open_db() else {
+pub fn parse_opencode_sessions(ctx: &HostCtx) -> Vec<SessionInfo> {
+    let Some(conn) = opencode_open_db(ctx) else {
         return vec![];
     };
-    let limits = opencode_context_limits();
+    let limits = opencode_context_limits(ctx);
 
     // One pass over the message table collects everything per-turn: user-message count,
     // per-day token bands, and the newest assistant turn's context size (input + cached
@@ -239,9 +242,9 @@ pub fn parse_opencode_sessions() -> Vec<SessionInfo> {
 
 // Directories opencode has been used in — for the Add Projects picker's per-agent marks.
 // Grouped from the sessions' recorded directories, same shape as the other agents' lists.
-pub fn list_opencode_projects() -> Vec<CodexProjectInfo> {
+pub fn list_opencode_projects(ctx: &HostCtx) -> Vec<CodexProjectInfo> {
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
-    for s in parse_opencode_sessions() {
+    for s in parse_opencode_sessions(ctx) {
         let slot = by_cwd.entry(s.project_path).or_insert((0, String::new()));
         slot.0 += 1;
         if s.timestamp > slot.1 {
@@ -334,12 +337,15 @@ pub fn parse_jsonc(content: &str) -> Option<serde_json::Value> {
 
 // The opencode config files that apply to a project, nearest first: project opencode.json(c),
 // then global ~/.config/opencode/opencode.json(c).
-pub fn opencode_config_files(project_path: &std::path::Path) -> Vec<(PathBuf, &'static str)> {
+pub fn opencode_config_files(
+    ctx: &HostCtx,
+    project_path: &std::path::Path,
+) -> Vec<(PathBuf, &'static str)> {
     let mut files = vec![];
     for name in ["opencode.json", "opencode.jsonc"] {
         files.push((project_path.join(name), "project"));
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ctx.home.clone() {
         for name in ["opencode.json", "opencode.jsonc"] {
             files.push((home.join(".config").join("opencode").join(name), "global"));
         }
@@ -347,10 +353,10 @@ pub fn opencode_config_files(project_path: &std::path::Path) -> Vec<(PathBuf, &'
     files.into_iter().filter(|(p, _)| p.exists()).collect()
 }
 
-pub fn get_opencode_context(project_path: String) -> OpencodeContext {
+pub fn get_opencode_context(ctx: &HostCtx, project_path: String) -> OpencodeContext {
     let pp = std::path::Path::new(&project_path);
     let mut sections: Vec<AgentContextSection> = vec![];
-    let configs: Vec<(serde_json::Value, &str)> = opencode_config_files(pp)
+    let configs: Vec<(serde_json::Value, &str)> = opencode_config_files(ctx, pp)
         .into_iter()
         .filter_map(|(p, scope)| {
             fs::read_to_string(&p)
@@ -371,7 +377,7 @@ pub fn get_opencode_context(project_path: String) -> OpencodeContext {
             path: agents_md.to_string_lossy().into_owned(),
         });
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ctx.home.clone() {
         let global = home.join(".config").join("opencode").join("AGENTS.md");
         if global.exists() {
             instructions.push(AgentContextItem {
@@ -439,7 +445,7 @@ pub fn get_opencode_context(project_path: String) -> OpencodeContext {
             }
         };
         scan(pp.join(".opencode").join(subdir), "project");
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = ctx.home.clone() {
             scan(home.join(".config").join("opencode").join(subdir), "global");
         }
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -505,6 +511,7 @@ pub fn get_opencode_context(project_path: String) -> OpencodeContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{path_str, sections_view, Fixture};
 
     #[test]
     fn parse_jsonc_strips_comments_and_trailing_commas_outside_strings() {
@@ -521,5 +528,261 @@ mod tests {
         // a comment between the comma and the closing brace leaves the comma in place and the
         // final parse fails. Not fixed here on purpose.
         assert_eq!(parse_jsonc("{\"a\": 1, /* b */}"), None);
+    }
+
+    // opencode.db with the two tables the parser reads.
+    fn write_db(path: &std::path::Path) -> rusqlite::Connection {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT, title TEXT, directory TEXT, model TEXT, version TEXT,
+                time_created INTEGER, time_updated INTEGER, tokens_input INTEGER,
+                tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                tokens_cache_write INTEGER, parent_id TEXT, time_archived INTEGER);
+             CREATE TABLE message (session_id TEXT, data TEXT, time_created INTEGER);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_session(
+        conn: &rusqlite::Connection,
+        id: &str,
+        title: &str,
+        dir: &str,
+        model: Option<&str>,
+        parent: Option<&str>,
+        archived: Option<i64>,
+        tokens: [i64; 5],
+    ) {
+        conn.execute(
+            "INSERT INTO session VALUES (?1, ?2, ?3, ?4, '1.0.0', 1709210000000, 1709210096999,
+                ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                id, title, dir, model, tokens[0], tokens[1], tokens[2], tokens[3], tokens[4],
+                parent, archived
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_message(conn: &rusqlite::Connection, sid: &str, data: serde_json::Value, at: i64) {
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3)",
+            rusqlite::params![sid, data.to_string(), at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_opencode_sessions_reads_rows_tokens_and_limits() {
+        let f = Fixture::new();
+        f.write(
+            "home/.cache/opencode/models.json",
+            r#"{"prov":{"models":{"m1":{"limit":{"context":200000}},"m2":{}}}}"#,
+        );
+        let conn = write_db(&f.home().join(".local/share/opencode/opencode.db"));
+        let model = r#"{"id":"m1","providerID":"prov"}"#;
+        insert_session(
+            &conn,
+            "ses_main",
+            "Main work",
+            "/work/oc",
+            Some(model),
+            None,
+            None,
+            [10, 20, 5, 30, 40],
+        );
+        insert_session(
+            &conn,
+            "ses_child",
+            "Child",
+            "/work/oc",
+            Some(model),
+            Some("ses_main"),
+            None,
+            [1, 1, 1, 1, 1],
+        );
+        insert_session(
+            &conn,
+            "ses_arch",
+            "Archived",
+            "/work/oc",
+            None,
+            None,
+            Some(1),
+            [1, 1, 1, 1, 1],
+        );
+        insert_session(
+            &conn,
+            "ses_untitled",
+            " ",
+            "/work/other",
+            None,
+            None,
+            None,
+            [0, 0, 0, 0, 0],
+        );
+        insert_session(
+            &conn,
+            "ses_nodir",
+            "No dir",
+            "",
+            None,
+            None,
+            None,
+            [0, 0, 0, 0, 0],
+        );
+        insert_message(&conn, "ses_main", serde_json::json!({"role": "user"}), 1);
+        insert_message(
+            &conn,
+            "ses_main",
+            serde_json::json!({"role": "assistant", "time": {"created": 1_709_210_000_000u64},
+                "tokens": {"input": 100, "output": 10, "reasoning": 5, "cache": {"read": 50, "write": 20}}}),
+            2,
+        );
+        insert_message(&conn, "ses_main", serde_json::json!({"role": "user"}), 3);
+        insert_message(
+            &conn,
+            "ses_main",
+            serde_json::json!({"role": "assistant", "time": {"created": 1_709_300_000_000u64},
+                "tokens": {"input": 7, "output": 3, "reasoning": 0, "cache": {"read": 1000, "write": 0}}}),
+            4,
+        );
+        // Assistant turn without tokens is ignored.
+        insert_message(
+            &conn,
+            "ses_main",
+            serde_json::json!({"role": "assistant"}),
+            5,
+        );
+        drop(conn);
+
+        let sessions = parse_opencode_sessions(&f.ctx());
+        let mut ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["ses_main", "ses_untitled"]);
+
+        let s = sessions.iter().find(|s| s.id == "ses_main").unwrap();
+        let expected_dir = if cfg!(windows) {
+            "\\work\\oc"
+        } else {
+            "/work/oc"
+        };
+        assert_eq!(s.project_path, expected_dir);
+        assert_eq!(s.project_name, "oc");
+        assert_eq!(s.title, "Main work");
+        assert_eq!(s.model, "m1");
+        assert_eq!(s.context_limit, 200_000);
+        assert_eq!(s.claude_version, "1.0.0");
+        assert_eq!(s.timestamp, "2024-02-29T12:34:56Z");
+        assert_eq!(s.duration_ms, 96_999);
+        assert_eq!(s.message_count, 2);
+        // Context = the last assistant turn's input + cache read + cache write.
+        assert_eq!(s.context_tokens, 1007);
+        // Bands: [input, cache write, cache read, output + reasoning].
+        let daily: Vec<(&str, [u64; 4])> = s
+            .daily_tokens
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        assert_eq!(
+            daily,
+            vec![
+                ("2024-02-29", [100, 20, 50, 15]),
+                ("2024-03-01", [7, 0, 1000, 3])
+            ]
+        );
+        assert_eq!(s.total_input_tokens, 10);
+        assert_eq!(s.total_output_tokens, 25);
+        assert_eq!(s.total_cache_read_tokens, 30);
+        assert_eq!(s.total_cache_creation_tokens, 40);
+        assert!(s.is_authoritative_stats);
+        assert_eq!(s.agent, "opencode");
+
+        let u = sessions.iter().find(|s| s.id == "ses_untitled").unwrap();
+        assert_eq!(u.title, "Session ses_unti");
+        assert_eq!(u.model, "");
+        assert_eq!(u.context_limit, 0);
+        assert_eq!(u.message_count, 0);
+        assert!(u.daily_tokens.is_empty());
+
+        // No database: nothing.
+        assert!(parse_opencode_sessions(&Fixture::new().ctx()).is_empty());
+    }
+
+    #[test]
+    fn get_opencode_context_merges_configs() {
+        let f = Fixture::new();
+        let project = f.dir.path().join("proj");
+        let agents = f.write("proj/AGENTS.md", "# a");
+        f.write("proj/docs/rules.md", "rules");
+        f.write("proj/glob/x.md", "matched only by a glob");
+        f.write(
+            "proj/opencode.jsonc",
+            include_str!("../tests/fixtures/opencode/opencode.jsonc"),
+        );
+        let global_agents = f.write("home/.config/opencode/AGENTS.md", "# g");
+        f.write(
+            "home/.config/opencode/opencode.json",
+            r#"{"mcp":{"local":{"command":["shadowed"]},"gl":{"command":["g","--x"]}}}"#,
+        );
+        let deploy = f.write("proj/.opencode/command/deploy.md", "d");
+        let nested = f.write("proj/.opencode/command/sub/nested.md", "n");
+        f.write("proj/.opencode/command/notes.txt", "x");
+        let zz = f.write("home/.config/opencode/command/zz.md", "z");
+        let reviewer = f.write("proj/.opencode/agent/reviewer.md", "r");
+
+        let c = get_opencode_context(&f.ctx(), path_str(&project));
+        assert!(c.present);
+        let item = |n: &str, d: &str, p: String| (n.to_string(), d.to_string(), p);
+        assert_eq!(
+            sections_view(&c.sections),
+            vec![
+                (
+                    "Instructions".to_string(),
+                    vec![
+                        item("AGENTS.md", "project", path_str(&agents)),
+                        item("AGENTS.md", "global", path_str(&global_agents)),
+                        // Literal config paths that exist; globs, missing files and
+                        // duplicates are skipped.
+                        // Joined as the config spells it, so `/` stays on Windows.
+                        item(
+                            "rules.md",
+                            "project config",
+                            path_str(&project.join("docs/rules.md"))
+                        ),
+                    ]
+                ),
+                (
+                    "Commands".to_string(),
+                    vec![
+                        item("deploy", "project", path_str(&deploy)),
+                        item("nested", "project", path_str(&nested)),
+                        item("zz", "global", path_str(&zz)),
+                    ]
+                ),
+                (
+                    "Agents".to_string(),
+                    vec![item("reviewer", "project", path_str(&reviewer))]
+                ),
+                (
+                    "MCP servers".to_string(),
+                    vec![
+                        // Project config first (keys alphabetical); a global entry with the
+                        // same name is dropped.
+                        item("bare", "project", String::new()),
+                        item("local", "npx -y srv", String::new()),
+                        item("remote", "https://r.example", String::new()),
+                        item("gl", "g --x", String::new()),
+                    ]
+                ),
+            ]
+        );
+
+        let empty = Fixture::new();
+        let c = get_opencode_context(&empty.ctx(), path_str(&empty.dir.path().join("p")));
+        assert!(!c.present && c.sections.is_empty());
     }
 }

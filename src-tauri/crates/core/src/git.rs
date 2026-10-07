@@ -422,4 +422,69 @@ mod tests {
         assert_eq!(normalize_git_path("a -> b"), "b");
         assert_eq!(normalize_git_path("c"), "c");
     }
+
+    #[test]
+    fn git_status_stage_unstage_round_trip() {
+        let fx = crate::testutil::Fixture::new();
+        let Some(repo) = crate::testutil::git_repo(&fx.dir.path().join("repo")) else {
+            eprintln!("git not available; skipping");
+            return;
+        };
+        let cwd = repo.to_string_lossy().to_string();
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("new.txt"), "new\n").unwrap();
+        std::fs::write(repo.join("README.md"), "changed\n").unwrap();
+        let files = |s: &GitStatus| -> Vec<(String, String, String)> {
+            let mut v: Vec<_> = s
+                .files
+                .iter()
+                .map(|f| (f.path.clone(), f.staged.clone(), f.unstaged.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let row = |p: &str, a: &str, b: &str| (p.to_string(), a.to_string(), b.to_string());
+
+        let s = get_git_status(cwd.clone());
+        assert!(s.is_repo);
+        assert_eq!(s.branch, "main");
+        assert!(!s.has_upstream);
+        assert_eq!(
+            files(&s),
+            [row("README.md", " ", "M"), row("sub/new.txt", "?", "?")]
+        );
+
+        // Stage from a subdirectory cwd: paths are repo-root-relative, as status reports them.
+        let sub_cwd = sub.to_string_lossy().to_string();
+        git_stage(
+            sub_cwd.clone(),
+            vec!["sub/new.txt".into(), "README.md".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            files(&get_git_status(cwd.clone())),
+            [row("README.md", "M", " "), row("sub/new.txt", "A", " ")]
+        );
+        let staged = git_diff(cwd.clone(), "README.md".into(), "staged".into()).unwrap();
+        assert!(staged.contains("+changed"), "{staged}");
+
+        git_unstage(sub_cwd, vec!["sub/new.txt".into(), "README.md".into()]).unwrap();
+        assert_eq!(
+            files(&get_git_status(cwd.clone())),
+            [row("README.md", " ", "M"), row("sub/new.txt", "?", "?")]
+        );
+
+        let log = get_git_log(cwd.clone(), None);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].subject, "init");
+
+        // Not a repo.
+        let plain = fx.dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        // The fixture lives in the system temp dir, which is not inside a repository.
+        let s = get_git_status(plain.to_string_lossy().to_string());
+        assert!(!s.is_repo);
+        assert!(s.files.is_empty());
+    }
 }

@@ -66,8 +66,12 @@ xshell/
 │   ├── layout.ts              # Pane split / drag layout
 │   └── types.ts               # Shared TypeScript types
 ├── src-tauri/                 # Rust backend
-│   ├── src/lib.rs             # Tauri commands (PTY, stats, projects, skills, git)
+│   ├── src/lib.rs             # Tauri commands: PTY, desktop-only commands, thin wrappers over core
 │   ├── src/main.rs            # Entry point
+│   ├── crates/core/           # xshell-core: Tauri-free host logic (sessions, agents, skills, git, files)
+│   │   ├── src/dispatch.rs    # Method table for every host command
+│   │   ├── src/launch.rs      # Terminal launch spec → command plan
+│   │   └── tests/             # Integration tests and text fixtures
 │   └── tauri.conf.json        # Tauri 2 configuration
 ├── docs/screenshots/          # README screenshots
 └── .github/workflows/         # CI / release automation
@@ -99,13 +103,16 @@ xshell/
 Run the automated tests before opening a PR:
 
 ```bash
-npm test                      # Vitest (frontend unit tests)
-cd src-tauri && cargo test    # Rust unit tests
+npm test                                  # Vitest (frontend unit tests)
+cd src-tauri && cargo test --workspace    # Rust tests: desktop crate and xshell-core
+cd src-tauri && cargo test -p xshell-core # core only; needs no Tauri system dependencies
 ```
 
-Building the desktop crate needs the Tauri system dependencies (see Prerequisites).
+Building the desktop crate needs the Tauri system dependencies (see Prerequisites). `xshell-core` does not depend on Tauri, so it builds and tests on its own.
 
-CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
+Host-side logic belongs in `xshell-core`, not in `src/lib.rs`: a new command is a core function plus an entry in `dispatch.rs` (`METHODS` and the `match`), and the desktop gets a thin wrapper that keeps the frontend's parameter names. Core reads the home and temp directories only through `HostCtx`, never from `dirs::home_dir()` or `std::env::temp_dir()`.
+
+CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, a check that `xshell-core` has no Tauri dependency, a check that core never reads the home or temp directory outside `HostCtx`, `cargo clippy` and `cargo test` for `xshell-core` on Windows and macOS, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
 
 Automated tests do not replace a manual pass: please also test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
 

@@ -1,6 +1,7 @@
 use crate::agent_context::{AgentContextItem, AgentContextSection};
 use crate::claude::list_claude_projects;
 use crate::codex::list_codex_projects;
+use crate::ctx::HostCtx;
 use crate::sessions::{CodexProjectInfo, SessionInfo};
 use crate::time::{system_time_to_iso, unix_ms_to_iso};
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ pub struct CursorContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-pub fn get_cursor_context(project_path: String) -> CursorContext {
+pub fn get_cursor_context(ctx: &HostCtx, project_path: String) -> CursorContext {
     let pp = std::path::Path::new(&project_path);
     let mut sections: Vec<AgentContextSection> = vec![];
 
@@ -108,7 +109,7 @@ pub fn get_cursor_context(project_path: String) -> CursorContext {
         }
     };
     read_mcp(pp.join(".cursor").join("mcp.json"), "project");
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ctx.home.clone() {
         read_mcp(home.join(".cursor").join("mcp.json"), "global");
     }
     if !mcp_items.is_empty() {
@@ -131,9 +132,9 @@ pub fn get_cursor_context(project_path: String) -> CursorContext {
 // locally, so those stay zero. The workspace folder is md5 of the exact cwd string and isn't
 // reversible — we resolve it via a md5(path)→path map built below.
 
-pub fn cursor_workspace_map() -> HashMap<String, String> {
+pub fn cursor_workspace_map(ctx: &HostCtx) -> HashMap<String, String> {
     let mut map: HashMap<String, String> = HashMap::new();
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ctx.home.clone() else {
         return map;
     };
     let mut add = |path: &str| {
@@ -157,17 +158,17 @@ pub fn cursor_workspace_map() -> HashMap<String, String> {
     }
     // Safety net: any project the user also uses in Claude or Codex resolves even if Cursor
     // never wrote a trust file for it.
-    for p in list_claude_projects() {
+    for p in list_claude_projects(ctx) {
         add(&p.path);
     }
-    for p in list_codex_projects() {
+    for p in list_codex_projects(ctx) {
         add(&p.path);
     }
     map
 }
 
-pub fn cursor_chats_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cursor").join("chats"))
+pub fn cursor_chats_dir(ctx: &HostCtx) -> Option<PathBuf> {
+    ctx.home.clone().map(|h| h.join(".cursor").join("chats"))
 }
 
 // Read the model id from a chat's store.db. The `meta` row's value is a TEXT column holding
@@ -279,10 +280,10 @@ pub fn parse_cursor_session(
 
 // Directories Cursor has been used in — for the Add Projects picker's per-agent marks.
 // Same shape as the Claude/Codex project lists; grouped by each chat's resolved cwd.
-pub fn list_cursor_projects() -> Vec<CodexProjectInfo> {
-    let ws = cursor_workspace_map();
+pub fn list_cursor_projects(ctx: &HostCtx) -> Vec<CodexProjectInfo> {
+    let ws = cursor_workspace_map(ctx);
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
-    for dir in cursor_chat_dirs() {
+    for dir in cursor_chat_dirs(ctx) {
         if let Some(s) = parse_cursor_session(&dir, &ws) {
             if s.project_path.is_empty() {
                 continue;
@@ -307,9 +308,9 @@ pub fn list_cursor_projects() -> Vec<CodexProjectInfo> {
 }
 
 // Enumerate ~/.cursor/chats/<hash>/<chat-uuid>/ session directories.
-pub fn cursor_chat_dirs() -> Vec<PathBuf> {
+pub fn cursor_chat_dirs(ctx: &HostCtx) -> Vec<PathBuf> {
     let mut dirs = vec![];
-    let Some(chats) = cursor_chats_dir() else {
+    let Some(chats) = cursor_chats_dir(ctx) else {
         return dirs;
     };
     for ws in fs::read_dir(&chats).ok().into_iter().flatten().flatten() {
@@ -323,4 +324,155 @@ pub fn cursor_chat_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{path_str, sections_view, Fixture};
+
+    fn md5_hex(s: &str) -> String {
+        format!("{:x}", md5::compute(s.as_bytes()))
+    }
+
+    // A chat's store.db: one `meta` row whose TEXT value is hex-encoded JSON.
+    fn write_store(path: &std::path::Path, meta: &serde_json::Value) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE meta (key TEXT, value TEXT)", [])
+            .unwrap();
+        let hex: String = meta
+            .to_string()
+            .bytes()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        conn.execute("INSERT INTO meta VALUES ('0', ?1)", [hex])
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_cursor_session_resolves_cwd_and_model() {
+        let f = Fixture::new();
+        let cwd = "/work/cursor-proj";
+        f.write(
+            "home/.cursor/projects/work-cursor-proj/.workspace-trusted",
+            serde_json::json!({ "workspacePath": cwd }).to_string(),
+        );
+        let chat_rel = format!("home/.cursor/chats/{}/0d1e2f3a-chat", md5_hex(cwd));
+        f.write(
+            format!("{chat_rel}/meta.json"),
+            serde_json::json!({
+                "title": "Fix login",
+                "hasConversation": true,
+                "createdAtMs": 1_000u64,
+                "updatedAtMs": 1_709_210_096_999u64,
+            })
+            .to_string(),
+        );
+        let chat_dir = f.dir.path().join(&chat_rel);
+        write_store(
+            &chat_dir.join("store.db"),
+            &serde_json::json!({ "lastUsedModel": "gpt-5", "mode": "agent" }),
+        );
+
+        let ctx = f.ctx();
+        let ws = cursor_workspace_map(&ctx);
+        assert_eq!(ws.get(&md5_hex(cwd)).map(String::as_str), Some(cwd));
+        assert_eq!(cursor_chat_dirs(&ctx), vec![chat_dir.clone()]);
+
+        let s = parse_cursor_session(&chat_dir, &ws).expect("session");
+        assert_eq!(s.id, "0d1e2f3a-chat");
+        assert_eq!(s.title, "Fix login");
+        assert_eq!(s.project_path, cwd);
+        assert_eq!(s.project_name, "cursor-proj");
+        assert_eq!(s.model, "gpt-5");
+        assert_eq!(s.timestamp, "2024-02-29T12:34:56Z");
+        assert_eq!(s.agent, "cursor");
+        assert!(!s.is_authoritative_stats);
+
+        // Unknown workspace hash: no cwd, and no store.db means no model.
+        let other = f.dir.path().join("home/.cursor/chats/ffff/abcdef123456");
+        f.write(
+            "home/.cursor/chats/ffff/abcdef123456/meta.json",
+            r#"{"title":"  ","hasConversation":true,"createdAtMs":1709210096999}"#,
+        );
+        let s = parse_cursor_session(&other, &ws).expect("session");
+        assert_eq!(s.project_path, "");
+        assert_eq!(s.project_name, "");
+        assert_eq!(s.model, "");
+        assert_eq!(s.title, "Session abcdef12");
+        assert_eq!(s.timestamp, "2024-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn parse_cursor_session_skips_empty_chats() {
+        let f = Fixture::new();
+        let ws = HashMap::new();
+        f.write(
+            "home/.cursor/chats/h/stub/meta.json",
+            r#"{"title":"x","hasConversation":false}"#,
+        );
+        assert!(
+            parse_cursor_session(&f.dir.path().join("home/.cursor/chats/h/stub"), &ws).is_none()
+        );
+        f.write("home/.cursor/chats/h/nokey/meta.json", r#"{"title":"x"}"#);
+        assert!(
+            parse_cursor_session(&f.dir.path().join("home/.cursor/chats/h/nokey"), &ws).is_none()
+        );
+        // No meta.json at all.
+        assert!(
+            parse_cursor_session(&f.dir.path().join("home/.cursor/chats/h/none"), &ws).is_none()
+        );
+    }
+
+    #[test]
+    fn get_cursor_context_collects_rules_instructions_mcp() {
+        let f = Fixture::new();
+        let top = f.write("proj/.cursor/rules/top.mdc", "rule");
+        let inner = f.write("proj/.cursor/rules/nested/deep/inner.md", "rule");
+        f.write("proj/.cursor/rules/ignored.txt", "x");
+        let agents = f.write("proj/AGENTS.md", "# a");
+        f.write(
+            "proj/.cursor/mcp.json",
+            r#"{"mcpServers":{"zeta":{"command":"npx"},"alpha":{"url":"http://x"}}}"#,
+        );
+        f.write(
+            "home/.cursor/mcp.json",
+            r#"{"mcpServers":{"global-one":{"command":"g-cmd"},"plain":{}}}"#,
+        );
+        let project = f.dir.path().join("proj");
+
+        let c = get_cursor_context(&f.ctx(), path_str(&project));
+        assert!(c.present);
+        let item = |n: &str, d: &str, p: String| (n.to_string(), d.to_string(), p);
+        assert_eq!(
+            sections_view(&c.sections),
+            vec![
+                (
+                    "Rules".to_string(),
+                    vec![
+                        item("inner", "nested/deep", path_str(&inner)),
+                        item("top", "", path_str(&top)),
+                    ]
+                ),
+                (
+                    "Instructions".to_string(),
+                    vec![item("AGENTS.md", "project", path_str(&agents))]
+                ),
+                (
+                    "MCP servers".to_string(),
+                    vec![
+                        // Object keys iterate alphabetically; project file before global.
+                        item("alpha", "project", String::new()),
+                        item("zeta", "npx", String::new()),
+                        item("global-one", "g-cmd", String::new()),
+                        item("plain", "global", String::new()),
+                    ]
+                ),
+            ]
+        );
+
+        let empty = Fixture::new();
+        let c = get_cursor_context(&empty.ctx(), path_str(&empty.dir.path().join("p")));
+        assert!(!c.present && c.sections.is_empty());
+    }
 }

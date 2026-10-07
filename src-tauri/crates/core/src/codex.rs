@@ -1,4 +1,5 @@
 use crate::agent_context::{AgentContextItem, AgentContextSection};
+use crate::ctx::HostCtx;
 use crate::paths::find_git_root;
 use crate::sessions::{CodexProjectInfo, SessionInfo};
 use crate::time::system_time_to_iso;
@@ -17,8 +18,8 @@ use std::time::SystemTime;
 // subscription plans have no per-use cost — while is_authoritative_stats is true so the
 // context bar renders: the numbers come from Codex itself, not an estimate.
 
-pub fn codex_rollout_files() -> Vec<std::path::PathBuf> {
-    let Some(home) = dirs::home_dir() else {
+pub fn codex_rollout_files(ctx: &HostCtx) -> Vec<std::path::PathBuf> {
+    let Some(home) = ctx.home.clone() else {
         return vec![];
     };
     let mut files = vec![];
@@ -42,9 +43,9 @@ pub fn codex_rollout_files() -> Vec<std::path::PathBuf> {
 // they land in ~/.codex/session_index.jsonl, one JSON line per named session. Load once
 // per listing call and overlay onto parsed sessions; for repeated renames of the same id
 // the last line wins (insertion order preserves that).
-pub fn codex_session_names() -> HashMap<String, String> {
+pub fn codex_session_names(ctx: &HostCtx) -> HashMap<String, String> {
     let mut names = HashMap::new();
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ctx.home.clone() else {
         return names;
     };
     let Ok(content) = fs::read_to_string(home.join(".codex").join("session_index.jsonl")) else {
@@ -254,8 +255,8 @@ pub struct CodexContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-pub fn get_codex_context(project_path: String) -> CodexContext {
-    let home = dirs::home_dir();
+pub fn get_codex_context(ctx: &HostCtx, project_path: String) -> CodexContext {
+    let home = ctx.home.clone();
     let mut sections: Vec<AgentContextSection> = vec![];
 
     // Instructions — AGENTS.md at the project root (plus git root when different) and the
@@ -405,7 +406,7 @@ pub struct CodexUsage {
     pub daily_sessions: Vec<DailySessionCount>,
 }
 
-pub fn get_codex_usage() -> CodexUsage {
+pub fn get_codex_usage(ctx: &HostCtx) -> CodexUsage {
     let mut out = CodexUsage {
         present: false,
         primary: None,
@@ -414,7 +415,7 @@ pub fn get_codex_usage() -> CodexUsage {
         rate_limits_updated_iso: None,
         daily_sessions: vec![],
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = ctx.home.clone() else {
         return out;
     };
     let sessions_dir = home.join(".codex").join("sessions");
@@ -518,8 +519,8 @@ pub fn get_codex_usage() -> CodexUsage {
     out
 }
 
-pub fn list_codex_projects() -> Vec<CodexProjectInfo> {
-    let Some(home) = dirs::home_dir() else {
+pub fn list_codex_projects(ctx: &HostCtx) -> Vec<CodexProjectInfo> {
+    let Some(home) = ctx.home.clone() else {
         return vec![];
     };
     let sessions_dir = home.join(".codex").join("sessions");
@@ -575,4 +576,289 @@ pub fn list_codex_projects() -> Vec<CodexProjectInfo> {
         .collect();
     projects.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     projects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{path_str, sections_view, Fixture};
+    use std::time::Duration;
+
+    const ROLLOUT: &str = include_str!("../tests/fixtures/codex/rollout.jsonl");
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn meta_line(id: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-01-01T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": id, "cwd": cwd},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_codex_session_maps_meta_model_and_tokens() {
+        let f = Fixture::new();
+        let p = f.write("home/.codex/sessions/2026/01/02/rollout-a.jsonl", ROLLOUT);
+        let s = parse_codex_session(&p, &HashMap::new()).expect("session");
+        assert_eq!(s.id, "0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        assert_eq!(s.project_path, "/work/proj");
+        assert_eq!(s.project_name, "proj");
+        assert_eq!(s.git_branch, "main");
+        assert_eq!(s.claude_version, "0.50.0");
+        // The latest turn_context wins.
+        assert_eq!(s.model, "gpt-5.1-codex");
+        // First prompt, trimmed, newlines flattened.
+        assert_eq!(s.title, "fix the bug");
+        assert_eq!(s.message_count, 2);
+        assert_eq!(s.timestamp, "2026-01-02T09:00:02Z");
+        // Context = last turn's input + output; limit from the latest token_count.
+        assert_eq!(s.context_tokens, 350);
+        assert_eq!(s.context_limit, 400_000);
+        // Daily bands come from differences between cumulative snapshots:
+        // [non-cached input, 0, cached input, output].
+        let daily: Vec<(&str, [u64; 4])> = s
+            .daily_tokens
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
+        assert_eq!(
+            daily,
+            vec![
+                ("2026-01-01", [60, 0, 40, 20]),
+                ("2026-01-02", [140, 0, 160, 50])
+            ]
+        );
+        assert_eq!(s.total_input_tokens, 200);
+        assert_eq!(s.total_cache_creation_tokens, 0);
+        assert_eq!(s.total_cache_read_tokens, 200);
+        assert_eq!(s.total_output_tokens, 70);
+        assert_eq!(s.cost_usd, 0.0);
+        assert!(s.is_authoritative_stats);
+        assert_eq!(s.agent, "codex");
+    }
+
+    #[test]
+    fn parse_codex_session_requires_meta() {
+        let f = Fixture::new();
+        // Everything but the session_meta line.
+        let no_meta: String = ROLLOUT
+            .lines()
+            .filter(|l| !l.contains("session_meta"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = f.write("home/.codex/sessions/no-meta.jsonl", no_meta);
+        assert!(parse_codex_session(&p, &HashMap::new()).is_none());
+        // A meta line without a cwd is not enough either.
+        let p = f.write(
+            "home/.codex/sessions/no-cwd.jsonl",
+            meta_line("0199ffff-0000", ""),
+        );
+        assert!(parse_codex_session(&p, &HashMap::new()).is_none());
+        // Missing file.
+        assert!(parse_codex_session(&f.home().join("nope.jsonl"), &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn codex_session_names_override_title_last_wins() {
+        let f = Fixture::new();
+        f.write(
+            "home/.codex/session_index.jsonl",
+            [
+                r#"{"id":"0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee","thread_name":"first name"}"#,
+                "garbage",
+                r#"{"id":"0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee","thread_name":"second name"}"#,
+                r#"{"id":"blank","thread_name":"   "}"#,
+                r#"{"id":"no-name"}"#,
+            ]
+            .join("\n"),
+        );
+        let names = codex_session_names(&f.ctx());
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names
+                .get("0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                .map(String::as_str),
+            Some("second name")
+        );
+        let p = f.write("home/.codex/sessions/2026/01/02/rollout-a.jsonl", ROLLOUT);
+        let s = parse_codex_session(&p, &names).unwrap();
+        assert_eq!(s.title, "second name");
+        // No home: no names.
+        let mut ctx = f.ctx();
+        ctx.home = None;
+        assert!(codex_session_names(&ctx).is_empty());
+    }
+
+    #[test]
+    fn list_codex_projects_groups_by_cwd() {
+        let f = Fixture::new();
+        let a1 = f.write(
+            "home/.codex/sessions/2026/01/01/r1.jsonl",
+            meta_line("1", "/a"),
+        );
+        let a2 = f.write(
+            "home/.codex/sessions/2026/01/03/r2.jsonl",
+            meta_line("2", "/a"),
+        );
+        let b1 = f.write(
+            "home/.codex/sessions/2026/01/02/r3.jsonl",
+            meta_line("3", "/b"),
+        );
+        // Skipped: first line has no cwd, and a non-jsonl file.
+        f.write(
+            "home/.codex/sessions/2026/01/02/r4.jsonl",
+            "{\"type\":\"x\"}\n",
+        );
+        f.write(
+            "home/.codex/sessions/2026/01/02/notes.txt",
+            meta_line("5", "/c"),
+        );
+        f.set_mtime(&a1, at(1_000_000));
+        f.set_mtime(&a2, at(3_000_000));
+        f.set_mtime(&b1, at(2_000_000));
+
+        let projects: Vec<(String, usize, String)> = list_codex_projects(&f.ctx())
+            .into_iter()
+            .map(|p| (p.path, p.session_count, p.last_active))
+            .collect();
+        assert_eq!(
+            projects,
+            vec![
+                ("/a".into(), 2, system_time_to_iso(at(3_000_000))),
+                ("/b".into(), 1, system_time_to_iso(at(2_000_000))),
+            ]
+        );
+        assert!(list_codex_projects(&Fixture::new().ctx()).is_empty());
+    }
+
+    #[test]
+    fn get_codex_usage_reads_rate_limits_and_daily_counts() {
+        let f = Fixture::new();
+        let rl = |used: f64| {
+            serde_json::json!({
+                "timestamp": format!("2026-01-01T0{}:00:00Z", used as u64 % 10),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "rate_limits": {
+                    "primary": {"used_percent": used, "window_minutes": 300, "resets_at": 1_700_000_000u64},
+                    "secondary": {"used_percent": 40.0, "window_minutes": 10080},
+                    "plan_type": "plus",
+                }},
+            })
+            .to_string()
+        };
+        // Older file with two token_count events: the last one counts.
+        let older = f.write(
+            "home/.codex/sessions/2026/01/01/r1.jsonl",
+            [meta_line("1", "/a"), rl(11.0), rl(12.0)].join("\n"),
+        );
+        // Newest file has no token_count yet, so usage falls back to the older file.
+        let newest = f.write(
+            "home/.codex/sessions/2026/01/02/r2.jsonl",
+            meta_line("2", "/a"),
+        );
+        // A rollout outside the YYYY/MM/DD layout counts as present but has no date.
+        let odd = f.write("home/.codex/sessions/misc/r3.jsonl", meta_line("3", "/a"));
+        f.set_mtime(&odd, at(1_000));
+        f.set_mtime(&older, at(2_000));
+        f.set_mtime(&newest, at(3_000));
+
+        let u = get_codex_usage(&f.ctx());
+        assert!(u.present);
+        let primary = u.primary.expect("primary");
+        assert_eq!(primary.used_percent, Some(12.0));
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at, Some(1_700_000_000));
+        let secondary = u.secondary.expect("secondary");
+        assert_eq!(secondary.used_percent, Some(40.0));
+        assert_eq!(secondary.window_minutes, Some(10080));
+        assert_eq!(secondary.resets_at, None);
+        assert_eq!(u.plan_type.as_deref(), Some("plus"));
+        assert_eq!(
+            u.rate_limits_updated_iso.as_deref(),
+            Some("2026-01-01T02:00:00Z")
+        );
+        let daily: Vec<(String, usize)> = u
+            .daily_sessions
+            .into_iter()
+            .map(|d| (d.date, d.count))
+            .collect();
+        assert_eq!(
+            daily,
+            vec![("2026-01-01".into(), 1), ("2026-01-02".into(), 1)]
+        );
+
+        let empty = get_codex_usage(&Fixture::new().ctx());
+        assert!(!empty.present);
+        assert!(empty.primary.is_none() && empty.daily_sessions.is_empty());
+    }
+
+    #[test]
+    fn get_codex_context_lists_instructions_prompts_mcp_and_trust() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.dir.path().join("repo/.git")).unwrap();
+        let project = f.dir.path().join("repo").join("sub");
+        let project_agents = f.write("repo/sub/AGENTS.md", "# p");
+        let root_agents = f.write("repo/AGENTS.md", "# r");
+        let global_agents = f.write("home/.codex/AGENTS.md", "# g");
+        let prompt_b = f.write("home/.codex/prompts/b.md", "b");
+        let prompt_a = f.write("home/.codex/prompts/a.md", "a");
+        f.write("home/.codex/prompts/ignored.txt", "x");
+        let project_str = path_str(&project);
+        f.write(
+            "home/.codex/config.toml",
+            format!(
+                "model = \"gpt-5\"\n\
+                 [mcp_servers.docs]\n\
+                 command = \"npx\"\n\
+                 args = [\"-y\"]\n\
+                 [mcp_servers.\"quoted\"]\n\
+                 url = \"http://x\"\n\
+                 [projects.'{project_str}']\n\
+                 trust_level = \"trusted\"\n\
+                 [projects.'/elsewhere']\n\
+                 trust_level = \"untrusted\"\n"
+            ),
+        );
+
+        let c = get_codex_context(&f.ctx(), project_str.clone());
+        assert!(c.present);
+        assert_eq!(c.trust_level.as_deref(), Some("trusted"));
+        let item = |n: &str, d: &str, p: String| (n.to_string(), d.to_string(), p);
+        assert_eq!(
+            sections_view(&c.sections),
+            vec![
+                (
+                    "Instructions".to_string(),
+                    vec![
+                        item("AGENTS.md", "project", path_str(&project_agents)),
+                        item("AGENTS.md", "repo root", path_str(&root_agents)),
+                        item("AGENTS.md", "global", path_str(&global_agents)),
+                    ]
+                ),
+                (
+                    "Prompts".to_string(),
+                    vec![
+                        item("/a", "global", path_str(&prompt_a)),
+                        item("/b", "global", path_str(&prompt_b)),
+                    ]
+                ),
+                (
+                    "MCP servers".to_string(),
+                    vec![
+                        item("docs", "npx", String::new()),
+                        item("quoted", "", String::new()),
+                    ]
+                ),
+            ]
+        );
+
+        // Nothing configured: not present.
+        let empty = Fixture::new();
+        let c = get_codex_context(&empty.ctx(), path_str(&empty.dir.path().join("p")));
+        assert!(!c.present && c.trust_level.is_none() && c.sections.is_empty());
+    }
 }

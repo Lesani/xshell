@@ -1,4 +1,4 @@
-use crate::claude::get_claude_projects_dir;
+use crate::ctx::HostCtx;
 use crate::paths::find_git_root;
 use serde::Serialize;
 use std::fs;
@@ -37,8 +37,8 @@ pub fn encode_path_for_claude(path: &str) -> String {
 // All worktrees/subdirs within the same repo share one memory folder; outside a repo the
 // project path itself is used. Each .md has YAML frontmatter (name/description/type);
 // MEMORY.md is the index and is skipped.
-pub fn get_project_memories(project_path: String) -> ProjectMemories {
-    let projects_root = match get_claude_projects_dir() {
+pub fn get_project_memories(ctx: &HostCtx, project_path: String) -> ProjectMemories {
+    let projects_root = match ctx.claude_projects_dir() {
         Some(d) => d,
         None => {
             return ProjectMemories {
@@ -118,5 +118,82 @@ pub fn get_project_memories(project_path: String) -> ProjectMemories {
     ProjectMemories {
         dir: dir_str,
         items,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::Fixture;
+    use serde_json::json;
+
+    #[test]
+    fn get_project_memories_uses_git_root_and_skips_index() {
+        let fx = Fixture::new();
+        // The repo root holds `.git`; the project is a subdirectory of it, so memories are
+        // looked up under the encoded repo root, not the encoded project path.
+        let repo = fx.dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let project = repo.join("pkg").join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let encoded = encode_path_for_claude(&repo.to_string_lossy());
+        let mem = format!("home/.claude/projects/{encoded}/memory");
+        fx.write(format!("{mem}/MEMORY.md"), "- index\n");
+        fx.write(
+            format!("{mem}/zeta.md"),
+            "---\nname: \"Zeta rule\"\ndescription: Always zeta\ntype: feedback\n---\nbody\n",
+        );
+        fx.write(
+            format!("{mem}/alpha.md"),
+            "---\nname: alpha fact\ndescription: \"A\"\ntype: project\n---\n",
+        );
+        fx.write(format!("{mem}/plain.md"), "no frontmatter\n");
+        fx.write(format!("{mem}/ignored.txt"), "not markdown");
+
+        let r = serde_json::to_value(get_project_memories(
+            &fx.ctx(),
+            project.to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        let dir = fx
+            .home()
+            .join(".claude")
+            .join("projects")
+            .join(&encoded)
+            .join("memory");
+        assert_eq!(r["dir"], json!(dir.to_string_lossy()));
+        let items: Vec<(String, String, String)> = r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["type"].as_str().unwrap().to_string(),
+                    m["name"].as_str().unwrap().to_string(),
+                    m["description"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        // Sorted by type, then case-insensitive name; MEMORY.md and non-.md files skipped.
+        assert_eq!(
+            items,
+            [
+                ("feedback".into(), "Zeta rule".into(), "Always zeta".into()),
+                ("note".into(), "plain".into(), String::new()),
+                ("project".into(), "alpha fact".into(), "A".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_project_memories_without_home_is_empty() {
+        let fx = Fixture::new();
+        let ctx = HostCtx {
+            home: None,
+            ..fx.ctx()
+        };
+        let r = serde_json::to_value(get_project_memories(&ctx, "/p".into())).unwrap();
+        assert_eq!(r, json!({"dir": "", "items": []}));
     }
 }

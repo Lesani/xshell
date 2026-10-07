@@ -1,3 +1,4 @@
+use crate::ctx::HostCtx;
 use crate::sessions::{MessagePreview, ProjectInfo, SessionInfo};
 use crate::time::system_time_to_iso;
 use serde::{Deserialize, Serialize};
@@ -7,10 +8,6 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
-
-pub fn get_claude_projects_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
-}
 
 // Mirror Claude Code's encoding of a project path into the directory name under
 // `~/.claude/projects/`. Every non-alphanumeric character collapses to `-` — including
@@ -40,9 +37,10 @@ pub fn session_cache() -> &'static Mutex<HashMap<PathBuf, SessionCacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn stats_path_for(session_id: &str) -> Option<PathBuf> {
+pub fn stats_path_for(ctx: &HostCtx, session_id: &str) -> Option<PathBuf> {
     Some(
-        dirs::home_dir()?
+        ctx.home
+            .clone()?
             .join(".claude")
             .join("xshell-stats")
             .join(format!("{}.json", session_id)),
@@ -54,6 +52,7 @@ pub fn stats_path_for(session_id: &str) -> Option<PathBuf> {
 // parsing at the first such line, which changes behaviour.
 #[allow(clippy::lines_filter_map_ok)]
 pub fn parse_session(
+    ctx: &HostCtx,
     path: &std::path::Path,
     project_name: &str,
     project_path: &str,
@@ -65,7 +64,7 @@ pub fn parse_session(
 
     // Stats-file mtime (sidecar from the xshell-stats statusline hook). May not exist —
     // None is a valid cache key value, so a session without stats stays cached cleanly.
-    let stats_mtime = stats_path_for(&session_id)
+    let stats_mtime = stats_path_for(ctx, &session_id)
         .and_then(|p| fs::metadata(&p).ok())
         .and_then(|m| m.modified().ok());
 
@@ -319,7 +318,7 @@ pub fn parse_session(
     // Code computes cost and context% authoritatively, including system-prompt + tools
     // tokens we can't see in the per-turn `message.usage`. The file is keyed by session id
     // and refreshed every Claude Code refresh tick.
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = ctx.home.clone() {
         let stats_path = home
             .join(".claude")
             .join("xshell-stats")
@@ -453,8 +452,8 @@ pub fn parse_session(
     Some(info)
 }
 
-pub fn list_claude_projects() -> Vec<ProjectInfo> {
-    let projects_dir = match get_claude_projects_dir() {
+pub fn list_claude_projects(ctx: &HostCtx) -> Vec<ProjectInfo> {
+    let projects_dir = match ctx.claude_projects_dir() {
         Some(d) if d.exists() => d,
         _ => return vec![],
     };
@@ -544,11 +543,12 @@ pub fn list_claude_projects() -> Vec<ProjectInfo> {
 // parsing at the first such line, which changes behaviour.
 #[allow(clippy::lines_filter_map_ok)]
 pub fn get_session_messages(
+    ctx: &HostCtx,
     encoded_name: String,
     session_id: String,
     limit: usize,
 ) -> Vec<MessagePreview> {
-    let projects_dir = match get_claude_projects_dir() {
+    let projects_dir = match ctx.claude_projects_dir() {
         Some(d) => d,
         None => return vec![],
     };
@@ -648,8 +648,8 @@ pub fn read_forked_from(path: &std::path::Path) -> Option<String> {
     None
 }
 
-pub fn list_project_session_ids(cwd: String) -> Vec<String> {
-    let projects_dir = match get_claude_projects_dir() {
+pub fn list_project_session_ids(ctx: &HostCtx, cwd: String) -> Vec<String> {
+    let projects_dir = match ctx.claude_projects_dir() {
         Some(d) => d,
         None => return vec![],
     };
@@ -673,12 +673,13 @@ pub fn list_project_session_ids(cwd: String) -> Vec<String> {
 }
 
 pub fn detect_session_branch(
+    ctx: &HostCtx,
     cwd: String,
     current_session_id: String,
     known_session_ids: Vec<String>,
 ) -> Option<BranchInfo> {
     // Project dir derivation mirrors how Claude Code encodes paths (slashes/backslashes/colons → dashes).
-    let projects_dir = get_claude_projects_dir()?;
+    let projects_dir = ctx.claude_projects_dir()?;
     let encoded = encode_project_name(&cwd);
     let project_dir = projects_dir.join(&encoded);
     if !project_dir.exists() {
@@ -715,7 +716,7 @@ pub fn detect_session_branch(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let title = parse_session(&p, &project_name, &cwd)
+                let title = parse_session(ctx, &p, &project_name, &cwd)
                     .map(|s| s.title)
                     .unwrap_or_else(|| format!("Branch {}", &stem[..8.min(stem.len())]));
                 return Some(BranchInfo {
@@ -744,5 +745,375 @@ mod tests {
             "-home-u-CalcApps-Framework"
         );
         assert_eq!(encode_project_name("SSY2_Lab"), "SSY2-Lab");
+    }
+
+    use crate::testutil::Fixture;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    const CWD: &str = "/work/alpha";
+
+    fn session_path(encoded: &str, sid: &str) -> String {
+        format!("home/.claude/projects/{encoded}/{sid}.jsonl")
+    }
+
+    // Write a Claude session JSONL for `CWD` and parse it.
+    fn parse(fx: &Fixture, sid: &str, lines: &[Value]) -> SessionInfo {
+        let p = fx.write_jsonl(session_path(&encode_project_name(CWD), sid), lines);
+        parse_session(&fx.ctx(), &p, "alpha", CWD).expect("parsed")
+    }
+
+    fn user(text: &str) -> Value {
+        json!({"type": "user", "cwd": CWD, "timestamp": "2026-01-02T10:00:00Z",
+               "message": {"role": "user", "content": text}})
+    }
+
+    fn assistant(id: &str, model: &str, ts: &str, usage: Value) -> Value {
+        json!({"type": "assistant", "timestamp": ts,
+               "message": {"id": id, "role": "assistant", "model": model, "usage": usage,
+                           "content": [{"type": "text", "text": "ok"}]}})
+    }
+
+    fn usage(inp: u64, cc: u64, cr: u64, out: u64) -> Value {
+        json!({"input_tokens": inp, "cache_creation_input_tokens": cc,
+               "cache_read_input_tokens": cr, "output_tokens": out})
+    }
+
+    #[test]
+    fn parse_session_title_precedence() {
+        let fx = Fixture::new();
+        let custom = json!({"type": "custom-title", "customTitle": "Custom"});
+        let agent = json!({"type": "agent-name", "agentName": "Agent"});
+        let ai = json!({"type": "ai-title", "aiTitle": "AI"});
+        let prompt = user("first prompt");
+        let all = [prompt.clone(), ai.clone(), agent.clone(), custom];
+        assert_eq!(parse(&fx, "s1-aaaaaaaa", &all).title, "Custom");
+        let no_custom = [prompt.clone(), ai.clone(), agent];
+        assert_eq!(parse(&fx, "s2-aaaaaaaa", &no_custom).title, "Agent");
+        assert_eq!(parse(&fx, "s3-aaaaaaaa", &[prompt.clone(), ai]).title, "AI");
+        assert_eq!(parse(&fx, "s4-aaaaaaaa", &[prompt]).title, "first prompt");
+        let bare = [json!({"type": "permission-mode", "cwd": CWD})];
+        assert_eq!(parse(&fx, "abcdef123456", &bare).title, "Session abcdef12");
+    }
+
+    #[test]
+    fn parse_session_counts_only_real_prompts() {
+        let fx = Fixture::new();
+        let long = "x".repeat(200);
+        let lines = [
+            user(&long),
+            json!({"type": "user", "message": {"role": "user",
+                   "content": [{"type": "text", "text": "text part"}]}}),
+            json!({"type": "user", "toolUseResult": {}, "message": {"role": "user",
+                   "content": [{"type": "tool_result", "content": "out"}]}}),
+            user(""),
+        ];
+        let s = parse(&fx, "count-session", &lines);
+        assert_eq!(s.message_count, 2);
+        assert_eq!(s.tool_use_count, 1);
+        assert_eq!(s.title, "x".repeat(120));
+    }
+
+    #[test]
+    fn parse_session_dedups_usage_by_message_id() {
+        let fx = Fixture::new();
+        let ts = "2026-01-02T10:00:00Z";
+        let lines = [
+            assistant("msg_1", "claude-x", ts, usage(10, 20, 30, 5)),
+            // Same API response split into a second content-block line: same id, same usage.
+            assistant("msg_1", "claude-x", ts, usage(10, 20, 30, 5)),
+            assistant(
+                "msg_2",
+                "claude-x",
+                "2026-01-03T10:00:00Z",
+                usage(1, 2, 3, 4),
+            ),
+        ];
+        let s = parse(&fx, "dedup-session", &lines);
+        assert_eq!(
+            (
+                s.total_input_tokens,
+                s.total_cache_creation_tokens,
+                s.total_cache_read_tokens,
+                s.total_output_tokens
+            ),
+            (11, 22, 33, 9)
+        );
+        assert_eq!(s.daily_tokens["2026-01-02"], [10, 20, 30, 5]);
+        assert_eq!(s.daily_tokens["2026-01-03"], [1, 2, 3, 4]);
+        // Context is the last turn's input side.
+        assert_eq!(s.context_tokens, 6);
+        assert_eq!(s.context_limit, 200_000);
+        assert_eq!(s.timestamp, "2026-01-03T10:00:00Z");
+    }
+
+    #[test]
+    fn parse_session_ignores_synthetic_model() {
+        let fx = Fixture::new();
+        let lines = [
+            assistant(
+                "msg_1",
+                "claude-real",
+                "2026-01-02T10:00:00Z",
+                usage(1, 0, 0, 1),
+            ),
+            assistant(
+                "msg_2",
+                "<synthetic>",
+                "2026-01-02T11:00:00Z",
+                usage(500, 0, 0, 500),
+            ),
+        ];
+        let s = parse(&fx, "synthetic-session", &lines);
+        assert_eq!(s.model, "claude-real");
+        assert_eq!((s.total_input_tokens, s.total_output_tokens), (1, 1));
+        assert_eq!(s.context_tokens, 1);
+    }
+
+    #[test]
+    fn parse_session_detects_1m_context() {
+        let fx = Fixture::new();
+        let lines = [
+            assistant(
+                "m1",
+                "claude-x",
+                "2026-01-02T10:00:00Z",
+                usage(150_000, 0, 60_000, 1),
+            ),
+            assistant(
+                "m2",
+                "claude-x",
+                "2026-01-02T11:00:00Z",
+                usage(1_000, 0, 9_000, 1),
+            ),
+        ];
+        let s = parse(&fx, "big-session", &lines);
+        assert_eq!(s.context_limit, 1_000_000);
+        assert_eq!(s.context_tokens, 10_000);
+    }
+
+    fn sidecar() -> Value {
+        json!({
+            "cost": {"total_cost_usd": 1.5},
+            "context_window": {"context_window_size": 1_000_000, "used_percentage": 10.0,
+                               "current_usage": {"input_tokens": 1}},
+            "model": {"id": "claude-opus-x", "display_name": "Opus X"},
+            "rate_limits": {"five_hour": {"used_percentage": 12.0},
+                            "seven_day": {"used_percentage": 34.0}},
+            "xshell_daily_cost": {"2026-01-02": 0.5}
+        })
+    }
+
+    #[test]
+    fn parse_session_overlays_xshell_stats() {
+        let fx = Fixture::new();
+        fx.write(
+            "home/.claude/xshell-stats/stats-session.json",
+            sidecar().to_string(),
+        );
+        let lines = [assistant(
+            "m1",
+            "claude-x",
+            "2026-01-02T10:00:00Z",
+            usage(5, 0, 0, 1),
+        )];
+        let s = parse(&fx, "stats-session", &lines);
+        assert!(s.is_authoritative_stats);
+        assert_eq!(s.cost_usd, 1.5);
+        assert_eq!(s.context_limit, 1_000_000);
+        assert_eq!(s.context_tokens, 100_000);
+        assert_eq!(s.model, "Opus X");
+        assert_eq!(s.rate_limit_5h_pct, Some(12.0));
+        assert_eq!(s.rate_limit_7d_pct, Some(34.0));
+        assert_eq!(s.daily_cost.get("2026-01-02"), Some(&0.5));
+    }
+
+    #[test]
+    fn parse_session_cache_refreshes_when_stats_sidecar_appears() {
+        let fx = Fixture::new();
+        let lines = [assistant(
+            "m1",
+            "claude-x",
+            "2026-01-02T10:00:00Z",
+            usage(5, 0, 0, 1),
+        )];
+        let first = parse(&fx, "late-stats", &lines);
+        assert!(!first.is_authoritative_stats);
+        assert_eq!(first.cost_usd, 0.0);
+        // The JSONL is unchanged; only the sidecar appears, which changes the cache key.
+        fx.write(
+            "home/.claude/xshell-stats/late-stats.json",
+            sidecar().to_string(),
+        );
+        let p = fx
+            .home()
+            .join(".claude/projects/-work-alpha/late-stats.jsonl");
+        let second = parse_session(&fx.ctx(), &p, "alpha", CWD).unwrap();
+        assert!(second.is_authoritative_stats);
+        assert_eq!(second.cost_usd, 1.5);
+    }
+
+    #[test]
+    fn list_claude_projects_reads_cwd_counts_and_sorts() {
+        let fx = Fixture::new();
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let alpha = |sid: &str| {
+            fx.write_jsonl(
+                session_path("-work-alpha", sid),
+                &[
+                    json!({"type": "permission-mode"}),
+                    json!({"cwd": "/work/alpha"}),
+                ],
+            )
+        };
+        let a1 = alpha("a1");
+        let a2 = alpha("a2");
+        let b1 = fx.write_jsonl(
+            session_path("-work-beta", "b1"),
+            &[json!({"cwd": "/work/beta"})],
+        );
+        fx.set_mtime(&a1, at(1_700_000_000));
+        fx.set_mtime(&a2, at(1_700_000_100));
+        fx.set_mtime(&b1, at(1_800_000_000));
+        // Skipped: a project dir whose JSONL has no cwd, and one with no JSONL at all.
+        fx.write_jsonl(session_path("-no-cwd", "x"), &[json!({"type": "user"})]);
+        fx.write("home/.claude/projects/-no-jsonl/notes.txt", "x");
+
+        let projects = list_claude_projects(&fx.ctx());
+        let got: Vec<(&str, &str, &str, usize)> = projects
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.path.as_str(),
+                    p.encoded_name.as_str(),
+                    p.session_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("beta", "/work/beta", "-work-beta", 1),
+                ("alpha", "/work/alpha", "-work-alpha", 2),
+            ]
+        );
+        assert_eq!(
+            projects[0].last_active,
+            system_time_to_iso(at(1_800_000_000))
+        );
+        assert_eq!(
+            projects[1].last_active,
+            system_time_to_iso(at(1_700_000_100))
+        );
+    }
+
+    #[test]
+    fn list_claude_projects_is_empty_without_home() {
+        let fx = Fixture::new();
+        fx.write_jsonl(session_path("-work-alpha", "a1"), &[json!({"cwd": CWD})]);
+        let ctx = HostCtx {
+            home: None,
+            ..fx.ctx()
+        };
+        assert!(list_claude_projects(&ctx).is_empty());
+        assert_eq!(list_claude_projects(&fx.ctx()).len(), 1);
+    }
+
+    #[test]
+    fn get_session_messages_returns_last_n_text_messages() {
+        let fx = Fixture::new();
+        let long = "y".repeat(300);
+        fx.write_jsonl(
+            session_path("-work-alpha", "msgs"),
+            &[
+                user("one"),
+                json!({"type": "assistant", "message": {"role": "assistant",
+                       "content": [{"type": "text", "text": "two"}]}}),
+                // No text part: skipped.
+                json!({"type": "assistant", "message": {"role": "assistant",
+                       "content": [{"type": "tool_use", "name": "Bash"}]}}),
+                json!({"type": "summary", "message": {"role": "user", "content": "ignored"}}),
+                user(&long),
+            ],
+        );
+        let ctx = fx.ctx();
+        let got = get_session_messages(&ctx, "-work-alpha".into(), "msgs".into(), 2);
+        let got: Vec<(&str, String)> = got
+            .iter()
+            .map(|m| (m.role.as_str(), m.text.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("assistant", "two".to_string()), ("user", "y".repeat(200))]
+        );
+        let all = get_session_messages(&ctx, "-work-alpha".into(), "msgs".into(), 10);
+        assert_eq!(all.len(), 3);
+        assert!(get_session_messages(&ctx, "-work-alpha".into(), "missing".into(), 10).is_empty());
+    }
+
+    #[test]
+    fn list_project_session_ids_lists_jsonl_stems() {
+        let fx = Fixture::new();
+        fx.write_jsonl(session_path("-work-alpha", "s-b"), &[]);
+        fx.write_jsonl(session_path("-work-alpha", "s-a"), &[]);
+        fx.write("home/.claude/projects/-work-alpha/notes.txt", "x");
+        let mut ids = list_project_session_ids(&fx.ctx(), CWD.into());
+        ids.sort();
+        assert_eq!(ids, vec!["s-a", "s-b"]);
+        assert!(list_project_session_ids(&fx.ctx(), "/work/none".into()).is_empty());
+    }
+
+    fn fork_of(parent: &str) -> Value {
+        json!({"type": "user", "forkedFrom": {"sessionId": parent}, "cwd": CWD,
+               "timestamp": "2026-01-02T10:00:00Z",
+               "message": {"role": "user", "content": "branched prompt"}})
+    }
+
+    #[test]
+    fn detect_session_branch_finds_new_fork() {
+        let fx = Fixture::new();
+        fx.write_jsonl(session_path("-work-alpha", "parent-01"), &[user("hi")]);
+        fx.write_jsonl(
+            session_path("-work-alpha", "child-001"),
+            &[
+                fork_of("parent-01"),
+                json!({"type": "custom-title", "customTitle": "My branch"}),
+            ],
+        );
+        let got = detect_session_branch(
+            &fx.ctx(),
+            CWD.into(),
+            "parent-01".into(),
+            vec!["parent-01".into()],
+        )
+        .expect("branch found");
+        assert_eq!(got.new_session_id, "child-001");
+        assert_eq!(got.title, "My branch");
+    }
+
+    #[test]
+    fn detect_session_branch_ignores_known_and_unrelated() {
+        let fx = Fixture::new();
+        fx.write_jsonl(session_path("-work-alpha", "parent-01"), &[user("hi")]);
+        // A fork of ours that already existed when the tab started.
+        fx.write_jsonl(
+            session_path("-work-alpha", "known-001"),
+            &[fork_of("parent-01")],
+        );
+        // A new fork, but of a different session.
+        fx.write_jsonl(
+            session_path("-work-alpha", "other-001"),
+            &[fork_of("someone-else")],
+        );
+        // A new session that is not a fork at all.
+        fx.write_jsonl(session_path("-work-alpha", "plain-001"), &[user("x")]);
+        let got = detect_session_branch(
+            &fx.ctx(),
+            CWD.into(),
+            "parent-01".into(),
+            vec!["parent-01".into(), "known-001".into()],
+        );
+        assert!(got.is_none());
     }
 }

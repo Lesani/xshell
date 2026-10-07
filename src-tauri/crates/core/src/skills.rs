@@ -1,3 +1,4 @@
+use crate::ctx::HostCtx;
 use crate::paths::paths_equal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -468,7 +469,7 @@ pub fn parse_plugin_key(key: &str) -> (String, Option<String>) {
     }
 }
 
-pub fn get_project_skills(project_path: String) -> ProjectSkills {
+pub fn get_project_skills(ctx: &HostCtx, project_path: String) -> ProjectSkills {
     let empty = || ProjectSkills {
         personal_skills: vec![],
         project_skills: vec![],
@@ -481,7 +482,7 @@ pub fn get_project_skills(project_path: String) -> ProjectSkills {
         claude_md_files: vec![],
         settings_sources: vec![],
     };
-    let home = match dirs::home_dir() {
+    let home = match ctx.home.clone() {
         Some(h) => h,
         None => return empty(),
     };
@@ -673,5 +674,245 @@ pub fn get_project_skills(project_path: String) -> ProjectSkills {
         hooks,
         claude_md_files,
         settings_sources,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::testutil::Fixture;
+    use serde_json::json;
+
+    fn names<T>(v: &[T], f: impl Fn(&T) -> String) -> Vec<String> {
+        v.iter().map(f).collect()
+    }
+
+    #[test]
+    fn parse_skill_description_prefers_frontmatter_then_h1() {
+        let fx = Fixture::new();
+        let fm = fx.write(
+            "a.md",
+            "---\nname: x\ndescription: \"From frontmatter\"\n---\n# Heading\n",
+        );
+        let h1 = fx.write("b.md", "---\nname: y\n---\nintro\n# The heading \n");
+        let empty_fm = fx.write("c.md", "---\ndescription:\n---\n# Fallback\n");
+        let none = fx.write("d.md", "no heading here\n## not h1\n");
+        assert_eq!(
+            parse_skill_description(&fm).as_deref(),
+            Some("From frontmatter")
+        );
+        assert_eq!(parse_skill_description(&h1).as_deref(), Some("The heading"));
+        assert_eq!(
+            parse_skill_description(&empty_fm).as_deref(),
+            Some("Fallback")
+        );
+        assert_eq!(parse_skill_description(&none), None);
+        assert_eq!(
+            parse_skill_description(&fx.dir.path().join("missing.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn get_project_skills_full_tree() {
+        let fx = Fixture::new();
+        let home = fx.home();
+        let proj = fx.dir.path().join("proj");
+        let proj_s = proj.to_string_lossy().to_string();
+        let plugins_root = fx.dir.path().join("plugins");
+
+        // Personal and project skills.
+        fx.write(
+            "home/.claude/skills/alpha/SKILL.md",
+            "---\ndescription: Alpha skill\n---\n",
+        );
+        fx.write("home/.claude/skills/not-a-skill/README.md", "x");
+        fx.write("proj/.claude/skills/beta/SKILL.md", "# Beta skill\n");
+
+        // Plugins: a user-scope one (enabled, manifest overrides name/version), a local-scope
+        // one for this project (enabled via settings.local.json, which beats settings.json),
+        // a local-scope one for another project (filtered out) and a disabled user one.
+        let userp = plugins_root.join("userp");
+        let localp = plugins_root.join("localp");
+        let offp = plugins_root.join("offp");
+        fx.write(
+            "plugins/userp/.claude-plugin/plugin.json",
+            json!({"name": "User Plugin", "version": "2.0", "description": "Manifest desc"})
+                .to_string(),
+        );
+        fx.write("plugins/userp/skills/s1/SKILL.md", "# Plugin skill\n");
+        fx.write(
+            "plugins/userp/.mcp.json",
+            json!({"mcpServers": {"pm": {"command": "pm-server"}}}).to_string(),
+        );
+        fx.write(
+            "home/.claude/plugins/installed_plugins.json",
+            json!({"plugins": {
+                "userp@mk": [{"scope": "user", "installPath": userp, "version": "1.0"}],
+                "localp@mk": [
+                    {"scope": "local", "projectPath": proj_s, "installPath": localp, "version": "0.1"},
+                    {"scope": "local", "projectPath": "/somewhere/else", "installPath": "/x"}
+                ],
+                "offp": [{"scope": "user", "installPath": offp}]
+            }})
+            .to_string(),
+        );
+        fx.write(
+            "home/.claude/settings.json",
+            json!({
+                "enabledPlugins": {"userp@mk": true, "offp": false},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}]}
+            })
+            .to_string(),
+        );
+        fx.write(
+            "proj/.claude/settings.local.json",
+            json!({
+                "enabledPlugins": {"localp@mk": true},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "local-stop"}]}]}
+            })
+            .to_string(),
+        );
+        fx.write(
+            "proj/.claude/settings.json",
+            json!({
+                "enabledPlugins": {"localp@mk": false},
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "proj-pre"},
+                    {"type": "command", "command": ""}
+                ]}]}
+            })
+            .to_string(),
+        );
+
+        // ~/.claude.json MCP servers: user-level and per-project.
+        fx.write(
+            "home/.claude.json",
+            json!({
+                "mcpServers": {"web": {"url": "http://x"}, "Aaa": {"command": "c"}, "s": {"type": "sse"}},
+                "projects": {
+                    proj_s.clone(): {"mcpServers": {"p1": {"command": "y"}}},
+                    "/somewhere/else": {"mcpServers": {"other": {"command": "z"}}}
+                }
+            })
+            .to_string(),
+        );
+
+        // Subagents and slash commands (namespaced).
+        fx.write(
+            "proj/.claude/agents/reviewer.md",
+            "---\ndescription: Reviews\n---\n",
+        );
+        fx.write("home/.claude/agents/helper.md", "# Helps\n");
+        fx.write("proj/.claude/commands/git/commit.md", "# Commit\n");
+        fx.write("home/.claude/commands/hello.md", "hi\n");
+
+        // CLAUDE.md files: root, nested, skipped vendor dir, user.
+        fx.write("proj/CLAUDE.md", "root");
+        fx.write("proj/sub/CLAUDE.md", "nested");
+        fx.write("proj/node_modules/x/CLAUDE.md", "vendored");
+        fx.write("home/.claude/CLAUDE.md", "user");
+
+        let r = get_project_skills(&fx.ctx(), proj_s.clone());
+
+        assert_eq!(names(&r.personal_skills, |s| s.name.clone()), ["alpha"]);
+        assert_eq!(r.personal_skills[0].scope, "personal");
+        assert_eq!(
+            r.personal_skills[0].description.as_deref(),
+            Some("Alpha skill")
+        );
+        assert_eq!(names(&r.project_skills, |s| s.name.clone()), ["beta"]);
+        assert_eq!(
+            r.project_skills[0].description.as_deref(),
+            Some("Beta skill")
+        );
+
+        // Enabled first, alphabetical (case-insensitive) within each group.
+        assert_eq!(
+            names(&r.plugins, |p| p.name.clone()),
+            ["localp", "User Plugin", "offp"]
+        );
+        let (local, user, off) = (&r.plugins[0], &r.plugins[1], &r.plugins[2]);
+        assert!(local.enabled && local.scope == "local");
+        assert_eq!(local.version.as_deref(), Some("0.1"));
+        assert_eq!(local.marketplace.as_deref(), Some("mk"));
+        assert!(user.enabled && user.scope == "user");
+        assert_eq!(user.version.as_deref(), Some("2.0"));
+        assert_eq!(user.description.as_deref(), Some("Manifest desc"));
+        assert_eq!(names(&user.skills, |s| s.name.clone()), ["s1"]);
+        assert_eq!(user.skills[0].scope, "plugin");
+        assert_eq!(
+            names(&user.mcps, |m| format!(
+                "{}:{}:{}",
+                m.name, m.kind, m.source
+            )),
+            ["pm:stdio:plugin"]
+        );
+        assert!(!off.enabled);
+        assert_eq!(off.marketplace, None);
+
+        assert_eq!(
+            names(&r.user_mcps, |m| format!(
+                "{}:{}:{}",
+                m.name, m.kind, m.source
+            )),
+            ["Aaa:stdio:user", "s:sse:user", "web:http:user"]
+        );
+        assert_eq!(
+            names(&r.project_mcps, |m| format!(
+                "{}:{}:{}",
+                m.name, m.kind, m.source
+            )),
+            ["p1:stdio:project"]
+        );
+
+        assert_eq!(
+            names(&r.subagents, |a| format!("{}:{}", a.name, a.scope)),
+            ["reviewer:project", "helper:user"]
+        );
+        assert_eq!(r.subagents[0].description.as_deref(), Some("Reviews"));
+        assert_eq!(
+            names(&r.slash_commands, |c| format!("{}:{}", c.name, c.scope)),
+            ["git/commit:project", "hello:user"]
+        );
+
+        // Hooks: local, then project, then user; empty commands are dropped.
+        assert_eq!(
+            names(&r.hooks, |h| format!(
+                "{}:{}:{}:{}",
+                h.source,
+                h.event,
+                h.matcher.clone().unwrap_or_default(),
+                h.command
+            )),
+            [
+                "local:Stop::local-stop",
+                "project:PreToolUse:Bash:proj-pre",
+                "user:Stop::user-stop"
+            ]
+        );
+
+        // Root CLAUDE.md first, user CLAUDE.md last, vendor dirs skipped.
+        assert_eq!(
+            names(&r.claude_md_files, |f| format!(
+                "{}:{}",
+                f.scope, f.rel_path
+            )),
+            [
+                "project-root:CLAUDE.md",
+                "project-nested:sub/CLAUDE.md",
+                "user:~/.claude/CLAUDE.md"
+            ]
+        );
+
+        assert_eq!(
+            names(&r.settings_sources, |s| format!("{}:{}", s.scope, s.exists)),
+            ["local:true", "project:true", "user:true"]
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&r.settings_sources[2].path),
+            home.join(".claude").join("settings.json")
+        );
     }
 }

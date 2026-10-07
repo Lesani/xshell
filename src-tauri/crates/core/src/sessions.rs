@@ -1,6 +1,7 @@
 use crate::antigravity::parse_antigravity_sessions;
-use crate::claude::{encode_project_name, get_claude_projects_dir, parse_session};
+use crate::claude::{encode_project_name, parse_session};
 use crate::codex::{codex_rollout_files, codex_session_names, parse_codex_session};
+use crate::ctx::HostCtx;
 use crate::cursor::{cursor_chat_dirs, cursor_workspace_map, parse_cursor_session};
 use crate::opencode::parse_opencode_sessions;
 use serde::{Deserialize, Serialize};
@@ -61,12 +62,12 @@ pub struct SessionInfo {
     pub agent: String,
 }
 
-pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
+pub fn get_sessions(ctx: &HostCtx, encoded_name: String) -> Vec<SessionInfo> {
     let mut sessions: Vec<SessionInfo> = vec![];
 
     // Claude sessions live under ~/.claude/projects/<encoded_name>/. A project can be
     // Codex-only (no such directory) — that must not short-circuit the Codex pass below.
-    if let Some(project_dir) = get_claude_projects_dir().map(|d| d.join(&encoded_name)) {
+    if let Some(project_dir) = ctx.claude_projects_dir().map(|d| d.join(&encoded_name)) {
         if project_dir.exists() {
             // Get project path from first JSONL
             let mut project_path = String::new();
@@ -111,7 +112,7 @@ pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
                         if p.extension().is_none_or(|ext| ext != "jsonl") {
                             return None;
                         }
-                        parse_session(&p, &project_name, &project_path)
+                        parse_session(ctx, &p, &project_name, &project_path)
                     }),
             );
         }
@@ -119,8 +120,8 @@ pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
 
     // Codex sessions have no per-project directory — match rollouts whose recorded cwd
     // encodes to the same project directory name Claude would use.
-    let codex_names = codex_session_names();
-    for p in codex_rollout_files() {
+    let codex_names = codex_session_names(ctx);
+    for p in codex_rollout_files(ctx) {
         if let Some(s) = parse_codex_session(&p, &codex_names) {
             if encode_project_name(&s.project_path) == encoded_name {
                 sessions.push(s);
@@ -129,8 +130,8 @@ pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
     }
 
     // Cursor chats — same approach: resolve each chat's cwd, then match by encoded name.
-    let cursor_ws = cursor_workspace_map();
-    for dir in cursor_chat_dirs() {
+    let cursor_ws = cursor_workspace_map(ctx);
+    for dir in cursor_chat_dirs(ctx) {
         if let Some(s) = parse_cursor_session(&dir, &cursor_ws) {
             if !s.project_path.is_empty() && encode_project_name(&s.project_path) == encoded_name {
                 sessions.push(s);
@@ -140,14 +141,14 @@ pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
 
     // opencode sessions — each row records its cwd directly; match by encoded name.
     sessions.extend(
-        parse_opencode_sessions()
+        parse_opencode_sessions(ctx)
             .into_iter()
             .filter(|s| encode_project_name(&s.project_path) == encoded_name),
     );
 
     // Antigravity conversations — workspace-scoped by design; match by encoded name.
     sessions.extend(
-        parse_antigravity_sessions()
+        parse_antigravity_sessions(ctx)
             .into_iter()
             .filter(|s| encode_project_name(&s.project_path) == encoded_name),
     );
@@ -156,12 +157,12 @@ pub fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
     sessions
 }
 
-pub fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
+pub fn get_all_recent_sessions(ctx: &HostCtx, limit: usize) -> Vec<SessionInfo> {
     let mut all_sessions: Vec<SessionInfo> = vec![];
 
     // A machine can have Codex sessions but no ~/.claude/projects (or vice versa) — each
     // agent's pass is independent.
-    let projects_dir = get_claude_projects_dir().filter(|d| d.exists());
+    let projects_dir = ctx.claude_projects_dir().filter(|d| d.exists());
     for entry in projects_dir
         .iter()
         .flat_map(|d| fs::read_dir(d).ok().into_iter().flatten().flatten())
@@ -218,33 +219,33 @@ pub fn get_all_recent_sessions(limit: usize) -> Vec<SessionInfo> {
             if p.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
-            if let Some(session) = parse_session(&p, &project_name, &project_path) {
+            if let Some(session) = parse_session(ctx, &p, &project_name, &project_path) {
                 all_sessions.push(session);
             }
         }
     }
 
     // Codex sessions across all directories — same recency pool as the Claude ones.
-    let codex_names = codex_session_names();
+    let codex_names = codex_session_names(ctx);
     all_sessions.extend(
-        codex_rollout_files()
+        codex_rollout_files(ctx)
             .iter()
             .filter_map(|p| parse_codex_session(p, &codex_names)),
     );
 
     // Cursor chats across all workspaces — same recency pool.
-    let cursor_ws = cursor_workspace_map();
+    let cursor_ws = cursor_workspace_map(ctx);
     all_sessions.extend(
-        cursor_chat_dirs()
+        cursor_chat_dirs(ctx)
             .iter()
             .filter_map(|d| parse_cursor_session(d, &cursor_ws)),
     );
 
     // opencode sessions across all directories — same recency pool.
-    all_sessions.extend(parse_opencode_sessions());
+    all_sessions.extend(parse_opencode_sessions(ctx));
 
     // Antigravity conversations across all workspaces — same recency pool.
-    all_sessions.extend(parse_antigravity_sessions());
+    all_sessions.extend(parse_antigravity_sessions(ctx));
 
     all_sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     all_sessions.truncate(limit);
@@ -268,4 +269,106 @@ pub struct CodexProjectInfo {
     pub path: String,
     pub session_count: usize,
     pub last_active: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::Fixture;
+    use serde_json::json;
+
+    fn claude_session(fx: &Fixture, cwd: &str, sid: &str, ts: &str) {
+        fx.write_jsonl(
+            format!(
+                "home/.claude/projects/{}/{sid}.jsonl",
+                encode_project_name(cwd)
+            ),
+            &[json!({"type": "user", "cwd": cwd, "timestamp": ts,
+                     "message": {"role": "user", "content": format!("prompt {sid}")}})],
+        );
+    }
+
+    fn codex_session(fx: &Fixture, cwd: &str, sid: &str, ts: &str) {
+        fx.write_jsonl(
+            format!("home/.codex/sessions/2026/01/02/rollout-{sid}.jsonl"),
+            &[
+                json!({"type": "session_meta", "timestamp": ts,
+                       "payload": {"id": sid, "cwd": cwd, "cli_version": "0.1"}}),
+                json!({"type": "event_msg", "timestamp": ts,
+                       "payload": {"type": "user_message", "message": "codex prompt"}}),
+            ],
+        );
+    }
+
+    // opencode.db with the two tables parse_opencode_sessions reads.
+    fn opencode_db(fx: &Fixture, rows: &[(&str, &str, i64)]) {
+        let dir = fx.home().join(".local/share/opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT, title TEXT, directory TEXT, model TEXT, \
+             version TEXT, time_created INTEGER, time_updated INTEGER, tokens_input INTEGER, \
+             tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, \
+             tokens_cache_write INTEGER, parent_id TEXT, time_archived INTEGER);
+             CREATE TABLE message (session_id TEXT, data TEXT, time_created INTEGER);",
+        )
+        .unwrap();
+        for (id, dir, updated_ms) in rows {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, 'oc title', ?2, NULL, '1.0', ?3, ?3, 0, 0, 0, 0, 0, NULL, NULL)",
+                rusqlite::params![id, dir, updated_ms],
+            )
+            .unwrap();
+        }
+    }
+
+    fn ids(sessions: &[SessionInfo]) -> Vec<(&str, &str)> {
+        sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.agent.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn get_sessions_merges_agents_for_encoded_name() {
+        let fx = Fixture::new();
+        let cwd = "/work/alpha";
+        claude_session(&fx, cwd, "claude-1", "2026-01-02T10:00:00Z");
+        claude_session(&fx, "/work/beta", "claude-other", "2026-01-09T10:00:00Z");
+        codex_session(&fx, cwd, "codex-1", "2026-01-04T10:00:00Z");
+        codex_session(&fx, "/work/beta", "codex-other", "2026-01-08T10:00:00Z");
+        // 2026-01-03T00:00:00Z and 2026-01-07T00:00:00Z in unix ms.
+        opencode_db(
+            &fx,
+            &[
+                ("oc-1", cwd, 1_767_398_400_000),
+                ("oc-other", "/work/beta", 1_767_744_000_000),
+            ],
+        );
+        let got = get_sessions(&fx.ctx(), encode_project_name(cwd));
+        assert_eq!(
+            ids(&got),
+            vec![
+                ("codex-1", "codex"),
+                ("oc-1", "opencode"),
+                ("claude-1", "claude")
+            ]
+        );
+        assert_eq!(got[1].timestamp, "2026-01-03T00:00:00Z");
+    }
+
+    #[test]
+    fn get_all_recent_sessions_truncates_to_limit() {
+        let fx = Fixture::new();
+        claude_session(&fx, "/work/alpha", "s-old", "2026-01-01T10:00:00Z");
+        claude_session(&fx, "/work/alpha", "s-mid", "2026-01-02T10:00:00Z");
+        claude_session(&fx, "/work/beta", "s-new", "2026-01-03T10:00:00Z");
+        codex_session(&fx, "/work/gamma", "codex-x", "2026-01-02T12:00:00Z");
+        let ctx = fx.ctx();
+        assert_eq!(
+            ids(&get_all_recent_sessions(&ctx, 2)),
+            vec![("s-new", "claude"), ("codex-x", "codex")]
+        );
+        assert_eq!(get_all_recent_sessions(&ctx, 100).len(), 4);
+    }
 }

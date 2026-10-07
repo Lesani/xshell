@@ -32,7 +32,6 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-dirs = { workspace = true }
 portable-pty = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 xshell-core = { path = "crates/core" }

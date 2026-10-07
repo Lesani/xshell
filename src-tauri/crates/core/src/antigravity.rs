@@ -1,4 +1,5 @@
 use crate::agent_context::{AgentContextItem, AgentContextSection};
+use crate::ctx::HostCtx;
 use crate::sessions::{CodexProjectInfo, SessionInfo};
 use crate::time::system_time_to_iso;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,10 @@ use std::path::PathBuf;
 // previews). Antigravity persists no token/cost/rate-limit data locally (usage is cloud-side
 // "AI Credits"), so those stay zero and the context bar stays hidden.
 
-pub fn antigravity_data_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".gemini").join("antigravity-cli"))
+pub fn antigravity_data_dir(ctx: &HostCtx) -> Option<PathBuf> {
+    ctx.home
+        .clone()
+        .map(|h| h.join(".gemini").join("antigravity-cli"))
 }
 
 // Printable UTF-8 runs from a protobuf blob. Bytes 0x20..0x7E plus complete, valid multi-byte
@@ -77,9 +80,9 @@ pub fn strip_len_prefix(run: &str) -> &str {
 
 // Title/preview overlay from cache/conversation_metadata.json: id → display name.
 // Precedence within a summary: user rename (Title) > generated preview.
-pub fn antigravity_conversation_names() -> HashMap<String, String> {
+pub fn antigravity_conversation_names(ctx: &HostCtx) -> HashMap<String, String> {
     let mut names = HashMap::new();
-    let Some(dir) = antigravity_data_dir() else {
+    let Some(dir) = antigravity_data_dir(ctx) else {
         return names;
     };
     let Ok(content) = fs::read_to_string(dir.join("cache").join("conversation_metadata.json"))
@@ -265,11 +268,11 @@ pub fn parse_antigravity_conversation(
     })
 }
 
-pub fn parse_antigravity_sessions() -> Vec<SessionInfo> {
-    let Some(dir) = antigravity_data_dir().map(|d| d.join("conversations")) else {
+pub fn parse_antigravity_sessions(ctx: &HostCtx) -> Vec<SessionInfo> {
+    let Some(dir) = antigravity_data_dir(ctx).map(|d| d.join("conversations")) else {
         return vec![];
     };
-    let names = antigravity_conversation_names();
+    let names = antigravity_conversation_names(ctx);
     fs::read_dir(&dir)
         .ok()
         .into_iter()
@@ -282,9 +285,9 @@ pub fn parse_antigravity_sessions() -> Vec<SessionInfo> {
 }
 
 // Directories Antigravity has been used in — for the Add Projects picker's per-agent marks.
-pub fn list_antigravity_projects() -> Vec<CodexProjectInfo> {
+pub fn list_antigravity_projects(ctx: &HostCtx) -> Vec<CodexProjectInfo> {
     let mut by_cwd: HashMap<String, (usize, String)> = HashMap::new();
-    for s in parse_antigravity_sessions() {
+    for s in parse_antigravity_sessions(ctx) {
         let slot = by_cwd.entry(s.project_path).or_insert((0, String::new()));
         slot.0 += 1;
         if s.timestamp > slot.1 {
@@ -315,10 +318,10 @@ pub struct AntigravityContext {
     pub sections: Vec<AgentContextSection>,
 }
 
-pub fn get_antigravity_context(project_path: String) -> AntigravityContext {
+pub fn get_antigravity_context(ctx: &HostCtx, project_path: String) -> AntigravityContext {
     let pp = std::path::Path::new(&project_path);
-    let home = dirs::home_dir();
-    let data_dir = antigravity_data_dir();
+    let home = ctx.home.clone();
+    let data_dir = antigravity_data_dir(ctx);
     let mut sections: Vec<AgentContextSection> = vec![];
 
     // Markdown files under a directory tree (skills and rules folders allow nesting).
@@ -471,5 +474,171 @@ pub fn get_antigravity_context(project_path: String) -> AntigravityContext {
     AntigravityContext {
         present: !sections.is_empty(),
         sections,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::Fixture;
+
+    // A length-delimited protobuf string field: tag byte, length byte, payload.
+    fn field(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag, payload.len() as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    // A conversation DB with the three tables the parser reads. `prompts` are (idx, payload)
+    // rows of step_type 14.
+    fn write_conversation(path: &std::path::Path, cwd_uri: &str, prompts: &[(i64, Vec<u8>)]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);
+             CREATE TABLE steps (idx INTEGER, step_type INTEGER, step_payload BLOB);
+             CREATE TABLE executor_metadata (data BLOB);",
+        )
+        .unwrap();
+        let mut meta = field(0x0a, b"\x01\x02");
+        meta.extend(field(0x12, cwd_uri.as_bytes()));
+        meta.extend(field(0x1a, b"other"));
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob VALUES ('main', ?1)",
+            [meta],
+        )
+        .unwrap();
+        for (idx, payload) in prompts {
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, 14, ?2)",
+                rusqlite::params![idx, payload],
+            )
+            .unwrap();
+        }
+        // A non-prompt step.
+        conn.execute(
+            "INSERT INTO steps VALUES (0, 15, ?1)",
+            [field(0x0a, b"tool output text")],
+        )
+        .unwrap();
+        let mut exec = field(0x0a, b"runs on gemini-3 family");
+        exec.extend(field(0x12, b"gemini-3.5-flash-low"));
+        exec.push(0xff);
+        conn.execute("INSERT INTO executor_metadata VALUES (?1)", [exec])
+            .unwrap();
+    }
+
+    #[test]
+    fn printable_runs_keeps_valid_utf8_and_splits_on_wire_bytes() {
+        let mut data = b"\x0a\x05hello\x12".to_vec();
+        data.extend_from_slice("grüße".as_bytes());
+        // A truncated multi-byte lead (0xC3 with no continuation byte) ends the run.
+        data.extend_from_slice(b"\x00ab\x1aworld\xc3");
+        data.extend_from_slice(b"tail");
+        assert_eq!(
+            printable_runs(&data, 3),
+            vec!["hello", "grüße", "world", "tail"]
+        );
+        // Runs shorter than min_len are dropped ("ab" here, and "tail" at min 5).
+        assert_eq!(printable_runs(&data, 5), vec!["hello", "grüße", "world"]);
+        assert!(printable_runs(b"\x00\x01\x02", 1).is_empty());
+    }
+
+    #[test]
+    fn strip_len_prefix_removes_matching_length_byte() {
+        // '(' is 40: the remaining 40 bytes are the string.
+        let s = "Refactor the parser into smaller modules";
+        assert_eq!(s.len(), 40);
+        let run = format!("({}", s);
+        assert_eq!(strip_len_prefix(&run), s);
+        // First byte does not match the remaining length: untouched.
+        assert_eq!(strip_len_prefix("(short"), "(short");
+        assert_eq!(strip_len_prefix("abc"), "abc");
+        assert_eq!(strip_len_prefix(""), "");
+    }
+
+    #[test]
+    fn parse_antigravity_conversation_extracts_cwd_prompt_model() {
+        let f = Fixture::new();
+        let prompt = "Refactor the parser into smaller modules";
+        // Noise run with '$' (a UUID reference) first, then the prompt with a printable
+        // length prefix ('(' == 40).
+        let mut first = field(0x0a, b"ref$1234-5678$abcd");
+        first.extend(field(0x12, prompt.as_bytes()));
+        let second = field(0x12, b"a later prompt");
+        let db = f
+            .home()
+            .join(".gemini/antigravity-cli/conversations/conv-1234-abcd.db");
+        write_conversation(&db, "file:///home/u/my%20proj", &[(2, second), (1, first)]);
+
+        let s = parse_antigravity_conversation(&db, &HashMap::new()).expect("session");
+        assert_eq!(s.id, "conv-1234-abcd");
+        let expected_cwd = if cfg!(windows) {
+            "home\\u\\my proj"
+        } else {
+            "/home/u/my proj"
+        };
+        assert_eq!(s.project_path, expected_cwd);
+        assert_eq!(s.project_name, "my proj");
+        assert_eq!(s.title, prompt);
+        assert_eq!(s.message_count, 2);
+        // The longest known-family match wins over the shorter mention.
+        assert_eq!(s.model, "gemini-3.5-flash-low");
+        assert_eq!(s.agent, "antigravity");
+        assert!(!s.is_authoritative_stats);
+
+        // A name from conversation_metadata.json overrides the prompt.
+        let names = HashMap::from([("conv-1234-abcd".to_string(), "Renamed".to_string())]);
+        assert_eq!(
+            parse_antigravity_conversation(&db, &names).unwrap().title,
+            "Renamed"
+        );
+    }
+
+    #[test]
+    fn parse_antigravity_skips_conversations_without_prompts() {
+        let f = Fixture::new();
+        let dir = f.home().join(".gemini/antigravity-cli/conversations");
+        write_conversation(&dir.join("empty.db"), "file:///work/p", &[]);
+        write_conversation(
+            &dir.join("full.db"),
+            "file:///work/p",
+            &[(1, field(0x12, b"do the thing"))],
+        );
+        f.write("home/.gemini/antigravity-cli/conversations/notes.txt", "x");
+
+        assert!(parse_antigravity_conversation(&dir.join("empty.db"), &HashMap::new()).is_none());
+        let sessions = parse_antigravity_sessions(&f.ctx());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "full");
+        assert_eq!(sessions[0].title, "do the thing");
+
+        let projects = list_antigravity_projects(&f.ctx());
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(projects[0].path, sessions[0].project_path);
+    }
+
+    #[test]
+    fn antigravity_names_prefer_title_over_preview() {
+        let f = Fixture::new();
+        f.write(
+            "home/.gemini/antigravity-cli/cache/conversation_metadata.json",
+            serde_json::json!({"conversations": {
+                "a": {"summary": {"Title": "Renamed", "Preview": "preview a"}},
+                "b": {"summary": {"Title": "  ", "Preview": "preview b"}},
+                "c": {"summary": {}},
+                "d": {},
+            }})
+            .to_string(),
+        );
+        let names = antigravity_conversation_names(&f.ctx());
+        let mut got: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![("a", "Renamed"), ("b", "preview b")]);
+        assert!(antigravity_conversation_names(&Fixture::new().ctx()).is_empty());
     }
 }

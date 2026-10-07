@@ -38,5 +38,52 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Guard - xshell-core stays Tauri-free
+        shell: bash # -eo pipefail: a failing cargo tree fails the step
+        run: |
+          tree=$(cargo tree -p xshell-core -e normal --prefix none --locked)
+          grep -q '^xshell-core ' <<<"$tree" # the tree really is core's
+          if grep -E '^(tauri|wry|webkit2gtk|gtk) ' <<<"$tree"; then
+            echo "::error::xshell-core depends on a Tauri/webview crate"
+            exit 1
+          fi
+      - name: Guard - home and temp dirs only come from HostCtx
+        shell: bash
+        run: |
+          test -d crates/core/src
+          set +e
+          hits=$(grep -rnE 'dirs::home_dir|env::temp_dir' crates/core/src --include='*.rs')
+          rc=$?
+          set -e
+          [ "$rc" -le 1 ] || { echo "::error::grep failed ($rc)"; exit 1; }
+          # Positive control: the pattern must still find the lookups in ctx.rs.
+          grep -q '^crates/core/src/ctx.rs:' <<<"$hits"
+          bad=$(grep -v '^crates/core/src/ctx.rs:' <<<"$hits" || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "::error::read the home or temp dir through HostCtx, not the process"
+            exit 1
+          fi
+  core:
+    # Core is Tauri-free, so it builds without webview packages. These runners compile the
+    # #[cfg(windows)] and macOS paths that the Linux job never sees.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo clippy -p xshell-core --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-core --locked
