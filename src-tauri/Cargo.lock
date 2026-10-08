@@ -5518,6 +5518,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshelld"
+version = "1.5.0"
+dependencies = [
+ "dirs",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "xshell-core",
+]
+
+[[package]]
 name = "yoke"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core"]
+members = [".", "crates/core", "crates/xshelld"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -12,6 +12,7 @@ portable-pty = "0.9"
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
 
 [package]
 name = "xshell"
@@ -59,3 +60,10 @@ codegen-units = 1
 panic = "abort"
 strip = true
 incremental = false
+
+# The Daemon's release build. `panic = "abort"` above would turn one panicking `call` into a
+# dead Daemon and every Terminal hung up; xshelld catches panics per call, which needs unwind.
+# Cargo does not allow `panic` per package, hence a separate profile for xshelld artefacts.
+[profile.release-daemon]
+inherits = "release"
+panic = "unwind"

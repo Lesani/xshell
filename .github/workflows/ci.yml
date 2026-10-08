@@ -39,6 +39,7 @@ jobs:
           workspaces: ./src-tauri -> target
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Includes xshelld's unit and integration tests (in-process server, real binary).
       - run: cargo test --workspace --locked
       - name: Guard - xshell-core stays Tauri-free
         shell: bash # -eo pipefail: a failing cargo tree fails the step
@@ -67,8 +68,9 @@ jobs:
             exit 1
           fi
   core:
-    # Core is Tauri-free, so it builds without webview packages. These runners compile the
-    # #[cfg(windows)] and macOS paths that the Linux job never sees.
+    # Core and xshelld are Tauri-free, so they build without webview packages. These runners
+    # compile the #[cfg(windows)] and macOS paths that the Linux job never sees. xshelld is
+    # Unix-only: on Windows it compiles to a stub and its tests are empty.
     strategy:
       fail-fast: false
       matrix:
@@ -85,5 +87,31 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-      - run: cargo clippy -p xshell-core --all-targets --locked -- -D warnings
-      - run: cargo test -p xshell-core --locked
+      - run: cargo clippy -p xshell-core -p xshelld --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-core -p xshelld --locked
+  xshelld-musl:
+    # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, hence musl-gcc.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo build -p xshelld --profile release-daemon --target x86_64-unknown-linux-musl --locked
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Static and runnable
+        shell: bash
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release-daemon/xshelld
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          "$bin" --version
+          ls -l "$bin"

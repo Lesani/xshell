@@ -26,7 +26,7 @@ src-tauri/                      Cargo workspace root (target/ stays here)
 
 One byte stream per connection (the `ssh` process's stdio on the Desktop; the Unix socket on the Daemon). Frames: `u32` big-endian length, then a `u8` kind, then the payload.
 
-- kind `0` — JSON message (UTF-8). Every message has `"t"` (type). Requests carry `"id"`; responses echo it with `"ok"` or `"err"`.
+- kind `0` — JSON message (UTF-8). Every message has `"t"` (type). Requests carry `"id"`; responses echo it with `"ok"` or `"err"`. `id` is optional on every Desktop→Host message: without it the Host sends no response (the Desktop omits it on `term.input`/`term.resize`).
 - kind `1` — Terminal output: 16-byte Terminal UUID followed by raw bytes. Output is never JSON-encoded.
 
 Handshake: first message from each side is `hello { protocol: { min, max }, version, capabilities[] }`. The connection uses the highest common protocol version; no overlap → the Daemon replies with an error naming both ranges and closes. Changes are additive: unknown message types get an `err` response, unknown fields are ignored, and new features are gated on `capabilities`.
@@ -40,7 +40,7 @@ Messages (protocol 1):
 | D→H | `term.attach { id, terminal }` | Subscribe; Daemon replies, then sends the replay buffer as kind-1 frames, then live output. |
 | D→H | `term.detach`, `term.input`, `term.resize`, `term.close`, `term.update { meta }` | `term.update` records late-bound metadata (e.g. a session id linked after start) so restore resumes the right session. |
 | H→D | `terminals { list }` | Full Terminal list; sent after `hello` and whenever it changes. The Desktop reconciles Tabs against it (ADR-0001). |
-| H→D | `term.exit { terminal, code }` | Terminal ended. |
+| H→D | `term.exit { terminal, code }` | Terminal ended. Sent to every connection, only after the process exited **and** its last output was read, so no output follows it. An attach to an ended Terminal gets reply, replay, then `term.exit`. |
 | D→H | `daemon.upgrade` | Persist, end every Terminal, exit (ADR-0003). The next `connect` starts the new binary, which restores. |
 
 ## Daemon (`xshelld`)
@@ -51,9 +51,13 @@ Messages (protocol 1):
 - Each Terminal: a PTY from the same command-building code the Local Host uses, a reader thread feeding a per-Terminal **replay buffer** (ring of raw bytes, 2 MiB default) and every attached connection. Replay is trimmed forward to just after a newline and preceded by a terminal reset, so it never starts mid-escape. After an attach the Daemon forces a redraw by nudging the PTY size (rows−1, then back), because full-screen TUIs only repaint on `SIGWINCH`.
 - Size follows the last connection that sent `term.input` or `term.resize` for that Terminal.
 - Launch specs are persisted to `~/.xshell/daemon/terminals.json` on every change. On `serve` start, each persisted Terminal is relaunched with the agent's resume flag (raw shells start fresh in the same cwd) under the same UUID. A Terminal whose relaunch fails is dropped from the list.
-- Closing (`term.close`) kills the process group and removes it from the list and the state file. Connections dropping never ends anything.
+- A Terminal whose process ends stays listed (with `exitCode`) until `term.close`, like a local Tab showing "[Session ended]", and is relaunched on restart.
+- Closing (`term.close`) SIGHUPs the session leader's and the foreground job's process groups, then SIGKILLs each group still alive after a grace period; it removes the Terminal from the list and the state file. Connections dropping never ends anything. A missing cwd is an error on the Daemon (no silent fallback to `$HOME`).
+- SIGTERM/SIGINT/SIGHUP end every Terminal and keep the state file. After a crash, `serve` ends the processes left over from the previous run (tracked by leader pid and start time) before relaunching, so an agent never runs twice.
+- Dropped files (`save_dropped_file`) go to a per-user private dir: `$XDG_RUNTIME_DIR/xshell/tmp`, else `~/.xshell/tmp`.
 - Idle exit: with zero Terminals and zero connections for 1 hour, `serve` exits.
 - Image paste/drop (`save_dropped_file`) runs on the Host like any other call, so the path typed into the agent exists where the agent runs.
+- Release builds of `xshelld` use the `release-daemon` profile (`panic = "unwind"`), so a panicking `call` becomes an `err` instead of killing the Daemon.
 
 ## Desktop
 
@@ -86,4 +90,4 @@ Messages (protocol 1):
 
 ## Out of scope (first version)
 
-Windows as a Remote Host; Local Host through a Daemon; live Daemon handover on upgrade; Host discovery beyond SSH config aliases.
+Windows as a Remote Host; Local Host through a Daemon; live Daemon handover on upgrade; Host discovery beyond SSH config aliases; home directories shared between Hosts (NFS) without `XDG_RUNTIME_DIR`, where two Daemons would share one socket and state file.
