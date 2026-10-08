@@ -187,7 +187,10 @@ impl Sup {
                     Parked::Closed(why) => self.ended(c, why),
                     Parked::UpgradeTimeout => {
                         // The old Daemon did not exit by itself: SIGTERM it, then reconnect.
-                        let _ = kill_daemon(&*self.transport, &self.cancel);
+                        // Not on a Daemon-command host: it may allow no other ssh command.
+                        if self.managed {
+                            let _ = kill_daemon(&*self.transport, &self.cancel);
+                        }
                         c.link.close();
                         self.ended(c, "the Daemon did not exit for the upgrade".into())
                     }

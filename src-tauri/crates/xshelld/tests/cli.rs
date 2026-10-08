@@ -19,10 +19,16 @@ fn version_is_machine_readable() {
     let s = String::from_utf8(out.stdout).unwrap();
     assert_eq!(s.lines().count(), 1);
     let v: Value = serde_json::from_str(&s).unwrap();
+    let os = match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "Darwin",
+        other => other,
+    };
     assert_eq!(
         v,
         json!({"name": "xshelld", "version": env!("CARGO_PKG_VERSION"),
-               "protocol": {"min": 1, "max": 1}})
+               "protocol": {"min": 1, "max": 1},
+               "os": os, "arch": std::env::consts::ARCH})
     );
 }
 

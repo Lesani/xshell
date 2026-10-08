@@ -4,7 +4,7 @@
 use crate::cancel::CancelToken;
 use crate::config::{validate, validate_one, HostConfig};
 use crate::handle::HostHandle;
-use crate::install::{probe_script, probe_script_override, run_probe, target_triple, BinarySource};
+use crate::install::{probe_override, probe_script, run_probe, target_triple, BinarySource};
 use crate::link::LinkLimits;
 use crate::status::{HostSnapshot, HostStatus, HostTestResult};
 use crate::transport::TransportFactory;
@@ -212,10 +212,25 @@ impl Manager {
             return r;
         }
         let t = self.mc.transports.for_host(cfg);
-        let script = match cfg.daemon_override() {
-            Some(cmd) => probe_script_override(cmd),
-            None => probe_script(&self.mc.desktop_version),
-        };
+        if let Some(cmd) = cfg.daemon_override() {
+            match probe_override(&*t, cmd, &self.cancel) {
+                Ok(p) => {
+                    r.ok = true;
+                    r.installed_version = Some(p.installed.version);
+                    if let (Some(os), Some(arch)) = (&p.os, &p.arch) {
+                        r.triple = target_triple(os, arch).ok().map(Into::into);
+                    }
+                    r.os = p.os;
+                    r.arch = p.arch;
+                }
+                Err(e) => {
+                    r.error = Some(e.message);
+                    r.error_hint = e.hint;
+                }
+            }
+            return r;
+        }
+        let script = probe_script(&self.mc.desktop_version);
         match run_probe(&*t, &script, &self.cancel) {
             Ok(p) => {
                 r.installed_version = p.installed.map(|d| d.version);
@@ -422,6 +437,82 @@ pub(crate) mod tests {
         assert!(!r.ok);
         assert_eq!(r.error_hint, Some(crate::errors::HostErrorHint::Unresolved));
     }
+
+    /// A Daemon-command host may allow only `<cmd> --version` / `<cmd> connect` over ssh
+    /// (ForceCommand): the test must send exactly `<cmd> --version`, nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn test_with_daemon_command_sends_exactly_cmd_version() {
+        struct Recording(Arc<Mutex<Vec<String>>>);
+        impl TransportFactory for Recording {
+            fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+                struct T(Arc<Mutex<Vec<String>>>);
+                impl Transport for T {
+                    fn command(&self, remote: &str) -> CommandSpec {
+                        self.0.lock().unwrap().push(remote.to_string());
+                        // Behave like a ForceCommand that only knows the exact form.
+                        let script = if remote == "xshelld --version" {
+                            r#"echo '{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"os":"Linux","arch":"x86_64"}'"#
+                        } else {
+                            "echo 'usage: agent <name>' >&2; exit 2"
+                        };
+                        LocalShellTransport::default().command(script)
+                    }
+                    fn describe(&self) -> String {
+                        "recording".into()
+                    }
+                }
+                Box::new(T(self.0.clone()))
+            }
+        }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut mc = test_config(Arc::new(NullObserver));
+        mc.transports = Arc::new(Recording(sent.clone()));
+        let mut host = test_host("h_aaaaaaaa", "a");
+        host.daemon_command = Some("xshelld".into());
+        let r = Manager::new(mc).test(&host);
+        assert_eq!(*sent.lock().unwrap(), vec!["xshelld --version".to_string()]);
+        assert_eq!(
+            r,
+            HostTestResult {
+                ok: true,
+                os: Some("Linux".into()),
+                arch: Some("x86_64".into()),
+                triple: Some("x86_64-unknown-linux-musl".into()),
+                installed_version: Some("1.5.0".into()),
+                error: None,
+                error_hint: None,
+            }
+        );
+    }
+
+    /// An older Daemon without os/arch in `--version` still passes; a refused command fails
+    /// with the host's own message and the daemon-command hint.
+    #[cfg(unix)]
+    #[test]
+    fn test_with_daemon_command_old_daemon_and_refusal() {
+        let mut host = test_host("h_aaaaaaaa", "a");
+        host.daemon_command = Some("xshelld".into());
+        let mut mc = test_config(Arc::new(NullObserver));
+        mc.transports = script_factory(
+            r#"echo noise; echo '{"name":"xshelld","version":"1.4.0","protocol":{"min":1,"max":1}}'"#,
+        );
+        let r = Manager::new(mc).test(&host);
+        assert!(r.ok);
+        assert_eq!(r.installed_version.as_deref(), Some("1.4.0"));
+        assert_eq!((r.os, r.arch, r.triple), (None, None, None));
+
+        let mut mc = test_config(Arc::new(NullObserver));
+        mc.transports = script_factory("echo 'usage: agent <name>' >&2; exit 2");
+        let r = Manager::new(mc).test(&host);
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("usage: agent <name>"));
+        assert_eq!(
+            r.error_hint,
+            Some(crate::errors::HostErrorHint::DaemonCommandFailed)
+        );
+    }
+
     /// Picks the local script by what the remote command is for.
     #[cfg(unix)]
     struct ByPurpose {

@@ -36,15 +36,27 @@ options:
   --socket PATH   Daemon socket (env XSHELLD_SOCKET)
 ";
 
-/// The `--version` line. The Desktop parses it, so keep exactly these keys.
+/// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
+/// use `uname -s` / `uname -m` spelling, so a Desktop that can only run `<cmd> --version`
+/// (a Daemon command behind a restricted ssh) still learns the platform.
 pub fn version_json() -> String {
     // Written by hand to keep this exact key order (serde_json sorts object keys).
     format!(
-        r#"{{"name":"xshelld","version":{},"protocol":{{"min":{},"max":{}}}}}"#,
+        r#"{{"name":"xshelld","version":{},"protocol":{{"min":{},"max":{}}},"os":{},"arch":{}}}"#,
         serde_json::Value::from(env!("CARGO_PKG_VERSION")),
         xshell_core::protocol::PROTOCOL_MIN,
         xshell_core::protocol::PROTOCOL_MAX,
+        serde_json::Value::from(uname_os()),
+        serde_json::Value::from(std::env::consts::ARCH),
     )
+}
+
+fn uname_os() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "Darwin",
+        other => other,
+    }
 }
 
 fn parse_ms(v: &OsString, what: &str) -> Result<Duration, String> {
@@ -168,15 +180,17 @@ mod tests {
         assert_eq!(
             version_json(),
             format!(
-                r#"{{"name":"xshelld","version":"{}","protocol":{{"min":1,"max":1}}}}"#,
-                env!("CARGO_PKG_VERSION")
+                r#"{{"name":"xshelld","version":"{}","protocol":{{"min":1,"max":1}},"os":"{}","arch":"{}"}}"#,
+                env!("CARGO_PKG_VERSION"),
+                uname_os(),
+                std::env::consts::ARCH
             )
         );
         let v: serde_json::Value = serde_json::from_str(&version_json()).unwrap();
         assert_eq!(
             v,
             serde_json::json!({"name":"xshelld","version":env!("CARGO_PKG_VERSION"),
-                "protocol":{"min":1,"max":1}})
+                "protocol":{"min":1,"max":1},"os":uname_os(),"arch":std::env::consts::ARCH})
         );
     }
 }

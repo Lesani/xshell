@@ -81,9 +81,65 @@ pub fn probe_script(version: &str) -> String {
     )
 }
 
-/// The probe for a daemon command override (the user's own shell text, not quoted).
-pub fn probe_script_override(cmd: &str) -> String {
-    format!("uname -sm; echo {MARKER}; {cmd} --version 2>/dev/null; exit 0")
+/// The exact remote command that probes a Daemon command override. Hosts that need an
+/// override often restrict ssh to fixed commands (ForceCommand), so this is sent verbatim:
+/// no shell wrapper, no `uname`. The platform comes from the `--version` JSON instead.
+pub fn override_version_command(cmd: &str) -> String {
+    format!("{cmd} --version")
+}
+
+/// What `<cmd> --version` told us about a Daemon command override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverrideProbe {
+    pub installed: DaemonVersion,
+    /// `uname -s` / `uname -m` spelling; absent from Daemons older than this field.
+    pub os: Option<String>,
+    pub arch: Option<String>,
+}
+
+pub fn parse_override_probe(stdout: &str) -> Option<OverrideProbe> {
+    stdout.lines().find_map(|l| {
+        let installed = parse_version_json(l)?;
+        let v: Value = serde_json::from_str(l.trim()).ok()?;
+        let field = |k: &str| v[k].as_str().map(String::from);
+        Some(OverrideProbe {
+            installed,
+            os: field("os"),
+            arch: field("arch"),
+        })
+    })
+}
+
+/// Run `<cmd> --version` on the Host exactly as written and parse its JSON line.
+pub fn probe_override(
+    t: &dyn Transport,
+    cmd: &str,
+    cancel: &CancelToken,
+) -> Result<OverrideProbe, InstallError> {
+    let out = run_script(
+        t,
+        &override_version_command(cmd),
+        None,
+        PROBE_TIMEOUT,
+        cancel,
+    )
+    .map_err(|e| proc_failure(e, "the host probe"))?;
+    parse_override_probe(&out.stdout).ok_or_else(|| {
+        let msg = if !out.stderr.trim().is_empty() {
+            out.stderr.trim().to_string()
+        } else {
+            format!(
+                "`{}` printed no xshelld version (exit {:?})",
+                override_version_command(cmd),
+                out.code
+            )
+        };
+        InstallError::new(
+            classify_ssh_failure(&out.stderr, None, out.code)
+                .or(Some(HostErrorHint::DaemonCommandFailed)),
+            msg,
+        )
+    })
 }
 
 /// Write stdin to a temp file and move it into place, then print its `--version`.

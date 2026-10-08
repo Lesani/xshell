@@ -941,6 +941,14 @@ impl HostHandle {
                     once.call(Err(e));
                 }
             }
+            Plan::Kill if self.config().daemon_override().is_some() => {
+                // A Daemon command means the user manages the binary, and such hosts often
+                // allow only `<cmd> connect` / `<cmd> --version` over ssh: send no script.
+                once.call(Err(HostError::new(
+                    crate::errors::HostErrorCode::Incompatible,
+                    "this host runs xshelld through a Daemon command: replace that binary with a compatible xshelld and restart its Daemon on the host",
+                )));
+            }
             Plan::Kill => {
                 let sh = self.sh.clone();
                 let o = once.clone();
