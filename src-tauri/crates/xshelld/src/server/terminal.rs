@@ -33,7 +33,8 @@ struct Record {
 }
 
 struct TermIo {
-    master: Box<dyn MasterPty + Send>,
+    /// `None` for a Terminal restored without a process (see [`unresolved`]).
+    master: Option<Box<dyn MasterPty + Send>>,
     arb: SizeArbiter,
 }
 
@@ -65,6 +66,9 @@ pub(crate) struct Terminal {
     nudge_pending: AtomicBool,
     last_overflow_nudge: Mutex<Option<Instant>>,
     persist_pending: AtomicBool,
+    /// For a Terminal restored without a process: the previous run's leader, kept in the
+    /// state file so a later start retries ending it.
+    kept_leader: Option<Leader>,
 }
 
 /// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
@@ -127,7 +131,7 @@ pub(crate) fn spawn(
             created_at_ms,
         }),
         io: Mutex::new(TermIo {
-            master: pair.master,
+            master: Some(pair.master),
             arb: SizeArbiter::new(cols, rows),
         }),
         out: Mutex::new(TermOutput {
@@ -143,6 +147,7 @@ pub(crate) fn spawn(
         nudge_pending: AtomicBool::new(false),
         last_overflow_nudge: Mutex::new(None),
         persist_pending: AtomicBool::new(false),
+        kept_leader: None,
     });
     let tag = short(&id);
 
@@ -315,7 +320,10 @@ impl Terminal {
     }
 
     fn apply_size(io: &TermIo, (cols, rows): (u16, u16)) -> Result<(), String> {
-        io.master
+        let Some(master) = &io.master else {
+            return Ok(());
+        };
+        master
             .resize(PtySize {
                 rows,
                 cols,
@@ -419,7 +427,14 @@ impl Terminal {
     /// that still exists after `grace`. A Terminal that already exited is never signalled.
     pub fn kill(self: &Arc<Self>, grace: Duration) {
         let mut groups: Vec<i32> = self.pid.map(|p| p as i32).into_iter().collect();
-        if let Some(g) = self.io.lock().unwrap().master.process_group_leader() {
+        let fg = self
+            .io
+            .lock()
+            .unwrap()
+            .master
+            .as_ref()
+            .and_then(|m| m.process_group_leader());
+        if let Some(g) = fg {
             if !groups.contains(&g) {
                 groups.push(g);
             }
@@ -511,7 +526,7 @@ impl Terminal {
                 pid: pid as i32,
                 start_time: self.start_time,
             }];
-            if let Some(g) = io.master.process_group_leader() {
+            if let Some(g) = io.master.as_ref().and_then(|m| m.process_group_leader()) {
                 if g != pid as i32 {
                     groups.push(super::orphans::identity(g));
                 }
@@ -529,7 +544,47 @@ impl Terminal {
             cols,
             rows,
             created_at_ms: r.created_at_ms,
-            leader,
+            leader: leader.or_else(|| self.kept_leader.clone()),
         }
     }
+}
+
+/// Exit code listed for a Terminal that was not relaunched because leftovers of its previous
+/// run could not be ended or confirmed gone.
+pub(crate) const UNRESOLVED_EXIT: i32 = -1;
+
+/// A restored Terminal without a process: listed as exited (`UNRESOLVED_EXIT`), its record
+/// and previous leader kept in the state file until `term.close` removes it.
+pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal> {
+    let t = Terminal {
+        id: p.terminal,
+        record: Mutex::new(Record {
+            spec: p.spec,
+            meta: p.meta,
+            created_at_ms: p.created_at_ms,
+        }),
+        io: Mutex::new(TermIo {
+            master: None,
+            arb: SizeArbiter::new(p.cols, p.rows),
+        }),
+        out: Mutex::new(TermOutput {
+            replay: ReplayBuffer::new(d.cfg.replay_capacity),
+            subs: HashMap::new(),
+            exit_code: Some(UNRESOLVED_EXIT),
+        }),
+        input: Mutex::new(None),
+        pid: None,
+        start_time: None,
+        life: Mutex::new(Life {
+            exited: Some(UNRESOLVED_EXIT),
+            reader_done: true,
+            closing: false,
+        }),
+        life_cv: Condvar::new(),
+        nudge_pending: AtomicBool::new(false),
+        last_overflow_nudge: Mutex::new(None),
+        persist_pending: AtomicBool::new(false),
+        kept_leader: p.leader,
+    };
+    Arc::new(t)
 }

@@ -499,7 +499,8 @@ fn stalled_connection_does_not_block_others() {
     let deadline = Instant::now() + T;
     let (mut seen, mut disconnected) = (false, false);
     let mut tail: Vec<u8> = Vec::new();
-    while !seen && !disconnected {
+    // Hard stop at the deadline: continuous output must not keep this loop alive.
+    while !seen && !disconnected && Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
         match a.read(left) {
             Got::Frame(Frame::Output { data, .. }) => {

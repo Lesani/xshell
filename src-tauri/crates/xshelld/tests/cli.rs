@@ -86,35 +86,6 @@ fn concurrent_connects_start_one_daemon() {
         p.client
             .terminals_where(|l| l.iter().any(|i| i.terminal == t));
     }
-    // Every `serve` a connect spawned and lost the race with is reaped, not left a zombie
-    // for the lifetime of the bridge.
-    #[cfg(target_os = "linux")]
-    {
-        let connects: Vec<u32> = ps.iter().map(|p| p.child.id()).collect();
-        let zombies = || -> Vec<i32> {
-            fs::read_dir("/proc")
-                .unwrap()
-                .flatten()
-                .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
-                .filter(|p| {
-                    let Ok(s) = fs::read_to_string(format!("/proc/{p}/stat")) else {
-                        return false;
-                    };
-                    let f: Vec<&str> = s[s.rfind(')').unwrap() + 1..].split_whitespace().collect();
-                    f[0] == "Z" && f[1].parse::<u32>().is_ok_and(|pp| connects.contains(&pp))
-                })
-                .collect()
-        };
-        let deadline = std::time::Instant::now() + T;
-        while !zombies().is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "unreaped serve children: {:?}",
-                zombies()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
     // One Daemon: one serving process, the rest lost the lock race (exit 3) or never ran.
     let log = fs::read_to_string(h.home().join(".xshell/log/xshelld.log")).unwrap();
     assert_eq!(log.matches(" serving ").count(), 1, "{log}");
@@ -156,4 +127,80 @@ fn connect_reports_unstartable_daemon() {
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("xshelld serve exited with"), "{err}");
+}
+
+/// A `serve` that `connect` spawned and that lost the lock race exits only after `connect`
+/// has bridged to the winner; `connect` must still reap it while the bridge lives.
+#[cfg(target_os = "linux")]
+#[test]
+fn connect_reaps_a_losing_serve() {
+    use std::os::unix::net::UnixListener;
+    let h = TestHome::new();
+    let paths = h.paths();
+    let sock_dir = paths.socket.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&sock_dir).unwrap();
+    fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    // We hold the lock, so the spawned `serve` loses and waits for `release`.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&paths.lock)
+        .unwrap();
+    lock.try_lock().unwrap();
+    let release = h.root().join("release");
+    let mut connect = bin_cmd(&h)
+        .arg("connect")
+        .env("XSHELLD_TEST_HOLD_LOSER", &release)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let cpid = connect.id() as i32;
+    let stat = |p: i32| -> Option<(String, i32)> {
+        let s = fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+        let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
+        Some((f[0].to_string(), f[1].parse().ok()?))
+    };
+    let children = || -> Vec<i32> {
+        fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&p| stat(p).is_some_and(|(_, pp)| pp == cpid))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + T;
+    let loser = loop {
+        if let Some(&p) = children().first() {
+            break p;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "connect spawned no serve"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Play the winner: `connect` bridges to us while the loser is still running.
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let (_bridged, _) = listener.accept().unwrap();
+    assert!(
+        stat(loser).is_some_and(|(st, _)| st != "Z"),
+        "loser exited too early"
+    );
+    fs::write(&release, "").unwrap();
+    let deadline = std::time::Instant::now() + T;
+    while stat(loser).is_some_and(|(_, pp)| pp == cpid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the losing serve {loser} was never reaped: {:?}",
+            stat(loser)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(connect.try_wait().unwrap().is_none(), "the bridge ended");
+    let _ = connect.kill();
+    let _ = connect.wait();
 }

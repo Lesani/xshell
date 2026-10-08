@@ -1,8 +1,9 @@
 //! The shared Daemon state: Terminals, connections, persistence, idle tracking and exit.
 
+use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
-use super::{conn, orphans, Config, ConnId, ExitReason};
+use super::{conn, Config, ConnId, ExitReason};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -176,15 +177,25 @@ impl Daemon {
         let mut reg = self.reg.lock().unwrap();
         let had = loaded.terminals.len();
         for p in loaded.terminals {
+            // No budget check here: budgets bound new mutations, and a record saved under an
+            // earlier limit is never dropped for its size.
             if let Some(leader) = &p.leader {
-                let n = orphans::end_leftovers(leader, self.cfg.kill_grace);
-                if n > 0 {
-                    crate::log!("INFO", "ended {n} leftover process(es) of {}", p.terminal);
+                let cleanup = self.cfg.cleanup_override.unwrap_or(orphans::end_leftovers)(
+                    leader,
+                    self.cfg.kill_grace,
+                );
+                if cleanup == Cleanup::Unresolved {
+                    crate::log!(
+                        "WARN",
+                        "not relaunching {}: leftovers of its previous run may still be running; \
+                         listed as exited ({})",
+                        p.terminal,
+                        terminal::UNRESOLVED_EXIT
+                    );
+                    let t = terminal::unresolved(self, p);
+                    reg.terminals.insert(t.id, t);
+                    continue;
                 }
-            }
-            if let Err(e) = self.check_budget(&reg, p.terminal, &p.spec, &p.meta) {
-                crate::log!("WARN", "dropping {}: {e}", p.terminal);
-                continue;
             }
             match terminal::spawn(
                 self,

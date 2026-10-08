@@ -184,3 +184,93 @@ fn shutdown_keeps_state() {
         ))
         .is_none());
 }
+
+fn persisted(id: Uuid, cwd: &std::path::Path, title: &str) -> PersistedTerminal {
+    let mut meta = serde_json::Map::new();
+    meta.insert("title".into(), json!(title));
+    PersistedTerminal {
+        terminal: id,
+        spec: sh_spec(cwd),
+        meta,
+        cols: 80,
+        rows: 24,
+        created_at_ms: 1,
+        leader: None,
+    }
+}
+
+/// Records saved under earlier (or larger) limits are restored, not dropped for their size.
+#[test]
+fn restore_ignores_budgets() {
+    let h = TestHome::new();
+    let cwd = h.project("p");
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    save_atomic(
+        &h.paths().state,
+        &[
+            persisted(a, &cwd, &"x".repeat(5000)),
+            persisted(b, &cwd, &"y".repeat(5000)),
+        ],
+    )
+    .unwrap();
+    let srv = start(&h, |c| {
+        c.max_terminal_bytes = 1000;
+        c.max_list_bytes = 2000;
+    });
+    let mut c = Client::connect(&srv.socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert_eq!(list.len(), 2);
+    assert!(list
+        .iter()
+        .all(|i| i.exit_code.is_none() && i.pid.is_some()));
+    let mut ids = h.state_ids();
+    ids.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+fn unkillable(_: &xshell_core::terminal::state::Leader, _: Duration) -> xshelld::server::Cleanup {
+    xshelld::server::Cleanup::Unresolved
+}
+
+/// When leftovers of the previous run cannot be ended, the Terminal is not relaunched: it is
+/// listed as exited (-1) with its record and leader kept, until `term.close` removes it.
+#[test]
+fn unresolved_cleanup_does_not_relaunch() {
+    let h = TestHome::new();
+    let cwd = h.project("p");
+    let t = Uuid::new_v4();
+    let mut p = persisted(t, &cwd, "kept");
+    let leader = xshell_core::terminal::state::Leader {
+        pid: 999_999,
+        start_time: Some(42),
+        groups: vec![],
+    };
+    p.leader = Some(leader.clone());
+    save_atomic(&h.paths().state, &[p]).unwrap();
+    let srv = start(&h, |c| c.cleanup_override = Some(unkillable));
+    let mut c = Client::connect(&srv.socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].terminal, t);
+    assert_eq!(list[0].exit_code, Some(-1));
+    assert_eq!(list[0].pid, None);
+    assert_eq!(list[0].meta.get("title"), Some(&json!("kept")));
+    let state = h.state_json();
+    assert_eq!(state["terminals"][0]["leader"]["pid"], json!(999_999));
+    // Attaching shows it ended; input is refused.
+    let id = c.request_id();
+    c.send(&ClientMsg::TermAttach { terminal: t }, Some(id));
+    assert_eq!(c.wait_res(id).unwrap(), json!({"exitCode": -1}));
+    let err = c
+        .request(&ClientMsg::TermInput {
+            terminal: t,
+            data: "x".into(),
+        })
+        .unwrap_err();
+    assert_eq!(err, "terminal has exited");
+    c.request(&ClientMsg::TermClose { terminal: t }).unwrap();
+    c.terminals_where(|l| l.is_empty());
+    assert!(h.state_ids().is_empty());
+}

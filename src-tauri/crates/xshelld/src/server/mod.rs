@@ -7,6 +7,7 @@
 mod calls;
 mod conn;
 mod orphans;
+pub use orphans::Cleanup;
 mod outbox;
 mod registry;
 mod size;
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use xshell_core::terminal::state::Leader;
 use xshell_core::HostCtx;
 
 pub(crate) type ConnId = u64;
@@ -52,6 +54,9 @@ pub struct Config {
     pub max_terminal_bytes: usize,
     /// Largest serialized `terminals` list; keeps it far below the 64 MiB frame limit.
     pub max_list_bytes: usize,
+    /// Test hook: replaces crash-leftover cleanup during restore.
+    #[doc(hidden)]
+    pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
 }
 
 impl Config {
@@ -71,6 +76,7 @@ impl Config {
             resize_persist_delay: Duration::from_secs(1),
             max_terminal_bytes: 256 * 1024,
             max_list_bytes: 16 * 1024 * 1024,
+            cleanup_override: None,
         }
     }
 }
@@ -261,6 +267,7 @@ pub fn run_serve(cfg: Config) -> i32 {
         Ok(h) => h,
         Err(StartError::AlreadyRunning) => {
             crate::log!("INFO", "another xshelld serve holds the lock; exiting");
+            hold_loser_for_tests();
             return 3;
         }
         Err(e) => {
@@ -279,6 +286,19 @@ pub fn run_serve(cfg: Config) -> i32 {
     let reason = h.wait();
     crate::log!("INFO", "exiting: {reason:?}");
     0
+}
+
+/// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits
+/// (at most 30 s) until `<path>` exists before exiting, so a test can order its exit after
+/// `connect` has already bridged to the winner.
+fn hold_loser_for_tests() {
+    let Some(p) = std::env::var_os("XSHELLD_TEST_HOLD_LOSER") else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::path::Path::new(&p).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn exit_signal_set() -> libc::sigset_t {
