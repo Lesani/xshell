@@ -6,24 +6,25 @@ import { FolderEditorDialog } from "./FolderEditorDialog";
 import { RateLimitIndicator } from "./RateLimitIndicator";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SidebarItem, SidebarFolder } from "../types";
+import { asProjectKey, keyBasename, keyOf, lookupKey, parseProjectKey, sameKey, type ProjectKey } from "../hosts/projectKey";
 
 interface SidebarProps {
   projects: ProjectInfo[];
   projectIcons: Record<string, ProjectSettings>;
   selectedProject: ProjectInfo | null;
-  activeCountByProject: Map<string, number>;
+  activeCountByProject: Map<string, number>; // keyed by lookupKey(ProjectKey)
   sidebarLayout: SidebarItem[];
   onLayoutChange: (next: SidebarItem[]) => void;
   onSelectProject: (project: ProjectInfo) => void;
   onGoHome: () => void;
-  onRemoveProject: (path: string) => void;
-  onEditProject: (path: string) => void;
-  onHoverProject: (path: string | null) => void;
+  onRemoveProject: (key: ProjectKey) => void;
+  onEditProject: (key: ProjectKey) => void;
+  onHoverProject: (key: ProjectKey | null) => void;
   onOpenSettings: () => void;
   onAddProject: () => void;
   onCollapse: () => void;
   activeTabId: string;
-  linkedProjectPath: string | null;
+  linkedProjectKey: ProjectKey | null;
   showRateLimit: boolean;
   showRateLimitCodex: boolean;
   updateAvailable: boolean;
@@ -48,7 +49,7 @@ interface ProjectCtx { kind: "project"; x: number; y: number; project: ProjectIn
 interface FolderCtx { kind: "folder"; x: number; y: number; folder: SidebarFolder; }
 type CtxState = ProjectCtx | FolderCtx | null;
 
-function ProjectContextMenu({ ctx, onEdit, onReveal, onRemove, onClose }: { ctx: ProjectCtx; onEdit: () => void; onReveal: () => void; onRemove: () => void; onClose: () => void }) {
+function ProjectContextMenu({ ctx, onEdit, onReveal, onRemove, onClose }: { ctx: ProjectCtx; onEdit: () => void; onReveal: (() => void) | null; onRemove: () => void; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const handle = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onClose(); };
@@ -58,7 +59,7 @@ function ProjectContextMenu({ ctx, onEdit, onReveal, onRemove, onClose }: { ctx:
   return (
     <div className="ctx-menu" ref={ref} style={{ top: ctx.y, left: ctx.x }}>
       <div className="ctx-item" onClick={() => { onEdit(); onClose(); }}>Edit project...</div>
-      <div className="ctx-item" onClick={() => { onReveal(); onClose(); }}>Reveal in Explorer</div>
+      {onReveal && <div className="ctx-item" onClick={() => { onReveal(); onClose(); }}>Reveal in Explorer</div>}
       <div className="ctx-separator" />
       <div className="ctx-item ctx-danger" onClick={() => { onRemove(); onClose(); }}>Remove from sidebar</div>
     </div>
@@ -87,20 +88,21 @@ function Tooltip({ text, rect }: { text: string; rect: DOMRect }) {
 }
 
 // Mini-grid shown on a collapsed folder: up to 4 contained project icons in a 2x2 layout.
-function FolderMiniGrid({ paths, projectIcons, projects }: { paths: string[]; projectIcons: Record<string, ProjectSettings>; projects: ProjectInfo[] }) {
+function FolderMiniGrid({ paths, projectIcons, projects }: { paths: ProjectKey[]; projectIcons: Record<string, ProjectSettings>; projects: ProjectInfo[] }) {
   const byPath = useMemo(() => {
     const m = new Map<string, ProjectInfo>();
-    for (const p of projects) m.set(p.path.toLowerCase(), p);
+    for (const p of projects) m.set(lookupKey(keyOf(p)), p);
     return m;
   }, [projects]);
   const first4 = paths.slice(0, 4);
   return (
     <div className="ds-folder-grid">
       {first4.map(p => {
-        const pl = p.toLowerCase();
+        const pl = lookupKey(p);
         const settings = projectIcons[pl];
         const proj = byPath.get(pl);
-        const displayName = settings?.customName || proj?.name || p.split(/[\\/]/).pop() || p;
+        const raw = parseProjectKey(p).path;
+        const displayName = settings?.customName || proj?.name || raw.split(/[\\/]/).pop() || raw;
         return <ProjectSidebarIcon key={p} iconValue={settings?.icon} color={settings?.color} name={displayName} highlighted={false} mini />;
       })}
       {Array.from({ length: Math.max(0, 4 - first4.length) }).map((_, i) => (
@@ -113,14 +115,14 @@ function FolderMiniGrid({ paths, projectIcons, projects }: { paths: string[]; pr
 // ── Drag state ──────────────────────────────────────────────────────
 // One source path, one computed target — target describes where the drop would land.
 type DropTarget =
-  | { kind: "merge-with-project"; path: string }           // dropping on another top-level project → create folder
+  | { kind: "merge-with-project"; path: ProjectKey }           // dropping on another top-level project → create folder
   | { kind: "merge-with-folder"; folderId: string }        // dropping on a folder (header or its body)
   | { kind: "reorder-top"; index: number }                 // insert at this top-level index (0..layout.length)
   | { kind: "reorder-in-folder"; folderId: string; index: number } // insert into a folder at this slot
   | null;
 
 type DragSource =
-  | { kind: "project"; path: string; originFolderId: string | null }
+  | { kind: "project"; path: ProjectKey; originFolderId: string | null }
   | { kind: "folder"; id: string };
 
 // Only fields that matter for re-rendering live in state. Pointer position is kept in a
@@ -137,14 +139,14 @@ function targetsEqual(a: DropTarget, b: DropTarget): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
   if (a.kind !== b.kind) return false;
-  if (a.kind === "merge-with-project" && b.kind === "merge-with-project") return a.path.toLowerCase() === b.path.toLowerCase();
+  if (a.kind === "merge-with-project" && b.kind === "merge-with-project") return sameKey(a.path, b.path);
   if (a.kind === "merge-with-folder" && b.kind === "merge-with-folder") return a.folderId === b.folderId;
   if (a.kind === "reorder-top" && b.kind === "reorder-top") return a.index === b.index;
   if (a.kind === "reorder-in-folder" && b.kind === "reorder-in-folder") return a.folderId === b.folderId && a.index === b.index;
   return false;
 }
 
-export function Sidebar({ projects, projectIcons, selectedProject, activeCountByProject, sidebarLayout, onLayoutChange, onSelectProject, onGoHome, onRemoveProject, onEditProject, onHoverProject, onOpenSettings, onAddProject, onCollapse, activeTabId, linkedProjectPath, showRateLimit, showRateLimitCodex, updateAvailable }: SidebarProps) {
+export function Sidebar({ projects, projectIcons, selectedProject, activeCountByProject, sidebarLayout, onLayoutChange, onSelectProject, onGoHome, onRemoveProject, onEditProject, onHoverProject, onOpenSettings, onAddProject, onCollapse, activeTabId, linkedProjectKey, showRateLimit, showRateLimitCodex, updateAvailable }: SidebarProps) {
   const [ctx, setCtx] = useState<CtxState>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -156,7 +158,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
 
   const projectsByPath = useMemo(() => {
     const m = new Map<string, ProjectInfo>();
-    for (const p of projects) m.set(p.path.toLowerCase(), p);
+    for (const p of projects) m.set(lookupKey(keyOf(p)), p);
     return m;
   }, [projects]);
 
@@ -236,8 +238,8 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
           if (rel < 0.30) return { kind: "reorder-top", index: idx };
           if (rel > 0.70) return { kind: "reorder-top", index: idx + 1 };
           if (isFolderSource) return null;
-          if (source.kind === "project" && ds.dropPath.toLowerCase() !== source.path.toLowerCase()) {
-            return { kind: "merge-with-project", path: ds.dropPath };
+          if (source.kind === "project" && !sameKey(ds.dropPath, source.path)) {
+            return { kind: "merge-with-project", path: asProjectKey(ds.dropPath) };
           }
           // Dropping on yourself, middle-zone = no-op.
           return null;
@@ -300,13 +302,12 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
 
     // Branch 2: the source is a PROJECT being moved/merged.
     const sourcePath = source.path;
-    const pl = sourcePath.toLowerCase();
     const stripped: SidebarItem[] = [];
     for (const item of sidebarLayout) {
       if (item.kind === "project") {
-        if (item.path.toLowerCase() !== pl) stripped.push(item);
+        if (!sameKey(item.path, sourcePath)) stripped.push(item);
       } else {
-        const kept = item.projectPaths.filter(p => p.toLowerCase() !== pl);
+        const kept = item.projectPaths.filter(p => !sameKey(p, sourcePath));
         stripped.push({ ...item, projectPaths: kept });
       }
     }
@@ -314,7 +315,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
     let createdFolderId: string | null = null;
     if (target.kind === "merge-with-project") {
       next = stripped.map((item): SidebarItem => {
-        if (item.kind === "project" && item.path.toLowerCase() === target.path.toLowerCase()) {
+        if (item.kind === "project" && sameKey(item.path, target.path)) {
           const id = `sfolder-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
           createdFolderId = id;
           const folder: SidebarFolder = { kind: "folder", id, name: "New folder", collapsed: false, projectPaths: [item.path, sourcePath] };
@@ -347,7 +348,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
     if (createdFolderId) setEditingFolderId(createdFolderId);
   }, [sidebarLayout, onLayoutChange]);
 
-  const startProjectDrag = useCallback((e: React.PointerEvent, path: string, originFolderId: string | null) => {
+  const startProjectDrag = useCallback((e: React.PointerEvent, path: ProjectKey, originFolderId: string | null) => {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest("button, input")) return;
     dragPosRef.current = { x: e.clientX, y: e.clientY };
@@ -410,19 +411,20 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
   }, [drag, computeTarget, applyDrop]);
 
   // ── Render helpers ──
-  const renderProject = (path: string, idx: number, parentFolderId: string | null) => {
-    const pl = path.toLowerCase();
+  // `path` is the item's ProjectKey (the bare path for a Local Project).
+  const renderProject = (path: ProjectKey, idx: number, parentFolderId: string | null) => {
+    const pl = lookupKey(path);
     const proj = projectsByPath.get(pl);
-    const name = proj?.name || path.split(/[\\/]/).filter(Boolean).pop() || path;
+    const name = proj?.name || keyBasename(path);
     const settings = projectIcons[pl];
     const displayName = settings?.customName || name;
     const customIcon = settings?.icon;
-    const isSelected = !isInTerminal && selectedProject?.path.toLowerCase() === pl;
-    const isLinked = isInTerminal && linkedProjectPath?.toLowerCase() === pl;
+    const isSelected = !isInTerminal && !!selectedProject && lookupKey(keyOf(selectedProject)) === pl;
+    const isLinked = isInTerminal && !!linkedProjectKey && lookupKey(linkedProjectKey) === pl;
     const highlighted = isSelected || isLinked;
     const activeCount = activeCountByProject.get(pl) || 0;
-    const isDragging = drag?.source.kind === "project" && drag.source.path.toLowerCase() === pl;
-    const isMergeTarget = drag?.target?.kind === "merge-with-project" && drag.target.path.toLowerCase() === pl;
+    const isDragging = drag?.source.kind === "project" && lookupKey(drag.source.path) === pl;
+    const isMergeTarget = drag?.target?.kind === "merge-with-project" && lookupKey(drag.target.path) === pl;
     // Drop-line indicators on the item itself — cleaner than explicit gap strips.
     const indicatorBefore = drag?.target && (
       (parentFolderId && drag.target.kind === "reorder-in-folder" && drag.target.folderId === parentFolderId && drag.target.index === idx)
@@ -474,7 +476,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
             const folder = item;
             const isMergeTarget = drag?.target?.kind === "merge-with-folder" && drag.target.folderId === folder.id;
             const isDraggingSelf = drag?.source.kind === "folder" && drag.source.id === folder.id;
-            const folderActiveCount = folder.projectPaths.reduce((acc, p) => acc + (activeCountByProject.get(p.toLowerCase()) || 0), 0);
+            const folderActiveCount = folder.projectPaths.reduce((acc, p) => acc + (activeCountByProject.get(lookupKey(p)) || 0), 0);
             const tooltipText = folder.name + (folder.projectPaths.length ? ` (${folder.projectPaths.length})` : "");
             // Drop-line indicators around the folder header (top-level reorder hits).
             const folderIndicatorBefore = drag?.target?.kind === "reorder-top" && drag.target.index === idx;
@@ -541,10 +543,10 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
       {drag?.dragging && (() => {
         const commonProps = { ref: ghostRef, className: "ds-drag-ghost" } as const;
         if (drag.source.kind === "project") {
-          const pl = drag.source.path.toLowerCase();
+          const pl = lookupKey(drag.source.path);
           const proj = projectsByPath.get(pl);
           const settings = projectIcons[pl];
-          const displayName = settings?.customName || proj?.name || drag.source.path.split(/[\\/]/).pop() || "Project";
+          const displayName = settings?.customName || proj?.name || parseProjectKey(drag.source.path).path.split(/[\\/]/).pop() || "Project";
           return (
             <div {...commonProps}>
               <ProjectSidebarIcon iconValue={settings?.icon} color={settings?.color} name={displayName} highlighted={false} />
@@ -561,7 +563,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
       })()}
 
       {tooltip && !drag?.dragging && <Tooltip text={tooltip.text} rect={tooltip.rect} />}
-      {ctx?.kind === "project" && <ProjectContextMenu ctx={ctx} onEdit={() => onEditProject(ctx.project.path)} onReveal={() => invoke("reveal_in_explorer", { path: ctx.project.path }).catch(() => {})} onRemove={() => onRemoveProject(ctx.project.path)} onClose={() => setCtx(null)} />}
+      {ctx?.kind === "project" && <ProjectContextMenu ctx={ctx} onEdit={() => onEditProject(keyOf(ctx.project))} onReveal={ctx.project.host ? null : () => invoke("reveal_in_explorer", { path: ctx.project.path }).catch(() => {})} onRemove={() => onRemoveProject(keyOf(ctx.project))} onClose={() => setCtx(null)} />}
       {ctx?.kind === "folder" && <FolderContextMenu ctx={ctx} onRename={() => setEditingFolderId(ctx.folder.id)} onUngroup={() => ungroupFolder(ctx.folder.id)} onClose={() => setCtx(null)} />}
       {editingFolderId && (() => {
         const folder = sidebarLayout.find(i => i.kind === "folder" && i.id === editingFolderId) as SidebarFolder | undefined;

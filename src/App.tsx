@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -20,11 +19,15 @@ import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
+import { hostInvoke } from "./hosts/hostInvoke";
+import { asProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
+import { latestGate } from "./hosts/requestGate";
 
-// Flatten sidebar items to an ordered list of project paths (folders expanded in place).
-// Used to derive `savedPaths` for downstream code that doesn't care about folders.
-function flattenSidebarPaths(layout: SidebarItem[]): string[] {
-  const out: string[] = [];
+// Flatten sidebar items to an ordered list of project keys (folders expanded in place).
+// Used to derive `savedPaths` for downstream code that doesn't care about folders. A Local
+// Project's key is its bare path, so stored data needs no migration.
+function flattenSidebarPaths(layout: SidebarItem[]): ProjectKey[] {
+  const out: ProjectKey[] = [];
   for (const item of layout) {
     if (item.kind === "project") out.push(item.path);
     else for (const p of item.projectPaths) out.push(p);
@@ -32,14 +35,13 @@ function flattenSidebarPaths(layout: SidebarItem[]): string[] {
   return out;
 }
 
-function removeProjectFromLayout(layout: SidebarItem[], path: string): SidebarItem[] {
-  const pl = path.toLowerCase();
+function removeProjectFromLayout(layout: SidebarItem[], key: ProjectKey): SidebarItem[] {
   const out: SidebarItem[] = [];
   for (const item of layout) {
     if (item.kind === "project") {
-      if (item.path.toLowerCase() !== pl) out.push(item);
+      if (!sameKey(item.path, key)) out.push(item);
     } else {
-      const kept = item.projectPaths.filter(p => p.toLowerCase() !== pl);
+      const kept = item.projectPaths.filter(p => !sameKey(p, key));
       if (kept.length > 0) out.push({ ...item, projectPaths: kept });
       // An empty folder is dropped entirely — no ghost folders sticking around.
     }
@@ -47,9 +49,9 @@ function removeProjectFromLayout(layout: SidebarItem[], path: string): SidebarIt
   return out;
 }
 
-function addProjectToLayout(layout: SidebarItem[], path: string): SidebarItem[] {
-  if (flattenSidebarPaths(layout).some(p => p.toLowerCase() === path.toLowerCase())) return layout;
-  return [...layout, { kind: "project", path }];
+function addProjectToLayout(layout: SidebarItem[], key: ProjectKey): SidebarItem[] {
+  if (flattenSidebarPaths(layout).some(p => sameKey(p, key))) return layout;
+  return [...layout, { kind: "project", path: key }];
 }
 
 // Overlay that paints a drop-zone rectangle (edge of a target pane) while a tab is
@@ -73,7 +75,7 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
 
 export default function App() {
   const [allProjects, setAllProjects] = useState<ProjectInfo[]>([]);
-  const [savedPaths, setSavedPaths] = useState<string[]>([]);
+  const [savedPaths, setSavedPaths] = useState<ProjectKey[]>([]);
   // Discord-style sidebar — top-level list of projects and folders-of-projects. `savedPaths`
   // is kept as a derived flat view (used by other components that just want "which projects
   // are pinned") but `sidebarLayout` is the source of truth for ordering + grouping.
@@ -150,7 +152,7 @@ export default function App() {
   const [projectStatsView, setProjectStatsView] = useState<'cost' | 'tokens'>('cost');
   const [theme, setTheme] = useState<ThemeMode>("dark");
   const [showProjectPicker, setShowProjectPicker] = useState(false);
-  const [editingProjectPath, setEditingProjectPath] = useState<string | null>(null);
+  const [editingProjectKey, setEditingProjectKey] = useState<ProjectKey | null>(null);
   // Which agent CLIs exist on this machine — gates every agent-choice surface (plus
   // button, dropdown group, default-agent setting). Until the probe lands we assume
   // Claude-only, which matches the app's pre-Codex behavior.
@@ -162,7 +164,7 @@ export default function App() {
 
   useEffect(() => {
     AGENT_IDS.forEach(id => {
-      invoke<{ installed: boolean }>("detect_agent_binary", { binary: AGENTS[id].binary })
+      hostInvoke<{ installed: boolean }>(undefined, "detect_agent_binary", { binary: AGENTS[id].binary })
         .then(p => setInstalledAgents(prev => ({ ...prev, [id]: p.installed })))
         .catch(() => {});
     });
@@ -238,13 +240,13 @@ export default function App() {
         if (Array.isArray(storedLayout) && storedLayout.length > 0) {
           layout = storedLayout;
         } else if (paths && paths.length > 0) {
-          layout = paths.map(p => ({ kind: "project" as const, path: p }));
+          layout = paths.map(p => ({ kind: "project" as const, path: asProjectKey(p) }));
         }
         setSidebarLayout(layout);
         // Derive the flat paths list from the layout so downstream code stays happy.
         const derivedPaths = flattenSidebarPaths(layout);
         if (derivedPaths.length) setSavedPaths(derivedPaths);
-        else if (paths) setSavedPaths(paths);
+        else if (paths) setSavedPaths(paths.map(asProjectKey));
         if (icons) setProjectIcons(icons);
         if (typeof gitLazy === "boolean") setGitLazyPolling(gitLazy);
         if (typeof bgColor === "string") setTerminalBgColor(bgColor);
@@ -299,8 +301,8 @@ export default function App() {
       } catch (_) {}
       setTabsRestored(true);
       const [projects, sessions] = await Promise.all([
-        invoke<ProjectInfo[]>("list_claude_projects").catch(() => [] as ProjectInfo[]),
-        invoke<SessionInfo[]>("get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
+        hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => [] as ProjectInfo[]),
+        hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
       ]);
       setAllProjects(projects);
       setRecentSessions(sessions);
@@ -359,11 +361,13 @@ export default function App() {
 
   // ── Derive user projects ──────────────────────────────────────────
   useEffect(() => {
-    setUserProjects(savedPaths.map(path => {
-      const found = allProjects.find(p => p.path.toLowerCase() === path.toLowerCase());
+    setUserProjects(savedPaths.map(key => {
+      const found = allProjects.find(p => sameKey(keyOf(p), key));
       if (found) return found;
+      const { host, path } = parseProjectKey(key);
       const name = path.split(/[\\/]/).filter(Boolean).pop() || path;
-      return { name, path, encoded_name: "", session_count: 0, last_active: "" };
+      const fallback: ProjectInfo = { name, path, encoded_name: "", session_count: 0, last_active: "" };
+      return host ? { ...fallback, host } : fallback;
     }));
   }, [savedPaths, allProjects]);
 
@@ -372,25 +376,32 @@ export default function App() {
     if (tabs.length === 0) return;
 
     const syncTitles = async () => {
-      // Distinct original-cased project paths across open tabs (encoding is case-sensitive).
-      const origPaths = [...new Map(tabs.filter(t => t.projectPath).map(t => [t.projectPath!.toLowerCase(), t.projectPath!])).values()];
+      // Distinct projects across open tabs, by key (original-cased path: encoding is
+      // case-sensitive). A Project is (Host, path), so the same path on two Hosts is polled twice.
+      const projectsByKey = new Map<string, { host?: ProjectInfo["host"]; path: string }>();
+      for (const t of tabs) {
+        const k = keyOfTab(t);
+        // Later tabs overwrite earlier ones (same casing rule as before Remote Hosts).
+        if (k) projectsByKey.set(lookupKey(k), { host: t.host, path: t.projectPath! });
+      }
       const projectMap = new Map<string, ProjectInfo>();
-      for (const p of allProjects) projectMap.set(p.path.toLowerCase(), p);
+      for (const p of allProjects) projectMap.set(lookupKey(keyOf(p)), p);
 
-      for (const origPath of origPaths) {
-        const pp = origPath.toLowerCase();
+      for (const [pp, { host, path: origPath }] of projectsByKey) {
         // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so the
         // poll also reaches Codex/Cursor-only projects (which carry no Claude encoded_name).
-        const encodedName = projectMap.get(pp)?.encoded_name || origPath.replace(/[^a-zA-Z0-9]/g, "-");
+        const encodedName = encodedNameFor({ encoded_name: projectMap.get(pp)?.encoded_name, path: origPath });
         if (!encodedName) continue;
         try {
-          const sessions = await invoke<SessionInfo[]>("get_sessions", { encodedName });
+          const sessions = await hostInvoke<SessionInfo[]>(host, "get_sessions", { encodedName });
           setTabs(prev => {
             let changed = false;
             // Sessions already linked to an open tab — an unlinked tab must not claim them.
-            const claimed = new Set(prev.map(t => t.sessionId).filter(Boolean) as string[]);
+            // Host-qualified, so a remote session never claims a local id (amendment 19).
+            const claimed = new Set(prev.map(sessionKeyOfTab).filter(Boolean) as string[]);
             const next = prev.map(tab => {
-              if (tab.projectPath?.toLowerCase() !== pp) return tab;
+              const tk = keyOfTab(tab);
+              if (!tk || lookupKey(tk) !== pp) return tab;
               // Link an unlinked new-chat tab (Codex — which has no pre-created id — or a Cursor
               // tab whose create-chat fell back) to its freshly-created session: newest unclaimed
               // session of the same agent that appeared after the tab opened and already has a
@@ -398,9 +409,9 @@ export default function App() {
               // meaningful name instead of flashing an intermediate one.
               if (!tab.sessionId && tab.agent && tab.agent !== "claude") {
                 const candidate = sessions
-                  .filter(s => s.agent === tab.agent && !claimed.has(s.id) && !s.title.startsWith("Session ") && new Date(s.timestamp).getTime() >= (tab.createdAt ?? 0))
+                  .filter(s => s.agent === tab.agent && !claimed.has(sessionKeyOf({ host, id: s.id })) && !s.title.startsWith("Session ") && new Date(s.timestamp).getTime() >= (tab.createdAt ?? 0))
                   .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
-                if (candidate) { claimed.add(candidate.id); changed = true; return { ...tab, sessionId: candidate.id, title: candidate.title }; }
+                if (candidate) { claimed.add(sessionKeyOf({ host, id: candidate.id })); changed = true; return { ...tab, sessionId: candidate.id, title: candidate.title }; }
                 return tab;
               }
               // Linked tab: keep its title in sync — picks up `/rename`, ai-title, first-prompt alike.
@@ -420,7 +431,7 @@ export default function App() {
   }, [tabs.length, allProjects]); // Only re-setup when tab count or projects change
 
   // ── Persistence ───────────────────────────────────────────────────
-  const persistPaths = useCallback(async (paths: string[]) => {
+  const persistPaths = useCallback(async (paths: ProjectKey[]) => {
     setSavedPaths(paths);
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("project_paths", paths); } catch (_) {}
   }, []);
@@ -593,15 +604,21 @@ export default function App() {
 
 
   // ── Navigation: fresh load on every navigate ──────────────────────
+  // Responses for a project that is no longer selected are dropped (amendment 23).
+  const projectSessionsGate = useRef(latestGate());
   const handleSelectProject = useCallback(async (project: ProjectInfo) => {
     setSelectedProject(project);
     setActiveTabId("home");
     // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so projects
     // only ever used by Codex/Cursor/opencode (no ~/.claude entry) still list their sessions.
-    const encodedName = project.encoded_name || project.path.replace(/[^a-zA-Z0-9]/g, "-");
+    const encodedName = encodedNameFor(project);
+    const token = projectSessionsGate.current.begin(keyOf(project));
     if (!encodedName) { setProjectSessions([]); return; }
     setSessionsLoading(true);
-    try { setProjectSessions(await invoke<SessionInfo[]>("get_sessions", { encodedName })); } catch (_) { setProjectSessions([]); }
+    let next: SessionInfo[];
+    try { next = await hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName }); } catch (_) { next = []; }
+    if (!projectSessionsGate.current.isCurrent(token)) return;
+    setProjectSessions(next);
     setSessionsLoading(false);
   }, []);
 
@@ -610,8 +627,8 @@ export default function App() {
     setActiveTabId("home");
     setSessionsLoading(true);
     const [sessions, projects] = await Promise.all([
-      invoke<SessionInfo[]>("get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
-      invoke<ProjectInfo[]>("list_claude_projects").catch(() => allProjects),
+      hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
+      hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => allProjects),
     ]);
     setRecentSessions(sessions);
     setAllProjects(projects);
@@ -619,20 +636,20 @@ export default function App() {
   }, [allProjects]);
 
   // ── Project management ────────────────────────────────────────────
-  const handleToggleProject = useCallback(async (path: string) => {
-    const exists = flattenSidebarPaths(sidebarLayout).some(p => p.toLowerCase() === path.toLowerCase());
-    const next = exists ? removeProjectFromLayout(sidebarLayout, path) : addProjectToLayout(sidebarLayout, path);
+  const handleToggleProject = useCallback(async (key: ProjectKey) => {
+    const exists = flattenSidebarPaths(sidebarLayout).some(p => sameKey(p, key));
+    const next = exists ? removeProjectFromLayout(sidebarLayout, key) : addProjectToLayout(sidebarLayout, key);
     await persistSidebarLayout(next);
-    if (exists && selectedProject?.path.toLowerCase() === path.toLowerCase()) setSelectedProject(null);
+    if (exists && selectedProject && sameKey(keyOf(selectedProject), key)) setSelectedProject(null);
   }, [sidebarLayout, persistSidebarLayout, selectedProject]);
 
-  const handleRemoveProject = useCallback(async (path: string) => {
-    await persistSidebarLayout(removeProjectFromLayout(sidebarLayout, path));
-    if (selectedProject?.path.toLowerCase() === path.toLowerCase()) { setSelectedProject(null); setActiveTabId("home"); }
+  const handleRemoveProject = useCallback(async (key: ProjectKey) => {
+    await persistSidebarLayout(removeProjectFromLayout(sidebarLayout, key));
+    if (selectedProject && sameKey(keyOf(selectedProject), key)) { setSelectedProject(null); setActiveTabId("home"); }
   }, [sidebarLayout, persistSidebarLayout, selectedProject]);
 
-  const handleSaveProjectSettings = useCallback(async (path: string, next: ProjectSettings) => {
-    const key = path.toLowerCase();
+  const handleSaveProjectSettings = useCallback(async (projectKey: ProjectKey, next: ProjectSettings) => {
+    const key = lookupKey(projectKey);
     const existing = projectIcons[key] || {};
     // Editor only touches icon + color + customName; preserve folders that already exist.
     const entry: ProjectSettings = { ...existing, icon: next.icon, color: next.color, customName: next.customName };
@@ -641,8 +658,8 @@ export default function App() {
     await persistIcons(merged);
   }, [projectIcons, persistIcons]);
 
-  const handleSaveFolders = useCallback(async (path: string, folders: SessionFolder[]) => {
-    const key = path.toLowerCase();
+  const handleSaveFolders = useCallback(async (projectKey: ProjectKey, folders: SessionFolder[]) => {
+    const key = lookupKey(projectKey);
     const existing = projectIcons[key] || {};
     const entry: ProjectSettings = { ...existing, folders: folders.length > 0 ? folders : undefined };
     const merged: Record<string, ProjectSettings> = { ...projectIcons, [key]: entry };
@@ -653,16 +670,17 @@ export default function App() {
   const handleBrowseFolder = useCallback(async () => {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select project folder" });
-      if (selected && typeof selected === "string" && !flattenSidebarPaths(sidebarLayout).some(p => p.toLowerCase() === selected.toLowerCase())) {
-        await persistSidebarLayout(addProjectToLayout(sidebarLayout, selected));
-        setAllProjects(await invoke<ProjectInfo[]>("list_claude_projects"));
+      // Browse is Local only: the picked folder is on this computer.
+      if (selected && typeof selected === "string" && !flattenSidebarPaths(sidebarLayout).some(p => sameKey(p, selected))) {
+        await persistSidebarLayout(addProjectToLayout(sidebarLayout, asProjectKey(selected)));
+        setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects"));
       }
     } catch (_) {}
   }, [sidebarLayout, persistSidebarLayout]);
 
   // ── Tab management ────────────────────────────────────────────────
   const handleOpenSession = useCallback((session: SessionInfo, project?: ProjectInfo) => {
-    const existingTab = tabs.find(t => t.sessionId === session.id);
+    const existingTab = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf(session));
     if (existingTab) {
       if (existingTab.groupId) {
         // Tab lives inside a group — surface that group and focus the matching pane.
@@ -683,7 +701,7 @@ export default function App() {
 
   // Add as tab without switching to it — stays on current view.
   const handleOpenSessionBackground = useCallback((session: SessionInfo, project?: ProjectInfo) => {
-    const existingTab = tabs.find(t => t.sessionId === session.id);
+    const existingTab = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf(session));
     if (existingTab) return;
     const tabId = `terminal-${session.id}-${Date.now().toString(36)}`;
     setTabs(prev => [...prev, { id: tabId, type: "terminal", title: session.title, sessionId: session.id, agent: session.agent, projectPath: session.project_path || project?.path || "", projectName: session.project_name || project?.name || "", lastActiveAt: Date.now() }]);
@@ -753,7 +771,7 @@ export default function App() {
     }, 180);
   }, [activeTabId]);
 
-  const handleReorderProjects = useCallback(async (newPaths: string[]) => {
+  const handleReorderProjects = useCallback(async (newPaths: ProjectKey[]) => {
     await persistPaths(newPaths);
   }, [persistPaths]);
 
@@ -763,13 +781,14 @@ export default function App() {
     setTabs(newTabs);
   }, []);
 
-  const [hoveredProjectPath, setHoveredProjectPath] = useState<string | null>(null);
+  const [hoveredProjectKey, setHoveredProjectKey] = useState<ProjectKey | null>(null);
 
-  // Active terminal-tab count per project path (used for sidebar badges).
+  // Active terminal-tab count per project (used for sidebar badges), by lookupKey.
   const activeCountByProject = new Map<string, number>();
   for (const t of tabs) {
-    if (t.projectPath) {
-      const key = t.projectPath.toLowerCase();
+    const tk = keyOfTab(t);
+    if (tk) {
+      const key = lookupKey(tk);
       activeCountByProject.set(key, (activeCountByProject.get(key) || 0) + 1);
     }
   }
@@ -777,6 +796,7 @@ export default function App() {
   const showSettings = activeTabId === "settings";
   const activeTab = tabs.find(t => t.id === activeTabId);
   const activeTabProjectPath = activeTab?.projectPath || null;
+  const activeTabProjectKey = activeTab ? keyOfTab(activeTab) : null;
 
   // ── Groups (multi-pane split view) ────────────────────────────
   // A Group bundles up to 8 tabs into one "entry" in the tab bar, displaying them
@@ -1090,9 +1110,12 @@ export default function App() {
   // Current project context: active terminal's project, or selected project on the project view.
   // Null on home (no context → hide + and dropdown).
   const contextProject: ProjectInfo | null = (() => {
-    if (activeTabProjectPath) {
-      return allProjects.find(p => p.path.toLowerCase() === activeTabProjectPath.toLowerCase())
-        || (activeTab?.projectName ? { name: activeTab.projectName, path: activeTabProjectPath, encoded_name: "", session_count: 0, last_active: "" } : null);
+    if (activeTabProjectPath && activeTabProjectKey) {
+      const found = allProjects.find(p => sameKey(keyOf(p), activeTabProjectKey));
+      if (found) return found;
+      if (!activeTab?.projectName) return null;
+      const fallback: ProjectInfo = { name: activeTab.projectName, path: activeTabProjectPath, encoded_name: "", session_count: 0, last_active: "" };
+      return activeTab.host ? { ...fallback, host: activeTab.host } : fallback;
     }
     if (selectedProject) return selectedProject;
     return null;
@@ -1132,9 +1155,9 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectPath={hoveredProjectPath} linkedProjectPath={activeTabProjectPath} activeTabProject={contextProject} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
-      <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(p) => setEditingProjectPath(p)} onHoverProject={setHoveredProjectPath} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectPath={activeTabProjectPath} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
+      <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onHoverProject={setHoveredProjectKey} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectKey={activeTabProjectKey} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
@@ -1142,16 +1165,17 @@ export default function App() {
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <HomeView contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} openSessionIds={new Set(tabs.filter(t => t.sessionId).map(t => t.sessionId!))} sessionGroupName={(() => {
+          <HomeView contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} sessionGroupName={(() => {
             const map: Record<string, string> = {};
             for (const t of tabs) {
-              if (t.sessionId && t.groupId) {
+              const sk = sessionKeyOfTab(t);
+              if (sk && t.groupId) {
                 const g = groups.find(gr => gr.id === t.groupId);
-                if (g) map[t.sessionId] = g.name;
+                if (g) map[sk] = g.name;
               }
             }
             return map;
-          })()} loading={initialLoading} sessionsLoading={sessionsLoading} projectStatsView={projectStatsView} onChangeProjectStatsView={persistProjectStatsView} onOpenSession={handleOpenSession} onOpenSessionBackground={handleOpenSessionBackground} onSelectProject={handleSelectProject} onNewChat={handleNewChat} onAddProject={() => setShowProjectPicker(true)} onRemoveProject={handleRemoveProject} onEditProject={(p) => setEditingProjectPath(p)} onSaveFolders={handleSaveFolders} />
+          })()} loading={initialLoading} sessionsLoading={sessionsLoading} projectStatsView={projectStatsView} onChangeProjectStatsView={persistProjectStatsView} onOpenSession={handleOpenSession} onOpenSessionBackground={handleOpenSessionBackground} onSelectProject={handleSelectProject} onNewChat={handleNewChat} onAddProject={() => setShowProjectPicker(true)} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onSaveFolders={handleSaveFolders} />
         </div>
         {/* Work area — shows the active entry (either a single tab or a group's split layout).
             Terminal DOM hosts (created imperatively below) are physically reparented into
@@ -1213,8 +1237,9 @@ export default function App() {
           // Look up the encoded claude-projects dir name for this tab's project so the
           // TerminalTab can pull cost/context stats. Empty string when the project hasn't
           // been seen by claude yet — TerminalTab handles that by hiding the stats strip.
-          const encodedName = tab.projectPath
-            ? (allProjects.find(p => p.path.toLowerCase() === tab.projectPath!.toLowerCase())?.encoded_name || "")
+          const tabKey = keyOfTab(tab);
+          const encodedName = tabKey
+            ? (allProjects.find(p => sameKey(keyOf(p), tabKey))?.encoded_name || "")
             : "";
           // The third arg is the portal's key — without it, this array reconciles by index,
           // so reordering tabs shuffles which host each portal targets and React remounts
@@ -1228,13 +1253,13 @@ export default function App() {
         })}
       </div>
       </div>
-      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await invoke<ProjectInfo[]>("list_claude_projects")); } catch (_) {} }} />}
+      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} />}
       {agentPickerProject && <AgentPickerDialog project={agentPickerProject} agents={AGENT_IDS.filter(a => installedAgents[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
-      {editingProjectPath && (() => {
-        const proj = allProjects.find(p => p.path.toLowerCase() === editingProjectPath.toLowerCase()) || userProjects.find(p => p.path.toLowerCase() === editingProjectPath.toLowerCase());
-        if (!proj) { setEditingProjectPath(null); return null; }
-        const settings = projectIcons[editingProjectPath.toLowerCase()] || {};
-        return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectPath, s)} onClose={() => setEditingProjectPath(null)} />;
+      {editingProjectKey && (() => {
+        const proj = allProjects.find(p => sameKey(keyOf(p), editingProjectKey)) || userProjects.find(p => sameKey(keyOf(p), editingProjectKey));
+        if (!proj) { setEditingProjectKey(null); return null; }
+        const settings = projectIcons[lookupKey(editingProjectKey)] || {};
+        return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectKey, s)} onClose={() => setEditingProjectKey(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
     </div>

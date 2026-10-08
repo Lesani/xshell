@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import type { HostId } from "../hosts/types";
 import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon } from "lucide-react";
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
@@ -95,6 +97,7 @@ interface NodeProps {
   item: DirItem;
   depth: number;
   tick: number;
+  host?: HostId;
   activePath: string | null;
   onReveal: (path: string) => void;
   onContext: (x: number, y: number, item: DirItem) => void;
@@ -105,7 +108,7 @@ interface NodeProps {
 // One tree row + its lazily-loaded children. Children load on first expand and then stay
 // mounted (height-collapsed) so the open/close height transition is smooth and re-expanding
 // is instant. The grid-rows trick (0fr↔1fr) animates to the children's natural height.
-function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
+function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -114,19 +117,19 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
     if (!expanded || children !== null) return;
     let alive = true;
     setLoading(true);
-    invoke<DirItem[]>("list_dir", { path: item.path })
+    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path })
       .then((c) => { if (alive) setChildren(c); })
       .catch(() => { if (alive) setChildren([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [expanded, item.path, children]);
+  }, [expanded, item.path, children, host]);
 
   // Silent re-pull on each poll tick (only for an open, already-loaded folder) so additions /
   // deletions inside it show up live. Collapsed or unloaded folders are skipped.
   useEffect(() => {
     if (tick === 0 || !expanded || children === null) return;
     let alive = true;
-    invoke<DirItem[]>("list_dir", { path: item.path }).then((c) => { if (alive) setChildren(c); }).catch(() => {});
+    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path }).then((c) => { if (alive) setChildren(c); }).catch(() => {});
     return () => { alive = false; };
   }, [tick]);
 
@@ -143,7 +146,7 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
               ? (loading && expanded ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Loading…</div> : null)
               : children.length === 0
                 ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Empty</div>
-                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
+                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} host={host} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
           </div>
         </div>
       )}
@@ -153,6 +156,7 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
 
 interface PanelProps {
   rootPath: string;
+  host?: HostId;
   terminalId: string;
   visible: boolean;
   showTt: (text: string, el: HTMLElement) => void;
@@ -162,7 +166,7 @@ interface PanelProps {
 // Inner content of the file-explorer side panel — header (current dir + up/search/refresh) and
 // a scrollable area showing either the lazy tree or flat search results. TerminalTab wraps this
 // in the shared `.terminal-side-panel` + splitter, mirroring how the git panel is hosted.
-export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideTt }: PanelProps) {
+export function FileExplorerPanel({ rootPath, host, terminalId, visible, showTt, hideTt }: PanelProps) {
   // The browsable root. Starts at the terminal's cwd but the up-button can climb past it.
   const [cwd, setCwd] = useState(rootPath);
   const [roots, setRoots] = useState<DirItem[] | null>(null);
@@ -176,15 +180,16 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Reset to the terminal's cwd if the tab's project path changes underneath us.
-  useEffect(() => { setCwd(rootPath); }, [rootPath]);
+  // Keyed on (host, path): the same path on another Host is a different folder (amendment 23).
+  useEffect(() => { setCwd(rootPath); setRoots(null); }, [rootPath, host]);
 
   const load = useCallback((silent = false) => {
     if (!silent) setRefreshing(true);
-    invoke<DirItem[]>("list_dir", { path: cwd })
+    hostInvoke<DirItem[]>(host, "list_dir", { path: cwd })
       .then(setRoots)
       .catch(() => setRoots([]))
       .finally(() => { if (!silent) setRefreshing(false); });
-  }, [cwd]);
+  }, [cwd, host]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -210,11 +215,11 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
     if (!q) { setResults(null); setSearching(false); return; }
     setSearching(true);
     const t = window.setTimeout(() => {
-      invoke<DirItem[]>("search_dir", { root: cwd, query: q, limit: 300 })
+      hostInvoke<DirItem[]>(host, "search_dir", { root: cwd, query: q, limit: 300 })
         .then(setResults).catch(() => setResults([])).finally(() => setSearching(false));
     }, 220);
     return () => window.clearTimeout(t);
-  }, [query, searchOpen, cwd]);
+  }, [query, searchOpen, cwd, host]);
 
   useEffect(() => { if (searchOpen) searchInputRef.current?.focus(); }, [searchOpen]);
 
@@ -281,7 +286,7 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
           <>
             {roots === null && <div className="git-panel-empty">Loading…</div>}
             {roots !== null && roots.length === 0 && <div className="git-panel-empty">Empty folder</div>}
-            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
+            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} host={host} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
           </>
         )}
       </div>

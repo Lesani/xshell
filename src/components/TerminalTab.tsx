@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import type { HostId } from "../hosts/types";
 import { load } from "@tauri-apps/plugin-store";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -400,7 +402,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           const blob = await item.getType(imgType);
           if (blob.size > MAX_DROPPED_FILE_BYTES) throw new Error("clipboard image too large");
           const ext = imgType.split("/")[1] || "png";
-          const path = await invoke<string>("save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
+          const path = await hostInvoke<string>(tabRef.current.host, "save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
           invoke("write_terminal", { id: tabRef.current.id, data: /\s/.test(path) ? `"${path}" ` : `${path} ` }).catch(() => {});
           return;
         }
@@ -658,7 +660,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     if (!tab.projectPath) return;
     setGitRefreshing(true);
     try {
-      const status = await invoke<GitStatus>("get_git_status", { cwd: tab.projectPath });
+      const status = await hostInvoke<GitStatus>(tab.host, "get_git_status", { cwd: tab.projectPath });
       const currentKeys = new Set((status.files || []).map(fileKey));
       // "Changed since last poll" = keys present now that weren't present before. This
       // captures new files, newly-staged, newly-modified, etc. Pure removals aren't flagged
@@ -689,33 +691,33 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const fetchGitLog = useCallback(async () => {
     if (!tab.projectPath) return;
     try {
-      const commits = await invoke<GitCommit[]>("get_git_log", { cwd: tab.projectPath, limit: 25 });
+      const commits = await hostInvoke<GitCommit[]>(tab.host, "get_git_log", { cwd: tab.projectPath, limit: 25 });
       setGitCommits(commits);
     } catch (_) { setGitCommits([]); }
   }, [tab.projectPath]);
 
   const handleStageFile = useCallback(async (path: string) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_stage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
+    try { await hostInvoke(tab.host, "git_stage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
     fetchGitStatus();
   }, [tab.projectPath, fetchGitStatus]);
 
   const handleUnstageFile = useCallback(async (path: string) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_unstage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
+    try { await hostInvoke(tab.host, "git_unstage", { cwd: tab.projectPath, paths: [path] }); } catch (_) {}
     fetchGitStatus();
   }, [tab.projectPath, fetchGitStatus]);
 
   // Bulk stage/unstage — the +/- button on a section header stages (or unstages) every file in it.
   const handleStageAll = useCallback(async (paths: string[]) => {
     if (!tab.projectPath || paths.length === 0) return;
-    try { await invoke("git_stage", { cwd: tab.projectPath, paths }); } catch (_) {}
+    try { await hostInvoke(tab.host, "git_stage", { cwd: tab.projectPath, paths }); } catch (_) {}
     fetchGitStatus();
   }, [tab.projectPath, fetchGitStatus]);
 
   const handleUnstageAll = useCallback(async (paths: string[]) => {
     if (!tab.projectPath || paths.length === 0) return;
-    try { await invoke("git_unstage", { cwd: tab.projectPath, paths }); } catch (_) {}
+    try { await hostInvoke(tab.host, "git_unstage", { cwd: tab.projectPath, paths }); } catch (_) {}
     fetchGitStatus();
   }, [tab.projectPath, fetchGitStatus]);
 
@@ -724,7 +726,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // deletes. Clears the diff selection if it was that file.
   const handleDiscardFile = useCallback(async (path: string, mode: DiffMode) => {
     if (!tab.projectPath) return;
-    try { await invoke("git_discard", { cwd: tab.projectPath, path, mode }); } catch (_) {}
+    try { await hostInvoke(tab.host, "git_discard", { cwd: tab.projectPath, path, mode }); } catch (_) {}
     setSelectedDiff(prev => (prev && prev.path === path ? null : prev));
     fetchGitStatus();
   }, [tab.projectPath, fetchGitStatus]);
@@ -752,7 +754,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     }
     setCheckoutInFlight(true);
     try {
-      await invoke("git_checkout", { cwd: tab.projectPath, branch });
+      await hostInvoke(tab.host, "git_checkout", { cwd: tab.projectPath, branch });
       dismissCheckoutError();
       setBranchDropdown(null);
       // Refresh status immediately so the chip updates without waiting for the 3s tick.
@@ -770,7 +772,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const seedKnownSessionIds = useCallback(async () => {
     if (!tab.projectPath) return;
     try {
-      const ids = await invoke<string[]>("list_project_session_ids", { cwd: tab.projectPath });
+      const ids = await hostInvoke<string[]>(tab.host, "list_project_session_ids", { cwd: tab.projectPath });
       const set = new Set<string>(ids);
       if (tab.sessionId) set.add(tab.sessionId);
       knownSessionIdsRef.current = set;
@@ -789,7 +791,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     if (!tab.projectPath || !tab.sessionId || (tab.shellMode || "claude") !== "claude") return;
     if (!knownSeededRef.current) return;
     try {
-      const info = await invoke<BranchInfo | null>("detect_session_branch", {
+      const info = await hostInvoke<BranchInfo | null>(tab.host, "detect_session_branch", {
         cwd: tab.projectPath,
         currentSessionId: tab.sessionId,
         knownSessionIds: Array.from(knownSessionIdsRef.current),
@@ -890,7 +892,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     let cancelled = false;
     const fetchStats = async () => {
       try {
-        const sessions = await invoke<SessionInfo[]>("get_sessions", { encodedName: projectEncodedName });
+        const sessions = await hostInvoke<SessionInfo[]>(tab.host, "get_sessions", { encodedName: projectEncodedName });
         if (cancelled) return;
         const match = sessions.find(s => s.id === tab.sessionId);
         if (match) setSessionStats(match);
@@ -1073,7 +1075,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
               const images = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/") && f.size <= MAX_DROPPED_FILE_BYTES);
               if (images.length === 0) return;
               Promise.all(images.map(async (f) => {
-                return invoke<string>("save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
+                return hostInvoke<string>(tab.host, "save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
               })).then((paths) => {
                 invoke("write_terminal", { id: tab.id, data: paths.map(quote).join(" ") + " " }).catch(() => {});
                 terminalRef.current?.focus();
@@ -1139,7 +1141,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
                   <div className="git-hsplitter" onPointerDown={onGitBottomSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
                   <div className="git-bottom" style={{ height: gitBottomHeight }}>
                     <div className="git-tab-body">
-                      <DiffView cwd={tab.projectPath || "."} file={selectedDiff} version={gitTick} />
+                      <DiffView cwd={tab.projectPath || "."} host={tab.host} file={selectedDiff} version={gitTick} />
                     </div>
                   </div>
                 </>
@@ -1157,7 +1159,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           <>
             <div className="terminal-splitter" style={{ display: showFilePanel ? undefined : "none" }} onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth, display: showFilePanel ? undefined : "none" }}>
-              <FileExplorerPanel rootPath={tab.projectPath} terminalId={tab.id} visible={showFilePanel} showTt={showTt} hideTt={hideTt} />
+              <FileExplorerPanel rootPath={tab.projectPath} host={tab.host} terminalId={tab.id} visible={showFilePanel} showTt={showTt} hideTt={hideTt} />
             </div>
           </>
         )}
@@ -1223,6 +1225,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       {branchDropdown && tab.projectPath && gitStatus && (
         <BranchDropdown
           cwd={tab.projectPath}
+          host={tab.host}
           currentBranch={gitStatus.branch}
           dirty={(gitStatus.files?.length || 0) > 0}
           busy={checkoutInFlight}
@@ -1427,7 +1430,7 @@ function parseDiff(diff: string): DiffRow[] {
   return rows;
 }
 
-function DiffView({ cwd, file, version }: { cwd: string; file: { path: string; mode: DiffMode } | null; version: number }) {
+function DiffView({ cwd, host, file, version }: { cwd: string; host?: HostId; file: { path: string; mode: DiffMode } | null; version: number }) {
   const [diff, setDiff] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1441,12 +1444,12 @@ function DiffView({ cwd, file, version }: { cwd: string; file: { path: string; m
     if (!file) { setDiff(null); setError(null); return; }
     let alive = true;
     setLoading(true); setError(null);
-    invoke<string>("git_diff", { cwd, path: file.path, mode: file.mode })
+    hostInvoke<string>(host, "git_diff", { cwd, path: file.path, mode: file.mode })
       .then((d) => { if (alive) setDiff(d); })
       .catch((e) => { if (alive) { setError(String(e)); setDiff(null); } })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [cwd, file?.path, file?.mode, version]);
+  }, [cwd, host, file?.path, file?.mode, version]);
 
   const lang = file ? diffLang(file.path) : null;
   // Parse + highlight once per (diff, language) rather than on every render.
@@ -1506,16 +1509,16 @@ function DiffView({ cwd, file, version }: { cwd: string; file: { path: string; m
 // first (most-recent committerdate at the top), then a "Remote-only" section for refs
 // under refs/remotes/* that have no matching local branch yet (clicking those uses git's
 // DWIM checkout to create a tracking branch). Search filters by name.
-function BranchDropdown({ cwd, currentBranch, dirty, busy, panelWidth, anchorRect, anchorEl, onPick, onClose }: { cwd: string; currentBranch: string; dirty: boolean; busy: boolean; panelWidth: number; anchorRect: DOMRect; anchorEl: HTMLElement; onPick: (branch: string) => void; onClose: () => void }) {
+function BranchDropdown({ cwd, host, currentBranch, dirty, busy, panelWidth, anchorRect, anchorEl, onPick, onClose }: { cwd: string; host?: HostId; currentBranch: string; dirty: boolean; busy: boolean; panelWidth: number; anchorRect: DOMRect; anchorEl: HTMLElement; onPick: (branch: string) => void; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [branches, setBranches] = useState<GitBranchEntry[] | null>(null);
   const [query, setQuery] = useState("");
 
   useEffect(() => {
-    invoke<GitBranchEntry[]>("list_git_branches", { cwd })
+    hostInvoke<GitBranchEntry[]>(host, "list_git_branches", { cwd })
       .then(setBranches)
       .catch(() => setBranches([]));
-  }, [cwd]);
+  }, [cwd, host]);
 
   // Click-outside / Escape close. Ignore clicks on the anchor itself so toggling works.
   useEffect(() => {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
 import { Sparkles } from "lucide-react";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { OpenAIIcon } from "./OpenAIIcon";
@@ -74,9 +74,9 @@ export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripPro
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
-      invoke<ClaudeCostSummary>("get_claude_cost_summary").then(v => { if (!cancelled) setClaudeCost(v); }).catch(() => {});
-      invoke<GlobalRateLimits>("get_global_rate_limits").then(v => { if (!cancelled) setClaudeLimits(v); }).catch(() => {});
-      invoke<CodexUsage>("get_codex_usage").then(v => { if (!cancelled) setCodex(v); }).catch(() => {});
+      hostInvoke<ClaudeCostSummary>(undefined, "get_claude_cost_summary").then(v => { if (!cancelled) setClaudeCost(v); }).catch(() => {});
+      hostInvoke<GlobalRateLimits>(undefined, "get_global_rate_limits").then(v => { if (!cancelled) setClaudeLimits(v); }).catch(() => {});
+      hostInvoke<CodexUsage>(undefined, "get_codex_usage").then(v => { if (!cancelled) setCodex(v); }).catch(() => {});
     };
     refresh();
     const timer = setInterval(refresh, 60000);

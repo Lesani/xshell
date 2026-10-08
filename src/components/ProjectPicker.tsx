@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import { isPinned, toProjectKey, type ProjectKey } from "../hosts/projectKey";
 import { Check, FolderPlus, Search } from "lucide-react";
 import type { CodexProjectInfo, ProjectInfo } from "../types";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -8,8 +9,8 @@ import { normalizePath } from "../utils";
 
 interface ProjectPickerProps {
   allProjects: ProjectInfo[];
-  savedPaths: string[];
-  onToggle: (path: string) => void;
+  savedPaths: ProjectKey[];
+  onToggle: (key: ProjectKey) => void;
   onBrowse: () => void;
   onClose: () => void;
   onRefresh?: () => void;
@@ -39,10 +40,10 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
   // (or since the last open) appear without requiring a restart.
   useEffect(() => {
     onRefresh?.();
-    invoke<CodexProjectInfo[]>("list_codex_projects").then(setCodexProjects).catch(() => {});
-    invoke<CodexProjectInfo[]>("list_cursor_projects").then(setCursorProjects).catch(() => {});
-    invoke<CodexProjectInfo[]>("list_opencode_projects").then(setOpencodeProjects).catch(() => {});
-    invoke<CodexProjectInfo[]>("list_antigravity_projects").then(setAntigravityProjects).catch(() => {});
+    hostInvoke<CodexProjectInfo[]>(undefined, "list_codex_projects").then(setCodexProjects).catch(() => {});
+    hostInvoke<CodexProjectInfo[]>(undefined, "list_cursor_projects").then(setCursorProjects).catch(() => {});
+    hostInvoke<CodexProjectInfo[]>(undefined, "list_opencode_projects").then(setOpencodeProjects).catch(() => {});
+    hostInvoke<CodexProjectInfo[]>(undefined, "list_antigravity_projects").then(setAntigravityProjects).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -82,7 +83,7 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
     return q ? list.filter(r => r.name.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)) : list;
   }, [allProjects, codexProjects, cursorProjects, opencodeProjects, antigravityProjects, filter]);
 
-  const isChecked = (path: string) => savedPaths.some(p => normalizePath(p) === normalizePath(path));
+  const isChecked = (path: string) => isPinned(savedPaths, undefined, path);
 
   return (
     <div className="picker-overlay">
@@ -108,7 +109,7 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
           <span className="corner-dot corner-dot-br" aria-hidden />
           <div className="picker-list">
             {rows.map(row => (
-              <div key={row.path} className={`picker-item ${isChecked(row.path) ? "checked" : ""}`} onClick={() => onToggle(row.path)}>
+              <div key={row.path} className={`picker-item ${isChecked(row.path) ? "checked" : ""}`} onClick={() => onToggle(toProjectKey(undefined, row.path))}>
                 <div className="picker-check">
                   {isChecked(row.path) && <Check size={12} />}
                 </div>

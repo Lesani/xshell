@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
 import { Activity } from "lucide-react";
 import { AGENTS, AgentIcon, type AgentId } from "../agents";
 import type { CodexUsage } from "../types";
@@ -133,7 +133,7 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   useEffect(() => {
     let cancelled = false;
     if (!showClaude) { setClaude(null); return; }
-    const fetch = () => invoke<GlobalRateLimits>("get_global_rate_limits").then(d => { if (!cancelled) setClaude(d); }).catch(() => {});
+    const fetch = () => hostInvoke<GlobalRateLimits>(undefined, "get_global_rate_limits").then(d => { if (!cancelled) setClaude(d); }).catch(() => {});
     fetch();
     const id = setInterval(fetch, 8000);
     const onFocus = () => fetch();
@@ -144,7 +144,7 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   useEffect(() => {
     let cancelled = false;
     if (!showCodex) { setCodex(null); return; }
-    const fetch = () => invoke<CodexUsage>("get_codex_usage").then(d => { if (!cancelled) setCodex(d); }).catch(() => {});
+    const fetch = () => hostInvoke<CodexUsage>(undefined, "get_codex_usage").then(d => { if (!cancelled) setCodex(d); }).catch(() => {});
     fetch();
     const id = setInterval(fetch, 30000);
     const onFocus = () => fetch();

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
 import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
@@ -188,7 +189,7 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
 
   useEffect(() => {
     let cancelled = false;
-    invoke<{ stats_dir_present: boolean; stats_session_count: number }>("probe_statusline_setup")
+    hostInvoke<{ stats_dir_present: boolean; stats_session_count: number }>(undefined, "probe_statusline_setup")
       .then(p => { if (!cancelled) setStatslineConfigured(p.stats_dir_present && p.stats_session_count > 0); })
       .catch(() => { if (!cancelled) setStatslineConfigured(false); });
     return () => { cancelled = true; };
@@ -197,7 +198,7 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
   const probeAgents = useCallback(() => {
     AGENT_IDS.forEach(id => {
       setAgentProbes(prev => ({ ...prev, [id]: { loading: true, probe: prev[id].probe } }));
-      invoke<AgentProbe>("detect_agent_binary", { binary: AGENTS[id].binary })
+      hostInvoke<AgentProbe>(undefined, "detect_agent_binary", { binary: AGENTS[id].binary })
         .then(probe => setAgentProbes(prev => ({ ...prev, [id]: { loading: false, probe } })))
         .catch(() => setAgentProbes(prev => ({ ...prev, [id]: { loading: false, probe: null } })));
     });

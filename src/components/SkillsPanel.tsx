@@ -1,5 +1,9 @@
-import { useEffect, useState, ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import { toProjectKey } from "../hosts/projectKey";
+import { latestGate } from "../hosts/requestGate";
+import type { HostId } from "../hosts/types";
 import { Network, User, FolderTree, Puzzle, ChevronRight, Plug, Globe, Terminal as TerminalIcon, Wand2, FolderOpen, Sparkles, Brain, Bot, Slash, Zap, FileText, Layers } from "lucide-react";
 import type { ProjectSkills, Skill, Plugin, McpInfo, ProjectMemories, Memory, SubagentInfo, SlashCommand, HookEntry, ClaudeMdFile, SettingsSource, CodexContext, CursorContext, OpencodeContext, AntigravityContext, AgentContextSection } from "../types";
 import { useTooltip, useTt, ttProps, TooltipProvider } from "./Tooltip";
@@ -8,6 +12,9 @@ import { AGENTS, AgentIcon } from "../agents";
 
 interface Props {
   projectPath: string;
+  // Set when the project lives on a Remote Host: reads go through the Daemon and every
+  // reveal-in-explorer action is hidden (the files are not on this computer).
+  host?: HostId;
   projectName: string;
   // Which agents have sessions in this project — part of the root-section gating (a pure
   // Codex/Cursor project hides the Claude roots and vice versa; see visibility rules below).
@@ -16,9 +23,14 @@ interface Props {
 
 function revealFolder(path: string) { invoke("reveal_in_explorer", { path }).catch(() => {}); }
 
+// False inside a remote project's panel — RevealBtn renders nothing.
+const RevealAllowed = createContext(true);
+
 // Reveal-in-explorer icon button with custom tooltip (no native title).
 function RevealBtn({ path, size = 10, label = "Reveal in Explorer" }: { path: string; size?: number; label?: string }) {
   const tt = useTt();
+  const allowed = useContext(RevealAllowed);
+  if (!allowed) return null;
   return <button className="tn-act" onClick={() => revealFolder(path)} {...ttProps(tt, label)}><FolderOpen size={size} /></button>;
 }
 
@@ -424,7 +436,7 @@ function AgentContextRoot({ title, icon, trustLevel, sections, onOpenDoc }: { ti
 }
 
 // ─── Main panel ────────────────────────────────────────────────────
-export function SkillsPanel({ projectPath, projectName, agentPresence }: Props) {
+export function SkillsPanel({ projectPath, host, projectName, agentPresence }: Props) {
   const [data, setData] = useState<ProjectSkills | null>(null);
   const [codexCtx, setCodexCtx] = useState<CodexContext | null>(null);
   const [cursorCtx, setCursorCtx] = useState<CursorContext | null>(null);
@@ -439,53 +451,76 @@ export function SkillsPanel({ projectPath, projectName, agentPresence }: Props) 
   const { tt, Tooltip } = useTooltip();
 
   useEffect(() => {
-    invoke<string>("get_username").then(setUsername).catch(() => {});
-    invoke<string>("get_home_dir").then(setHomeDir).catch(() => {});
-  }, []);
+    let alive = true;
+    hostInvoke<string>(host, "get_username").then(v => { if (alive) setUsername(v); }).catch(() => {});
+    hostInvoke<string>(host, "get_home_dir").then(v => { if (alive) setHomeDir(v); }).catch(() => {});
+    return () => { alive = false; };
+  }, [host]);
 
+  // Responses for a superseded (host, path) are dropped (amendment 23) — the same path on
+  // another Host is a different project.
+  const gateRef = useRef(latestGate());
   const fetchData = async () => {
     if (!projectPath) return;
+    const token = gateRef.current.begin(toProjectKey(host, projectPath));
+    const live = () => gateRef.current.isCurrent(token);
     setLoading(true);
     try {
-      const skills = await invoke<ProjectSkills>("get_project_skills", { projectPath });
+      const skills = await hostInvoke<ProjectSkills>(host, "get_project_skills", { projectPath });
+      if (!live()) return;
       setData(skills);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] skills error:", e);
       setData({ personal_skills: [], project_skills: [], plugins: [], user_mcps: [], project_mcps: [], subagents: [], slash_commands: [], hooks: [], claude_md_files: [], settings_sources: [] });
     }
     try {
-      const mems = await invoke<ProjectMemories>("get_project_memories", { projectPath });
+      const mems = await hostInvoke<ProjectMemories>(host, "get_project_memories", { projectPath });
+      if (!live()) return;
       setMemories(mems);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] memories error:", e);
       setMemories({ dir: "", items: [] });
-    } finally { setLoading(false); }
+    } finally { if (live()) setLoading(false); }
     try {
-      setCodexCtx(await invoke<CodexContext>("get_codex_context", { projectPath }));
+      const ctx = await hostInvoke<CodexContext>(host, "get_codex_context", { projectPath });
+      if (!live()) return;
+      setCodexCtx(ctx);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] codex context error:", e);
       setCodexCtx(null);
     }
     try {
-      setCursorCtx(await invoke<CursorContext>("get_cursor_context", { projectPath }));
+      const ctx = await hostInvoke<CursorContext>(host, "get_cursor_context", { projectPath });
+      if (!live()) return;
+      setCursorCtx(ctx);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] cursor context error:", e);
       setCursorCtx(null);
     }
     try {
-      setOpencodeCtx(await invoke<OpencodeContext>("get_opencode_context", { projectPath }));
+      const ctx = await hostInvoke<OpencodeContext>(host, "get_opencode_context", { projectPath });
+      if (!live()) return;
+      setOpencodeCtx(ctx);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] opencode context error:", e);
       setOpencodeCtx(null);
     }
     try {
-      setAntigravityCtx(await invoke<AntigravityContext>("get_antigravity_context", { projectPath }));
+      const ctx = await hostInvoke<AntigravityContext>(host, "get_antigravity_context", { projectPath });
+      if (!live()) return;
+      setAntigravityCtx(ctx);
     } catch (e) {
+      if (!live()) return;
       console.error("[SkillsPanel] antigravity context error:", e);
       setAntigravityCtx(null);
     }
   };
-  useEffect(() => { fetchData(); /* eslint-disable-next-line */ }, [projectPath]);
+  useEffect(() => { fetchData(); /* eslint-disable-next-line */ }, [projectPath, host]);
 
   const userPlugins  = data?.plugins.filter(p => p.scope === "user")  || [];
   const localPlugins = data?.plugins.filter(p => p.scope === "local") || [];
@@ -526,6 +561,7 @@ export function SkillsPanel({ projectPath, projectName, agentPresence }: Props) 
 
   return (
     <TooltipProvider tt={tt}>
+    <RevealAllowed.Provider value={!host}>
     <aside className="skills-panel">
       <div className="skills-panel-head">
         <Network size={14} className="skills-panel-head-icon" />
@@ -616,9 +652,10 @@ export function SkillsPanel({ projectPath, projectName, agentPresence }: Props) 
         )}
       </div>
       {Tooltip}
-      <MarkdownDialog path={openMemory?.path || null} title={openMemory?.name} onClose={() => setOpenMemory(null)} />
-      <MarkdownDialog path={openDoc?.path || null} title={openDoc?.title} onClose={() => setOpenDoc(null)} />
+      <MarkdownDialog path={openMemory?.path || null} title={openMemory?.name} host={host} onClose={() => setOpenMemory(null)} />
+      <MarkdownDialog path={openDoc?.path || null} title={openDoc?.title} host={host} onClose={() => setOpenDoc(null)} />
     </aside>
+    </RevealAllowed.Provider>
     </TooltipProvider>
   );
 }

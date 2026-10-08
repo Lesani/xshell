@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
 import { X, Check, AlertCircle, Copy, RefreshCw, FolderOpen, FileText, Info } from "lucide-react";
 import { useTooltip, ttProps } from "./Tooltip";
 
@@ -239,7 +240,7 @@ export function DetailedSessionInfoWizard({ onClose }: Props) {
   const { tt, Tooltip } = useTooltip();
 
   const refresh = useCallback(() => {
-    invoke<StatuslineProbe>("probe_statusline_setup").then(setProbe).catch(() => setProbe(null));
+    hostInvoke<StatuslineProbe>(undefined, "probe_statusline_setup").then(setProbe).catch(() => setProbe(null));
   }, []);
 
   useEffect(() => {

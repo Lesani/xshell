@@ -1,9 +1,13 @@
+import type { HostId } from "./hosts/types";
+import type { ProjectKey } from "./hosts/projectKey";
+
 export interface ProjectInfo {
   name: string;
   path: string;
   encoded_name: string;
   session_count: number;
   last_active: string;
+  host?: HostId; // absent = Local Host; stamped only at the fetch boundary
 }
 
 // Directory Codex has been used in — derived from ~/.codex/sessions rollout metadata
@@ -13,6 +17,7 @@ export interface CodexProjectInfo {
   path: string;
   session_count: number;
   last_active: string;
+  host?: HostId; // absent = Local Host
 }
 
 // ── Agent context (see lib.rs: get_codex_context) ──
@@ -49,6 +54,16 @@ export interface OpencodeContext {
 export interface AntigravityContext {
   present: boolean;
   sections: AgentContextSection[];
+}
+
+// Claude's account-wide rate-limit snapshot (see lib.rs: get_global_rate_limits).
+export interface GlobalRateLimits {
+  five_hour_pct: number | null;
+  seven_day_pct: number | null;
+  five_hour_resets_at: number | null;
+  seven_day_resets_at: number | null;
+  last_update_iso?: string | null;
+  source_session_id?: string | null;
 }
 
 // ── Home usage strip (see lib.rs: get_claude_cost_summary / get_codex_usage) ──
@@ -120,6 +135,7 @@ export interface SessionInfo {
   // Which coding agent produced this session — drives the row icon, model formatting, and
   // the resume command the terminal tab spawns.
   agent: "claude" | "codex" | "cursor" | "opencode" | "antigravity";
+  host?: HostId; // absent = Local Host; stamped only at the fetch boundary
 }
 
 export interface MessagePreview {
@@ -181,12 +197,12 @@ export interface SidebarFolder {
   name: string;
   color?: string; // hex, e.g. "#c96442" — optional background tint for the folder pill
   collapsed: boolean;
-  projectPaths: string[];
+  projectPaths: ProjectKey[];
 }
 
 export interface SidebarProject {
   kind: "project";
-  path: string;
+  path: ProjectKey;
 }
 
 export type SidebarItem = SidebarFolder | SidebarProject;
@@ -293,6 +309,8 @@ export interface Tab {
   groupId?: string; // when set, the tab is a member of a group (not standalone in the tab bar)
   lastActiveAt?: number; // ms epoch — bumped whenever the tab becomes the focused leaf; drives "recent" sort in the tab search dialog
   createdAt?: number; // ms epoch at tab creation (stable, unlike lastActiveAt) — lets the title-sync link an unlinked agent tab to a session that appeared after it opened
+  host?: HostId;     // Remote Host the Terminal runs on; absent = Local Host
+  terminal?: string; // remote Terminal UUID (the tab id is `remote-<uuid>`)
 }
 
 // Binary layout tree for a group's split view. Leaves point at tab ids.
