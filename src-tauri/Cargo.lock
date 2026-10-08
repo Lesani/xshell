@@ -5491,6 +5491,7 @@ name = "xshell"
 version = "1.5.0"
 dependencies = [
  "dirs",
+ "libc",
  "portable-pty",
  "reqwest",
  "rustls",
