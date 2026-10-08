@@ -88,3 +88,97 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           cp src-tauri/target/release/xshell.exe "xshell_${VERSION}_x64.exe"
           gh release upload "${GITHUB_REF_NAME}" "xshell_${VERSION}_x64.exe" --clobber
+
+  # The Desktop downloads xshelld-<triple> and its .sha256 from the release of its own
+  # version (src-tauri/src/hosts/binaries.rs). The sidecar is a sha256sum line.
+  xshelld-assets:
+    needs: publish-tauri
+    # On a tag the assets go into the draft release, so the desktop job must have created it.
+    # Branch dry runs (workflow_dispatch) build the daemon even if desktop publishing fails.
+    if: ${{ !cancelled() && (needs.publish-tauri.result == 'success' || !startsWith(github.ref, 'refs/tags/v')) }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rusqlite (bundled) compiles C; each musl target builds natively with musl-gcc on a
+      # runner of its own architecture.
+      - name: Install musl-tools
+        if: endsWith(matrix.target, '-linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Build (musl-gcc)
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        run: |
+          cc_var="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          export "$cc_var=musl-gcc"
+          cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
+
+      - name: Build (native)
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
+
+      - name: Stage asset and checksum
+        shell: bash
+        run: |
+          name="xshelld-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release-daemon/xshelld" "$name"
+          if [[ "${{ matrix.target }}" == *linux-musl ]]; then
+            file "$name"
+            file "$name" | grep -Eq 'statically linked|static-pie linked'
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name" > "$name.sha256"
+          else
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+          cat "$name.sha256"
+          ls -l "$name" "$name.sha256"
+
+      - name: Upload to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="xshelld-${{ matrix.target }}"
+          gh release upload "${GITHUB_REF_NAME}" "$name" "$name.sha256" --clobber
+
+      # Dry runs (workflow_dispatch on a branch) keep the files as a workflow artifact.
+      - name: Upload workflow artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshelld-${{ matrix.target }}
+          path: |
+            src-tauri/xshelld-${{ matrix.target }}
+            src-tauri/xshelld-${{ matrix.target }}.sha256

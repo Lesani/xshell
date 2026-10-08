@@ -90,27 +90,43 @@ jobs:
       - run: cargo clippy -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-core -p xshelld -p xshell-hostlink --locked
   xshelld-musl:
-    # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, hence musl-gcc.
-    runs-on: ubuntu-22.04
+    # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
+    # builds natively with musl-gcc on a runner of its own architecture. The release workflow
+    # builds the same way, so this proves the release path on every push.
+    name: xshelld-musl (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: src-tauri
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-      - run: cargo build -p xshelld --profile release-daemon --target x86_64-unknown-linux-musl --locked
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          cc_var="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          export "$cc_var=musl-gcc"
+          cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
       - name: Static and runnable
         shell: bash
         run: |
-          bin=target/x86_64-unknown-linux-musl/release-daemon/xshelld
+          bin=target/${{ matrix.target }}/release-daemon/xshelld
           file "$bin"
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
           "$bin" --version
