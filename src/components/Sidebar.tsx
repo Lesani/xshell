@@ -4,6 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { useProjectImage } from "../hooks/useProjectImage";
 import { FolderEditorDialog } from "./FolderEditorDialog";
 import { RateLimitIndicator } from "./RateLimitIndicator";
+import { HostBadge } from "./HostBadge";
+import { useHostsSnapshot, statusLabel } from "../hosts/useHosts";
+import { isUsableStatus } from "../hosts/registry";
+import { fmt } from "../hosts/strings";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SidebarItem, SidebarFolder } from "../types";
 import { asProjectKey, keyBasename, keyOf, lookupKey, parseProjectKey, sameKey, type ProjectKey } from "../hosts/projectKey";
@@ -154,6 +158,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
   const ghostRef = useRef<HTMLDivElement | null>(null);
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const isHomeActive = activeTabId === "home" && !selectedProject;
+  const hostsSnap = useHostsSnapshot();
   const isInTerminal = activeTabId !== "home" && activeTabId !== "settings";
 
   const projectsByPath = useMemo(() => {
@@ -423,6 +428,14 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
     const isLinked = isInTerminal && !!linkedProjectKey && lookupKey(linkedProjectKey) === pl;
     const highlighted = isSelected || isLinked;
     const activeCount = activeCountByProject.get(pl) || 0;
+    // Remote Project: Host badge; dimmed with a status dot while its Host is not usable.
+    const host = proj?.host ?? parseProjectKey(path).host;
+    const hostName = host ? (hostsSnap.configs.find(c => c.id === host)?.name || host) : "";
+    const hostStatus = host ? hostsSnap.status[host] : undefined;
+    const stale = !!host && !isUsableStatus(hostStatus);
+    const tooltipText = !host ? displayName
+      : stale ? `${fmt("sidebar.project.hostTooltip", { project: displayName, host: hostName })} · ${fmt("sidebar.project.staleTooltip", { host: hostName, status: statusLabel(hostStatus) })}`
+      : fmt("sidebar.project.hostTooltip", { project: displayName, host: hostName });
     const isDragging = drag?.source.kind === "project" && lookupKey(drag.source.path) === pl;
     const isMergeTarget = drag?.target?.kind === "merge-with-project" && lookupKey(drag.target.path) === pl;
     // Drop-line indicators on the item itself — cleaner than explicit gap strips.
@@ -441,15 +454,17 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
         data-drop-path={path}
         data-drop-idx={idx}
         data-drop-parent={parentFolderId || ""}
-        className={`ds-item ${isSelected ? "active" : ""} ${isLinked ? "linked" : ""} ${isDragging ? "ds-dragging" : ""} ${isMergeTarget ? "ds-merge-target" : ""}`}
+        className={`ds-item ${isSelected ? "active" : ""} ${isLinked ? "linked" : ""} ${isDragging ? "ds-dragging" : ""} ${isMergeTarget ? "ds-merge-target" : ""} ${stale ? "ds-stale" : ""}`}
         onClick={(e) => { if (!drag?.dragging && proj) onSelectProject(proj); e.stopPropagation(); }}
         onContextMenu={(e) => proj && handleProjectCtx(e, proj)}
-        onMouseEnter={(e) => { onHoverProject(path); showTooltip(displayName, e.currentTarget); }}
+        onMouseEnter={(e) => { onHoverProject(path); showTooltip(tooltipText, e.currentTarget); }}
         onMouseLeave={() => { onHoverProject(null); hideTooltip(); }}
         onPointerDown={(e) => startProjectDrag(e, path, parentFolderId)}
       >
         {indicatorBefore && <div className="ds-drop-line ds-drop-line-before" />}
         <ProjectSidebarIcon iconValue={customIcon} color={settings?.color} name={displayName} highlighted={highlighted} />
+        {host && <HostBadge host={host} size="md" className="ds-host-badge" />}
+        {stale && <div className={`ds-host-status ds-host-status-${hostStatus?.status ?? "reconnecting"}`} />}
         {activeCount > 0 && <div className="ds-active-badge" title={`${activeCount} active session${activeCount > 1 ? "s" : ""}`}>{activeCount}</div>}
         <div className="ds-indicator" />
         {indicatorAfter && <div className="ds-drop-line ds-drop-line-after" />}

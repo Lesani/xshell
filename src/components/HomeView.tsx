@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderPlus, Plus, Trash2, GitBranch, Search, ArrowRight, ArrowUp, Pencil, Folder as FolderIcon, ChevronRight, X, FolderOpen, MessageSquare, Sparkles } from "lucide-react";
+import { FolderPlus, Plus, Trash2, GitBranch, Search, ArrowRight, ArrowUp, Pencil, Folder as FolderIcon, ChevronRight, X, FolderOpen, MessageSquare, Sparkles, AlertTriangle } from "lucide-react";
 import { SkillsPanel } from "./SkillsPanel";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { AGENTS, AgentIcon } from "../agents";
@@ -10,6 +10,9 @@ import { useProjectImage } from "../hooks/useProjectImage";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo } from "../types";
 import { keyOf, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
+import { HostBadge } from "./HostBadge";
+import { registry } from "../hosts/registry";
+import { fmt } from "../hosts/strings";
 
 interface HomeViewProps {
   projects: ProjectInfo[];
@@ -19,6 +22,8 @@ interface HomeViewProps {
   projectIcons: Record<string, ProjectSettings>;
   recentSessions: SessionInfo[];
   projectSessions: SessionInfo[];
+  // True when the project's session list came from the offline cache (amendment 24).
+  projectSessionsStale?: boolean;
   openSessionIds: Set<string>;               // session keys (sessionKeyOf)
   sessionGroupName?: Record<string, string>; // by session key
   loading: boolean;
@@ -392,6 +397,7 @@ function SessionRow({ session, isOpen, groupName, onClick, isDragging, onPointer
         {isOpen && <div className="session-open-dot" />}
       </div>
       <AgentIcon agent={session.agent} size={14} className={`session-item-prompt ${AGENTS[session.agent || "claude"].neutralIcon ? "session-item-prompt-neutral" : ""}`} />
+      {session.host && <HostBadge host={session.host} size="md" className="session-item-host" tooltip={fmt("home.session.hostBadge", { host: registry.hostName(session.host) })} tt={tt ?? null} />}
       <div className="session-item-content">
         <div className="session-item-title">{session.title}</div>
         <div className="session-item-meta">
@@ -620,7 +626,7 @@ function filterSessions(sessions: SessionInfo[], query: string): SessionInfo[] {
   return sessions.filter(s => s.title.toLowerCase().includes(q) || s.project_name.toLowerCase().includes(q) || s.git_branch.toLowerCase().includes(q));
 }
 
-export function HomeView({ projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
+export function HomeView({ projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, projectSessionsStale, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
   const [search, setSearch] = useState("");
   // Scroll-driven collapse of the stats strip in the project detail view. Same UX the old
   // preview cards had: scroll down → strip slides up out of view; pull back up at the very
@@ -813,7 +819,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                   <ProjectIcon project={selectedProject} projectIcons={projectIcons} size={40} />
                   <div>
                     <div className="sessions-view-title">{projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name}</div>
-                    <div className="sessions-view-path">{selectedProject.path}</div>
+                    <div className="sessions-view-path">{selectedProject.host && <HostBadge host={selectedProject.host} size="md" className="sessions-view-host" tooltip={fmt("home.session.hostBadge", { host: registry.hostName(selectedProject.host) })} tt={tt} />}{selectedProject.path}</div>
                   </div>
                 </div>
                 <div className="sessions-view-header-actions">
@@ -823,6 +829,9 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                 </div>
               </div>
             </div>
+            {selectedProject.host && projectSessionsStale && (
+              <div className="home-stale-banner"><AlertTriangle size={12} /><span>{fmt("home.project.stale", { host: registry.hostName(selectedProject.host) })}</span></div>
+            )}
             <button className={`continue-chip ${showChip ? "show" : ""}`} onClick={restoreStats} onMouseEnter={(e) => showTt("Show project stats", e.currentTarget)} onMouseLeave={hideTt}>
               <ArrowUp size={11} />
               <span>Project stats</span>

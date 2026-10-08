@@ -7,7 +7,10 @@ import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { timeAgo, processSessions } from "../utils";
 import type { ProjectInfo, ProjectSettings, SessionInfo, Tab, Group } from "../types";
-import { getAvailableShells } from "../shells";
+import { getAvailableShells, shellsForPlatform } from "../shells";
+import { registry } from "../hosts/registry";
+import { useHostsSnapshot } from "../hosts/useHosts";
+import { fmt } from "../hosts/strings";
 import { collectLeafIds } from "../layout";
 import { Layers } from "lucide-react";
 import { useDragReorder } from "../hooks/useDragReorder";
@@ -107,7 +110,8 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
     ? { top, left: Math.max(4, anchorRect.left) }
     : { top, right: Math.max(4, window.innerWidth - anchorRect.right) };
 
-  const shells = getAvailableShells();
+  // A Remote Host offers its own OS's shells, never the Desktop's.
+  const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();
   // If there's no project, collapsing the shells makes no sense — there's nothing else in the dropdown.
   const [shellsOpen, setShellsOpen] = useState(!project);
   // With one agent installed the new-chat entry stays a single row for that agent; with
@@ -207,6 +211,8 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
 
 export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
+  const hostsSnap = useHostsSnapshot();
+  const hostNameOf = (h: string) => hostsSnap.configs.find(c => c.id === h)?.name || h;
   const highlightKey = hoveredProjectKey || linkedProjectKey || (selectedProject ? keyOf(selectedProject) : null);
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
@@ -362,7 +368,8 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const isRawShell = tab.shellMode === "raw";
             const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
             const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
-            const tooltipText = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const baseTooltip = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const tooltipText = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
             return (
               <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}

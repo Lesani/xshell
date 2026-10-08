@@ -1,5 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { hostInvoke } from "../hosts/hostInvoke";
+import { fanOutSourced, freshestRateLimits, mergeCodexUsage, type Sourced } from "../hosts/aggregate";
+import { registry } from "../hosts/registry";
+import { useHostsSnapshot, usableHosts } from "../hosts/useHosts";
+import { fmt } from "../hosts/strings";
 import { Activity } from "lucide-react";
 import { AGENTS, AgentIcon, type AgentId } from "../agents";
 import type { CodexUsage } from "../types";
@@ -29,6 +32,7 @@ interface RateSource {
   // session — flagged so the footer says "as of" rather than "updated".
   stale: boolean;
   note: string | null; // extra footer context (e.g. plan type)
+  sourceHost: string | null; // Remote Host the reading came from; null = this computer
 }
 
 function formatResetIn(unixSec: number | null): string {
@@ -109,7 +113,7 @@ function Panel({ sources, rect }: PanelProps) {
             <MeterRow label="5-hour limit" pct={src.fivePct} resetsAt={src.fiveResetsAt} />
             <MeterRow label="Weekly limit" pct={src.sevenPct} resetsAt={src.sevenResetsAt} />
             <div className="rl-panel-foot">
-              {src.stale ? "Limits as of " : "Updated "}{ageLabel(src.updatedIso)}{src.note ? ` · ${src.note}` : ""}
+              {src.stale ? "Limits as of " : "Updated "}{ageLabel(src.updatedIso)}{src.note ? ` · ${src.note}` : ""}{src.sourceHost ? ` · ${fmt("usage.sourceHost", { host: src.sourceHost })}` : ""}
             </div>
           </div>
         </div>
@@ -123,8 +127,10 @@ function Panel({ sources, rect }: PanelProps) {
 // collapsed chip shows the single worst percentage across all shown agents; the popover
 // breaks it down per agent.
 export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: boolean; showCodex: boolean }) {
-  const [claude, setClaude] = useState<GlobalRateLimits | null>(null);
-  const [codex, setCodex] = useState<CodexUsage | null>(null);
+  // Freshest reading across this computer and every usable Remote Host (same account).
+  const [claude, setClaude] = useState<Sourced<GlobalRateLimits> | null>(null);
+  const [codex, setCodex] = useState<Sourced<CodexUsage> | null>(null);
+  const usableKey = usableHosts(useHostsSnapshot()).join(",");
   const [hoverRect, setHoverRect] = useState<DOMRect | null>(null);
   const hideTimer = useRef<number | null>(null);
 
@@ -133,33 +139,45 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   useEffect(() => {
     let cancelled = false;
     if (!showClaude) { setClaude(null); return; }
-    const fetch = () => hostInvoke<GlobalRateLimits>(undefined, "get_global_rate_limits").then(d => { if (!cancelled) setClaude(d); }).catch(() => {});
+    const fetch = () => fanOutSourced<GlobalRateLimits>("get_global_rate_limits").then(r => {
+      if (cancelled || r.length === 0) return;
+      const best = freshestRateLimits(r.map(x => x.value));
+      setClaude(r.find(x => x.value === best) ?? null);
+    }).catch(() => {});
     fetch();
     const id = setInterval(fetch, 8000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
     return () => { cancelled = true; clearInterval(id); window.removeEventListener("focus", onFocus); };
-  }, [showClaude]);
+  }, [showClaude, usableKey]);
 
   useEffect(() => {
     let cancelled = false;
     if (!showCodex) { setCodex(null); return; }
-    const fetch = () => hostInvoke<CodexUsage>(undefined, "get_codex_usage").then(d => { if (!cancelled) setCodex(d); }).catch(() => {});
+    const fetch = () => fanOutSourced<CodexUsage>("get_codex_usage").then(r => {
+      if (cancelled || r.length === 0) return;
+      const merged = mergeCodexUsage(r.map(x => x.value));
+      // Source = the Host whose windows won the merge (freshest update).
+      const src = r.find(x => x.value.rate_limits_updated_iso === merged.rate_limits_updated_iso) ?? r[0];
+      setCodex({ host: src.host, value: merged });
+    }).catch(() => {});
     fetch();
     const id = setInterval(fetch, 30000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
     return () => { cancelled = true; clearInterval(id); window.removeEventListener("focus", onFocus); };
-  }, [showCodex]);
+  }, [showCodex, usableKey]);
 
   // Assemble the visible sources. An agent contributes only when enabled AND it actually
   // has a percentage to show — no empty placeholder rows.
   const sources: RateSource[] = [];
-  if (showClaude && claude && (claude.five_hour_pct != null || claude.seven_day_pct != null)) {
-    sources.push({ agent: "claude", fivePct: claude.five_hour_pct, fiveResetsAt: claude.five_hour_resets_at, sevenPct: claude.seven_day_pct, sevenResetsAt: claude.seven_day_resets_at, updatedIso: claude.last_update_iso, stale: false, note: null });
+  const cl = claude?.value;
+  if (showClaude && cl && (cl.five_hour_pct != null || cl.seven_day_pct != null)) {
+    sources.push({ agent: "claude", fivePct: cl.five_hour_pct, fiveResetsAt: cl.five_hour_resets_at, sevenPct: cl.seven_day_pct, sevenResetsAt: cl.seven_day_resets_at, updatedIso: cl.last_update_iso ?? null, stale: false, note: null, sourceHost: claude?.host ? registry.hostName(claude.host) : null });
   }
-  if (showCodex && codex?.present && (codex.primary?.used_percent != null || codex.secondary?.used_percent != null)) {
-    sources.push({ agent: "codex", fivePct: codex.primary?.used_percent ?? null, fiveResetsAt: codex.primary?.resets_at ?? null, sevenPct: codex.secondary?.used_percent ?? null, sevenResetsAt: codex.secondary?.resets_at ?? null, updatedIso: codex.rate_limits_updated_iso, stale: true, note: null });
+  const cx = codex?.value;
+  if (showCodex && cx?.present && (cx.primary?.used_percent != null || cx.secondary?.used_percent != null)) {
+    sources.push({ agent: "codex", fivePct: cx.primary?.used_percent ?? null, fiveResetsAt: cx.primary?.resets_at ?? null, sevenPct: cx.secondary?.used_percent ?? null, sevenResetsAt: cx.secondary?.resets_at ?? null, updatedIso: cx.rate_limits_updated_iso, stale: true, note: null, sourceHost: codex?.host ? registry.hostName(codex.host) : null });
   }
 
   if (sources.length === 0) return null;

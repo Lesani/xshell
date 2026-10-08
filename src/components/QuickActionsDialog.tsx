@@ -3,7 +3,8 @@ import { Search, Terminal as TerminalIcon, Settings, X, PanelLeft, ChevronRight,
 import { useProjectImage } from "../hooks/useProjectImage";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AgentIcon, type AgentId } from "../agents";
-import { getAvailableShells } from "../shells";
+import { getAvailableShells, shellsForPlatform } from "../shells";
+import { registry } from "../hosts/registry";
 import { keyOf, keyOfTab, lookupKey, type ProjectKey } from "../hosts/projectKey";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, Tab } from "../types";
@@ -129,7 +130,9 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
   ], [hasActiveTab, activeTabId, contextLabel, newChatAgent, onCloseTab, onGoHome, onToggleSidebar, onOpenSettings]);
 
   // Available shells for the drill-down view.
-  const shells = useMemo(() => getAvailableShells(), []);
+  // Shells for the context project's Host (a Remote Host offers its own OS's shells).
+  const contextHost = contextProject?.host;
+  const shells = useMemo(() => contextHost ? shellsForPlatform(registry.getStatus(contextHost)?.os ?? "linux") : getAvailableShells(), [contextHost]);
 
   const filteredShells = useMemo(() => {
     const q = query.trim().toLowerCase();

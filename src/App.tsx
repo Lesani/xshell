@@ -20,8 +20,8 @@ import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
-import { hostInvoke } from "./hosts/hostInvoke";
-import { asProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
+import { hostInvoke, hostQuery } from "./hosts/hostInvoke";
+import { asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
 import { cache } from "./hosts/cache";
@@ -130,6 +130,8 @@ export default function App() {
   // Refetch a Host's data whenever it becomes usable.
   useEffect(() => registry.onUsable(host => { fetchHostData(host); }), [fetchHostData]);
   const [projectSessions, setProjectSessions] = useState<SessionInfo[]>([]);
+  // Remote project page served from the offline cache (stays true until a live fetch).
+  const [projectSessionsStale, setProjectSessionsStale] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   // Lazy polling = only fetch git status while the panel is open (a single fetch fires at
@@ -680,11 +682,17 @@ export default function App() {
     if (!encodedName) { setProjectSessions([]); return; }
     setSessionsLoading(true);
     let next: SessionInfo[];
-    try { next = await hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName }); } catch (_) { next = []; }
+    let stale = false;
+    try {
+      const r = await hostQuery<SessionInfo[]>(project.host, "get_sessions", { encodedName });
+      next = r.value;
+      stale = r.stale;
+    } catch (_) { next = []; }
     // Stamp the Host at the fetch boundary so every consumer knows where a session lives.
     if (project.host) next = next.map(x => ({ ...x, host: project.host }));
     if (!projectSessionsGate.current.isCurrent(token)) return;
     setProjectSessions(next);
+    setProjectSessionsStale(stale);
     setSessionsLoading(false);
   }, []);
 
@@ -743,6 +751,14 @@ export default function App() {
         setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects"));
       }
     } catch (_) {}
+  }, [sidebarLayout, persistSidebarLayout]);
+
+  // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
+  const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
+    if (!registry.isUsable(host)) return "offline";
+    try { await hostInvoke(host, "list_dir", { path }); } catch (_) { return registry.isUsable(host) ? "notFound" : "offline"; }
+    await persistSidebarLayout(addProjectToLayout(sidebarLayout, toProjectKey(host, path)));
+    return "ok";
   }, [sidebarLayout, persistSidebarLayout]);
 
   // ── Tab management ────────────────────────────────────────────────
@@ -1301,7 +1317,7 @@ export default function App() {
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <HomeView contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} sessionGroupName={(() => {
+          <HomeView contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} projectSessionsStale={projectSessionsStale} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} sessionGroupName={(() => {
             const map: Record<string, string> = {};
             for (const t of tabs) {
               const sk = sessionKeyOfTab(t);
@@ -1389,8 +1405,8 @@ export default function App() {
         })}
       </div>
       </div>
-      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} />}
-      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
+      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} onAddRemotePath={handleAddRemotePath} />}
+      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} hostName={agentPickerProject.host ? registry.hostName(agentPickerProject.host) : undefined} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
       {editingProjectKey && (() => {
         const proj = allProjects.find(p => sameKey(keyOf(p), editingProjectKey)) || userProjects.find(p => sameKey(keyOf(p), editingProjectKey));
         if (!proj) { setEditingProjectKey(null); return null; }
