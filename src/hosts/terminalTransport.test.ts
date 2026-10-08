@@ -275,3 +275,86 @@ describe("connection failures during start", () => {
     await expect(rt.start(H, "a1", g, opts)).resolves.toMatchObject({ kind: "attached", exitCode: 3 });
   });
 });
+
+// Sol finding 2: a failed close keeps its intent, is retried, and never resurrects the Tab.
+import { reconcileHosts, tabFromTerminal } from "./reconcile";
+describe("failed closes", () => {
+  const listed = (uuid: string) => [{ terminal: uuid, spec: { cwd: "/p", agent: "claude" }, meta: {}, createdAtMs: 1, pid: 1, exitCode: null }];
+
+  it("close rejected offline → reconnect → close retried, tab not resurrected", async () => {
+    let usable = false;
+    let becomeUsable!: () => void;
+    const waiting = new Promise<void>(r => { becomeUsable = r; });
+    const rt = new RemoteTerminals({ isUsable: () => usable, waitUsable: () => waiting });
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "host_term_attach") return Promise.resolve({ exitCode: null });
+      if (cmd === "host_term_close") return calls("host_term_close").length === 1 ? Promise.reject({ code: "offline", message: "down" }) : Promise.resolve();
+      return Promise.resolve();
+    });
+    const g = rt.mount(H, "f1", sinks().s);
+    await rt.start(H, "f1", g, opts);
+    const closing = rt.close(H, "f1");
+    rt.unmount("f1", g);
+    await flush();
+    expect(calls("host_term_close")).toHaveLength(1);
+    expect(rt.isClosing("f1")).toBe(true);
+    // The Host reconnects and lists the still-running Terminal before the retry lands:
+    // reconcile must not bring its Tab back.
+    const r = reconcileHosts([], [[H, listed("f1")]], { pending: new Set(), isClosing: u => rt.isClosing(u) });
+    expect(r.deltas).toEqual([]);
+    usable = true;
+    becomeUsable();
+    await closing;
+    expect(calls("host_term_close")).toHaveLength(2);
+    expect(calls("host_term_detach")).toEqual([]);
+    expect(rt.isClosing("f1")).toBe(true); // retired only once the list drops it
+    rt.forgetUnlisted(H, []);
+    expect(rt.isClosing("f1")).toBe(false);
+  });
+
+  it("repeated close sends again after a permanent failure, and the tab is restored", async () => {
+    const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: () => Promise.resolve() });
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "host_term_attach") return Promise.resolve({ exitCode: null });
+      if (cmd === "host_term_close") return calls("host_term_close").length === 1 ? Promise.reject({ code: "remote", message: "permission denied" }) : Promise.resolve();
+      return Promise.resolve();
+    });
+    const failures: string[] = [];
+    rt.onCloseFailed(f => failures.push(`${f.uuid}: ${f.error}`));
+    const g = rt.mount(H, "f2", sinks().s);
+    await rt.start(H, "f2", g, opts);
+    await rt.close(H, "f2");
+    expect(failures).toEqual(["f2: permission denied"]);
+    expect(rt.isClosing("f2")).toBe(false);
+    // Still listed → its Tab comes back and can attach again.
+    const r = reconcileHosts([], [[H, listed("f2")]], { pending: new Set(), isClosing: u => rt.isClosing(u) });
+    expect(r.deltas[0].add.map(t => t.id)).toEqual([tabFromTerminal(H, listed("f2")[0]).id]);
+    const g2 = rt.mount(H, "f2", sinks().s);
+    await expect(rt.start(H, "f2", g2, opts)).resolves.toMatchObject({ kind: "attached" });
+    await rt.close(H, "f2");
+    expect(calls("host_term_close")).toHaveLength(2);
+  });
+
+  it("a busy Host gets the close again after a backoff", async () => {
+    const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: () => Promise.resolve() });
+    invoke.mockImplementation((cmd: string) => cmd === "host_term_close" && calls("host_term_close").length === 1 ? Promise.reject({ code: "busy", message: "queue full" }) : Promise.resolve({ exitCode: null }));
+    const g = rt.mount(H, "f3", sinks().s);
+    await rt.start(H, "f3", g, opts);
+    const t0 = Date.now();
+    await rt.close(H, "f3");
+    expect(calls("host_term_close")).toHaveLength(2);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(200);
+  });
+
+  it("the list dropping the Terminal stops a close waiting for the Host", async () => {
+    const rt = new RemoteTerminals({ isUsable: () => false, waitUsable: (_h, signal) => new Promise((_r, rej) => signal?.addEventListener("abort", () => rej(new Error("aborted")))) });
+    invoke.mockImplementation((cmd: string) => cmd === "host_term_close" ? Promise.reject({ code: "offline", message: "down" }) : Promise.resolve({ exitCode: null }));
+    const g = rt.mount(H, "f4", sinks().s);
+    await rt.start(H, "f4", g, opts);
+    const closing = rt.close(H, "f4");
+    await flush();
+    rt.forgetUnlisted(H, []);
+    await closing;
+    expect(calls("host_term_close")).toHaveLength(1);
+  });
+});

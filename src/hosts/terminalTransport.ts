@@ -1,6 +1,8 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type { Tab } from "../types";
 import { getShellById } from "../shells";
+import { registry } from "./registry";
+import { backoffDelay, sleep } from "./backoff";
 import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type RemoteExit, type TerminalMeta } from "./types";
 
 // The one place TerminalTab talks to a PTY. Local tabs use today's spawn/write/resize/close
@@ -47,6 +49,7 @@ export const pendingUuids = (): ReadonlySet<string> => new Set(pendingOpens.keys
 // An open is retried only when the request never reached the Daemon (offline/busy); after a
 // timeout the Terminal may exist, so that open is reported as failed.
 const RETRY_ATTACH: ReadonlySet<HostErrorCode> = new Set<HostErrorCode>(["offline", "busy", "timeout", "incompatible"]);
+const CLOSE_RETRY: ReadonlySet<HostErrorCode> = new Set<HostErrorCode>(["offline", "busy", "timeout", "incompatible", "unknown-host"]);
 const RETRY_OPEN: ReadonlySet<HostErrorCode> = new Set<HostErrorCode>(["offline", "busy", "incompatible"]);
 export function isRetryableStartError(err: unknown, kind: "open" | "attach"): boolean {
   return isHostError(err) && (kind === "open" ? RETRY_OPEN : RETRY_ATTACH).has(err.code);
@@ -88,8 +91,22 @@ interface Entry {
   opening: Promise<unknown> | null;
   closeIntent: boolean;
   closing: Promise<void> | null;
+  closeAbort: AbortController | null; // cancels a close waiting to be retried
   gone: boolean;          // no longer listed by the Daemon
 }
+
+// A close the Host rejected for good while the Terminal is still listed. The Tab is restored
+// (attachable again) and the error shown.
+export interface CloseFailure { host: HostId; uuid: string; error: string }
+
+export interface RemoteTerminalsDeps {
+  waitUsable(host: HostId, signal?: AbortSignal): Promise<void>;
+  isUsable(host: HostId): boolean;
+}
+const registryDeps: RemoteTerminalsDeps = {
+  waitUsable: (h, s) => registry.waitUsable(h, s),
+  isUsable: (h) => registry.isUsable(h),
+};
 
 // A start that failed for a connection reason; the caller waits for the Host and retries.
 export class RetryableStartError extends Error {
@@ -102,11 +119,15 @@ export interface RemoteStartResult { kind: "opened" | "attached"; exitCode: numb
 export class RemoteTerminals {
   private entries = new Map<string, Entry>();
   private gen = 0;
+  private closeFailedListeners = new Set<(f: CloseFailure) => void>();
+  constructor(private deps: RemoteTerminalsDeps = registryDeps) {}
+
+  onCloseFailed(cb: (f: CloseFailure) => void): () => void { this.closeFailedListeners.add(cb); return () => { this.closeFailedListeners.delete(cb); }; }
 
   private entry(host: HostId, uuid: string): Entry {
     let e = this.entries.get(uuid);
     if (!e) {
-      e = { host, uuid, mountGen: 0, sinks: null, inflight: null, epoch: 0, attached: false, opening: null, closeIntent: false, closing: null, gone: false };
+      e = { host, uuid, mountGen: 0, sinks: null, inflight: null, epoch: 0, attached: false, opening: null, closeIntent: false, closing: null, closeAbort: null, gone: false };
       this.entries.set(uuid, e);
     }
     return e;
@@ -227,11 +248,17 @@ export class RemoteTerminals {
   }
 
   // Explicit close (the user closed the Tab): ends the Terminal for every Desktop.
-  // Independent of unmount and idempotent. A Terminal that was never opened is just dropped.
+  // Independent of unmount and idempotent while in progress. A Terminal that was never opened
+  // is just dropped. The intent is kept until the close succeeds or the Daemon stops listing
+  // the Terminal: a close that fails for a connection reason is retried once the Host is
+  // usable (with backoff while it stays busy). A close the Host rejects for good restores the
+  // Tab (attachable again) and reports the error through onCloseFailed.
   close(host: HostId, uuid: string): Promise<void> {
     const e = this.entry(host, uuid);
     e.closeIntent = true;
     if (e.closing) return e.closing;
+    const abort = new AbortController();
+    e.closeAbort = abort;
     e.closing = (async () => {
       const pending = pendingOpens.get(uuid);
       if (pending && pending.state === "opening") { pendingOpens.delete(uuid); return; }
@@ -240,22 +267,53 @@ export class RemoteTerminals {
         try { await e.opening; } catch (_) { pendingOpens.delete(uuid); return; }
       }
       e.epoch++;
-      try { await invoke("host_term_close", { host, terminal: uuid }); } catch (_) {}
-      pendingOpens.delete(uuid);
+      for (let attempt = 0; ; attempt++) {
+        if (e.gone || abort.signal.aborted) return;
+        try {
+          await invoke("host_term_close", { host, terminal: uuid });
+          pendingOpens.delete(uuid);
+          return; // the intent stays until the list drops the Terminal (forget)
+        } catch (err) {
+          if (e.gone || abort.signal.aborted) return;
+          if (isHostError(err) && CLOSE_RETRY.has(err.code)) {
+            try {
+              // Wait for the Host; if it is usable but busy, back off before trying again.
+              if (this.deps.isUsable(host)) await sleep(backoffDelay(attempt), abort.signal);
+              else await this.deps.waitUsable(host, abort.signal);
+            } catch (_) { return; }
+            continue;
+          }
+          // Rejected for good: the Terminal keeps running, so its Tab comes back.
+          e.closeIntent = false;
+          e.closing = null;
+          e.closeAbort = null;
+          const error = errorText(err);
+          for (const l of this.closeFailedListeners) l({ host, uuid, error });
+          return;
+        }
+      }
     })();
     return e.closing;
   }
 
-  // The Daemon no longer lists the Terminal: nothing to detach or close.
+  // The Daemon no longer lists the Terminal: nothing to detach or close (a pending close is
+  // done — the Terminal is gone).
   forget(uuid: string) {
     const e = this.entries.get(uuid);
-    if (e) { e.gone = true; e.sinks = null; }
+    if (e) { e.gone = true; e.sinks = null; e.closeAbort?.abort(); }
     this.entries.delete(uuid);
+  }
+
+  // A Host's list arrived: Terminals it no longer lists whose Tab was closed here are gone,
+  // so their close intent is retired (a close waiting to be retried stops).
+  forgetUnlisted(host: HostId, listed: readonly string[]) {
+    const keep = new Set(listed);
+    for (const [uuid, e] of [...this.entries]) if (e.host === host && e.closeIntent && !keep.has(uuid) && !pendingOpens.has(uuid)) this.forget(uuid);
   }
 
   // Host removed from settings: drop every attachment without ending anything.
   dropHost(host: HostId) {
-    for (const [uuid, e] of this.entries) if (e.host === host) { e.gone = true; e.sinks = null; this.entries.delete(uuid); }
+    for (const [uuid, e] of this.entries) if (e.host === host) { e.gone = true; e.sinks = null; e.closeAbort?.abort(); this.entries.delete(uuid); }
   }
 }
 

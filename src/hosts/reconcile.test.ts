@@ -131,3 +131,31 @@ describe("groups with remote leaves (amendment 22)", () => {
     expect(s2.groups[0].layout).toEqual(leaf(c.id));
   });
 });
+
+// Sol finding 3: removals from several Hosts are one transaction — focus never lands on a
+// pane another Host's list removed in the same pass.
+import { applyHostsReconcile, reconcileHosts } from "./reconcile";
+describe("multi-host reconcile transaction", () => {
+  const leaf = (tabId: string) => ({ kind: "leaf" as const, tabId });
+  const split = (a: any, b: any) => ({ kind: "split" as const, direction: "col" as const, ratio: 0.5, children: [a, b] as [any, any] });
+
+  it("removals from two hosts in one group keep focus on a survivor", () => {
+    const a = { ...tabFromTerminal(H, info("a")), groupId: "g1" };
+    const b = { ...tabFromTerminal(H2, info("b")), groupId: "g1" };
+    const c: Tab = { id: "terminal-c", type: "terminal", title: "C", groupId: "g1" };
+    const d: Tab = { id: "terminal-d", type: "terminal", title: "D", groupId: "g1" };
+    // a, b first so a naive per-host pass would hand focus from a to b
+    const g: Group = { id: "g1", name: "Group 1", layout: split(split(leaf(a.id), leaf(b.id)), split(leaf(c.id), leaf(d.id))) };
+    const r = reconcileHosts([a, b, c, d], [[H, []], [H2, []]], { pending: new Set() });
+    expect(r.removed.sort()).toEqual([a.id, b.id].sort());
+    const s = applyHostsReconcile({ tabs: [a, b, c, d], groups: [g], activeLeafByGroup: { g1: a.id } }, r);
+    expect(s.tabs.map(t => t.id)).toEqual([c.id, d.id]);
+    expect(s.groups[0].layout).toEqual(split(leaf(c.id), leaf(d.id)));
+    expect([c.id, d.id]).toContain(s.activeLeafByGroup.g1);
+  });
+
+  it("closing terminals are never re-added; other hosts still reconcile", () => {
+    const r = reconcileHosts([], [[H, [info("x")]], [H2, [info("y")]]], { pending: new Set(), isClosing: u => u === "x" });
+    expect(r.deltas.flatMap(d => d.add.map(t => t.terminal))).toEqual(["y"]);
+  });
+});

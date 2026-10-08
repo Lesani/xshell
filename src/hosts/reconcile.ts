@@ -156,3 +156,49 @@ export function restoreGroupIds(tabs: Tab[], groups: Group[]): Tab[] {
     return gid && t.groupId !== gid ? { ...t, groupId: gid } : t;
   });
 }
+
+// ── Several Hosts in one pass (one tabs/groups/focus transaction) ───
+
+export interface ReconcileOptions {
+  pending: ReadonlySet<string>;
+  isDirty?: (tabId: string, field: "title" | "sessionId") => boolean;
+  // Terminals whose Tab the user closed (close still in progress): never re-added.
+  isClosing?: (uuid: string) => boolean;
+}
+
+export interface HostsReconcile {
+  deltas: ReconcileDelta[];
+  removed: string[];   // tab ids removed across all Hosts
+  confirmed: string[]; // pending-open uuids now listed
+}
+
+// Reconciles every Host's latest list against one evolving tab list, so the result can be
+// applied as a single transaction.
+export function reconcileHosts(tabs: Tab[], lists: [HostId, TerminalInfo[]][], o: ReconcileOptions): HostsReconcile {
+  const deltas: ReconcileDelta[] = [];
+  const removed: string[] = [];
+  const confirmed: string[] = [];
+  let cur = tabs;
+  for (const [host, list] of lists) {
+    const visible = o.isClosing ? list.filter(i => !o.isClosing!(i.terminal)) : list;
+    const d = reconcile(cur, host, visible, o.pending, o.isDirty);
+    confirmed.push(...d.confirmed);
+    if (isEmptyDelta(d)) continue;
+    deltas.push(d);
+    removed.push(...d.remove);
+    cur = applyTabDelta(cur, d);
+  }
+  return { deltas, removed, confirmed };
+}
+
+// Pure pieces of the transaction, each usable as a functional state update.
+export const applyTabDeltas = (tabs: Tab[], deltas: ReconcileDelta[]): Tab[] => deltas.reduce(applyTabDelta, tabs);
+
+// Applies every Host's delta at once: groups lose all removed leaves together, and focus
+// moves only to a leaf that survives every removal.
+export function applyHostsReconcile(s: ReconcileState, r: HostsReconcile): ReconcileState {
+  const tabs = applyTabDeltas(s.tabs, r.deltas);
+  const groups = applyGroupRemovals(s.groups, r.removed);
+  const activeLeafByGroup = applyFocusRemovals(s.activeLeafByGroup, groups, r.removed);
+  return { tabs, groups, activeLeafByGroup };
+}

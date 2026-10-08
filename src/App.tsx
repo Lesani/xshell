@@ -25,7 +25,7 @@ import { asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey,
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
 import { cache } from "./hosts/cache";
-import { applyFocusRemovals, applyGroupRemovals, applyTabDelta, isEmptyDelta, reconcile, restoreGroupIds, tabFromTerminal } from "./hosts/reconcile";
+import { applyFocusRemovals, applyGroupRemovals, applyTabDeltas, reconcileHosts, restoreGroupIds, tabFromTerminal } from "./hosts/reconcile";
 import { localEdits, metaSync } from "./hosts/metaSync";
 import { planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
@@ -1060,30 +1060,49 @@ export default function App() {
   // Buffered until the restore of open_tabs + cache has committed (amendment 21); then the
   // latest list per Host is applied. Lists already applied are skipped by identity.
   const appliedLiveRef = useRef<Record<string, TerminalInfo[]>>({});
+  // A close the Host rejected for good restores the Tab: forget the applied list so the next
+  // pass re-adds it, and show the error.
+  const [reconcileTick, setReconcileTick] = useState(0);
+  useEffect(() => remoteTerminals.onCloseFailed(f => {
+    delete appliedLiveRef.current[f.host];
+    setReconcileTick(n => n + 1);
+    showNotice(f.error);
+  }), [showNotice]);
   useEffect(() => {
     if (!tabsRestored) return;
+    const fresh: [HostId, TerminalInfo[]][] = [];
     for (const [host, list] of Object.entries(hostsSnap.live)) {
       if (!list || appliedLiveRef.current[host] === list) continue;
       appliedLiveRef.current[host] = list;
       cache.putTerminals(host, list);
       metaSync.observe(host, list, tabsRef.current);
-      const d = reconcile(tabsRef.current, host, list, pendingUuids(), (id, f) => metaSync.isDirty(id, f));
-      for (const uuid of d.confirmed) if (pendingOpens.get(uuid)?.state === "sent") pendingOpens.delete(uuid);
-      if (isEmptyDelta(d)) continue;
-      for (const id of d.remove) {
-        const t = tabsRef.current.find(x => x.id === id);
-        if (t?.terminal) remoteTerminals.forget(t.terminal);
-        metaSync.forget(id);
-      }
-      setTabs(prev => applyTabDelta(prev, d));
-      if (d.remove.length) {
-        setGroups(prev => applyGroupRemovals(prev, d.remove));
-        // Amendment 22: a removed focused leaf hands focus to a surviving leaf.
-        setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, d.remove), d.remove));
-        if (d.remove.includes(activeTabIdRef.current)) setActiveTabId("home");
-      }
+      fresh.push([host, list]);
     }
-  }, [tabsRestored, hostsSnap.live]);
+    if (fresh.length === 0) return;
+    // Every Host's delta in one transaction (tabs, groups and focus together).
+    const r = reconcileHosts(tabsRef.current, fresh, {
+      pending: pendingUuids(),
+      isDirty: (id, f) => metaSync.isDirty(id, f),
+      isClosing: (uuid) => remoteTerminals.isClosing(uuid),
+    });
+    for (const uuid of r.confirmed) if (pendingOpens.get(uuid)?.state === "sent") pendingOpens.delete(uuid);
+    // Terminals the Host stopped listing while their close was pending are done.
+    for (const [host, list] of fresh) remoteTerminals.forgetUnlisted(host, list.map(i => i.terminal));
+    if (r.deltas.length === 0) return;
+    for (const id of r.removed) {
+      const t = tabsRef.current.find(x => x.id === id);
+      if (t?.terminal) remoteTerminals.forget(t.terminal);
+      metaSync.forget(id);
+    }
+    setTabs(prev => applyTabDeltas(prev, r.deltas));
+    if (r.removed.length) {
+      const removed = r.removed;
+      setGroups(prev => applyGroupRemovals(prev, removed));
+      // Amendment 22: focus moves to a leaf that survives every Host's removals.
+      setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, removed), removed));
+      if (removed.includes(activeTabIdRef.current)) setActiveTabId("home");
+    }
+  }, [tabsRestored, hostsSnap.live, reconcileTick]);
 
   // Push local edits of remote Tabs (linked session id, title) to their Terminal's meta.
   // Only while the Host is usable; a failed call is retried once (amendment 17).
