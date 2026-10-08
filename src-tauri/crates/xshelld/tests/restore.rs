@@ -5,7 +5,6 @@
 mod common;
 
 use common::*;
-use std::fs;
 use std::time::Duration;
 use uuid::Uuid;
 use xshell_core::protocol::msg::ClientMsg;
@@ -158,7 +157,7 @@ fn crash_leftover_forking_on_hup_is_ended() {
     drop(c);
     crash(s1);
     let read_kids = || -> Vec<i32> {
-        fs::read_to_string(&kids)
+        std::fs::read_to_string(&kids)
             .unwrap_or_default()
             .lines()
             .filter_map(|l| l.trim().parse().ok())
