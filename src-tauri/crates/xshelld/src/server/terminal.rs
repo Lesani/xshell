@@ -2,9 +2,10 @@
 //! and the connections attached to it.
 
 use super::outbox::Outbox;
+use super::registry::Registry;
 use super::registry::{frame, Daemon};
 use super::size::SizeArbiter;
-use super::ConnId;
+use super::{ConnId, TestPoint};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -15,7 +16,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::launch::LaunchSpec;
+use xshell_core::launch::{relaunch_spec, LaunchSpec};
 use xshell_core::protocol::msg::{encode_res, ServerMsg, TerminalInfo};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
@@ -30,6 +31,9 @@ struct Record {
     spec: LaunchSpec,
     meta: Map<String, Value>,
     created_at_ms: u64,
+    /// The `skipPermissions` a Relaunch in progress will start with. Persisted in its place,
+    /// so a restart during the Relaunch restores what the user asked for.
+    pending_skip: Option<bool>,
 }
 
 struct TermIo {
@@ -48,8 +52,27 @@ struct TermOutput {
 #[derive(Default)]
 struct Life {
     closing: bool,
+    /// A Relaunch is ending the process to start a replacement: its exit is held back.
+    relaunching: bool,
     reader_done: bool,
     exited: Option<i32>,
+    /// An exit held back for a Relaunch, published only if the Relaunch fails.
+    held_exit: Option<i32>,
+}
+
+impl Life {
+    /// Whether a Relaunch may start.
+    fn check_relaunch(&self) -> Result<(), String> {
+        if self.exited.is_some() {
+            Err("terminal has exited".into())
+        } else if self.closing {
+            Err("terminal is closing".into())
+        } else if self.relaunching {
+            Err("terminal is already relaunching".into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) struct Terminal {
@@ -129,6 +152,7 @@ pub(crate) fn spawn(
             spec,
             meta,
             created_at_ms,
+            pending_skip: None,
         }),
         io: Mutex::new(TermIo {
             master: Some(pair.master),
@@ -176,20 +200,24 @@ pub(crate) fn spawn(
             tw.publish_exit(&dw, code);
         });
 
-    let input_thread = std::thread::Builder::new()
-        .name(format!("pty-in-{tag}"))
-        .spawn(move || {
-            let mut writer = writer;
-            for data in rx {
-                if writer
-                    .write_all(&data)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    break;
+    let input_thread = if d.test_point(id, TestPoint::StartInput) {
+        Err(std::io::Error::other("refused by a test hook"))
+    } else {
+        std::thread::Builder::new()
+            .name(format!("pty-in-{tag}"))
+            .spawn(move || {
+                let mut writer = writer;
+                for data in rx {
+                    if writer
+                        .write_all(&data)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+    };
     if let Some(e) = [reader_thread.err(), waiter.err(), input_thread.err()]
         .into_iter()
         .flatten()
@@ -230,9 +258,33 @@ impl Terminal {
         d.nudge_overflowed(dropped);
     }
 
-    /// Runs once the process has exited and its output is drained.
+    /// Runs once the process has exited and its output is drained. During a Relaunch the
+    /// exit is held back: no `term.exit`, and the attached connections stay for the
+    /// replacement.
     fn publish_exit(self: &Arc<Self>, d: &Arc<Daemon>, code: i32) {
         let mut reg = d.reg.lock().unwrap();
+        let held = {
+            let mut l = self.life.lock().unwrap();
+            let hold = l.relaunching && !l.closing && !reg.frozen;
+            if hold {
+                l.exited = Some(code);
+                l.held_exit = Some(code);
+            }
+            hold
+        };
+        if held {
+            self.input.lock().unwrap().take();
+            self.life_cv.notify_all();
+        } else {
+            self.finish_exit(d, &mut reg, code);
+        }
+        drop(reg);
+        d.test_point(self.id, TestPoint::ExitHandled { pid: self.pid });
+    }
+
+    /// Mark the Terminal ended and tell every connection, unless the Daemon is upgrading or
+    /// shutting down or this Terminal is not the one listed under its UUID.
+    fn finish_exit(self: &Arc<Self>, d: &Arc<Daemon>, reg: &mut Registry, code: i32) {
         {
             let mut o = self.out.lock().unwrap();
             o.exit_code = Some(code);
@@ -250,20 +302,95 @@ impl Terminal {
             // Upgrade/shutdown: the Terminal stays in the state file and on the Desktops.
             return;
         }
+        if !d.is_current(reg, self) {
+            // A Relaunch replacement whose start failed: the listed Terminal is not this one.
+            return;
+        }
         if let Some(f) = frame(&ServerMsg::TermExit {
             terminal: self.id,
             code,
         }) {
-            d.broadcast(&reg, f);
+            d.broadcast(reg, f);
         }
         if closing {
             reg.terminals.remove(&self.id);
-            d.touch_idle(&mut reg);
+            d.touch_idle(reg);
         }
         // Also when it stays listed: the state file must stop naming its process, whose pid
         // may be reused from now on.
-        d.persist(&reg);
-        d.broadcast_terminals(&reg);
+        d.persist(reg);
+        d.broadcast_terminals(reg);
+    }
+
+    /// The current launch spec.
+    pub fn spec(&self) -> LaunchSpec {
+        self.record.lock().unwrap().spec.clone()
+    }
+
+    /// Whether a Relaunch may start now.
+    pub fn check_relaunch(&self) -> Result<(), String> {
+        self.life.lock().unwrap().check_relaunch()
+    }
+
+    /// Reserve the Terminal for a Relaunch to `skip`: from now on its exit is held back and
+    /// the state file names the pending spec. Refused while it has exited, is closing or is
+    /// already relaunching.
+    pub fn begin_relaunch(&self, skip: bool) -> Result<(), String> {
+        let mut r = self.record.lock().unwrap();
+        let mut l = self.life.lock().unwrap();
+        l.check_relaunch()?;
+        l.relaunching = true;
+        r.pending_skip = Some(skip);
+        Ok(())
+    }
+
+    /// Undo [`Terminal::begin_relaunch`] after a failed Relaunch: publish an exit held back
+    /// in the meantime, exactly once, and drop the pending spec from the state file.
+    pub fn abort_relaunch(self: &Arc<Self>, d: &Arc<Daemon>, reg: &mut Registry) {
+        self.record.lock().unwrap().pending_skip = None;
+        let held = {
+            let mut l = self.life.lock().unwrap();
+            l.relaunching = false;
+            l.held_exit.take()
+        };
+        match held {
+            Some(code) => self.finish_exit(d, reg, code),
+            None => d.persist(reg),
+        }
+    }
+
+    /// What a Relaunch restarts with: spec, metadata, creation time and the current size.
+    pub fn relaunch_parts(&self) -> (LaunchSpec, Map<String, Value>, u64, (u16, u16)) {
+        let r = self.record.lock().unwrap();
+        let size = self.io.lock().unwrap().arb.current();
+        (r.spec.clone(), r.meta.clone(), r.created_at_ms, size)
+    }
+
+    /// Move the attached connections and the size arbiter to `next`, which replaces this
+    /// Terminal under its UUID, and send them `next`'s replay: a reset, then whatever `next`
+    /// printed so far. Returns Terminals whose queued output was dropped.
+    pub fn hand_over(&self, next: &Terminal) -> Vec<Uuid> {
+        let (subs, arb) = {
+            let mut io = self.io.lock().unwrap();
+            let mut o = self.out.lock().unwrap();
+            let (cols, rows) = io.arb.current();
+            (
+                std::mem::take(&mut o.subs),
+                std::mem::replace(&mut io.arb, SizeArbiter::new(cols, rows)),
+            )
+        };
+        let mut dropped = Vec::new();
+        let mut io = next.io.lock().unwrap();
+        io.arb = arb;
+        let mut o = next.out.lock().unwrap();
+        let snap = o.replay.snapshot();
+        for (conn, ob) in subs {
+            for piece in snap.chunks(REPLAY_CHUNK) {
+                dropped.extend(ob.push_output(self.id, Arc::from(piece)));
+            }
+            o.subs.insert(conn, ob);
+        }
+        dropped
     }
 
     pub fn is_exited(&self) -> bool {
@@ -422,10 +549,20 @@ impl Terminal {
         }
     }
 
+    /// End the Terminal: [`Terminal::signal_groups`], marked as closing so that its exit
+    /// removes it from the list.
+    pub fn kill(self: &Arc<Self>, grace: Duration) {
+        self.hang_up(grace, true);
+    }
+
     /// End the process: SIGHUP the session leader's group and the foreground job's group
     /// (job control puts an agent under `bash -i` in its own group), then SIGKILL each group
     /// that still exists after `grace`. A Terminal that already exited is never signalled.
-    pub fn kill(self: &Arc<Self>, grace: Duration) {
+    pub fn signal_groups(self: &Arc<Self>, grace: Duration) {
+        self.hang_up(grace, false);
+    }
+
+    fn hang_up(self: &Arc<Self>, grace: Duration, closing: bool) {
         let mut groups: Vec<i32> = self.pid.map(|p| p as i32).into_iter().collect();
         let fg = self
             .io
@@ -444,7 +581,7 @@ impl Terminal {
             if l.exited.is_some() {
                 return;
             }
-            l.closing = true;
+            l.closing |= closing;
             for &g in &groups {
                 unsafe { libc::killpg(g, libc::SIGHUP) };
             }
@@ -489,6 +626,11 @@ impl Terminal {
         let mut r = self.record.lock().unwrap();
         r.spec = spec;
         r.meta = meta;
+    }
+
+    /// Connections attached to the output.
+    pub fn attached(&self) -> usize {
+        self.out.lock().unwrap().subs.len()
     }
 
     /// Connections the size arbiter still remembers.
@@ -537,9 +679,13 @@ impl Terminal {
                 groups,
             }
         });
+        let spec = r
+            .pending_skip
+            .and_then(|skip| relaunch_spec(&r.spec, skip).ok())
+            .unwrap_or_else(|| r.spec.clone());
         PersistedTerminal {
             terminal: self.id,
-            spec: r.spec.clone(),
+            spec,
             meta: r.meta.clone(),
             cols,
             rows,
@@ -562,6 +708,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
             spec: p.spec,
             meta: p.meta,
             created_at_ms: p.created_at_ms,
+            pending_skip: None,
         }),
         io: Mutex::new(TermIo {
             master: None,
@@ -578,7 +725,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         life: Mutex::new(Life {
             exited: Some(UNRESOLVED_EXIT),
             reader_done: true,
-            closing: false,
+            ..Life::default()
         }),
         life_cv: Condvar::new(),
         nudge_pending: AtomicBool::new(false),

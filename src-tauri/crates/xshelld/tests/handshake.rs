@@ -22,6 +22,7 @@ fn hello_negotiates_and_sends_terminals() {
     assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(hello.protocol, range(1, 1));
     assert!(hello.capabilities.iter().any(|c| c == "term"));
+    assert!(hello.capabilities.iter().any(|c| c == "term.relaunch"));
     assert!(list.is_empty());
 }
 

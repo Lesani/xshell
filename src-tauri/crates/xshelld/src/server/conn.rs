@@ -5,6 +5,7 @@
 use super::calls::spawn_call;
 use super::outbox::{writer_loop, Outbox};
 use super::registry::{frame, now_ms, Daemon};
+use super::relaunch;
 use super::terminal::{self, Terminal};
 use super::{ConnId, ExitReason};
 use serde_json::{json, Value};
@@ -151,18 +152,15 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
         }
     }
 
-    // Cleanup: detach everywhere, deregister. Terminals are never touched.
-    let terms: Vec<Arc<Terminal>> = {
+    // Cleanup: detach everywhere, deregister. Terminals are never touched. Under the registry
+    // lock, like every attach and detach, so a Relaunch never hands this connection over.
+    {
         let mut reg = d.reg.lock().unwrap();
         reg.conns.remove(&id);
         d.touch_idle(&mut reg);
-        c.touched
-            .iter()
-            .filter_map(|t| reg.terminals.get(t).cloned())
-            .collect()
-    };
-    for t in terms {
-        t.detach(id);
+        for t in c.touched.iter().filter_map(|t| reg.terminals.get(t)) {
+            t.detach(id);
+        }
     }
     if clean {
         ob.close();
@@ -172,6 +170,19 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
 }
 
 impl Conn {
+    /// Run `f` on the Terminal listed under `id` with the registry still locked. Attach,
+    /// detach and resize go through here: a Relaunch moves the attached connections and the
+    /// size arbiter to the replacement under the same lock, so none of them lands on the
+    /// Terminal it replaced.
+    fn with_listed<R>(&self, id: &Uuid, f: impl FnOnce(&Arc<Terminal>) -> R) -> Result<R, String> {
+        let reg = self.d.reg.lock().unwrap();
+        let t = reg
+            .terminals
+            .get(id)
+            .ok_or_else(|| format!("unknown terminal {id}"))?;
+        Ok(f(t))
+    }
+
     fn terminal(&self, id: &Uuid) -> Result<Arc<Terminal>, String> {
         self.d
             .reg
@@ -227,17 +238,20 @@ impl Conn {
                     }
                 }
             }
-            ClientMsg::TermAttach { terminal } => match self.terminal(&terminal) {
-                Ok(t) => {
-                    let dropped = t.attach(self.id, &self.ob, id);
-                    self.touched.insert(terminal);
-                    d.nudge_overflowed(dropped);
-                    t.nudge(d.cfg.nudge_delay);
+            ClientMsg::TermAttach { terminal } => {
+                let r =
+                    self.with_listed(&terminal, |t| (t.clone(), t.attach(self.id, &self.ob, id)));
+                match r {
+                    Ok((t, dropped)) => {
+                        self.touched.insert(terminal);
+                        d.nudge_overflowed(dropped);
+                        t.nudge(d.cfg.nudge_delay);
+                    }
+                    Err(e) => reply(&self.ob, id, Err(e)),
                 }
-                Err(e) => reply(&self.ob, id, Err(e)),
-            },
+            }
             ClientMsg::TermDetach { terminal } => {
-                let r = self.terminal(&terminal).map(|t| {
+                let r = self.with_listed(&terminal, |t| {
                     t.detach(self.id);
                     Value::Null
                 });
@@ -245,6 +259,8 @@ impl Conn {
             }
             ClientMsg::TermInput { terminal, data } => {
                 self.touched.insert(terminal);
+                // Not under the registry lock: input is the hot path. Input that reaches a
+                // Terminal a Relaunch is replacing is dropped like input to an ended one.
                 let r = self.terminal(&terminal).and_then(|t| {
                     // Typing can hand the size to this connection; persist it like a resize.
                     if t.write_input(self.id, data)? {
@@ -260,12 +276,18 @@ impl Conn {
                 rows,
             } => {
                 self.touched.insert(terminal);
-                let r = self.terminal(&terminal).and_then(|t| {
-                    if t.resize(self.id, cols, rows)? {
-                        t.schedule_persist(&d);
-                    }
-                    Ok(Value::Null)
-                });
+                let r = self
+                    .with_listed(&terminal, |t| {
+                        t.resize(self.id, cols, rows)
+                            .map(|changed| (t.clone(), changed))
+                    })
+                    .and_then(|r| r)
+                    .map(|(t, changed)| {
+                        if changed {
+                            t.schedule_persist(&d);
+                        }
+                        Value::Null
+                    });
                 reply(&self.ob, id, r);
             }
             ClientMsg::TermClose { terminal } => {
@@ -311,12 +333,10 @@ impl Conn {
                 drop(reg);
                 reply(&self.ob, id, r);
             }
-            // Not served yet: answered like any message type this Daemon does not know.
-            ClientMsg::TermRelaunch { .. } => reply(
-                &self.ob,
-                id,
-                Err("unknown message type: term.relaunch".into()),
-            ),
+            ClientMsg::TermRelaunch {
+                terminal,
+                skip_permissions,
+            } => relaunch::start(&d, &self.ob, id, terminal, skip_permissions),
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();
