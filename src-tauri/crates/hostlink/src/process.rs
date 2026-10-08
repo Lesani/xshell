@@ -276,7 +276,11 @@ pub fn spawn(spec: &CommandSpec, cancel: &CancelToken) -> io::Result<Proc> {
         stderr.lock().unwrap().done = true;
     }
     let killer = cell.clone();
-    let hook = cancel.on_cancel(move || killer.kill());
+    // Kill and reap right here: the owner may be stuck (a blocked delivery holds the lock
+    // it waits for), and an unreaped child would linger as a zombie until it moves on.
+    let hook = cancel.on_cancel(move || {
+        killer.kill_and_wait(Duration::from_millis(200));
+    });
     Ok(Proc {
         child: cell,
         stdin,

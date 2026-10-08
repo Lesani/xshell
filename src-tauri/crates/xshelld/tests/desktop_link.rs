@@ -334,7 +334,7 @@ fn shutdown_is_bounded_with_a_blocked_delivery() {
         "{:?}",
         start.elapsed()
     );
-    assert!(wait_dead(ssh), "transport {ssh} survived");
+    assert!(reaped(ssh), "transport {ssh} survived or was not reaped");
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn shutdown_is_bounded_with_a_concurrent_configure() {
             "{:?}",
             start.elapsed()
         );
-        assert!(wait_dead(ssh), "transport {ssh} survived");
+        assert!(reaped(ssh), "transport {ssh} survived or was not reaped");
         drop(release);
         cfg.join().unwrap().unwrap();
     });
@@ -369,4 +369,16 @@ fn shutdown_is_bounded_with_a_concurrent_configure() {
         Some(p) if p as i32 != ssh => assert!(wait_dead(p as i32), "a new transport {p} runs"),
         _ => {}
     }
+}
+
+/// Gone and reaped: `kill(0)` fails only once nobody holds the zombie.
+fn reaped(pid: i32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
