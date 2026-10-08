@@ -172,8 +172,7 @@ const READ_BUF: usize = 16 * 1024;
 
 const MAX_PENDING: usize = 4 * 1024 * 1024;
 
-const OVERFLOW_NOTICE: &[u8] =
-    b"\x1bc\x1b[2m[xshell: dropped output due to backpressure]\x1b[0m\r\n";
+use xshell_core::terminal::OVERFLOW_NOTICE;
 
 // The argument list is the frontend IPC contract (`invoke('spawn_terminal', {...})`).
 #[allow(clippy::too_many_arguments)]

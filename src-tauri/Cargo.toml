@@ -11,6 +11,7 @@ portable-pty = "0.9"
 # depend on a system libsqlite. md5: Cursor keys chat folders by md5 of the workspace cwd.
 rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [package]
 name = "xshell"
@@ -33,7 +34,7 @@ tauri-plugin-process = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 xshell-core = { path = "crates/core" }
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
