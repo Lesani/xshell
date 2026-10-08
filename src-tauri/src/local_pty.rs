@@ -6,9 +6,12 @@
 //! and the waiter (reaps the child). Runs are numbered, and a thread of an older run never
 //! changes the Terminal once a newer run started.
 //!
-//! Locking: `LocalPtys.terms` → `LocalTerminal.st` → `LocalTerminal.io`. The flusher
-//! publishes the exit under `st`, which close and Relaunch also hold to change the phase, so
-//! an exit is emitted at most once per run and never for a run a Relaunch is replacing.
+//! Locking: `LocalPtys.terms` → `LocalTerminal.st` → `LocalTerminal.master` →
+//! `LocalTerminal.writer`. The flusher publishes the exit under `st`, which close and
+//! Relaunch also hold to change the phase, so an exit is emitted at most once per run and
+//! never for a run a Relaunch is replacing. A write blocks while the PTY's input queue is
+//! full (the process does not read), so it holds only its run's [`WriterCell`], which no
+//! other path ever waits for: close and Relaunch always get through.
 
 use portable_pty::{native_pty_system, Child, ChildKiller, MasterPty, PtySize};
 use std::collections::HashMap;
@@ -52,6 +55,8 @@ pub enum Point {
     Waited { done: bool },
     /// A run's output drained; `published` says whether its exit went to the sink.
     Drained { published: bool },
+    /// A write holds its run's writer and is about to write (it may block).
+    Writing,
 }
 
 pub type Hook = Arc<dyn Fn(&str, Point) -> bool + Send + Sync>;
@@ -65,10 +70,13 @@ enum Phase {
     Exited,
 }
 
-struct Io {
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-}
+/// One run's PTY writer. A write clones the cell out of `LocalTerminal.writer` and writes
+/// holding only the cell, so replacing or dropping the run never waits for a blocked write.
+type WriterCell = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// A run's PTY, taken out to be dropped outside the locks (dropping the writer writes to the
+/// PTY).
+type Pty = (Option<Box<dyn MasterPty + Send>>, Option<WriterCell>);
 
 struct St {
     phase: Phase,
@@ -87,13 +95,16 @@ struct LocalTerminal {
     sink: Arc<dyn Sink>,
     st: Mutex<St>,
     cv: Condvar,
-    /// `None` once closed (and on Windows while a Relaunch tears the pseudoconsole down).
-    io: Mutex<Option<Io>>,
+    /// The current run's PTY and writer. `None` once closed (and on Windows while a Relaunch
+    /// tears the pseudoconsole down).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<WriterCell>>,
 }
 
 /// A started process before its threads run.
 struct Started {
-    io: Io,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
     reader: Box<dyn Read + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -126,10 +137,8 @@ fn start(plan: &CommandPlan, size: PtySize) -> Result<Started, String> {
         .take_writer()
         .map_err(|e| format!("Failed to take writer: {}", e))?;
     Ok(Started {
-        io: Io {
-            writer,
-            master: pair.master,
-        },
+        master: pair.master,
+        writer,
         reader,
         child,
     })
@@ -186,14 +195,15 @@ impl LocalPtys {
                 drained: false,
             }),
             cv: Condvar::new(),
-            io: Mutex::new(Some(s.io)),
+            master: Mutex::new(Some(s.master)),
+            writer: Mutex::new(Some(Arc::new(Mutex::new(s.writer)))),
         });
         self.run_threads(&t, 0, s.reader, s.child);
-        let old_io = {
+        let old_pty = {
             let mut terms = self.terms.lock().unwrap();
-            terms.insert(id, t).and_then(|old| old.mark_closing())
+            terms.insert(id, t).map(|old| old.mark_closing())
         };
-        drop(old_io);
+        drop(old_pty);
         Ok(())
     }
 
@@ -201,15 +211,15 @@ impl LocalPtys {
         let Some(t) = self.get(id) else {
             return Ok(());
         };
-        let mut io = t.io.lock().unwrap();
-        if let Some(io) = io.as_mut() {
-            io.writer
-                .write_all(data)
-                .map_err(|e| format!("Write failed: {}", e))?;
-            io.writer
-                .flush()
-                .map_err(|e| format!("Flush failed: {}", e))?;
-        }
+        let cell = t.writer.lock().unwrap().clone();
+        let Some(cell) = cell else {
+            return Ok(());
+        };
+        let mut w = cell.lock().unwrap();
+        self.hook(id, Point::Writing);
+        w.write_all(data)
+            .map_err(|e| format!("Write failed: {}", e))?;
+        w.flush().map_err(|e| format!("Flush failed: {}", e))?;
         Ok(())
     }
 
@@ -217,9 +227,9 @@ impl LocalPtys {
         let Some(t) = self.get(id) else {
             return Ok(());
         };
-        let io = t.io.lock().unwrap();
-        if let Some(io) = io.as_ref() {
-            io.master
+        let master = t.master.lock().unwrap();
+        if let Some(master) = master.as_ref() {
+            master
                 .resize(PtySize {
                     rows,
                     cols,
@@ -236,11 +246,11 @@ impl LocalPtys {
     pub fn close(&self, id: &str) {
         // Marked under the map lock, which a Relaunch holds while it starts the replacement:
         // a Terminal is either replaced before it is closed or closed before it is replaced.
-        let io = {
+        let pty = {
             let mut terms = self.terms.lock().unwrap();
-            terms.remove(id).and_then(|t| t.mark_closing())
+            terms.remove(id).map(|t| t.mark_closing())
         };
-        drop(io);
+        drop(pty);
     }
 
     /// End the Terminal's process and start it again with `skipPermissions` set to `skip`,
@@ -271,14 +281,15 @@ impl LocalPtys {
             if st.spec.skip_permissions.unwrap_or(false) == skip {
                 return Ok(false);
             }
-            let io = t.io.lock().unwrap();
-            let io = io.as_ref().ok_or("terminal is closing")?;
+            // Never the writer: a write blocked on a process that does not read must not keep
+            // the Relaunch from ending that process.
+            let master = t.master.lock().unwrap();
+            let master = master.as_ref().ok_or("terminal is closing")?;
             // Taken before the teardown: on Windows the pseudoconsole goes with the process.
-            let size = io
-                .master
+            let size = master
                 .get_size()
                 .map_err(|e| format!("cannot read the terminal size: {e}"))?;
-            let groups = process_groups(st.pid, io.master.as_ref());
+            let groups = process_groups(st.pid, master.as_ref());
             st.phase = Phase::Relaunching;
             (next, size, groups)
         };
@@ -326,8 +337,10 @@ impl LocalPtys {
         st.reaped = false;
         st.drained = false;
         st.phase = Phase::Live;
-        // Drops the old writer; the EOF it writes goes to a PTY nothing reads any more.
-        *t.io.lock().unwrap() = Some(s.io);
+        // Drops the old writer (once no write holds it); the EOF it writes goes to a PTY
+        // nothing reads any more.
+        *t.master.lock().unwrap() = Some(s.master);
+        *t.writer.lock().unwrap() = Some(Arc::new(Mutex::new(s.writer)));
         self.run_threads(&t, st.run, s.reader, s.child);
         Ok(true)
     }
@@ -462,12 +475,19 @@ impl LocalTerminal {
 
     /// Mark the Terminal closing and take its PTY, for the caller to drop outside the locks
     /// (dropping the writer writes to the PTY).
-    fn mark_closing(&self) -> Option<Io> {
+    fn mark_closing(&self) -> Pty {
         let mut st = self.st.lock().unwrap();
         if st.phase != Phase::Exited {
             st.phase = Phase::Closing;
         }
-        self.io.lock().unwrap().take()
+        self.take_pty()
+    }
+
+    fn take_pty(&self) -> Pty {
+        (
+            self.master.lock().unwrap().take(),
+            self.writer.lock().unwrap().take(),
+        )
     }
 
     /// Ask the process to end: SIGHUP its session's and foreground job's process groups on
@@ -482,8 +502,7 @@ impl LocalTerminal {
             let _ = groups;
             let _ = self.st.lock().unwrap().killer.kill();
             // Closing the pseudoconsole ends what still runs in it and lets the reader drain.
-            let io = self.io.lock().unwrap().take();
-            drop(io);
+            drop(self.take_pty());
         }
     }
 }
@@ -934,5 +953,47 @@ mod tests {
         }
         let _ = g.release.send(());
         assert_eq!(r.join().unwrap(), Ok(true));
+    }
+
+    /// A process that never reads fills the PTY's input queue, and a write blocks holding the
+    /// writer. A Relaunch must still end that process, and a close must still return.
+    #[test]
+    fn local_relaunch_and_close_with_a_blocked_write() {
+        const NO_READ: &str =
+            "stty raw -echo\ntrap '' HUP\necho \"pid $$ args $*.\"\nexec sleep 1000";
+        let (g, hook) = gate(|p| p == Point::Writing);
+        let f = fx_with(NO_READ, None, |p| p.hook = Some(hook));
+        f.spawn("claude", Some(SID));
+        f.sink.wait_for("args ");
+        let blocked_write = |ptys: Arc<LocalPtys>| {
+            std::thread::spawn(move || ptys.write("t", &vec![b'x'; 4 << 20]))
+        };
+        let _w1 = blocked_write(f.ptys.clone());
+        g.wait(Point::Writing);
+        let _ = g.release.send(());
+
+        let (tx, rx) = channel();
+        let ptys = f.ptys.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ptys.relaunch("t", true, Some(SID.into()), Some("claude".into())));
+        });
+        assert_eq!(
+            rx.recv_timeout(T).expect("relaunch blocked by a write"),
+            Ok(true)
+        );
+        f.sink.wait_for(&format!(
+            "args --dangerously-skip-permissions --session-id {SID}."
+        ));
+
+        let _w2 = blocked_write(f.ptys.clone());
+        g.wait(Point::Writing);
+        let _ = g.release.send(());
+        let (tx, rx) = channel();
+        let ptys = f.ptys.clone();
+        std::thread::spawn(move || {
+            ptys.close("t");
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(T).expect("close blocked by a write");
     }
 }
