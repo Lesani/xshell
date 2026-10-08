@@ -38,6 +38,16 @@ serde_json = { workspace = true }
 portable-pty = { workspace = true }
 uuid = { workspace = true }
 xshell-core = { path = "crates/core" }
+xshell-hostlink = { path = "crates/hostlink" }
+dirs = { workspace = true }
+# All already in the tree via tauri-plugin-updater: no new crates.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["sync"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 [profile.dev]

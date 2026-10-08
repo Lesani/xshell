@@ -5490,17 +5490,24 @@ dependencies = [
 name = "xshell"
 version = "1.5.0"
 dependencies = [
+ "dirs",
  "portable-pty",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-store",
  "tauri-plugin-updater",
+ "tempfile",
+ "tokio",
  "uuid",
  "xshell-core",
+ "xshell-hostlink",
 ]
 
 [[package]]

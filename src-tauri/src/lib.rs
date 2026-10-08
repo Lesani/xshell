@@ -1,3 +1,5 @@
+mod hosts;
+
 use portable_pty::{native_pty_system, PtySize};
 use std::collections::HashMap;
 use std::fs;
@@ -361,7 +363,29 @@ fn close_terminal(state: State<'_, AppState>, id: String) -> Result<(), String> 
 // serves them: project icons are local files, and the other two open local apps. The tests
 // below check that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
-const DESKTOP_ONLY_COMMANDS: &[&str] = &["open_url", "reveal_in_explorer", "read_image_base64"];
+const DESKTOP_ONLY_COMMANDS: &[&str] = &[
+    "open_url",
+    "reveal_in_explorer",
+    "read_image_base64",
+    "list_ssh_hosts",
+];
+// The Remote Host connection commands (`hosts::commands`).
+#[cfg(test)]
+const HOST_LINK_COMMANDS: &[&str] = &[
+    "hosts_configure",
+    "hosts_status",
+    "hosts_kick",
+    "host_call",
+    "host_term_open",
+    "host_term_attach",
+    "host_term_detach",
+    "host_term_input",
+    "host_term_resize",
+    "host_term_close",
+    "host_term_update",
+    "host_upgrade",
+    "host_test",
+];
 // The PTY commands; a remote host serves terminals through its own protocol.
 #[cfg(test)]
 const TERMINAL_COMMANDS: &[&str] = &[
@@ -569,6 +593,11 @@ pub fn run() {
         .manage(AppState {
             terminals: Mutex::new(HashMap::new()),
         })
+        .setup(|app| {
+            use tauri::Manager as _;
+            app.manage(hosts::Hosts::new(app.handle()));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_claude_projects,
             get_sessions,
@@ -611,10 +640,33 @@ pub fn run() {
             spawn_terminal,
             write_terminal,
             resize_terminal,
-            close_terminal
+            close_terminal,
+            hosts::commands::hosts_configure,
+            hosts::commands::hosts_status,
+            hosts::commands::hosts_kick,
+            hosts::commands::host_call,
+            hosts::commands::host_term_open,
+            hosts::commands::host_term_attach,
+            hosts::commands::host_term_detach,
+            hosts::commands::host_term_input,
+            hosts::commands::host_term_resize,
+            hosts::commands::host_term_close,
+            hosts::commands::host_term_update,
+            hosts::commands::host_upgrade,
+            hosts::commands::host_test,
+            hosts::commands::list_ssh_hosts
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, ev| {
+            if let tauri::RunEvent::Exit = ev {
+                use tauri::Manager as _;
+                // Kill every ssh; the Daemons and their Terminals keep running.
+                if let Some(h) = app.try_state::<hosts::Hosts>() {
+                    h.manager.shutdown();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -630,7 +682,7 @@ mod tests {
         let end = start + src[start..].find(']').expect("handler list end");
         src[start..end]
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().rsplit("::").next().unwrap_or("").to_string())
             .filter(|s| !s.is_empty())
             .collect()
     }
@@ -640,6 +692,7 @@ mod tests {
         let excluded: BTreeSet<&str> = DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)
+            .chain(HOST_LINK_COMMANDS)
             .copied()
             .collect();
         let host: BTreeSet<String> = registered_commands()
@@ -652,11 +705,29 @@ mod tests {
     }
 
     #[test]
-    fn excluded_command_lists_are_registered() {
+    fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 42);
-        for c in DESKTOP_ONLY_COMMANDS.iter().chain(TERMINAL_COMMANDS) {
+        assert_eq!(registered.len(), 56);
+        for c in DESKTOP_ONLY_COMMANDS
+            .iter()
+            .chain(TERMINAL_COMMANDS)
+            .chain(HOST_LINK_COMMANDS)
+        {
             assert!(registered.contains(*c), "{c} is not registered");
         }
+    }
+
+    // The Desktop installs the xshelld of its own version on Remote Hosts.
+    #[test]
+    fn versions_agree() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let daemon = include_str!("../crates/xshelld/Cargo.toml")
+            .lines()
+            .find_map(|l| l.strip_prefix("version = "))
+            .map(|v| v.trim().trim_matches('"'))
+            .expect("xshelld version");
+        assert_eq!(conf["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(daemon, env!("CARGO_PKG_VERSION"));
     }
 }
