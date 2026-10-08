@@ -690,6 +690,17 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .terminal-activity-btn.active { background: var(--bg-active); color: var(--accent-terracotta); }
 .terminal-activity-btn:disabled { opacity: 0.35; cursor: default; }
 .terminal-activity-badge { position: absolute; top: 1px; right: 1px; min-width: 14px; height: 14px; padding: 0 3px; background: var(--accent-terracotta); color: #fff; font-size: 9px; font-weight: 700; line-height: 1; border-radius: 7px; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 2px var(--bg-surface); pointer-events: none; }
+/* Skip permissions: the activity button turns danger-colored while it is on, the header chip and
+   the tab icon say so too, and a translucent overlay covers the old screen while the agent restarts. */
+.terminal-activity-btn.terminal-activity-danger { color: var(--accent-coral); background: color-mix(in oklab, var(--error) 16%, transparent); }
+.terminal-activity-btn.terminal-activity-danger:hover:not(:disabled) { color: var(--accent-coral); background: color-mix(in oklab, var(--error) 24%, transparent); }
+.terminal-skip-perms-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 8px; background: color-mix(in oklab, var(--error) 18%, transparent); color: var(--accent-coral); flex-shrink: 0; }
+.terminal-relaunch-overlay { background: color-mix(in oklab, var(--bg-surface) 72%, transparent); }
+.skip-perms-confirm { width: 270px; }
+.skip-perms-confirm .file-ctx-confirm { max-width: none; padding-top: 2px; }
+.skip-perms-confirm-title { padding: 7px 10px 0; font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.tab-skip-perms-icon { flex-shrink: 0; color: var(--accent-coral); transition: opacity 0.1s; }
+.tab-item:hover .tab-skip-perms-icon { opacity: 0; }
 /* min-height keeps the git and file-explorer headers the same height so their bottom dividers
    line up. The git header is the taller of the two (its branch dropdown button adds padding +
    border); this pins both to that height regardless of which controls each one carries. */

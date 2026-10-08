@@ -20,14 +20,17 @@ export interface AgentMeta {
   // True when the icon draws with currentColor and needs a neutral text color instead of
   // the terracotta accent classes designed around the Claude mark.
   neutralIcon: boolean;
+  // True when the CLI has a flag to run without permission prompts, which a Tab can turn on
+  // by restarting the agent. Mirrors `permission_flag` in src-tauri/crates/core/src/launch.rs.
+  bypassFlag: boolean;
 }
 
 export const AGENTS: Record<AgentId, AgentMeta> = {
-  claude: { id: "claude", label: "Claude Code", binary: "claude",       tagline: "Anthropic's coding agent CLI", neutralIcon: false },
-  codex:  { id: "codex",  label: "Codex",       binary: "codex",        tagline: "OpenAI's coding agent CLI",    neutralIcon: true },
-  cursor: { id: "cursor", label: "Cursor",      binary: "cursor-agent", tagline: "Cursor's coding agent CLI",    neutralIcon: false },
-  opencode: { id: "opencode", label: "opencode", binary: "opencode",    tagline: "The open-source coding agent CLI", neutralIcon: true },
-  antigravity: { id: "antigravity", label: "Antigravity", binary: "agy", tagline: "Google's coding agent CLI",       neutralIcon: false },
+  claude: { id: "claude", label: "Claude Code", binary: "claude",       tagline: "Anthropic's coding agent CLI", neutralIcon: false, bypassFlag: true },
+  codex:  { id: "codex",  label: "Codex",       binary: "codex",        tagline: "OpenAI's coding agent CLI",    neutralIcon: true,  bypassFlag: true },
+  cursor: { id: "cursor", label: "Cursor",      binary: "cursor-agent", tagline: "Cursor's coding agent CLI",    neutralIcon: false, bypassFlag: false },
+  opencode: { id: "opencode", label: "opencode", binary: "opencode",    tagline: "The open-source coding agent CLI", neutralIcon: true, bypassFlag: false },
+  antigravity: { id: "antigravity", label: "Antigravity", binary: "agy", tagline: "Google's coding agent CLI",       neutralIcon: false, bypassFlag: false },
 };
 
 export const AGENT_IDS = Object.keys(AGENTS) as AgentId[];

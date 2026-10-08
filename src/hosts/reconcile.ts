@@ -36,6 +36,7 @@ export function tabFromTerminal(host: HostId, info: TerminalInfo): Tab {
   if (spec.sessionId) tab.sessionId = spec.sessionId;
   if (agent) tab.agent = agent;
   if (spec.shellId) tab.shellId = spec.shellId;
+  if (spec.skipPermissions) tab.skipPermissions = true;
   return tab;
 }
 
@@ -73,6 +74,9 @@ export function reconcile(
     if (sid && sid !== t.sessionId && !isDirty(t.id, "sessionId")) next = { ...next, sessionId: sid };
     const projectName = str(info.meta.projectName);
     if (projectName && projectName !== t.projectName) next = { ...next, projectName };
+    // Compared as booleans, so turning it off on the Host clears it here too.
+    const skip = !!info.spec.skipPermissions;
+    if (skip !== !!t.skipPermissions) next = { ...next, skipPermissions: skip };
     if (next !== t) update.push(next);
   }
   const add = list

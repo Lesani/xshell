@@ -41,6 +41,9 @@ export interface HostStatus {
   // remote Tabs re-run their attach once usable when it changes. Optional so a Rust side
   // that does not send it yet is still accepted.
   configGeneration?: number;
+  // The connected Daemon's hello capabilities; empty while not connected. Optional so an
+  // older Rust side is still accepted.
+  daemonCapabilities?: string[];
 }
 
 export interface LaunchSpec {
@@ -52,6 +55,7 @@ export interface LaunchSpec {
   shellId?: string | null;
   fullscreenRendering?: boolean | null;
   forceSyncOutput?: boolean | null;
+  skipPermissions?: boolean | null;
 }
 
 export interface TerminalInfo {

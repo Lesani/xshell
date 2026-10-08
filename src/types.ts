@@ -311,6 +311,7 @@ export interface Tab {
   createdAt?: number; // ms epoch at tab creation (stable, unlike lastActiveAt) — lets the title-sync link an unlinked agent tab to a session that appeared after it opened
   host?: HostId;     // Remote Host the Terminal runs on; absent = Local Host
   terminal?: string; // remote Terminal UUID (the tab id is `remote-<uuid>`)
+  skipPermissions?: boolean; // the agent runs without permission prompts; remote tabs mirror the Daemon's spec
 }
 
 // Binary layout tree for a group's split view. Leaves point at tab ids.

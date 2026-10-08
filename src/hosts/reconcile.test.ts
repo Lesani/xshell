@@ -159,3 +159,22 @@ describe("multi-host reconcile transaction", () => {
     expect(r.deltas.flatMap(d => d.add.map(t => t.terminal))).toEqual(["y"]);
   });
 });
+
+describe("reconcile: skip permissions", () => {
+  it("maps the spec's value onto new tabs", () => {
+    expect(tabFromTerminal(H, info("a", { spec: { ...info("a").spec, skipPermissions: true } })).skipPermissions).toBe(true);
+    expect(tabFromTerminal(H, info("b")).skipPermissions).toBeUndefined();
+  });
+
+  it("propagates true → false and false → true", () => {
+    const on = { ...info("a"), spec: { ...info("a").spec, skipPermissions: true } };
+    const tab = tabFromTerminal(H, on);
+    expect(reconcile([tab], H, [on], new Set()).update).toEqual([]);
+    const d = reconcile([tab], H, [info("a")], new Set());
+    expect(d.update).toEqual([{ ...tab, skipPermissions: false }]);
+    const back = reconcile(d.update, H, [on], new Set());
+    expect(back.update).toEqual([{ ...tab, skipPermissions: true }]);
+    // A spec without the field (older Daemon) is off.
+    expect(reconcile(d.update, H, [info("a")], new Set()).update).toEqual([]);
+  });
+});

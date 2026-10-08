@@ -105,3 +105,19 @@ describe("new chat / new shell", () => {
     expect(plan.pending?.open.spec).toEqual({ agent: null, sessionId: null, cwd: "/home/u/proj", shellMode: "raw", shellId: "bash", shellCommand: "bash", fullscreenRendering: true, forceSyncOutput: true });
   });
 });
+
+describe("skip permissions is never part of a remote open", () => {
+  // A Daemon that predates it would silently drop the field; it is only set by term.relaunch.
+  it("no spec carries the key", () => {
+    const plans = [
+      planOpenSession(session({ host: H }), remoteProject, [], ctx()),
+      planNewChat(remoteProject, "claude", ctx()),
+      planNewChat(remoteProject, "codex", ctx()),
+      planNewShell(remoteProject, "bash", "Bash", ctx()),
+    ];
+    for (const plan of plans) {
+      if (plan.kind !== "create" || !plan.pending) throw new Error("expected a remote create");
+      expect(Object.keys(plan.pending.open.spec)).not.toContain("skipPermissions");
+    }
+  });
+});
