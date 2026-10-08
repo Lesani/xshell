@@ -26,7 +26,9 @@ pub const W: Duration = Duration::from_secs(10);
 pub struct Recorder {
     pub statuses: Mutex<Vec<HostStatus>>,
     pub lists: Mutex<Vec<Vec<TerminalInfo>>>,
+    // One condvar per mutex: macOS refuses a condvar used with two.
     cv: Condvar,
+    list_cv: Condvar,
 }
 
 impl Recorder {
@@ -80,7 +82,7 @@ impl Recorder {
             }
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "no list {what}; got {:#?}", g.last());
-            g = self.cv.wait_timeout(g, left).unwrap().0;
+            g = self.list_cv.wait_timeout(g, left).unwrap().0;
         }
     }
 
@@ -104,7 +106,7 @@ impl Observer for Recorder {
     }
     fn terminals(&self, _host: &str, list: &[TerminalInfo]) {
         self.lists.lock().unwrap().push(list.to_vec());
-        self.cv.notify_all();
+        self.list_cv.notify_all();
     }
 }
 

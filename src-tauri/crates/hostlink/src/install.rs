@@ -328,6 +328,7 @@ pub fn ensure_installed(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod testutil {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -369,6 +370,7 @@ pub(crate) mod testutil {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 mod tests {
     use super::testutil::*;
     use super::*;
