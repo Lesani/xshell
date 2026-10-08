@@ -1,8 +1,9 @@
-import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react";
+import { createContext, useContext, useEffect, useReducer, useRef, useState, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import { toProjectKey } from "../hosts/projectKey";
 import { latestGate } from "../hosts/requestGate";
+import { initialSkillsPanelState, skillsPanelReducer, type SkillsPanelLoaded } from "../hosts/skillsPanelState";
 import type { HostId } from "../hosts/types";
 import { Network, User, FolderTree, Puzzle, ChevronRight, Plug, Globe, Terminal as TerminalIcon, Wand2, FolderOpen, Sparkles, Brain, Bot, Slash, Zap, FileText, Layers } from "lucide-react";
 import type { ProjectSkills, Skill, Plugin, McpInfo, ProjectMemories, Memory, SubagentInfo, SlashCommand, HookEntry, ClaudeMdFile, SettingsSource, CodexContext, CursorContext, OpencodeContext, AntigravityContext, AgentContextSection } from "../types";
@@ -437,90 +438,60 @@ function AgentContextRoot({ title, icon, trustLevel, sections, onOpenDoc }: { ti
 
 // ─── Main panel ────────────────────────────────────────────────────
 export function SkillsPanel({ projectPath, host, projectName, agentPresence }: Props) {
-  const [data, setData] = useState<ProjectSkills | null>(null);
-  const [codexCtx, setCodexCtx] = useState<CodexContext | null>(null);
-  const [cursorCtx, setCursorCtx] = useState<CursorContext | null>(null);
-  const [opencodeCtx, setOpencodeCtx] = useState<OpencodeContext | null>(null);
-  const [antigravityCtx, setAntigravityCtx] = useState<AntigravityContext | null>(null);
-  const [memories, setMemories] = useState<ProjectMemories>({ dir: "", items: [] });
-  const [loading, setLoading] = useState(false);
+  // All project-scoped state lives in one reducer keyed by ProjectKey: a key change (another
+  // project, or the same path on another Host) resets it before anything renders.
+  const key = toProjectKey(host, projectPath);
+  const [stored, dispatch] = useReducer(skillsPanelReducer, key, initialSkillsPanelState);
+  if (stored.key !== key) dispatch({ type: "switch", key });
+  const st = stored.key === key ? stored : initialSkillsPanelState(key);
+  const { data, codexCtx, cursorCtx, opencodeCtx, antigravityCtx, memories, loading, openMemory, openDoc } = st;
+  // Host-scoped (not project-scoped): fetched once per Host, as before.
   const [username, setUsername] = useState("user");
   const [homeDir, setHomeDir] = useState<string>("");
-  const [openMemory, setOpenMemory] = useState<Memory | null>(null);
-  const [openDoc, setOpenDoc] = useState<{ path: string; title: string } | null>(null);
-  const { tt, Tooltip } = useTooltip();
-
   useEffect(() => {
     let alive = true;
+    setUsername("user"); setHomeDir("");
     hostInvoke<string>(host, "get_username").then(v => { if (alive) setUsername(v); }).catch(() => {});
     hostInvoke<string>(host, "get_home_dir").then(v => { if (alive) setHomeDir(v); }).catch(() => {});
     return () => { alive = false; };
   }, [host]);
+  const setOpenMemory = (m: Memory | null) => dispatch({ type: "open", patch: { openMemory: m } });
+  const setOpenDoc = (d: { path: string; title: string } | null) => dispatch({ type: "open", patch: { openDoc: d } });
+  const { tt, Tooltip } = useTooltip();
 
-  // Responses for a superseded (host, path) are dropped (amendment 23) — the same path on
-  // another Host is a different project.
+  // Fetches for `key`; results for any other key are dropped by the reducer and the gate.
   const gateRef = useRef(latestGate());
-  const fetchData = async () => {
+  useEffect(() => {
     if (!projectPath) return;
-    const token = gateRef.current.begin(toProjectKey(host, projectPath));
+    const token = gateRef.current.begin(key);
     const live = () => gateRef.current.isCurrent(token);
-    setLoading(true);
-    try {
-      const skills = await hostInvoke<ProjectSkills>(host, "get_project_skills", { projectPath });
-      if (!live()) return;
-      setData(skills);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] skills error:", e);
-      setData({ personal_skills: [], project_skills: [], plugins: [], user_mcps: [], project_mcps: [], subagents: [], slash_commands: [], hooks: [], claude_md_files: [], settings_sources: [] });
-    }
-    try {
-      const mems = await hostInvoke<ProjectMemories>(host, "get_project_memories", { projectPath });
-      if (!live()) return;
-      setMemories(mems);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] memories error:", e);
-      setMemories({ dir: "", items: [] });
-    } finally { if (live()) setLoading(false); }
-    try {
-      const ctx = await hostInvoke<CodexContext>(host, "get_codex_context", { projectPath });
-      if (!live()) return;
-      setCodexCtx(ctx);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] codex context error:", e);
-      setCodexCtx(null);
-    }
-    try {
-      const ctx = await hostInvoke<CursorContext>(host, "get_cursor_context", { projectPath });
-      if (!live()) return;
-      setCursorCtx(ctx);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] cursor context error:", e);
-      setCursorCtx(null);
-    }
-    try {
-      const ctx = await hostInvoke<OpencodeContext>(host, "get_opencode_context", { projectPath });
-      if (!live()) return;
-      setOpencodeCtx(ctx);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] opencode context error:", e);
-      setOpencodeCtx(null);
-    }
-    try {
-      const ctx = await hostInvoke<AntigravityContext>(host, "get_antigravity_context", { projectPath });
-      if (!live()) return;
-      setAntigravityCtx(ctx);
-    } catch (e) {
-      if (!live()) return;
-      console.error("[SkillsPanel] antigravity context error:", e);
-      setAntigravityCtx(null);
-    }
-  };
-  useEffect(() => { fetchData(); /* eslint-disable-next-line */ }, [projectPath, host]);
+    const put = (patch: Partial<SkillsPanelLoaded>) => { if (live()) dispatch({ type: "loaded", key, patch }); };
+    (async () => {
+      put({ loading: true });
+      try {
+        put({ data: await hostInvoke<ProjectSkills>(host, "get_project_skills", { projectPath }) });
+      } catch (e) {
+        if (!live()) return;
+        console.error("[SkillsPanel] skills error:", e);
+        put({ data: { personal_skills: [], project_skills: [], plugins: [], user_mcps: [], project_mcps: [], subagents: [], slash_commands: [], hooks: [], claude_md_files: [], settings_sources: [] } });
+      }
+      try {
+        put({ memories: await hostInvoke<ProjectMemories>(host, "get_project_memories", { projectPath }) });
+      } catch (e) {
+        if (!live()) return;
+        console.error("[SkillsPanel] memories error:", e);
+        put({ memories: { dir: "", items: [] } });
+      } finally { put({ loading: false }); }
+      try { put({ codexCtx: await hostInvoke<CodexContext>(host, "get_codex_context", { projectPath }) }); }
+      catch (e) { if (live()) { console.error("[SkillsPanel] codex context error:", e); put({ codexCtx: null }); } }
+      try { put({ cursorCtx: await hostInvoke<CursorContext>(host, "get_cursor_context", { projectPath }) }); }
+      catch (e) { if (live()) { console.error("[SkillsPanel] cursor context error:", e); put({ cursorCtx: null }); } }
+      try { put({ opencodeCtx: await hostInvoke<OpencodeContext>(host, "get_opencode_context", { projectPath }) }); }
+      catch (e) { if (live()) { console.error("[SkillsPanel] opencode context error:", e); put({ opencodeCtx: null }); } }
+      try { put({ antigravityCtx: await hostInvoke<AntigravityContext>(host, "get_antigravity_context", { projectPath }) }); }
+      catch (e) { if (live()) { console.error("[SkillsPanel] antigravity context error:", e); put({ antigravityCtx: null }); } }
+    })();
+  }, [key]);
 
   const userPlugins  = data?.plugins.filter(p => p.scope === "user")  || [];
   const localPlugins = data?.plugins.filter(p => p.scope === "local") || [];
