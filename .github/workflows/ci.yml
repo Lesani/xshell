@@ -68,7 +68,7 @@ jobs:
             exit 1
           fi
   core:
-    # Core and xshelld are Tauri-free, so they build without webview packages. These runners
+    # Core, xshelld and hostlink are Tauri-free, so they build without webview packages. These runners
     # compile the #[cfg(windows)] and macOS paths that the Linux job never sees. xshelld is
     # Unix-only: on Windows it compiles to a stub and its tests are empty.
     strategy:
@@ -87,8 +87,8 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-      - run: cargo clippy -p xshell-core -p xshelld --all-targets --locked -- -D warnings
-      - run: cargo test -p xshell-core -p xshelld --locked
+      - run: cargo clippy -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-core -p xshelld -p xshell-hostlink --locked
   xshelld-musl:
     # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, hence musl-gcc.
     runs-on: ubuntu-22.04
@@ -115,3 +115,66 @@ jobs:
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
           "$bin" --version
           ls -l "$bin"
+  e2e-ssh:
+    # The real ssh path: a throwaway sshd on the runner, auto-install of the musl xshelld from
+    # a binary directory, then a Terminal over it.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo build -p xshelld --profile release-daemon --target x86_64-unknown-linux-musl --locked
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Binary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/x86_64-unknown-linux-musl/release-daemon/xshelld "$RUNNER_TEMP/bin/xshelld-x86_64-unknown-linux-musl"
+      - name: Throwaway sshd on port 2222
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/xshell_e2e
+          cat ~/.ssh/xshell_e2e.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/hostkey"
+          cat > "$RUNNER_TEMP/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $RUNNER_TEMP/hostkey
+          PidFile $RUNNER_TEMP/sshd.pid
+          AuthorizedKeysFile .ssh/authorized_keys
+          UsePAM no
+          StrictModes no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          EOF
+          cat >> ~/.ssh/config <<EOF
+          Host xshell-e2e
+            HostName 127.0.0.1
+            Port 2222
+            IdentityFile ~/.ssh/xshell_e2e
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile $RUNNER_TEMP/kh
+          EOF
+          chmod 600 ~/.ssh/config
+          /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config" -E "$RUNNER_TEMP/sshd.log"
+          ssh -o BatchMode=yes xshell-e2e true
+      - name: e2e_ssh
+        run: cargo test -p xshelld --test e2e_ssh --locked -- --ignored --test-threads=1
+        env:
+          XSHELL_E2E_SSH_TARGET: xshell-e2e
+          XSHELL_E2E_BIN_DIR: ${{ runner.temp }}/bin
+      - name: sshd log
+        if: failure()
+        run: cat "$RUNNER_TEMP/sshd.log" || true
