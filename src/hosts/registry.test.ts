@@ -227,3 +227,23 @@ describe("waitUsable after a version", () => {
     r._dispose();
   });
 });
+
+describe("host epochs", () => {
+  it("bump when the Host becomes usable and when its connection is replaced", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined));
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    const epoch = () => r.getSnapshot().epochs[H] ?? 0;
+    expect(epoch()).toBe(0);
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 1 }) });
+    expect(epoch()).toBe(1);
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 1 }) });
+    expect(epoch()).toBe(1);
+    handlers["hosts:status"]({ payload: status("offline", { configGeneration: 1 }) });
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 1 }) });
+    expect(epoch()).toBe(2);
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 2 }) });
+    expect(epoch()).toBe(3);
+    r._dispose();
+  });
+});

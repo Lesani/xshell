@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import { toProjectKey } from "../hosts/projectKey";
 import { latestGate } from "../hosts/requestGate";
+import { useHostsSnapshot } from "../hosts/useHosts";
 import { initialSkillsPanelState, skillsPanelReducer, type SkillsPanelLoaded } from "../hosts/skillsPanelState";
 import type { HostId } from "../hosts/types";
 import { Network, User, FolderTree, Puzzle, ChevronRight, Plug, Globe, Terminal as TerminalIcon, Wand2, FolderOpen, Sparkles, Brain, Bot, Slash, Zap, FileText, Layers } from "lucide-react";
@@ -461,6 +462,8 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
 
   // Fetches for `key`; results for any other key are dropped by the reducer and the gate.
   const gateRef = useRef(latestGate());
+  // A reconnect (or replaced connection) re-reads the context, so cached data is replaced.
+  const hostEpoch = useHostsSnapshot().epochs[host ?? ""] ?? 0;
   useEffect(() => {
     if (!projectPath) return;
     const token = gateRef.current.begin(key);
@@ -491,7 +494,7 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
       try { put({ antigravityCtx: await hostInvoke<AntigravityContext>(host, "get_antigravity_context", { projectPath }) }); }
       catch (e) { if (live()) { console.error("[SkillsPanel] antigravity context error:", e); put({ antigravityCtx: null }); } }
     })();
-  }, [key]);
+  }, [key, hostEpoch]);
 
   const userPlugins  = data?.plugins.filter(p => p.scope === "user")  || [];
   const localPlugins = data?.plugins.filter(p => p.scope === "local") || [];

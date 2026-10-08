@@ -20,7 +20,8 @@ import { GroupView } from "./components/GroupView";
 import { countLeaves, collectLeafIds, insertLeaf, removeLeaf, setRatioAt, DropZone } from "./layout";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { UpdateDialog } from "./components/UpdateDialog";
-import { hostInvoke, hostQuery } from "./hosts/hostInvoke";
+import { hostInvoke } from "./hosts/hostInvoke";
+import { loadProjectSessions } from "./hosts/projectSessions";
 import { asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
@@ -672,29 +673,37 @@ export default function App() {
   // ── Navigation: fresh load on every navigate ──────────────────────
   // Responses for a project that is no longer selected are dropped (amendment 23).
   const projectSessionsGate = useRef(latestGate());
-  const handleSelectProject = useCallback(async (project: ProjectInfo) => {
-    setSelectedProject(project);
-    setActiveTabId("home");
+  // Loads the project page's sessions (with provenance). `quiet` skips the loading spinner
+  // (background refresh after a reconnect).
+  const loadSelectedSessions = useCallback(async (project: ProjectInfo, quiet = false) => {
     // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so projects
     // only ever used by Codex/Cursor/opencode (no ~/.claude entry) still list their sessions.
     const encodedName = encodedNameFor(project);
     const token = projectSessionsGate.current.begin(keyOf(project));
     if (!encodedName) { setProjectSessions([]); return; }
-    setSessionsLoading(true);
-    let next: SessionInfo[];
-    let stale = false;
-    try {
-      const r = await hostQuery<SessionInfo[]>(project.host, "get_sessions", { encodedName });
-      next = r.value;
-      stale = r.stale;
-    } catch (_) { next = []; }
-    // Stamp the Host at the fetch boundary so every consumer knows where a session lives.
-    if (project.host) next = next.map(x => ({ ...x, host: project.host }));
+    if (!quiet) setSessionsLoading(true);
+    const r = await loadProjectSessions(project);
     if (!projectSessionsGate.current.isCurrent(token)) return;
-    setProjectSessions(next);
-    setProjectSessionsStale(stale);
+    setProjectSessions(r.sessions);
+    setProjectSessionsStale(r.stale);
     setSessionsLoading(false);
   }, []);
+  const handleSelectProject = useCallback(async (project: ProjectInfo) => {
+    setSelectedProject(project);
+    setActiveTabId("home");
+    await loadSelectedSessions(project);
+  }, [loadSelectedSessions]);
+  // A remote project page refetches when its Host becomes usable again or its connection is
+  // replaced, so cached (stale) sessions do not stay on screen.
+  const selectedEpoch = selectedProject?.host ? (hostsSnap.epochs[selectedProject.host] ?? 0) : 0;
+  const lastEpochRef = useRef<{ key: string; epoch: number } | null>(null);
+  useEffect(() => {
+    if (!selectedProject?.host) { lastEpochRef.current = null; return; }
+    const k = keyOf(selectedProject);
+    const prev = lastEpochRef.current;
+    lastEpochRef.current = { key: k, epoch: selectedEpoch };
+    if (prev && prev.key === k && prev.epoch !== selectedEpoch) loadSelectedSessions(selectedProject, true);
+  }, [selectedProject, selectedEpoch, loadSelectedSessions]);
 
   const handleGoHome = useCallback(async () => {
     setSelectedProject(null);

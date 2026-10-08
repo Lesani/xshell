@@ -14,6 +14,9 @@ export interface RegistrySnapshot {
   status: Record<HostId, HostStatus>;
   live: Record<HostId, TerminalInfo[] | null>; // null = never connected this run
   agents: Record<HostId, Record<AgentId, boolean>>;
+  // Bumped each time a Host becomes usable or its connection is replaced: views showing data
+  // read from that Host refetch when it changes.
+  epochs: Record<HostId, number>;
 }
 
 export const isUsableStatus = (s: HostStatus | undefined): boolean =>
@@ -30,7 +33,7 @@ const WAKE_POLL_MS = 5000;
 const WAKE_GAP_MS = 30000;
 
 export class HostRegistry {
-  private snap: RegistrySnapshot = { configs: [], status: {}, live: {}, agents: {} };
+  private snap: RegistrySnapshot = { configs: [], status: {}, live: {}, agents: {}, epochs: {} };
   private listeners = new Set<() => void>();
   // Amendment 21: per-host sequence numbers, one per field. A status event bumps only the
   // status number and a terminals event only the terminals number; a `hosts_status` snapshot
@@ -121,6 +124,9 @@ export class HostRegistry {
     // A replaced connection may reach another machine: forget its agent inventory.
     if (replaced) this.invalidateAgents(h);
     if (nowUsable) this.flushWaiters(h);
+    if ((nowUsable && !isUsableStatus(prev)) || replaced) {
+      this.emit({ epochs: { ...this.snap.epochs, [h]: (this.snap.epochs[h] ?? 0) + 1 } });
+    }
     if (nowUsable && !isUsableStatus(prev)) {
       for (const l of this.usableListeners) l(h);
     }
