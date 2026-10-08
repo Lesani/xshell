@@ -247,6 +247,11 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
     // (telemetry reads `terminal.type` from TERM_PROGRAM; without this we'd land in the
     // Unknown bucket). Always set — no user-facing toggle.
     env.push(("TERM_PROGRAM".into(), "xshell.sh".into()));
+    // Describe the terminal xterm.js emulates. A GUI-launched app inherits no TERM (or the
+    // TERM of the terminal that started it), and without one terminfo consumers fall back to
+    // a dumb terminal: TUIs render monochrome and `clear`/`tput` fail.
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("COLORTERM".into(), "truecolor".into()));
     // Claude Code's flicker-free / alternate-screen-buffer renderer is opt-in via env var.
     // Default ON for any claude-mode spawn; raw shells don't get it (no claude process to read it).
     // Inherited by the wrapping shell → claude child, so setting it here is sufficient.
@@ -313,8 +318,18 @@ mod tests {
             .collect()
     }
 
+    // Every plan carries the terminal variables first, then `extra`.
+    fn plan_env(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut v = env(&[
+            ("TERM_PROGRAM", "xshell.sh"),
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "truecolor"),
+        ]);
+        v.extend(env(extra));
+        v
+    }
+
     const CLAUDE_ENV: &[(&str, &str)] = &[
-        ("TERM_PROGRAM", "xshell.sh"),
         ("CLAUDE_CODE_NO_FLICKER", "1"),
         ("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1"),
     ];
@@ -346,7 +361,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.program, "claude");
         assert_eq!(plan.args, strings(&["--session-id", "sid-1"]));
-        assert_eq!(plan.env, env(CLAUDE_ENV));
+        assert_eq!(plan.env, plan_env(CLAUDE_ENV));
         assert_eq!(plan.cwd, "/work/app");
         assert_builder(&plan);
     }
@@ -373,7 +388,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.program, "claude");
         assert_eq!(plan.args, strings(&["--resume", "sid-2"]));
-        assert_eq!(plan.env, env(CLAUDE_ENV));
+        assert_eq!(plan.env, plan_env(CLAUDE_ENV));
         assert_builder(&plan);
     }
 
@@ -404,7 +419,7 @@ mod tests {
             )
             .unwrap();
             // Only Claude reads the two renderer variables.
-            assert_eq!(plan.env, env(&[("TERM_PROGRAM", "xshell.sh")]), "{agent}");
+            assert_eq!(plan.env, plan_env(&[]), "{agent}");
             if !cfg!(windows) {
                 assert_eq!(plan.program, *bin);
                 assert_eq!(plan.args, strings(args));
@@ -433,26 +448,17 @@ mod tests {
             .unwrap()
             .env
         };
-        assert_eq!(off(None, None), env(CLAUDE_ENV));
-        assert_eq!(off(Some(true), Some(true)), env(CLAUDE_ENV));
+        assert_eq!(off(None, None), plan_env(CLAUDE_ENV));
+        assert_eq!(off(Some(true), Some(true)), plan_env(CLAUDE_ENV));
         assert_eq!(
             off(Some(false), None),
-            env(&[
-                ("TERM_PROGRAM", "xshell.sh"),
-                ("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1")
-            ])
+            plan_env(&[("CLAUDE_CODE_FORCE_SYNC_OUTPUT", "1")])
         );
         assert_eq!(
             off(None, Some(false)),
-            env(&[
-                ("TERM_PROGRAM", "xshell.sh"),
-                ("CLAUDE_CODE_NO_FLICKER", "1")
-            ])
+            plan_env(&[("CLAUDE_CODE_NO_FLICKER", "1")])
         );
-        assert_eq!(
-            off(Some(false), Some(false)),
-            env(&[("TERM_PROGRAM", "xshell.sh")])
-        );
+        assert_eq!(off(Some(false), Some(false)), plan_env(&[]));
     }
 
     #[test]
@@ -474,8 +480,8 @@ mod tests {
         .unwrap();
         assert_eq!(plan.program, "zsh");
         assert!(plan.args.is_empty());
-        // Raw shells host no claude process, so only the terminal tag is set.
-        assert_eq!(plan.env, env(&[("TERM_PROGRAM", "xshell.sh")]));
+        // Raw shells host no claude process, so only the terminal variables are set.
+        assert_eq!(plan.env, plan_env(&[]));
         assert_builder(&plan);
 
         let default = plan_command(&ctx, &raw).unwrap();
@@ -516,7 +522,7 @@ mod tests {
             plan.args,
             strings(&["-i", "-c", "claude '--resume' 'a'\\''b'; exec bash -i"])
         );
-        assert_eq!(plan.env, env(CLAUDE_ENV));
+        assert_eq!(plan.env, plan_env(CLAUDE_ENV));
         assert_builder(&plan);
 
         // zsh keeps zsh alive afterwards, and an empty session list runs the bare agent.
