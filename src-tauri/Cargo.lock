@@ -5542,6 +5542,7 @@ dependencies = [
  "tempfile",
  "uuid",
  "xshell-core",
+ "xshell-hostlink",
 ]
 
 [[package]]
