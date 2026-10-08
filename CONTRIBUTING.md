@@ -154,6 +154,7 @@ Manual checklist:
 - [ ] Settings persist across restarts
 - [ ] For UI changes: both light and dark themes still look right
 - [ ] Remote hosts connect, share terminals across Desktops, survive disconnect/quit, reconnect, and restart terminals correctly after Upgrade now
+- [ ] Skip permissions on a local Claude and Codex Tab: turning it on and off restarts the agent in the same Tab, resumes the conversation, and leaves no second agent process running; the Tab keeps its size. CI runs the local relaunch tests on Linux only, so check this on Windows by hand (there the agent is terminated and its pseudoconsole closed instead of hung up)
 
 ## Reporting issues
 

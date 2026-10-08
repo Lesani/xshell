@@ -120,6 +120,9 @@ pub struct LocalPtys {
     /// How long after SIGKILL a Relaunch waits for the process to end and its output to drain.
     pub(crate) exit_timeout: Duration,
     pub(crate) hook: Option<Hook>,
+    /// End a run by terminating it and closing its pseudoconsole (Windows, which has no
+    /// hangup) rather than only by signals. Settable so tests run that path everywhere.
+    pub(crate) close_console: bool,
 }
 
 fn start(plan: &CommandPlan, size: PtySize) -> Result<Started, String> {
@@ -155,6 +158,7 @@ impl LocalPtys {
             kill_grace: Duration::from_secs(2),
             exit_timeout: Duration::from_secs(5),
             hook: None,
+            close_console: cfg!(windows),
         }
     }
 
@@ -303,7 +307,7 @@ impl LocalPtys {
         };
         self.hook(id, Point::Reserved);
 
-        t.hang_up(&groups);
+        t.hang_up(&groups, self.close_console);
         let mut done = t.wait_done(Instant::now() + self.kill_grace);
         if !done {
             kill_groups(&groups);
@@ -532,16 +536,19 @@ impl LocalTerminal {
 
     /// Ask the process to end: SIGHUP its session's and foreground job's process groups on
     /// Unix. Windows has no hangup: the process is terminated and the pseudoconsole closed.
-    fn hang_up(&self, groups: &[i32]) {
+    fn hang_up(&self, groups: &[i32], close_console: bool) {
         #[cfg(unix)]
         for &g in groups {
             unsafe { libc::killpg(g, libc::SIGHUP) };
         }
         #[cfg(windows)]
-        {
-            let _ = groups;
-            let _ = self.st.lock().unwrap().killer.kill();
+        let _ = groups;
+        if close_console {
+            if cfg!(windows) {
+                let _ = self.st.lock().unwrap().killer.kill();
+            }
             // Closing the pseudoconsole ends what still runs in it and lets the reader drain.
+            // The size went with it: the Relaunch read it before.
             drop(self.take_pty());
         }
     }
@@ -574,6 +581,69 @@ fn kill_groups(groups: &[i32]) {
     }
     #[cfg(windows)]
     let _ = groups;
+}
+
+/// The pseudoconsole teardown, run on every platform (`close_console`): the replacement gets
+/// the size the Tab had, read before the teardown took the PTY away.
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+
+    struct NullSink;
+
+    impl Sink for NullSink {
+        fn data(&self, _: Vec<u8>) -> bool {
+            true
+        }
+        fn exit(&self, _: i32) {}
+    }
+
+    /// A long-running child that never reads and outlives a hangup.
+    fn idle_child(p: CommandPlan) -> CommandPlan {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd.exe", &["/C", "ping -n 1000 127.0.0.1 >NUL"])
+        } else {
+            ("/bin/sh", &["-c", "trap '' HUP; exec sleep 1000"])
+        };
+        CommandPlan {
+            program: program.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            ..p
+        }
+    }
+
+    #[test]
+    fn local_relaunch_console_teardown_keeps_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = xshell_core::HostCtx::with_home(dir.path().join("home"), dir.path().join("tmp"));
+        let planner: Planner =
+            Arc::new(move |spec| Ok(idle_child(xshell_core::plan_command(&ctx, spec)?)));
+        let mut ptys = LocalPtys::new(planner);
+        ptys.kill_grace = Duration::from_millis(200);
+        ptys.close_console = true;
+        let ptys = Arc::new(ptys);
+        let spec = LaunchSpec {
+            session_id: Some("s1".into()),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        ptys.spawn("t".into(), spec, 80, 24, Arc::new(NullSink))
+            .unwrap();
+        ptys.resize("t", 100, 30).unwrap();
+        assert_eq!(ptys.relaunch("t", true, Some("s1".into()), None), Ok(true));
+        let t = ptys.get("t").unwrap();
+        let size = t
+            .master
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_size()
+            .unwrap();
+        assert_eq!((size.cols, size.rows), (100, 30));
+        let _ = t.st.lock().unwrap().killer.kill();
+        ptys.close("t");
+    }
 }
 
 #[cfg(all(test, unix))]
