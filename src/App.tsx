@@ -753,6 +753,44 @@ export default function App() {
     } catch (_) {}
   }, [sidebarLayout, persistSidebarLayout]);
 
+  // ── Settings → Hosts ──────────────────────────────────────────────
+  // Persist the `hosts` key, then reconfigure the registry (starts it on the first Host).
+  const persistHosts = useCallback(async (list: HostConfig[]) => {
+    const added = list.filter(h => !registry.isConfigured(h.id));
+    configuredHostsRef.current = list;
+    // The registry drops removed Hosts synchronously, so no late event re-adds their Tabs.
+    const configured = registry.configure(list).catch(() => {});
+    if (list.length > 0) cache.load().catch(() => {});
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("hosts", list); } catch (_) {}
+    await configured;
+    for (const h of added) fetchHostData(h.id);
+  }, [fetchHostData]);
+
+  // Remove a Host: its Tabs go away here without a close intent (they detach; the Terminals
+  // keep running on the Host), its projects are unpinned and its cache is dropped.
+  const handleRemoveHost = useCallback(async (id: HostId) => {
+    const saved = persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id));
+    const gone = tabsRef.current.filter(t => t.host === id).map(t => t.id);
+    for (const [uuid, p] of pendingOpens) if (p.host === id) pendingOpens.delete(uuid);
+    for (const tid of gone) metaSync.forget(tid);
+    if (gone.length) {
+      setTabs(prev => prev.filter(t => t.host !== id));
+      setGroups(prev => applyGroupRemovals(prev, gone));
+      setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, gone), gone));
+      if (gone.includes(activeTabIdRef.current)) setActiveTabId("home");
+    }
+    const layout = sidebarLayout
+      .map((item): SidebarItem => item.kind === "folder" ? { ...item, projectPaths: item.projectPaths.filter(k => parseProjectKey(k).host !== id) } : item)
+      .filter(item => item.kind === "folder" ? item.projectPaths.length > 0 : parseProjectKey(item.path).host !== id);
+    if (layout.length !== sidebarLayout.length || layout.some((it, i) => it !== sidebarLayout[i])) await persistSidebarLayout(layout);
+    if (selectedProject?.host === id) { setSelectedProject(null); setActiveTabId("home"); }
+    setProjectsByHost(prev => { const n = { ...prev }; delete n[id]; return n; });
+    setRecentByHost(prev => { const n = { ...prev }; delete n[id]; return n; });
+    delete appliedLiveRef.current[id];
+    cache.dropHost(id);
+    await saved;
+  }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts]);
+
   // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
   const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
     if (!registry.isUsable(host)) return "offline";
@@ -1313,7 +1351,7 @@ export default function App() {
       <div className="main-content">
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView onSaveHosts={persistHosts} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>

@@ -1818,3 +1818,44 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .picker-addpath input:focus { border-color: var(--border-strong); }
 .picker-addpath-error { flex-basis: 100%; font-size: 10px; color: #d97757; }
 .edit-preview-host { margin-right: 6px; vertical-align: middle; }
+.host-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.host-empty { padding: 18px; text-align: center; border: 1px dashed var(--border-default); border-radius: var(--radius-md); }
+.host-empty-title { font-size: 12px; font-weight: 500; color: var(--text-primary); margin-bottom: 3px; }
+.host-empty-body { font-size: 11px; color: var(--text-muted); }
+.host-row { padding: 12px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-card); display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.host-row-head { display: flex; align-items: center; gap: 10px; }
+.host-row-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.host-row-name { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+.host-row-target { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.host-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--bg-active); color: var(--text-secondary); white-space: nowrap; }
+.host-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+.host-chip-connected .host-chip-dot { background: var(--success); }
+.host-chip-upgrade-pending .host-chip-dot, .host-chip-reconnecting .host-chip-dot { background: #c9a042; }
+.host-chip-offline .host-chip-dot, .host-chip-incompatible .host-chip-dot { background: #b53333; }
+.host-row-note { font-size: 11px; color: var(--text-secondary); }
+.host-row-warn { color: #d97757; }
+.host-row-error { font-size: 11px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+.host-row-error-label { font-weight: 600; color: #d97757; }
+.host-row-error-text { font-family: var(--font-mono); font-size: 10px; min-width: 0; overflow-wrap: anywhere; }
+.host-row-hint { flex-basis: 100%; color: var(--text-secondary); }
+.host-row-link { background: none; border: none; padding: 0; color: var(--accent-terracotta); cursor: pointer; font-size: 11px; }
+.host-row-details { flex-basis: 100%; margin: 0; padding: 8px; max-height: 160px; overflow: auto; background: var(--bg-deep); border-radius: var(--radius-sm); font-size: 10px; white-space: pre-wrap; user-select: text; -webkit-user-select: text; }
+.host-row-info { display: flex; flex-wrap: wrap; gap: 12px; font-size: 10px; color: var(--text-muted); }
+.host-row-agents { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 11px; color: var(--text-secondary); }
+.host-row-agents-title { font-weight: 500; }
+.host-row-agent { display: inline-flex; align-items: center; gap: 4px; }
+.host-row-muted { color: var(--text-muted); }
+.host-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.host-row-remove:hover { color: #d97757; }
+.host-test-result { font-size: 11px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-deep); }
+.host-test-result.ok { color: var(--success); }
+.host-test-result.failed { color: #d97757; }
+.host-form-panel { width: min(480px, calc(100vw - 32px)); }
+.host-confirm-panel { width: min(420px, calc(100vw - 32px)); }
+.host-confirm-body { margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.host-form-mono { font-family: var(--font-mono); }
+.host-form-error { margin-top: 5px; font-size: 11px; color: #d97757; }
+.host-form-disclosure { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; padding: 0; color: var(--text-secondary); font-size: 11px; font-weight: 500; cursor: pointer; }
+.host-form-disclosure svg { transition: transform 0.15s; }
+.host-form-disclosure.open svg { transform: rotate(90deg); }
+.host-form-advanced { margin-top: 8px; }
