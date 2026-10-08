@@ -111,7 +111,7 @@ Open **Settings → Hosts**, choose **Add host**, enter a name and an SSH alias 
 
 xshell installs only the `xshelld` binary at `~/.xshell/server/<version>/xshelld`, not packages, services, or agent CLIs. No ports are opened. Everything goes over SSH.
 
-For restricted SSH setups such as `ForceCommand`, install `xshelld` yourself from the [GitHub release assets](https://github.com/MertPROJ/xshell/releases). Download `xshelld-<triple>` and its `xshelld-<triple>.sha256` checksum for your host. Under **Advanced**, set **Daemon command**, for example `~/bin/xshelld`. xshell appends `connect` and skips automatic installation and upgrades.
+For restricted SSH setups such as `ForceCommand`, install `xshelld` yourself from the [GitHub release assets](https://github.com/MertPROJ/xshell/releases). Download `xshelld-<triple>` and its `xshelld-<triple>.sha256` checksum for your host. Under **Advanced**, set **Daemon command**, for example `~/bin/xshelld`. xshell sends exactly `<command> connect` and `<command> --version`, with no shell wrapping, so a `ForceCommand` wrapper sees those strings in `SSH_ORIGINAL_COMMAND`; set the command to whatever your wrapper accepts. Automatic installation and upgrades are skipped.
 
 xshell stages updates without interrupting running terminals. When **Upgrade pending** appears, choose **Upgrade now** to switch. This restarts every terminal on that host, including those used by other Desktops. Agent sessions resume; shells start fresh in the same directory. A staged update also takes effect at the Daemon's next restart.
 

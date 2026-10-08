@@ -19,7 +19,7 @@ export const S = {
   "hosts.form.color.label": "Color",
   "hosts.form.advanced": "Advanced",
   "hosts.form.daemonCommand.label": "Daemon command",
-  "hosts.form.daemonCommand.placeholder": "~/bin/xshelld",
+  "hosts.form.daemonCommand.placeholder": "e.g. xshelld",
   "hosts.form.daemonCommand.help": "Optional command to run an existing daemon on the host. xshell appends connect and skips automatic installation and upgrades. Leave blank for managed setup.",
   "hosts.form.save": "Save",
   "hosts.form.cancel": "Cancel",
