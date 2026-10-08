@@ -57,6 +57,9 @@ pub enum Point {
     Drained { published: bool },
     /// A write holds its run's writer and is about to write (it may block).
     Writing,
+    /// A run's reader and flusher threads run and its waiter is next. Returning `true`
+    /// makes the waiter's start fail.
+    StartWaiter { pid: Option<u32> },
 }
 
 pub type Hook = Arc<dyn Fn(&str, Point) -> bool + Send + Sync>;
@@ -198,7 +201,12 @@ impl LocalPtys {
             master: Mutex::new(Some(s.master)),
             writer: Mutex::new(Some(Arc::new(Mutex::new(s.writer)))),
         });
-        self.run_threads(&t, 0, s.reader, s.child);
+        if let Err(e) = self.run_threads(&t, 0, s.reader, s.child) {
+            // Nothing was listed or shown yet: no exit to publish.
+            t.st.lock().unwrap().phase = Phase::Exited;
+            drop(t.take_pty());
+            return Err(e);
+        }
         let old_pty = {
             let mut terms = self.terms.lock().unwrap();
             terms.insert(id, t).map(|old| old.mark_closing())
@@ -330,10 +338,18 @@ impl LocalPtys {
         };
         // Before the new run's flusher can send anything.
         t.sink.data(RESET.to_vec());
+        let (pid, killer) = (s.child.process_id(), s.child.clone_killer());
+        // The new run's threads wait for `st`, held here, before they touch the Terminal.
+        if let Err(e) = self.run_threads(&t, st.run + 1, s.reader, s.child) {
+            // The replacement was ended and reaped; the Tab sees the run end, once.
+            st.phase = Phase::Exited;
+            t.sink.exit(0);
+            return Err(format!("restart failed: {e}"));
+        }
         st.spec = next;
         st.run += 1;
-        st.pid = s.child.process_id();
-        st.killer = s.child.clone_killer();
+        st.pid = pid;
+        st.killer = killer;
         st.reaped = false;
         st.drained = false;
         st.phase = Phase::Live;
@@ -341,17 +357,29 @@ impl LocalPtys {
         // nothing reads any more.
         *t.master.lock().unwrap() = Some(s.master);
         *t.writer.lock().unwrap() = Some(Arc::new(Mutex::new(s.writer)));
-        self.run_threads(&t, st.run, s.reader, s.child);
         Ok(true)
     }
 
+    /// Start run `run`'s reader, flusher and waiter. If one cannot start, the child is
+    /// killed and reaped here and the threads already running drain into a run that never
+    /// becomes current.
     fn run_threads(
         &self,
         t: &Arc<LocalTerminal>,
         run: u64,
         reader: Box<dyn Read + Send>,
-        mut child: Box<dyn Child + Send + Sync>,
-    ) {
+        child: Box<dyn Child + Send + Sync>,
+    ) -> Result<(), String> {
+        let pid = child.process_id();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let fail = |e: std::io::Error| {
+            if let Some(mut c) = child.lock().unwrap().take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            format!("Failed to start terminal threads: {e}")
+        };
+        let thread = |name: &str| std::thread::Builder::new().name(format!("pty-{name}-{}", t.id));
         // ── PTY → frontend transport ─────────────────────────────────────────
         // Reader thread does blocking reads of large chunks and appends RAW BYTES to a shared
         // buffer. A separate flusher coalesces a short window so a burst (e.g. a full TUI
@@ -365,72 +393,84 @@ impl LocalPtys {
 
         let pending_r = pending.clone();
         let done_r = done.clone();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(reader);
-            let mut buf = [0u8; READ_BUF];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let (lock, cv) = &*pending_r;
-                        let mut g = lock.lock().unwrap();
-                        // Backpressure: discard the whole backlog (slicing it would corrupt
-                        // xterm mid-escape) and drop a hard reset + notice in its place.
-                        if g.len() + n > MAX_PENDING {
-                            g.clear();
-                            g.extend_from_slice(OVERFLOW_NOTICE);
+        thread("read")
+            .spawn(move || {
+                let mut reader = BufReader::new(reader);
+                let mut buf = [0u8; READ_BUF];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let (lock, cv) = &*pending_r;
+                            let mut g = lock.lock().unwrap();
+                            // Backpressure: discard the whole backlog (slicing it would corrupt
+                            // xterm mid-escape) and drop a hard reset + notice in its place.
+                            if g.len() + n > MAX_PENDING {
+                                g.clear();
+                                g.extend_from_slice(OVERFLOW_NOTICE);
+                            }
+                            g.extend_from_slice(&buf[..n]);
+                            cv.notify_one();
                         }
-                        g.extend_from_slice(&buf[..n]);
-                        cv.notify_one();
                     }
                 }
-            }
-            done_r.store(true, Ordering::Release);
-            pending_r.1.notify_one();
-        });
+                done_r.store(true, Ordering::Release);
+                pending_r.1.notify_one();
+            })
+            .map_err(fail)?;
 
         // Flusher: wait for data, coalesce a burst into one chunk, send as binary. When the
         // reader has hit EOF and the buffer is fully drained, publish the exit — same thread,
         // so the exit never races ahead of the final output chunk.
         let (tf, hook) = (t.clone(), self.hook.clone());
-        std::thread::spawn(move || {
-            let (lock, cv) = &*pending;
-            loop {
-                {
-                    let mut g = lock.lock().unwrap();
-                    while g.is_empty() {
-                        if done.load(Ordering::Acquire) {
-                            drop(g);
-                            let published = tf.drained(run);
-                            if let (Some(h), Some(published)) = (hook, published) {
-                                h(&tf.id, Point::Drained { published });
+        thread("flush")
+            .spawn(move || {
+                let (lock, cv) = &*pending;
+                loop {
+                    {
+                        let mut g = lock.lock().unwrap();
+                        while g.is_empty() {
+                            if done.load(Ordering::Acquire) {
+                                drop(g);
+                                let published = tf.drained(run);
+                                if let (Some(h), Some(published)) = (hook, published) {
+                                    h(&tf.id, Point::Drained { published });
+                                }
+                                return;
                             }
-                            return;
+                            let (next, _) = cv.wait_timeout(g, FLUSH_MAX_IDLE).unwrap();
+                            g = next;
                         }
-                        let (next, _) = cv.wait_timeout(g, FLUSH_MAX_IDLE).unwrap();
-                        g = next;
+                    }
+                    std::thread::sleep(FLUSH_COALESCE);
+                    let chunk = std::mem::take(&mut *lock.lock().unwrap());
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if !tf.sink.data(chunk) {
+                        break;
                     }
                 }
-                std::thread::sleep(FLUSH_COALESCE);
-                let chunk = std::mem::take(&mut *lock.lock().unwrap());
-                if chunk.is_empty() {
-                    continue;
-                }
-                if !tf.sink.data(chunk) {
-                    break;
-                }
-            }
-        });
+            })
+            .map_err(fail)?;
 
-        let tw = t.clone();
-        std::thread::spawn(move || {
-            let _ = child.wait();
-            let mut st = tw.st.lock().unwrap();
-            if st.run == run {
-                st.reaped = true;
-                tw.cv.notify_all();
-            }
-        });
+        let (tw, cw) = (t.clone(), child.clone());
+        let waiter = if self.hook(&t.id, Point::StartWaiter { pid }) {
+            Err(std::io::Error::other("refused by a test hook"))
+        } else {
+            thread("wait").spawn(move || {
+                let Some(mut child) = cw.lock().unwrap().take() else {
+                    return;
+                };
+                let _ = child.wait();
+                let mut st = tw.st.lock().unwrap();
+                if st.run == run {
+                    st.reaped = true;
+                    tw.cv.notify_all();
+                }
+            })
+        };
+        waiter.map(drop).map_err(fail)
     }
 }
 
@@ -995,5 +1035,43 @@ mod tests {
             let _ = tx.send(());
         });
         rx.recv_timeout(T).expect("close blocked by a write");
+    }
+
+    /// The replacement's waiter cannot start: the replacement is killed and reaped, the Tab
+    /// sees one exit, and no lock is left poisoned.
+    #[test]
+    fn local_relaunch_thread_start_failure_rolls_back() {
+        let pids = Arc::new(Mutex::new(Vec::new()));
+        let p = pids.clone();
+        let f = fx_with(AGENT, None, move |ptys| {
+            ptys.hook = Some(Arc::new(move |_, point| match point {
+                Point::StartWaiter { pid } => {
+                    let mut p = p.lock().unwrap();
+                    p.push(pid);
+                    p.len() == 2
+                }
+                _ => false,
+            }))
+        });
+        f.spawn("claude", Some(SID));
+        f.sink.wait_for("args ");
+        let err = f.relaunch(true, "claude", Some(SID)).unwrap_err();
+        assert_eq!(
+            err,
+            "restart failed: Failed to start terminal threads: refused by a test hook"
+        );
+        assert_eq!(f.sink.exits(), vec![0]);
+        let replacement = pids.lock().unwrap()[1].expect("replacement pid") as i32;
+        assert!(!alive(replacement), "the replacement was not reaped");
+        assert_eq!(
+            f.relaunch(false, "claude", Some(SID)),
+            Err("terminal has exited".into())
+        );
+        // Every lock still works.
+        f.ptys.write("t", b"x").unwrap();
+        f.ptys.resize("t", 90, 20).unwrap();
+        f.ptys.close("t");
+        f.spawn("claude", Some(SID));
+        f.sink.wait_for(&format!("args --session-id {SID}."));
     }
 }
