@@ -484,6 +484,8 @@ fn relaunch_partial_start_failure_keeps_entry() {
     assert!(info.exit_code.is_some());
     assert_eq!(info.pid, Some(old as u32));
     assert_eq!(e.h.state_ids(), vec![t]);
+    // The failed replacement was confirmed gone, so nothing is left to end on a restart.
+    assert_eq!(e.h.state_json()["terminals"][0]["leader"], Value::Null);
     let mut b = e.client();
     b.attach(t);
     b.output_until(t, &format!("pid {old} "));
@@ -603,6 +605,55 @@ fn relaunch_interrupted_restores_with_flag() {
     let (_, list) = c.hello(range(1, 1));
     assert_eq!(only(&list, t).spec.skip_permissions, Some(true));
     assert_eq!(fake.wait_launches(2)[1], vec![SKIP, "--resume", SID]);
+}
+
+/// The Daemon crashes right after starting the replacement, before it is listed: the state
+/// file already names it, so the restart ends it and exactly one agent runs.
+#[test]
+fn crash_after_replacement_spawn_ends_it_on_restore() {
+    let h = TestHome::new();
+    let f = fake_claude(&h);
+    let _reaper = FakeReaper(f.pids_log.clone());
+    let cwd = h.project("app");
+    let t = Uuid::new_v4();
+    let path = f.path_env();
+    let crash_file = f.pids_log.to_string_lossy().into_owned();
+
+    let mut s1 = ServeProc::start(
+        &h,
+        &[
+            ("PATH", &path),
+            ("XSHELLD_TEST_CRASH_AFTER_REPLACEMENT", &crash_file),
+        ],
+    );
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    c.open(t, claude_spec(&cwd, Some(SID)));
+    let old = f.wait_pids(1)[0];
+    make_jsonl(&h, &cwd, SID);
+    let id = c.request_id();
+    c.send(&relaunch_msg(t, true), Some(id));
+    assert!(s1.wait_exit(T).is_some(), "serve did not crash");
+    let replacement = f.wait_pids(2)[1];
+    assert!(!alive(old));
+    // The master closed with the crash; the HUP-ignoring replacement survived it.
+    assert!(
+        alive(replacement),
+        "the replacement should survive the crash"
+    );
+
+    let _s2 = ServeProc::start(&h, &[("PATH", &path)]);
+    let mut c = Client::connect(&h.paths().socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert_eq!(only(&list, t).spec.skip_permissions, Some(true));
+    assert!(
+        wait_dead(replacement, T),
+        "the leftover replacement was not ended"
+    );
+    let pids = f.wait_pids(3);
+    assert_eq!(pids.iter().filter(|&&p| alive(p)).count(), 1, "{pids:?}");
+    assert!(alive(pids[2]));
+    assert_eq!(f.wait_launches(3)[2], vec![SKIP, "--resume", SID]);
 }
 
 /// Through the real binary: relaunch, crash, restart. Both the relaunched agent and the one

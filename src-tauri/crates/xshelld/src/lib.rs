@@ -49,8 +49,32 @@ pub fn main_entry() -> i32 {
         if let Some(t) = opts.idle_timeout {
             cfg.idle_timeout = t;
         }
+        cfg.test_hook = crash_after_replacement_hook();
         server::run_serve(cfg)
     } else {
         connect::run_connect(&opts, &paths)
     }
+}
+
+/// Test hook: with `XSHELLD_TEST_CRASH_AFTER_REPLACEMENT=<file>`, `serve` aborts (a crash: no
+/// cleanup) as soon as a Relaunch's replacement process exists, once `<file>` names its pid on
+/// a line (at most 10 s), so a test knows the replacement is past its startup.
+fn crash_after_replacement_hook() -> Option<server::TestHook> {
+    let file = std::env::var_os("XSHELLD_TEST_CRASH_AFTER_REPLACEMENT")?;
+    Some(server::TestHook(std::sync::Arc::new(move |_, point| {
+        if let server::TestPoint::ReplacementSpawned { pid } = point {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let named = || {
+                std::fs::read_to_string(&file)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.trim() == pid.to_string())
+            };
+            while !named() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::process::abort();
+        }
+        false
+    })))
 }

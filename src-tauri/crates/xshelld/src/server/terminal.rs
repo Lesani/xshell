@@ -34,6 +34,10 @@ struct Record {
     /// The `skipPermissions` a Relaunch in progress will start with. Persisted in its place,
     /// so a restart during the Relaunch restores what the user asked for.
     pending_skip: Option<bool>,
+    /// The process a Relaunch started to replace this Terminal's, persisted as this
+    /// Terminal's leader from the moment it exists until it is listed in its own right or
+    /// confirmed gone: a restart in between ends it instead of running a second agent.
+    replacement: Option<Leader>,
 }
 
 struct TermIo {
@@ -108,6 +112,23 @@ fn short(id: &Uuid) -> String {
     id.simple().to_string()[..8].to_string()
 }
 
+/// Why [`spawn_with`] failed.
+pub(crate) struct SpawnError {
+    pub message: String,
+    /// Set when the process started but some of its threads did not: it is being ended, and
+    /// its exit is published on this Terminal (never on a listed one).
+    pub started: Option<Arc<Terminal>>,
+}
+
+impl From<String> for SpawnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            started: None,
+        }
+    }
+}
+
 /// Start a Terminal. Unlike the Desktop, a cwd that is not a directory is an error: the PTY
 /// library would silently fall back to `$HOME`, and a restore must fail visibly instead.
 pub(crate) fn spawn(
@@ -119,8 +140,22 @@ pub(crate) fn spawn(
     rows: u16,
     created_at_ms: u64,
 ) -> Result<Arc<Terminal>, String> {
+    spawn_with(d, id, spec, meta, (cols, rows), created_at_ms, |_| {}).map_err(|e| e.message)
+}
+
+/// [`spawn`], calling `spawned` with the new process's identity as soon as it exists, before
+/// any of its threads start.
+pub(crate) fn spawn_with(
+    d: &Arc<Daemon>,
+    id: Uuid,
+    spec: LaunchSpec,
+    meta: Map<String, Value>,
+    (cols, rows): (u16, u16),
+    created_at_ms: u64,
+    spawned: impl FnOnce(&Leader),
+) -> Result<Arc<Terminal>, SpawnError> {
     if !spec.cwd.is_empty() && !Path::new(&spec.cwd).is_dir() {
-        return Err(format!("working directory does not exist: {}", spec.cwd));
+        return Err(format!("working directory does not exist: {}", spec.cwd).into());
     }
     let plan = xshell_core::plan_command(&d.ctx, &spec)?;
     let pair = native_pty_system()
@@ -135,6 +170,18 @@ pub(crate) fn spawn(
         .slave
         .spawn_command(plan.to_command_builder())
         .map_err(|e| format!("failed to start {}: {e}", plan.program))?;
+    let pid = child.process_id();
+    let start_time = pid.and_then(|p| super::orphans::start_time(p as i32));
+    if let Some(pid) = pid {
+        spawned(&Leader {
+            pid,
+            start_time,
+            groups: vec![ProcIdentity {
+                pid: pid as i32,
+                start_time,
+            }],
+        });
+    }
     drop(pair.slave);
     let reader = pair
         .master
@@ -144,7 +191,6 @@ pub(crate) fn spawn(
         .master
         .take_writer()
         .map_err(|e| format!("failed to take PTY writer: {e}"))?;
-    let pid = child.process_id();
     let (tx, rx) = sync_channel::<Vec<u8>>(INPUT_BACKLOG);
     let t = Arc::new(Terminal {
         id,
@@ -153,6 +199,7 @@ pub(crate) fn spawn(
             meta,
             created_at_ms,
             pending_skip: None,
+            replacement: None,
         }),
         io: Mutex::new(TermIo {
             master: Some(pair.master),
@@ -165,7 +212,7 @@ pub(crate) fn spawn(
         }),
         input: Mutex::new(Some(tx)),
         pid,
-        start_time: pid.and_then(|p| super::orphans::start_time(p as i32)),
+        start_time,
         life: Mutex::new(Life::default()),
         life_cv: Condvar::new(),
         nudge_pending: AtomicBool::new(false),
@@ -224,7 +271,10 @@ pub(crate) fn spawn(
         .next()
     {
         t.kill(d.cfg.kill_grace);
-        return Err(format!("failed to start terminal threads: {e}"));
+        return Err(SpawnError {
+            message: format!("failed to start terminal threads: {e}"),
+            started: Some(t),
+        });
     }
     Ok(t)
 }
@@ -357,6 +407,11 @@ impl Terminal {
             Some(code) => self.finish_exit(d, reg, code),
             None => d.persist(reg),
         }
+    }
+
+    /// Name (or stop naming) the process a Relaunch started to replace this one's.
+    pub fn set_replacement(&self, leader: Option<Leader>) {
+        self.record.lock().unwrap().replacement = leader;
     }
 
     /// What a Relaunch restarts with: spec, metadata, creation time and the current size.
@@ -690,7 +745,9 @@ impl Terminal {
             cols,
             rows,
             created_at_ms: r.created_at_ms,
-            leader: leader.or_else(|| self.kept_leader.clone()),
+            leader: leader
+                .or_else(|| r.replacement.clone())
+                .or_else(|| self.kept_leader.clone()),
         }
     }
 }
@@ -709,6 +766,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
             meta: p.meta,
             created_at_ms: p.created_at_ms,
             pending_skip: None,
+            replacement: None,
         }),
         io: Mutex::new(TermIo {
             master: None,

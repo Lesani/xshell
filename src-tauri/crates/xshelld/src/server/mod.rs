@@ -78,6 +78,9 @@ pub enum TestPoint {
     /// The Relaunch worker stopped waiting for the old process; `exited` says whether it
     /// ended in time. Returning `true` treats it as a timeout.
     Waited { exited: bool },
+    /// A Relaunch started the replacement process `pid` and persisted its identity; none of
+    /// its threads run yet (registry locked: do not block on the Daemon).
+    ReplacementSpawned { pid: u32 },
     /// A Terminal's reader and waiter threads are running and its input thread is next.
     /// Returning `true` makes that thread start fail.
     StartInput,

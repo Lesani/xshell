@@ -7,13 +7,14 @@
 use super::conn::reply;
 use super::outbox::Outbox;
 use super::registry::{Daemon, Registry};
-use super::terminal::{self, Terminal};
+use super::terminal::{self, SpawnError, Terminal};
 use super::TestPoint;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::launch::relaunch_spec;
+use xshell_core::terminal::state::Leader;
 
 /// How long past the kill grace the old process may take to end before the Relaunch gives
 /// up. SIGKILL is sent at the grace, so this only covers reaping and draining its output.
@@ -132,25 +133,46 @@ fn run(d: &Arc<Daemon>, t: &Arc<Terminal>, skip: bool, ob: &Arc<Outbox>, id: Opt
             reply(ob, id, Ok(json!({ "pid": pid, "relaunched": true })));
         }
         Err(e) => {
+            if let Some(failed) = e.started {
+                // Its process exists but not all of its threads: it is being ended. The state
+                // file keeps naming it until it is confirmed gone; its exit needs the lock.
+                drop(reg);
+                let gone = failed.wait_exited(Instant::now() + d.cfg.kill_grace + EXIT_SLACK);
+                reg = d.reg.lock().unwrap();
+                if gone {
+                    t.set_replacement(None);
+                }
+            }
             t.abort_relaunch(d, &mut reg);
             drop(reg);
-            reply(ob, id, Err(e));
+            reply(ob, id, Err(e.message));
         }
     }
 }
 
+/// Start the replacement. Its identity is persisted (as the old Terminal's leader) before
+/// any of its threads start, so a crash from then on leaves a record that ends it.
 fn replacement(
     d: &Arc<Daemon>,
     reg: &Registry,
     t: &Arc<Terminal>,
     skip: bool,
-) -> Result<Arc<Terminal>, String> {
+) -> Result<Arc<Terminal>, SpawnError> {
     if reg.frozen {
-        return Err("xshelld is upgrading or shutting down".into());
+        return Err(String::from("xshelld is upgrading or shutting down").into());
     }
-    let (spec, meta, created_at_ms, (cols, rows)) = t.relaunch_parts();
+    let (spec, meta, created_at_ms, size) = t.relaunch_parts();
     let spec = relaunch_spec(&spec, skip)?;
     d.check_budget(reg, t.id, &spec, &meta)?;
-    terminal::spawn(d, t.id, spec, meta, cols, rows, created_at_ms)
-        .map_err(|e| format!("restart failed: {e}"))
+    let spawned = |leader: &Leader| {
+        t.set_replacement(Some(leader.clone()));
+        d.persist(reg);
+        d.test_point(t.id, TestPoint::ReplacementSpawned { pid: leader.pid });
+    };
+    terminal::spawn_with(d, t.id, spec, meta, size, created_at_ms, spawned).map_err(|e| {
+        SpawnError {
+            message: format!("restart failed: {}", e.message),
+            started: e.started,
+        }
+    })
 }
