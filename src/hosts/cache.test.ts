@@ -51,3 +51,13 @@ describe("cache", () => {
     expect(parseCache(JSON.parse(JSON.stringify(ok)))).toEqual(ok);
   });
 });
+
+import { tabFromTerminal } from "./reconcile";
+describe("cache at startup", () => {
+  it("cached terminals produce stale tabs at startup", () => {
+    const s = putTerminals(emptyCache(), H, [term("b"), { ...term("a"), meta: { title: "Agent", projectName: "p" } }], 5);
+    const tabs = s.hosts[H].terminals.map(i => tabFromTerminal(H, i));
+    expect(tabs.map(t => t.id)).toEqual(["remote-b", "remote-a"]);
+    expect(tabs[1]).toMatchObject({ host: H, terminal: "a", title: "Agent", projectName: "p", projectPath: "/p" });
+  });
+});

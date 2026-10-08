@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getDefaultShellId, getShellById } from "./shells";
+import { defaultShellForPlatform, getDefaultShellId, getShellById } from "./shells";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
@@ -22,6 +23,16 @@ import { UpdateDialog } from "./components/UpdateDialog";
 import { hostInvoke } from "./hosts/hostInvoke";
 import { asProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
 import { latestGate } from "./hosts/requestGate";
+import { registry } from "./hosts/registry";
+import { cache } from "./hosts/cache";
+import { applyFocusRemovals, applyGroupRemovals, applyTabDelta, isEmptyDelta, reconcile, restoreGroupIds, tabFromTerminal } from "./hosts/reconcile";
+import { localEdits, metaSync } from "./hosts/metaSync";
+import { planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
+import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
+import { mergeRecent } from "./hosts/aggregate";
+import { statusLabel, useHostsSnapshot } from "./hosts/useHosts";
+import type { HostConfig, HostId, TerminalInfo } from "./hosts/types";
+import { AppNotice } from "./components/AppNotice";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders. A Local
@@ -74,7 +85,14 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
 }
 
 export default function App() {
-  const [allProjects, setAllProjects] = useState<ProjectInfo[]>([]);
+  // Projects per Host ("local" plus each Remote Host id); remote items carry `host`.
+  const [projectsByHost, setProjectsByHost] = useState<Record<string, ProjectInfo[]>>({ local: [] });
+  const allProjects = useMemo(() => {
+    const remote = Object.entries(projectsByHost).filter(([k]) => k !== "local");
+    if (remote.length === 0) return projectsByHost.local;
+    return [...projectsByHost.local, ...remote.flatMap(([, v]) => v)];
+  }, [projectsByHost]);
+  const setAllProjects = useCallback((local: ProjectInfo[]) => setProjectsByHost(prev => ({ ...prev, local })), []);
   const [savedPaths, setSavedPaths] = useState<ProjectKey[]>([]);
   // Discord-style sidebar — top-level list of projects and folders-of-projects. `savedPaths`
   // is kept as a derived flat view (used by other components that just want "which projects
@@ -85,7 +103,32 @@ export default function App() {
   const [selectedProject, setSelectedProject] = useState<ProjectInfo | null>(null);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState("home");
-  const [recentSessions, setRecentSessions] = useState<SessionInfo[]>([]);
+  const [recentByHost, setRecentByHost] = useState<Record<string, SessionInfo[]>>({ local: [] });
+  const recentSessions = useMemo(() => {
+    const remote = Object.entries(recentByHost).filter(([k]) => k !== "local");
+    if (remote.length === 0) return recentByHost.local;
+    return mergeRecent([recentByHost.local, ...remote.map(([, v]) => v)], 100);
+  }, [recentByHost]);
+  const setRecentSessions = useCallback((local: SessionInfo[]) => setRecentByHost(prev => ({ ...prev, local })), []);
+  // Remote Hosts: registry snapshot (dormant and constant when no Hosts are configured).
+  const hostsSnap = useHostsSnapshot();
+  const [notice, setNotice] = useState<{ id: number; text: string } | null>(null);
+  const showNotice = useCallback((text: string) => setNotice({ id: Date.now(), text }), []);
+  const dismissNotice = useCallback(() => setNotice(null), []);
+  const configuredHostsRef = useRef<HostConfig[]>([]);
+  // A Remote Host's projects and recent sessions, stamped with `host` at this boundary. Served
+  // from the cache while the Host is offline.
+  const fetchHostData = useCallback(async (host: HostId) => {
+    const [projects, sessions] = await Promise.all([
+      hostInvoke<ProjectInfo[]>(host, "list_claude_projects").catch(() => null),
+      hostInvoke<SessionInfo[]>(host, "get_all_recent_sessions", { limit: 100 }).catch(() => null),
+    ]);
+    if (!registry.isConfigured(host)) return;
+    if (projects) setProjectsByHost(prev => ({ ...prev, [host]: projects.map(p => ({ ...p, host })) }));
+    if (sessions) setRecentByHost(prev => ({ ...prev, [host]: sessions.map(x => ({ ...x, host })) }));
+  }, []);
+  // Refetch a Host's data whenever it becomes usable.
+  useEffect(() => registry.onUsable(host => { fetchHostData(host); }), [fetchHostData]);
   const [projectSessions, setProjectSessions] = useState<SessionInfo[]>([]);
   const [initialLoading, setInitialLoading] = useState(true);
   const [sessionsLoading, setSessionsLoading] = useState(false);
@@ -204,7 +247,7 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode] = await Promise.all([
+        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts] = await Promise.all([
           store.get<string[]>("project_paths"),
           store.get<Record<string, ProjectSettings>>("project_icons"),
           store.get<Tab[]>("open_tabs"),
@@ -233,7 +276,16 @@ export default function App() {
           store.get<boolean>("session_row_metrics_codex"),
           store.get<boolean>("rate_limit_in_sidebar_codex"),
           store.get<boolean>("session_row_metrics_opencode"),
+          store.get<HostConfig[]>("hosts"),
         ]);
+        // Remote Hosts: start the registry (a no-op with none configured) and load the
+        // offline cache so their last known Terminals show as Tabs right away.
+        const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
+        if (hostConfigs.length > 0) {
+          await cache.load();
+          registry.init(hostConfigs).catch(() => {});
+        }
+        configuredHostsRef.current = hostConfigs;
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
         let layout: SidebarItem[] = [];
@@ -271,9 +323,11 @@ export default function App() {
         if (typeof rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(rowMetricsCodex);
         if (typeof rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(rlSidebarCodex);
         if (typeof rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(rowMetricsOpencode);
-        // Restore only tabs that have a real sessionId (not abandoned "New Chat" tabs)
-        if (savedTabs?.length) {
-          const restorable = savedTabs.filter(t => t.sessionId && t.projectPath);
+        // Restore only tabs that have a real sessionId (not abandoned "New Chat" tabs). Remote
+        // Tabs are not in open_tabs: they come from the cached `terminals` list per Host.
+        const cachedRemote: Tab[] = hostConfigs.flatMap(h => (cache.terminals(h.id) ?? []).slice().sort((a, b) => a.createdAtMs - b.createdAtMs).map(info => tabFromTerminal(h.id, info)));
+        if (savedTabs?.length || cachedRemote.length) {
+          const restorable = [...(savedTabs ?? []).filter(t => t.sessionId && t.projectPath && !t.host), ...cachedRemote];
           if (restorable.length) {
             // First, filter groups: keep only those whose leaves are all restorable.
             const restoredIds = new Set(restorable.map(t => t.id));
@@ -287,7 +341,8 @@ export default function App() {
             const validGroupIds = new Set(keptGroups.map(g => g.id));
             // Then, scrub any orphaned groupId off a tab — a leftover from an earlier bug
             // where tabs kept a groupId pointing at a group that no longer exists.
-            const scrubbed = restorable.map(t => (t.groupId && !validGroupIds.has(t.groupId)) ? { ...t, groupId: undefined } : t);
+            // Cached remote tabs get their groupId back from the kept layouts (amendment 22).
+            const scrubbed = restoreGroupIds(restorable, keptGroups).map(t => (t.groupId && !validGroupIds.has(t.groupId)) ? { ...t, groupId: undefined } : t);
             setTabs(scrubbed);
             setGroups(keptGroups);
             let maxN = 0;
@@ -300,6 +355,7 @@ export default function App() {
         }
       } catch (_) {}
       setTabsRestored(true);
+      for (const h of configuredHostsRef.current) fetchHostData(h.id);
       const [projects, sessions] = await Promise.all([
         hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => [] as ProjectInfo[]),
         hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
@@ -354,7 +410,8 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        await store.set("open_tabs", tabs);
+        // Remote Tabs are mirrored from their Daemon, never persisted here.
+        await store.set("open_tabs", tabs.some(t => t.host) ? tabs.filter(t => !t.host) : tabs);
       } catch (_) {}
     })();
   }, [tabs, tabsRestored]);
@@ -368,8 +425,8 @@ export default function App() {
       const name = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const fallback: ProjectInfo = { name, path, encoded_name: "", session_count: 0, last_active: "" };
       return host ? { ...fallback, host } : fallback;
-    }));
-  }, [savedPaths, allProjects]);
+    }).filter(p => !p.host || hostsSnap.configs.some(c => c.id === p.host))); // keys of unknown Hosts are skipped
+  }, [savedPaths, allProjects, hostsSnap.configs]);
 
   // ── Tab title sync: lightweight poll only when terminals are open ──
   useEffect(() => {
@@ -420,7 +477,10 @@ export default function App() {
               if (match && match.title !== tab.title) { changed = true; return { ...tab, title: match.title }; }
               return tab;
             });
-            return changed ? next : prev;
+            if (!changed) return prev;
+            // Remote tabs: a link or rename is a local edit → pushed to the Terminal's meta.
+            for (const e of localEdits(prev, next)) metaSync.markDirty(e.tabId, e.field, e.value);
+            return next;
           });
         } catch (_) {}
       }
@@ -596,7 +656,11 @@ export default function App() {
   // metadata — the PTY is already attached to the new sessionId's JSONL, so nothing else
   // needs to change.
   const handleSwitchTabToBranch = useCallback((tabId: string, newSessionId: string, newTitle: string) => {
-    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, sessionId: newSessionId, title: newTitle } : t));
+    setTabs(prev => {
+      const next = prev.map(t => t.id === tabId ? { ...t, sessionId: newSessionId, title: newTitle } : t);
+      for (const e of localEdits(prev, next)) metaSync.markDirty(e.tabId, e.field, e.value);
+      return next;
+    });
   }, []);
 
   // Apply always-on-top on startup once the value has been restored from disk.
@@ -617,6 +681,8 @@ export default function App() {
     setSessionsLoading(true);
     let next: SessionInfo[];
     try { next = await hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName }); } catch (_) { next = []; }
+    // Stamp the Host at the fetch boundary so every consumer knows where a session lives.
+    if (project.host) next = next.map(x => ({ ...x, host: project.host }));
     if (!projectSessionsGate.current.isCurrent(token)) return;
     setProjectSessions(next);
     setSessionsLoading(false);
@@ -628,12 +694,13 @@ export default function App() {
     setSessionsLoading(true);
     const [sessions, projects] = await Promise.all([
       hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
-      hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => allProjects),
+      hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => projectsByHost.local),
     ]);
     setRecentSessions(sessions);
     setAllProjects(projects);
     setSessionsLoading(false);
-  }, [allProjects]);
+    for (const h of registry.getSnapshot().configs) fetchHostData(h.id);
+  }, [projectsByHost.local, fetchHostData]);
 
   // ── Project management ────────────────────────────────────────────
   const handleToggleProject = useCallback(async (key: ProjectKey) => {
@@ -679,9 +746,35 @@ export default function App() {
   }, [sidebarLayout, persistSidebarLayout]);
 
   // ── Tab management ────────────────────────────────────────────────
-  const handleOpenSession = useCallback((session: SessionInfo, project?: ProjectInfo) => {
-    const existingTab = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf(session));
-    if (existingTab) {
+  // Context for the pure Terminal-start planners (src/hosts/sessionOps.ts).
+  const openContext = useCallback((): OpenContext => ({
+    now: Date.now(),
+    uuid: () => crypto.randomUUID(),
+    fullscreenRendering,
+    forceSyncOutput,
+    isUsable: (h) => registry.isUsable(h),
+    isConfigured: (h) => registry.isConfigured(h),
+    status: (h) => registry.getStatus(h),
+    hostName: (h) => registry.hostName(h),
+    statusLabel,
+  }), [fullscreenRendering, forceSyncOutput]);
+
+  // Applies a plan: refusal → notice; create → add the tab (and register a remote open).
+  const applyPlan = useCallback((plan: Plan, activate: boolean): Tab | null => {
+    if (plan.kind === "refuse") { showNotice(plan.notice); return null; }
+    if (plan.kind === "focus") return plan.tab;
+    if (plan.pending) pendingOpens.set(plan.pending.uuid, plan.pending.open);
+    setTabs(prev => [...prev, plan.tab]);
+    if (activate) setActiveTabId(plan.tab.id);
+    return plan.tab;
+  }, [showNotice]);
+
+  // Amendment 18: one host-aware open path for every session-open entry point.
+  const openSession = useCallback((session: SessionInfo, project: ProjectInfo | undefined, opts: { background: boolean }) => {
+    const plan = planOpenSession(session, project, tabs, openContext());
+    if (plan.kind === "focus") {
+      if (opts.background) return;
+      const existingTab = plan.tab;
       if (existingTab.groupId) {
         // Tab lives inside a group — surface that group and focus the matching pane.
         setActiveTabId(existingTab.groupId);
@@ -691,60 +784,51 @@ export default function App() {
       }
       return;
     }
-    // Unique tab id (not derived from session id) — otherwise, a tab that auto-switches
-    // its sessionId after /branch would leave its original session id "free", and a later
-    // re-open of that session would generate a colliding tab id.
-    const tabId = `terminal-${session.id}-${Date.now().toString(36)}`;
-    setTabs(prev => [...prev, { id: tabId, type: "terminal", title: session.title, sessionId: session.id, agent: session.agent, projectPath: session.project_path || project?.path || "", projectName: session.project_name || project?.name || "", lastActiveAt: Date.now() }]);
-    setActiveTabId(tabId);
-  }, [tabs]);
+    applyPlan(plan, !opts.background);
+  }, [tabs, openContext, applyPlan]);
 
+  const handleOpenSession = useCallback((session: SessionInfo, project?: ProjectInfo) => openSession(session, project, { background: false }), [openSession]);
   // Add as tab without switching to it — stays on current view.
-  const handleOpenSessionBackground = useCallback((session: SessionInfo, project?: ProjectInfo) => {
-    const existingTab = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf(session));
-    if (existingTab) return;
-    const tabId = `terminal-${session.id}-${Date.now().toString(36)}`;
-    setTabs(prev => [...prev, { id: tabId, type: "terminal", title: session.title, sessionId: session.id, agent: session.agent, projectPath: session.project_path || project?.path || "", projectName: session.project_name || project?.name || "", lastActiveAt: Date.now() }]);
-  }, [tabs]);
+  const handleOpenSessionBackground = useCallback((session: SessionInfo, project?: ProjectInfo) => openSession(session, project, { background: true }), [openSession]);
+
+  // Which agent CLIs exist on a Host: this machine's probe for Local, the registry's for a
+  // Remote Host (never the Desktop's).
+  const installedAgentsFor = useCallback((host?: HostId): Record<AgentId, boolean> => {
+    if (!host) return installedAgents;
+    return hostsSnap.agents[host] ?? (Object.fromEntries(AGENT_IDS.map(a => [a, false])) as Record<AgentId, boolean>);
+  }, [installedAgents, hostsSnap]);
 
   const handleNewChat = useCallback((project: ProjectInfo, agent?: AgentId) => {
     // Resolve which agent hosts the chat: explicit pick > single installed agent > the
     // user's default. With multiple agents and no default ("ask"), open the picker dialog
     // and re-enter with the chosen agent. Single-agent machines never see any of this.
     if (!agent) {
-      const installed = AGENT_IDS.filter(a => installedAgents[a]);
+      const agents = installedAgentsFor(project.host);
+      const installed = AGENT_IDS.filter(a => agents[a]);
       if (installed.length > 1) {
-        if (defaultAgent !== "ask") agent = defaultAgent;
+        if (defaultAgent !== "ask" && installed.includes(defaultAgent)) agent = defaultAgent;
+        else if (defaultAgent !== "ask" && !project.host) agent = defaultAgent;
         else { setAgentPickerProject(project); return; }
+      } else if (project.host && installed.length === 0) {
+        // A Remote Host with no detected agent CLI: the picker explains it.
+        if (!registry.isUsable(project.host)) { applyPlan(planNewChat(project, "claude", openContext()), true); return; }
+        setAgentPickerProject(project);
+        return;
       } else {
         agent = installed[0] ?? "claude";
       }
     }
-    const tabId = `terminal-new-${Date.now()}`;
-    const base = { id: tabId, type: "terminal" as const, title: "New Chat", projectPath: project.path, projectName: project.name, shellMode: "claude" as const, lastActiveAt: Date.now(), createdAt: Date.now() };
-    if (agent === "claude") {
-      // Pre-allocate a UUID and pass it to Claude via `--session-id`. Two wins over the old
-      // `-n Chat-xxxxxx` approach: (1) we know the JSONL filename from the start, so the polling
-      // sync can match by sessionId immediately instead of racing on customTitle; (2) Claude's
-      // `ai-title` summary actually fires (it's suppressed when customTitle is set).
-      setTabs(prev => [...prev, { ...base, sessionId: crypto.randomUUID(), agent: "claude" as const }]);
-    } else {
-      // Codex and Cursor can't pre-assign a session id, so spawn the agent bare in the project
-      // cwd — instant, like Claude. The session id only exists once the agent writes it, so the
-      // tab starts unlinked; the title-sync links it (and renames the tab) once a session with a
-      // real title appears.
-      setTabs(prev => [...prev, { ...base, agent }]);
-    }
-    setActiveTabId(tabId);
-  }, [installedAgents, defaultAgent]);
+    // Claude: a pre-allocated UUID passed via `--session-id` (known JSONL name from the start,
+    // and Claude's ai-title still fires). Codex and Cursor can't pre-assign a session id, so
+    // they spawn bare and the title-sync links the tab once a session with a real title appears.
+    applyPlan(planNewChat(project, agent, openContext()), true);
+  }, [installedAgentsFor, defaultAgent, applyPlan, openContext]);
 
   // Open a raw shell tab (no Claude wrapping) — disposable by design, not persisted across restart.
   // project === null → shell spawned in the user's home directory.
   const handleNewShell = useCallback((project: ProjectInfo | null, shellId: string, shellName: string) => {
-    const tabId = `terminal-shell-${Date.now()}`;
-    setTabs(prev => [...prev, { id: tabId, type: "terminal" as const, title: shellName, projectPath: project?.path || "", projectName: project?.name || "~", shellMode: "raw", shellId, lastActiveAt: Date.now() }]);
-    setActiveTabId(tabId);
-  }, []);
+    applyPlan(planNewShell(project, shellId, shellName, openContext()), true);
+  }, [applyPlan, openContext]);
 
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(new Set());
 
@@ -753,12 +837,15 @@ export default function App() {
     const group = groupsRef.current.find(g => g.id === id);
     if (group) {
       const memberIds = collectLeafIds(group.layout);
+      // Close intent first: remote Terminals end for every Desktop (not just detach).
+      markClosing(tabsRef.current.filter(t => memberIds.includes(t.id)));
       if (activeTabId === id) setActiveTabId("home");
       setGroups(prev => prev.filter(g => g.id !== id));
       setTabs(prev => prev.filter(t => !memberIds.includes(t.id)));
       return;
     }
     // Standalone tab close (existing animated path).
+    markClosing(tabsRef.current.filter(t => t.id === id));
     setClosingTabIds(prev => new Set(prev).add(id));
     if (activeTabId === id) {
       const idx = tabsRef.current.findIndex(t => t.id === id);
@@ -915,6 +1002,52 @@ export default function App() {
     return out;
   }, [tabs, groups]);
 
+  // ── Remote Tabs mirror each Host's `terminals` list (ADR-0001) ──────
+  // Buffered until the restore of open_tabs + cache has committed (amendment 21); then the
+  // latest list per Host is applied. Lists already applied are skipped by identity.
+  const appliedLiveRef = useRef<Record<string, TerminalInfo[]>>({});
+  useEffect(() => {
+    if (!tabsRestored) return;
+    for (const [host, list] of Object.entries(hostsSnap.live)) {
+      if (!list || appliedLiveRef.current[host] === list) continue;
+      appliedLiveRef.current[host] = list;
+      cache.putTerminals(host, list);
+      metaSync.observe(host, list, tabsRef.current);
+      const d = reconcile(tabsRef.current, host, list, pendingUuids(), (id, f) => metaSync.isDirty(id, f));
+      for (const uuid of d.confirmed) if (pendingOpens.get(uuid)?.state === "sent") pendingOpens.delete(uuid);
+      if (isEmptyDelta(d)) continue;
+      for (const id of d.remove) {
+        const t = tabsRef.current.find(x => x.id === id);
+        if (t?.terminal) remoteTerminals.forget(t.terminal);
+        metaSync.forget(id);
+      }
+      setTabs(prev => applyTabDelta(prev, d));
+      if (d.remove.length) {
+        setGroups(prev => applyGroupRemovals(prev, d.remove));
+        // Amendment 22: a removed focused leaf hands focus to a surviving leaf.
+        setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, d.remove), d.remove));
+        if (d.remove.includes(activeTabIdRef.current)) setActiveTabId("home");
+      }
+    }
+  }, [tabsRestored, hostsSnap.live]);
+
+  // Push local edits of remote Tabs (linked session id, title) to their Terminal's meta.
+  // Only while the Host is usable; a failed call is retried once (amendment 17).
+  const [metaTick, setMetaTick] = useState(0);
+  useEffect(() => {
+    if (!tabsRestored) return;
+    const ready = tabs.filter(t => t.host && t.terminal && registry.isUsable(t.host));
+    if (ready.length === 0) return;
+    for (const u of metaSync.takeUpdates(ready)) {
+      const args: Record<string, unknown> = { host: u.host, terminal: u.terminal };
+      if (u.sessionId !== undefined) args.sessionId = u.sessionId;
+      if (u.meta) args.meta = u.meta;
+      invoke("host_term_update", args)
+        .then(() => metaSync.settled(u, true))
+        .catch(() => { metaSync.settled(u, false); if (metaSync.hasPending()) window.setTimeout(() => setMetaTick(n => n + 1), 2000); });
+    }
+  }, [tabs, tabsRestored, hostsSnap.status, metaTick]);
+
   // Dissolve a group when it has 0 or 1 leaves left; 1-leaf groups are pointless.
   useEffect(() => {
     const dissolved: string[] = [];
@@ -985,6 +1118,7 @@ export default function App() {
     if (!tab?.groupId) return;
     const group = groupsRef.current.find(g => g.id === tab.groupId);
     if (!group) return;
+    markClosing([tab]);
     const nextLayout = removeLeaf(group.layout, tabId);
     if (nextLayout) {
       setGroups(prev => prev.map(g => g.id === group.id ? { ...g, layout: nextLayout } : g));
@@ -1128,8 +1262,10 @@ export default function App() {
   // The + button in the tab bar: always open a raw shell using the user's default shell,
   // cwd = context project (or home if none).
   const handleNewShellInContext = useCallback(() => {
-    const shell = getShellById(defaultShell);
-    handleNewShell(contextProject, defaultShell, shell?.name || "Shell");
+    // A Remote Host never gets the Desktop's default shell: use its OS's default instead.
+    const shellId = contextProject?.host ? defaultShellForPlatform(registry.getStatus(contextProject.host)?.os ?? "linux") : defaultShell;
+    const shell = getShellById(shellId);
+    handleNewShell(contextProject, shellId, shell?.name || "Shell");
   }, [contextProject, defaultShell, handleNewShell]);
 
   // Group-aware tab selection: a tab inside a group requires activating its group AND
@@ -1155,7 +1291,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgents} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onHoverProject={setHoveredProjectKey} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectKey={activeTabProjectKey} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
@@ -1254,7 +1390,7 @@ export default function App() {
       </div>
       </div>
       {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} />}
-      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} agents={AGENT_IDS.filter(a => installedAgents[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
+      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
       {editingProjectKey && (() => {
         const proj = allProjects.find(p => sameKey(keyOf(p), editingProjectKey)) || userProjects.find(p => sameKey(keyOf(p), editingProjectKey));
         if (!proj) { setEditingProjectKey(null); return null; }
@@ -1262,6 +1398,7 @@ export default function App() {
         return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectKey, s)} onClose={() => setEditingProjectKey(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
+      <AppNotice notice={notice} onDismiss={dismissNotice} />
     </div>
   );
 }

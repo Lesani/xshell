@@ -75,7 +75,7 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
     if (!project?.encoded_name) { setSessions([]); return; }
     let alive = true;
     hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName: project.encoded_name })
-      .then(v => { if (alive) setSessions(v); })
+      .then(v => { if (alive) setSessions(project.host ? v.map(s => ({ ...s, host: project.host })) : v); })
       .catch(() => { if (alive) setSessions([]); });
     return () => { alive = false; };
   }, [project?.encoded_name, project?.host]);

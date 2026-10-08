@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { fmt } from "../hosts/strings";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
 import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon } from "lucide-react";
@@ -64,11 +65,16 @@ interface RowProps {
   hideTt: () => void;
 }
 
+// True inside a Remote Host's explorer: files are not on this computer, so rows cannot be
+// revealed — drag (path typed into the remote terminal) is the only file action.
+const RemoteRows = createContext(false);
+
 // Single presentational row, shared by the tree and the flat search results.
 function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContext, showTt, hideTt }: RowProps) {
+  const remote = useContext(RemoteRows);
   const agent = agentForDir(item);
   const iconUrl = agent ? "" : item.is_dir ? folderIconUrl(item.name, !!expanded) : fileIconUrl(item.name);
-  const tip = item.is_dir ? item.path : `${item.path} — click to reveal · drag to terminal`;
+  const tip = item.is_dir ? item.path : remote ? fmt("explorer.row.tooltipRemote") : `${item.path} — click to reveal · drag to terminal`;
   const onDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
     e.dataTransfer.setData("text/plain", item.path);
@@ -157,7 +163,8 @@ function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt
 interface PanelProps {
   rootPath: string;
   host?: HostId;
-  terminalId: string;
+  // Types the given text into this panel's terminal (local PTY or Remote Terminal).
+  onWritePath: (data: string) => void;
   visible: boolean;
   showTt: (text: string, el: HTMLElement) => void;
   hideTt: () => void;
@@ -166,7 +173,7 @@ interface PanelProps {
 // Inner content of the file-explorer side panel — header (current dir + up/search/refresh) and
 // a scrollable area showing either the lazy tree or flat search results. TerminalTab wraps this
 // in the shared `.terminal-side-panel` + splitter, mirroring how the git panel is hosted.
-export function FileExplorerPanel({ rootPath, host, terminalId, visible, showTt, hideTt }: PanelProps) {
+export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt, hideTt }: PanelProps) {
   // The browsable root. Starts at the terminal's cwd but the up-button can climb past it.
   const [cwd, setCwd] = useState(rootPath);
   const [roots, setRoots] = useState<DirItem[] | null>(null);
@@ -234,8 +241,9 @@ export function FileExplorerPanel({ rootPath, host, terminalId, visible, showTt,
     return () => window.removeEventListener("keydown", onKey);
   }, [ctx, searchOpen]);
 
-  const reveal = useCallback((path: string) => { invoke("reveal_in_explorer", { path }).catch(() => {}); }, []);
-  const writePath = useCallback((path: string) => { invoke("write_terminal", { id: terminalId, data: pathForTerminal(path) }).catch(() => {}); }, [terminalId]);
+  // Reveal is Local only; on a Remote Host it does nothing.
+  const reveal = useCallback((path: string) => { if (host) return; invoke("reveal_in_explorer", { path }).catch(() => {}); }, [host]);
+  const writePath = useCallback((path: string) => { onWritePath(pathForTerminal(path)); }, [onWritePath]);
   const openContext = useCallback((x: number, y: number, item: DirItem) => setCtx({ x, y, item }), []);
 
   // Tooltip with a hover delay (tree/search rows). The timer is cleared on leave so it never
@@ -253,7 +261,7 @@ export function FileExplorerPanel({ rootPath, host, terminalId, visible, showTt,
   const showingSearch = searchOpen && query.trim().length > 0;
 
   return (
-    <>
+    <RemoteRows.Provider value={!!host}>
       <div className="git-panel-header file-panel-header">
         <Folder size={13} className="file-panel-folder" />
         <span className="file-panel-title" onMouseEnter={(e) => showTt(cwd, e.currentTarget)} onMouseLeave={hideTt}>{baseName(cwd)}</span>
@@ -294,11 +302,11 @@ export function FileExplorerPanel({ rootPath, host, terminalId, visible, showTt,
         <>
           <div className="file-ctx-backdrop" onClick={() => setCtx(null)} onContextMenu={(e) => { e.preventDefault(); setCtx(null); }} />
           <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 80) }}>
-            <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>
+            {!host && <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>}
             <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>Write path to terminal</span></button>
           </div>
         </>
       )}
-    </>
+    </RemoteRows.Provider>
   );
 }

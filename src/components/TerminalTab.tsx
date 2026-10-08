@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
+import { localShellOptions, mountTerminal, resizeTerminal, RetryableStartError, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { registry } from "../hosts/registry";
+import { useHostLive, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
+import { fmt } from "../hosts/strings";
+import { HostBadge } from "./HostBadge";
 import { load } from "@tauri-apps/plugin-store";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -15,7 +20,6 @@ import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
 import { detectMonoFontFamily, ensureMonoFontsLoaded } from "../lib/fonts";
 import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry } from "../types";
-import { getShellById } from "../shells";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
 
@@ -214,6 +218,24 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // is ready. Universal: works for fresh, --resume, and raw shells.
   const [isInitializing, setIsInitializing] = useState(true);
   const sawFirstOutputRef = useRef(false);
+  // Lifecycle bookkeeping for the Terminal (local PTY or remote Terminal).
+  const startedRef = useRef(false);
+  const startOptsRef = useRef<StartOptions | null>(null);
+  const isActiveRef = useRef(isActive);
+  useEffect(() => { isActiveRef.current = isActive; }, [isActive]);
+  // Remote Tabs: Host Status drives the overlays; the live list carries the exit code.
+  const hostStatus = useHostStatus(tab.host);
+  const hostLive = useHostLive(tab.host);
+  const hostsSnap = useHostsSnapshot();
+  const hostName = tab.host ? (hostsSnap.configs.find(c => c.id === tab.host)?.name || tab.host) : "";
+  const [inputPaused, setInputPaused] = useState(false);
+  const inputPausedTimerRef = useRef<number | null>(null);
+  const flashInputPaused = useCallback(() => {
+    setInputPaused(true);
+    if (inputPausedTimerRef.current) window.clearTimeout(inputPausedTimerRef.current);
+    inputPausedTimerRef.current = window.setTimeout(() => setInputPaused(false), 2500);
+  }, []);
+  useEffect(() => () => { if (inputPausedTimerRef.current) window.clearTimeout(inputPausedTimerRef.current); }, []);
 
   const [showGitPanel, setShowGitPanel] = useState(false);
   // The git and file-explorer panels share one slot on the right — only one is open at a
@@ -276,6 +298,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
 
   const showTt = useCallback((text: string, el: HTMLElement) => setTooltip({ text, rect: el.getBoundingClientRect() }), []);
   const hideTt = useCallback(() => setTooltip(null), []);
+  const writePathToTerminal = useCallback((data: string) => writeTerminal(tabRef.current, data), []);
 
   // Delayed-tooltip variant for git-change rows — like the file explorer, it waits ~1s so the
   // hint ("Click to show diff") doesn't flicker as the cursor scans the list.
@@ -403,7 +426,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           if (blob.size > MAX_DROPPED_FILE_BYTES) throw new Error("clipboard image too large");
           const ext = imgType.split("/")[1] || "png";
           const path = await hostInvoke<string>(tabRef.current.host, "save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
-          invoke("write_terminal", { id: tabRef.current.id, data: /\s/.test(path) ? `"${path}" ` : `${path} ` }).catch(() => {});
+          writeTerminal(tabRef.current, /\s/.test(path) ? `"${path}" ` : `${path} `);
           return;
         }
       } catch (_) { /* clipboard.read() unsupported/denied, no image item, or too large — fall back to text */ }
@@ -454,15 +477,50 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     // This is the "first render is too small" bug specific to xterm.js + ink CLIs.
     // Gate the first fit on the bundled font being ready too — measuring the cell against a
     // fallback metric and then swapping to JetBrains Mono would resize claude's TUI mid-boot.
-    Promise.all([loadZoom(tabRef.current.id, defaultFontSizeRef.current), ensureMonoFontsLoaded()]).then(([size]) => {
+    // Amendment 16: everything below is cancellable — the cleanup aborts it, so a stale
+    // continuation can never open/attach (or spawn) after unmount.
+    const abort = new AbortController();
+    const signal = abort.signal;
+    // The Terminal's output sink, registered before anything starts.
+    const conn: MountedTerminal = mountTerminal(tabRef.current, {
+      data: (bytes) => {
+        if (!sawFirstOutputRef.current) {
+          sawFirstOutputRef.current = true;
+          setIsInitializing(false);
+        }
+        term.write(bytes);
+      },
+      exit: () => {
+        // Spawn failed before any output (e.g. claude not on PATH) — drop the loader so
+        // the error message we're about to write isn't hidden behind it.
+        if (!sawFirstOutputRef.current) {
+          sawFirstOutputRef.current = true;
+          setIsInitializing(false);
+        }
+        term.write("\r\n\x1b[90m[Session ended]\x1b[0m\r\n");
+      },
+    });
+    const remoteHost = tabRef.current.host;
+    let inputDisposable: { dispose(): void } | null = null;
+    let resizeDisposable: { dispose(): void } | null = null;
+    let resizeTimer: number | undefined;
+
+    Promise.all([loadZoom(tabRef.current.id, defaultFontSizeRef.current), ensureMonoFontsLoaded()]).then(async ([size]) => {
+      if (signal.aborted) return;
       fontSizeRef.current = size;
       term.options.fontSize = size;
+      // A remote Terminal starts (open or attach) only once its Host is usable.
+      if (remoteHost) {
+        try { await registry.waitUsable(remoteHost, signal); } catch (_) { return; }
+      }
       const el = containerRef.current;
-      if (!el) return;
+      if (!el || signal.aborted) return;
       const tick = () => {
+        if (signal.aborted) return;
         if (el.offsetWidth > 0 && el.offsetHeight > 0) {
           // One extra rAF lets any pending flex/layout work flush before we measure.
           requestAnimationFrame(() => {
+            if (signal.aborted) return;
             fitAddon.fit();
             spawnBackend(term, fitAddon);
           });
@@ -473,7 +531,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           // moment the host is reparented into a visible slot, so claude gets the right
           // dimensions on first view. Without this, every restored tab waits to spawn
           // until the user clicks it, which makes the launch experience feel sluggish.
-          requestAnimationFrame(() => spawnBackend(term, fitAddon));
+          requestAnimationFrame(() => { if (!signal.aborted) spawnBackend(term, fitAddon); });
         } else {
           requestAnimationFrame(tick);
         }
@@ -505,35 +563,10 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     containerRef.current.addEventListener("contextmenu", onContextMenu);
 
     async function spawnBackend(term: Terminal, _fitAddon: FitAddon) {
-      const id = tabRef.current.id;
-
-      // Transport: PTY output arrives as RAW BYTES over a Tauri Channel
-      // (binary ArrayBuffer, no JSON event + no utf8-lossy round-trip), pre-coalesced on the
-      // Rust side into whole-frame chunks. Feeding term.write a Uint8Array lets xterm's parser
-      // reassemble multibyte sequences across chunk boundaries — eliminating the partial-frame
-      // "flying letters" the old per-4KB `emit` produced.
-      const onData = new Channel<ArrayBuffer>();
-      onData.onmessage = (buf) => {
-        if (!sawFirstOutputRef.current) {
-          sawFirstOutputRef.current = true;
-          setIsInitializing(false);
-        }
-        term.write(new Uint8Array(buf));
-      };
-
-      const onExit = new Channel<number>();
-      onExit.onmessage = () => {
-        // Spawn failed before any output (e.g. claude not on PATH) — drop the loader so
-        // the error message we're about to write isn't hidden behind it.
-        if (!sawFirstOutputRef.current) {
-          sawFirstOutputRef.current = true;
-          setIsInitializing(false);
-        }
-        term.write("\r\n\x1b[90m[Session ended]\x1b[0m\r\n");
-      };
-
-      const onDataDisposable = term.onData((data) => {
-        invoke("write_terminal", { id, data }).catch(() => {});
+      inputDisposable = term.onData((data) => {
+        // Remote Terminal while its Host is not usable: input is dropped, with a hint.
+        if (remoteHost && !registry.isUsable(remoteHost)) { flashInputPaused(); return; }
+        writeTerminal(tabRef.current, data);
       });
 
       // Debounce the PTY resize (SIGWINCH). xterm reflows visually on every fit(), but Claude
@@ -541,54 +574,72 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       // user drags the git-panel splitter or resizes the window causes a redraw storm. We let
       // fit() reflow xterm live for instant feedback, but coalesce the actual PTY resize to a
       // single call ~150ms after the drag settles.
-      let resizeTimer: number | undefined;
-      const onResizeDisposable = term.onResize(({ cols, rows }) => {
+      resizeDisposable = term.onResize(({ cols, rows }) => {
         if (resizeTimer) window.clearTimeout(resizeTimer);
         resizeTimer = window.setTimeout(() => {
           resizeTimer = undefined;
-          invoke("resize_terminal", { id, cols, rows }).catch(() => {});
+          resizeTerminal(tabRef.current, cols, rows);
         }, 150);
       });
 
       try {
-        const shellMode = tabRef.current.shellMode || "claude";
-        // Raw shells always use the tab's explicit shellId. Claude sessions fall back to the
-        // user's default shell setting, so claude runs under the shell the user picked.
-        const effectiveShellId = tabRef.current.shellId || (shellMode === "claude" ? defaultShellId : null);
-        const shellCommand = effectiveShellId ? (getShellById(effectiveShellId)?.command || null) : null;
-        await invoke("spawn_terminal", { id, sessionId: tabRef.current.sessionId || null, cwd: tabRef.current.projectPath || ".", cols: term.cols, rows: term.rows, shellMode, shellCommand, shellId: effectiveShellId, agent: tabRef.current.agent || null, fullscreenRendering, forceSyncOutput, onData, onExit });
+        const shell = localShellOptions(tabRef.current, defaultShellId);
+        const opts: StartOptions = { cols: term.cols, rows: term.rows, ...shell, fullscreenRendering, forceSyncOutput };
+        startOptsRef.current = opts;
+        // A remote start that failed for a connection reason waits for the Host and retries.
+        let r = null as Awaited<ReturnType<MountedTerminal["start"]>>;
+        for (;;) {
+          try { r = await conn.start(opts, signal); break; }
+          catch (err) {
+            if (!(remoteHost && err instanceof RetryableStartError) || signal.aborted) throw err;
+            try { await registry.waitUsable(remoteHost, signal); } catch (_) { return; }
+          }
+        }
+        if (signal.aborted) return;
+        startedRef.current = true;
+        if (r && r.exitCode != null && !sawFirstOutputRef.current) {
+          // Attached to a Terminal that already ended: nothing more will arrive.
+          sawFirstOutputRef.current = true;
+          setIsInitializing(false);
+        }
         // Post-spawn nudge for ink-based TUIs (claude code). Some Ink renderers ignore the
         // very first SIGWINCH if it arrives mid-bootstrap; a delayed re-fit + forced PTY
         // resize ensures the final cols/rows are picked up cleanly even if xterm's own
         // dimensions haven't changed (in which case onResize wouldn't fire on its own).
+        // A remote Terminal's size follows the last Desktop that touched it, so a hidden
+        // remote tab never sends it (it would steal the size from another Desktop).
         setTimeout(() => {
-          if (!terminalRef.current || !fitAddonRef.current) return;
+          if (!terminalRef.current || !fitAddonRef.current || signal.aborted) return;
+          if (remoteHost && !isActiveRef.current) return;
           fitAddonRef.current.fit();
-          invoke("resize_terminal", { id, cols: terminalRef.current.cols, rows: terminalRef.current.rows }).catch(() => {});
+          resizeTerminal(tabRef.current, terminalRef.current.cols, terminalRef.current.rows);
         }, 250);
       } catch (err) {
+        if (signal.aborted) return;
         setError(String(err));
         // Locally-written errors don't go through the terminal-output event, so the
         // loader wouldn't auto-clear. Dismiss it here so the message is visible.
         sawFirstOutputRef.current = true;
         setIsInitializing(false);
+        if (remoteHost) {
+          const message = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
+          term.write(`\x1b[31m${fmt("terminal.remote.openFailed", { host: registry.hostName(remoteHost), error: message })}\x1b[0m\r\n`);
+          return;
+        }
         term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
         if ((tabRef.current.shellMode || "claude") === "claude") {
           term.write(`\x1b[90mMake sure '${AGENTS[tabRef.current.agent || "claude"].binary}' is installed and available in your PATH.\x1b[0m\r\n`);
         }
       }
-
-      (term as any)._cleanup = () => {
-        // Channels have no explicit unsubscribe — dropping the handler stops processing, and
-        // close_terminal tears down the PTY (and thus the Rust side of the channel).
-        onData.onmessage = () => {};
-        onExit.onmessage = () => {};
-        if (resizeTimer) window.clearTimeout(resizeTimer);
-        onDataDisposable.dispose();
-        onResizeDisposable.dispose();
-        invoke("close_terminal", { id }).catch(() => {});
-      };
     }
+
+    // Amendment 20: the Host's connection was replaced — re-run the (single-flight) attach
+    // once usable. Rust re-attaches on its own; this is the fallback.
+    const offReattach = remoteHost ? registry.onReattach((h) => {
+      if (h !== remoteHost || !startedRef.current || !startOptsRef.current) return;
+      const opts = { ...startOptsRef.current, cols: term.cols, rows: term.rows };
+      registry.waitUsable(remoteHost, signal).then(() => conn.reattach(opts, signal)).catch(() => {});
+    }) : null;
 
     const containerEl = containerRef.current;
     return () => {
@@ -596,7 +647,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       intersectionObserver.disconnect();
       containerEl?.removeEventListener("contextmenu", onContextMenu);
       containerEl?.removeEventListener("wheel", onWheel);
-      if ((term as any)._cleanup) (term as any)._cleanup();
+      abort.abort();
+      offReattach?.();
+      if (resizeTimer) window.clearTimeout(resizeTimer);
+      inputDisposable?.dispose();
+      resizeDisposable?.dispose();
+      // Local: close the PTY. Remote: close the Terminal if the user closed the Tab, else
+      // just detach — losing a Tab ends nothing on the Host.
+      conn.end();
       // Dispose the WebGL addon explicitly before the terminal — its docs note that an
       // explicit dispose() is required to free the GL resources cleanly. term.dispose()
       // does cascade, but ordering it this way mirrors the xterm.js example.
@@ -1004,12 +1062,26 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // numbers for this session AND the user hasn't opted out via the Agents tab toggle.
   // Without authoritative stats the cost would always be $0 and the bar empty — falls back
   // to the plain path in that case (or whenever the user has explicitly disabled the strip).
+  // Remote Host state for the overlay/banner: null when local or usable.
+  const remoteState: null | "waiting" | "reconnecting" | "offline" | "incompatible" = (() => {
+    if (!tab.host) return null;
+    const st = hostStatus?.status;
+    if (st === "connected" || st === "upgrade-pending") return null;
+    if (st === "incompatible") return "incompatible";
+    if (st === "offline") return "offline";
+    return hostLive == null || !startedRef.current ? "waiting" : "reconnecting";
+  })();
+  const remoteStateText = remoteState ? fmt(`terminal.remote.${remoteState}` as const, { host: hostName }) : null;
+  const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
+
   const showStatsStrip = isClaudeSession && showTerminalHeaderStats && sessionStats?.is_authoritative_stats && sessionStats.context_limit > 0;
   const ctxPct = showStatsStrip ? Math.min(100, (sessionStats!.context_tokens / sessionStats!.context_limit) * 100) : 0;
 
   return (
     <div className="terminal-wrapper" onMouseLeave={hideTt}>
       <div className="terminal-header" data-tauri-drag-region>
+        {tab.host && <HostBadge host={tab.host} tooltip={fmt("terminal.header.hostBadge", { host: hostName })} tt={{ showTt, hideTt }} />}
+        {remoteEnded && <span className="terminal-ended-chip">{fmt("terminal.remote.ended")}</span>}
         {tab.groupId && (
           <span className="terminal-header-label">
             {tab.projectName && <span className="terminal-header-project">{tab.projectName}</span>}
@@ -1077,22 +1149,28 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
               Promise.all(images.map(async (f) => {
                 return hostInvoke<string>(tab.host, "save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
               })).then((paths) => {
-                invoke("write_terminal", { id: tab.id, data: paths.map(quote).join(" ") + " " }).catch(() => {});
+                writeTerminal(tab, paths.map(quote).join(" ") + " ");
                 terminalRef.current?.focus();
               }).catch(() => {});
               return;
             }
             const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
             if (!p) return;
-            invoke("write_terminal", { id: tab.id, data: `${quote(p)} ` }).catch(() => {});
+            writeTerminal(tab, `${quote(p)} `);
             terminalRef.current?.focus();
           }}
         >
           {isInitializing && (
             <div className="terminal-loading-overlay">
               <div className="spinner" />
-              <span>{isClaudeSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…"}</span>
+              <span>{remoteStateText ?? (isClaudeSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…")}</span>
             </div>
+          )}
+          {!isInitializing && remoteStateText && (
+            <div className="terminal-remote-banner"><AlertTriangle size={12} /><span>{remoteStateText}</span></div>
+          )}
+          {inputPaused && remoteState && (
+            <div className="terminal-remote-hint">{fmt("terminal.remote.inputPaused")}</div>
           )}
         </div>
         {isClaudeSession && showGitPanel && gitStatus?.is_repo && (
@@ -1159,7 +1237,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           <>
             <div className="terminal-splitter" style={{ display: showFilePanel ? undefined : "none" }} onPointerDown={onSplitterDown} onMouseEnter={(e) => showTt("Drag to resize", e.currentTarget)} onMouseLeave={hideTt} />
             <div className="terminal-side-panel" style={{ width: gitPanelWidth, display: showFilePanel ? undefined : "none" }}>
-              <FileExplorerPanel rootPath={tab.projectPath} host={tab.host} terminalId={tab.id} visible={showFilePanel} showTt={showTt} hideTt={hideTt} />
+              <FileExplorerPanel rootPath={tab.projectPath} host={tab.host} onWritePath={writePathToTerminal} visible={showFilePanel} showTt={showTt} hideTt={hideTt} />
             </div>
           </>
         )}
