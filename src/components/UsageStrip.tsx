@@ -10,7 +10,10 @@ import { timeAgo } from "../utils";
 import type { ClaudeCostSummary, CodexUsage, GlobalRateLimits, SessionInfo } from "../types";
 
 interface UsageStripProps {
-  recentSessions: SessionInfo[];
+  // Sessions for the today/week counters: live lists only — this computer plus usable Hosts
+  // whose list was fetched live (build it with liveRecentSessions). Never the cached lists
+  // of offline Hosts (amendment 24).
+  liveSessions: SessionInfo[];
   tt: TtFns;
   onOpenSettings: () => void;
 }
@@ -61,7 +64,7 @@ function Gauge({ label, pct, resetsAt, tt }: { label: string; pct: number | null
 // counts plus the Connect nudge. Codex needs no setup: rate limits and activity are read
 // straight from its rollout files, with a staleness note since they only update when
 // Codex actually runs.
-export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripProps) {
+export function UsageStrip({ liveSessions: recentSessions, tt, onOpenSettings }: UsageStripProps) {
   const [claudeCost, setClaudeCost] = useState<ClaudeCostSummary | null>(null);
   const [claudeLimits, setClaudeLimits] = useState<GlobalRateLimits | null>(null);
   const [codex, setCodex] = useState<CodexUsage | null>(null);

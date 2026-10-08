@@ -53,3 +53,16 @@ describe("aggregate", () => {
     expect(r).toEqual([{ host: undefined, value: { present: false } }]);
   });
 });
+
+import { liveRecentSessions } from "./aggregate";
+// Sol finding 6: the usage counters never count cached sessions of offline Hosts.
+describe("usage counter sources", () => {
+  it("keeps local plus live usable hosts, drops cached/offline lists", () => {
+    const local = [s("l", "2026-10-03")];
+    const byHost = { local, h_live0000: [s("r1", "2026-10-02")], h_cache000: [s("c1", "2026-10-04")] };
+    const live = liveRecentSessions(byHost, h => h === "h_live0000");
+    expect(live.map(x => x.id)).toEqual(["l", "r1"]);
+    expect(liveRecentSessions({ local }, () => true)).toBe(local);
+    expect(liveRecentSessions(byHost, () => false)).toBe(local);
+  });
+});

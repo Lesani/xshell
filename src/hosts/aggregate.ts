@@ -79,3 +79,11 @@ export function mergeRecent(lists: SessionInfo[][], limit = 100): SessionInfo[] 
   if (rest.every(l => l.length === 0)) return first;
   return lists.flat().sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, limit);
 }
+
+// Sessions for the usage counters: this computer plus only those Remote Hosts whose list was
+// fetched live and that are usable now — cached lists stay browsable but are not counted
+// (amendment 24). With no Remote Hosts this is the Local list itself.
+export function liveRecentSessions(byHost: Record<string, SessionInfo[]>, isLive: (host: HostId) => boolean, limit = 100): SessionInfo[] {
+  const remote = Object.entries(byHost).filter(([k]) => k !== "local" && isLive(k));
+  return mergeRecent([byHost.local ?? [], ...remote.map(([, v]) => v)], limit);
+}
