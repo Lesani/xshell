@@ -128,6 +128,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::TermResize { .. } => "term.resize",
         ClientMsg::TermClose { .. } => "term.close",
         ClientMsg::TermUpdate { .. } => "term.update",
+        ClientMsg::TermRelaunch { .. } => "term.relaunch",
         ClientMsg::DaemonUpgrade => "daemon.upgrade",
     }
 }

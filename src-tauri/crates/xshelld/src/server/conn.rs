@@ -311,6 +311,12 @@ impl Conn {
                 drop(reg);
                 reply(&self.ob, id, r);
             }
+            // Not served yet: answered like any message type this Daemon does not know.
+            ClientMsg::TermRelaunch { .. } => reply(
+                &self.ob,
+                id,
+                Err("unknown message type: term.relaunch".into()),
+            ),
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();

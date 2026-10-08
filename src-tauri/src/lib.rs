@@ -214,6 +214,7 @@ fn spawn_terminal(
         shell_id,
         fullscreen_rendering,
         force_sync_output,
+        skip_permissions: None,
     };
     let cmd = xshell_core::plan_command(&ctx(), &spec)?.to_command_builder();
 
