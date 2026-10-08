@@ -2064,6 +2064,11 @@ fn spawn_terminal(state: State<'_, AppState>, id: String, session_id: Option<Str
     // (telemetry reads `terminal.type` from TERM_PROGRAM; without this we'd land in the
     // Unknown bucket). Always set — no user-facing toggle.
     cmd.env("TERM_PROGRAM", "xshell.sh");
+    // Describe the terminal xterm.js emulates. A GUI-launched app inherits no TERM (or the
+    // TERM of the terminal that started it), and without one terminfo consumers fall back to
+    // a dumb terminal: TUIs render monochrome and `clear`/`tput` fail.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
     // Claude Code's flicker-free / alternate-screen-buffer renderer is opt-in via env var.
     // Default ON for any claude-mode spawn; raw shells don't get it (no claude process to read it).
     // Inherited by the wrapping shell → claude child, so setting it here is sufficient.
