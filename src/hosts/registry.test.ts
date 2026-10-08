@@ -209,3 +209,21 @@ describe("registry", () => {
     r._dispose();
   });
 });
+
+describe("waitUsable after a version", () => {
+  it("ignores the stale usable status and resolves on a newer one", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined));
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    handlers["hosts:status"]({ payload: status("connected") });
+    const seen = r.statusVersion(H);
+    let done = false;
+    const w = r.waitUsable(H, undefined, seen).then(() => { done = true; });
+    await flush();
+    expect(done).toBe(false);
+    handlers["hosts:status"]({ payload: status("connected", { sinceMs: 5 }) });
+    await w;
+    expect(done).toBe(true);
+    r._dispose();
+  });
+});

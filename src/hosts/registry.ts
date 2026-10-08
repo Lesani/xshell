@@ -24,7 +24,7 @@ export class HostUnknownError extends Error {
   constructor(host: HostId) { super(`unknown host ${host}`); this.name = "HostUnknownError"; }
 }
 
-type Waiter = { host: HostId; resolve: () => void; reject: (e: unknown) => void; signal?: AbortSignal; onAbort?: () => void };
+type Waiter = { host: HostId; resolve: () => void; reject: (e: unknown) => void; signal?: AbortSignal; onAbort?: () => void; after?: number };
 
 const WAKE_POLL_MS = 5000;
 const WAKE_GAP_MS = 30000;
@@ -188,13 +188,18 @@ export class HostRegistry {
   getStatus(id: HostId): HostStatus | undefined { return this.snap.status[id]; }
   isUsable(id: HostId): boolean { return isUsableStatus(this.snap.status[id]); }
 
+  // Bumped by every status event of the Host (generation for waitUsable's `after`).
+  statusVersion(id: HostId): number { return this.statusSeq[id] ?? 0; }
+
   // Resolves once the Host is usable; rejects when the signal aborts or the Host is removed.
-  waitUsable(id: HostId, signal?: AbortSignal): Promise<void> {
+  // With `after`, a status from that version or older does not count: the caller saw the
+  // connection fail and waits for a newer usable status.
+  waitUsable(id: HostId, signal?: AbortSignal, after?: number): Promise<void> {
     if (signal?.aborted) return Promise.reject(abortError());
     if (!this.isConfigured(id)) return Promise.reject(new HostUnknownError(id));
-    if (this.isUsable(id)) return Promise.resolve();
+    if (this.isUsable(id) && (after === undefined || this.statusVersion(id) > after)) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
-      const w: Waiter = { host: id, resolve, reject, signal };
+      const w: Waiter = { host: id, resolve, reject, signal, after };
       if (signal) {
         w.onAbort = () => { this.waiters = this.waiters.filter(x => x !== w); reject(abortError()); };
         signal.addEventListener("abort", w.onAbort, { once: true });
@@ -204,8 +209,10 @@ export class HostRegistry {
   }
 
   private flushWaiters(host: HostId) {
-    const ready = this.waiters.filter(w => w.host === host);
-    this.waiters = this.waiters.filter(w => w.host !== host);
+    const v = this.statusVersion(host);
+    const isReady = (w: Waiter) => w.host === host && (w.after === undefined || v > w.after);
+    const ready = this.waiters.filter(isReady);
+    this.waiters = this.waiters.filter(w => !isReady(w));
     for (const w of ready) { if (w.onAbort) w.signal?.removeEventListener("abort", w.onAbort); w.resolve(); }
   }
 

@@ -3,8 +3,8 @@ import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
-import { localShellOptions, mountTerminal, resizeTerminal, RetryableStartError, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
-import { registry } from "../hosts/registry";
+import { localShellOptions, mountTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { registry, HostUnknownError } from "../hosts/registry";
 import { useHostLive, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import { HostBadge } from "./HostBadge";
@@ -587,13 +587,12 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         const opts: StartOptions = { cols: term.cols, rows: term.rows, ...shell, fullscreenRendering, forceSyncOutput };
         startOptsRef.current = opts;
         // A remote start that failed for a connection reason waits for the Host and retries.
-        let r = null as Awaited<ReturnType<MountedTerminal["start"]>>;
-        for (;;) {
-          try { r = await conn.start(opts, signal); break; }
-          catch (err) {
-            if (!(remoteHost && err instanceof RetryableStartError) || signal.aborted) throw err;
-            try { await registry.waitUsable(remoteHost, signal); } catch (_) { return; }
-          }
+        let r: Awaited<ReturnType<MountedTerminal["start"]>>;
+        if (remoteHost) {
+          try { r = await startWithRetry(remoteHost, () => conn.start(opts, signal), signal); }
+          catch (err) { if (signal.aborted || (err as Error)?.name === "AbortError" || err instanceof HostUnknownError) return; throw err; }
+        } else {
+          r = await conn.start(opts, signal);
         }
         if (signal.aborted) return;
         startedRef.current = true;

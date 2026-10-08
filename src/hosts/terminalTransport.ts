@@ -114,6 +114,32 @@ export class RetryableStartError extends Error {
   constructor(cause: unknown) { super(errorText(cause)); this.name = "RetryableStartError"; this.cause = cause; }
 }
 
+export interface StartRetryDeps {
+  statusVersion(host: HostId): number;
+  waitUsable(host: HostId, signal?: AbortSignal, after?: number): Promise<void>;
+}
+const registryRetryDeps: StartRetryDeps = {
+  statusVersion: (h) => registry.statusVersion(h),
+  waitUsable: (h, s, after) => registry.waitUsable(h, s, after),
+};
+
+// Runs a remote start until it succeeds, the signal aborts, or it fails for a non-connection
+// reason. `busy` (Host connected, queue full) backs off 250 ms → 5 s; other connection
+// failures wait for a Host status newer than the one seen before the attempt, so a status
+// that still says "connected" for a dead link cannot spin the loop.
+export async function startWithRetry<T>(host: HostId, start: () => Promise<T>, signal: AbortSignal, deps: StartRetryDeps = registryRetryDeps): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const version = deps.statusVersion(host);
+    try {
+      return await start();
+    } catch (err) {
+      if (!(err instanceof RetryableStartError) || signal.aborted) throw err;
+      if (isHostError(err.cause) && err.cause.code === "busy") await sleep(backoffDelay(attempt), signal);
+      else await deps.waitUsable(host, signal, version);
+    }
+  }
+}
+
 export interface RemoteStartResult { kind: "opened" | "attached"; exitCode: number | null; pid: number | null }
 
 export class RemoteTerminals {

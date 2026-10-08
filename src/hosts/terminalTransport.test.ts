@@ -358,3 +358,56 @@ describe("failed closes", () => {
     expect(calls("host_term_close")).toHaveLength(1);
   });
 });
+
+// Sol finding 8: the TerminalTab start loop backs off on `busy` and waits for a newer Host
+// status on other connection failures.
+import { startWithRetry, RetryableStartError as RSE } from "./terminalTransport";
+import { backoffDelay } from "./backoff";
+describe("start retry loop", () => {
+  it("a host that stays busy is retried with exponential backoff, and abort stops it", async () => {
+    vi.useFakeTimers();
+    try {
+      const start = vi.fn(() => Promise.reject(new RSE({ code: "busy", message: "queue full" })));
+      const waitUsable = vi.fn(() => Promise.resolve());
+      const ac = new AbortController();
+      const run = startWithRetry(H, start, ac.signal, { statusVersion: () => 1, waitUsable }).catch(e => e);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(start).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(249);
+      expect(start).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(start).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(start).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(start).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(60_000); // capped at 5 s per step
+      expect(start.mock.calls.length).toBeLessThanOrEqual(4 + 1 + 1 + Math.ceil(60_000 / 5000));
+      expect(waitUsable).not.toHaveBeenCalled();
+      ac.abort();
+      expect((await run).name).toBe("AbortError");
+      const n = start.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(start).toHaveBeenCalledTimes(n);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect([0, 1, 2, 3, 4, 5, 10].map(backoffDelay)).toEqual([250, 500, 1000, 2000, 4000, 5000, 5000]);
+  });
+
+  it("other connection failures wait for a status newer than the one before the attempt", async () => {
+    let version = 7;
+    const start = vi.fn()
+      .mockImplementationOnce(() => Promise.reject(new RSE({ code: "offline", message: "down" })))
+      .mockImplementationOnce(() => Promise.resolve("ok"));
+    const waitUsable = vi.fn(async (_h: string, _s?: AbortSignal, after?: number) => { expect(after).toBe(7); version = 8; });
+    await expect(startWithRetry(H, start, new AbortController().signal, { statusVersion: () => version, waitUsable })).resolves.toBe("ok");
+    expect(waitUsable).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-connection errors are thrown at once", async () => {
+    const start = vi.fn(() => Promise.reject({ code: "remote", message: "no such dir" }));
+    await expect(startWithRetry(H, start, new AbortController().signal, { statusVersion: () => 0, waitUsable: vi.fn() })).rejects.toMatchObject({ message: "no such dir" });
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+});
