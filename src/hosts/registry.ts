@@ -32,9 +32,14 @@ const WAKE_GAP_MS = 30000;
 export class HostRegistry {
   private snap: RegistrySnapshot = { configs: [], status: {}, live: {}, agents: {} };
   private listeners = new Set<() => void>();
-  // Amendment 21: per-host sequence numbers. Every event bumps its host's number; a
-  // `hosts_status` snapshot is applied only for hosts with no newer event.
-  private seq: Record<HostId, number> = {};
+  // Amendment 21: per-host sequence numbers, one per field. A status event bumps only the
+  // status number and a terminals event only the terminals number; a `hosts_status` snapshot
+  // applies each field only where no newer event of that kind arrived.
+  private statusSeq: Record<HostId, number> = {};
+  private liveSeq: Record<HostId, number> = {};
+  // Agent inventory probes are fenced by a per-host generation, bumped when the connection
+  // is replaced (another machine may now answer).
+  private probeGen: Record<HostId, number> = {};
   private initPromise: Promise<void> | null = null;
   private unlisten: UnlistenFn[] = [];
   private waiters: Waiter[] = [];
@@ -68,7 +73,7 @@ export class HostRegistry {
     //    before step 1 (applied only where no newer event arrived).
     this.unlisten.push(await listen<HostStatus>("hosts:status", e => this.applyStatus(e.payload)));
     this.unlisten.push(await listen<HostTerminalsEvent>("hosts:terminals", e => this.applyTerminals(e.payload.host, e.payload.list)));
-    const seqBefore = { ...this.seq };
+    const seqBefore = { status: { ...this.statusSeq }, live: { ...this.liveSeq } };
     try { await invoke("hosts_configure", { hosts: this.snap.configs }); } catch (_) {}
     let snaps: HostSnapshot[] = [];
     try { snaps = await invoke<HostSnapshot[]>("hosts_status"); } catch (_) {}
@@ -76,7 +81,7 @@ export class HostRegistry {
     this.installWakeHooks();
   }
 
-  applySnapshot(snaps: HostSnapshot[], seqBefore: Record<HostId, number>) {
+  applySnapshot(snaps: HostSnapshot[], seqBefore: { status: Record<HostId, number>; live: Record<HostId, number> }) {
     const status = { ...this.snap.status };
     const live = { ...this.snap.live };
     const prevStatus = this.snap.status;
@@ -84,10 +89,9 @@ export class HostRegistry {
     for (const s of snaps) {
       const h = s.status.host;
       if (!this.isConfigured(h)) continue;
-      if ((this.seq[h] ?? 0) !== (seqBefore[h] ?? 0)) continue; // a newer event already applied
-      status[h] = s.status;
-      if (s.terminals !== null || !(h in live)) live[h] = s.terminals;
-      changed = true;
+      // Each field independently: skip it only if a newer event of that kind was applied.
+      if ((this.statusSeq[h] ?? 0) === (seqBefore.status[h] ?? 0)) { status[h] = s.status; changed = true; }
+      if ((this.liveSeq[h] ?? 0) === (seqBefore.live[h] ?? 0) && (s.terminals !== null || !(h in live))) { live[h] = s.terminals; changed = true; }
     }
     if (!changed) return;
     this.emit({ status, live });
@@ -97,7 +101,7 @@ export class HostRegistry {
   applyStatus(s: HostStatus) {
     const h = s.host;
     if (!this.isConfigured(h)) return;
-    this.seq[h] = (this.seq[h] ?? 0) + 1;
+    this.statusSeq[h] = (this.statusSeq[h] ?? 0) + 1;
     const prev = this.snap.status[h];
     this.emit({ status: { ...this.snap.status, [h]: s } });
     this.afterStatus(prev, s);
@@ -105,7 +109,7 @@ export class HostRegistry {
 
   applyTerminals(host: HostId, list: TerminalInfo[]) {
     if (!this.isConfigured(host)) return;
-    this.seq[host] = (this.seq[host] ?? 0) + 1;
+    this.liveSeq[host] = (this.liveSeq[host] ?? 0) + 1;
     this.emit({ live: { ...this.snap.live, [host]: list } });
   }
 
@@ -113,25 +117,41 @@ export class HostRegistry {
     if (!next) return;
     const h = next.host;
     const nowUsable = isUsableStatus(next);
+    const replaced = !!prev && prev.configGeneration !== undefined && next.configGeneration !== undefined && prev.configGeneration !== next.configGeneration;
+    // A replaced connection may reach another machine: forget its agent inventory.
+    if (replaced) this.invalidateAgents(h);
     if (nowUsable) this.flushWaiters(h);
     if (nowUsable && !isUsableStatus(prev)) {
       for (const l of this.usableListeners) l(h);
-      if (!this.agentsProbed.has(h)) { this.agentsProbed.add(h); this.probeAgents(h); }
     }
+    if (nowUsable && !this.agentsProbed.has(h)) { this.agentsProbed.add(h); this.probeAgents(h); }
     // Amendment 20: a replaced connection (configGeneration changed) → mounted Tabs re-attach.
-    if (prev && prev.configGeneration !== undefined && next.configGeneration !== undefined && prev.configGeneration !== next.configGeneration) {
+    if (replaced) {
       for (const l of this.reattachListeners) l(h);
     }
   }
 
+  private invalidateAgents(host: HostId) {
+    this.probeGen[host] = (this.probeGen[host] ?? 0) + 1;
+    this.agentsProbed.delete(host);
+    if (host in this.snap.agents) {
+      const agents = { ...this.snap.agents };
+      delete agents[host];
+      this.emit({ agents });
+    }
+  }
+
   private probeAgents(host: HostId) {
+    const gen = this.probeGen[host] ?? 0;
+    const current = () => (this.probeGen[host] ?? 0) === gen && this.isConfigured(host);
     for (const id of AGENT_IDS) {
       hostInvoke<{ installed: boolean }>(host, "detect_agent_binary", { binary: AGENTS[id].binary })
         .then(p => {
+          if (!current()) return; // answer from a replaced connection
           const cur = this.snap.agents[host] ?? (Object.fromEntries(AGENT_IDS.map(a => [a, false])) as Record<AgentId, boolean>);
           this.emit({ agents: { ...this.snap.agents, [host]: { ...cur, [id]: !!p.installed } } });
         })
-        .catch(() => { this.agentsProbed.delete(host); });
+        .catch(() => { if (current()) this.agentsProbed.delete(host); });
     }
   }
 
@@ -141,10 +161,16 @@ export class HostRegistry {
     const status = { ...this.snap.status };
     const live = { ...this.snap.live };
     const agents = { ...this.snap.agents };
-    for (const id of removed) {
-      delete status[id]; delete live[id]; delete agents[id];
-      delete this.seq[id];
+    // A Host whose target or daemon command changed is a new connection: its agent
+    // inventory belongs to the old one.
+    const retargeted = list.filter(n => { const o = this.config(n.id); return !!o && (o.sshTarget !== n.sshTarget || (o.daemonCommand ?? "") !== (n.daemonCommand ?? "")); }).map(c => c.id);
+    for (const id of [...removed, ...retargeted]) {
+      delete agents[id];
       this.agentsProbed.delete(id);
+      this.probeGen[id] = (this.probeGen[id] ?? 0) + 1;
+    }
+    for (const id of removed) {
+      delete status[id]; delete live[id];
       this.rejectWaiters(id);
     }
     this.emit({ configs: list, status, live, agents });

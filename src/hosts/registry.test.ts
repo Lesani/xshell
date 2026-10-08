@@ -145,4 +145,67 @@ describe("registry", () => {
     expect(invoke.mock.calls[invoke.mock.calls.length - 1]).toEqual(["hosts_configure", { hosts: [cfg, { ...cfg, id: "h_zz12cd34" }] }]);
     r._dispose();
   });
+
+  // Sol finding 1: status and terminals snapshots are fenced independently.
+  it("a terminals event during hosts_status keeps the snapshot's status", async () => {
+    const snap = deferred<HostSnapshot[]>();
+    invoke.mockImplementation((cmd: string) => (cmd === "hosts_status" ? snap.p : cmd === "host_call" ? Promise.resolve({ installed: false }) : Promise.resolve()));
+    const r = new HostRegistry();
+    const done = r.init([cfg]);
+    await flush(); await flush();
+    const eventList = [{ terminal: "t-event", spec: { cwd: "/" }, meta: {}, createdAtMs: 1, pid: 1, exitCode: null }];
+    handlers["hosts:terminals"]({ payload: { host: H, list: eventList } });
+    snap.resolve([{ status: status("connected"), terminals: [] }]);
+    await done;
+    expect(r.getStatus(H)?.status).toBe("connected");
+    expect(r.isUsable(H)).toBe(true);
+    expect(r.getSnapshot().live[H]).toBe(eventList);
+    r._dispose();
+  });
+
+  it("a status event during hosts_status keeps the snapshot's terminals", async () => {
+    const snap = deferred<HostSnapshot[]>();
+    invoke.mockImplementation((cmd: string) => (cmd === "hosts_status" ? snap.p : cmd === "host_call" ? Promise.resolve({ installed: false }) : Promise.resolve()));
+    const r = new HostRegistry();
+    const done = r.init([cfg]);
+    await flush(); await flush();
+    handlers["hosts:status"]({ payload: status("reconnecting") });
+    const snapList = [{ terminal: "t-snap", spec: { cwd: "/" }, meta: {}, createdAtMs: 1, pid: 1, exitCode: null }];
+    snap.resolve([{ status: status("connected"), terminals: snapList }]);
+    await done;
+    expect(r.getStatus(H)?.status).toBe("reconnecting");
+    expect(r.getSnapshot().live[H]).toBe(snapList);
+    r._dispose();
+  });
+
+  // Sol finding 7: a replaced connection (or a retargeted host) loses its agent inventory,
+  // and answers from the old connection are ignored.
+  it("connection replacement invalidates agents and fences outstanding probes", async () => {
+    const answers: { binary: string; resolve: (v: { installed: boolean }) => void }[] = [];
+    invoke.mockImplementation((cmd: string, args: any) => {
+      if (cmd === "hosts_status") return Promise.resolve([]);
+      if (cmd === "host_call") return new Promise(res => answers.push({ binary: args.params.binary, resolve: res }));
+      return Promise.resolve();
+    });
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 1 }) });
+    const firstRound = answers.splice(0);
+    expect(firstRound.length).toBeGreaterThan(0);
+    // The connection is replaced (another machine) before the old probes answer.
+    handlers["hosts:status"]({ payload: status("connected", { configGeneration: 2 }) });
+    for (const a of firstRound) a.resolve({ installed: a.binary === "claude" });
+    await flush();
+    expect(r.getSnapshot().agents[H]?.claude).not.toBe(true); // stale answer ignored
+    const secondRound = answers.splice(0);
+    expect(secondRound.length).toBe(firstRound.length);      // re-probed on the new connection
+    for (const a of secondRound) a.resolve({ installed: a.binary === "codex" });
+    await flush();
+    expect(r.getSnapshot().agents[H]).toMatchObject({ codex: true, claude: false });
+
+    // Editing the SSH target drops the inventory right away.
+    await r.configure([{ ...cfg, sshTarget: "other" }]);
+    expect(r.getSnapshot().agents[H]).toBeUndefined();
+    r._dispose();
+  });
 });
