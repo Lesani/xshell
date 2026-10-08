@@ -167,10 +167,16 @@ fn relaunch_keeps_sink_no_exit() {
     let sink = VecSink::new();
     let old = open(&h, t, claude_spec(&cwd, Some(sid)), sink.clone()).unwrap();
     sink.wait_from(0, &format!("pid {old} "));
+    // Only what arrives from the relaunch on: the open's replay starts with a reset too.
+    let from = sink.len();
     let new = relaunch(&h, t, true).unwrap().expect("pid");
-    let text = sink.wait_from(0, &format!("pid {new} "));
-    let reset = text.find("\x1bc").expect("a reset before the new output");
-    assert!(text[reset..].contains(&format!("pid {new} ")), "{text:?}");
+    let text = sink.wait_from(from, &format!("pid {new} "));
+    let first = text.find(&format!("pid {new} ")).unwrap();
+    let reset = text.find("\x1bc").expect("a reset from the relaunch");
+    assert!(
+        reset < first,
+        "the reset must precede the new output: {text:?}"
+    );
     fx.a.rec.wait_list("with the relaunched terminal", |l| {
         l.iter()
             .any(|i| i.terminal == t && i.pid == Some(new) && i.spec.skip_permissions == Some(true))
