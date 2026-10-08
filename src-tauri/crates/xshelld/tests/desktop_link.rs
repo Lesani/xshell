@@ -229,3 +229,144 @@ fn config_replacement_reattaches() {
     assert!(after.contains("\x1bc"), "{after:?}");
     marker(&fx.a.host(), &sink, t, "second");
 }
+
+/// A sink that, once armed, blocks inside `data` until released: a stalled delivery.
+#[derive(Default)]
+struct Gate {
+    armed: std::sync::atomic::AtomicBool,
+    inside: std::sync::atomic::AtomicBool,
+    open: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl xshell_hostlink::TermSink for Gate {
+    fn data(&self, _: &[u8]) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.armed.load(SeqCst) {
+            self.inside.store(true, SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+        }
+        true
+    }
+    fn exit(&self, _: i32, _: u64) {}
+}
+
+impl Gate {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+/// Opens the gate on drop, so a failing test never leaves the reader stuck.
+struct Release(std::sync::Arc<Gate>);
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Open a terminal whose sink then blocks the link's reader inside a delivery.
+fn stall_delivery(fx: &Fx) -> (Uuid, std::sync::Arc<Gate>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    fx.a.wait_usable();
+    let h = fx.a.host();
+    let t = Uuid::new_v4();
+    let gate = std::sync::Arc::new(Gate::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.term_open(
+        xshell_core::protocol::msg::OpenSpec {
+            terminal: t,
+            launch: fx.project(),
+            cols: 80,
+            rows: 24,
+            meta: Default::default(),
+        },
+        gate.clone(),
+        Box::new(move |r| {
+            let _ = tx.send(r);
+        }),
+    );
+    rx.recv_timeout(W).unwrap().unwrap();
+    gate.armed.store(true, SeqCst);
+    h.term_input(t, "echo stall\n".into()).unwrap();
+    let deadline = Instant::now() + W;
+    while !gate.inside.load(SeqCst) {
+        assert!(Instant::now() < deadline, "the delivery never started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (t, gate)
+}
+
+#[test]
+fn input_never_waits_on_a_blocked_delivery() {
+    let fx = Fx::new();
+    let (t, gate) = stall_delivery(&fx);
+    let _release = Release(gate.clone());
+    let h = fx.a.host();
+    for i in 0..20 {
+        let start = Instant::now();
+        h.term_input(t, format!("echo {i}\n")).unwrap();
+        h.term_resize(t, 100, 30 + i).unwrap();
+        let _ = h.snapshot();
+        fx.a.m.kick_all();
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[test]
+fn shutdown_is_bounded_with_a_blocked_delivery() {
+    let fx = Fx::new();
+    let (_t, gate) = stall_delivery(&fx);
+    let _release = Release(gate.clone());
+    let ssh = fx.a.host().child_pid().unwrap() as i32;
+    let start = Instant::now();
+    fx.a.m.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_millis(3500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(wait_dead(ssh), "transport {ssh} survived");
+}
+
+#[test]
+fn shutdown_is_bounded_with_a_concurrent_configure() {
+    let fx = Fx::new();
+    let (_t, gate) = stall_delivery(&fx);
+    let release = Release(gate.clone());
+    let ssh = fx.a.host().child_pid().unwrap() as i32;
+    let handle = fx.a.host();
+    // The configure replaces the Host: it stops it, then waits on the blocked state.
+    std::thread::scope(|s| {
+        let cfg = s.spawn(|| {
+            fx.a.m
+                .configure(vec![host_config(Some(format!("exec {}", override_cmd())))])
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let start = Instant::now();
+        fx.a.m.shutdown();
+        assert!(
+            start.elapsed() < Duration::from_millis(3500),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(wait_dead(ssh), "transport {ssh} survived");
+        drop(release);
+        cfg.join().unwrap().unwrap();
+    });
+    // The configure that finished after the shutdown started nothing.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(fx.a.m.snapshot().is_empty());
+    match handle.child_pid() {
+        Some(p) if p as i32 != ssh => assert!(wait_dead(p as i32), "a new transport {p} runs"),
+        _ => {}
+    }
+}

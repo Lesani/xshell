@@ -5,6 +5,7 @@ use crate::cancel::CancelToken;
 use crate::config::{validate, validate_one, HostConfig};
 use crate::handle::HostHandle;
 use crate::install::{probe_script, probe_script_override, run_probe, target_triple, BinarySource};
+use crate::link::LinkLimits;
 use crate::status::{HostSnapshot, HostStatus, HostTestResult};
 use crate::transport::TransportFactory;
 use std::collections::HashMap;
@@ -36,6 +37,9 @@ pub struct ManagerConfig {
     /// After `daemon.upgrade` is acknowledged, the old Daemon must close the link by then;
     /// otherwise it gets a SIGTERM through its pidfile.
     pub upgrade_close_timeout: Duration,
+    /// `term.open`, `term.attach`, `term.close`, `term.update` and `daemon.upgrade`.
+    pub term_timeout: Duration,
+    pub link_limits: LinkLimits,
 }
 
 impl ManagerConfig {
@@ -56,6 +60,8 @@ impl ManagerConfig {
             hello_timeout: Duration::from_secs(30),
             call_timeout: Duration::from_secs(60),
             upgrade_close_timeout: Duration::from_secs(15),
+            term_timeout: Duration::from_secs(30),
+            link_limits: LinkLimits::default(),
         }
     }
 }
@@ -70,6 +76,8 @@ pub struct Manager {
     configure_lock: Mutex<()>,
     config_gen: AtomicU64,
     shut: AtomicBool,
+    /// Manager-wide work outside any Host (connection tests); cancelled by `shutdown`.
+    cancel: CancelToken,
 }
 
 fn join_all(joins: Vec<JoinHandle<()>>, deadline: Instant) {
@@ -91,6 +99,7 @@ impl Manager {
             configure_lock: Mutex::new(()),
             config_gen: AtomicU64::new(0),
             shut: AtomicBool::new(false),
+            cancel: CancelToken::new(),
         }
     }
 
@@ -144,8 +153,16 @@ impl Manager {
             }
         }
         join_all(joins, Instant::now() + STOP_DEADLINE);
-        for (h, cfg) in replaced {
-            h.reset(cfg, self.next_gen());
+        for (h, cfg) in &replaced {
+            h.reset(cfg.clone(), self.next_gen());
+        }
+        // Serialized with `shutdown` by the hosts lock: either it already took the list
+        // (and `shut` is set, so nothing starts) or it will take the new one.
+        let mut hs = self.hosts.lock().unwrap();
+        if self.shut.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        for (h, _) in &replaced {
             h.start();
         }
         for h in &next {
@@ -153,7 +170,7 @@ impl Manager {
                 h.start();
             }
         }
-        *self.hosts.lock().unwrap() = next;
+        *hs = next;
         Ok(())
     }
 
@@ -199,7 +216,7 @@ impl Manager {
             Some(cmd) => probe_script_override(cmd),
             None => probe_script(&self.mc.desktop_version),
         };
-        match run_probe(&*t, &script, &CancelToken::new()) {
+        match run_probe(&*t, &script, &self.cancel) {
             Ok(p) => {
                 r.installed_version = p.installed.map(|d| d.version);
                 match target_triple(&p.os, &p.arch) {
@@ -223,14 +240,21 @@ impl Manager {
         r
     }
 
-    /// Stop every Host in parallel: kill each ssh, join within 3 s overall, then return
-    /// regardless. Daemons and their Terminals keep running. Idempotent.
+    /// Stop every Host in parallel: kill each ssh, join, and return within 3 s of entry
+    /// whatever else is going on (a configure in progress, a sink blocked in a delivery).
+    /// No new configuration starts anything afterwards. Daemons and their Terminals keep
+    /// running. Idempotent.
     pub fn shutdown(&self) {
-        let _one = self.configure_lock.lock().unwrap();
+        let deadline = Instant::now() + STOP_DEADLINE;
         self.shut.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
         let hosts: Vec<Arc<HostHandle>> = std::mem::take(&mut *self.hosts.lock().unwrap());
-        let joins: Vec<JoinHandle<()>> = hosts.iter().filter_map(|h| h.stop_begin()).collect();
-        join_all(joins, Instant::now() + STOP_DEADLINE);
+        let mut joins = Vec::new();
+        for h in &hosts {
+            h.retire();
+            joins.extend(h.stop_begin());
+        }
+        join_all(joins, deadline);
     }
 }
 
@@ -518,5 +542,70 @@ pub(crate) mod tests {
         shutdown_during("exit 1", "exit 1", "STALL", true, |s| {
             s.status == StatusKind::Reconnecting && s.phase.is_none()
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_cancels_a_stalled_connection_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidf = dir.path().join("pid");
+        let mut mc = test_config(Arc::new(NullObserver));
+        mc.transports = script_factory(&format!("echo $$ > '{}'; exec sleep 1000", pidf.display()));
+        let m = Arc::new(Manager::new(mc));
+        let m2 = m.clone();
+        // An unsaved host: the probe runs outside every configured Host.
+        let t = std::thread::spawn(move || m2.test(&test_host("h_cccccccc", "c")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid: i32 = loop {
+            if let Some(p) = std::fs::read_to_string(&pidf)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let start = Instant::now();
+        m.shutdown();
+        let r = t.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(!r.ok);
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "probe {pid} survived");
+        // And nothing runs after the shutdown.
+        assert!(!m.test(&test_host("h_cccccccc", "c")).ok);
+    }
+
+    /// A Daemon that completes the handshake and hangs up at once, every time.
+    #[cfg(unix)]
+    #[test]
+    fn flapping_connection_goes_offline() {
+        use crate::link::testpeer::{hello_frame, terminals_frame};
+        let dir = tempfile::tempdir().unwrap();
+        let frames = dir.path().join("frames");
+        let mut b = hello_frame(1, 1, "1.5.0");
+        b.extend(terminals_frame(vec![]));
+        std::fs::write(&frames, b).unwrap();
+        let rec = Recorder::new();
+        let mut mc = test_config(rec.clone());
+        mc.transports = script_factory(&format!("cat '{}'; sleep 0.05", frames.display()));
+        mc.stable_after = Duration::from_secs(10);
+        let m = Manager::new(mc);
+        let mut h = test_host("h_dddddddd", "d");
+        h.daemon_command = Some("xd".into());
+        m.configure(vec![h]).unwrap();
+        let s = rec.wait_status(|s| s.status == StatusKind::Offline);
+        assert!(s.next_retry_at.is_some());
+        let connected = rec
+            .statuses()
+            .iter()
+            .filter(|s| s.status == StatusKind::Connected)
+            .count();
+        assert!(connected >= 3, "it did connect each time ({connected})");
+        m.shutdown();
     }
 }

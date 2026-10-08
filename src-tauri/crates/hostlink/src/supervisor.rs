@@ -11,12 +11,16 @@ use crate::process::{self, run_script, Proc};
 use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind};
 use crate::transport::{connect_command, sh_wrap, Transport};
 use crate::version::{self, classify, Classified};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BACKOFF: [u64; 7] = [1, 2, 4, 8, 16, 32, 60];
 const FIRST_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFLINE_AFTER: u32 = 3;
+/// How often waits re-check the cancel token and the kick flag.
+const POLL: Duration = Duration::from_millis(50);
+const REATTACH_RETRIES: u32 = 30;
 
 /// The wait before retry `n` (0-based) in units: 1, 2, 4 … 32, then 60 for good.
 pub fn backoff(n: u32, unit: Duration) -> Duration {
@@ -37,13 +41,14 @@ impl Backoff {
     }
 
     /// An established connection ended after `up_for`: a stable one resets the count and
-    /// retries at once; a short-lived one keeps the count and waits.
+    /// retries at once; one that dropped sooner counts as a failure, so a flapping Host
+    /// backs off and goes offline like an unreachable one.
     pub fn ended(&mut self, up_for: Duration, stable_after: Duration, unit: Duration) -> Duration {
         if up_for >= stable_after {
             self.failures = 0;
             Duration::ZERO
         } else {
-            backoff(self.failures, unit)
+            self.failed(unit)
         }
     }
 }
@@ -76,6 +81,8 @@ struct Failure {
 }
 
 struct Connected {
+    /// Attachments not re-attached yet (the send queue was full).
+    left: usize,
     link: Arc<Link>,
     proc: Proc,
     gen: u64,
@@ -166,7 +173,7 @@ impl Sup {
                         });
                 }
                 st.status.next_retry_at = None;
-                st.kick = false;
+                self.sh.kick.store(false, Ordering::SeqCst);
                 self.sh.publish(&mut st);
             }
             delay = match self.attempt() {
@@ -191,7 +198,9 @@ impl Sup {
         let link = {
             let mut st = self.sh.lock();
             if st.gen == self.last_gen {
-                st.link.take()
+                let l = st.link().cloned();
+                self.sh.set_link(&mut st, None);
+                l
             } else {
                 None
             }
@@ -201,7 +210,8 @@ impl Sup {
         }
     }
 
-    /// Wait on the Host's condvar until stopped, kicked, or `d` passes.
+    /// Wait until stopped, kicked, or `d` passes. Polls the token and the kick flag:
+    /// stopping and kicking never need the `State` lock.
     fn wait(&self, d: Duration) -> Waited {
         let deadline = Instant::now() + d;
         let mut st = self.sh.lock();
@@ -209,15 +219,14 @@ impl Sup {
             if self.cancel.is_cancelled() {
                 return Waited::Stop;
             }
-            if st.kick {
-                st.kick = false;
+            if self.sh.kick.swap(false, Ordering::SeqCst) {
                 return Waited::Kick;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Waited::Elapsed;
             }
-            st = self.sh.cv.wait_timeout(st, left).unwrap().0;
+            st = self.sh.cv.wait_timeout(st, left.min(POLL)).unwrap().0;
         }
     }
 
@@ -265,7 +274,7 @@ impl Sup {
             self.backoff
                 .ended(up_for, self.sh.mc.stable_after, self.unit())
         };
-        st.link = None;
+        self.sh.set_link(&mut st, None);
         st.status
             .set_kind(if self.backoff.failures < OFFLINE_AFTER {
                 StatusKind::Reconnecting
@@ -280,6 +289,11 @@ impl Sup {
     }
 
     fn park(&self, c: &Connected) -> Parked {
+        // Attachments the adoption could not send yet (queue full): bounded retries.
+        let mut left = c.left;
+        let mut retry_delay = Duration::from_millis(10);
+        let mut retries = 0u32;
+        let mut retry_at = Instant::now() + retry_delay;
         let mut st = self.sh.lock();
         loop {
             if self.cancel.is_cancelled() || st.gen != c.gen {
@@ -293,16 +307,33 @@ impl Sup {
                 );
             }
             // Connected: a kick has nothing to retry.
-            st.kick = false;
+            self.sh.kick.store(false, Ordering::SeqCst);
             let now = Instant::now();
-            let wait = match st.upgrade_deadline {
+            if left > 0 && retry_at <= now {
+                left = self.sh.reattach_locked(&mut st, c.gen, &c.link);
+                retries += 1;
+                if left > 0 && retries >= REATTACH_RETRIES {
+                    drop(st);
+                    c.link.close();
+                    return Parked::Closed(format!(
+                        "could not re-attach {left} terminals; reconnecting"
+                    ));
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+                retry_at = now + retry_delay;
+            }
+            let mut wait = POLL;
+            match st.upgrade_deadline {
                 Some(d) if d <= now => {
                     st.upgrade_deadline = None;
                     return Parked::UpgradeTimeout;
                 }
-                Some(d) => d - now,
-                None => Duration::from_secs(3600),
-            };
+                Some(d) => wait = wait.min(d - now),
+                None => {}
+            }
+            if left > 0 {
+                wait = wait.min(retry_at.saturating_duration_since(now));
+            }
             st = self.sh.cv.wait_timeout(st, wait).unwrap().0;
         }
     }
@@ -362,8 +393,14 @@ impl Sup {
             read: Box::new(proc.stdout.take().expect("piped stdout")),
             write: Box::new(proc.stdin.take().expect("piped stdin")),
         };
-        let established =
-            Link::establish(io, mc.ours, &version, self.sh.events(gen), mc.hello_timeout);
+        let established = Link::establish_with(
+            io,
+            mc.ours,
+            &version,
+            self.sh.events(gen),
+            mc.hello_timeout,
+            mc.link_limits,
+        );
         let (link, hello, noise) = match established {
             Ok(x) => x,
             Err(_) if self.cancel.is_cancelled() => return Attempt::Cancelled,
@@ -428,7 +465,7 @@ impl Sup {
             st.upgrade_expect = false;
             st.upgrade_deadline = None;
         });
-        if !adopted {
+        let Some(left) = adopted else {
             link.close();
             if self.cancel.is_cancelled() {
                 return Attempt::Cancelled;
@@ -445,12 +482,13 @@ impl Sup {
                 incompatible: None,
                 reinstall: false,
             });
-        }
+        };
         Attempt::Connected(Connected {
             link,
             proc,
             gen,
             at: Instant::now(),
+            left,
         })
     }
 
@@ -528,13 +566,17 @@ mod tests {
         assert_eq!(b.failed(unit), Duration::from_secs(1));
         assert_eq!(b.failed(unit), Duration::from_secs(2));
         assert_eq!(b.failed(unit), Duration::from_secs(4));
-        // Connected, dropped after 3 s: the count stays.
+        // Connected, dropped after 3 s: counts as a failure and escalates.
         assert_eq!(
             b.ended(Duration::from_secs(3), stable, unit),
             Duration::from_secs(8)
         );
-        assert_eq!(b.failures, 3);
-        assert_eq!(b.failed(unit), Duration::from_secs(8));
+        assert_eq!(b.failures, 4);
+        assert_eq!(
+            b.ended(Duration::from_secs(1), stable, unit),
+            Duration::from_secs(16)
+        );
+        assert_eq!(b.failed(unit), Duration::from_secs(32));
         // Up for 10 s: reset, retry at once.
         assert_eq!(b.ended(stable, stable, unit), Duration::ZERO);
         assert_eq!(b.failures, 0);

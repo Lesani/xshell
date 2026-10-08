@@ -141,14 +141,33 @@ impl HttpReleaseSource {
         Ok(bytes)
     }
 
+    /// The cached binary, only if it matches the digest stored next to it. Anything else
+    /// (missing digest, mismatch) is deleted, so the caller downloads again.
+    fn read_cached(&self, path: &Path) -> Option<Vec<u8>> {
+        let digest = digest_path(path);
+        let bytes = std::fs::read(path).ok();
+        let sidecar = std::fs::read_to_string(&digest).ok();
+        match (bytes, sidecar) {
+            (Some(b), Some(d)) if verify_sha256(&b, &d).is_ok() => Some(b),
+            (None, None) => None,
+            _ => {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&digest);
+                None
+            }
+        }
+    }
+
+    /// Publish a verified download: each file goes through its own exclusive temp file and
+    /// an atomic rename, so concurrent fetches (other triples, other windows) never mix.
     fn store(&self, path: &Path, bytes: &[u8]) {
         let Some(dir) = path.parent() else { return };
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
-        let tmp = dir.join(format!(".download.{}", std::process::id()));
-        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        let digest = format!("{}\n", sha256_hex(bytes));
+        if publish(&digest_path(path), digest.as_bytes()).is_ok() {
+            let _ = publish(path, bytes);
         }
     }
 }
@@ -156,7 +175,7 @@ impl HttpReleaseSource {
 impl BinarySource for HttpReleaseSource {
     fn fetch(&self, triple: &str, version: &str, cancel: &CancelToken) -> Result<Vec<u8>, String> {
         let path = self.cached(version, triple);
-        if let Ok(b) = std::fs::read(&path) {
+        if let Some(b) = self.read_cached(&path) {
             return Ok(b);
         }
         let stop = Arc::new(Notify::new());
@@ -168,6 +187,37 @@ impl BinarySource for HttpReleaseSource {
         self.store(&path, &r);
         Ok(r)
     }
+}
+
+fn digest_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Write `bytes` to a fresh temp file next to `path` (unique per process, call and name;
+/// created exclusively), then rename it over `path`.
+fn publish(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let res = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|_| f.sync_all()))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Debug builds: a daemon built with `cargo build -p xshelld --profile release-daemon
@@ -295,18 +345,55 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_skips_download() {
+    fn cache_is_verified_on_read() {
         let t = tempfile::tempdir().unwrap();
         let mut s = HttpReleaseSource::new(t.path().into());
         s.base = "http://127.0.0.1:9".into(); // nothing listens on discard
-        let p = s.cached("1.5.0", "x86_64-unknown-linux-musl");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, b"CACHED").unwrap();
-        assert_eq!(
-            s.fetch("x86_64-unknown-linux-musl", "1.5.0", &CancelToken::new())
-                .unwrap(),
-            b"CACHED"
-        );
+        let triple = "x86_64-unknown-linux-musl";
+        let c = CancelToken::new();
+        let p = s.cached("1.5.0", triple);
+        // A verified download is served from the cache.
+        s.store(&p, b"CACHED");
+        assert_eq!(s.fetch(triple, "1.5.0", &c).unwrap(), b"CACHED");
+        let leftovers: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // Tampered bytes, or bytes without a digest, are deleted and fetched again.
+        std::fs::write(&p, b"EVIL").unwrap();
+        assert!(s.fetch(triple, "1.5.0", &c).is_err());
+        assert!(!p.exists() && !digest_path(&p).exists());
+        std::fs::write(&p, b"NO DIGEST").unwrap();
+        assert!(s.fetch(triple, "1.5.0", &c).is_err());
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn concurrent_stores_never_mix() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Arc::new(HttpReleaseSource::new(t.path().into()));
+        let joins: Vec<_> = (0..8u8)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let triple = if i % 2 == 0 { "a-triple" } else { "b-triple" };
+                    let bytes = vec![i % 2; 256 * 1024];
+                    let p = s.cached("1.5.0", triple);
+                    for _ in 0..10 {
+                        s.store(&p, &bytes);
+                    }
+                })
+            })
+            .collect();
+        for j in joins {
+            j.join().unwrap();
+        }
+        for (triple, byte) in [("a-triple", 0u8), ("b-triple", 1u8)] {
+            let b = s.read_cached(&s.cached("1.5.0", triple)).expect("verified");
+            assert!(b.len() == 256 * 1024 && b.iter().all(|x| *x == byte));
+        }
     }
 
     /// A server that accepts and never answers; the receiver hears of each connection.

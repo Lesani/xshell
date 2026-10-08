@@ -84,6 +84,8 @@ pub fn strip_ansi(s: &str) -> String {
 struct Cell {
     child: Child,
     reaped: Option<ExitStatus>,
+    /// The process group was seen empty: its id may be reused now, never signal it again.
+    group_gone: bool,
 }
 
 /// A shared, killable child.
@@ -98,18 +100,51 @@ impl ChildCell {
         self.pid
     }
 
-    /// SIGKILL the child's process group (unix), or the child. A reaped child is left
-    /// alone: its pid may belong to someone else by now.
+    /// SIGKILL the child's process group (unix), or the child. The group outlives a reaped
+    /// leader while any member lives (a pgid is not reused while a member exists), so it
+    /// is signalled until it is seen empty, and never after that.
     pub fn kill(&self) {
         let mut c = self.inner.lock().unwrap();
-        if c.reaped.is_some() {
-            return;
+        Self::kill_group_locked(&mut c, self.pid);
+        if c.reaped.is_none() {
+            let _ = c.child.kill();
+        }
+    }
+
+    /// Signal the group once; `true` while it still has members.
+    #[allow(unused_variables)]
+    fn kill_group_locked(c: &mut Cell, pid: u32) -> bool {
+        if c.group_gone {
+            return false;
         }
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+        {
+            let r = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                c.group_gone = true;
+                return false;
+            }
+            true
         }
-        let _ = c.child.kill();
+        #[cfg(not(unix))]
+        {
+            c.group_gone = true;
+            false
+        }
+    }
+
+    /// Kill what is left of the group (descendants that outlived the child), bounded.
+    pub fn kill_group(&self, d: Duration) {
+        let deadline = Instant::now() + d;
+        loop {
+            if !Self::kill_group_locked(&mut self.inner.lock().unwrap(), self.pid) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
     }
 
     pub fn try_wait(&self) -> Option<ExitStatus> {
@@ -139,10 +174,12 @@ impl ChildCell {
         }
     }
 
-    /// Kill, then reap (bounded).
+    /// Kill, reap, then make sure the rest of the group is gone (bounded).
     pub fn kill_and_wait(&self, d: Duration) -> Option<ExitStatus> {
         self.kill();
-        self.wait_timeout(d)
+        let s = self.wait_timeout(d);
+        self.kill_group(d);
+        s
     }
 }
 
@@ -216,6 +253,7 @@ pub fn spawn(spec: &CommandSpec, cancel: &CancelToken) -> io::Result<Proc> {
         inner: Arc::new(Mutex::new(Cell {
             child,
             reaped: None,
+            group_gone: false,
         })),
         pid,
     };
@@ -335,7 +373,8 @@ pub fn run_script(
         }
         std::thread::sleep(POLL);
     };
-    // A grandchild may keep the pipes open; do not wait for it forever.
+    // A descendant left behind would keep the pipes (and the drain threads) alive.
+    p.child.kill_group(Duration::from_secs(2));
     let stdout = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
     p.wait_stderr(Duration::from_millis(500));
     Ok(Output {
@@ -348,7 +387,7 @@ pub fn run_script(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::transport::LocalShellTransport;
+    use crate::transport::{LocalShellTransport, Transport};
 
     #[test]
     fn strip_ansi_and_tail() {
@@ -378,6 +417,68 @@ mod tests {
         assert_eq!(out.stdout.trim(), "3145728");
         assert_eq!(out.stderr, "oops");
         assert_eq!(out.code, Some(3));
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn read_pid(p: &std::path::Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(n) = std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return n;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL);
+        }
+    }
+
+    #[test]
+    fn surviving_descendant_is_killed_after_the_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidf = dir.path().join("pid");
+        let t = LocalShellTransport::default();
+        // The parent exits at once; its child keeps stdout and stderr open.
+        let script = format!("sleep 1000 & echo $! > '{}'; echo done", pidf.display());
+        let start = Instant::now();
+        let out = run_script(
+            &t,
+            &script,
+            None,
+            Duration::from_secs(10),
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert_eq!(out.stdout.trim(), "done");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        let orphan = read_pid(&pidf);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive(orphan) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        assert!(!alive(orphan), "descendant {orphan} survived");
+
+        // The same through `Proc`: the leader is reaped first, dropping still cleans up.
+        let pidf2 = dir.path().join("pid2");
+        let spec = t.command(&format!("sleep 1000 & echo $! > '{}'", pidf2.display()));
+        let p = spawn(&spec, &CancelToken::new()).unwrap();
+        let orphan = read_pid(&pidf2);
+        assert!(p.child.wait_timeout(Duration::from_secs(5)).is_some());
+        assert!(alive(orphan));
+        drop(p);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive(orphan) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        assert!(!alive(orphan), "descendant {orphan} survived the drop");
     }
 
     #[test]

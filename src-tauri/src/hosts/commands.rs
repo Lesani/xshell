@@ -137,13 +137,19 @@ pub async fn host_term_attach(
     Ok(AttachResult { exit_code })
 }
 
+// Async (the JS call is the same): forgetting a sink takes the Host's state lock, which a
+// delivery may hold; that wait must not land on the main thread.
 #[tauri::command]
-pub fn host_term_detach(
+pub async fn host_term_detach(
     state: State<'_, Hosts>,
     host: String,
     terminal: String,
 ) -> Result<(), HostError> {
-    handle(&state, &host)?.term_detach(uuid(&terminal)?)
+    let h = handle(&state, &host)?;
+    let t = uuid(&terminal)?;
+    tauri::async_runtime::spawn_blocking(move || h.term_detach(t))
+        .await
+        .map_err(|e| HostError::offline(e.to_string()))?
 }
 
 #[tauri::command]

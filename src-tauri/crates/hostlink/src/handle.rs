@@ -5,6 +5,11 @@
 //! Locking: `State` is one mutex. Link methods may be called under it (they only enqueue);
 //! `Link::close` and user callbacks never are. Sinks and the observer are called under it,
 //! which keeps their events in order; they must not call back into the handle.
+//!
+//! The sync paths the UI thread uses (input, resize, status snapshots, kick) never take
+//! `State`: they read small separately locked copies (`ep`, `sizes`, `snap`) that are only
+//! ever held for a copy or an enqueue, so a sink blocked inside a delivery cannot stall them.
+//! Stopping never takes `State` either (see `stop_begin`).
 
 use crate::cancel::CancelToken;
 use crate::config::HostConfig;
@@ -14,7 +19,8 @@ use crate::manager::ManagerConfig;
 use crate::status::{HostSnapshot, HostStatus, Phase, StatusKind};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -22,14 +28,13 @@ use xshell_core::protocol::msg::{ClientMsg, OpenSpec, TerminalInfo};
 
 /// Where one Tab's output goes.
 pub trait TermSink: Send + Sync {
-    /// `false`: the receiver is gone; the handle detaches.
+    /// `false`: the receiver is gone; the handle retires this sink.
     fn data(&self, bytes: &[u8]) -> bool;
     /// The Terminal ended. `bytes` is everything this sink received through `data`, so the
     /// receiver can apply the exit only after that much output (the exit watermark).
     fn exit(&self, code: i32, bytes: u64);
 }
 
-pub(crate) const TERM_TIMEOUT: Duration = Duration::from_secs(30);
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct SinkSlot {
@@ -44,19 +49,18 @@ impl SinkSlot {
 }
 
 pub(crate) struct Attachment {
-    /// Receives output now.
-    sink: SinkSlot,
+    /// Receives output now. `None`: its receiver went away while a replacement is pending.
+    sink: Option<SinkSlot>,
     /// A replacement installed before its `term.attach` was sent; it takes over when that
     /// request's reply arrives (output before the reply belongs to the previous attach).
     pending: Option<(u64, SinkSlot)>,
-    /// The last size this Desktop set, re-sent after a re-attach.
-    pub(crate) size: Option<(u16, u16)>,
-    /// The link generation of the latest attach.
+    /// The link generation of the latest attach that was actually sent.
     pub(crate) attached_gen: u64,
     /// The epoch of the latest attach request.
     epoch: u64,
-    /// Attach requests awaiting a reply. Lists never prune an attachment with one in flight.
-    inflight: u32,
+    /// Attach requests (by epoch) awaiting a reply. Lists never prune an attachment with
+    /// one in flight.
+    inflight: HashSet<u64>,
 }
 
 pub(crate) struct State {
@@ -66,24 +70,20 @@ pub(crate) struct State {
     pub terminals: Option<Vec<TerminalInfo>>,
     /// The generation of the newest link (events of older links are ignored).
     pub gen: u64,
-    /// The usable link; always of generation `gen`.
-    pub link: Option<Arc<Link>>,
+    /// The usable link; always of generation `gen`. Change it only through `set_link`.
+    link: Option<Arc<Link>>,
     pub link_closed: bool,
     pub close_reason: Option<String>,
     /// The generation of the newest `terminals` list.
     pub list_gen: u64,
     pub atts: HashMap<Uuid, Attachment>,
     epoch: u64,
-    pub kick: bool,
-    pub child_pid: Option<u32>,
     /// An upgrade is in progress: phase `upgrading` until connected again.
     pub upgrading: bool,
     /// The Daemon acknowledged `daemon.upgrade`; it must close the link by then.
     pub upgrade_deadline: Option<Instant>,
     /// After an upgrade, the next Daemon must report the Desktop's version.
     pub upgrade_expect: bool,
-    /// The running supervisor's token (for helper work such as the upgrade kill script).
-    pub cancel: CancelToken,
 }
 
 impl State {
@@ -91,6 +91,16 @@ impl State {
         self.epoch += 1;
         self.epoch
     }
+
+    pub(crate) fn link(&self) -> Option<&Arc<Link>> {
+        self.link.as_ref()
+    }
+}
+
+/// What the sync paths need: the link to enqueue on, or why there is none.
+struct Endpoint {
+    link: Option<Arc<Link>>,
+    down: HostError,
 }
 
 pub(crate) struct Shared {
@@ -98,15 +108,24 @@ pub(crate) struct Shared {
     pub mc: Arc<ManagerConfig>,
     pub st: Mutex<State>,
     pub cv: Condvar,
+    /// Set by `kick`; the supervisor polls it (no `State` lock needed to kick).
+    pub kick: AtomicBool,
+    /// The current transport process (0: none), for tests.
+    child_pid: AtomicU32,
+    ep: Mutex<Endpoint>,
+    /// The last size this Desktop set per Terminal, re-sent after a re-attach.
+    sizes: Mutex<HashMap<Uuid, (u16, u16)>>,
+    /// The latest status and list, for `snapshot`.
+    snap: Mutex<HostSnapshot>,
 }
 
-/// Calls the wrapped callback at most once, whichever path gets there first.
 type Callback<T> = Box<dyn FnOnce(T) + Send>;
 type Reply = Result<Value, HostError>;
 
 /// Joins the replies of `term.open` and its `term.attach`: (how many arrived, the first).
 type Joined = Arc<Mutex<(u8, Option<Reply>)>>;
 
+/// Calls the wrapped callback at most once, whichever path gets there first.
 struct Once<T>(Mutex<Option<Callback<T>>>);
 
 impl<T> Once<T> {
@@ -141,12 +160,42 @@ fn unusable(st: &State) -> HostError {
     }
 }
 
+/// Take a briefly held lock without ever waiting long: the holders only copy or enqueue.
+/// Contention past a few retries reports `busy` instead of blocking the caller.
+fn quick<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, HostError> {
+    for i in 0..64 {
+        match m.try_lock() {
+            Ok(g) => return Ok(g),
+            Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if i < 32 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+    Err(HostError::busy())
+}
+
+/// What happened to an attach request.
+enum Done<'a> {
+    Ok,
+    Err(&'a HostError),
+}
+
 impl Shared {
     pub(crate) fn new(cfg: HostConfig, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
         let status = HostStatus::initial(&cfg.id, &mc.desktop_version, config_generation);
+        let down = HostError::offline(format!("{} is reconnecting", cfg.name));
         Self {
             id: cfg.id.clone(),
             mc,
+            snap: Mutex::new(HostSnapshot {
+                status: status.clone(),
+                terminals: None,
+            }),
             st: Mutex::new(State {
                 cfg,
                 status,
@@ -159,14 +208,15 @@ impl Shared {
                 list_gen: 0,
                 atts: HashMap::new(),
                 epoch: 0,
-                kick: false,
-                child_pid: None,
                 upgrading: false,
                 upgrade_deadline: None,
                 upgrade_expect: false,
-                cancel: CancelToken::new(),
             }),
             cv: Condvar::new(),
+            kick: AtomicBool::new(false),
+            child_pid: AtomicU32::new(0),
+            ep: Mutex::new(Endpoint { link: None, down }),
+            sizes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,22 +224,41 @@ impl Shared {
         self.st.lock().unwrap()
     }
 
+    fn sync_ep(&self, st: &State) {
+        let mut ep = self.ep.lock().unwrap();
+        ep.link = st.link.clone();
+        ep.down = unusable(st);
+    }
+
+    /// The only way the usable link changes, so the sync paths see it too.
+    pub(crate) fn set_link(&self, st: &mut State, link: Option<Arc<Link>>) {
+        st.link = link;
+        self.sync_ep(st);
+    }
+
     /// Emit the status if it changed since the last emit.
     pub(crate) fn publish(&self, st: &mut State) {
         if st.published.as_ref() != Some(&st.status) {
             st.published = Some(st.status.clone());
+            self.snap.lock().unwrap().status = st.status.clone();
+            self.sync_ep(st);
             self.mc.observer.status(&st.status);
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> HostSnapshot {
+        self.snap.lock().unwrap().clone()
     }
 
     /// Start a new link generation: everything from older links is ignored from now on.
     pub(crate) fn begin_link(&self, child_pid: Option<u32>) -> u64 {
         let mut st = self.lock();
         st.gen += 1;
-        st.link = None;
+        self.set_link(&mut st, None);
         st.link_closed = false;
         st.close_reason = None;
-        st.child_pid = child_pid;
+        self.child_pid
+            .store(child_pid.unwrap_or(0), Ordering::SeqCst);
         st.gen
     }
 
@@ -219,19 +288,20 @@ impl Shared {
     }
 
     /// Make `link` (generation `gen`) the usable one: re-attach every attachment the list
-    /// still has, then let `set` publish the status, all in one critical section. `false`
-    /// when a newer generation exists or the link already closed.
+    /// still has, then let `set` publish the status, all in one critical section. Returns
+    /// how many attachments could not be sent yet (queue full), or `None` when a newer
+    /// generation exists or the link already closed.
     pub(crate) fn adopt(
         self: &Arc<Self>,
         gen: u64,
         link: &Arc<Link>,
         set: impl FnOnce(&mut State),
-    ) -> bool {
+    ) -> Option<usize> {
         let mut st = self.lock();
         if st.gen != gen || st.link_closed {
-            return false;
+            return None;
         }
-        st.link = Some(link.clone());
+        self.set_link(&mut st, Some(link.clone()));
         let listed: HashSet<Uuid> = st
             .terminals
             .as_deref()
@@ -240,74 +310,119 @@ impl Shared {
             .map(|i| i.terminal)
             .collect();
         st.atts.retain(|t, _| listed.contains(t));
-        let ids: Vec<Uuid> = st.atts.keys().copied().collect();
-        for t in ids {
-            let epoch = st.next_epoch();
-            let a = st.atts.get_mut(&t).expect("listed");
-            // An explicit attach on this link already replayed into the newest sink.
-            if a.attached_gen == gen {
-                continue;
-            }
-            if let Some((_, p)) = a.pending.take() {
-                a.sink = p;
-            }
-            a.attached_gen = gen;
-            a.epoch = epoch;
-            a.inflight += 1;
-            let size = a.size;
-            let sh = Arc::downgrade(self);
-            let w: Waiter = Box::new(move |r| {
-                if let Some(sh) = sh.upgrade() {
-                    sh.attach_done(t, epoch, gen, false, r.as_ref().err());
-                }
-            });
-            if link
-                .request(ClientMsg::TermAttach { terminal: t }, TERM_TIMEOUT, w)
-                .is_err()
-            {
-                if let Some(a) = st.atts.get_mut(&t) {
-                    a.inflight = a.inflight.saturating_sub(1);
-                }
-            }
-            if let Some((cols, rows)) = size {
-                let _ = link.notify(ClientMsg::TermResize {
-                    terminal: t,
-                    cols,
-                    rows,
-                });
-            }
-        }
+        let left = self.reattach_locked(&mut st, gen, link);
         set(&mut st);
         self.publish(&mut st);
         self.cv.notify_all();
-        true
+        Some(left)
     }
 
-    /// An attach request finished. A reply promotes its pending sink; a refusal from the
-    /// Daemon rolls the sink back (and drops a fresh attachment). A lost connection keeps
-    /// everything: the next link re-attaches.
-    fn attach_done(&self, t: Uuid, epoch: u64, gen: u64, fresh: bool, err: Option<&HostError>) {
-        let mut st = self.lock();
-        let Some(a) = st.atts.get_mut(&t) else {
-            return;
+    /// Send `term.attach` (and the remembered size) for every attachment not yet attached
+    /// on `gen`. An attachment counts as attached only once its request is enqueued; the
+    /// ones refused (queue full) are left for a retry. Returns how many are left.
+    pub(crate) fn reattach_locked(
+        self: &Arc<Self>,
+        st: &mut State,
+        gen: u64,
+        link: &Arc<Link>,
+    ) -> usize {
+        if st.gen != gen {
+            return 0;
+        }
+        let mut left = 0;
+        let ids: Vec<Uuid> = st.atts.keys().copied().collect();
+        for t in ids {
+            match st.atts.get_mut(&t) {
+                // An explicit attach on this link already replayed into the newest sink.
+                None => continue,
+                Some(a) if a.attached_gen == gen => continue,
+                // Requests of older links can no longer complete (they are fenced).
+                Some(a) => a.inflight.clear(),
+            }
+            let epoch = st.next_epoch();
+            let sh = Arc::downgrade(self);
+            let w: Waiter = Box::new(move |r| {
+                if let Some(sh) = sh.upgrade() {
+                    sh.attach_done(t, epoch, gen, done_of(&r));
+                }
+            });
+            match link.request(
+                ClientMsg::TermAttach { terminal: t },
+                self.mc.term_timeout,
+                w,
+            ) {
+                Ok(()) => {
+                    let a = st.atts.get_mut(&t).expect("listed");
+                    // The superseded attach intent of an old link takes over now: nothing
+                    // reaches this Terminal on the new link before this request's reply.
+                    if let Some((_, p)) = a.pending.take() {
+                        a.sink = Some(p);
+                    }
+                    a.attached_gen = gen;
+                    a.epoch = epoch;
+                    a.inflight.insert(epoch);
+                    let size = self.sizes.lock().unwrap().get(&t).copied();
+                    if let Some((cols, rows)) = size {
+                        let _ = link.notify(ClientMsg::TermResize {
+                            terminal: t,
+                            cols,
+                            rows,
+                        });
+                    }
+                }
+                Err(_) => left += 1,
+            }
+        }
+        left
+    }
+
+    /// An attach request finished. Only the request it belongs to, on the link generation
+    /// it was sent on, may change anything. A reply promotes its pending sink; a refusal
+    /// from the Daemon rolls it back; a timeout on a live link is ambiguous (the late reply
+    /// would be dropped), so the link is closed and the reconnect re-attaches everything.
+    fn attach_done(&self, t: Uuid, epoch: u64, gen: u64, done: Done<'_>) {
+        let closing = {
+            let mut st = self.lock();
+            if st.gen != gen {
+                return;
+            }
+            let Some(a) = st.atts.get_mut(&t) else {
+                return;
+            };
+            if !a.inflight.remove(&epoch) {
+                return;
+            }
+            let pending_is_ours = a.pending.as_ref().map(|p| p.0) == Some(epoch);
+            match done {
+                Done::Ok => {
+                    if pending_is_ours {
+                        a.sink = a.pending.take().map(|p| p.1);
+                    }
+                    None
+                }
+                Done::Err(e) if e.code == HostErrorCode::Remote => {
+                    if pending_is_ours {
+                        a.pending = None;
+                    }
+                    let orphan = a.sink.is_none() && a.pending.is_none();
+                    if orphan || (!pending_is_ours && a.epoch == epoch) {
+                        Self::detach_locked(&mut st, t, &self.sizes);
+                    }
+                    None
+                }
+                Done::Err(e) if e.code == HostErrorCode::Timeout => {
+                    let link = st.link.take();
+                    self.sync_ep(&st);
+                    st.link_closed = true;
+                    st.close_reason = Some("term.attach timed out; reconnecting".into());
+                    self.cv.notify_all();
+                    link
+                }
+                Done::Err(_) => None,
+            }
         };
-        a.inflight = a.inflight.saturating_sub(1);
-        let pending_is_ours = a.pending.as_ref().map(|p| p.0) == Some(epoch);
-        match err {
-            None => {
-                if pending_is_ours {
-                    a.sink = a.pending.take().expect("pending").1;
-                }
-            }
-            Some(e) if e.code == HostErrorCode::Remote => {
-                if pending_is_ours {
-                    a.pending = None;
-                } else if a.epoch == epoch && a.attached_gen == gen {
-                    let _ = fresh;
-                    st.atts.remove(&t);
-                }
-            }
-            Some(_) => {}
+        if let Some(l) = closing {
+            l.close();
         }
     }
 
@@ -318,13 +433,12 @@ impl Shared {
         }
     }
 
-    /// Install `sink` for `t` and send `term.attach`, under the caller's lock. Returns the
-    /// request's epoch and whether the attachment is new.
+    /// Install `sink` for `t` and send `term.attach`, under the caller's lock.
     fn begin_attach(
         self: &Arc<Self>,
         st: &mut State,
         (link, gen): (&Arc<Link>, u64),
-        (t, sink, size): (Uuid, Arc<dyn TermSink>, Option<(u16, u16)>),
+        (t, sink): (Uuid, Arc<dyn TermSink>),
         done: Callback<Reply>,
     ) -> Result<(), HostError> {
         let epoch = st.next_epoch();
@@ -333,12 +447,11 @@ impl Shared {
             st.atts.insert(
                 t,
                 Attachment {
-                    sink: SinkSlot::new(sink),
+                    sink: Some(SinkSlot::new(sink)),
                     pending: None,
-                    size,
                     attached_gen: gen,
                     epoch,
-                    inflight: 1,
+                    inflight: HashSet::from([epoch]),
                 },
             );
         } else {
@@ -346,25 +459,26 @@ impl Shared {
             a.pending = Some((epoch, SinkSlot::new(sink)));
             a.attached_gen = gen;
             a.epoch = epoch;
-            a.inflight += 1;
-            if size.is_some() {
-                a.size = size;
-            }
+            a.inflight.insert(epoch);
         }
         let sh = Arc::downgrade(self);
         let w: Waiter = Box::new(move |r| {
             if let Some(sh) = sh.upgrade() {
-                sh.attach_done(t, epoch, gen, fresh, r.as_ref().err());
+                sh.attach_done(t, epoch, gen, done_of(&r));
             }
             done(r);
         });
-        let sent = link.request(ClientMsg::TermAttach { terminal: t }, TERM_TIMEOUT, w);
+        let sent = link.request(
+            ClientMsg::TermAttach { terminal: t },
+            self.mc.term_timeout,
+            w,
+        );
         if sent.is_err() {
             // Not sent: undo exactly what this call installed.
             if fresh {
                 st.atts.remove(&t);
             } else if let Some(a) = st.atts.get_mut(&t) {
-                a.inflight = a.inflight.saturating_sub(1);
+                a.inflight.remove(&epoch);
                 if a.pending.as_ref().map(|p| p.0) == Some(epoch) {
                     a.pending = None;
                 }
@@ -373,12 +487,20 @@ impl Shared {
         sent
     }
 
-    fn detach_locked(st: &mut State, t: Uuid) {
+    fn detach_locked(st: &mut State, t: Uuid, sizes: &Mutex<HashMap<Uuid, (u16, u16)>>) {
         if st.atts.remove(&t).is_some() {
+            sizes.lock().unwrap().remove(&t);
             if let Some(l) = &st.link {
                 let _ = l.notify(ClientMsg::TermDetach { terminal: t });
             }
         }
+    }
+}
+
+fn done_of(r: &Result<Value, HostError>) -> Done<'_> {
+    match r {
+        Ok(_) => Done::Ok,
+        Err(e) => Done::Err(e),
     }
 }
 
@@ -396,18 +518,22 @@ impl LinkEvents for LinkObs {
         if st.gen != self.gen {
             return;
         }
-        let alive = match st.atts.get_mut(&t) {
-            Some(a) => {
-                let ok = a.sink.sink.data(data);
-                if ok {
-                    a.sink.bytes += data.len() as u64;
-                }
-                ok
-            }
-            None => true,
+        let Some(a) = st.atts.get_mut(&t) else {
+            return;
         };
-        if !alive {
-            Shared::detach_locked(&mut st, t);
+        let Some(slot) = a.sink.as_mut() else {
+            // The previous sink is retired and the replacement's reply has not arrived:
+            // this output belongs to the previous attach.
+            return;
+        };
+        if slot.sink.data(data) {
+            slot.bytes += data.len() as u64;
+        } else if a.pending.is_some() {
+            // Retire only the gone receiver; the pending replacement stays and takes over
+            // when its reply arrives (the reader handles both, in wire order).
+            a.sink = None;
+        } else {
+            Shared::detach_locked(&mut st, t, &sh.sizes);
         }
     }
 
@@ -418,8 +544,10 @@ impl LinkEvents for LinkObs {
             return;
         }
         let listed: HashSet<Uuid> = list.iter().map(|i| i.terminal).collect();
-        st.atts.retain(|t, a| listed.contains(t) || a.inflight > 0);
+        st.atts
+            .retain(|t, a| listed.contains(t) || !a.inflight.is_empty());
         sh.mc.observer.terminals(&sh.id, &list);
+        sh.snap.lock().unwrap().terminals = Some(list.clone());
         st.terminals = Some(list);
         st.list_gen = self.gen;
         sh.cv.notify_all();
@@ -432,8 +560,8 @@ impl LinkEvents for LinkObs {
             return;
         }
         // The Terminal stays listed, so the attachment stays too.
-        if let Some(a) = st.atts.get(&t) {
-            a.sink.sink.exit(code, a.sink.bytes);
+        if let Some(Some(s)) = st.atts.get(&t).map(|a| a.sink.as_ref()) {
+            s.sink.exit(code, s.bytes);
         }
     }
 
@@ -445,7 +573,7 @@ impl LinkEvents for LinkObs {
         }
         st.link_closed = true;
         st.close_reason = Some(why);
-        st.link = None;
+        sh.set_link(&mut st, None);
         sh.cv.notify_all();
     }
 }
@@ -460,6 +588,8 @@ struct Running {
 pub struct HostHandle {
     pub(crate) sh: Arc<Shared>,
     run: Mutex<Option<Running>>,
+    /// Shut down for good: `start` does nothing any more.
+    retired: AtomicBool,
 }
 
 fn opt_u32(v: &Value, k: &str) -> Option<u32> {
@@ -471,34 +601,50 @@ impl HostHandle {
         Self {
             sh: Arc::new(Shared::new(cfg, mc, config_generation)),
             run: Mutex::new(None),
+            retired: AtomicBool::new(false),
         }
     }
 
+    /// Start the supervisor. Takes no `State` lock (a blocked sink cannot delay it).
     pub(crate) fn start(&self) {
-        let cancel = CancelToken::new();
-        {
-            let mut st = self.sh.lock();
-            st.cancel = cancel.clone();
-            self.sh.publish(&mut st);
+        let mut run = self.run.lock().unwrap();
+        if self.retired.load(Ordering::SeqCst) || run.is_some() {
+            return;
         }
+        let cancel = CancelToken::new();
         let sh = self.sh.clone();
         let c = cancel.clone();
         let join = std::thread::Builder::new()
             .name(format!("host-{}", self.sh.id))
             .spawn(move || crate::supervisor::run(sh, c))
             .expect("spawn supervisor");
-        *self.run.lock().unwrap() = Some(Running { cancel, join });
+        *run = Some(Running { cancel, join });
     }
 
-    /// Cancel the supervisor (killing its children); the caller joins.
+    /// Never start again (manager shutdown).
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+    }
+
+    /// Cancel the supervisor (killing its children); the caller joins. Needs no lock a
+    /// delivery callback could hold: the supervisor polls the token.
     pub(crate) fn stop_begin(&self) -> Option<JoinHandle<()>> {
         let r = self.run.lock().unwrap().take()?;
         r.cancel.cancel();
-        {
-            let _st = self.sh.lock();
+        if let Ok(_st) = self.sh.st.try_lock() {
             self.sh.cv.notify_all();
         }
         Some(r.join)
+    }
+
+    /// The running supervisor's token, for helper work such as the upgrade kill script.
+    fn cancel_token(&self) -> CancelToken {
+        self.run
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.cancel.clone())
+            .unwrap_or_default()
     }
 
     /// After a stop: take the new configuration, fence the old links, keep attachments.
@@ -512,17 +658,19 @@ impl HostHandle {
             st.list_gen = 0;
             st.link_closed = false;
             st.close_reason = None;
-            st.child_pid = None;
+            self.sh.child_pid.store(0, Ordering::SeqCst);
             st.upgrading = false;
             st.upgrade_deadline = None;
             st.upgrade_expect = false;
-            st.kick = false;
+            self.sh.kick.store(false, Ordering::SeqCst);
             for a in st.atts.values_mut() {
                 a.attached_gen = 0;
-                a.inflight = 0;
+                a.inflight.clear();
             }
             st.status =
                 HostStatus::initial(&self.sh.id, &self.sh.mc.desktop_version, config_generation);
+            self.sh.snap.lock().unwrap().terminals = None;
+            self.sh.publish(&mut st);
             link
         };
         if let Some(l) = closing {
@@ -543,25 +691,22 @@ impl HostHandle {
     }
 
     pub fn status(&self) -> HostStatus {
-        self.sh.lock().status.clone()
+        self.sh.snapshot().status
     }
 
     pub fn terminals(&self) -> Option<Vec<TerminalInfo>> {
-        self.sh.lock().terminals.clone()
+        self.sh.snapshot().terminals
     }
 
+    /// The latest status and list. Never waits on deliveries.
     pub fn snapshot(&self) -> HostSnapshot {
-        let st = self.sh.lock();
-        HostSnapshot {
-            status: st.status.clone(),
-            terminals: st.terminals.clone(),
-        }
+        self.sh.snapshot()
     }
 
     /// The pid of the current transport process (ssh), for tests.
     #[doc(hidden)]
     pub fn child_pid(&self) -> Option<u32> {
-        self.sh.lock().child_pid
+        Some(self.sh.child_pid.load(Ordering::SeqCst)).filter(|p| *p != 0)
     }
 
     fn request(&self, msg: ClientMsg, timeout: Duration, w: Waiter) {
@@ -596,12 +741,12 @@ impl HostHandle {
     ) {
         let once = Once::new(w);
         let t = spec.terminal;
-        let size = Some((spec.cols, spec.rows));
+        let size = (spec.cols, spec.rows);
         // Both replies are joined; the second one to finish answers.
         let joined: Joined = Arc::new(Mutex::new((0, None)));
         let finish = {
             let once = once.clone();
-            move |open: Option<Result<Value, HostError>>, attach: Result<Value, HostError>| {
+            move |open: Option<Reply>, attach: Reply| {
                 let r = match (open, attach) {
                     (Some(Err(e)), _) | (_, Err(e)) => Err(e),
                     (Some(Ok(v)), Ok(_)) => Ok(opt_u32(&v, "pid")),
@@ -611,6 +756,7 @@ impl HostHandle {
             }
         };
         let finish = Arc::new(Mutex::new(Some(finish)));
+        let timeout = self.sh.mc.term_timeout;
         let sent = {
             let mut st = self.sh.lock();
             Shared::usable_link(&st).and_then(|(link, gen)| {
@@ -628,9 +774,10 @@ impl HostHandle {
                         j.1 = Some(r);
                     }
                 });
-                link.request(ClientMsg::TermOpen { spec }, TERM_TIMEOUT, w_open)?;
+                link.request(ClientMsg::TermOpen { spec }, timeout, w_open)?;
+                self.sh.sizes.lock().unwrap().insert(t, size);
                 let (j2, f2) = (joined.clone(), finish.clone());
-                let done: Box<dyn FnOnce(Result<Value, HostError>) + Send> = Box::new(move |r| {
+                let done: Callback<Reply> = Box::new(move |r| {
                     let mut j = j2.lock().unwrap();
                     j.0 += 1;
                     if j.0 == 2 {
@@ -644,8 +791,7 @@ impl HostHandle {
                     }
                 });
                 // If this fails, the open still runs; the Terminal shows up in the list.
-                self.sh
-                    .begin_attach(&mut st, (&link, gen), (t, sink, size), done)
+                self.sh.begin_attach(&mut st, (&link, gen), (t, sink), done)
             })
         };
         if let Err(e) = sent {
@@ -663,14 +809,13 @@ impl HostHandle {
     ) {
         let once = Once::new(w);
         let o = once.clone();
-        let done: Box<dyn FnOnce(Result<Value, HostError>) + Send> = Box::new(move |r| {
+        let done: Callback<Reply> = Box::new(move |r| {
             o.call(r.map(|v| v.get("exitCode").and_then(Value::as_i64).map(|c| c as i32)))
         });
         let sent = {
             let mut st = self.sh.lock();
             Shared::usable_link(&st).and_then(|(link, gen)| {
-                self.sh
-                    .begin_attach(&mut st, (&link, gen), (t, sink, None), done)
+                self.sh.begin_attach(&mut st, (&link, gen), (t, sink), done)
             })
         };
         if let Err(e) = sent {
@@ -681,23 +826,29 @@ impl HostHandle {
     /// Forget the sink. Never fails: offline, there is nothing to tell the Daemon.
     pub fn term_detach(&self, t: Uuid) -> Result<(), HostError> {
         let mut st = self.sh.lock();
-        Shared::detach_locked(&mut st, t);
+        Shared::detach_locked(&mut st, t, &self.sh.sizes);
         Ok(())
     }
 
-    pub fn term_input(&self, t: Uuid, data: String) -> Result<(), HostError> {
-        let st = self.sh.lock();
-        let (l, _) = Shared::usable_link(&st)?;
-        l.notify(ClientMsg::TermInput { terminal: t, data })
+    /// The current link for the sync paths, or why there is none. Never waits on `State`.
+    fn endpoint(&self) -> Result<Arc<Link>, HostError> {
+        let ep = quick(&self.sh.ep)?;
+        match &ep.link {
+            Some(l) if !l.is_closed() => Ok(l.clone()),
+            _ => Err(ep.down.clone()),
+        }
     }
 
+    /// Sync and non-blocking: enqueues or fails with `offline`, `incompatible` or `busy`.
+    pub fn term_input(&self, t: Uuid, data: String) -> Result<(), HostError> {
+        self.endpoint()?
+            .notify(ClientMsg::TermInput { terminal: t, data })
+    }
+
+    /// Sync and non-blocking; the size is remembered for re-attach even when offline.
     pub fn term_resize(&self, t: Uuid, cols: u16, rows: u16) -> Result<(), HostError> {
-        let mut st = self.sh.lock();
-        if let Some(a) = st.atts.get_mut(&t) {
-            a.size = Some((cols, rows));
-        }
-        let (l, _) = Shared::usable_link(&st)?;
-        l.notify(ClientMsg::TermResize {
+        quick(&self.sh.sizes)?.insert(t, (cols, rows));
+        self.endpoint()?.notify(ClientMsg::TermResize {
             terminal: t,
             cols,
             rows,
@@ -705,7 +856,11 @@ impl HostHandle {
     }
 
     pub fn term_close(&self, t: Uuid, w: Waiter) {
-        self.request(ClientMsg::TermClose { terminal: t }, TERM_TIMEOUT, w);
+        self.request(
+            ClientMsg::TermClose { terminal: t },
+            self.sh.mc.term_timeout,
+            w,
+        );
     }
 
     pub fn term_update(
@@ -721,7 +876,7 @@ impl HostHandle {
                 session_id,
                 meta,
             },
-            TERM_TIMEOUT,
+            self.sh.mc.term_timeout,
             w,
         );
     }
@@ -733,16 +888,14 @@ impl HostHandle {
         let once = Once::new(w);
         enum Plan {
             Request(Arc<Link>),
-            Kill(CancelToken),
+            Kill,
             Refuse(HostError),
         }
         let plan = {
             let mut st = self.sh.lock();
             let plan = match Shared::usable_link(&st) {
                 Ok((l, _)) => Plan::Request(l),
-                Err(_) if st.status.status == StatusKind::Incompatible => {
-                    Plan::Kill(st.cancel.clone())
-                }
+                Err(_) if st.status.status == StatusKind::Incompatible => Plan::Kill,
                 Err(e) => Plan::Refuse(e),
             };
             if !matches!(plan, Plan::Refuse(_)) {
@@ -777,7 +930,8 @@ impl HostHandle {
                     }
                     o.call(r);
                 });
-                if let Err(e) = link.request(ClientMsg::DaemonUpgrade, TERM_TIMEOUT, w) {
+                let timeout = self.sh.mc.term_timeout;
+                if let Err(e) = link.request(ClientMsg::DaemonUpgrade, timeout, w) {
                     let mut st = self.sh.lock();
                     st.upgrading = false;
                     st.upgrade_expect = false;
@@ -787,20 +941,17 @@ impl HostHandle {
                     once.call(Err(e));
                 }
             }
-            Plan::Kill(cancel) => {
+            Plan::Kill => {
                 let sh = self.sh.clone();
                 let o = once.clone();
                 let cfg = self.config();
+                let cancel = self.cancel_token();
                 let spawned = std::thread::Builder::new()
                     .name("host-upgrade".into())
                     .spawn(move || {
                         let t = sh.mc.transports.for_host(&cfg);
                         let r = crate::supervisor::kill_daemon(&*t, &cancel);
-                        {
-                            let mut st = sh.lock();
-                            st.kick = true;
-                            sh.cv.notify_all();
-                        }
+                        sh.kick.store(true, Ordering::SeqCst);
                         o.call(r.map(|_| Value::Null));
                     });
                 if spawned.is_err() {
@@ -810,11 +961,12 @@ impl HostHandle {
         }
     }
 
-    /// Retry now instead of waiting out the backoff.
+    /// Retry now instead of waiting out the backoff. Never waits on `State`.
     pub fn kick(&self) {
-        let mut st = self.sh.lock();
-        st.kick = true;
-        self.sh.cv.notify_all();
+        self.sh.kick.store(true, Ordering::SeqCst);
+        if let Ok(_st) = self.sh.st.try_lock() {
+            self.sh.cv.notify_all();
+        }
     }
 }
 
@@ -878,7 +1030,13 @@ pub(crate) mod tests {
     }
 
     fn shared() -> Arc<Shared> {
-        let mc = Arc::new(test_config(Arc::new(NullObserver)));
+        shared_with(|_| {})
+    }
+
+    fn shared_with(tweak: impl FnOnce(&mut ManagerConfig)) -> Arc<Shared> {
+        let mut mc = test_config(Arc::new(NullObserver));
+        tweak(&mut mc);
+        let mc = Arc::new(mc);
         Arc::new(Shared::new(
             crate::config::test_host("h_ab12cd34", "x"),
             mc,
@@ -889,29 +1047,43 @@ pub(crate) mod tests {
     /// What the supervisor does for one connection, over a scripted peer whose first list
     /// is `list`.
     fn connect(sh: &Arc<Shared>, list: Vec<TerminalInfo>) -> (Peer, Arc<Link>, u64) {
+        let (p, l, g, left) = connect_with(sh, list, crate::link::LinkLimits::default());
+        assert_eq!(left, 0);
+        (p, l, g)
+    }
+
+    fn connect_with(
+        sh: &Arc<Shared>,
+        list: Vec<TerminalInfo>,
+        limits: crate::link::LinkLimits,
+    ) -> (Peer, Arc<Link>, u64, usize) {
         let (io, mut peer) = pair();
         let mut b = hello_frame(1, 1, "1.5.0");
         b.extend(terminals_frame(list));
         peer.write(&b);
         let gen = sh.begin_link(None);
-        let (link, _, _) = Link::establish(
+        let (link, _, _) = Link::establish_with(
             io,
             ProtocolRange { min: 1, max: 1 },
             "1.5.0",
             sh.events(gen),
             Duration::from_secs(5),
+            limits,
         )
         .unwrap();
         assert!(sh.wait_first_list(gen, Duration::from_secs(5)));
-        assert!(sh.adopt(gen, &link, |st| st.status.set_kind(StatusKind::Connected)));
+        let left = sh
+            .adopt(gen, &link, |st| st.status.set_kind(StatusKind::Connected))
+            .expect("adopted");
         peer.expect("hello");
-        (peer, link, gen)
+        (peer, link, gen, left)
     }
 
     fn handle(sh: &Arc<Shared>) -> HostHandle {
         HostHandle {
             sh: sh.clone(),
             run: Mutex::new(None),
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -1076,11 +1248,11 @@ pub(crate) mod tests {
         .unwrap();
         {
             let mut st = sh.lock();
-            st.link = Some(l3.clone());
+            sh.set_link(&mut st, Some(l3.clone()));
         }
         let (w, _rx) = res_slot();
         h.term_attach(t, c.clone(), w);
-        assert!(sh.adopt(gen, &l3, |_| {}));
+        assert_eq!(sh.adopt(gen, &l3, |_| {}), Some(0));
         p3.expect("hello");
         p3.expect("term.attach");
         // No second attach was sent: the next message is our probe.
@@ -1120,7 +1292,11 @@ pub(crate) mod tests {
             h.term_input(Uuid::nil(), "x".into()).unwrap_err().code,
             HostErrorCode::Offline
         );
-        sh.lock().status.set_kind(StatusKind::Incompatible);
+        {
+            let mut st = sh.lock();
+            st.status.set_kind(StatusKind::Incompatible);
+            sh.publish(&mut st);
+        }
         assert_eq!(
             h.term_resize(Uuid::nil(), 1, 1).unwrap_err().code,
             HostErrorCode::Incompatible
@@ -1163,7 +1339,7 @@ pub(crate) mod tests {
         peer.write(&b);
         assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(Some(77)));
         sink.wait_text("hi");
-        assert_eq!(sh.lock().atts[&t].size, Some((90, 30)));
+        assert_eq!(sh.sizes.lock().unwrap().get(&t), Some(&(90, 30)));
         // A failed open reports the open's error and removes the attachment.
         let t2 = Uuid::new_v4();
         let (w, rx) = res_slot();
@@ -1191,5 +1367,140 @@ pub(crate) mod tests {
             Err(HostError::remote("no such cwd"))
         );
         assert!(!sh.lock().atts.contains_key(&t2));
+    }
+
+    /// Attach `sink` and complete it with a reply (no output).
+    fn attached(h: &HostHandle, peer: &mut Peer, t: Uuid, sink: Arc<VecSink>) {
+        let (w, rx) = res_slot();
+        h.term_attach(t, sink, w);
+        let id = peer.expect("term.attach")["id"].as_u64().unwrap();
+        peer.reply(id, Ok(json!({"exitCode": null})));
+        rx.recv_timeout(T5).unwrap().unwrap();
+    }
+
+    #[test]
+    fn retiring_the_old_sink_keeps_the_pending_replacement() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (mut peer, _link, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let a = Arc::new(VecSink::default());
+        attached(&h, &mut peer, t, a.clone());
+        // Remount: B's attach is pending while A's receiver goes away.
+        let b = Arc::new(VecSink::default());
+        let (w, rx) = res_slot();
+        h.term_attach(t, b.clone(), w);
+        let id = peer.expect("term.attach")["id"].as_u64().unwrap();
+        a.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut bytes = out_frame(t, b"for A");
+        bytes.extend(res_frame(id, Ok(json!({"exitCode": null}))));
+        bytes.extend(out_frame(t, b"\x1bcREPLAY"));
+        peer.write(&bytes);
+        rx.recv_timeout(T5).unwrap().unwrap();
+        assert_eq!(b.wait_text("REPLAY"), "\x1bcREPLAY");
+        assert!(sh.lock().atts.contains_key(&t));
+        // No detach went out: the next message is our probe.
+        h.term_input(t, "probe".into()).unwrap();
+        assert_eq!(peer.read_json()["t"], "term.input");
+    }
+
+    #[test]
+    fn stale_attach_completion_is_fenced() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (mut p1, _l1, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let (w, _rx) = res_slot();
+        h.term_attach(t, Arc::new(VecSink::default()), w);
+        let old = p1.expect("term.attach")["id"].as_u64().unwrap();
+        // A new link takes over and re-attaches; then the old link's reply arrives late.
+        let (mut p2, _l2, _) = connect(&sh, vec![info(t)]);
+        p2.expect("term.attach");
+        let inflight = sh.lock().atts[&t].inflight.clone();
+        assert_eq!(inflight.len(), 1);
+        p1.reply(old, Ok(json!({"exitCode": null})));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(sh.lock().atts[&t].inflight, inflight);
+        // So a list without the Terminal cannot prune it while its re-attach is in flight.
+        p2.write(&terminals_frame(vec![]));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sh.lock().atts.contains_key(&t));
+    }
+
+    #[test]
+    fn attach_timeout_reconnects_and_restores() {
+        let sh = shared_with(|c| c.term_timeout = Duration::from_millis(150));
+        let t = Uuid::new_v4();
+        let (mut p1, _l1, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        attached(&h, &mut p1, t, Arc::new(VecSink::default()));
+        let b = Arc::new(VecSink::default());
+        let (w, rx) = res_slot();
+        h.term_attach(t, b.clone(), w);
+        p1.expect("term.attach"); // never answered
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Timeout);
+        {
+            let st = sh.lock();
+            assert!(
+                st.link_closed && st.link().is_none(),
+                "the link is given up"
+            );
+            assert!(st.atts[&t].pending.is_some(), "the replacement is kept");
+        }
+        // The reconnect re-attaches into the replacement.
+        let (mut p2, _l2, _) = connect(&sh, vec![info(t)]);
+        let id = p2.expect("term.attach")["id"].as_u64().unwrap();
+        let mut bytes = res_frame(id, Ok(json!({"exitCode": null})));
+        bytes.extend(out_frame(t, b"\x1bcBACK"));
+        p2.write(&bytes);
+        assert_eq!(b.wait_text("BACK"), "\x1bcBACK");
+    }
+
+    #[test]
+    fn adoption_retries_attachments_refused_by_a_full_queue() {
+        let sh = shared();
+        let ts: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let list: Vec<TerminalInfo> = ts.iter().map(|t| info(*t)).collect();
+        let (mut p1, _l1, _) = connect(&sh, list.clone());
+        let h = handle(&sh);
+        for t in &ts {
+            attached(&h, &mut p1, *t, Arc::new(VecSink::default()));
+        }
+        // The new link takes one request at a time.
+        let limits = crate::link::LinkLimits {
+            max_pending: 1,
+            ..Default::default()
+        };
+        let (mut p2, l2, gen, left) = connect_with(&sh, list, limits);
+        assert_eq!(left, 2);
+        let sent_on = |sh: &Shared| {
+            sh.lock()
+                .atts
+                .values()
+                .filter(|a| a.attached_gen == gen)
+                .count()
+        };
+        assert_eq!(sent_on(&sh), 1, "only enqueued attaches count as attached");
+        for expect_left in [1, 0] {
+            let id = p2.expect("term.attach")["id"].as_u64().unwrap();
+            // Still full until the reply frees the slot.
+            assert_eq!(
+                sh.reattach_locked(&mut sh.lock(), gen, &l2),
+                expect_left + 1
+            );
+            p2.reply(id, Ok(json!({"exitCode": null})));
+            let deadline = Instant::now() + T5;
+            loop {
+                let n = sh.reattach_locked(&mut sh.lock(), gen, &l2);
+                if n == expect_left {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        p2.expect("term.attach");
+        assert_eq!(sent_on(&sh), 3);
     }
 }
