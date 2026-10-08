@@ -384,6 +384,7 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_term_resize",
     "host_term_close",
     "host_term_update",
+    "host_term_relaunch",
     "host_upgrade",
     "host_test",
 ];
@@ -653,6 +654,7 @@ pub fn run() {
             hosts::commands::host_term_resize,
             hosts::commands::host_term_close,
             hosts::commands::host_term_update,
+            hosts::commands::host_term_relaunch,
             hosts::commands::host_upgrade,
             hosts::commands::host_test,
             hosts::commands::list_ssh_hosts
@@ -708,7 +710,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 56);
+        assert_eq!(registered.len(), 57);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

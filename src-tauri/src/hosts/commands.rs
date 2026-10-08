@@ -199,6 +199,21 @@ pub async fn host_term_update(
         .map(|_| ())
 }
 
+/// Restart a Terminal with `skipPermissions` changed (`term.relaunch`). Answers the pid now
+/// running it.
+#[tauri::command]
+pub async fn host_term_relaunch(
+    state: State<'_, Hosts>,
+    host: String,
+    terminal: String,
+    skip_permissions: bool,
+) -> Result<OpenResult, HostError> {
+    let h = handle(&state, &host)?;
+    let t = uuid(&terminal)?;
+    let pid = reply(|w| h.term_relaunch(t, skip_permissions, w)).await?;
+    Ok(OpenResult { pid })
+}
+
 #[tauri::command]
 pub async fn host_upgrade(state: State<'_, Hosts>, host: String) -> Result<(), HostError> {
     let h = handle(&state, &host)?;
