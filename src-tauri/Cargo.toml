@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core", "crates/xshelld"]
+members = [".", "crates/core", "crates/xshelld", "crates/hostlink"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -13,6 +13,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 md5 = "0.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
+semver = "1"
 
 [package]
 name = "xshell"

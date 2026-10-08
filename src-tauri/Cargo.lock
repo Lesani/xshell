@@ -5518,6 +5518,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xshell-hostlink"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "xshell-core",
+]
+
+[[package]]
 name = "xshelld"
 version = "1.5.0"
 dependencies = [
