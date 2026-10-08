@@ -86,6 +86,35 @@ fn concurrent_connects_start_one_daemon() {
         p.client
             .terminals_where(|l| l.iter().any(|i| i.terminal == t));
     }
+    // Every `serve` a connect spawned and lost the race with is reaped, not left a zombie
+    // for the lifetime of the bridge.
+    #[cfg(target_os = "linux")]
+    {
+        let connects: Vec<u32> = ps.iter().map(|p| p.child.id()).collect();
+        let zombies = || -> Vec<i32> {
+            fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                .filter(|p| {
+                    let Ok(s) = fs::read_to_string(format!("/proc/{p}/stat")) else {
+                        return false;
+                    };
+                    let f: Vec<&str> = s[s.rfind(')').unwrap() + 1..].split_whitespace().collect();
+                    f[0] == "Z" && f[1].parse::<u32>().is_ok_and(|pp| connects.contains(&pp))
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + T;
+        while !zombies().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unreaped serve children: {:?}",
+                zombies()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     // One Daemon: one serving process, the rest lost the lock race (exit 3) or never ran.
     let log = fs::read_to_string(h.home().join(".xshell/log/xshelld.log")).unwrap();
     assert_eq!(log.matches(" serving ").count(), 1, "{log}");

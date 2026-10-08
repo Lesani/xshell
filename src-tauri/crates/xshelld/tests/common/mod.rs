@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 use xshell_core::launch::LaunchSpec;
-use xshell_core::protocol::frame::{read_frame, write_frame, Frame, MAX_FRAME_LEN};
+use xshell_core::protocol::frame::{read_frame, write_frame, Frame, FrameDecoder, MAX_FRAME_LEN};
 use xshell_core::protocol::msg::{
     decode_server, encode_msg, ClientMsg, Hello, OpenSpec, ProtocolRange, ServerMsg, TerminalInfo,
 };
@@ -668,10 +669,24 @@ pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// What a [`RawClient`] read produced.
+#[derive(Debug)]
+pub enum Got {
+    Frame(Frame),
+    /// Nothing arrived in time; the connection is still open.
+    Timeout,
+    /// The Daemon closed (or reset) the connection.
+    Eof,
+}
+
 /// A client that only reads when asked: nothing drains its socket in the background, so the
-/// Daemon really sees a stalled peer.
+/// Daemon really sees a stalled peer. Reads wait with `poll` and feed a frame decoder, so a
+/// timeout never loses a partial frame and needs no socket option (macOS refuses
+/// `setsockopt` on a socket the peer has shut down).
 pub struct RawClient {
     pub sock: UnixStream,
+    dec: FrameDecoder,
+    eof: bool,
     next_id: u64,
 }
 
@@ -679,6 +694,8 @@ impl RawClient {
     pub fn connect(socket: &Path) -> RawClient {
         RawClient {
             sock: connect_socket(socket),
+            dec: FrameDecoder::new(),
+            eof: false,
             next_id: 1,
         }
     }
@@ -687,10 +704,38 @@ impl RawClient {
         self.sock.write_all(&encode_msg(msg, id).unwrap()).unwrap();
     }
 
-    /// Next frame, or `None` on EOF or timeout.
-    pub fn read(&mut self, within: Duration) -> Option<Frame> {
-        self.sock.set_read_timeout(Some(within)).unwrap();
-        read_frame(&mut self.sock, MAX_FRAME_LEN).ok().flatten()
+    /// The next frame, a timeout, or EOF.
+    pub fn read(&mut self, within: Duration) -> Got {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.dec.next_frame() {
+                Ok(Some(f)) => return Got::Frame(f),
+                Ok(None) => {}
+                Err(e) => panic!("bad frame from the Daemon: {e}"),
+            }
+            if self.eof {
+                return Got::Eof;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut pfd = libc::pollfd {
+                fd: self.sock.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+            let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+            if n == 0 {
+                return Got::Timeout;
+            }
+            if n < 0 {
+                continue; // EINTR
+            }
+            let mut buf = [0u8; 64 * 1024];
+            match (&self.sock).read(&mut buf) {
+                Ok(0) | Err(_) => self.eof = true,
+                Ok(k) => self.dec.feed(&buf[..k]),
+            }
+        }
     }
 
     /// Hello and wait for the first `terminals` list.
@@ -704,13 +749,13 @@ impl RawClient {
             None,
         );
         loop {
-            match self.read(T).expect("frame") {
-                Frame::Json(j) => {
+            match self.read(T) {
+                Got::Frame(Frame::Json(j)) => {
                     if matches!(decode_server(&j).unwrap(), ServerMsg::Terminals { .. }) {
                         return;
                     }
                 }
-                f => panic!("unexpected {f:?}"),
+                g => panic!("unexpected {g:?}"),
             }
         }
     }
@@ -720,20 +765,15 @@ impl RawClient {
         self.send(&ClientMsg::TermAttach { terminal: t }, Some(self.next_id));
     }
 
-    /// Read until EOF (true) or until `within` passes without EOF (false). Returns whether
-    /// `needle` showed up in this Terminal's output, too.
+    /// Read until EOF or until `within` passes. Returns `(eof, needle seen in any output)`.
     pub fn drain_until_eof(&mut self, within: Duration, needle: &[u8]) -> (bool, bool) {
         let deadline = Instant::now() + within;
         let mut seen = false;
         let mut tail: Vec<u8> = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return (false, seen);
-            }
-            self.sock.set_read_timeout(Some(left)).unwrap();
-            match read_frame(&mut self.sock, MAX_FRAME_LEN) {
-                Ok(Some(Frame::Output { data, .. })) => {
+            match self.read(left) {
+                Got::Frame(Frame::Output { data, .. }) => {
                     tail.extend_from_slice(&data);
                     if find(&tail, needle).is_some() {
                         seen = true;
@@ -741,18 +781,9 @@ impl RawClient {
                     let keep = tail.len().saturating_sub(needle.len());
                     tail.drain(..keep);
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => return (true, seen),
-                Err(xshell_core::protocol::frame::FrameError::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return (false, seen)
-                }
-                // Reset or a frame cut short by the Daemon dropping us: that is the EOF.
-                Err(_) => return (true, seen),
+                Got::Frame(_) => {}
+                Got::Eof => return (true, seen),
+                Got::Timeout => return (false, seen),
             }
         }
     }

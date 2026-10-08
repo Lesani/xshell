@@ -27,18 +27,21 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     }
 }
 
-fn error_frame(code: &str, message: String) -> Arc<[u8]> {
-    frame(&ServerMsg::Error {
+fn push_error(ob: &Outbox, code: &str, message: String) {
+    if let Some(f) = frame(&ServerMsg::Error {
         code: code.into(),
         message,
-    })
+    }) {
+        ob.push_control(f);
+    }
 }
 
 struct Conn {
     d: Arc<Daemon>,
     id: ConnId,
     ob: Arc<Outbox>,
-    attached: HashSet<Uuid>,
+    /// Terminals this connection attached to or sized; all are released on disconnect.
+    touched: HashSet<Uuid>,
     inflight: Arc<AtomicUsize>,
 }
 
@@ -56,11 +59,13 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
     {
         return;
     }
-    ob.push_control(frame(&ServerMsg::Hello(Hello {
+    if let Some(f) = frame(&ServerMsg::Hello(Hello {
         protocol: PROTOCOL,
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
-    })));
+    })) {
+        ob.push_control(f);
+    }
 
     let mut reader = BufReader::new(&sock);
     let _ = sock.set_read_timeout(Some(d.cfg.hello_timeout));
@@ -75,15 +80,16 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
         _ => None,
     };
     let Some(theirs) = theirs else {
-        ob.push_control(error_frame(
+        push_error(
+            &ob,
             "expected_hello",
             "the first message must be hello".into(),
-        ));
+        );
         ob.close();
         return;
     };
     if let Err(m) = negotiate(PROTOCOL, theirs.protocol) {
-        ob.push_control(error_frame("protocol_mismatch", m.to_string()));
+        push_error(&ob, "protocol_mismatch", m.to_string());
         ob.close();
         return;
     }
@@ -92,20 +98,22 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
         let mut reg = d.reg.lock().unwrap();
         if reg.closed {
             drop(reg);
-            ob.push_control(error_frame("shutting_down", "xshelld is exiting".into()));
+            push_error(&ob, "shutting_down", "xshelld is exiting".into());
             ob.close();
             return;
         }
         reg.conns.insert(id, ob.clone());
         d.touch_idle(&mut reg);
-        ob.push_terminals(d.terminals_frame(&reg));
+        if let Some(f) = d.terminals_frame(&reg) {
+            ob.push_terminals(f);
+        }
     }
 
     let mut c = Conn {
         d: d.clone(),
         id,
         ob: ob.clone(),
-        attached: HashSet::new(),
+        touched: HashSet::new(),
         inflight: Arc::new(AtomicUsize::new(0)),
     };
     // A clean EOF lets queued replies drain; a protocol error drops them.
@@ -148,7 +156,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
         let mut reg = d.reg.lock().unwrap();
         reg.conns.remove(&id);
         d.touch_idle(&mut reg);
-        c.attached
+        c.touched
             .iter()
             .filter_map(|t| reg.terminals.get(t).cloned())
             .collect()
@@ -189,6 +197,9 @@ impl Conn {
                     Err("xshelld is upgrading or shutting down".to_string())
                 } else if reg.terminals.contains_key(&spec.terminal) {
                     Err(format!("terminal {} already exists", spec.terminal))
+                } else if let Err(e) = d.check_budget(&reg, spec.terminal, &spec.launch, &spec.meta)
+                {
+                    Err(e)
                 } else {
                     terminal::spawn(
                         &d,
@@ -219,7 +230,7 @@ impl Conn {
             ClientMsg::TermAttach { terminal } => match self.terminal(&terminal) {
                 Ok(t) => {
                     let dropped = t.attach(self.id, &self.ob, id);
-                    self.attached.insert(terminal);
+                    self.touched.insert(terminal);
                     d.nudge_overflowed(dropped);
                     t.nudge(d.cfg.nudge_delay);
                 }
@@ -228,12 +239,12 @@ impl Conn {
             ClientMsg::TermDetach { terminal } => {
                 let r = self.terminal(&terminal).map(|t| {
                     t.detach(self.id);
-                    self.attached.remove(&terminal);
                     Value::Null
                 });
                 reply(&self.ob, id, r);
             }
             ClientMsg::TermInput { terminal, data } => {
+                self.touched.insert(terminal);
                 let r = self.terminal(&terminal).and_then(|t| {
                     // Typing can hand the size to this connection; persist it like a resize.
                     if t.write_input(self.id, data)? {
@@ -248,6 +259,7 @@ impl Conn {
                 cols,
                 rows,
             } => {
+                self.touched.insert(terminal);
                 let r = self.terminal(&terminal).and_then(|t| {
                     if t.resize(self.id, cols, rows)? {
                         t.schedule_persist(&d);
@@ -287,10 +299,13 @@ impl Conn {
                 let r = match reg.terminals.get(&terminal) {
                     None => Err(format!("unknown terminal {terminal}")),
                     Some(t) => {
-                        t.update(session_id, meta);
-                        d.persist(&reg);
-                        d.broadcast_terminals(&reg);
-                        Ok(Value::Null)
+                        let (spec, meta) = t.updated(session_id, meta);
+                        d.check_budget(&reg, terminal, &spec, &meta).map(|_| {
+                            t.set_record(spec, meta);
+                            d.persist(&reg);
+                            d.broadcast_terminals(&reg);
+                            Value::Null
+                        })
                     }
                 };
                 drop(reg);

@@ -253,6 +253,16 @@ fn process_exit_broadcasts_and_stays_listed() {
         Some(7)
     );
     assert_eq!(h.state_ids(), vec![t]);
+    // The state file stops naming the ended process at once: its pid may be reused.
+    let deadline = Instant::now() + T;
+    while h.state_json()["terminals"][0]["leader"] != json!(null) {
+        assert!(
+            Instant::now() < deadline,
+            "leader still persisted: {}",
+            h.state_json()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // Input to an exited Terminal is refused.
     let err = a
         .request(&ClientMsg::TermInput {
@@ -298,7 +308,48 @@ fn attach_exited_sends_exit_after_replay() {
     assert!(res < first_out && first_out < exit, "{:?}", b.summary());
 }
 
-/// `term.exit` waits for the output of a descendant that outlives the leader.
+/// `term.exit` follows everything the process wrote before exiting; no output after it.
+#[test]
+fn exit_follows_final_burst() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut a = client(&srv);
+    let t = Uuid::new_v4();
+    let prog = h.script(
+        "burst",
+        "read go\ni=0\nwhile [ $i -lt 2000 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done\necho EN\"\"D\nexit 4",
+    );
+    a.open(t, raw_spec(&h.project("p"), &prog));
+    // Attached before it prints: everything must arrive live, ahead of `term.exit`.
+    a.attach(t);
+    a.input(t, "go\n");
+    assert_eq!(exit_of(&mut a, t), 4);
+    let exit = exit_index(&a, t);
+    let before: Vec<u8> = a.log[..exit]
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Out(x, d) if *x == t => Some(d.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        find(&before, b"END").is_some(),
+        "final output missing before term.exit"
+    );
+    a.drain_for(Duration::from_millis(300));
+    assert!(
+        !a.log[exit..]
+            .iter()
+            .any(|e| matches!(e, Ev::Out(x, _) if *x == t)),
+        "output after term.exit"
+    );
+}
+
+/// `term.exit` waits for the output of a descendant that outlives the leader. Linux only:
+/// BSD kernels revoke the terminal from the session when its leader exits, so there a
+/// descendant cannot write after the leader is gone.
+#[cfg(target_os = "linux")]
 #[test]
 fn exit_follows_all_output() {
     let h = TestHome::new();
@@ -444,22 +495,28 @@ fn stalled_connection_does_not_block_others() {
     let c0 = Instant::now();
     get_home(&mut b);
     assert!(c0.elapsed() < Duration::from_secs(1));
-    // A resumes: it sees the overflow notice, or EOF if it was dropped meanwhile.
+    // A resumes: it must see the overflow notice, or a confirmed EOF if it was dropped.
     let deadline = Instant::now() + T;
-    let mut seen = false;
+    let (mut seen, mut disconnected) = (false, false);
     let mut tail: Vec<u8> = Vec::new();
-    while Instant::now() < deadline && !seen {
-        match a.read(T) {
-            Some(Frame::Output { data, .. }) => {
+    while !seen && !disconnected {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match a.read(left) {
+            Got::Frame(Frame::Output { data, .. }) => {
                 tail.extend_from_slice(&data);
                 seen = find(&tail, OVERFLOW_NOTICE).is_some();
                 let keep = tail.len().saturating_sub(OVERFLOW_NOTICE.len());
                 tail.drain(..keep);
             }
-            Some(_) => {}
-            None => break,
+            Got::Frame(_) => {}
+            Got::Eof => disconnected = true,
+            Got::Timeout => break,
         }
     }
+    assert!(
+        seen || disconnected,
+        "the stalled reader got neither the overflow notice nor a disconnect"
+    );
     b.request(&ClientMsg::TermClose { terminal: t }).unwrap();
     exit_of(&mut b, t);
 }
@@ -540,4 +597,88 @@ fn control_flood_disconnects_peer() {
     assert!(eof);
     let mut b = client(&srv);
     get_home(&mut b);
+}
+
+/// One Terminal's metadata, or the whole list, over budget is refused before anything
+/// changes, so a `terminals` list can never grow past the frame limit.
+#[test]
+fn terminal_list_budget_enforced() {
+    let h = TestHome::new();
+    let srv = start(&h, |c| {
+        c.max_terminal_bytes = 2000;
+        c.max_list_bytes = 3000;
+    });
+    let mut a = client(&srv);
+    let open_with = |a: &mut Client, title_len: usize| {
+        let t = Uuid::new_v4();
+        let mut meta = Map::new();
+        meta.insert("title".into(), json!("x".repeat(title_len)));
+        let r = a.request(&ClientMsg::TermOpen {
+            spec: xshell_core::protocol::msg::OpenSpec {
+                terminal: t,
+                launch: sh_spec(&h.project("p")),
+                cols: 80,
+                rows: 24,
+                meta,
+            },
+        });
+        (t, r)
+    };
+    let (_, r) = open_with(&mut a, 2500);
+    let e = r.unwrap_err();
+    assert!(e.contains("terminal metadata too large"), "{e}");
+    let (t1, r) = open_with(&mut a, 1200);
+    r.unwrap();
+    let (_, r) = open_with(&mut a, 1200);
+    let e = r.unwrap_err();
+    assert!(e.contains("terminal list too large"), "{e}");
+    let (t2, r) = open_with(&mut a, 0);
+    r.unwrap();
+    let mut meta = Map::new();
+    meta.insert("title".into(), json!("y".repeat(1200)));
+    let e = a
+        .request(&ClientMsg::TermUpdate {
+            terminal: t2,
+            session_id: Some("s".into()),
+            meta: Some(meta),
+        })
+        .unwrap_err();
+    assert!(e.contains("terminal list too large"), "{e}");
+    // Nothing changed: two Terminals, t2 without the rejected update.
+    let mut b = Client::connect(&srv.socket);
+    let (_, list) = b.hello(range(1, 1));
+    let mut ids: Vec<Uuid> = list.iter().map(|i| i.terminal).collect();
+    ids.sort();
+    let mut want = vec![t1, t2];
+    want.sort();
+    assert_eq!(ids, want);
+    let e2 = list.iter().find(|i| i.terminal == t2).unwrap();
+    assert_eq!(e2.meta.get("title"), Some(&json!("")));
+    assert_eq!(e2.spec.session_id, None);
+}
+
+/// A connection that resized a Terminal without attaching is forgotten by its size arbiter
+/// when it disconnects.
+#[test]
+fn disconnect_forgets_size_without_attach() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut a = client(&srv);
+    let t = Uuid::new_v4();
+    a.open(t, sh_spec(&h.project("p")));
+    for _ in 0..3 {
+        let mut r = client(&srv);
+        r.resize(t, 100, 30);
+        r.input(t, "");
+        r.shutdown();
+    }
+    let deadline = Instant::now() + T;
+    while srv.size_tracked() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} size entries left",
+            srv.size_tracked()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

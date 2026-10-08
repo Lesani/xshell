@@ -47,6 +47,11 @@ impl SizeArbiter {
         self.apply(w)
     }
 
+    /// How many connections have a size recorded here.
+    pub fn tracked(&self) -> usize {
+        self.wanted.len() + usize::from(self.owner.is_some_and(|o| !self.wanted.contains_key(&o)))
+    }
+
     /// `c` detached or disconnected. The current size stays.
     pub fn forget(&mut self, c: ConnId) {
         self.wanted.remove(&c);

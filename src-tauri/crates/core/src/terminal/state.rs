@@ -12,18 +12,31 @@ use uuid::Uuid;
 
 pub const STATE_VERSION: u32 = 1;
 
+/// A process as it was when recorded: a pid plus its start time, so a reused pid can be told
+/// apart from the original. `start_time` is platform-specific (Linux: clock ticks since boot;
+/// macOS: microseconds since the epoch) and `None` where it cannot be read.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcIdentity {
+    pub pid: i32,
+    #[serde(default)]
+    pub start_time: Option<u64>,
+}
+
 /// The process that last ran a Terminal, so a restarted Daemon can end it if it survived.
+/// Cleared (`None` in [`PersistedTerminal`]) once the Terminal's process has exited.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Leader {
     /// The session leader; also its process group id.
     pub pid: u32,
-    /// Process groups seen in the Terminal (the leader's and the last foreground job's).
-    #[serde(default)]
-    pub pgids: Vec<i32>,
-    /// Linux only: field 22 of `/proc/<pid>/stat`, to tell a reused pid from ours.
+    /// The leader's start time (see [`ProcIdentity`]).
     #[serde(default)]
     pub start_time: Option<u64>,
+    /// Process groups seen in the Terminal (the leader's and the last foreground job's),
+    /// each identified by its group leader.
+    #[serde(default)]
+    pub groups: Vec<ProcIdentity>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -139,8 +152,17 @@ mod tests {
             created_at_ms: 1,
             leader: Some(Leader {
                 pid: 42,
-                pgids: vec![42, 43],
                 start_time: Some(7),
+                groups: vec![
+                    ProcIdentity {
+                        pid: 42,
+                        start_time: Some(7),
+                    },
+                    ProcIdentity {
+                        pid: 43,
+                        start_time: None,
+                    },
+                ],
             }),
         }
     }

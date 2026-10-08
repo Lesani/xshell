@@ -22,6 +22,11 @@ struct Fake {
 /// `fake-bin/claude`: ignores SIGHUP like a stubborn agent, logs argv (one block per launch,
 /// ended by `--`) and then its pid, then sleeps. A logged pid means the trap is in place.
 fn fake_claude(h: &TestHome) -> Fake {
+    fake_claude_with(h, "trap '' HUP", "exec sleep 1000")
+}
+
+/// A fake agent with its own hangup handling (`trap`) and main loop (`body`).
+fn fake_claude_with(h: &TestHome, trap: &str, body: &str) -> Fake {
     let bin = h.root().join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
     let argv_log = h.root().join("argv.log");
@@ -30,7 +35,7 @@ fn fake_claude(h: &TestHome) -> Fake {
     fs::write(
         &p,
         format!(
-            "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> '{}'\necho $$ >> '{}'\nexec sleep 1000\n",
+            "#!/bin/sh\n{trap}\nprintf '%s\\n' \"$@\" -- >> '{}'\necho $$ >> '{}'\n{body}\n",
             argv_log.display(),
             pids_log.display()
         ),
@@ -257,4 +262,58 @@ fn sigterm_ends_terminals_and_keeps_state() {
     assert!(wait_dead(agent, T));
     assert_eq!(h.state_ids(), vec![t]);
     assert!(!h.paths().socket.exists());
+}
+
+/// A leftover that forks a HUP-immune child while handling each hangup: cleanup must rescan
+/// the session and end the child born during its own grace period too.
+#[cfg(target_os = "linux")]
+#[test]
+fn crash_leftover_forking_on_hup_is_ended() {
+    let h = TestHome::new();
+    let kids = h.root().join("kids.log");
+    let trap = format!(
+        "trap 'sh -c \"trap \\\"\\\" HUP; echo \\$\\$ >> {}; exec sleep 1000\" &' HUP",
+        kids.display()
+    );
+    let f = fake_claude_with(&h, &trap, "while :; do sleep 0.1; done");
+    let _reaper = FakeReaper(f.pids_log.clone());
+    let _kid_reaper = FakeReaper(kids.clone());
+    let cwd = h.project("app");
+    let t = Uuid::new_v4();
+
+    let s1 = serve(&h, &f);
+    let (mut c, _) = client(&h);
+    c.open(t, claude_spec(&cwd, Some("s")));
+    let first = f.wait_pids(1)[0];
+    drop(c);
+    crash(s1);
+    let read_kids = || -> Vec<i32> {
+        fs::read_to_string(&kids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    };
+    // Whatever the crash's hangup forked has had time to log itself.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = read_kids().len();
+
+    let _s2 = serve(&h, &f);
+    client(&h);
+    assert!(wait_dead(first, T), "leftover agent was not ended");
+    let pids = f.wait_pids(2);
+    // Cleanup's own SIGHUP made the leftover fork a child after the first session scan.
+    let spawned = read_kids();
+    eprintln!(
+        "children: {before} after the crash, {} in total",
+        spawned.len()
+    );
+    assert!(
+        spawned.len() > before,
+        "no child was forked during cleanup: {spawned:?}"
+    );
+    for k in spawned {
+        assert!(!alive(k), "child {k} forked during cleanup survived");
+    }
+    assert!(alive(pids[1]), "the relaunched agent is not running");
 }

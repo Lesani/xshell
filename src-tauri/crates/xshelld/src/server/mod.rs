@@ -48,6 +48,10 @@ pub struct Config {
     pub max_calls_per_conn: usize,
     /// Size changes are persisted at most this often per Terminal.
     pub resize_persist_delay: Duration,
+    /// Largest spec + metadata one Terminal may carry, serialized.
+    pub max_terminal_bytes: usize,
+    /// Largest serialized `terminals` list; keeps it far below the 64 MiB frame limit.
+    pub max_list_bytes: usize,
 }
 
 impl Config {
@@ -65,6 +69,8 @@ impl Config {
             nudge_delay: Duration::from_millis(60),
             max_calls_per_conn: 32,
             resize_persist_delay: Duration::from_secs(1),
+            max_terminal_bytes: 256 * 1024,
+            max_list_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -226,6 +232,13 @@ impl ServerHandle {
     pub fn shutdown(self) -> ExitReason {
         self.d.exit(ExitReason::Shutdown);
         self.wait()
+    }
+
+    /// Test hook: connections remembered by the Terminals' size arbiters, summed.
+    #[doc(hidden)]
+    pub fn size_tracked(&self) -> usize {
+        let reg = self.d.reg.lock().unwrap();
+        reg.terminals.values().map(|t| t.size_tracked()).sum()
     }
 
     pub fn stopper(&self) -> Stopper {

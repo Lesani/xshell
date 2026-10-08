@@ -142,6 +142,10 @@ impl Outbox {
         }
         let mut dropped = Vec::new();
         if g.output_bytes + data.len() > self.output_cap {
+            // Each Terminal's first dropped chunk becomes its notice, in place: the notice
+            // stays ahead of any control frame queued after that output (a `term.exit` is a
+            // barrier no output of its Terminal may cross).
+            let notice: Arc<[u8]> = Arc::from(OVERFLOW_NOTICE);
             let mut kept = VecDeque::with_capacity(g.q.len());
             let q = std::mem::take(&mut g.q);
             for o in q {
@@ -154,22 +158,18 @@ impl Outbox {
                         g.total_bytes -= d.len();
                         if !dropped.contains(&t) {
                             dropped.push(t);
+                            g.output_bytes += notice.len();
+                            g.total_bytes += notice.len();
+                            kept.push_back(Out::Output {
+                                terminal: t,
+                                data: notice.clone(),
+                            });
                         }
                     }
                     other => kept.push_back(other),
                 }
             }
             g.q = kept;
-            let notice: Arc<[u8]> = Arc::from(OVERFLOW_NOTICE);
-            for t in &dropped {
-                let item = Out::Output {
-                    terminal: *t,
-                    data: notice.clone(),
-                };
-                if !self.push_locked(&mut g, item) {
-                    return Vec::new();
-                }
-            }
         }
         self.push_locked(&mut g, Out::Output { terminal, data });
         dropped
@@ -332,6 +332,43 @@ mod tests {
                 ('o', c.to_vec())
             ]
         );
+    }
+
+    /// Overflow for B must not move A's notice behind A's `term.exit`.
+    #[test]
+    fn overflow_notice_stays_before_exit_barrier() {
+        let ob = Outbox::new(100, 10_000, None);
+        let (ta, tb) = (Uuid::new_v4(), Uuid::new_v4());
+        ob.push_output(ta, bytes(b"last words"));
+        ob.push_control(bytes(b"exit-A"));
+        ob.push_output(tb, bytes(&[b'b'; 60]));
+        let mut dropped = ob.push_output(tb, bytes(&[b'c'; 60]));
+        dropped.sort();
+        let mut want = vec![ta, tb];
+        want.sort();
+        assert_eq!(dropped, want);
+        assert_eq!(
+            queued(&ob),
+            vec![
+                ('o', OVERFLOW_NOTICE.to_vec()),
+                ('c', b"exit-A".to_vec()),
+                ('o', OVERFLOW_NOTICE.to_vec()),
+                ('o', [b'c'; 60].to_vec()),
+            ]
+        );
+        // And which Terminal each output belongs to.
+        let owners: Vec<Option<Uuid>> = ob
+            .inner
+            .lock()
+            .unwrap()
+            .q
+            .iter()
+            .map(|o| match o {
+                Out::Output { terminal, .. } => Some(*terminal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owners, vec![Some(ta), None, Some(tb), Some(tb)]);
     }
 
     #[test]

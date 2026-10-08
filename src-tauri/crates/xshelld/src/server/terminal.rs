@@ -18,7 +18,7 @@ use uuid::Uuid;
 use xshell_core::launch::LaunchSpec;
 use xshell_core::protocol::msg::{encode_res, ServerMsg, TerminalInfo};
 use xshell_core::terminal::replay::ReplayBuffer;
-use xshell_core::terminal::state::{Leader, PersistedTerminal};
+use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
 
 const READ_BUF: usize = 16 * 1024;
 const INPUT_BACKLOG: usize = 1024;
@@ -67,21 +67,18 @@ pub(crate) struct Terminal {
     persist_pending: AtomicBool,
 }
 
-fn short(id: &Uuid) -> String {
-    id.simple().to_string()[..8].to_string()
+/// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
+/// exit code, timestamps, keys).
+const ENTRY_OVERHEAD: usize = 256;
+
+/// The size a Terminal with this spec and metadata adds to a serialized `terminals` list.
+pub(crate) fn entry_bytes(spec: &LaunchSpec, meta: &Map<String, Value>) -> usize {
+    let len = |v: serde_json::Result<Vec<u8>>| v.map_or(usize::MAX / 4, |b| b.len());
+    len(serde_json::to_vec(spec)) + len(serde_json::to_vec(meta)) + ENTRY_OVERHEAD
 }
 
-/// Field 22 of `/proc/<pid>/stat`: the start time in clock ticks since boot.
-#[cfg(target_os = "linux")]
-pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
-    super::orphans::stat_fields(pid as i32)?
-        .get(19)?
-        .parse()
-        .ok()
-}
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn proc_start_time(_pid: u32) -> Option<u64> {
-    None
+fn short(id: &Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
 }
 
 /// Start a Terminal. Unlike the Desktop, a cwd that is not a directory is an error: the PTY
@@ -140,7 +137,7 @@ pub(crate) fn spawn(
         }),
         input: Mutex::new(Some(tx)),
         pid,
-        start_time: pid.and_then(proc_start_time),
+        start_time: pid.and_then(|p| super::orphans::start_time(p as i32)),
         life: Mutex::new(Life::default()),
         life_cv: Condvar::new(),
         nudge_pending: AtomicBool::new(false),
@@ -248,18 +245,19 @@ impl Terminal {
             // Upgrade/shutdown: the Terminal stays in the state file and on the Desktops.
             return;
         }
-        d.broadcast(
-            &reg,
-            frame(&ServerMsg::TermExit {
-                terminal: self.id,
-                code,
-            }),
-        );
+        if let Some(f) = frame(&ServerMsg::TermExit {
+            terminal: self.id,
+            code,
+        }) {
+            d.broadcast(&reg, f);
+        }
         if closing {
             reg.terminals.remove(&self.id);
-            d.persist(&reg);
             d.touch_idle(&mut reg);
         }
+        // Also when it stays listed: the state file must stop naming its process, whose pid
+        // may be reused from now on.
+        d.persist(&reg);
         d.broadcast_terminals(&reg);
     }
 
@@ -297,10 +295,12 @@ impl Terminal {
         }
         match o.exit_code {
             Some(code) => {
-                ob.push_control(frame(&ServerMsg::TermExit {
+                if let Some(f) = frame(&ServerMsg::TermExit {
                     terminal: self.id,
                     code,
-                }));
+                }) {
+                    ob.push_control(f);
+                }
             }
             None => {
                 o.subs.insert(conn, ob.clone());
@@ -449,18 +449,42 @@ impl Terminal {
         }
     }
 
-    pub fn update(&self, session_id: Option<String>, meta: Option<Map<String, Value>>) {
-        let mut r = self.record.lock().unwrap();
+    /// The spec and metadata a `term.update` would produce, without applying it.
+    pub fn updated(
+        &self,
+        session_id: Option<String>,
+        meta: Option<Map<String, Value>>,
+    ) -> (LaunchSpec, Map<String, Value>) {
+        let r = self.record.lock().unwrap();
+        let (mut spec, mut m) = (r.spec.clone(), r.meta.clone());
         if let Some(s) = session_id {
-            r.spec.session_id = Some(s);
+            spec.session_id = Some(s);
         }
         for (k, v) in meta.into_iter().flatten() {
             if v.is_null() {
-                r.meta.remove(&k);
+                m.remove(&k);
             } else {
-                r.meta.insert(k, v);
+                m.insert(k, v);
             }
         }
+        (spec, m)
+    }
+
+    pub fn set_record(&self, spec: LaunchSpec, meta: Map<String, Value>) {
+        let mut r = self.record.lock().unwrap();
+        r.spec = spec;
+        r.meta = meta;
+    }
+
+    /// Connections the size arbiter still remembers.
+    pub fn size_tracked(&self) -> usize {
+        self.io.lock().unwrap().arb.tracked()
+    }
+
+    /// This Terminal's share of the `terminals` list budget.
+    pub fn entry_bytes(&self) -> usize {
+        let r = self.record.lock().unwrap();
+        entry_bytes(&r.spec, &r.meta)
     }
 
     pub fn info(&self) -> TerminalInfo {
@@ -483,16 +507,19 @@ impl Terminal {
         // An exited Terminal has no process left to end; its pid may already be reused.
         let pid = self.pid.filter(|_| !self.is_exited());
         let leader = pid.map(|pid| {
-            let mut pgids = vec![pid as i32];
+            let mut groups = vec![ProcIdentity {
+                pid: pid as i32,
+                start_time: self.start_time,
+            }];
             if let Some(g) = io.master.process_group_leader() {
                 if g != pid as i32 {
-                    pgids.push(g);
+                    groups.push(super::orphans::identity(g));
                 }
             }
             Leader {
                 pid,
-                pgids,
                 start_time: self.start_time,
+                groups,
             }
         });
         PersistedTerminal {

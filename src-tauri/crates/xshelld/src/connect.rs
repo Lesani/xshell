@@ -37,7 +37,7 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
             ) => {}
         Err(e) => return Err(e),
     }
-    let mut child = spawn_detached_serve(paths, opts)?;
+    let mut child = Reaped(Some(spawn_detached_serve(paths, opts)?));
     let deadline = Instant::now() + SPAWN_WAIT;
     let mut delay = Duration::from_millis(10);
     let mut lost_race = false;
@@ -47,7 +47,8 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
         }
         if !lost_race {
             if let Some(st) = child.try_wait()? {
-                // 3: another `serve` won the lock; it will be listening shortly.
+                child.0 = None; // reaped
+                                // 3: another `serve` won the lock; it will be listening shortly.
                 if st.code() == Some(3) {
                     lost_race = true;
                 } else {
@@ -69,6 +70,35 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_millis(200));
+    }
+}
+
+/// A spawned `serve`, reaped whatever path we leave by: on drop an unreaped child is handed
+/// to a thread that waits for it, so a racer that lost the lock (exit 3) never lingers as a
+/// zombie for the lifetime of the bridge. The winner is waited for too, harmlessly: the
+/// thread just blocks until `connect` itself exits.
+struct Reaped(Option<Child>);
+
+impl Reaped {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match &mut self.0 {
+            Some(c) => c.try_wait(),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            if let Ok(None) = c.try_wait() {
+                let _ = std::thread::Builder::new()
+                    .name("reap-serve".into())
+                    .spawn(move || {
+                        let _ = c.wait();
+                    });
+            }
+        }
     }
 }
 

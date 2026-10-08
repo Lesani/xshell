@@ -3,6 +3,7 @@
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
 use super::{conn, orphans, Config, ConnId, ExitReason};
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use xshell_core::launch::LaunchSpec;
 use xshell_core::protocol::msg::{encode_msg, ServerMsg, TerminalInfo};
 use xshell_core::terminal::state;
 use xshell_core::HostCtx;
@@ -47,8 +49,16 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn frame(msg: &ServerMsg) -> Arc<[u8]> {
-    Arc::from(encode_msg(msg, None).expect("server message fits in a frame"))
+/// Encode a server message. Never panics: a message that does not fit in a frame is logged
+/// and dropped (the list budget keeps `terminals` far below the limit).
+pub(crate) fn frame(msg: &ServerMsg) -> Option<Arc<[u8]>> {
+    match encode_msg(msg, None) {
+        Ok(f) => Some(Arc::from(f)),
+        Err(e) => {
+            crate::log!("ERROR", "cannot encode a server message: {e}");
+            None
+        }
+    }
 }
 
 impl Daemon {
@@ -56,17 +66,50 @@ impl Daemon {
         reg.terminals.values().map(|t| t.info()).collect()
     }
 
-    pub fn terminals_frame(&self, reg: &Registry) -> Arc<[u8]> {
+    pub fn terminals_frame(&self, reg: &Registry) -> Option<Arc<[u8]>> {
         frame(&ServerMsg::Terminals {
             list: self.list(reg),
         })
     }
 
     pub fn broadcast_terminals(&self, reg: &Registry) {
-        let f = self.terminals_frame(reg);
-        for ob in reg.conns.values() {
-            ob.push_terminals(f.clone());
+        if let Some(f) = self.terminals_frame(reg) {
+            for ob in reg.conns.values() {
+                ob.push_terminals(f.clone());
+            }
         }
+    }
+
+    /// Refuse a Terminal entry (new, or `id` updated) that would make one entry or the whole
+    /// `terminals` list exceed its budget. Checked before anything is changed.
+    pub fn check_budget(
+        &self,
+        reg: &Registry,
+        id: Uuid,
+        spec: &LaunchSpec,
+        meta: &Map<String, Value>,
+    ) -> Result<(), String> {
+        let n = terminal::entry_bytes(spec, meta);
+        if n > self.cfg.max_terminal_bytes {
+            return Err(format!(
+                "terminal metadata too large ({n} bytes, max {})",
+                self.cfg.max_terminal_bytes
+            ));
+        }
+        let others: usize = reg
+            .terminals
+            .values()
+            .filter(|t| t.id != id)
+            .map(|t| t.entry_bytes())
+            .sum();
+        if others + n > self.cfg.max_list_bytes {
+            return Err(format!(
+                "terminal list too large ({} bytes, max {})",
+                others + n,
+                self.cfg.max_list_bytes
+            ));
+        }
+        Ok(())
     }
 
     pub fn broadcast(&self, reg: &Registry, f: Arc<[u8]>) {
@@ -138,6 +181,10 @@ impl Daemon {
                 if n > 0 {
                     crate::log!("INFO", "ended {n} leftover process(es) of {}", p.terminal);
                 }
+            }
+            if let Err(e) = self.check_budget(&reg, p.terminal, &p.spec, &p.meta) {
+                crate::log!("WARN", "dropping {}: {e}", p.terminal);
+                continue;
             }
             match terminal::spawn(
                 self,
