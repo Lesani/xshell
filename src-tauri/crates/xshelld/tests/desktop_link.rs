@@ -1058,18 +1058,23 @@ fn assert_consistent(a: &LocalDesk, home: &common::TestHome, t: Uuid) {
     }
 }
 
-/// A switch whose successor does not come up in time (here: no time at all) is undone or
-/// kept so that the setting still describes what runs.
+/// A switch whose successor does not come up in time is undone or kept so that the setting
+/// still describes what runs. The successor is spawned but cannot become usable before the
+/// deadline: every Daemon waits 2.5 s before restoring each persisted Terminal
+/// (the first one starts with none), far longer than the switch may take.
 #[test]
 fn local_switch_failure_after_successor_spawn_keeps_setting_consistent() {
     for to_persistent in [true, false] {
         let home = common::TestHome::new();
         let _guard = common::DaemonGuard::new(&home);
-        let a = if to_persistent {
-            LocalDesk::new(&home)
-        } else {
-            LocalDesk::persistent(&home)
-        };
+        let a = LocalDesk::with(
+            &home,
+            LocalOpts {
+                persistent: !to_persistent,
+                env: vec![("XSHELLD_TEST_RESTORE_DELAY_MS".into(), "2500".into())],
+                ..Default::default()
+            },
+        );
         a.wait_usable();
         let t = Uuid::new_v4();
         open(
@@ -1078,9 +1083,13 @@ fn local_switch_failure_after_successor_spawn_keeps_setting_consistent() {
             common::sh_spec(&home.project("p")),
             VecSink::new(),
         );
+        a.rec
+            .wait_list("with the terminal", |l| l.iter().any(|i| i.terminal == t));
+        let t0 = Instant::now();
         let r = a
             .daemon
-            .switch(&a.host(), to_persistent, 1, Duration::from_millis(1));
+            .switch(&a.host(), to_persistent, 1, Duration::from_millis(500));
+        assert!(t0.elapsed() < Duration::from_secs(25), "{:?}", t0.elapsed());
         assert!(r.is_err(), "{to_persistent}: {r:?}");
         assert_consistent(&a, &home, t);
         // And a switch with time to finish still works from there.
