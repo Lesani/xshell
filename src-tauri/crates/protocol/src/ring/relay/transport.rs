@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Instant;
+use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::WebSocket;
@@ -234,6 +235,28 @@ pub(crate) fn dial(
     deadline: Instant,
     write_buffer_max: usize,
 ) -> Result<WebSocket<Conn>, RingError> {
+    dial_with_headers(url, endpoint, &[], tls, deadline, write_buffer_max)
+}
+
+/// [`dial`], with extra request headers.
+pub(crate) fn dial_with_headers(
+    url: &RelayUrl,
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    tls: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    write_buffer_max: usize,
+) -> Result<WebSocket<Conn>, RingError> {
+    let mut req = endpoint
+        .into_client_request()
+        .map_err(|e| RingError::Invalid(e.to_string()))?;
+    for (name, value) in headers {
+        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| RingError::Invalid(e.to_string()))?;
+        let value = tungstenite::http::HeaderValue::from_str(value)
+            .map_err(|e| RingError::Invalid(e.to_string()))?;
+        req.headers_mut().append(name, value);
+    }
     let tcp = connect_tcp(url, deadline)?;
     let sock = Sock {
         tcp,
@@ -255,7 +278,7 @@ pub(crate) fn dial(
     };
     let conn = Conn { stream: conn };
     let mut r =
-        tungstenite::client::client_with_config(endpoint, conn, Some(ws_config(write_buffer_max)));
+        tungstenite::client::client_with_config(req, conn, Some(ws_config(write_buffer_max)));
     loop {
         match r {
             Ok((ws, _)) => return Ok(ws),

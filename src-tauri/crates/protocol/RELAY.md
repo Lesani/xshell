@@ -581,29 +581,78 @@ pinning the chain (`SESSIONS.md`). The rules below keep the Relay tidy and bound
   ```
 
 - **Single use.** Once two sockets have met, the slot is used up: every later open gets
-  `pair_busy`, close 4010, even after both left. A slot whose only socket left before anyone
-  came may be opened again.
+  `pair_busy`, close 4010, even after both left, for as long as the slot's tombstone lasts
+  (below). A socket refused for a protocol violation (`bad_request`, `unsupported`,
+  `too_large`, `too_many`, under the limits per socket below) *burns* its slot: the slot is
+  then used up just the same, met or not. A slot whose only socket just closed before anyone
+  came is not burnt and may be opened again.
 - **Lifetime.** A slot expires 600 s after its first open: a socket still on it gets
-  `error{code:"pair_expired"}`, close 4008, and so does every later open.
+  `error{code:"pair_expired"}`, close 4008, and so does every later open while the tombstone
+  lasts, unless the slot was used up or burnt: such a slot answers `pair_busy` for its whole
+  tombstone, checked before the lifetime. Only a slot that expired without being used up
+  answers `pair_expired`.
 - **Limits per socket:** text frames of at most 16 KiB (else `too_large`, close 1009); at
   most 8 `pair.msg` (else `too_many`, close 4000); a `pair.msg` before the other side came,
   or whose payload is not canonical b64u of at most 8192 bytes, is `bad_request`, close
   4000. `{"t":"ping"}` works as in section 13. Any other `t`, and a binary frame, is
   `bad_request` (`unsupported` for binary), close 4000.
 - **Peers.** When one side closes, the Relay closes the other with 1000.
-- **Abuse limits** (the Relay's own; a device needs none of them):
-  - before the upgrade, at most 10 slot opens per client address per minute
-    (`wire::PAIR_OPENS_PER_MINUTE`), else HTTP 429;
-  - at most 1000 slots outstanding per Relay (`wire::PAIR_MAX_SLOTS`), else HTTP 503 for a
-    new slot;
-  - a slot's state (its first open, whether it was used) is kept at most 15 minutes, then
-    forgotten;
-  - a slot's Durable Object holds at most two sockets.
+- **Client address.** The rate limit and the slot cap below count opens by client address.
+  The Relay takes it from the first of these that applies:
+  1. on Cloudflare, `CF-Connecting-IP`, and only for a request that really came through
+     Cloudflare's edge (a Worker sees `request.cf` with a `colo`). Cloudflare sets that header
+     itself; on workerd or in the Docker image a client can send any value, so it is ignored
+     there;
+  2. a request header that a trusted reverse proxy sets, when the Relay is configured with its
+     name (the Worker's `CLIENT_IP_HEADER`, the test Relay's `client_ip_header`): the last
+     entry of its list (the entry the nearest proxy added, as in `X-Forwarded-For`). When such
+     a header is configured, the Relay uses nothing else;
+  3. the socket's peer address, when the runtime gives one (the test Relay; a Worker gets
+     none);
+  4. none: all such opens count against one shared bucket. So does an open whose value is
+     not an IPv4 or IPv6 address (an IPv6 address may be in brackets).
+
+  An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counts as its IPv4 address. The rate limit
+  counts an IPv4 address alone and an IPv6 address by its /64; the slot cap counts an IPv4
+  address by its /24 and an IPv6 address by its /64 (the address's *prefix*). One subscriber
+  usually holds a whole IPv6 /64, so rotating addresses inside it gains nothing.
+- **Abuse limits** (the Relay's own; a device needs none of them), all before the upgrade:
+  - at most 10 slot opens per client address per minute (`wire::PAIR_OPENS_PER_MINUTE`),
+    else HTTP 429. An open refused with 429 is not counted;
+  - an open of a *new* slot (one the Relay holds no state for: neither outstanding nor a
+    tombstone) takes a reservation, counted against the prefix of its client address: at
+    most 20 slots outstanding per prefix (`wire::PAIR_MAX_SLOTS_PER_PREFIX`) and at most 1000
+    per Relay (`wire::PAIR_MAX_SLOTS`), else HTTP 503. The rate limit is checked first. An
+    open of a slot that is outstanding or has a tombstone takes no reservation and is not
+    capped: the slot itself answers it (`pair.peer`, `pair_busy` or `pair_expired`).
+- **Reservations.** A slot is *outstanding*, and holds its reservation, from its first open
+  until one of these releases it at once:
+  - two sockets met on it, or a socket on it was refused for a protocol violation (it is
+    used up or burnt);
+  - it expired (600 s after its first open);
+  - its first open was refused: the upgrade failed or never reached the slot.
+
+  A slot whose only socket left before anyone came stays outstanding until it expires. A
+  Relay that reserves in one place and admits in another (the Worker: a coordinating object
+  and the slot's own) may also let a reservation the slot never confirmed lapse after a short
+  time. One prefix thus holds at most 20 slots. This is the limit of the mitigation: an
+  attacker with 50 prefixes (50 IPv4 /24s or IPv6 /64s, which a single cloud account or IPv6
+  allocation can supply) can still fill the Relay's 1000 and keep new pairings refused with
+  503 while they keep their slots outstanding.
+- **Tombstones.** A used-up or burnt slot keeps a tombstone (that it was used) for 60 s
+  (`wire::PAIR_TOMBSTONE`) from the meeting (or the refusal) or from its last socket leaving,
+  whichever is later; a slot that expired unused keeps one for 60 s from its expiry. Opens in that time get
+  `pair_busy` or `pair_expired`. A tombstone holds no reservation. Then the Relay forgets the
+  slot, and a later open of it starts a new slot: the endpoints enforce single use and the
+  lifetime themselves (`SESSIONS.md`).
+- **Sockets.** A slot's Durable Object holds at most two sockets.
 
 The test Relay implements all of this (the rate limit only when configured with
-`pair_opens_per_minute`); `TestRelayOptions::lax_pairing` turns single use
-and the lifetime off, to prove that the endpoints enforce them themselves. The contract
-scenarios `pair_pipe_*` pin it (section 19).
+`pair_opens_per_minute`; the client address from the socket, or from `client_ip_header` when
+configured); `TestRelayOptions::lax_pairing` turns single use and the lifetime off, to prove
+that the endpoints enforce them themselves. The contract scenarios `pair_pipe_*`,
+`pair_prefix_cap_refuses_21st`, `pair_reservation_released_on_meeting` and
+`pair_refusal_burns_slot` pin it (section 19).
 
 ## 17. Reserved for later versions
 
@@ -647,7 +696,10 @@ scenarios `pair_pipe_*` pin it (section 19).
 - Log `bad_signature` together with the origin the Relay expected.
 - The pairing pipe (section 16): one Durable Object per slot (`idFromName("pair:" + slot)`),
   storage `firstOpen` and `used`, an alarm that closes sockets at expiry and deletes the
-  state after 15 minutes, and the per-address rate limit and slot cap in front of it.
+  state when its tombstone runs out, and in front of it the per-address rate limit and the
+  slot caps (per prefix and per Relay), whose reservations the slot releases as soon as it
+  is used up or burnt, expires or refuses its first open. The client address comes from
+  `CF-Connecting-IP` only when `request.cf` is present, else from `CLIENT_IP_HEADER`.
 
 ## 19. Test vectors and the contract suite
 
@@ -671,7 +723,7 @@ A normal test run fails when the files are stale.
 
 The contract scenarios in `ring::relay::contract` (feature `test-relay`) are public functions
 taking a `RelayTarget { url, tls, auth_timeout, gateway, quota_frames_per_day,
-pair_opens_per_minute, pair_ttl }`. This repository runs them against the test
+pair_opens_per_minute, pair_ttl, client_ip_header }`. This repository runs them against the test
 Relay. `xshell-remote` runs the same functions against the Worker on workerd, which makes them
 the definition of a conforming Relay. Every scenario uses fresh random keys, so it needs no
 reset. `contract::SCENARIOS` lists the single-Relay scenarios.
@@ -683,6 +735,18 @@ mint tokens (`hosted_routing_ends_when_the_last_token_expires` is the routing cu
 daily quota (at most 1000 frames), which their target's `quota_frames_per_day` names.
 `SCENARIOS` includes the pairing pipe's `pair_pipe_joins_two`, `pair_pipe_refuses_third`,
 `pair_pipe_caps_messages` and `pair_pipe_closes_peer`. `contract::PAIR_TTL_SCENARIOS`
-(`pair_pipe_expires`) need a Relay with a slot lifetime of at most 5 s (`pair_ttl`), and
+(`pair_pipe_expires`, `pair_pipe_used_slot_stays_busy`) need a Relay with a slot lifetime of at most 5 s (`pair_ttl`), and
 `contract::PAIR_RATE_SCENARIOS` (`pair_pipe_rate_limited`) one with a rate limit of at most
-50 opens a minute (`pair_opens_per_minute`).
+20 opens a minute (`pair_opens_per_minute`). `contract::PAIR_CAP_SCENARIOS`
+(`pair_prefix_cap_refuses_21st`, `pair_reservation_released_on_meeting`,
+`pair_refusal_burns_slot`) need a Relay with
+the default per-prefix cap of 20. When the Relay trusts a client address header, the
+target's `client_ip_header` names it, and these scenarios send addresses of their own in it,
+each in fresh random prefixes; without one, they open from the runner's address, and each
+needs a Relay on which nothing else from that prefix is outstanding.
+
+**Contract runners raise the rate limit.** The pairing scenarios open many more slots from
+one machine than the default 10 opens a minute allows. A runner therefore configures every
+Relay it runs pairing scenarios on with a raised limit (at least 100 opens a minute; the
+`xshell-remote` runner uses 10000), except the Relay for `PAIR_RATE_SCENARIOS`. The test
+Relay has no rate limit unless configured with one.

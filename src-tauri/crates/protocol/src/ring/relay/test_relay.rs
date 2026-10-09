@@ -20,7 +20,7 @@ use super::wire::{
 };
 use super::wire::{
     decode_pair_client, PairClientFrame, PairRelayFrame, MAX_PAIR_FRAME, MAX_PAIR_MSGS,
-    PAIR_MAX_SLOTS, PAIR_SLOT_TTL, PAIR_STATE_TTL,
+    PAIR_MAX_SLOTS, PAIR_MAX_SLOTS_PER_PREFIX, PAIR_SLOT_TTL, PAIR_TOMBSTONE,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -77,6 +77,15 @@ pub struct TestRelayOptions {
     pub pair_opens_per_minute: Option<u32>,
     /// Pairing pipe: slots outstanding at once before HTTP 503.
     pub pair_max_slots: usize,
+    /// Pairing pipe: slots outstanding per client address prefix (an IPv4 /24, an IPv6 /64)
+    /// before HTTP 503.
+    pub pair_max_slots_per_prefix: usize,
+    /// Pairing pipe: how long a used-up or expired slot keeps its tombstone.
+    pub pair_tombstone: Duration,
+    /// Pairing pipe: take the client address from this request header, as set by a trusted
+    /// reverse proxy (its last list entry), instead of the socket's peer address. An open
+    /// without a usable value counts against one shared bucket (section 16).
+    pub client_ip_header: Option<String>,
 }
 
 impl Default for TestRelayOptions {
@@ -94,6 +103,9 @@ impl Default for TestRelayOptions {
             pair_ttl: PAIR_SLOT_TTL,
             pair_opens_per_minute: None,
             pair_max_slots: PAIR_MAX_SLOTS,
+            pair_max_slots_per_prefix: PAIR_MAX_SLOTS_PER_PREFIX,
+            pair_tombstone: PAIR_TOMBSTONE,
+            client_ip_header: None,
         }
     }
 }
@@ -466,6 +478,7 @@ impl TestRelay {
             pair_opens_per_minute: self.shared.opts.pair_opens_per_minute,
             pair_ttl: (self.shared.opts.pair_ttl != PAIR_SLOT_TTL)
                 .then_some(self.shared.opts.pair_ttl),
+            client_ip_header: self.shared.opts.client_ip_header.clone(),
         }
     }
 
@@ -500,10 +513,21 @@ impl TestRelay {
             .clone()
     }
 
-    /// How many pairing slots the Relay holds state for.
+    /// How many pairing slots are outstanding (hold a reservation against the caps).
     pub fn pair_slots(&self) -> usize {
         let mut p = self.shared.pair.lock().unwrap_or_else(|e| e.into_inner());
-        p.sweep();
+        self.shared.pair_sweep(&mut p);
+        p.slots
+            .values()
+            .filter(|s| self.shared.pair_outstanding(s))
+            .count()
+    }
+
+    /// How many pairing slots the Relay holds any state for: outstanding slots, slots with a
+    /// socket or an open in progress, and tombstones.
+    pub fn pair_slots_held(&self) -> usize {
+        let mut p = self.shared.pair.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.pair_sweep(&mut p);
         p.slots.len()
     }
 
@@ -834,10 +858,17 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let head = read_head(&mut stream, deadline).ok_or(())?;
     let peer_ip = stream.tcp().peer_addr().map(|a| a.ip()).ok();
-    let route = route(&String::from_utf8_lossy(&head));
+    let head_text = String::from_utf8_lossy(&head);
+    let route = route(&head_text);
     let status = match &route {
         Route::Ring => None,
-        Route::Pair(slot) => shared.pair_admit(peer_ip, slot),
+        Route::Pair(slot) => {
+            let ip = match &shared.opts.client_ip_header {
+                Some(name) => header_address(&head_text, name),
+                None => peer_ip,
+            };
+            shared.pair_admit(ClientAddr::of(ip), slot)
+        }
         Route::Health => Some("200 OK"),
         Route::UpgradeRequired => Some("426 Upgrade Required"),
         Route::NotFound => Some("404 Not Found"),
@@ -881,7 +912,11 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
             Err(HandshakeError::Interrupted(mid)) if Instant::now() < deadline => {
                 r = mid.handshake()
             }
-            Err(_) => return Err(()),
+            Err(_) => {
+                // Give the reservation back before the client sees the connection close.
+                drop(reservation.take());
+                return Err(());
+            }
         }
     };
     let path = path.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1796,22 +1831,96 @@ impl Drop for Reservation {
     }
 }
 
+/// A client address as the pairing pipe's limits count it (section 16): an IPv4 address, an
+/// IPv6 address's /64, or none (one shared bucket). [`ClientAddr::prefix`] is the bucket of the
+/// per-prefix slot cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ClientAddr {
+    V4([u8; 4]),
+    V6([u8; 8]),
+    Unknown,
+}
+
+impl ClientAddr {
+    fn of(ip: Option<IpAddr>) -> ClientAddr {
+        match ip {
+            Some(IpAddr::V4(a)) => ClientAddr::V4(a.octets()),
+            Some(IpAddr::V6(a)) => match a.to_ipv4_mapped() {
+                Some(v4) => ClientAddr::V4(v4.octets()),
+                None => {
+                    let mut p = [0u8; 8];
+                    p.copy_from_slice(&a.octets()[..8]);
+                    ClientAddr::V6(p)
+                }
+            },
+            None => ClientAddr::Unknown,
+        }
+    }
+
+    /// The address prefix the slot cap counts by: an IPv4 /24, an IPv6 /64.
+    fn prefix(self) -> ClientAddr {
+        match self {
+            ClientAddr::V4([a, b, c, _]) => ClientAddr::V4([a, b, c, 0]),
+            other => other,
+        }
+    }
+}
+
+/// The client address a trusted proxy names in header `name` of a request head: the last list
+/// entry of its last occurrence (as in `X-Forwarded-For`), an IPv6 address possibly in
+/// brackets. `None` without a usable value.
+fn header_address(head: &str, name: &str) -> Option<IpAddr> {
+    let value = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+        .last()?
+        .1;
+    let last = value.rsplit(',').next()?.trim();
+    let bare = last
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .unwrap_or(last);
+    bare.parse().ok()
+}
+
 #[derive(Default)]
 struct PairState {
     slots: HashMap<String, Slot>,
     /// Slot opens per client address, for the rate limit.
-    opens: HashMap<IpAddr, VecDeque<Instant>>,
+    opens: HashMap<ClientAddr, VecDeque<Instant>>,
 }
 
 struct Slot {
     first_open: Instant,
+    /// The address prefix of the open that created the slot: its reservation counts there.
+    prefix: ClientAddr,
     /// The sockets on it, at most two: (socket id, its commands).
     socks: Vec<(u64, Sender<PairCmd>)>,
     /// Two parties met: the slot is used up.
     met: bool,
+    /// When a used-up slot stopped being needed: the meeting, or its last socket leaving,
+    /// whichever came later. Its tombstone runs from here.
+    ended: Instant,
     next_id: u64,
-    /// Opens admitted (counted against the slot cap) whose upgrade has not finished yet.
+    /// Opens admitted whose upgrade has not finished yet.
     reserved: usize,
+}
+
+impl Slot {
+    fn new(prefix: ClientAddr) -> Slot {
+        let now = Instant::now();
+        Slot {
+            first_open: now,
+            prefix,
+            socks: Vec::new(),
+            met: false,
+            ended: now,
+            next_id: 0,
+            reserved: 0,
+        }
+    }
 }
 
 enum PairCmd {
@@ -1819,23 +1928,29 @@ enum PairCmd {
     Close(u16),
 }
 
-impl PairState {
-    /// Forgets slots whose expiry state is older than it needs to be kept.
-    fn sweep(&mut self) {
-        self.slots.retain(|_, s| {
-            !s.socks.is_empty() || s.reserved > 0 || s.first_open.elapsed() < PAIR_STATE_TTL
+impl Shared {
+    /// Whether `s` is outstanding: it holds a reservation against the slot caps from its first
+    /// open until it is used up or expires (section 16).
+    fn pair_outstanding(&self, s: &Slot) -> bool {
+        !s.met && (self.opts.lax_pairing || s.first_open.elapsed() < self.opts.pair_ttl)
+    }
+
+    /// Forgets slots nobody holds whose tombstone has run out.
+    fn pair_sweep(&self, p: &mut PairState) {
+        let (ttl, tomb) = (self.opts.pair_ttl, self.opts.pair_tombstone);
+        p.slots.retain(|_, s| {
+            let ended = if s.met { s.ended } else { s.first_open + ttl };
+            !s.socks.is_empty() || s.reserved > 0 || Instant::now() < ended + tomb
         });
     }
-}
 
-impl Shared {
-    /// Before the upgrade: an HTTP status that refuses the open (rate limit, slot cap), or
+    /// Before the upgrade: an HTTP status that refuses the open (rate limit, slot caps), or
     /// `None` to go on.
-    fn pair_admit(&self, ip: Option<IpAddr>, slot: &str) -> Option<&'static str> {
+    fn pair_admit(&self, addr: ClientAddr, slot: &str) -> Option<&'static str> {
         let mut p = self.pair.lock().unwrap_or_else(|e| e.into_inner());
-        p.sweep();
-        if let (Some(limit), Some(ip)) = (self.opts.pair_opens_per_minute, ip) {
-            let log = p.opens.entry(ip).or_default();
+        self.pair_sweep(&mut p);
+        if let Some(limit) = self.opts.pair_opens_per_minute {
+            let log = p.opens.entry(addr).or_default();
             while log
                 .front()
                 .is_some_and(|t| t.elapsed() >= Duration::from_secs(60))
@@ -1847,25 +1962,31 @@ impl Shared {
             }
             log.push_back(Instant::now());
         }
-        // The slot is reserved here, at admission, so concurrent opens cannot overshoot the
-        // cap; a failed upgrade gives the reservation back (`pair_release`).
-        if !p.slots.contains_key(slot) && p.slots.len() >= self.opts.pair_max_slots {
+        // A slot the Relay holds state for (outstanding, or a tombstone) is not new: the caps
+        // do not apply, and the slot itself answers the open.
+        if let Some(s) = p.slots.get_mut(slot) {
+            s.reserved += 1;
+            return None;
+        }
+        // A new slot is reserved here, at admission, so concurrent opens cannot overshoot the
+        // caps; a failed upgrade gives the reservation back (`pair_release`).
+        let prefix = addr.prefix();
+        let (mut all, mut mine) = (0, 0);
+        for s in p.slots.values().filter(|s| self.pair_outstanding(s)) {
+            all += 1;
+            mine += usize::from(s.prefix == prefix);
+        }
+        if all >= self.opts.pair_max_slots || mine >= self.opts.pair_max_slots_per_prefix {
             return Some("503 Service Unavailable");
         }
-        p.slots
-            .entry(slot.to_string())
-            .or_insert_with(|| Slot {
-                first_open: Instant::now(),
-                socks: Vec::new(),
-                met: false,
-                next_id: 0,
-                reserved: 0,
-            })
-            .reserved += 1;
+        let mut s = Slot::new(prefix);
+        s.reserved = 1;
+        p.slots.insert(slot.to_string(), s);
         None
     }
 
-    /// Gives back an admission's reservation; a slot nobody holds or remembers is forgotten.
+    /// Gives back an admission whose upgrade failed; a slot it created, which nobody has
+    /// joined, is forgotten (its open was refused).
     fn pair_release(&self, slot: &str) {
         let mut p = self.pair.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = p.slots.get_mut(slot) {
@@ -1916,11 +2037,8 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
     let joined = {
         let mut p = shared.pair.lock().unwrap_or_else(|e| e.into_inner());
         let s = p.slots.entry(slot.clone()).or_insert_with(|| Slot {
-            first_open: Instant::now(),
-            socks: Vec::new(),
-            met: false,
-            next_id: 0,
             reserved: 1,
+            ..Slot::new(ClientAddr::Unknown)
         });
         // This socket's admission reservation becomes the socket itself.
         s.reserved = s.reserved.saturating_sub(1);
@@ -1928,16 +2046,19 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
             s.met = false;
             s.first_open = Instant::now();
         }
-        if !lax && s.first_open.elapsed() >= ttl {
-            Err((ErrorCode::PairExpired, close::PAIR_EXPIRED))
-        } else if s.socks.len() >= 2 || (s.met && !lax) {
+        // A used-up (or burnt) slot answers `pair_busy` before its expiry is looked at.
+        if s.socks.len() >= 2 || (s.met && !lax) {
             Err((ErrorCode::PairBusy, close::PAIR_BUSY))
+        } else if !lax && s.first_open.elapsed() >= ttl {
+            Err((ErrorCode::PairExpired, close::PAIR_EXPIRED))
         } else {
             let id = s.next_id;
             s.next_id += 1;
             s.socks.push((id, tx));
             if s.socks.len() == 2 {
+                // Used up: the reservation is released, a tombstone remains.
                 s.met = true;
+                s.ended = Instant::now();
                 for (_, t) in &s.socks {
                     let _ = t.send(PairCmd::Text(PairRelayFrame::Peer.encode()));
                 }
@@ -1953,10 +2074,19 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
         Ok(x) => x,
         Err((code, c)) => return pair_refuse(&mut ws, code, c),
     };
-    let leave = |shared: &Shared| {
+    // Leaves the slot; `burn`: the socket was refused for a protocol violation, which uses the
+    // slot up (its reservation is released, a tombstone remains).
+    let leave = |shared: &Shared, burn: bool| {
         let mut p = shared.pair.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = p.slots.get_mut(&slot) {
             s.socks.retain(|(id, _)| *id != me);
+            if burn {
+                s.met = true;
+                s.ended = Instant::now();
+            }
+            if s.met && s.socks.is_empty() {
+                s.ended = Instant::now();
+            }
             // The Relay closes the other side when one side goes.
             for (_, t) in &s.socks {
                 let _ = t.send(PairCmd::Close(close::NORMAL));
@@ -1972,24 +2102,24 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
             match cmd {
                 PairCmd::Text(t) => {
                     if !pair_write(&mut ws, &t) {
-                        leave(&shared);
+                        leave(&shared, false);
                         return;
                     }
                 }
                 PairCmd::Close(c) => {
-                    leave(&shared);
+                    leave(&shared, false);
                     return pair_close(&mut ws, c);
                 }
             }
         }
         if !lax && first_open.elapsed() >= ttl {
-            leave(&shared);
+            leave(&shared, false);
             return pair_refuse(&mut ws, ErrorCode::PairExpired, close::PAIR_EXPIRED);
         }
         let text = match ws.read() {
             Ok(Message::Text(t)) => t.as_str().to_string(),
             Ok(Message::Binary(_)) => {
-                leave(&shared);
+                leave(&shared, true);
                 return pair_refuse(&mut ws, ErrorCode::Unsupported, close::BAD_REQUEST);
             }
             Ok(Message::Close(_)) => {
@@ -2001,7 +2131,7 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
             Err(_) => break,
         };
         if text.len() > MAX_PAIR_FRAME {
-            leave(&shared);
+            leave(&shared, true);
             return pair_refuse(&mut ws, ErrorCode::TooLarge, close::TOO_LARGE);
         }
         match decode_pair_client(&text) {
@@ -2012,12 +2142,12 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
                 let ok_len = super::super::b64::decoded_len(payload.len())
                     .is_some_and(|n| n <= super::super::pairing::MAX_PAIR_MESSAGE);
                 if !ok_len || super::super::b64::decode(&payload).is_err() {
-                    leave(&shared);
+                    leave(&shared, true);
                     return pair_refuse(&mut ws, ErrorCode::BadRequest, close::BAD_REQUEST);
                 }
                 sent += 1;
                 if sent > MAX_PAIR_MSGS {
-                    leave(&shared);
+                    leave(&shared, true);
                     return pair_refuse(&mut ws, ErrorCode::TooMany, close::BAD_REQUEST);
                 }
                 let p = shared.pair.lock().unwrap_or_else(|e| e.into_inner());
@@ -2033,18 +2163,18 @@ fn pair_serve(shared: Arc<Shared>, mut ws: WebSocket<SConn>, slot: String) {
                     }
                     // Nobody to forward to yet.
                     None => {
-                        leave(&shared);
+                        leave(&shared, true);
                         return pair_refuse(&mut ws, ErrorCode::BadRequest, close::BAD_REQUEST);
                     }
                 }
             }
             Err(_) => {
-                leave(&shared);
+                leave(&shared, true);
                 return pair_refuse(&mut ws, ErrorCode::BadRequest, close::BAD_REQUEST);
             }
         }
     }
-    leave(&shared);
+    leave(&shared, false);
 }
 
 /// A TCP proxy that forwards the client's bytes at once and the server's a few bytes at a

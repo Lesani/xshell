@@ -11,5 +11,5 @@ A device that is not paired yet is in no Roster, so the Relay will not let it au
 ## Consequences
 
 - The pipe is free on the Hosted Relay, so a Ring can pair the phone that later buys its subscription.
-- The Relay bounds abuse itself: a per-address rate limit before the upgrade, a cap on outstanding slots, slot state kept at most 15 minutes, two sockets per slot.
+- The Relay bounds abuse itself: a per-address rate limit before the upgrade, caps on outstanding slots per address prefix and per Relay (a slot's reservation is released as soon as it is used up or expires), a short tombstone for used-up slots, two sockets per slot.
 - A pairing secret lives only in the Desktop's memory; an app restart invalidates every offer.

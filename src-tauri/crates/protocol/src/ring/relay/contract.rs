@@ -6,7 +6,8 @@
 //! [`entitlement_slot_round_trips`] assumes a Relay without the Push Gateway's key (it then
 //! stores any well-formed token). [`HOSTED_SCENARIOS`] need a Hosted Relay and its gateway
 //! key in the target, [`QUOTA_SCENARIOS`] a Relay with a small daily quota, named in the
-//! target.
+//! target. The pairing scenarios open more slots from one machine than the default pairing
+//! rate limit allows, so a runner raises it, except for [`PAIR_RATE_SCENARIOS`].
 //!
 //! [`TestRelay`]: super::test_relay::TestRelay
 
@@ -22,7 +23,9 @@ use super::wire::{
     auth_message, close, decode_relay, ByeReason, ClientFrame, CloseReason, ErrorCode,
     MemberPresence, RelayFrame, MAX_ENVELOPE_PAYLOAD, PING, PONG, QUOTA_REFUSALS_BEFORE_CLOSE,
 };
-use super::wire::{decode_pair_relay, PairClientFrame, PairRelayFrame, MAX_PAIR_MSGS};
+use super::wire::{
+    decode_pair_relay, PairClientFrame, PairRelayFrame, MAX_PAIR_MSGS, PAIR_MAX_SLOTS_PER_PREFIX,
+};
 use rustls::ClientConfig;
 use serde_json::json;
 use std::sync::{Arc, Condvar, Mutex};
@@ -55,6 +58,10 @@ pub struct RelayTarget {
     /// For a Relay with a short pairing slot lifetime: [`PAIR_TTL_SCENARIOS`] need one of at
     /// most 5 s. `None`: the protocol's 600 s.
     pub pair_ttl: Option<Duration>,
+    /// For a Relay that takes the client address from a trusted proxy header (section 16):
+    /// the header's name. The pairing scenarios then send client addresses of their own in
+    /// it; without one they open from the runner's address.
+    pub client_ip_header: Option<String>,
 }
 
 impl RelayTarget {
@@ -379,10 +386,25 @@ impl RawConn {
 
     /// Opens a pairing pipe socket on `slot`.
     pub fn open_pair(t: &RelayTarget, slot: &str) -> Result<RawConn, RingError> {
+        RawConn::open_pair_from(t, slot, None)
+    }
+
+    /// Opens a pairing pipe socket on `slot`, naming client address `from` in the target's
+    /// [`RelayTarget::client_ip_header`] (ignored when it has none).
+    pub fn open_pair_from(
+        t: &RelayTarget,
+        slot: &str,
+        from: Option<&str>,
+    ) -> Result<RawConn, RingError> {
         let url = RelayUrl::parse(&t.url).map_err(|e| RingError::Invalid(e.to_string()))?;
-        let ws = transport::dial(
+        let headers: Vec<(&str, &str)> = match (&t.client_ip_header, from) {
+            (Some(name), Some(addr)) => vec![(name.as_str(), addr)],
+            _ => Vec::new(),
+        };
+        let ws = transport::dial_with_headers(
             &url,
             &url.pair_endpoint(slot),
+            &headers,
             t.tls.clone(),
             Instant::now() + Duration::from_secs(10),
             4 * 1024 * 1024,
@@ -1598,12 +1620,34 @@ pub fn pair_pipe_expires(t: &RelayTarget) {
     expect_pair_error(&mut b, ErrorCode::PairExpired, close::PAIR_EXPIRED);
 }
 
-/// Opens past the per-address limit are refused before the upgrade, with HTTP 429.
+/// A slot used before its expiry answers `pair_busy`, not `pair_expired`, after it: a used-up
+/// slot's tombstone is checked before the lifetime. The target names a lifetime of at most
+/// 5 s.
+pub fn pair_pipe_used_slot_stays_busy(t: &RelayTarget) {
+    let ttl = t
+        .pair_ttl
+        .expect("a target with a short pairing slot lifetime");
+    assert!(ttl <= Duration::from_secs(5));
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    drop((a, b));
+    std::thread::sleep(ttl + QUIET);
+    let mut c = RawConn::open_pair(t, &slot).expect("open c");
+    expect_pair_error(&mut c, ErrorCode::PairBusy, close::PAIR_BUSY);
+}
+
+/// Opens past the per-address limit are refused before the upgrade, with HTTP 429. The
+/// target names a limit of at most 20, so the opens stay within the per-prefix slot cap.
 pub fn pair_pipe_rate_limited(t: &RelayTarget) {
     let limit = t
         .pair_opens_per_minute
         .expect("a target with a pairing rate limit");
-    assert!(limit <= 50);
+    assert!(limit as usize <= PAIR_MAX_SLOTS_PER_PREFIX);
     for _ in 0..limit {
         let mut c = RawConn::open_pair(t, &fresh_slot()).expect("open within the limit");
         expect_pair(&mut c, "pair.wait", |f| {
@@ -1617,8 +1661,172 @@ pub fn pair_pipe_rate_limited(t: &RelayTarget) {
     }
 }
 
+/// Client addresses in one address prefix for the slot cap scenarios: a fresh random IPv4 /24
+/// (`10.x.y.0/24`) or IPv6 /64 (`fd…::/64`) when the target trusts a client address header,
+/// so scenarios sharing a Relay do not meet in a prefix; else `None`, the runner's address.
+struct Prefix {
+    v6: bool,
+    net: [u8; 6],
+    header: bool,
+}
+
+impl Prefix {
+    fn fresh(t: &RelayTarget, v6: bool) -> Prefix {
+        let mut net = [0u8; 6];
+        getrandom::getrandom(&mut net).expect("randomness");
+        Prefix {
+            v6,
+            net,
+            header: t.client_ip_header.is_some(),
+        }
+    }
+
+    /// Host `i` in the prefix.
+    fn addr(&self, i: u16) -> Option<String> {
+        if !self.header {
+            return None;
+        }
+        let n = &self.net;
+        Some(if self.v6 {
+            format!(
+                "fd{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}00:{i:x}:{:x}::1",
+                n[0],
+                n[1],
+                n[2],
+                n[3],
+                n[4],
+                n[5],
+                i.wrapping_mul(7919)
+            )
+        } else {
+            format!("10.{}.{}.{}", n[0], n[1], 1 + i % 254)
+        })
+    }
+}
+
+fn expect_503(r: Result<RawConn, RingError>) {
+    match r {
+        Err(RingError::Connect(m)) => assert!(m.contains("503"), "{m}"),
+        Ok(_) => panic!("an open over the slot cap was upgraded"),
+        Err(e) => panic!("expected HTTP 503, got {e}"),
+    }
+}
+
+/// Opens `n` new slots from `p` (host `i` opening the `i`-th), each waiting.
+fn open_waiting(t: &RelayTarget, p: &Prefix, n: usize) -> Vec<(String, RawConn)> {
+    (0..n)
+        .map(|i| {
+            let slot = fresh_slot();
+            let mut c = RawConn::open_pair_from(t, &slot, p.addr(i as u16).as_deref())
+                .unwrap_or_else(|e| panic!("open {} within the cap: {e}", i + 1));
+            expect_pair(&mut c, "pair.wait", |f| {
+                matches!(f, PairRelayFrame::Wait { .. })
+            });
+            (slot, c)
+        })
+        .collect()
+}
+
+/// At most 20 slots are outstanding per client address prefix: the 21st new slot from an IPv4
+/// /24 (or one IPv6 /64) is refused before the upgrade with HTTP 503, while a slot already
+/// outstanding still takes its second socket. With a client address header, the scenario
+/// also checks that an IPv6 /64 is one prefix and that another /24 still opens. Without one,
+/// it needs a Relay where nothing else from the runner's prefix is outstanding.
+pub fn pair_prefix_cap_refuses_21st(t: &RelayTarget) {
+    let cap = PAIR_MAX_SLOTS_PER_PREFIX;
+    let p = Prefix::fresh(t, false);
+    let held = open_waiting(t, &p, cap);
+    let host = p.addr(cap as u16);
+    expect_503(RawConn::open_pair_from(t, &fresh_slot(), host.as_deref()));
+    // An outstanding slot is not new: its second socket joins.
+    let mut b =
+        RawConn::open_pair_from(t, &held[0].0, host.as_deref()).expect("open the second side");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    if t.client_ip_header.is_none() {
+        return;
+    }
+    // Another /24 is another prefix.
+    let other = Prefix::fresh(t, false);
+    let _o = open_waiting(t, &other, 1);
+    // One IPv6 /64 is one prefix, whatever the interface ids.
+    let p6 = Prefix::fresh(t, true);
+    let _held6 = open_waiting(t, &p6, cap);
+    expect_503(RawConn::open_pair_from(
+        t,
+        &fresh_slot(),
+        p6.addr(cap as u16).as_deref(),
+    ));
+}
+
+/// A slot's reservation is released as soon as its two sides meet: with the prefix at the cap,
+/// a meeting frees a place for a new slot at once, and a later open of the used-up slot still
+/// gets `pair_busy` (its tombstone), not 503. Without a client address header, it needs a
+/// Relay where nothing else from the runner's prefix is outstanding.
+pub fn pair_reservation_released_on_meeting(t: &RelayTarget) {
+    let cap = PAIR_MAX_SLOTS_PER_PREFIX;
+    let p = Prefix::fresh(t, false);
+    let mut held = open_waiting(t, &p, cap);
+    let host = p.addr(cap as u16);
+    expect_503(RawConn::open_pair_from(t, &fresh_slot(), host.as_deref()));
+    let (slot, mut a) = held.remove(0);
+    let mut b = RawConn::open_pair_from(t, &slot, host.as_deref()).expect("open the second side");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    expect_pair(&mut a, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    // The meeting gave the reservation back: a new slot opens although the sockets stay.
+    let mut c = RawConn::open_pair_from(t, &fresh_slot(), host.as_deref())
+        .expect("a new slot after the meeting");
+    expect_pair(&mut c, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    // The prefix is at the cap again, but the used-up slot is not new.
+    drop((a, b));
+    std::thread::sleep(QUIET);
+    let mut d = RawConn::open_pair_from(t, &slot, host.as_deref()).expect("open the used slot");
+    expect_pair_error(&mut d, ErrorCode::PairBusy, close::PAIR_BUSY);
+}
+
+/// A socket refused for a protocol violation burns its slot: with the prefix at the cap, a
+/// `pair.msg` before the other side came (`bad_request`, close 4000) frees a place for a new
+/// slot at once, and the burnt slot answers `pair_busy`. Without a client address header, it
+/// needs a Relay where nothing else from the runner's prefix is outstanding.
+pub fn pair_refusal_burns_slot(t: &RelayTarget) {
+    let cap = PAIR_MAX_SLOTS_PER_PREFIX;
+    let p = Prefix::fresh(t, false);
+    let mut held = open_waiting(t, &p, cap);
+    let host = p.addr(cap as u16);
+    expect_503(RawConn::open_pair_from(t, &fresh_slot(), host.as_deref()));
+    let (slot, mut a) = held.remove(0);
+    a.pair_msg(b"alone");
+    expect_pair_error(&mut a, ErrorCode::BadRequest, close::BAD_REQUEST);
+    let mut c = RawConn::open_pair_from(t, &fresh_slot(), host.as_deref())
+        .expect("a new slot after the refusal");
+    expect_pair(&mut c, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    let mut d = RawConn::open_pair_from(t, &slot, host.as_deref()).expect("open the burnt slot");
+    expect_pair_error(&mut d, ErrorCode::PairBusy, close::PAIR_BUSY);
+}
+
+/// Scenarios for a Relay with the default per-prefix slot cap and a raised rate limit (at
+/// least 100 opens a minute). Without a client address header in the target, each needs a
+/// Relay of its own.
+pub const PAIR_CAP_SCENARIOS: &[(&str, Scenario)] = &[
+    ("pair_prefix_cap_refuses_21st", pair_prefix_cap_refuses_21st),
+    (
+        "pair_reservation_released_on_meeting",
+        pair_reservation_released_on_meeting,
+    ),
+    ("pair_refusal_burns_slot", pair_refusal_burns_slot),
+];
+
 /// Scenarios for a Relay with a short pairing slot lifetime; the target names it.
-pub const PAIR_TTL_SCENARIOS: &[(&str, Scenario)] = &[("pair_pipe_expires", pair_pipe_expires)];
+pub const PAIR_TTL_SCENARIOS: &[(&str, Scenario)] = &[
+    ("pair_pipe_expires", pair_pipe_expires),
+    (
+        "pair_pipe_used_slot_stays_busy",
+        pair_pipe_used_slot_stays_busy,
+    ),
+];
 
 /// Scenarios for a Relay with a small pairing rate limit; the target names it.
 pub const PAIR_RATE_SCENARIOS: &[(&str, Scenario)] =

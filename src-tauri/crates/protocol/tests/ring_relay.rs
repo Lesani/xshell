@@ -12,7 +12,7 @@ use xshell_protocol::ring::relay::test_relay::{
     Fault, TestRelay, TestRelayOptions, TestTls, TrickleProxy,
 };
 use xshell_protocol::ring::relay::wire::{
-    ByeReason, CloseReason, ErrorCode, MemberPresence, Presence, RelayFrame,
+    ByeReason, CloseReason, ErrorCode, MemberPresence, PairRelayFrame, Presence, RelayFrame,
     HOSTED_QUOTA_FRAMES_PER_DAY,
 };
 use xshell_protocol::ring::relay::{RingClient, RingLimits, RingTimeouts};
@@ -382,6 +382,7 @@ fn trickled_tls_records_do_not_stall_sends_or_keepalive() {
         quota_frames_per_day: None,
         pair_opens_per_minute: None,
         pair_ttl: None,
+        client_ip_header: None,
     };
     r.set_origin(&t.origin());
     let ring = TestRing::new(&t.url);
@@ -580,6 +581,20 @@ fn pair_pipe_expires() {
 }
 
 #[test]
+fn pair_pipe_used_slot_stays_busy() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_ttl: Duration::from_secs(1),
+        ..TestRelayOptions::default()
+    });
+    contract::pair_pipe_used_slot_stays_busy(&r.target());
+}
+
+#[test]
+fn pair_refusal_burns_slot() {
+    contract::pair_refusal_burns_slot(&cap_relay(None).target());
+}
+
+#[test]
 fn pair_pipe_rate_limited() {
     let r = TestRelay::start_with(TestRelayOptions {
         pair_opens_per_minute: Some(5),
@@ -590,8 +605,161 @@ fn pair_pipe_rate_limited() {
 
 #[test]
 fn every_pair_limit_scenario_is_run_here() {
-    assert_eq!(PAIR_TTL_SCENARIOS.len(), 1);
+    assert_eq!(PAIR_TTL_SCENARIOS.len(), 2);
     assert_eq!(PAIR_RATE_SCENARIOS.len(), 1);
+    assert_eq!(PAIR_CAP_SCENARIOS.len(), 3);
+}
+
+/// A Relay for the slot cap scenarios: the default caps and no rate limit, optionally taking
+/// the client address from a trusted header.
+fn cap_relay(header: Option<&str>) -> TestRelay {
+    TestRelay::start_with(TestRelayOptions {
+        client_ip_header: header.map(str::to_string),
+        ..TestRelayOptions::default()
+    })
+}
+
+#[test]
+fn pair_prefix_cap_refuses_21st() {
+    contract::pair_prefix_cap_refuses_21st(&cap_relay(None).target());
+    contract::pair_prefix_cap_refuses_21st(&cap_relay(Some("X-Forwarded-For")).target());
+}
+
+#[test]
+fn pair_reservation_released_on_meeting() {
+    contract::pair_reservation_released_on_meeting(&cap_relay(None).target());
+    // With a header, both scenarios share one Relay: each uses prefixes of its own.
+    let r = cap_relay(Some("X-Real-IP"));
+    for (_, s) in PAIR_CAP_SCENARIOS {
+        s(&r.target());
+    }
+}
+
+/// Opens a waiting pairing socket from `from` (in the target's client address header).
+fn wait_from(t: &RelayTarget, from: Option<&str>) -> Result<RawConn, RingError> {
+    let mut c = RawConn::open_pair_from(t, &fresh_slot(), from)?;
+    assert!(matches!(
+        c.pair_frame(Duration::from_secs(5)),
+        Some(PairRelayFrame::Wait { .. })
+    ));
+    Ok(c)
+}
+
+fn is_status(r: Result<RawConn, RingError>, status: &str) -> bool {
+    matches!(r, Err(RingError::Connect(m)) if m.contains(status))
+}
+
+#[test]
+fn pair_client_address_comes_from_the_trusted_header() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        client_ip_header: Some("X-Forwarded-For".into()),
+        pair_opens_per_minute: Some(1),
+        pair_max_slots_per_prefix: 2,
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    // The last list entry counts: the one the nearest proxy appended.
+    let _a = wait_from(&t, Some("203.0.113.9, 192.0.2.1")).unwrap();
+    assert!(is_status(wait_from(&t, Some("192.0.2.1")), "429"));
+    let _b = wait_from(&t, Some("192.0.2.1, 198.51.100.7")).unwrap();
+    // An IPv4-mapped IPv6 address is its IPv4 address.
+    assert!(is_status(wait_from(&t, Some("::ffff:198.51.100.7")), "429"));
+    // The rate limit counts IPv6 by its /64, brackets or not.
+    let _c = wait_from(&t, Some("[2001:db8:1:2::1]")).unwrap();
+    assert!(is_status(
+        wait_from(&t, Some("2001:db8:1:2:ffff::9")),
+        "429"
+    ));
+    // The slot cap counts IPv4 by its /24: the slots of 198.51.100.7 and .8 fill theirs.
+    let _d = wait_from(&t, Some("198.51.100.8")).unwrap();
+    assert!(is_status(wait_from(&t, Some("198.51.100.9")), "503"));
+    // Without a usable header value, every open shares one bucket.
+    let _e = wait_from(&t, None).unwrap();
+    assert!(is_status(wait_from(&t, Some("not an address")), "429"));
+}
+
+#[test]
+fn pair_peer_address_is_the_socket_s_without_a_trusted_header() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_opens_per_minute: Some(1),
+        ..TestRelayOptions::default()
+    });
+    // An untrusted header changes nothing: both opens come from 127.0.0.1.
+    let t = RelayTarget {
+        client_ip_header: Some("X-Forwarded-For".into()),
+        ..r.target()
+    };
+    let _a = wait_from(&t, Some("192.0.2.1")).unwrap();
+    assert!(is_status(wait_from(&t, Some("192.0.2.2")), "429"));
+}
+
+#[test]
+fn failed_pair_upgrade_releases_its_reservation_at_once() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_max_slots: 1,
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    // An upgrade without Sec-WebSocket-Key fails after admission reserved the only place.
+    let mut raw = std::net::TcpStream::connect(r.addr()).unwrap();
+    {
+        use std::io::Write;
+        write!(
+            raw,
+            "GET /v1/pair/{} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
+            fresh_slot()
+        )
+        .unwrap();
+    }
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut raw, &mut buf);
+    assert!(!String::from_utf8_lossy(&buf).contains(" 101 "));
+    // The place is free at once: a valid new slot waits, with the lifetime far from over.
+    let mut c = RawConn::open_pair(&t, &fresh_slot()).unwrap();
+    assert!(matches!(
+        c.pair_frame(Duration::from_secs(5)),
+        Some(PairRelayFrame::Wait { .. })
+    ));
+    assert_eq!(r.pair_slots(), 1);
+}
+
+#[test]
+fn pair_reservations_are_released_and_tombstones_forgotten() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_ttl: Duration::from_millis(500),
+        pair_tombstone: Duration::from_millis(300),
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    // A meeting releases the reservation; the tombstone stays while the sockets do.
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(&t, &slot).unwrap();
+    assert!(matches!(
+        a.pair_frame(Duration::from_secs(5)),
+        Some(PairRelayFrame::Wait { .. })
+    ));
+    assert_eq!(r.pair_slots(), 1);
+    let mut b = RawConn::open_pair(&t, &slot).unwrap();
+    assert_eq!(
+        b.pair_frame(Duration::from_secs(5)),
+        Some(PairRelayFrame::Peer)
+    );
+    assert_eq!(r.pair_slots(), 0);
+    assert_eq!(r.pair_slots_held(), 1);
+    drop((a, b));
+    // A waiting slot expires: its reservation goes, and its tombstone runs out too.
+    let lone = fresh_slot();
+    let _w = RawConn::open_pair(&t, &lone).unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(r.pair_slots(), 0);
+    assert_eq!(r.pair_slots_held(), 0);
+    // Forgotten: a later open of the used slot starts a new slot.
+    let mut again = RawConn::open_pair(&t, &slot).unwrap();
+    assert!(matches!(
+        again.pair_frame(Duration::from_secs(5)),
+        Some(PairRelayFrame::Wait { .. })
+    ));
+    assert_eq!(r.pair_slots(), 1);
 }
 
 #[test]
@@ -970,6 +1138,7 @@ fn session_frames_before_welcome_fail_the_connect() {
         quota_frames_per_day: None,
         pair_opens_per_minute: None,
         pair_ttl: None,
+        client_ip_header: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("env"), "{m}"),
@@ -1023,6 +1192,7 @@ fn too_much_traffic_during_sync_fails_the_connect() {
         quota_frames_per_day: None,
         pair_opens_per_minute: None,
         pair_ttl: None,
+        client_ip_header: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("too much"), "{m}"),

@@ -44,11 +44,14 @@ pub const MAX_PAIR_FRAME: usize = 16 * 1024;
 pub const MAX_PAIR_MSGS: usize = 8;
 /// A pairing slot lives this long after its first open.
 pub const PAIR_SLOT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-/// A Relay keeps a slot's expiry state at most this long.
-pub const PAIR_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(900);
-/// Suggested Relay limits on the pipe: slot opens per client address per minute, and slots
-/// outstanding at once.
+/// A used-up or expired slot keeps a tombstone this long, so later opens still get
+/// `pair_busy` or `pair_expired`; then the Relay forgets it (section 16).
+pub const PAIR_TOMBSTONE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Suggested Relay limits on the pipe (section 16): slot opens per client address per minute,
+/// slots outstanding per client address prefix (an IPv4 /24, an IPv6 /64), and slots
+/// outstanding per Relay.
 pub const PAIR_OPENS_PER_MINUTE: u32 = 10;
+pub const PAIR_MAX_SLOTS_PER_PREFIX: usize = 20;
 pub const PAIR_MAX_SLOTS: usize = 1000;
 
 /// The largest frame a client may send of type `t`.
