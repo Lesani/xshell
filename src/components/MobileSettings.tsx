@@ -1,12 +1,136 @@
-import { useEffect, useState } from "react";
-import { Smartphone } from "lucide-react";
+import { Fragment, useEffect, useReducer, useState } from "react";
+import { Monitor, Smartphone } from "lucide-react";
 import { fmt } from "../ring/strings";
 import { canClaim, canEnable, canSave, connectionLine, errorText, hostLine, initialForm, localLine, moveLine, presenceChip, presenceKey, problemLine, roleKey, startsOver, targetUrl, urlError, type RelayForm } from "../ring/mobileSettings";
-import { useRing } from "../ring/useRing";
-import type { HostRingState, MemberView, RingStatus } from "../ring/types";
+import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
+import { useRing, type PairingEvents } from "../ring/useRing";
+import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
 // Settings → Mobile (#8, #21): enable Mobile access (creates the Ring), choose its Relay, see
-// the Ring's devices and how they stand, and which Remote Hosts could not join.
+// the Ring's devices and how they stand, and which Remote Hosts could not join. Pairing (#9):
+// pair a phone by QR code, add a computer by the code `xshelld pair` shows.
+
+export interface Pairing {
+  events: PairingEvents;
+  startPhone: () => Promise<PhoneStart>;
+  cancelPhone: () => Promise<void>;
+  pairComputer: (code: string) => Promise<void>;
+  cancelComputer: () => Promise<void>;
+}
+
+// Text with `code` spans, as the copy writes commands.
+function WithCode({ text }: { text: string }) {
+  return <>{text.split("`").map((part, i) => i % 2 ? <code key={i}>{part}</code> : <Fragment key={i}>{part}</Fragment>)}</>;
+}
+
+// Dark modules on white whatever the theme, with a four-module quiet zone.
+function QrCode({ qr }: { qr: Qr }) {
+  const n = qr.size + 8;
+  return (
+    <svg viewBox={`0 0 ${n} ${n}`} width={200} height={200} shapeRendering="crispEdges" role="img" aria-label={fmt("mobile.pair.phone")}>
+      <rect width={n} height={n} fill="#fff" />
+      {qrRects(qr).map(r => <rect key={`${r.x},${r.y}`} x={r.x + 4} y={r.y + 4} width={r.w} height={1} fill="#000" />)}
+    </svg>
+  );
+}
+
+function PhonePanel({ p }: { p: Pairing }) {
+  const [st, dispatch] = useReducer(phoneReducer, PHONE_IDLE);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { if (p.events.phone) dispatch({ type: "event", event: p.events.phone }); }, [p.events.phone]);
+  const waiting = st.state === "waiting";
+  useEffect(() => {
+    if (!waiting) return;
+    const t = setInterval(() => {
+      const n = Date.now();
+      setNow(n);
+      dispatch({ type: "tick", nowMs: n });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [waiting]);
+  // Leaving Settings ends the offer: nobody sees the code any more.
+  useEffect(() => () => { p.cancelPhone().catch(() => {}); }, []);
+
+  const start = async () => {
+    dispatch({ type: "start" });
+    setNow(Date.now());
+    try {
+      dispatch({ type: "started", offer: await p.startPhone() });
+    } catch (e) {
+      dispatch({ type: "startFailed", error: errorText(e) });
+    }
+  };
+  const busy = st.state === "starting" || waiting;
+  return (
+    <div className="edit-field">
+      <label className="edit-label">{fmt("mobile.pair.phone")}</label>
+      {st.state === "waiting" && (
+        <>
+          <div className="edit-hint">{fmt("mobile.pair.phone.desc")}</div>
+          <QrCode qr={st.offer.qr} />
+          <div className="host-row-note">{expiresLine(st.offer.expiresAt, now)}</div>
+          <div className="host-row-note">{fmt("mobile.pair.waiting")}</div>
+        </>
+      )}
+      {st.state === "paired" && <div className="host-row-note">{pairedLine(st.name)}</div>}
+      {st.state === "expired" && <div className="host-row-note host-row-warn">{fmt("mobile.pair.expired")}</div>}
+      {st.state === "failed" && <div className="host-form-error">{failureLine(st.code, st.error)}</div>}
+      <div className="host-row-actions">
+        {st.state === "waiting" ? (
+          <button className="btn btn-ghost settings-action-btn" onClick={() => { navigator.clipboard?.writeText(st.offer.payload).catch(() => {}); }}>
+            {fmt("mobile.pair.phone.copy")}
+          </button>
+        ) : (
+          <button className="btn btn-primary settings-action-btn" disabled={busy} onClick={start}>
+            <Smartphone size={11} /> {fmt(offersNewCode(st) ? "mobile.pair.phone.new" : "mobile.pair.phone")}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
+  const [st, dispatch] = useReducer(computerReducer, COMPUTER_IDLE);
+  const [code, setCode] = useState("");
+  useEffect(() => { if (p.events.computer) dispatch({ type: "event", event: p.events.computer }); }, [p.events.computer]);
+  const connecting = st.state === "connecting";
+  // Leaving Settings while it looks for the computer stops looking.
+  useEffect(() => () => { p.cancelComputer().catch(() => {}); }, []);
+
+  const submit = async () => {
+    if (!canSubmit(code, st)) return;
+    dispatch({ type: "submit" });
+    try {
+      await p.pairComputer(normalizeCode(code));
+    } catch (e) {
+      dispatch({ type: "submitFailed", error: errorText(e) });
+    }
+  };
+  const invalid = codeError(code);
+  const line = computerLine(st);
+  return (
+    <div className="edit-field">
+      <label className="edit-label">{fmt("mobile.pair.computer")}</label>
+      <div className="edit-hint"><WithCode text={computerDesc(s)} /></div>
+      <div className="edit-field">
+        <label className="edit-label">{fmt("mobile.pair.computer.label")}</label>
+        <input className="edit-input host-form-mono" value={code} placeholder={fmt("mobile.pair.computer.placeholder")} spellCheck={false}
+          autoCapitalize="characters" autoComplete="off" disabled={connecting}
+          onChange={(e) => { setCode(formatCode(e.target.value)); dispatch({ type: "edit" }); }}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+        {invalid && <div className="host-form-error">{invalid}</div>}
+      </div>
+      <div className="host-row-actions">
+        <button className="btn btn-primary settings-action-btn" disabled={!canSubmit(code, st)} onClick={submit}>
+          <Monitor size={11} /> {fmt("mobile.pair.computer")}
+        </button>
+      </div>
+      {line && <div className={st.state === "failed" ? "host-form-error" : "host-row-note"}><WithCode text={line} /></div>}
+    </div>
+  );
+}
+
 
 function MemberRow({ m, s }: { m: MemberView; s: RingStatus }) {
   const key = presenceKey(m, s);
@@ -107,7 +231,7 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
   );
 }
 
-export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void> }) {
+export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, pairing }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void>; pairing?: Pairing }) {
   const [enabling, setEnabling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const enable = async () => {
@@ -150,6 +274,12 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost }: { 
               {s.members.map(m => <MemberRow key={m.signKey} m={m} s={s} />)}
               {s.hosts.map(h => <HostNote key={h.host} h={h} onClaim={onClaimHost} />)}
             </div>
+            {pairing && s.connection !== "other-window" && (
+              <>
+                <PhonePanel p={pairing} />
+                <ComputerPanel s={s} p={pairing} />
+              </>
+            )}
           </>
         )}
         {local && <div className="host-row-note">{local}</div>}
@@ -159,7 +289,8 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost }: { 
 }
 
 export function MobileSettings() {
-  const { status, enable, setRelayUrl, claimHost } = useRing();
+  const { status, enable, setRelayUrl, claimHost, pairing, startPhone, cancelPhone, pairComputer, cancelComputer } = useRing();
   if (!status) return null;
-  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} />;
+  const p: Pairing = { events: pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
+  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} pairing={p} />;
 }

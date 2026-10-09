@@ -14,8 +14,16 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use std::time::Instant;
+use xshell_protocol::ring::pairing::{
+    JoinRequest, Joined, PairCode, PairError, PairRefusal, PairSecret, PairingOffer,
+};
+use xshell_protocol::ring::relay::pair::{
+    host_pairing, Cancel, HostRequest, PairOptions, PairPipe, PairingHost,
+};
 use xshell_protocol::ring::relay::{
     ByeReason, Connector, ConnectorConfig, ConnectorEvents, LinkState, MemberPresence, MoveJob,
     MoveState, RingClientConfig, RingTimeouts,
@@ -269,6 +277,8 @@ pub struct DesktopRingConfig {
     /// How often an instance that does not own the connection re-reads the state and tries
     /// to take the connection over.
     pub owner_retry: Duration,
+    /// How long a pairing secret (a phone's QR, a computer's code) stays good.
+    pub pair_ttl: Duration,
 }
 
 impl DesktopRingConfig {
@@ -283,9 +293,56 @@ impl DesktopRingConfig {
             backoff_unit: Duration::from_secs(1),
             move_attempts: 5,
             owner_retry: Duration::from_secs(2),
+            pair_ttl: Duration::from_secs(xshell_protocol::ring::pairing::PAIR_TTL_SECS),
         }
     }
 }
+
+/// Which pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PairingFlow {
+    /// A phone scans this Desktop's QR code.
+    Phone,
+    /// Another computer runs `xshelld pair`, and its code is typed here.
+    Computer,
+}
+
+/// How a pairing goes, as the UI shows it (`ring:pairing`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum PairingEvent {
+    /// The QR is up, or the computer is being looked for.
+    Waiting,
+    Paired {
+        name: String,
+        role: Role,
+    },
+    /// Nobody came in time.
+    Expired,
+    /// `code`: a [`PairError::as_code`] (`used`, `role`, `full`, `not_found`, `cancelled`, …).
+    Failed {
+        code: String,
+    },
+}
+
+/// Told how a pairing goes. Called on the pairing's own thread, without any Ring lock held.
+pub trait PairingObserver: Send + Sync {
+    fn pairing(&self, flow: PairingFlow, event: &PairingEvent);
+}
+
+/// A phone offer as the UI shows it.
+#[derive(Debug, Clone)]
+pub struct PhoneOffer {
+    /// The QR payload (`xsp1.…`), also offered as text to copy.
+    pub payload: String,
+    /// Unix seconds; shown only, the expiry is enforced with a monotonic clock.
+    pub expires_at: u64,
+}
+
+/// Refusals of the pairing commands start with these codes.
+pub const PAIR_NOT_ENABLED: &str = "not_enabled: mobile access is not enabled";
+pub const PAIR_OTHER_WINDOW: &str = "other_window: another xshell window manages your devices";
 
 /// One member's presence as Settings → Mobile shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -387,6 +444,9 @@ struct Live {
     moving: Option<MoveState>,
     problem: Option<(String, String)>,
     quitting: bool,
+    /// The pairing in progress per flow (its cancel flag). Secrets live only in memory, on
+    /// the pairing's thread: `ring.json` never holds one.
+    pairing: Vec<(PairingFlow, Cancel)>,
 }
 
 pub struct DesktopRing {
@@ -954,6 +1014,264 @@ impl DesktopRing {
         Ok(Some((chain, outcomes)))
     }
 
+    /// Starts a phone offer, replacing the one shown. The slot on the Relay is held before
+    /// this returns; a thread waits for the phone and runs the Desktop's side.
+    pub fn pair_phone(&self, observer: Arc<dyn PairingObserver>) -> Result<PhoneOffer, String> {
+        let s = self.pairing_state()?;
+        let secret = PairSecret::generate().map_err(|e| e.to_string())?;
+        let head = s.chain.head();
+        let ttl = self.cfg.pair_ttl;
+        let offer = PairingOffer {
+            ring_id: head.ring_id().clone(),
+            relay_url: head.roster().relay_url.clone(),
+            sign_key: s.keys.sign_key(),
+            noise_key: s.keys.noise_key(),
+            secret: secret.clone(),
+            expires_at: now() + ttl.as_secs(),
+        };
+        let cancel = self.start_pairing(PairingFlow::Phone);
+        let opts = self.pair_options();
+        let pipe = PairPipe::open(&offer.relay_url, &secret.slot(), &opts).map_err(|e| {
+            self.end_pairing(PairingFlow::Phone, &cancel);
+            format!("{}: {e}", e.as_code())
+        })?;
+        let until = Instant::now() + ttl;
+        let me = self.me.clone();
+        let c = cancel.clone();
+        let ring_id = offer.ring_id.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ring-pair-phone".into())
+            .spawn(move || {
+                let mut pipe = pipe;
+                observer.pairing(PairingFlow::Phone, &PairingEvent::Waiting);
+                let r = pipe.wait_peer(until, Some(&c)).and_then(|()| {
+                    let ring = me.upgrade().ok_or(PairError::Cancelled)?;
+                    ring.host(pipe, &s.keys, &secret, &ring_id, Role::Mobile, until, &c)
+                });
+                if let Some(ring) = me.upgrade() {
+                    ring.end_pairing(PairingFlow::Phone, &c);
+                }
+                observer.pairing(PairingFlow::Phone, &event_of(r));
+            });
+        if let Err(e) = spawned {
+            self.end_pairing(PairingFlow::Phone, &cancel);
+            return Err(e.to_string());
+        }
+        Ok(PhoneOffer {
+            payload: offer.encode(),
+            expires_at: offer.expires_at,
+        })
+    }
+
+    /// Adds the computer whose `xshelld pair` shows `code`. Returns once the code parses;
+    /// the rest happens on a thread of its own, reported to `observer`.
+    pub fn pair_computer(
+        &self,
+        code: &str,
+        observer: Arc<dyn PairingObserver>,
+    ) -> Result<(), String> {
+        let code = PairCode::parse(code).map_err(|e| format!("{}: {e}", e.as_code()))?;
+        let s = self.pairing_state()?;
+        let secret = code.secret();
+        let cancel = self.start_pairing(PairingFlow::Computer);
+        let opts = self.pair_options();
+        let until = Instant::now() + self.cfg.pair_ttl;
+        let me = self.me.clone();
+        let c = cancel.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ring-pair-computer".into())
+            .spawn(move || {
+                observer.pairing(PairingFlow::Computer, &PairingEvent::Waiting);
+                let head = s.chain.head();
+                let r = PairPipe::open(&head.roster().relay_url, &secret.slot(), &opts).and_then(
+                    |pipe| {
+                        // `xshelld pair` waits on its slot: a code nobody waits on is wrong
+                        // (or that computer gave up).
+                        if !pipe.has_peer() {
+                            pipe.close();
+                            return Err(PairError::NotFound);
+                        }
+                        let ring = me.upgrade().ok_or(PairError::Cancelled)?;
+                        ring.host(
+                            pipe,
+                            &s.keys,
+                            &secret,
+                            head.ring_id(),
+                            Role::Daemon,
+                            until,
+                            &c,
+                        )
+                    },
+                );
+                if let Some(ring) = me.upgrade() {
+                    ring.end_pairing(PairingFlow::Computer, &c);
+                }
+                observer.pairing(PairingFlow::Computer, &event_of(r));
+            });
+        if let Err(e) = spawned {
+            self.end_pairing(PairingFlow::Computer, &cancel);
+            return Err(e.to_string());
+        }
+        Ok(())
+    }
+
+    /// Stops the pairing of `flow` in progress, if any (its observer hears `cancelled`).
+    pub fn cancel_pairing(&self, flow: PairingFlow) {
+        let mut l = self.lock();
+        for (f, c) in &l.pairing {
+            if *f == flow {
+                c.store(true, Ordering::Release);
+            }
+        }
+        l.pairing.retain(|(f, _)| *f != flow);
+    }
+
+    /// The state a pairing needs: a Ring, and this instance running its connection (it
+    /// publishes the new version).
+    fn pairing_state(&self) -> Result<RingState, String> {
+        let l = self.lock();
+        let s = match (&l.state, &l.problem) {
+            (Some(s), None) => s.clone(),
+            _ => return Err(PAIR_NOT_ENABLED.into()),
+        };
+        if l.connector.is_none() {
+            return Err(PAIR_OTHER_WINDOW.into());
+        }
+        Ok(s)
+    }
+
+    /// A new pairing of `flow`: the previous one is cancelled.
+    fn start_pairing(&self, flow: PairingFlow) -> Cancel {
+        self.cancel_pairing(flow);
+        let c: Cancel = Arc::new(AtomicBool::new(false));
+        self.lock().pairing.push((flow, c.clone()));
+        c
+    }
+
+    fn end_pairing(&self, flow: PairingFlow, c: &Cancel) {
+        self.lock()
+            .pairing
+            .retain(|(f, x)| !(*f == flow && Arc::ptr_eq(x, c)));
+    }
+
+    fn pair_options(&self) -> PairOptions {
+        PairOptions {
+            step: self.cfg.timeouts.connect,
+            ring: self.cfg.timeouts,
+            ..PairOptions::default()
+        }
+    }
+
+    /// The Desktop's side of one pairing over `pipe` (which has the peer).
+    #[allow(clippy::too_many_arguments)]
+    fn host(
+        &self,
+        pipe: PairPipe,
+        keys: &DeviceKeys,
+        secret: &PairSecret,
+        ring_id: &RingId,
+        role: Role,
+        until: Instant,
+        cancel: &Cancel,
+    ) -> Result<JoinRequest, PairError> {
+        let adder = Adder {
+            ring: self,
+            used: AtomicBool::new(false),
+            until,
+        };
+        host_pairing(
+            pipe,
+            &HostRequest {
+                keys,
+                secret,
+                ring_id,
+                name: &self.cfg.name,
+                role,
+            },
+            &adder,
+            Some(cancel),
+        )
+    }
+
+    /// Adds a paired device: a new Roster version, committed, adopted and published, and
+    /// acknowledged by the Relay. The same keys with the same role again are a member
+    /// already, not an error.
+    fn add_paired_member(&self, req: &JoinRequest) -> Result<Joined, PairRefusal> {
+        let (s, next) = {
+            let _c = self.lock_commit();
+            let r = self.tx(|cur, _| {
+                let Some(mut s) = cur else {
+                    return Ok((None, Err(PairRefusal::PublishFailed)));
+                };
+                let head = s.chain.head();
+                if let Some(m) = head.member(&req.sign_key) {
+                    if m.noise_key == req.noise_key && m.role == req.role {
+                        return Ok((None, Ok((s, None))));
+                    }
+                    return Ok((None, Err(PairRefusal::Duplicate)));
+                }
+                if head
+                    .roster()
+                    .members
+                    .iter()
+                    .any(|m| m.noise_key == req.noise_key)
+                {
+                    return Ok((None, Err(PairRefusal::Duplicate)));
+                }
+                if head.roster().members.len() >= MAX_MEMBERS {
+                    return Ok((None, Err(PairRefusal::Full)));
+                }
+                let t = now();
+                let next = head
+                    .next(&*s.keys, t, |d| {
+                        d.add(Member::new(
+                            &req.name,
+                            req.role,
+                            req.sign_key,
+                            req.noise_key,
+                            t,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                s.chain
+                    .accept(std::slice::from_ref(&next))
+                    .map_err(|e| e.to_string())?;
+                Ok((Some(s.clone()), Ok((s, Some(next)))))
+            });
+            let (s, next) = match r {
+                Ok(Ok(x)) => x,
+                Ok(Err(refusal)) => return Err(refusal),
+                Err(e) => {
+                    eprintln!("xshell: cannot add the paired device: {e}");
+                    return Err(PairRefusal::PublishFailed);
+                }
+            };
+            if next.is_some() {
+                self.hook();
+                self.adopt(s.clone());
+            }
+            (s, next)
+        };
+        self.emit();
+        let head = next.unwrap_or_else(|| s.chain.head().clone());
+        let connector = self.lock().connector.clone();
+        match connector.map(|c| c.publish(&head)) {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                eprintln!("xshell: cannot publish the new roster: {e}");
+                return Err(PairRefusal::PublishFailed);
+            }
+            None => return Err(PairRefusal::PublishFailed),
+        }
+        Ok(Joined {
+            ring_id: head.ring_id().clone(),
+            relay_url: head.roster().relay_url.clone(),
+            version: head.version(),
+            hash: head.hash(),
+            signed_by: head.roster().signed_by,
+        })
+    }
+
     /// The chain held, if a Ring exists.
     pub fn chain(&self) -> Option<RosterChain> {
         self.lock().state.as_ref().map(|s| s.chain.clone())
@@ -1077,6 +1395,8 @@ impl DesktopRing {
     /// The app quits: say goodbye (`quit`), stop connecting, and hand the connection over
     /// (the owner lock is released after the goodbye).
     pub fn quit(&self) {
+        self.cancel_pairing(PairingFlow::Phone);
+        self.cancel_pairing(PairingFlow::Computer);
         let c = {
             let mut l = self.lock();
             l.quitting = true;
@@ -1089,6 +1409,42 @@ impl DesktopRing {
         if let Some(f) = owner {
             let _ = f.unlock();
         }
+    }
+}
+
+/// One pairing's bookkeeping: its secret is good once, until `until`.
+struct Adder<'a> {
+    ring: &'a DesktopRing,
+    used: AtomicBool,
+    until: Instant,
+}
+
+impl PairingHost for Adder<'_> {
+    fn consume(&self) -> Result<(), PairRefusal> {
+        if self.used.swap(true, Ordering::SeqCst) {
+            return Err(PairRefusal::Used);
+        }
+        if Instant::now() >= self.until {
+            return Err(PairRefusal::Expired);
+        }
+        Ok(())
+    }
+
+    fn add(&self, req: &JoinRequest) -> Result<Joined, PairRefusal> {
+        self.ring.add_paired_member(req)
+    }
+}
+
+fn event_of(r: Result<JoinRequest, PairError>) -> PairingEvent {
+    match r {
+        Ok(req) => PairingEvent::Paired {
+            name: req.name,
+            role: req.role,
+        },
+        Err(PairError::Expired) => PairingEvent::Expired,
+        Err(e) => PairingEvent::Failed {
+            code: e.as_code().to_string(),
+        },
     }
 }
 
@@ -2019,5 +2375,221 @@ mod tests {
         assert_eq!(v.problem.as_deref(), Some("unreadable"));
         assert!(!v.enabled);
         ring.quit();
+    }
+
+    // ---- Pairing ------------------------------------------------------------------------
+
+    use xshell_protocol::ring::pairing::{PairCode, PairingOffer};
+    use xshell_protocol::ring::relay::pair::{pair_as_guest, GuestRequest, PairOptions};
+
+    #[derive(Default)]
+    struct Pairings {
+        events: Mutex<Vec<(PairingFlow, PairingEvent)>>,
+        cv: Condvar,
+    }
+
+    impl PairingObserver for Pairings {
+        fn pairing(&self, flow: PairingFlow, e: &PairingEvent) {
+            self.events.lock().unwrap().push((flow, e.clone()));
+            self.cv.notify_all();
+        }
+    }
+
+    impl Pairings {
+        /// The first event after `Waiting` for `flow`.
+        fn outcome(&self, flow: PairingFlow) -> PairingEvent {
+            let deadline = Instant::now() + WAIT;
+            let mut ev = self.events.lock().unwrap();
+            loop {
+                if let Some((_, e)) = ev
+                    .iter()
+                    .find(|(f, e)| *f == flow && *e != PairingEvent::Waiting)
+                {
+                    return e.clone();
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "no outcome for {flow:?}: {ev:?}");
+                ev = self.cv.wait_timeout(ev, left).unwrap().0;
+            }
+        }
+    }
+
+    fn guest_opts() -> PairOptions {
+        PairOptions {
+            step: Duration::from_secs(3),
+            ring: RingTimeouts {
+                connect: Duration::from_secs(3),
+                ..RingTimeouts::default()
+            },
+            ..PairOptions::default()
+        }
+    }
+
+    fn scan(payload: &str, keys: &Arc<DeviceKeys>) -> Result<RosterChain, PairError> {
+        let o = PairingOffer::parse(payload).unwrap();
+        pair_as_guest(
+            &GuestRequest {
+                relay_url: &o.relay_url,
+                secret: &o.secret,
+                pin: Some(o.noise_key),
+                ring_id: Some(&o.ring_id),
+                keys: keys.clone(),
+                role: Role::Mobile,
+                name: "my phone",
+                wait: Duration::ZERO,
+            },
+            &guest_opts(),
+            None,
+        )
+    }
+
+    #[test]
+    fn pair_phone_adds_mobile() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let obs = Arc::new(Pairings::default());
+        let offer = ring.pair_phone(obs.clone()).unwrap();
+        assert!(offer.payload.starts_with("xsp1."));
+        assert!(offer.expires_at > now());
+        let phone = Arc::new(DeviceKeys::generate().unwrap());
+        let chain = scan(&offer.payload, &phone).unwrap();
+        assert_eq!(
+            obs.outcome(PairingFlow::Phone),
+            PairingEvent::Paired {
+                name: "my phone".into(),
+                role: Role::Mobile
+            }
+        );
+        let m = chain.head().member(&phone.sign_key()).unwrap();
+        assert_eq!(m.role, Role::Mobile);
+        assert_eq!(ring.chain().unwrap().head(), chain.head());
+        // The secret is not in the state file.
+        let file = std::fs::read_to_string(t.path().join("ring").join("ring.json")).unwrap();
+        let o = PairingOffer::parse(&offer.payload).unwrap();
+        let secret = xshell_protocol::ring::b64::encode(o.secret.as_bytes());
+        assert!(!file.contains(&secret));
+        // Scanning the same code again finds nobody: it is used up.
+        let again = scan(&offer.payload, &Arc::new(DeviceKeys::generate().unwrap()));
+        assert!(again.is_err());
+        ring.quit();
+    }
+
+    #[test]
+    fn new_offer_invalidates_old() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let obs = Arc::new(Pairings::default());
+        let old = ring.pair_phone(obs.clone()).unwrap();
+        let new = ring.pair_phone(Arc::new(Pairings::default())).unwrap();
+        assert_eq!(
+            obs.outcome(PairingFlow::Phone),
+            PairingEvent::Failed {
+                code: "cancelled".into()
+            }
+        );
+        let phone = Arc::new(DeviceKeys::generate().unwrap());
+        assert!(
+            scan(&old.payload, &phone).is_err(),
+            "the old code still works"
+        );
+        scan(&new.payload, &phone).unwrap();
+        ring.quit();
+    }
+
+    #[test]
+    fn pair_computer_adds_daemon() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        // `xshelld pair` on the other computer: it waits on the slot of its code.
+        let code = PairCode::generate().unwrap();
+        let host = Arc::new(DeviceKeys::generate().unwrap());
+        let (url, c2, h2) = (r.url(), code.clone(), host.clone());
+        let guest = std::thread::spawn(move || {
+            let secret = c2.secret();
+            pair_as_guest(
+                &GuestRequest {
+                    relay_url: &url,
+                    secret: &secret,
+                    pin: None,
+                    ring_id: None,
+                    keys: h2,
+                    role: Role::Daemon,
+                    name: "server",
+                    wait: Duration::from_secs(5),
+                },
+                &guest_opts(),
+                None,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // A wrong code finds nobody, and the waiting computer is not disturbed.
+        let obs = Arc::new(Pairings::default());
+        assert!(ring
+            .pair_computer("not a code", obs.clone())
+            .unwrap_err()
+            .starts_with("invalid_code"));
+        let mut wrong: Vec<char> = code.format().chars().collect();
+        wrong[0] = if wrong[0] == '0' { '1' } else { '0' };
+        ring.pair_computer(&wrong.iter().collect::<String>(), obs.clone())
+            .unwrap();
+        assert_eq!(
+            obs.outcome(PairingFlow::Computer),
+            PairingEvent::Failed {
+                code: "not_found".into()
+            }
+        );
+        let obs = Arc::new(Pairings::default());
+        ring.pair_computer(&code.format().to_lowercase(), obs.clone())
+            .unwrap();
+        assert_eq!(
+            obs.outcome(PairingFlow::Computer),
+            PairingEvent::Paired {
+                name: "server".into(),
+                role: Role::Daemon
+            }
+        );
+        let chain = guest.join().unwrap().unwrap();
+        assert_eq!(
+            chain.head().member(&host.sign_key()).unwrap().role,
+            Role::Daemon
+        );
+        ring.quit();
+    }
+
+    #[test]
+    fn pairing_needs_connection_owner() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (none, _) = open(cfg(t.path(), &r.url()));
+        assert_eq!(
+            none.pair_phone(Arc::new(Pairings::default())).unwrap_err(),
+            PAIR_NOT_ENABLED
+        );
+        none.quit();
+        let (a, _) = open(cfg(t.path(), &r.url()));
+        a.enable(None, false).unwrap();
+        wait_view(&a, "a connected", connected);
+        let (b, _) = open(cfg(t.path(), &r.url()));
+        wait_view(&b, "b defers", |v| v.connection == "other-window");
+        assert_eq!(
+            b.pair_phone(Arc::new(Pairings::default())).unwrap_err(),
+            PAIR_OTHER_WINDOW
+        );
+        assert_eq!(
+            b.pair_computer("0000-0000-0000-0000", Arc::new(Pairings::default()))
+                .unwrap_err(),
+            PAIR_OTHER_WINDOW
+        );
+        a.quit();
+        b.quit();
     }
 }

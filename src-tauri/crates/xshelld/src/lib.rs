@@ -8,6 +8,8 @@ pub mod connect;
 pub mod env;
 pub mod job_exec;
 pub mod log;
+#[cfg(unix)]
+pub mod pair;
 pub mod paths;
 pub mod server;
 
@@ -45,6 +47,21 @@ pub fn main_entry() -> i32 {
         Command::JobExec { job, program, args } => return job_exec::run(&job, &program, &args),
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
+        #[cfg(windows)]
+        Command::Pair(_) => {
+            eprintln!("xshelld: pair is not supported on Windows.");
+            return 1;
+        }
+        #[cfg(unix)]
+        Command::Pair(o) => {
+            let Some(home) = o.home.clone().or_else(dirs::home_dir) else {
+                eprintln!("xshelld: cannot determine the home directory; pass --home");
+                return 1;
+            };
+            let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            let paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            return pair::run_pair(&o, &paths);
+        }
     };
     if serve {
         if let Some(code) = refuse_on_this_platform(&opts) {

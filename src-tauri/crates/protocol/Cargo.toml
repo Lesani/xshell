@@ -18,6 +18,7 @@ ring = [
     "dep:base64",
     "dep:getrandom",
     "dep:zeroize",
+    "dep:snow",
 ]
 # The blocking Relay client: WebSocket over TLS, one IO thread.
 relay-client = [
@@ -41,6 +42,9 @@ sha2 = { version = "=0.10.9", optional = true }
 base64 = { version = "=0.22.1", optional = true }
 getrandom = { version = "=0.2.17", optional = true }
 zeroize = { version = "=1.8.2", optional = true }
+# Noise (IK sessions, XXpsk3 pairing). No `std` feature: it would enable snow's optional
+# `ring` dependency (`ring/std` without `?`). no_std + alloc is all we use.
+snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"], optional = true }
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
 rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "=1.0.9", optional = true }
@@ -70,4 +74,12 @@ required-features = ["test-relay"]
 
 [[test]]
 name = "ring_connector"
+required-features = ["test-relay"]
+
+[[test]]
+name = "ring_sessions"
+required-features = ["test-relay"]
+
+[[test]]
+name = "ring_pairing"
 required-features = ["test-relay"]

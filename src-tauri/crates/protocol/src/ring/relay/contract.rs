@@ -12,6 +12,7 @@
 
 use super::super::chain::RosterChain;
 use super::super::entitlement::{sign_entitlement, Tier};
+use super::super::pairing::PairSecret;
 use super::super::roster::{Member, Role, Roster, RosterError, SignedRoster};
 use super::super::url::RelayUrl;
 use super::super::{b64, DeviceKeys, RingError, RingId, SignError, SignKey, Signature, Signer};
@@ -21,6 +22,7 @@ use super::wire::{
     auth_message, close, decode_relay, ByeReason, ClientFrame, CloseReason, ErrorCode,
     MemberPresence, RelayFrame, MAX_ENVELOPE_PAYLOAD, PING, PONG, QUOTA_REFUSALS_BEFORE_CLOSE,
 };
+use super::wire::{decode_pair_relay, PairClientFrame, PairRelayFrame, MAX_PAIR_MSGS};
 use rustls::ClientConfig;
 use serde_json::json;
 use std::sync::{Arc, Condvar, Mutex};
@@ -47,6 +49,12 @@ pub struct RelayTarget {
     /// For a Relay with a daily frame quota (section 14): the quota per Ring. The
     /// [`QUOTA_SCENARIOS`] need a small one (at most 1000).
     pub quota_frames_per_day: Option<u64>,
+    /// For a Relay with a pairing-pipe rate limit (section 16): slot opens per client
+    /// address per minute. The [`PAIR_RATE_SCENARIOS`] need one (at most 50).
+    pub pair_opens_per_minute: Option<u32>,
+    /// For a Relay with a short pairing slot lifetime: [`PAIR_TTL_SCENARIOS`] need one of at
+    /// most 5 s. `None`: the protocol's 600 s.
+    pub pair_ttl: Option<Duration>,
 }
 
 impl RelayTarget {
@@ -367,6 +375,48 @@ impl RawConn {
                 Raw::Closed(_) | Raw::Timeout => return None,
             }
         }
+    }
+
+    /// Opens a pairing pipe socket on `slot`.
+    pub fn open_pair(t: &RelayTarget, slot: &str) -> Result<RawConn, RingError> {
+        let url = RelayUrl::parse(&t.url).map_err(|e| RingError::Invalid(e.to_string()))?;
+        let ws = transport::dial(
+            &url,
+            &url.pair_endpoint(slot),
+            t.tls.clone(),
+            Instant::now() + Duration::from_secs(10),
+            4 * 1024 * 1024,
+        )?;
+        Ok(RawConn { ws })
+    }
+
+    /// The next pairing pipe frame other than `pong`, or `None` on close or timeout.
+    pub fn pair_frame(&mut self, timeout: Duration) -> Option<PairRelayFrame> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match self.recv(left) {
+                Raw::Text(t) => match decode_pair_relay(&t) {
+                    Ok(PairRelayFrame::Pong) | Err(_) => continue,
+                    Ok(f) => return Some(f),
+                },
+                Raw::Binary => continue,
+                Raw::Closed(_) | Raw::Timeout => return None,
+            }
+        }
+    }
+
+    pub fn pair_msg(&mut self, bytes: &[u8]) {
+        self.send(
+            &PairClientFrame::Msg {
+                payload: b64::encode(bytes),
+            }
+            .encode(),
+        )
+        .expect("send pair.msg");
     }
 
     /// The next `error` frame's code (skipping other frames).
@@ -1372,6 +1422,208 @@ pub fn quota_refuses_then_closes(t: &RelayTarget) {
     assert_eq!(d.close_code(WAIT), Some(close::NORMAL));
 }
 
+// ---- The pairing pipe (section 16) ------------------------------------------------------------
+
+/// A fresh random slot.
+pub fn fresh_slot() -> String {
+    PairSecret::generate().expect("randomness").slot()
+}
+
+fn expect_pair(c: &mut RawConn, what: &str, pred: impl Fn(&PairRelayFrame) -> bool) {
+    match c.pair_frame(WAIT) {
+        Some(f) if pred(&f) => {}
+        other => panic!("expected {what}, got {other:?}"),
+    }
+}
+
+fn expect_pair_error(c: &mut RawConn, code: ErrorCode, close_code: u16) {
+    expect_pair(
+        c,
+        code.as_str(),
+        |f| matches!(f, PairRelayFrame::Error { code: c, .. } if *c == code),
+    );
+    assert_eq!(c.close_code(WAIT), Some(close_code));
+}
+
+/// The first socket on a slot hears `pair.wait`, the second makes both hear `pair.peer`, and
+/// `pair.msg` goes to the other side unchanged, both ways.
+pub fn pair_pipe_joins_two(t: &RelayTarget) {
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { v: 1 })
+    });
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    expect_pair(&mut a, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    a.pair_msg(b"from a");
+    expect_pair(&mut b, "a's message", |f| {
+        *f == PairRelayFrame::Msg {
+            payload: b64::encode(b"from a"),
+        }
+    });
+    b.pair_msg(&[7u8; 8192]);
+    expect_pair(&mut a, "b's message", |f| {
+        *f == PairRelayFrame::Msg {
+            payload: b64::encode(&[7u8; 8192]),
+        }
+    });
+    a.send(PING).expect("ping");
+    match a.recv(WAIT) {
+        Raw::Text(t) => assert_eq!(t, PONG),
+        other => panic!("expected pong, got {other:?}"),
+    }
+}
+
+/// A third socket gets `pair_busy` and close 4010, and so does any socket on a slot whose
+/// two parties met, after they left.
+pub fn pair_pipe_refuses_third(t: &RelayTarget) {
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    let mut c = RawConn::open_pair(t, &slot).expect("open c");
+    expect_pair_error(&mut c, ErrorCode::PairBusy, close::PAIR_BUSY);
+    drop(a);
+    drop(b);
+    std::thread::sleep(QUIET);
+    let mut d = RawConn::open_pair(t, &slot).expect("open d");
+    expect_pair_error(&mut d, ErrorCode::PairBusy, close::PAIR_BUSY);
+}
+
+/// More than eight `pair.msg` from one socket: `too_many`, close 4000. A message over
+/// 8192 bytes, a message before the other side came, or any other type: `bad_request`,
+/// close 4000. A frame over 16 KiB: `too_large`, close 1009.
+pub fn pair_pipe_caps_messages(t: &RelayTarget) {
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    expect_pair(&mut a, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    for i in 0..MAX_PAIR_MSGS {
+        a.pair_msg(&[i as u8]);
+    }
+    for _ in 0..MAX_PAIR_MSGS {
+        expect_pair(&mut b, "a message", |f| {
+            matches!(f, PairRelayFrame::Msg { .. })
+        });
+    }
+    a.pair_msg(b"one too many");
+    expect_pair_error(&mut a, ErrorCode::TooMany, close::BAD_REQUEST);
+
+    let cases: Vec<(String, ErrorCode, u16)> = vec![
+        (
+            PairClientFrame::Msg {
+                payload: b64::encode(&[0u8; 8193]),
+            }
+            .encode(),
+            ErrorCode::BadRequest,
+            close::BAD_REQUEST,
+        ),
+        (
+            json!({"t": "env", "to": "x", "payload": ""}).to_string(),
+            ErrorCode::BadRequest,
+            close::BAD_REQUEST,
+        ),
+        (
+            json!({"t": "ping", "pad": "x".repeat(17 * 1024)}).to_string(),
+            ErrorCode::TooLarge,
+            close::TOO_LARGE,
+        ),
+    ];
+    for (frame, code, close_code) in cases {
+        let slot = fresh_slot();
+        let mut a = RawConn::open_pair(t, &slot).expect("open");
+        expect_pair(&mut a, "pair.wait", |f| {
+            matches!(f, PairRelayFrame::Wait { .. })
+        });
+        let mut b = RawConn::open_pair(t, &slot).expect("open b");
+        expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+        expect_pair(&mut a, "pair.peer", |f| *f == PairRelayFrame::Peer);
+        a.send(&frame).expect("send");
+        expect_pair_error(&mut a, code, close_code);
+    }
+    // Nobody to forward to.
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    a.pair_msg(b"alone");
+    expect_pair_error(&mut a, ErrorCode::BadRequest, close::BAD_REQUEST);
+}
+
+/// When one side goes, the Relay closes the other with 1000.
+pub fn pair_pipe_closes_peer(t: &RelayTarget) {
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair(&mut b, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    expect_pair(&mut a, "pair.peer", |f| *f == PairRelayFrame::Peer);
+    drop(a);
+    assert_eq!(b.close_code(WAIT), Some(close::NORMAL));
+}
+
+/// A slot expires its lifetime after its first open: a socket still waiting gets
+/// `pair_expired` and close 4008, and so does a later open. The target names a lifetime of
+/// at most 5 s.
+pub fn pair_pipe_expires(t: &RelayTarget) {
+    let ttl = t
+        .pair_ttl
+        .expect("a target with a short pairing slot lifetime");
+    assert!(ttl <= Duration::from_secs(5));
+    let slot = fresh_slot();
+    let mut a = RawConn::open_pair(t, &slot).expect("open a");
+    expect_pair(&mut a, "pair.wait", |f| {
+        matches!(f, PairRelayFrame::Wait { .. })
+    });
+    match a.pair_frame(ttl + WAIT) {
+        Some(PairRelayFrame::Error {
+            code: ErrorCode::PairExpired,
+            ..
+        }) => {}
+        other => panic!("expected pair_expired, got {other:?}"),
+    }
+    assert_eq!(a.close_code(WAIT), Some(close::PAIR_EXPIRED));
+    let mut b = RawConn::open_pair(t, &slot).expect("open b");
+    expect_pair_error(&mut b, ErrorCode::PairExpired, close::PAIR_EXPIRED);
+}
+
+/// Opens past the per-address limit are refused before the upgrade, with HTTP 429.
+pub fn pair_pipe_rate_limited(t: &RelayTarget) {
+    let limit = t
+        .pair_opens_per_minute
+        .expect("a target with a pairing rate limit");
+    assert!(limit <= 50);
+    for _ in 0..limit {
+        let mut c = RawConn::open_pair(t, &fresh_slot()).expect("open within the limit");
+        expect_pair(&mut c, "pair.wait", |f| {
+            matches!(f, PairRelayFrame::Wait { .. })
+        });
+    }
+    match RawConn::open_pair(t, &fresh_slot()) {
+        Err(RingError::Connect(m)) => assert!(m.contains("429"), "{m}"),
+        Ok(_) => panic!("an open over the limit was upgraded"),
+        Err(e) => panic!("expected HTTP 429, got {e}"),
+    }
+}
+
+/// Scenarios for a Relay with a short pairing slot lifetime; the target names it.
+pub const PAIR_TTL_SCENARIOS: &[(&str, Scenario)] = &[("pair_pipe_expires", pair_pipe_expires)];
+
+/// Scenarios for a Relay with a small pairing rate limit; the target names it.
+pub const PAIR_RATE_SCENARIOS: &[(&str, Scenario)] =
+    &[("pair_pipe_rate_limited", pair_pipe_rate_limited)];
+
 /// Scenarios for a Relay with a small daily quota; the target must name it.
 pub const QUOTA_SCENARIOS: &[(&str, Scenario)] =
     &[("quota_refuses_then_closes", quota_refuses_then_closes)];
@@ -1471,4 +1723,8 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
         "readded_member_keeps_new_socket_online",
         readded_member_keeps_new_socket_online,
     ),
+    ("pair_pipe_joins_two", pair_pipe_joins_two),
+    ("pair_pipe_refuses_third", pair_pipe_refuses_third),
+    ("pair_pipe_caps_messages", pair_pipe_caps_messages),
+    ("pair_pipe_closes_peer", pair_pipe_closes_peer),
 ];

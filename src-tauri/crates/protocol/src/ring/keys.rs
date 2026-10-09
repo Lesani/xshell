@@ -324,6 +324,13 @@ impl DeviceKeys {
         let secret = x25519_dalek::StaticSecret::from(*self.noise_seed);
         NoiseKey(x25519_dalek::PublicKey::from(&secret).to_bytes())
     }
+
+    /// The X25519 private scalar, for the Noise handshakes ([`super::noise`],
+    /// [`super::pairing`]). Both snow and x25519-dalek clamp it, so the public key snow
+    /// derives is [`DeviceKeys::noise_key`].
+    pub(crate) fn noise_secret(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(*self.noise_seed)
+    }
 }
 
 impl fmt::Debug for DeviceKeys {

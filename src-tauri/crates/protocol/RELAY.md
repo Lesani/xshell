@@ -27,9 +27,11 @@ What the protocol guarantees, and what it does not:
   #9), but this protocol alone does not detect it.
 - **`from` and presence are Relay assertions.** The Relay stamps an envelope's `from` with
   the key the socket authenticated as, and reports presence as it sees it. A malicious Relay
-  can lie about both. Until the Noise sessions (#9) authenticate the peer inside the
-  payload, a device must treat them as claims. Devices drop envelopes whose `from` is not in
-  their own trusted head.
+  can lie about both. Devices drop envelopes whose `from` is not in their own trusted head.
+  Inside an envelope, the Noise sessions (`SESSIONS.md`) authenticate the peer end to end:
+  each handshake binds both sign keys, so a lie about `from` makes the handshake fail, and
+  the Relay can drop, delay or refuse session messages but not read, alter, replay or
+  inject them. Presence remains a claim; a device uses it only to end sessions early.
 - **Before authentication the Relay reveals** a Ring's head version (in `challenge`) to
   anyone who knows the Ring id. The Ring id is a hash of a public key and is not secret
   within the Ring, but it is not guessable from outside.
@@ -228,7 +230,8 @@ expected origin when that happens.
   the prefix. `ringId` is the last path segment and must match `^[A-Za-z0-9_-]{16,128}$`.
   The Worker routes it to `idFromName(ringId)`.
 - HTTP answers: such a path without a WebSocket upgrade gets 426; `GET /healthz` gets 200;
-  every other request, a bad `ringId` included, gets 404.
+  every other request, a bad `ringId` included, gets 404. The pairing pipe,
+  `…/v1/pair/{slot}`, is the one other endpoint (section 16).
 - **Text frames only.** A binary frame gets `error{code:"unsupported"}` and close 4000.
 - Each frame is one JSON object tagged by `"t"`.
 - An unknown `t` from the Relay is ignored by devices. An unknown `t` from an authenticated
@@ -548,17 +551,68 @@ default. Any other Relay applies one only when it is configured with one (the Wo
 | `entitlement_required` | no | `env` in a limited session (section 12) |
 | `entitlement_invalid` | no | `entitlement.put` refused |
 | `internal` | optional | Relay failure |
+| `pair_busy` | 4010 | pairing pipe: a third socket, or a slot already used (section 16) |
+| `pair_expired` | 4008 | pairing pipe: the slot's time is up |
+| `too_many` | 4000 | pairing pipe: more than eight `pair.msg` from one socket |
 
 A close with 1000 follows a `bye`. Devices treat unknown codes as errors and keep going.
 
-## 16. Reserved for later versions
+## 16. Pairing pipe
+
+A device that is not paired yet is no member, so it cannot authenticate (section 7) or
+send an envelope. Pairing therefore meets on a rendezvous of its own, with no Ring, no
+authentication, no presence and no quota or entitlement (pairing must work before anyone
+buys a subscription): capability `pair`. The pipe only joins two sockets and forwards
+opaque messages between them. **It is not a security boundary**: security comes from the
+pre-shared key, the Desktop's single-use and expiry bookkeeping, and the joining device
+pinning the chain (`SESSIONS.md`). The rules below keep the Relay tidy and bound abuse.
+
+- **Path:** every request path that ends in `/v1/pair/{slot}`, with `slot` matching
+  `^[A-Za-z0-9_-]{43}$`, as a WebSocket upgrade (426 without one). The Worker routes it to
+  `idFromName("pair:" + slot)`. `slot` is `b64u(SHA-256("xshell-pair-slot-v1\n" ‖ secret))`.
+- **Sequence:**
+
+  ```text
+  first socket        <- {"t":"pair.wait","v":1}
+  second socket       -> both get {"t":"pair.peer"}
+  third and later     <- error{code:"pair_busy"}, close 4010
+  either side         -> {"t":"pair.msg","payload":"<b64u, at most 8192 bytes decoded>"}
+                         forwarded unchanged to the other side
+  ```
+
+- **Single use.** Once two sockets have met, the slot is used up: every later open gets
+  `pair_busy`, close 4010, even after both left. A slot whose only socket left before anyone
+  came may be opened again.
+- **Lifetime.** A slot expires 600 s after its first open: a socket still on it gets
+  `error{code:"pair_expired"}`, close 4008, and so does every later open.
+- **Limits per socket:** text frames of at most 16 KiB (else `too_large`, close 1009); at
+  most 8 `pair.msg` (else `too_many`, close 4000); a `pair.msg` before the other side came,
+  or whose payload is not canonical b64u of at most 8192 bytes, is `bad_request`, close
+  4000. `{"t":"ping"}` works as in section 13. Any other `t`, and a binary frame, is
+  `bad_request` (`unsupported` for binary), close 4000.
+- **Peers.** When one side closes, the Relay closes the other with 1000.
+- **Abuse limits** (the Relay's own; a device needs none of them):
+  - before the upgrade, at most 10 slot opens per client address per minute
+    (`wire::PAIR_OPENS_PER_MINUTE`), else HTTP 429;
+  - at most 1000 slots outstanding per Relay (`wire::PAIR_MAX_SLOTS`), else HTTP 503 for a
+    new slot;
+  - a slot's state (its first open, whether it was used) is kept at most 15 minutes, then
+    forgotten;
+  - a slot's Durable Object holds at most two sockets.
+
+The test Relay implements all of this (the rate limit only when configured with
+`pair_opens_per_minute`); `TestRelayOptions::lax_pairing` turns single use
+and the lifetime off, to prove that the endpoints enforce them themselves. The contract
+scenarios `pair_pipe_*` pin it (section 19).
+
+## 17. Reserved for later versions
 
 - `{"t":"state","foreground":bool}`, sent by Mobiles, which would add `foreground` to their
   presence;
 - `{"t":"push",…}`, for push forwarding;
 - caps `foreground`, `push`, `bin`. Binary frames stay reserved.
 
-## 17. Worker checklist
+## 18. Worker checklist
 
 - One Durable Object per Ring (`idFromName(ringId)`), using WebSocket Hibernation.
 - Storage: `roster:<version>` (the token string), `head` (version number), `presence:<signKey>`
@@ -591,8 +645,11 @@ A close with 1000 follows a `bye`. Devices treat unknown codes as errors and kee
 - Reuse the Push Gateway's `b64.ts` (its `fromB64u` must be strict as section 2 says,
   non-zero trailing bits included) and the shape of `entitlement.ts` for Roster tokens.
 - Log `bad_signature` together with the origin the Relay expected.
+- The pairing pipe (section 16): one Durable Object per slot (`idFromName("pair:" + slot)`),
+  storage `firstOpen` and `used`, an alarm that closes sockets at expiry and deletes the
+  state after 15 minutes, and the per-address rate limit and slot cap in front of it.
 
-## 18. Test vectors and the contract suite
+## 19. Test vectors and the contract suite
 
 `crates/protocol/testdata/ring/` holds deterministic vectors (fixed seeds and timestamps;
 Ed25519 is deterministic):
@@ -613,7 +670,8 @@ To regenerate them, run
 A normal test run fails when the files are stale.
 
 The contract scenarios in `ring::relay::contract` (feature `test-relay`) are public functions
-taking a `RelayTarget { url, tls, auth_timeout, gateway, quota_frames_per_day }`. This repository runs them against the test
+taking a `RelayTarget { url, tls, auth_timeout, gateway, quota_frames_per_day,
+pair_opens_per_minute, pair_ttl }`. This repository runs them against the test
 Relay. `xshell-remote` runs the same functions against the Worker on workerd, which makes them
 the definition of a conforming Relay. Every scenario uses fresh random keys, so it needs no
 reset. `contract::SCENARIOS` lists the single-Relay scenarios.
@@ -623,3 +681,8 @@ Relay; their target's `gateway` holds the gateway signing key the Relay trusts, 
 mint tokens (`hosted_routing_ends_when_the_last_token_expires` is the routing cutoff test).
 `contract::QUOTA_SCENARIOS` (`quota_refuses_then_closes`) run against a Relay with a small
 daily quota (at most 1000 frames), which their target's `quota_frames_per_day` names.
+`SCENARIOS` includes the pairing pipe's `pair_pipe_joins_two`, `pair_pipe_refuses_third`,
+`pair_pipe_caps_messages` and `pair_pipe_closes_peer`. `contract::PAIR_TTL_SCENARIOS`
+(`pair_pipe_expires`) need a Relay with a slot lifetime of at most 5 s (`pair_ttl`), and
+`contract::PAIR_RATE_SCENARIOS` (`pair_pipe_rate_limited`) one with a rate limit of at most
+50 opens a minute (`pair_opens_per_minute`).

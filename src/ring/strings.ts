@@ -1,5 +1,5 @@
-// Every user-facing string of Settings → Mobile (#8, #21): the binding copy tables and the
-// adopted review copy, verbatim. `{param}` placeholders are filled by fmt().
+// Every user-facing string of Settings → Mobile (#8, #21, pairing #9): the binding copy
+// tables and the adopted review copy, verbatim. `{param}` placeholders are filled by fmt().
 
 export const S = {
   "settings.nav.mobile": "Mobile",
@@ -46,6 +46,24 @@ export const S = {
   "mobile.host.claim": "Pair with this desktop",
   "mobile.host.full": "{name} can't join your devices. You've reached the limit of 64. Remove a device, then try again.",
   "mobile.host.failed": "Couldn't pair {name}: {error}",
+  "mobile.pair.phone": "Pair a phone",
+  "mobile.pair.phone.desc": "Scan this QR code with the phone app. It works once, for 10 minutes. Can't scan? Copy the pairing text into the phone app.",
+  "mobile.pair.phone.expires": "Code expires in {m}:{ss}",
+  "mobile.pair.phone.copy": "Copy pairing text",
+  "mobile.pair.phone.new": "New code",
+  "mobile.pair.expired": "This code expired. Select New code to try again.",
+  "mobile.pair.waiting": "Waiting for your phone…",
+  "mobile.pair.paired": "Added {name}",
+  "mobile.pair.failed": "Couldn't pair the device: {error}",
+  "mobile.pair.computer": "Add a computer",
+  "mobile.pair.computer.desc": "On the computer you want to add, run `xshelld pair`{relayArg}, then enter the code it shows.",
+  "mobile.pair.computer.label": "Pairing code",
+  "mobile.pair.computer.placeholder": "XXXX-XXXX-XXXX-XXXX",
+  "mobile.pair.computer.connecting": "Looking for the computer…",
+  "mobile.pair.computer.notFound": "Couldn't find the computer. Check the code and make sure `xshelld pair` is still running on it.",
+  "mobile.pair.computer.invalid": "Enter 16 letters and digits in the form XXXX-XXXX-XXXX-XXXX.",
+  "mobile.pair.err.role": "That device can't be added as a computer.",
+  "mobile.pair.err.full": "You've reached the limit of 64 devices. Remove a device, then try again.",
 } as const;
 
 export type StringKey = keyof typeof S;

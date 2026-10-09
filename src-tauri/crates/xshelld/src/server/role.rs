@@ -740,6 +740,7 @@ mod tests {
                 dir.join("ring"),
                 std::time::Duration::from_secs(1),
                 Default::default(),
+                std::time::Duration::from_secs(60),
             ),
         })
     }

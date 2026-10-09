@@ -77,7 +77,7 @@ The signed, versioned list of a **Ring**'s device keys and roles; the latest ver
 _Avoid_: member list, device list
 
 **Pairing**:
-Adding a device's key to a **Ring**, done once per device by scanning a code shown on a device already in it.
+Adding a device's key to a **Ring**, done once per device: a phone scans the code a **Desktop** shows; another computer runs `xshelld pair` and its code is typed on a **Desktop**.
 
 **Chat View**:
 A **Mobile**'s rendering of an agent **Terminal** as the conversation read from the agent's session, with replies sent as input to the **Terminal**.

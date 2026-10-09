@@ -8,15 +8,15 @@ pub mod store;
 pub mod sync;
 
 pub use desktop::{
-    DesktopRing, DesktopRingConfig, HostOutcome, HostRef, LocalIdentity, MemberView, PresenceView,
-    RingObserver, RingView,
+    DesktopRing, DesktopRingConfig, HostOutcome, HostRef, LocalIdentity, MemberView, PairingEvent,
+    PairingFlow, PairingObserver, PhoneOffer, PresenceView, RingObserver, RingView,
 };
 pub use store::HostMember;
 pub use sync::{HostRingState, HostSync, SyncWorker};
 
-/// The Hosted Relay, preset when a Ring is created. A placeholder until the domain is
-/// confirmed before release.
-pub const HOSTED_RELAY_URL: &str = "wss://relay.xshell.app";
+/// The Hosted Relay, preset when a Ring is created (defined in `xshell-protocol`, which
+/// `xshelld pair` shares).
+pub use xshell_protocol::ring::url::HOSTED_RELAY_URL;
 
 /// The Relay a new Ring starts on: `XSHELL_RELAY_URL` when set (development against a
 /// local Relay), else the Hosted Relay.

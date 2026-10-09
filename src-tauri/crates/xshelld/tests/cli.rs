@@ -317,3 +317,270 @@ fn connect_autostarts_after_persistent_handover() {
     p.client.hello(range(1, 1));
     assert!(p.finish().success());
 }
+
+// ---- `xshelld pair` -------------------------------------------------------------------------
+
+mod pair {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::Child;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use xshell_hostlink::ring::{
+        DesktopRing, DesktopRingConfig, PairingEvent, PairingFlow, PairingObserver, RingObserver,
+        RingView,
+    };
+    use xshell_protocol::ring::relay::test_relay::{TestRelay, TestRelayOptions};
+    use xshell_protocol::ring::relay::RingTimeouts;
+    use xshell_protocol::ring::{Role, RosterChain, SignKey};
+
+    struct Quiet;
+    impl RingObserver for Quiet {
+        fn changed(&self, _: &RingView) {}
+    }
+
+    #[derive(Default)]
+    struct Events(std::sync::Mutex<Vec<PairingEvent>>);
+    impl PairingObserver for Events {
+        fn pairing(&self, _: PairingFlow, e: &PairingEvent) {
+            self.0.lock().unwrap().push(e.clone());
+        }
+    }
+    impl Events {
+        fn outcome(&self) -> PairingEvent {
+            let deadline = Instant::now() + T;
+            loop {
+                if let Some(e) = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|e| **e != PairingEvent::Waiting)
+                {
+                    return e.clone();
+                }
+                assert!(Instant::now() < deadline, "no pairing outcome");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn timeouts() -> RingTimeouts {
+        RingTimeouts {
+            connect: Duration::from_secs(5),
+            request: Duration::from_secs(2),
+            ..RingTimeouts::default()
+        }
+    }
+
+    fn desktop(dir: &std::path::Path, url: &str) -> Arc<DesktopRing> {
+        let mut cfg = DesktopRingConfig::new(dir.join("ring"), "desk".into());
+        cfg.default_relay_url = url.into();
+        cfg.hosted_relay_url = url.into();
+        cfg.backoff_unit = Duration::from_millis(10);
+        cfg.timeouts = timeouts();
+        let r = DesktopRing::open(cfg, Arc::new(Quiet));
+        r.enable(None, false).unwrap();
+        let deadline = Instant::now() + T;
+        while r.view().connection != "connected" {
+            assert!(Instant::now() < deadline, "the desktop connected");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        r
+    }
+
+    fn relay() -> TestRelay {
+        TestRelay::start_with(TestRelayOptions {
+            auth_timeout: Duration::from_millis(500),
+            ..TestRelayOptions::default()
+        })
+    }
+
+    /// `xshelld pair` with its stdout read line by line.
+    fn pair(h: &TestHome, url: &str, env: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>) {
+        let mut c = bin_cmd(h);
+        c.args(["pair", "--relay", url, "--name", "box"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let mut child = c.spawn().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for l in BufReader::new(out).lines() {
+                let Ok(l) = l else { return };
+                if tx.send(l).is_err() {
+                    return;
+                }
+            }
+        });
+        (child, rx)
+    }
+
+    fn code(rx: &mpsc::Receiver<String>) -> String {
+        loop {
+            let l = rx.recv_timeout(T).expect("the code is shown");
+            if let Some(c) = l.strip_prefix("Pairing code: ") {
+                return c.to_string();
+            }
+        }
+    }
+
+    fn rest(rx: &mpsc::Receiver<String>) -> Vec<String> {
+        rx.iter().collect()
+    }
+
+    fn finish(mut child: Child, within: Duration) -> Option<i32> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                return s.code();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stored(h: &TestHome) -> Option<RosterChain> {
+        let p = h.paths().ring_dir.join("roster.json");
+        let v: Value = serde_json::from_slice(&fs::read(p).ok()?).ok()?;
+        let tokens: Vec<String> = serde_json::from_value(v["rosters"].clone()).unwrap();
+        RosterChain::from_tokens(&tokens).ok()
+    }
+
+    fn daemon_key(c: &RosterChain) -> Option<SignKey> {
+        c.head()
+            .roster()
+            .members
+            .iter()
+            .find(|m| m.role == Role::Daemon && m.name == "box")
+            .map(|m| m.sign_key)
+    }
+
+    #[test]
+    fn pair_prints_code_and_joins() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let ring = desktop(t.path(), &r.url());
+        let h = TestHome::new();
+        let (child, rx) = pair(&h, &r.url(), &[]);
+        let code = code(&rx);
+        assert_eq!(code.len(), 19, "{code}");
+        // Typed on the Desktop.
+        std::thread::sleep(Duration::from_millis(200));
+        let ev = Arc::new(Events::default());
+        ring.pair_computer(&code, ev.clone()).unwrap();
+        assert_eq!(
+            ev.outcome(),
+            PairingEvent::Paired {
+                name: "box".into(),
+                role: Role::Daemon
+            }
+        );
+        assert_eq!(finish(child, T), Some(0));
+        let lines = rest(&rx);
+        assert!(lines.iter().any(|l| l == "Paired as box"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("xshelld serve")),
+            "{lines:?}"
+        );
+        let chain = stored(&h).expect("the chain is stored");
+        assert_eq!(chain.head(), ring.chain().unwrap().head());
+        assert!(daemon_key(&chain).is_some());
+        // Its keys are its own and private.
+        let keys = h.paths().ring_dir.join("keys.json");
+        assert_eq!(
+            fs::metadata(keys).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Pairing again is refused without --force.
+        let out = bin_cmd(&h)
+            .args(["pair", "--relay", &r.url()])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
+        ring.quit();
+    }
+
+    #[test]
+    fn pair_hands_chain_to_running_serve() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let ring = desktop(t.path(), &r.url());
+        let h = TestHome::new();
+        let srv = start(&h, |c| {
+            c.ring_backoff_unit = Duration::from_millis(10);
+            c.ring_timeouts = timeouts();
+        });
+        let (child, rx) = pair(&h, &r.url(), &[]);
+        let code = code(&rx);
+        std::thread::sleep(Duration::from_millis(200));
+        ring.pair_computer(&code, Arc::new(Events::default()))
+            .unwrap();
+        assert_eq!(finish(child, T), Some(0));
+        let lines = rest(&rx);
+        assert!(
+            !lines.iter().any(|l| l.contains("not running")),
+            "{lines:?}"
+        );
+        // The running serve took the chain and is online on the Relay.
+        let mut c = Client::in_process(&srv, xshelld::server::Role::Desktop);
+        let id = c.request(&ClientMsg::RingIdentity).unwrap();
+        let head = ring.chain().unwrap();
+        assert_eq!(id["ring"]["version"], json!(head.head().version()));
+        let key = daemon_key(&head).unwrap();
+        assert_eq!(id["signKey"], json!(key.to_b64()));
+        let deadline = Instant::now() + T;
+        while !r.presence(head.ring_id(), &key).is_some_and(|p| p.online) {
+            assert!(Instant::now() < deadline, "the daemon is online");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ring.quit();
+    }
+
+    #[test]
+    fn pair_wrong_code_adds_nothing() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let ring = desktop(t.path(), &r.url());
+        let before = ring.chain().unwrap();
+        let h = TestHome::new();
+        let (child, rx) = pair(&h, &r.url(), &[("XSHELLD_PAIR_TTL_MS", "1500")]);
+        let code = code(&rx);
+        let mut wrong: Vec<char> = code.chars().collect();
+        wrong[0] = if wrong[0] == '0' { '1' } else { '0' };
+        let ev = Arc::new(Events::default());
+        ring.pair_computer(&wrong.iter().collect::<String>(), ev.clone())
+            .unwrap();
+        assert_eq!(
+            ev.outcome(),
+            PairingEvent::Failed {
+                code: "not_found".into()
+            }
+        );
+        assert_eq!(finish(child, T), Some(5));
+        assert!(rest(&rx)
+            .iter()
+            .any(|l| l == "This code expired. Run xshelld pair again to get a new one."));
+        assert_eq!(ring.chain().unwrap(), before);
+        assert!(stored(&h).is_none());
+        ring.quit();
+    }
+
+    #[test]
+    fn pair_expires() {
+        let r = relay();
+        let h = TestHome::new();
+        let (child, rx) = pair(&h, &r.url(), &[("XSHELLD_PAIR_TTL_MS", "500")]);
+        code(&rx);
+        assert_eq!(finish(child, T), Some(5));
+        assert!(stored(&h).is_none());
+    }
+}

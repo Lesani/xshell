@@ -63,10 +63,15 @@ jobs:
             echo "::error::xshell-protocol depends on a PTY, SQLite or Tauri crate"
             exit 1
           fi
+          # snow without `std`: its `std` feature would pull in the `ring` crypto crate.
+          if grep -E '^ring ' <<<"$tree"; then
+            echo "::error::xshell-protocol (default features) depends on the ring crate"
+            exit 1
+          fi
           # The codec alone (no default features) carries no crypto and no network code.
           bare=$(cargo tree -p xshell-protocol --no-default-features -e normal --prefix none --locked)
           grep -q '^xshell-protocol ' <<<"$bare"
-          if grep -E '^(ed25519-dalek|x25519-dalek|curve25519-dalek|sha2|tungstenite|rustls|ring|webpki-roots) ' <<<"$bare"; then
+          if grep -E '^(ed25519-dalek|x25519-dalek|curve25519-dalek|sha2|snow|blake2|chacha20poly1305|tungstenite|rustls|ring|webpki-roots) ' <<<"$bare"; then
             echo "::error::xshell-protocol --no-default-features depends on a crypto or network crate"
             exit 1
           fi

@@ -12,6 +12,8 @@ use std::time::Duration;
 pub enum Command {
     Serve(Opts),
     Connect(Opts),
+    /// `pair [--relay URL] [--name NAME] [--force]`: add this computer to a Ring.
+    Pair(Opts),
     /// `event <terminal|-> <status> [payload] [--socket PATH] [-v]`: report an agent hook
     /// (see `xshell_core::agent_status::event_main`), parsed there.
     Event(Vec<OsString>),
@@ -45,6 +47,12 @@ pub struct Opts {
     /// `serve --gui-bound --job NAME` (Windows): join the app's Job Object first, so the
     /// Daemon and its Terminals end with the app however it ends.
     pub job: Option<String>,
+    /// `pair --relay`: the Relay to meet the Desktop on (default: the Hosted Relay).
+    pub relay: Option<String>,
+    /// `pair --name`: this computer's name in the Roster (default: the hostname).
+    pub name: Option<String>,
+    /// `pair --force`: pair again although this computer is in a Ring already.
+    pub force: bool,
 }
 
 pub const USAGE: &str = "\
@@ -54,6 +62,8 @@ commands:
   connect     bridge stdin/stdout to the Daemon, starting it if needed (never
               when xshell on this machine runs it: then exit 4)
   serve       run the Daemon in the foreground
+  pair        add this computer to your devices: shows a code to enter in xshell
+              on another computer (Settings → Mobile → Add a computer)
   event       report an agent's status (run by agent hooks inside Terminals)
   --version   print name, version and protocol range as one line of JSON
 
@@ -68,6 +78,11 @@ serve options:
   --interactive-env  take PATH from an interactive login shell (rc files too);
                      implied by --gui-bound
   --job NAME         Windows: join the app's job object first (with --gui-bound)
+
+pair options:
+  --relay URL   the relay your xshell uses (default: the hosted relay)
+  --name NAME   this computer's name on your other devices (default: hostname)
+  --force       pair again although this computer is paired already
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
@@ -116,7 +131,7 @@ pub fn parse(
         "--help" | "-h" | "help" => return Ok(Command::Help),
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
-        "serve" | "connect" => {}
+        "serve" | "connect" | "pair" => {}
         other => return Err(format!("unknown command: {other}")),
     }
     let mut opts = Opts::default();
@@ -146,6 +161,11 @@ pub fn parse(
                     .ok_or_else(|| format!("--job: expected a job name, got {v:?}"))?;
                 opts.job = Some(name.to_string());
             }
+            "--relay" if cmd == "pair" => {
+                opts.relay = Some(value()?.to_string_lossy().into_owned())
+            }
+            "--name" if cmd == "pair" => opts.name = Some(value()?.to_string_lossy().into_owned()),
+            "--force" if cmd == "pair" && inline.is_none() => opts.force = true,
             "--parent-pid" => {
                 let v = value()?;
                 let pid = v
@@ -157,6 +177,9 @@ pub fn parse(
             }
             _ => return Err(format!("unknown option: {s}")),
         }
+    }
+    if cmd == "pair" && (opts.gui_bound || opts.parent_pid.is_some() || opts.interactive_env) {
+        return Err("--gui-bound, --parent-pid and --interactive-env are options of serve".into());
     }
     if cmd == "connect" && (opts.gui_bound || opts.parent_pid.is_some()) {
         return Err("--gui-bound and --parent-pid are options of serve only".into());
@@ -181,10 +204,10 @@ pub fn parse(
             opts.idle_timeout = Some(parse_ms(&v, "XSHELLD_IDLE_TIMEOUT_MS")?);
         }
     }
-    Ok(if cmd == "serve" {
-        Command::Serve(opts)
-    } else {
-        Command::Connect(opts)
+    Ok(match cmd {
+        "serve" => Command::Serve(opts),
+        "pair" => Command::Pair(opts),
+        _ => Command::Connect(opts),
     })
 }
 
@@ -381,6 +404,33 @@ mod tests {
         assert!(run(&["job-exec", "J", "cmd.exe"], &[]).is_err());
         assert!(run(&["job-exec", "J", "--"], &[]).is_err());
         assert!(run(&["job-exec", "", "--", "x"], &[]).is_err());
+    }
+
+    #[test]
+    fn parses_pair() {
+        assert_eq!(
+            run(
+                &[
+                    "pair",
+                    "--relay",
+                    "ws://127.0.0.1:1",
+                    "--name=box",
+                    "--force"
+                ],
+                &[]
+            ),
+            Ok(Command::Pair(Opts {
+                relay: Some("ws://127.0.0.1:1".into()),
+                name: Some("box".into()),
+                force: true,
+                ..Default::default()
+            }))
+        );
+        assert_eq!(run(&["pair"], &[]), Ok(Command::Pair(Opts::default())));
+        assert!(run(&["serve", "--relay", "x"], &[]).is_err());
+        assert!(run(&["connect", "--force"], &[]).is_err());
+        assert!(run(&["pair", "--gui-bound"], &[]).is_err());
+        assert!(run(&["pair", "--force=yes"], &[]).is_err());
     }
 
     #[test]

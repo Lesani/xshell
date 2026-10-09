@@ -49,3 +49,27 @@ export interface HostRingState {
   state: HostRingKind;
   error?: string;
 }
+
+// Pairing (#9): what `ring_pair_phone_start` answers and the `ring:pairing` event carries.
+
+// `rows[y][x]` is "1" for a dark module. No quiet zone; the UI adds the margin.
+export interface Qr {
+  size: number;
+  rows: string[];
+}
+
+export interface PhoneStart {
+  // The `xsp1.…` pairing text the QR code encodes.
+  payload: string;
+  qr: Qr;
+  // Unix seconds; shown only, the Desktop enforces the expiry.
+  expiresAt: number;
+}
+
+export type PairingFlow = "phone" | "computer";
+
+export type PairingEvent =
+  | { flow: PairingFlow; state: "waiting" }
+  | { flow: PairingFlow; state: "paired"; name: string; role: MemberRole }
+  | { flow: PairingFlow; state: "expired" }
+  | { flow: PairingFlow; state: "failed"; code: string };

@@ -12,7 +12,8 @@
 //! device back behind the head it already holds. It cannot prove freshness: a Relay can hide a
 //! newer version, and a fork signed by a removed or compromised Desktop is detectable (by the
 //! `prev` hash) only once two devices compare heads. Envelope `from` and presence are Relay
-//! assertions until the Noise sessions (#9) authenticate peers and payloads end to end.
+//! assertions; the Noise sessions ([`noise`], `relay::sessions`) authenticate peers and
+//! payloads end to end and bind `from` into each handshake.
 
 pub mod b64;
 pub mod chain;
@@ -20,6 +21,8 @@ pub mod entitlement;
 mod error;
 mod json;
 pub mod keys;
+pub mod noise;
+pub mod pairing;
 pub mod relay;
 pub mod ring_id;
 pub mod roster;
@@ -37,6 +40,10 @@ pub const RING_ID_CONTEXT: &str = "xshell-ring-v1\n";
 pub const ROSTER_CONTEXT: &str = "xshell-roster-v1\n";
 /// Prefix of the bytes a device signs to answer a Relay challenge.
 pub const AUTH_CONTEXT: &str = "xshell-relay-auth-v1\n";
+/// Prefix of the bytes a joining device signs over the pairing handshake hash.
+pub const PAIR_POP_CONTEXT: &str = pairing::POP_CONTEXT;
+/// Prefix of a session handshake's Noise prologue.
+pub const NOISE_CONTEXT: &str = noise::SESSION_PROLOGUE;
 /// Every Roster token starts with this.
 pub const ROSTER_PREFIX: &str = "xro1.";
 /// Every Push Gateway entitlement token starts with this (see `push/core/entitlement.ts`).

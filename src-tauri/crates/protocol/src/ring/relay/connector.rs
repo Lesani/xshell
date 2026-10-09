@@ -130,6 +130,12 @@ pub trait ConnectorEvents: Send + Sync {
     fn roster(&self, _chain: &RosterChain) {}
     fn presence(&self, _key: SignKey, _presence: &MemberPresence) {}
     fn moved(&self, _state: &MoveState) {}
+    /// An envelope from a member of the trusted head (its `from` is the Relay's word until a
+    /// Noise session authenticates it).
+    fn envelope(&self, _from: SignKey, _payload: Vec<u8>) {}
+    /// An `error` the Relay sent that answers no request (`offline`, `unknown_recipient`,
+    /// `entitlement_required`, …), `to` naming the envelope's addressee.
+    fn error(&self, _code: &ErrorCode, _to: Option<SignKey>) {}
 }
 
 struct Stop {
@@ -229,7 +235,14 @@ struct Attempt {
 }
 
 impl RingEvents for Attempt {
-    fn envelope(&self, _from: SignKey, _payload: Vec<u8>) {}
+    fn envelope(&self, from: SignKey, payload: Vec<u8>) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.is_current(self.gen) {
+            inner.events.envelope(from, payload);
+        }
+    }
 
     fn presence(&self, key: SignKey, presence: MemberPresence) {
         let Some(inner) = self.inner.upgrade() else {
@@ -268,9 +281,15 @@ impl RingEvents for Attempt {
 
     fn roster_rejected(&self, _error: super::super::RosterError) {}
 
-    fn error(&self, code: ErrorCode, _to: Option<SignKey>, _detail: Option<String>) {
+    fn error(&self, code: ErrorCode, to: Option<SignKey>, _detail: Option<String>) {
         if code == ErrorCode::EntitlementRequired {
             self.refresh();
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.is_current(self.gen) {
+            inner.events.error(&code, to);
         }
     }
 
@@ -758,6 +777,24 @@ impl Connector {
             Some(c) if !c.is_closed() => c.publish_roster(next),
             _ => Err(RingError::Closed(CloseReason::Local)),
         }
+    }
+
+    /// Sends one envelope on the current connection. `Err(Backpressure)` when its queue is
+    /// full, `Err(Closed)` when not connected. Delivery failures come back as
+    /// [`ConnectorEvents::error`].
+    pub fn send(&self, to: &SignKey, payload: &[u8]) -> Result<(), RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.send(to, payload),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// Whether the current connection is up and this Ring's envelopes are routed (not a
+    /// limited session).
+    pub fn routing(&self) -> bool {
+        let c = lock(&self.inner.st).client.clone();
+        c.is_some_and(|c| !c.is_closed() && !c.limited())
     }
 
     /// Every member of the trusted head with what the Relay says about it; `None` while not

@@ -7,6 +7,10 @@ use super::RingId;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// The Hosted Relay, preset when a Ring is created and the default of `xshelld pair`. A
+/// placeholder until the domain is confirmed before release.
+pub const HOSTED_RELAY_URL: &str = "wss://relay.xshell.app";
+
 /// A Roster's `relayUrl` is at most this long.
 pub const MAX_RELAY_URL_LEN: usize = 512;
 
@@ -108,6 +112,11 @@ impl RelayUrl {
     /// The WebSocket endpoint of one Ring on this Relay.
     pub fn ring_endpoint(&self, ring: &RingId) -> String {
         format!("{}{}/v1/ring/{}", self.origin(), self.path, ring)
+    }
+
+    /// The pairing pipe's WebSocket endpoint for `slot` on this Relay (section 16).
+    pub fn pair_endpoint(&self, slot: &str) -> String {
+        format!("{}{}/v1/pair/{}", self.origin(), self.path, slot)
     }
 
     pub fn is_loopback(&self) -> bool {

@@ -38,6 +38,19 @@ pub const QUOTA_REFUSALS_BEFORE_CLOSE: usize = 32;
 pub const PING: &str = r#"{"t":"ping"}"#;
 pub const PONG: &str = r#"{"t":"pong"}"#;
 
+/// A pairing pipe frame, either way, is at most this long (section 16).
+pub const MAX_PAIR_FRAME: usize = 16 * 1024;
+/// A pairing pipe socket sends at most this many `pair.msg` frames.
+pub const MAX_PAIR_MSGS: usize = 8;
+/// A pairing slot lives this long after its first open.
+pub const PAIR_SLOT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// A Relay keeps a slot's expiry state at most this long.
+pub const PAIR_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+/// Suggested Relay limits on the pipe: slot opens per client address per minute, and slots
+/// outstanding at once.
+pub const PAIR_OPENS_PER_MINUTE: u32 = 10;
+pub const PAIR_MAX_SLOTS: usize = 1000;
+
 /// The largest frame a client may send of type `t`.
 pub fn client_frame_cap(t: &str) -> usize {
     match t {
@@ -64,6 +77,10 @@ pub mod close {
     /// The same key connected again.
     pub const REPLACED: u16 = 4009;
     pub const QUOTA: u16 = 4029;
+    /// A third socket on a pairing slot, or a slot already used (section 16).
+    pub const PAIR_BUSY: u16 = 4010;
+    /// A pairing slot's time is up (section 16).
+    pub const PAIR_EXPIRED: u16 = 4008;
 }
 
 /// An `error` frame's `code`.
@@ -89,6 +106,12 @@ pub enum ErrorCode {
     EntitlementRequired,
     EntitlementInvalid,
     Internal,
+    /// Pairing pipe: a third socket, or a slot already used.
+    PairBusy,
+    /// Pairing pipe: the slot expired.
+    PairExpired,
+    /// Pairing pipe: more than [`MAX_PAIR_MSGS`] messages in one direction.
+    TooMany,
     /// A code this version does not know.
     Other(String),
 }
@@ -114,6 +137,9 @@ const ERROR_CODES: &[(ErrorCode, &str)] = &[
     (ErrorCode::EntitlementRequired, "entitlement_required"),
     (ErrorCode::EntitlementInvalid, "entitlement_invalid"),
     (ErrorCode::Internal, "internal"),
+    (ErrorCode::PairBusy, "pair_busy"),
+    (ErrorCode::PairExpired, "pair_expired"),
+    (ErrorCode::TooMany, "too_many"),
 ];
 
 impl ErrorCode {
@@ -464,6 +490,82 @@ const RELAY_TYPES: &[&str] = &[
     "pong",
 ];
 
+/// Pairing pipe, client → Relay (section 16).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "t")]
+pub enum PairClientFrame {
+    /// `payload`: b64u, at most 8192 bytes decoded; forwarded to the other socket.
+    #[serde(rename = "pair.msg")]
+    Msg { payload: String },
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+/// Pairing pipe, Relay → client (section 16).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "t")]
+pub enum PairRelayFrame {
+    /// The first socket on the slot: waiting for the other side.
+    #[serde(rename = "pair.wait")]
+    Wait { v: u32 },
+    /// Both sides are here.
+    #[serde(rename = "pair.peer")]
+    Peer,
+    #[serde(rename = "pair.msg")]
+    Msg { payload: String },
+    #[serde(rename = "error")]
+    Error {
+        code: ErrorCode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    #[serde(rename = "pong")]
+    Pong,
+    #[serde(skip)]
+    Unknown { t: String },
+}
+
+const PAIR_CLIENT_TYPES: &[&str] = &["pair.msg", "ping"];
+const PAIR_RELAY_TYPES: &[&str] = &["pair.wait", "pair.peer", "pair.msg", "error", "pong"];
+
+/// Decodes a pairing pipe frame from a client: at most [`MAX_PAIR_FRAME`]; an unknown `t`
+/// decodes as `Err(Invalid)` (the Relay refuses it).
+pub fn decode_pair_client(text: &str) -> Result<PairClientFrame, WireError> {
+    let (v, t) = split(text, MAX_PAIR_FRAME)?;
+    if !PAIR_CLIENT_TYPES.contains(&t.as_str()) {
+        return Err(WireError::Invalid {
+            t,
+            error: "not a pairing frame".into(),
+        });
+    }
+    typed(v, t)
+}
+
+/// Decodes a pairing pipe frame from the Relay.
+pub fn decode_pair_relay(text: &str) -> Result<PairRelayFrame, WireError> {
+    let (v, t) = split(text, MAX_PAIR_FRAME)?;
+    if !PAIR_RELAY_TYPES.contains(&t.as_str()) {
+        return Ok(PairRelayFrame::Unknown { t });
+    }
+    typed(v, t)
+}
+
+impl PairClientFrame {
+    pub fn encode(&self) -> String {
+        encode_tagged(self, None)
+    }
+}
+
+impl PairRelayFrame {
+    pub fn encode(&self) -> String {
+        let unknown = match self {
+            PairRelayFrame::Unknown { t } => Some(t.as_str()),
+            _ => None,
+        };
+        encode_tagged(self, unknown)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     /// Not a JSON object with a string `t`, or duplicate keys.
@@ -771,6 +873,35 @@ mod tests {
         assert!(decode_relay(&format!(r#"{{"t":"error","code":"x","id":{}}}"#, max + 1)).is_err());
         assert!(decode_relay(r#"{"t":"error","code":"x","id":null}"#).is_ok());
         assert!(decode_relay(r#"{"t":"error","code":"x"}"#).is_ok());
+    }
+
+    #[test]
+    fn pair_frames_round_trip() {
+        assert_eq!(
+            PairRelayFrame::Wait { v: 1 }.encode(),
+            r#"{"t":"pair.wait","v":1}"#
+        );
+        assert_eq!(PairRelayFrame::Peer.encode(), r#"{"t":"pair.peer"}"#);
+        assert_eq!(PairClientFrame::Ping.encode(), PING);
+        let m = PairClientFrame::Msg {
+            payload: b64::encode(b"x"),
+        };
+        assert_eq!(decode_pair_client(&m.encode()).unwrap(), m);
+        assert!(decode_pair_client(r#"{"t":"env","to":"x","payload":""}"#).is_err());
+        assert!(decode_pair_client(&format!(
+            r#"{{"t":"pair.msg","payload":"{}"}}"#,
+            "A".repeat(MAX_PAIR_FRAME)
+        ))
+        .is_err());
+        let e = PairRelayFrame::Error {
+            code: ErrorCode::PairBusy,
+            detail: None,
+        };
+        assert_eq!(decode_pair_relay(&e.encode()).unwrap(), e);
+        assert_eq!(
+            decode_pair_relay(r#"{"t":"later"}"#).unwrap(),
+            PairRelayFrame::Unknown { t: "later".into() }
+        );
     }
 
     #[test]

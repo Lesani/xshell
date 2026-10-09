@@ -1,14 +1,16 @@
 //! This Host as a Ring member (`daemon` role): its device keys, the Roster chain it trusts,
-//! and the Relay connection ([`Connector`]) that reports it online. The Relay carries only
-//! presence and the Roster here; envelopes are ignored until the Noise sessions (#9).
+//! and the Relay connection ([`Connector`]) that reports it online and carries the Noise
+//! sessions Desktops and Mobiles open to it ([`super::relay_conn`]).
 //!
 //! State lives in [`Paths::ring_dir`](crate::paths::Paths::ring_dir), 0700:
-//! - `keys.json` `{"v":1,"signSeed":b64u,"noiseSeed":b64u}`, created on the first
-//!   `ring.identity`; the private keys never leave this Host;
-//! - `roster.json` `{"v":1,"rosters":["xro1…",…]}`, the whole verified chain from version 1.
+//! - `keys.json` `{"v":1,"signSeed":b64u,"noiseSeed":b64u}`, created on first use (the first
+//!   `ring.identity`, or `xshelld pair`); the private keys never leave this Host;
+//! - `roster.json` `{"v":1,"rosters":["xro1…",…]}`, the whole verified chain from version 1;
+//! - `ring.lock`, held (flock) for every change to the other two, by `serve` and by
+//!   `xshelld pair` alike, so neither replaces the other's keys or rolls its chain back.
 //!
-//! Both are 0600, written through an exclusive temp file and a rename. An existing file that
-//! is a symlink or another user's is refused; one with a broader mode is tightened. On
+//! The files are 0600, written through an exclusive temp file and a rename. An existing file
+//! that is a symlink or another user's is refused; one with a broader mode is tightened. On
 //! Windows the same holds with owners and a protected user-only DACL in place of modes,
 //! and reparse points refused (`xshell_core::private_fs`).
 
@@ -26,11 +28,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use xshell_protocol::msg::{JoinExpect, MEMBERSHIP_CHANGED};
+use xshell_protocol::ring::relay::sessions::Sessions;
+use xshell_protocol::ring::relay::wire::{ErrorCode, MemberPresence};
 use xshell_protocol::ring::relay::{
     ByeReason, Connector, ConnectorConfig, ConnectorEvents, LinkState, RingClientConfig,
     RingTimeouts,
 };
-use xshell_protocol::ring::{member_name, DeviceKeys, Role, RosterChain, RosterError, SecretSeed};
+use xshell_protocol::ring::{
+    member_name, DeviceKeys, Role, RosterChain, RosterError, SecretSeed, SignKey,
+};
 
 /// What a Host is called when its hostname is unusable.
 const FALLBACK_NAME: &str = "this computer";
@@ -165,11 +171,75 @@ pub(crate) fn host_name() -> String {
 }
 
 /// The files in the ring directory.
-struct Store {
-    dir: PathBuf,
+pub(crate) struct Store {
+    pub dir: PathBuf,
 }
 
+/// What [`Store::save_chain`] settled on.
+#[derive(Debug)]
+pub(crate) struct Saved {
+    /// The chain to trust from now on.
+    pub trusted: RosterChain,
+    /// The chain forked the stored one: refused, and `trusted` is the stored chain.
+    pub conflict: Option<String>,
+    /// `trusted` could not be written (it is in force all the same).
+    pub write_error: Option<String>,
+}
+
+impl Saved {
+    fn new(trusted: RosterChain, write_error: Option<String>) -> Saved {
+        Saved {
+            trusted,
+            conflict: None,
+            write_error,
+        }
+    }
+}
+
+/// `ring.lock`, held while it lives.
+pub(crate) struct StoreLock(#[allow(dead_code)] fs::File);
+
 impl Store {
+    #[cfg_attr(windows, allow(dead_code))] // `xshelld pair` is Unix only
+    pub fn new(dir: PathBuf) -> Store {
+        Store { dir }
+    }
+
+    /// Takes `ring.lock`, waiting for another process (or thread) that holds it. Never
+    /// nested: every caller takes it once around one read-modify-write.
+    pub fn lock(&self) -> Result<StoreLock, String> {
+        self.ensure_dir().map_err(|e| e.to_string())?;
+        let path = self.dir.join("ring.lock");
+        #[cfg(windows)]
+        let f = xshell_core::private_fs::open_or_create(&path);
+        #[cfg(unix)]
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path);
+        let f = f.map_err(|e| format!("cannot open the ring lock: {e}"))?;
+        f.lock()
+            .map_err(|e| format!("cannot take the ring lock: {e}"))?;
+        Ok(StoreLock(f))
+    }
+
+    /// The stored keys, or new ones, under the lock: a key file another process wrote
+    /// meanwhile is read, never replaced.
+    pub fn load_or_create_keys(&self) -> Result<DeviceKeys, String> {
+        if let Some(k) = self.load_keys()? {
+            return Ok(k);
+        }
+        let _l = self.lock()?;
+        match self.load_keys()? {
+            Some(k) => Ok(k),
+            None => self.create_keys(),
+        }
+    }
+
     fn keys_path(&self) -> PathBuf {
         self.dir.join("keys.json")
     }
@@ -191,7 +261,7 @@ impl Store {
 
     /// The stored keys; `None` when there are none yet. An unreadable file is an error, never
     /// replaced: the keys are this Host's identity.
-    fn load_keys(&self) -> Result<Option<DeviceKeys>, String> {
+    pub fn load_keys(&self) -> Result<Option<DeviceKeys>, String> {
         if !self.dir.exists() {
             return Ok(None);
         }
@@ -216,8 +286,15 @@ impl Store {
         )))
     }
 
+    /// Only under the lock, after `load_keys` found none.
     fn create_keys(&self) -> Result<DeviceKeys, String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
+        if self.keys_path().exists() || fs::symlink_metadata(self.keys_path()).is_ok() {
+            return Err(format!(
+                "{} appeared while creating keys; refusing to replace it",
+                self.keys_path().display()
+            ));
+        }
         let k = DeviceKeys::generate().map_err(|e| e.to_string())?;
         let (s, n) = k.seeds();
         let f = KeysFile {
@@ -232,28 +309,45 @@ impl Store {
         Ok(k)
     }
 
-    /// The stored chain. An unreadable or unverifiable file is moved aside and logged: this
-    /// Host is then in no Ring until a Desktop sends `ring.join` again.
-    fn load_chain(&self) -> Option<RosterChain> {
+    /// The stored chain as it is: `Ok(None)` when there is none, `Err` when it is
+    /// unreadable or does not verify.
+    pub fn read_chain(&self) -> Result<Option<RosterChain>, String> {
         let p = self.roster_path();
-        let bytes = match read_private(&p) {
-            Ok(Some(b)) => b,
-            Ok(None) => return None,
-            Err(e) => {
-                crate::log!("ERROR", "cannot read {}: {e}", p.display());
-                return None;
-            }
+        let Some(bytes) = read_private(&p).map_err(|e| e.to_string())? else {
+            return Ok(None);
         };
-        let chain = serde_json::from_slice::<RosterFile>(&bytes)
+        serde_json::from_slice::<RosterFile>(&bytes)
             .map_err(|e| e.to_string())
             .and_then(|f| {
                 if f.v != 1 {
                     return Err("unknown format".to_string());
                 }
                 RosterChain::from_tokens(&f.rosters).map_err(|e| e.to_string())
-            });
-        match chain {
-            Ok(c) => Some(c),
+            })
+            .map(Some)
+    }
+
+    /// The stored chain. An unreadable or unverifiable file is moved aside (under the lock)
+    /// and logged: this Host is then in no Ring until a Desktop sends `ring.join` again.
+    fn load_chain(&self) -> Option<RosterChain> {
+        let p = self.roster_path();
+        match read_private(&p) {
+            Ok(Some(_)) => {}
+            Ok(None) => return None,
+            Err(e) => {
+                crate::log!("ERROR", "cannot read {}: {e}", p.display());
+                return None;
+            }
+        }
+        let _l = match self.lock() {
+            Ok(l) => l,
+            Err(e) => {
+                crate::log!("ERROR", "ring: {e}");
+                return None;
+            }
+        };
+        match self.read_chain() {
+            Ok(c) => c,
             Err(e) => {
                 let aside = p.with_extension(format!("json.bad-{}", super::registry::now_ms()));
                 let _ = fs::rename(&p, &aside);
@@ -268,7 +362,43 @@ impl Store {
         }
     }
 
-    fn save_chain(&self, chain: &RosterChain) -> Result<(), String> {
+    /// Settles `chain` against the store under the lock, and saves the result. For the same
+    /// Ring the stored chain must accept `chain` by the chain rules
+    /// ([`RosterChain::extended`]): versions it holds are skipped, so a newer stored head
+    /// (another process saved it meanwhile) wins. A fork of the stored chain is a trust
+    /// conflict: nothing is written and the stored chain stays the trusted one. Another Ring
+    /// (an explicit replacement), or no readable file: `chain` is the one. A write that fails
+    /// is reported apart: the settled chain is trusted all the same.
+    pub fn save_chain(&self, chain: &RosterChain) -> Saved {
+        let _l = match self.lock() {
+            Ok(l) => l,
+            Err(e) => return Saved::new(chain.clone(), Some(e)),
+        };
+        let next = match self.read_chain() {
+            Ok(Some(disk)) if disk.ring_id() == chain.ring_id() => {
+                match disk.extended(chain.versions()) {
+                    Ok((merged, _)) if merged == disk => return Saved::new(disk, None),
+                    Ok((merged, _)) => merged,
+                    Err(e) => {
+                        return Saved {
+                            trusted: disk,
+                            conflict: Some(format!(
+                                "the roster conflicts with the one stored here ({})",
+                                e.as_code()
+                            )),
+                            write_error: None,
+                        }
+                    }
+                }
+            }
+            _ => chain.clone(),
+        };
+        let err = self.write_chain(&next).err();
+        Saved::new(next, err)
+    }
+
+    /// Writes `chain` as it is; only with the lock held.
+    pub fn write_chain(&self, chain: &RosterChain) -> Result<(), String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
         let f = RosterFile {
             v: 1,
@@ -285,6 +415,8 @@ impl Store {
 
 struct Joined {
     connector: Arc<Connector>,
+    /// The Noise sessions over this Connector.
+    sessions: Sessions,
 }
 
 /// The chain the store holds, shared with the Connector's callbacks.
@@ -294,27 +426,46 @@ struct Persist {
 }
 
 impl Persist {
-    /// Keeps `chain` if it is the stored Ring's and newer (or there is none).
-    fn keep_newer(&self, chain: &RosterChain) {
+    /// A newer chain from the Relay: settled against the store first, then trusted in
+    /// memory, handed to the Connector when the store had more (or held a conflicting
+    /// fork, which is refused), and swept, all under the trusted chain's lock, which local
+    /// joins hold for the same sequence. A chain not newer than the trusted one (a callback
+    /// that lost the race to a local join) changes nothing.
+    fn keep_newer(&self, chain: &RosterChain, connector: Option<&Connector>, sessions: &Sessions) {
         let mut cur = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cur.as_ref() {
             if c.ring_id() != chain.ring_id() || c.head().version() >= chain.head().version() {
                 return;
             }
         }
-        match self.store.save_chain(chain) {
-            Ok(()) => *cur = Some(chain.clone()),
-            Err(e) => crate::log!("ERROR", "cannot save the Roster: {e}"),
+        let saved = self.store.save_chain(chain);
+        if let Some(e) = &saved.conflict {
+            crate::log!("ERROR", "ring: refused a roster from the relay: {e}");
         }
+        if let Some(e) = &saved.write_error {
+            crate::log!("ERROR", "cannot save the Roster: {e}");
+        }
+        let trusted = saved.trusted;
+        if &trusted != chain {
+            if let Some(c) = connector {
+                c.set_chain(trusted.clone(), None);
+            }
+        }
+        sessions.sweep(trusted.head());
+        *cur = Some(trusted);
     }
 }
 
 struct Events {
     persist: Arc<Persist>,
+    sessions: Sessions,
+    /// The Connector these events are of (set once it exists).
+    connector: Arc<std::sync::OnceLock<std::sync::Weak<Connector>>>,
 }
 
 impl ConnectorEvents for Events {
     fn state(&self, s: &LinkState) {
+        self.sessions.state(s);
         match s {
             LinkState::Connected { limited } => {
                 crate::log!("INFO", "ring: connected to the relay (limited: {limited})")
@@ -331,7 +482,20 @@ impl ConnectorEvents for Events {
     }
 
     fn roster(&self, chain: &RosterChain) {
-        self.persist.keep_newer(chain);
+        let c = self.connector.get().and_then(std::sync::Weak::upgrade);
+        self.persist.keep_newer(chain, c.as_deref(), &self.sessions);
+    }
+
+    fn presence(&self, key: SignKey, p: &MemberPresence) {
+        self.sessions.presence(key, p);
+    }
+
+    fn envelope(&self, from: SignKey, payload: Vec<u8>) {
+        self.sessions.envelope(from, &payload);
+    }
+
+    fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
+        self.sessions.error(code, to);
     }
 }
 
@@ -351,6 +515,8 @@ pub(crate) struct Ring {
     persist: Arc<Persist>,
     keys: Mutex<Option<Arc<DeviceKeys>>>,
     life: Mutex<Life>,
+    /// Builds each Connector's sessions and hands accepted ones to the Daemon.
+    hub: super::relay_conn::Hub,
     name: String,
     backoff_unit: Duration,
     timeouts: RingTimeouts,
@@ -369,7 +535,12 @@ fn link_json(s: &LinkState) -> (&'static str, Option<String>) {
 }
 
 impl Ring {
-    pub fn new(dir: PathBuf, backoff_unit: Duration, timeouts: RingTimeouts) -> Ring {
+    pub fn new(
+        dir: PathBuf,
+        backoff_unit: Duration,
+        timeouts: RingTimeouts,
+        write_stall: Duration,
+    ) -> Ring {
         Ring {
             persist: Arc::new(Persist {
                 store: Store { dir },
@@ -377,12 +548,17 @@ impl Ring {
             }),
             keys: Mutex::new(None),
             life: Mutex::new(Life::default()),
+            hub: super::relay_conn::Hub::new(write_stall),
             name: host_name(),
             backoff_unit,
             timeouts,
             #[cfg(test)]
             install_hook: Mutex::new(None),
         }
+    }
+
+    pub fn hub(&self) -> &super::relay_conn::Hub {
+        &self.hub
     }
 
     /// At start: rejoin the stored Ring, if this Host is a member of it.
@@ -413,10 +589,10 @@ impl Ring {
     fn keys(&self, create: bool) -> Result<Option<Arc<DeviceKeys>>, String> {
         let mut g = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            let k = match self.persist.store.load_keys()? {
-                Some(k) => Some(k),
-                None if create => Some(self.persist.store.create_keys()?),
-                None => None,
+            let k = if create {
+                Some(self.persist.store.load_or_create_keys()?)
+            } else {
+                self.persist.store.load_keys()?
             };
             *g = k.map(Arc::new);
         }
@@ -439,6 +615,7 @@ impl Ring {
             return Err("xshelld is exiting".into());
         }
         if let Some(old) = life.joined.take() {
+            old.sessions.stop();
             match std::thread::Builder::new()
                 .name("ring-leave".into())
                 .spawn({
@@ -450,19 +627,27 @@ impl Ring {
                 Err(_) => old.connector.stop(ByeReason::quit()),
             }
         }
+        let sessions = self.hub.sessions(keys.clone());
         let mut client = RingClientConfig::new(chain, keys);
         client.timeouts = self.timeouts;
         let mut cfg = ConnectorConfig::new(client);
         cfg.backoff_unit = self.backoff_unit;
+        let slot: Arc<std::sync::OnceLock<std::sync::Weak<Connector>>> = Arc::default();
         let c = Connector::start(
             cfg,
             Arc::new(Events {
                 persist: self.persist.clone(),
+                sessions: sessions.clone(),
+                connector: slot.clone(),
             }),
         )
         .map_err(|e| e.to_string())?;
+        let connector = Arc::new(c);
+        let _ = slot.set(Arc::downgrade(&connector));
+        sessions.attach(&connector);
         life.joined = Some(Joined {
-            connector: Arc::new(c),
+            connector,
+            sessions,
         });
         Ok(())
     }
@@ -543,24 +728,49 @@ impl Ring {
             }
             _ => chain,
         };
-        let version = next.head().version();
+        // Settled against the store first (under ring.lock): a newer stored head wins, and a
+        // fork of the stored chain is refused, leaving the established trust in force.
         let changed = cur.as_ref() != Some(&next);
-        if changed {
-            self.persist.store.save_chain(&next)?;
-            *cur = Some(next.clone());
-        }
-        drop(cur);
+        let saved = if changed {
+            self.persist.store.save_chain(&next)
+        } else {
+            Saved::new(next, None)
+        };
+        let trusted = saved.trusted;
+        // Then in force at once, whether or not the write succeeded: in memory, in the
+        // Connector (whose head new handshakes are checked against), and in the sweep.
+        let same_ring = cur
+            .as_ref()
+            .is_some_and(|c| c.ring_id() == trusted.ring_id());
+        let moved = cur.as_ref() != Some(&trusted);
+        *cur = Some(trusted.clone());
         match life.joined.as_ref() {
             Some(j) if same_ring => {
-                if changed {
-                    j.connector.set_chain(next, None);
+                if moved {
+                    j.connector.set_chain(trusted.clone(), None);
                 } else {
                     j.connector.kick();
                 }
+                j.sessions.sweep(trusted.head());
             }
             // Another Ring (or none): replace the Connector.
-            _ => self.install(&mut life, next, keys)?,
+            _ => self.install(&mut life, trusted.clone(), keys)?,
         }
+        drop(cur);
+        if let Some(e) = saved.conflict {
+            crate::log!("ERROR", "ring: refused a roster: {e}");
+            return Err(format!("roster refused: {e}"));
+        }
+        if let Some(e) = saved.write_error {
+            crate::log!(
+                "ERROR",
+                "ring: the new roster is in force but not saved: {e}"
+            );
+            return Err(format!(
+                "the roster is in force but could not be saved: {e}"
+            ));
+        }
+        let version = trusted.head().version();
         Ok(json!({ "version": version }))
     }
 
@@ -573,6 +783,7 @@ impl Ring {
             (life.joined.take(), std::mem::take(&mut life.retiring))
         };
         if let Some(j) = joined {
+            j.sessions.stop();
             j.connector.stop(reason);
         }
         for h in retiring {
@@ -598,7 +809,7 @@ fn expected(x: &JoinExpect, now: Option<(String, u64)>) -> bool {
     }
 }
 
-fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
+pub(crate) fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
     chain
         .head()
         .member(&keys.sign_key())
@@ -647,6 +858,7 @@ mod tests {
             t.path().join("ring"),
             Duration::from_millis(10),
             timeouts,
+            Duration::from_secs(5),
         ));
         let id = ring.identity().unwrap();
         let sign = xshell_protocol::ring::SignKey::parse(id["signKey"].as_str().unwrap()).unwrap();
@@ -688,6 +900,217 @@ mod tests {
         *ring.install_hook.lock().unwrap() = None;
         let tokens = vec![g.token().to_string(), v2.token().to_string()];
         assert_eq!(ring.join(&tokens, None).unwrap_err(), "xshelld is exiting");
+    }
+
+    /// `serve` (`ring.identity`) and `xshelld pair` making this Host's keys at the same
+    /// time: one set is created and both use it.
+    #[test]
+    fn simultaneous_first_use_makes_one_identity() {
+        for _ in 0..5 {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("ring");
+            let ring = Arc::new(Ring::new(
+                dir.clone(),
+                Duration::from_millis(10),
+                RingTimeouts::default(),
+                Duration::from_secs(5),
+            ));
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let mut hs = Vec::new();
+            for i in 0..5 {
+                let (ring, dir, b) = (ring.clone(), dir.clone(), barrier.clone());
+                hs.push(std::thread::spawn(move || {
+                    b.wait();
+                    if i == 0 {
+                        ring.identity().unwrap()["signKey"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    } else {
+                        Store::new(dir)
+                            .load_or_create_keys()
+                            .unwrap()
+                            .sign_key()
+                            .to_b64()
+                    }
+                }));
+            }
+            let keys: Vec<String> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+            assert!(keys.iter().all(|k| *k == keys[0]), "{keys:?}");
+            let on_disk = Store::new(dir)
+                .load_keys()
+                .unwrap()
+                .unwrap()
+                .sign_key()
+                .to_b64();
+            assert_eq!(on_disk, keys[0]);
+        }
+    }
+
+    /// `xshelld pair` and `serve` storing chains of one Ring in turn: the store only ever
+    /// moves forward along the chain, a fork is refused (and the verified head still rules
+    /// in memory), and what is trusted in memory follows the store's newer head.
+    #[test]
+    fn interleaved_stores_never_roll_back_or_fork() {
+        use xshell_protocol::ring::{Member, SignedRoster};
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let ring = Ring::new(
+            dir.clone(),
+            Duration::from_millis(10),
+            RingTimeouts {
+                connect: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        );
+        let id = ring.identity().unwrap();
+        let sign = xshell_protocol::ring::SignKey::parse(id["signKey"].as_str().unwrap()).unwrap();
+        let noise =
+            xshell_protocol::ring::NoiseKey::parse(id["noiseKey"].as_str().unwrap()).unwrap();
+        let desk = DeviceKeys::generate().unwrap();
+        let g = SignedRoster::genesis(&desk, desk.noise_key(), "d", "ws://127.0.0.1:9", 1).unwrap();
+        let mut v = vec![g.clone()];
+        v.push(
+            g.next(&desk, 2, |d| {
+                d.add(Member::new("h", Role::Daemon, sign, noise, 2))
+            })
+            .unwrap(),
+        );
+        for i in 3..=5u64 {
+            let k = DeviceKeys::generate().unwrap();
+            let n = v.last().unwrap().next(&desk, i, |d| {
+                d.add(Member::new(
+                    "m",
+                    Role::Mobile,
+                    k.sign_key(),
+                    k.noise_key(),
+                    i,
+                ))
+            });
+            v.push(n.unwrap());
+        }
+        let upto = |n: usize| RosterChain::from_chain(v[..n].to_vec()).unwrap();
+        let tokens = |c: &RosterChain| -> Vec<String> {
+            c.versions().iter().map(|r| r.token().to_string()).collect()
+        };
+        let store = Store::new(dir.clone());
+        assert_eq!(ring.join(&tokens(&upto(2)), None).unwrap()["version"], 2);
+        // `xshelld pair` stores v4; `serve` then joins v3: the store keeps v4, and so does
+        // the trusted chain in memory.
+        {
+            let _l = store.lock().unwrap();
+            store.write_chain(&upto(4)).unwrap();
+        }
+        assert_eq!(ring.join(&tokens(&upto(3)), None).unwrap()["version"], 4);
+        assert_eq!(store.read_chain().unwrap().unwrap(), upto(4));
+        assert_eq!(store.save_chain(&upto(2)).trusted, upto(4));
+        // A fork of a higher version: refused by the store, which keeps its chain.
+        let other = DeviceKeys::generate().unwrap();
+        let fork5 = v[3]
+            .next(&desk, 9, |d| {
+                d.add(Member::new(
+                    "o",
+                    Role::Mobile,
+                    other.sign_key(),
+                    other.noise_key(),
+                    9,
+                ))
+            })
+            .unwrap();
+        let mut fv = v[..4].to_vec();
+        fv.push(fork5);
+        let forked = RosterChain::from_chain(fv).unwrap();
+        {
+            let _l = store.lock().unwrap();
+            store.write_chain(&upto(5)).unwrap();
+        }
+        let s5 = store.save_chain(&forked);
+        assert!(s5.conflict.is_some());
+        assert_eq!(s5.trusted, upto(5));
+        assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
+        // `serve` handed the fork: refused, and the established v5 is what is in force.
+        let e = ring.join(&tokens(&forked), None).unwrap_err();
+        assert!(e.contains("conflicts"), "{e}");
+        assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
+        assert_eq!(ring.identity().unwrap()["ring"]["version"], 5);
+        // Another Ring is an explicit replacement, not a fork.
+        let desk2 = DeviceKeys::generate().unwrap();
+        let g2 =
+            SignedRoster::genesis(&desk2, desk2.noise_key(), "d2", "ws://127.0.0.1:9", 1).unwrap();
+        let v2b = g2
+            .next(&desk2, 2, |d| {
+                d.add(Member::new("h", Role::Daemon, sign, noise, 2))
+            })
+            .unwrap();
+        let other_ring = RosterChain::from_chain(vec![g2, v2b]).unwrap();
+        assert_eq!(ring.join(&tokens(&other_ring), None).unwrap()["version"], 2);
+        assert_eq!(store.read_chain().unwrap().unwrap(), other_ring);
+        ring.stop(ByeReason::quit());
+    }
+
+    /// A Relay callback that lost the race to a local `ring.join` (it carries an older head)
+    /// changes nothing: the Connector keeps the joined head.
+    #[test]
+    fn a_stale_relay_callback_never_rolls_the_connector_back() {
+        use xshell_protocol::ring::{Member, SignedRoster};
+        let t = tempfile::tempdir().unwrap();
+        let ring = Ring::new(
+            t.path().join("ring"),
+            Duration::from_millis(10),
+            RingTimeouts {
+                connect: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        );
+        let id = ring.identity().unwrap();
+        let sign = xshell_protocol::ring::SignKey::parse(id["signKey"].as_str().unwrap()).unwrap();
+        let noise =
+            xshell_protocol::ring::NoiseKey::parse(id["noiseKey"].as_str().unwrap()).unwrap();
+        let desk = DeviceKeys::generate().unwrap();
+        let g = SignedRoster::genesis(&desk, desk.noise_key(), "d", "ws://127.0.0.1:9", 1).unwrap();
+        let mut v = vec![g.clone()];
+        v.push(
+            g.next(&desk, 2, |d| {
+                d.add(Member::new("h", Role::Daemon, sign, noise, 2))
+            })
+            .unwrap(),
+        );
+        let k = DeviceKeys::generate().unwrap();
+        let v3 = v[1]
+            .next(&desk, 3, |d| {
+                d.add(Member::new(
+                    "m",
+                    Role::Mobile,
+                    k.sign_key(),
+                    k.noise_key(),
+                    3,
+                ))
+            })
+            .unwrap();
+        v.push(v3);
+        let upto = |n: usize| RosterChain::from_chain(v[..n].to_vec()).unwrap();
+        let tokens: Vec<String> = upto(3)
+            .versions()
+            .iter()
+            .map(|r| r.token().to_string())
+            .collect();
+        assert_eq!(ring.join(&tokens, None).unwrap()["version"], 3);
+        let (connector, sessions) = {
+            let life = ring.lock_life();
+            let j = life.joined.as_ref().unwrap();
+            (j.connector.clone(), j.sessions.clone())
+        };
+        // The callback of the older head arrives after the join.
+        ring.persist
+            .keep_newer(&upto(2), Some(&connector), &sessions);
+        assert_eq!(connector.chain(), upto(3));
+        assert_eq!(
+            ring.persist.chain.lock().unwrap().as_ref().unwrap(),
+            &upto(3)
+        );
+        ring.stop(ByeReason::quit());
     }
 
     #[test]

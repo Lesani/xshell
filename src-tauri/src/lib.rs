@@ -343,6 +343,10 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "ring_enable",
     "ring_set_relay_url",
     "ring_claim_host",
+    "ring_pair_phone_start",
+    "ring_pair_phone_cancel",
+    "ring_pair_computer",
+    "ring_pair_cancel",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -672,7 +676,11 @@ pub fn run() {
             ring::ring_status,
             ring::ring_enable,
             ring::ring_set_relay_url,
-            ring::ring_claim_host
+            ring::ring_claim_host,
+            ring::ring_pair_phone_start,
+            ring::ring_pair_phone_cancel,
+            ring::ring_pair_computer,
+            ring::ring_pair_cancel
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -751,7 +759,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 71);
+        assert_eq!(registered.len(), 75);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

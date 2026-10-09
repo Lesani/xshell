@@ -16,7 +16,8 @@ mod outbox;
 pub mod parent;
 mod registry;
 mod relaunch;
-mod ring;
+mod relay_conn;
+pub(crate) mod ring;
 mod role;
 pub use role::Role;
 mod signals;
@@ -329,6 +330,7 @@ impl Server {
             paths.ring_dir.clone(),
             cfg.ring_backoff_unit,
             cfg.ring_timeouts,
+            cfg.write_stall_timeout,
         );
         let d = Arc::new(Daemon {
             cfg,
@@ -347,6 +349,8 @@ impl Server {
             escalations: Default::default(),
             ring,
         });
+        // Sessions through the Relay are served by this Daemon.
+        d.ring.hub().bind(Arc::downgrade(&d));
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);
@@ -470,6 +474,12 @@ impl ServerHandle {
     pub fn attached(&self) -> usize {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.values().map(|t| t.attached()).sum()
+    }
+
+    /// Test hook: the connections registered (local, SSH and Relay sessions alike).
+    #[doc(hidden)]
+    pub fn connections(&self) -> usize {
+        self.d.reg.lock().unwrap().conns.len()
     }
 
     /// Test hook: a connection served in this process with `role`, as a transport other than

@@ -1,5 +1,7 @@
 //! Settings → Mobile: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status`,
 //! `ring_enable`, `ring_set_relay_url` and `ring_claim_host`; the event `ring:status`.
+//! Pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`, `ring_pair_computer` and
+//! `ring_pair_cancel`; the event `ring:pairing`.
 //!
 //! Every Host's Daemon (the Local Host's and each Remote Host's) joins the Ring whenever
 //! its Host connects: the Host Observer records the connection in [`HOST_SYNC`], and
@@ -8,8 +10,8 @@
 use serde::Serialize;
 use std::sync::Arc;
 use xshell_hostlink::ring::{
-    default_relay_url, DesktopRing, DesktopRingConfig, HostRingState, HostSync, RingObserver,
-    RingView, SyncWorker,
+    default_relay_url, DesktopRing, DesktopRingConfig, HostRingState, HostSync, PairingEvent,
+    PairingFlow, PairingObserver, RingObserver, RingView, SyncWorker,
 };
 use xshell_hostlink::{HostStatus, LOCAL_HOST_ID};
 
@@ -202,4 +204,152 @@ pub async fn ring_claim_host(app: AppHandle, host: String) -> Result<RingStatus,
         Ok(status_of(&app, w.ring.view()))
     })
     .await
+}
+
+// ── Pairing (#9) ──────────────────────────────────────────────────────────
+
+/// A QR code as the UI draws it: `size` rows of `size` modules, `'1'` dark and `'0'` light.
+/// No quiet zone; the UI adds the margin.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Qr {
+    pub size: usize,
+    pub rows: Vec<String>,
+}
+
+/// The QR code of `payload`, at error-correction level M.
+pub fn qr_rows(payload: &str) -> Result<Qr, String> {
+    use qrcode::{Color, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M)
+        .map_err(|e| format!("cannot build the QR code: {e}"))?;
+    let size = code.width();
+    let rows = code
+        .to_colors()
+        .chunks(size)
+        .map(|row| {
+            row.iter()
+                .map(|c| if *c == Color::Dark { '1' } else { '0' })
+                .collect()
+        })
+        .collect();
+    Ok(Qr { size, rows })
+}
+
+/// What `ring_pair_phone_start` answers: the pairing text, its QR code, and when it expires
+/// (unix seconds; shown only, the Desktop enforces the expiry itself).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneStart {
+    pub payload: String,
+    pub qr: Qr,
+    pub expires_at: u64,
+}
+
+/// The `ring:pairing` event: `{flow, state, name?, role?, code?}`.
+#[derive(Serialize, Clone)]
+struct PairingPayload<'a> {
+    flow: PairingFlow,
+    #[serde(flatten)]
+    event: &'a PairingEvent,
+}
+
+struct TauriPairingObserver(AppHandle);
+
+impl PairingObserver for TauriPairingObserver {
+    fn pairing(&self, flow: PairingFlow, event: &PairingEvent) {
+        let _ = self.0.emit("ring:pairing", PairingPayload { flow, event });
+    }
+}
+
+fn pairing_observer(app: &AppHandle) -> Arc<dyn PairingObserver> {
+    Arc::new(TauriPairingObserver(app.clone()))
+}
+
+/// Shows a new phone offer (cancelling the previous one). Progress arrives as `ring:pairing`.
+#[tauri::command]
+pub async fn ring_pair_phone_start(app: AppHandle) -> Result<PhoneStart, String> {
+    let w = worker(&app)?;
+    let obs = pairing_observer(&app);
+    run(move || {
+        let offer = w.ring.pair_phone(obs)?;
+        let qr = qr_rows(&offer.payload)?;
+        Ok(PhoneStart {
+            payload: offer.payload,
+            qr,
+            expires_at: offer.expires_at,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn ring_pair_phone_cancel(app: AppHandle) -> Result<(), String> {
+    let w = worker(&app)?;
+    run(move || {
+        w.ring.cancel_pairing(PairingFlow::Phone);
+        Ok(())
+    })
+    .await
+}
+
+/// Adds the computer that `xshelld pair` shows `code` on. Returns once the code is valid;
+/// progress arrives as `ring:pairing`.
+#[tauri::command]
+pub async fn ring_pair_computer(app: AppHandle, code: String) -> Result<(), String> {
+    let w = worker(&app)?;
+    let obs = pairing_observer(&app);
+    run(move || w.ring.pair_computer(&code, obs)).await
+}
+
+#[tauri::command]
+pub async fn ring_pair_cancel(app: AppHandle) -> Result<(), String> {
+    let w = worker(&app)?;
+    run(move || {
+        w.ring.cancel_pairing(PairingFlow::Computer);
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    #[test]
+    fn qr_rows_are_square_bits() {
+        let payload = format!("xsp1.{}", "A".repeat(300));
+        let qr = qr_rows(&payload).unwrap();
+        assert!(qr.size >= 21);
+        assert_eq!(qr.rows.len(), qr.size);
+        for r in &qr.rows {
+            assert_eq!(r.len(), qr.size);
+            assert!(r.chars().all(|c| c == '0' || c == '1'));
+        }
+        // Finder pattern: the top-left module is dark.
+        assert!(qr.rows[0].starts_with("1111111"));
+    }
+
+    #[test]
+    fn pairing_event_flattens_next_to_flow() {
+        let v = |flow, event: PairingEvent| {
+            serde_json::to_value(PairingPayload {
+                flow,
+                event: &event,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            v(PairingFlow::Phone, PairingEvent::Waiting),
+            serde_json::json!({"flow": "phone", "state": "waiting"})
+        );
+        assert_eq!(
+            v(
+                PairingFlow::Computer,
+                PairingEvent::Failed {
+                    code: "not_found".into()
+                }
+            ),
+            serde_json::json!({"flow": "computer", "state": "failed", "code": "not_found"})
+        );
+    }
 }

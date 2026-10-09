@@ -66,12 +66,16 @@ scenario!(
     unknown_client_type_is_answered_and_tolerated,
     binary_frame_is_unsupported,
     readded_member_keeps_new_socket_online,
+    pair_pipe_joins_two,
+    pair_pipe_refuses_third,
+    pair_pipe_caps_messages,
+    pair_pipe_closes_peer,
 );
 
 #[test]
 fn every_scenario_is_listed_and_run_here() {
     // The macro above and SCENARIOS must not drift apart.
-    assert_eq!(SCENARIOS.len(), 30);
+    assert_eq!(SCENARIOS.len(), 34);
 }
 
 #[test]
@@ -376,6 +380,8 @@ fn trickled_tls_records_do_not_stall_sends_or_keepalive() {
         auth_timeout: Duration::from_secs(10),
         gateway: None,
         quota_frames_per_day: None,
+        pair_opens_per_minute: None,
+        pair_ttl: None,
     };
     r.set_origin(&t.origin());
     let ring = TestRing::new(&t.url);
@@ -560,6 +566,76 @@ fn quota_refuses_then_closes() {
         ..TestRelayOptions::default()
     });
     contract::quota_refuses_then_closes(&r.target());
+}
+
+// ---- The pairing pipe's limits ---------------------------------------------------------------
+
+#[test]
+fn pair_pipe_expires() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_ttl: Duration::from_secs(1),
+        ..TestRelayOptions::default()
+    });
+    contract::pair_pipe_expires(&r.target());
+}
+
+#[test]
+fn pair_pipe_rate_limited() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_opens_per_minute: Some(5),
+        ..TestRelayOptions::default()
+    });
+    contract::pair_pipe_rate_limited(&r.target());
+}
+
+#[test]
+fn every_pair_limit_scenario_is_run_here() {
+    assert_eq!(PAIR_TTL_SCENARIOS.len(), 1);
+    assert_eq!(PAIR_RATE_SCENARIOS.len(), 1);
+}
+
+#[test]
+fn pair_slots_are_capped_and_forgotten() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_max_slots: 2,
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    let _a = RawConn::open_pair(&t, &fresh_slot()).unwrap();
+    let _b = RawConn::open_pair(&t, &fresh_slot()).unwrap();
+    match RawConn::open_pair(&t, &fresh_slot()) {
+        Err(RingError::Connect(m)) => assert!(m.contains("503"), "{m}"),
+        other => panic!("expected HTTP 503, got {:?}", other.err()),
+    }
+    assert_eq!(r.pair_slots(), 2);
+}
+
+#[test]
+fn concurrent_pair_opens_respect_the_slot_cap() {
+    // Admission reserves the slot, so opens racing for the last places cannot overshoot.
+    for _ in 0..5 {
+        let r = TestRelay::start_with(TestRelayOptions {
+            pair_max_slots: 2,
+            ..TestRelayOptions::default()
+        });
+        let t = r.target();
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let opens: Vec<_> = (0..6)
+            .map(|_| {
+                let (t, b) = (t.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    RawConn::open_pair(&t, &fresh_slot()).ok()
+                })
+            })
+            .collect();
+        let held: Vec<RawConn> = opens
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(held.len(), 2);
+        assert_eq!(r.pair_slots(), 2);
+    }
 }
 
 #[test]
@@ -892,6 +968,8 @@ fn session_frames_before_welcome_fail_the_connect() {
         auth_timeout: Duration::from_secs(10),
         gateway: None,
         quota_frames_per_day: None,
+        pair_opens_per_minute: None,
+        pair_ttl: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("env"), "{m}"),
@@ -943,6 +1021,8 @@ fn too_much_traffic_during_sync_fails_the_connect() {
         auth_timeout: Duration::from_secs(10),
         gateway: None,
         quota_frames_per_day: None,
+        pair_opens_per_minute: None,
+        pair_ttl: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("too much"), "{m}"),

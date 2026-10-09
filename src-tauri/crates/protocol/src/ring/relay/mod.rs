@@ -9,6 +9,10 @@ pub mod connector;
 #[cfg(feature = "relay-client")]
 mod io;
 #[cfg(feature = "relay-client")]
+pub mod pair;
+#[cfg(feature = "relay-client")]
+pub mod sessions;
+#[cfg(feature = "relay-client")]
 pub mod transport;
 
 #[cfg(feature = "test-relay")]
@@ -18,7 +22,7 @@ pub mod test_relay;
 
 #[cfg(feature = "relay-client")]
 pub use client::{
-    MemberStatus, RingClient, RingClientConfig, RingEvents, RingLimits, RingTimeouts,
+    ChainPin, MemberStatus, RingClient, RingClientConfig, RingEvents, RingLimits, RingTimeouts,
 };
 #[cfg(feature = "relay-client")]
 pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState};

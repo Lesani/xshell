@@ -312,7 +312,212 @@ fn pack_chain(tokens: &[&str], wrap: impl Fn(Vec<String>) -> String) -> Vec<Stri
     frames
 }
 
+/// The Roster version a device was told it was added in (by the Desktop, through the
+/// pairing handshake): the chain it fetches must hold exactly this version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainPin {
+    pub version: u64,
+    /// `b64u(SHA-256(token))`.
+    pub hash: String,
+}
+
+/// Dials `url`'s Ring endpoint for `ring` and answers the challenge as `signer`, staging
+/// what `stage` returns for the Relay's head version first. Returns the connection after
+/// `welcome`.
+#[allow(clippy::too_many_arguments)] // one private call site per dial mode
+fn authenticate(
+    url: &RelayUrl,
+    ring: &super::super::RingId,
+    signer: &dyn Signer,
+    stage: &dyn Fn(u64) -> Vec<String>,
+    tls: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    write_buffer: usize,
+    early: &mut Early,
+) -> Result<(Setup, Welcomed), RingError> {
+    let me = signer.sign_key();
+    let ws = transport::dial(url, &url.ring_endpoint(ring), tls, deadline, write_buffer)?;
+    let mut s = Setup {
+        ws,
+        last_error: None,
+    };
+    let (nonce, relay_version) = match s.recv_frame(early)? {
+        RelayFrame::Challenge {
+            v,
+            nonce,
+            roster_version,
+            ..
+        } => {
+            if v != RELAY_PROTOCOL {
+                return Err(RingError::Protocol(format!("relay protocol {v}")));
+            }
+            if b64::decode_array::<32>(&nonce).is_err() {
+                return Err(RingError::Protocol("bad challenge nonce".into()));
+            }
+            (nonce, roster_version)
+        }
+        other => {
+            return Err(RingError::Protocol(format!(
+                "expected challenge, got {other:?}"
+            )))
+        }
+    };
+    // Stage what the Relay lacks, then answer the challenge.
+    let staged = stage(relay_version);
+    if !staged.is_empty() {
+        let tokens: Vec<&str> = staged.iter().map(String::as_str).collect();
+        for f in pack_chain(&tokens, |rosters| {
+            ClientFrame::AuthChain { rosters }.encode()
+        }) {
+            s.send(f)?;
+        }
+    }
+    let msg = auth_message(&url.origin(), ring, &nonce, &me);
+    let sig = Signature::from_bytes(signer.sign(&msg)?);
+    s.send(
+        ClientFrame::Auth {
+            sign_key: me,
+            sig,
+            caps: Vec::new(),
+        }
+        .encode(),
+    )?;
+    let w = match s.recv_frame(early)? {
+        RelayFrame::Welcome {
+            you,
+            roster_version,
+            presence,
+            entitlement,
+            limited,
+            ..
+        } => {
+            if you != me {
+                return Err(RingError::Protocol("welcome for another key".into()));
+            }
+            Welcomed {
+                presence,
+                entitlement,
+                limited,
+                relay_head: roster_version,
+            }
+        }
+        RelayFrame::Error { code, detail, .. } => return Err(RingError::Relay { code, detail }),
+        other => {
+            return Err(RingError::Protocol(format!(
+                "expected welcome, got {other:?}"
+            )))
+        }
+    };
+    early.welcomed = true;
+    Ok((s, w))
+}
+
+struct Welcomed {
+    presence: Vec<Presence>,
+    entitlement: Option<String>,
+    limited: bool,
+    relay_head: u64,
+}
+
+/// One `roster.get` round: the versions after `since` and whether more remain.
+fn roster_get(
+    s: &mut Setup,
+    early: &mut Early,
+    id: u64,
+    since: u64,
+) -> Result<(Vec<String>, bool), RingError> {
+    s.send(ClientFrame::RosterGet { id, since }.encode())?;
+    loop {
+        match s.recv_frame(early)? {
+            RelayFrame::RosterChain {
+                id: got,
+                rosters,
+                more,
+            } if got == id => return Ok((rosters, more)),
+            RelayFrame::Error {
+                id: Some(got),
+                code,
+                detail,
+                ..
+            } if got == id => return Err(RingError::Relay { code, detail }),
+            _ => continue,
+        }
+    }
+}
+
 impl RingClient {
+    /// A device that was just paired has no chain yet: it authenticates as a member of the
+    /// Relay's head (without staging anything), reads the whole chain, and trusts it only if
+    /// it verifies from genesis for `ring`, holds exactly the pinned version (so a Relay
+    /// that hides or forks it fails), and lists this device in its head. The connection is
+    /// closed afterwards; [`RingClient::connect`] keeps its own check that a device is in its
+    /// chain.
+    pub fn fetch_chain(
+        relay_url: &str,
+        ring: &super::super::RingId,
+        signer: Arc<dyn Signer>,
+        pin: &ChainPin,
+        tls: Option<Arc<ClientConfig>>,
+        timeouts: RingTimeouts,
+    ) -> Result<RosterChain, RingError> {
+        use super::super::chain::MAX_CHAIN_LEN;
+        let deadline = Instant::now() + timeouts.connect;
+        let url = RelayUrl::parse(relay_url).map_err(|e| RingError::Invalid(e.to_string()))?;
+        let mut early = Early::default();
+        let (mut s, _) = authenticate(
+            &url,
+            ring,
+            &*signer,
+            &|_| Vec::new(),
+            tls,
+            deadline,
+            RingLimits::default().write_buffer_bytes,
+            &mut early,
+        )?;
+        let mut versions: Vec<SignedRoster> = Vec::new();
+        let mut id = 0;
+        loop {
+            id += 1;
+            let since = versions.last().map(|r| r.version()).unwrap_or(0);
+            let (rosters, more) = roster_get(&mut s, &mut early, id, since)?;
+            if rosters.is_empty() {
+                break;
+            }
+            for t in &rosters {
+                versions.push(SignedRoster::parse(t)?);
+            }
+            if versions.len() > MAX_CHAIN_LEN {
+                return Err(RingError::Roster(RosterError::TooLarge));
+            }
+            // Early session traffic is of no use here; keep the buffer bounded.
+            early.frames.clear();
+            early.bytes = 0;
+            if !more {
+                break;
+            }
+        }
+        let _ = s.ws.close(None);
+        let _ = s.ws.flush();
+        let chain = RosterChain::from_chain(versions)?;
+        if chain.ring_id() != ring {
+            return Err(RingError::Roster(RosterError::RingMismatch));
+        }
+        match chain.get(pin.version) {
+            Some(r) if r.hash() == pin.hash => {}
+            _ => {
+                return Err(RingError::Invalid(
+                    "the relay's roster does not hold the version this device was added in".into(),
+                ))
+            }
+        }
+        if chain.head().member(&signer.sign_key()).is_none() {
+            return Err(RingError::Invalid(
+                "this device is not in the relay's roster".into(),
+            ));
+        }
+        Ok(chain)
+    }
+
     /// Dials the Relay named by the trusted head, authenticates, and syncs the Roster: a
     /// Relay behind gets the missing versions staged before `auth`, a Relay ahead is asked
     /// for its newer versions, each verified before it is trusted.
@@ -331,112 +536,41 @@ impl RingClient {
         let url = RelayUrl::parse(&chain.head().roster().relay_url)
             .map_err(|e| RingError::Invalid(e.to_string()))?;
         let ring = chain.ring_id().clone();
-        let ws = transport::dial(
+        let mut early = Early::default();
+        let stage = |relay_version: u64| -> Vec<String> {
+            if relay_version < chain.head().version() {
+                chain
+                    .since(relay_version)
+                    .iter()
+                    .map(|r| r.token().to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        let (mut s, w) = authenticate(
             &url,
-            &url.ring_endpoint(&ring),
+            &ring,
+            &*cfg.signer,
+            &stage,
             cfg.tls.clone(),
             deadline,
             cfg.limits.write_buffer_bytes,
+            &mut early,
         )?;
-        let mut s = Setup {
-            ws,
-            last_error: None,
-        };
-        let mut early = Early::default();
+        let Welcomed {
+            presence,
+            entitlement,
+            limited,
+            relay_head,
+        } = w;
 
-        // Challenge.
-        let (nonce, relay_version) = match s.recv_frame(&mut early)? {
-            RelayFrame::Challenge {
-                v,
-                nonce,
-                roster_version,
-                ..
-            } => {
-                if v != RELAY_PROTOCOL {
-                    return Err(RingError::Protocol(format!("relay protocol {v}")));
-                }
-                if b64::decode_array::<32>(&nonce).is_err() {
-                    return Err(RingError::Protocol("bad challenge nonce".into()));
-                }
-                (nonce, roster_version)
-            }
-            other => {
-                return Err(RingError::Protocol(format!(
-                    "expected challenge, got {other:?}"
-                )))
-            }
-        };
-
-        // Stage what the Relay lacks, then answer the challenge.
-        if relay_version < chain.head().version() {
-            let tokens: Vec<&str> = chain
-                .since(relay_version)
-                .iter()
-                .map(|r| r.token())
-                .collect();
-            for f in pack_chain(&tokens, |rosters| {
-                ClientFrame::AuthChain { rosters }.encode()
-            }) {
-                s.send(f)?;
-            }
-        }
-        let msg = auth_message(&url.origin(), &ring, &nonce, &me);
-        let sig = Signature::from_bytes(cfg.signer.sign(&msg)?);
-        s.send(
-            ClientFrame::Auth {
-                sign_key: me,
-                sig,
-                caps: Vec::new(),
-            }
-            .encode(),
-        )?;
-        let (presence, entitlement, limited, relay_head) = match s.recv_frame(&mut early)? {
-            RelayFrame::Welcome {
-                you,
-                roster_version,
-                presence,
-                entitlement,
-                limited,
-                ..
-            } => {
-                if you != me {
-                    return Err(RingError::Protocol("welcome for another key".into()));
-                }
-                (presence, entitlement, limited, roster_version)
-            }
-            RelayFrame::Error { code, detail, .. } => {
-                return Err(RingError::Relay { code, detail })
-            }
-            other => {
-                return Err(RingError::Protocol(format!(
-                    "expected welcome, got {other:?}"
-                )))
-            }
-        };
-
-        early.welcomed = true;
         // Catch up with a Relay that is ahead, verifying every version.
         let mut id = 0u64;
         while chain.head().version() < relay_head {
             id += 1;
             let since = chain.head().version();
-            s.send(ClientFrame::RosterGet { id, since }.encode())?;
-            let (rosters, more) = loop {
-                match s.recv_frame(&mut early)? {
-                    RelayFrame::RosterChain {
-                        id: got,
-                        rosters,
-                        more,
-                    } if got == id => break (rosters, more),
-                    RelayFrame::Error {
-                        id: Some(got),
-                        code,
-                        detail,
-                        ..
-                    } if got == id => return Err(RingError::Relay { code, detail }),
-                    _ => continue,
-                }
-            };
+            let (rosters, more) = roster_get(&mut s, &mut early, id, since)?;
             let parsed: Result<Vec<SignedRoster>, RosterError> =
                 rosters.iter().map(|t| SignedRoster::parse(t)).collect();
             match parsed.and_then(|p| chain.accept(&p)) {
