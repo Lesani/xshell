@@ -375,6 +375,7 @@ mod unix {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::unix::{connect_nb, Pending};
     use super::*;
     use crate::link::testpeer::{hello_frame, terminals_frame, Ev, Rec};

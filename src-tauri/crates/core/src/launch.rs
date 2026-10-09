@@ -909,6 +909,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn prefixed(s: LaunchSpec) -> LaunchSpec {
         LaunchSpec {
             launch_prefix: Some(strings(&["/opt/proxy exec", "--quiet"])),
@@ -1110,6 +1111,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
     fn hook_env() -> Vec<(String, String)> {
         env(&[
             ("XSHELL_TERMINAL_ID", &format!("{TID}.3")),
@@ -1117,6 +1119,7 @@ mod tests {
         ])
     }
 
+    #[cfg(unix)]
     fn codex_overrides() -> Vec<String> {
         hooks().codex_overrides()
     }

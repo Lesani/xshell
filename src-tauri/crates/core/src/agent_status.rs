@@ -1257,6 +1257,7 @@ mod tests {
 
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn event_to(sock: &Path) -> Duration {
         let id = Uuid::new_v4();
         let t = std::time::Instant::now();
