@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
 import { hostInvoke } from "../hosts/hostInvoke";
 import { keyOf, keyOfTab, lookupKey, sameKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
-import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot } from "lucide-react";
+import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot, ShieldOff } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -334,8 +334,10 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const showDropAfter = dragIdx !== null && overIdx === i + 1 && overIdx !== dragIdx && overIdx !== dragIdx + 1;
             if (entry.kind === "group") {
               const g = entry.group;
-              const leafCount = collectLeafIds(g.layout).length;
+              const leafIds = collectLeafIds(g.layout);
+              const leafCount = leafIds.length;
               const isActive = g.id === activeTabId;
+              const anySkipPerms = tabs.some(t => t.skipPermissions && leafIds.includes(t.id));
               const tooltipText = `${g.name} — ${leafCount} pane${leafCount === 1 ? "" : "s"}`;
               const isRenaming = renamingGroupId === g.id;
               const startRename = () => { setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
@@ -351,6 +353,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
                     )}
                     <span className="tab-item-project">{leafCount} panes</span>
                   </div>
+                  {anySkipPerms && <ShieldOff size={11} className="tab-skip-perms-icon" />}
                   <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(g.id); }}>
                     <X size={11} />
                   </div>
@@ -369,9 +372,10 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
             const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
             const baseTooltip = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
-            const tooltipText = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
+            const hostTooltip = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
+            const tooltipText = tab.skipPermissions ? `${hostTooltip} · ${fmt("tab.skipPerms.tabTooltip")}` : hostTooltip;
             return (
-              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
+              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${tab.skipPermissions ? "tab-skip-perms" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                 {isRawShell
                   ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
@@ -382,6 +386,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
                   <span className="tab-item-title truncate">{displayTitle}</span>
                   {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}
                 </div>
+                {tab.skipPermissions && <ShieldOff size={11} className="tab-skip-perms-icon" />}
                 <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}>
                   <X size={11} />
                 </div>

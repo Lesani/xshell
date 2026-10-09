@@ -666,6 +666,12 @@ export default function App() {
     });
   }, []);
 
+  // Called by TerminalTab once a Local Tab's agent restarted with skip permissions changed.
+  // Persisted with the tab, so a restart of the app relaunches it the same way.
+  const handleSkipPermissionsChange = useCallback((tabId: string, value: boolean) => {
+    setTabs(prev => prev.map(t => t.id === tabId ? { ...t, skipPermissions: value } : t));
+  }, []);
+
   // Apply always-on-top on startup once the value has been restored from disk.
   useEffect(() => { getCurrentWindow().setAlwaysOnTop(alwaysOnTop).catch(() => {}); }, [alwaysOnTop]);
 
@@ -1464,7 +1470,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} />,
+            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
             host,
             tab.id,
           );

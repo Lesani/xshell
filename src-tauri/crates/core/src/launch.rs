@@ -17,6 +17,9 @@ pub struct LaunchSpec {
     pub shell_id: Option<String>,
     pub fullscreen_rendering: Option<bool>,
     pub force_sync_output: Option<bool>,
+    /// Start the agent with its "skip permission prompts" flag (see [`permission_flag`]).
+    /// `None` is off; agents without such a flag and raw shells ignore it.
+    pub skip_permissions: Option<bool>,
 }
 
 /// The process a [`LaunchSpec`] resolves to, as plain data. `env` holds only the variables
@@ -107,6 +110,37 @@ pub fn agent_binary(agent: Option<&str>) -> &'static str {
     }
 }
 
+/// The flag that makes an agent CLI run tools without asking, for the agents that have one.
+pub fn permission_flag(agent_bin: &str) -> Option<&'static str> {
+    match agent_bin {
+        "claude" => Some("--dangerously-skip-permissions"),
+        "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
+        _ => None,
+    }
+}
+
+/// The spec a Relaunch starts: `spec` with `skip_permissions` set to `skip`. Refused for raw
+/// shells, agents without a [`permission_flag`] and Terminals with no session to resume, since
+/// a Relaunch that cannot resume would silently drop the conversation.
+pub fn relaunch_spec(spec: &LaunchSpec, skip: bool) -> Result<LaunchSpec, String> {
+    if spec.shell_mode.as_deref() == Some("raw") {
+        return Err("a raw shell has no permission prompts to skip".into());
+    }
+    let agent_bin = agent_binary(spec.agent.as_deref());
+    if permission_flag(agent_bin).is_none() {
+        return Err(format!(
+            "{agent_bin} has no flag to skip permission prompts"
+        ));
+    }
+    if spec.session_id.as_deref().is_none_or(str::is_empty) {
+        return Err("no session to resume".into());
+    }
+    Ok(LaunchSpec {
+        skip_permissions: Some(skip),
+        ..spec.clone()
+    })
+}
+
 // Resume args per agent:
 //  - Claude: new chats arrive with a pre-allocated UUID and no JSONL on disk → use
 //    `--session-id` so Claude creates the session under our UUID (leaving customTitle
@@ -169,7 +203,14 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
     let mode = spec.shell_mode.as_deref().unwrap_or("claude");
     let agent_bin = agent_binary(spec.agent.as_deref());
     // The resume check uses the raw cwd, before the empty-cwd fallback below.
-    let agent_args = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
+    let mut agent_args = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
+    if mode != "raw" && spec.skip_permissions == Some(true) {
+        if let Some(flag) = permission_flag(agent_bin) {
+            // `codex resume` is a subcommand with its own options, so the flag goes after it.
+            let at = usize::from(agent_args.first().is_some_and(|a| a == "resume"));
+            agent_args.insert(at, flag.to_string());
+        }
+    }
     let shell_kind = spec.shell_id.as_deref().unwrap_or("");
     // Override the frontend-supplied `bash.exe` for the Git Bash preset with an absolute path
     // — see resolve_gitbash_path() for why. Surface a clear error if Git for Windows isn't
@@ -628,6 +669,7 @@ mod tests {
             "agent": "codex",
             "fullscreenRendering": false,
             "forceSyncOutput": true,
+            "skipPermissions": true,
         });
         let s: LaunchSpec = serde_json::from_value(v).unwrap();
         assert_eq!(
@@ -641,10 +683,242 @@ mod tests {
                 shell_id: Some("bash".into()),
                 fullscreen_rendering: Some(false),
                 force_sync_output: Some(true),
+                skip_permissions: Some(true),
             }
         );
         // Optional fields may be missing.
         let s: LaunchSpec = serde_json::from_value(serde_json::json!({"cwd": ""})).unwrap();
         assert_eq!(s, LaunchSpec::default());
+    }
+
+    fn skipping(s: LaunchSpec) -> LaunchSpec {
+        LaunchSpec {
+            skip_permissions: Some(true),
+            ..s
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_skip_permissions_claude_flag() {
+        let fx = Fixture::new();
+        let cwd = "/work/app";
+        let s = skipping(LaunchSpec {
+            session_id: Some("sid".into()),
+            ..spec(cwd)
+        });
+        let plan = plan_command(&fx.ctx(), &s).unwrap();
+        assert_eq!(
+            plan.args,
+            strings(&["--dangerously-skip-permissions", "--session-id", "sid"])
+        );
+        assert_builder(&plan);
+
+        fx.write(
+            format!(
+                "home/.claude/projects/{}/sid.jsonl",
+                encode_project_name(cwd)
+            ),
+            "{}\n",
+        );
+        let plan = plan_command(&fx.ctx(), &s).unwrap();
+        assert_eq!(
+            plan.args,
+            strings(&["--dangerously-skip-permissions", "--resume", "sid"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_skip_permissions_codex_after_subcommand() {
+        let fx = Fixture::new();
+        let codex = |sid: Option<&str>| {
+            plan_command(
+                &fx.ctx(),
+                &skipping(LaunchSpec {
+                    agent: Some("codex".into()),
+                    session_id: sid.map(str::to_string),
+                    ..spec("/w")
+                }),
+            )
+            .unwrap()
+            .args
+        };
+        assert_eq!(
+            codex(Some("id1")),
+            strings(&[
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "id1"
+            ])
+        );
+        // A new codex chat has no `resume` subcommand: the flag is the only argument.
+        assert_eq!(
+            codex(None),
+            strings(&["--dangerously-bypass-approvals-and-sandbox"])
+        );
+    }
+
+    #[test]
+    fn launch_skip_permissions_ignored_unsupported_and_raw() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        for agent in ["cursor", "opencode", "antigravity"] {
+            let s = LaunchSpec {
+                agent: Some(agent.into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            };
+            assert_eq!(
+                plan_command(&ctx, &skipping(s.clone())).unwrap(),
+                plan_command(&ctx, &s).unwrap(),
+                "{agent}"
+            );
+        }
+        let raw = LaunchSpec {
+            shell_mode: Some("raw".into()),
+            shell_command: Some("zsh".into()),
+            ..spec("/w")
+        };
+        let plan = plan_command(&ctx, &skipping(raw)).unwrap();
+        assert_eq!(plan.program, "zsh");
+        assert!(plan.args.is_empty());
+    }
+
+    #[test]
+    fn launch_skip_permissions_false_none_unchanged() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        for agent in ["claude", "codex"] {
+            let s = LaunchSpec {
+                agent: Some(agent.into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            };
+            let off = LaunchSpec {
+                skip_permissions: Some(false),
+                ..s.clone()
+            };
+            let expected = resume_args(&ctx, agent_binary(Some(agent)), Some("id1"), "/w");
+            assert_eq!(
+                plan_command(&ctx, &s).unwrap(),
+                plan_command(&ctx, &off).unwrap()
+            );
+            if !cfg!(windows) {
+                assert_eq!(plan_command(&ctx, &s).unwrap().args, expected, "{agent}");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_skip_permissions_in_wrappers() {
+        let fx = Fixture::new();
+        let cwd = "/w";
+        fx.write(
+            format!(
+                "home/.claude/projects/{}/sid.jsonl",
+                encode_project_name(cwd)
+            ),
+            "{}\n",
+        );
+        let wrapped = |shell_id: &str, shell: &str, agent: &str| {
+            plan_command(
+                &fx.ctx(),
+                &skipping(LaunchSpec {
+                    agent: Some(agent.into()),
+                    session_id: Some("sid".into()),
+                    shell_id: Some(shell_id.into()),
+                    shell_command: Some(shell.into()),
+                    ..spec(cwd)
+                }),
+            )
+            .unwrap()
+            .args
+        };
+        assert_eq!(
+            wrapped("bash", "bash", "claude"),
+            strings(&[
+                "-i",
+                "-c",
+                "claude '--dangerously-skip-permissions' '--resume' 'sid'; exec bash -i"
+            ])
+        );
+        assert_eq!(
+            wrapped("pwsh", "pwsh", "claude"),
+            strings(&[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                "& 'claude' '--dangerously-skip-permissions' '--resume' 'sid'"
+            ])
+        );
+        assert_eq!(
+            wrapped("cmd", "cmd.exe", "codex"),
+            strings(&[
+                "/K",
+                "codex",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "sid"
+            ])
+        );
+    }
+
+    #[test]
+    fn relaunch_spec_validation() {
+        let base = LaunchSpec {
+            agent: Some("codex".into()),
+            session_id: Some("id1".into()),
+            shell_id: Some("bash".into()),
+            shell_command: Some("bash".into()),
+            fullscreen_rendering: Some(false),
+            force_sync_output: Some(true),
+            ..spec("/w")
+        };
+        assert_eq!(
+            relaunch_spec(&base, true),
+            Ok(LaunchSpec {
+                skip_permissions: Some(true),
+                ..base.clone()
+            })
+        );
+        assert_eq!(
+            relaunch_spec(&skipping(base.clone()), false)
+                .unwrap()
+                .skip_permissions,
+            Some(false)
+        );
+        // Claude is the default agent.
+        let claude = LaunchSpec {
+            agent: None,
+            ..base.clone()
+        };
+        assert!(relaunch_spec(&claude, true).is_ok());
+
+        let refused = |s: LaunchSpec| relaunch_spec(&s, true).unwrap_err();
+        assert_eq!(
+            refused(LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..base.clone()
+            }),
+            "a raw shell has no permission prompts to skip"
+        );
+        assert_eq!(
+            refused(LaunchSpec {
+                agent: Some("cursor".into()),
+                ..base.clone()
+            }),
+            "cursor-agent has no flag to skip permission prompts"
+        );
+        for sid in [None, Some(String::new())] {
+            assert_eq!(
+                refused(LaunchSpec {
+                    session_id: sid,
+                    ..base.clone()
+                }),
+                "no session to resume"
+            );
+        }
     }
 }

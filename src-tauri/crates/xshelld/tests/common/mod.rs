@@ -15,6 +15,7 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
+use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
 use xshell_core::protocol::frame::{read_frame, write_frame, Frame, FrameDecoder, MAX_FRAME_LEN};
 use xshell_core::protocol::msg::{
@@ -195,6 +196,175 @@ impl Drop for PidReaper {
             }
         }
     }
+}
+
+// ── Fake agents ───────────────────────────────────────────────────────────
+
+pub struct Fake {
+    pub bin: PathBuf,
+    pub argv_log: PathBuf,
+    pub pids_log: PathBuf,
+}
+
+/// `fake-bin/claude`: ignores SIGHUP like a stubborn agent, logs argv (one block per launch,
+/// ended by `--`) and then its pid, then sleeps. A logged pid means the trap is in place.
+pub fn fake_claude(h: &TestHome) -> Fake {
+    fake_claude_with(h, "trap '' HUP", "exec sleep 1000")
+}
+
+/// A fake agent with its own hangup handling (`trap`) and main loop (`body`).
+pub fn fake_claude_with(h: &TestHome, trap: &str, body: &str) -> Fake {
+    let bin = h.root().join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let argv_log = h.root().join("argv.log");
+    let pids_log = h.root().join("pids.log");
+    let p = bin.join("claude");
+    fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\n{trap}\nprintf '%s\\n' \"$@\" -- >> '{}'\necho $$ >> '{}'\n{body}\n",
+            argv_log.display(),
+            pids_log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    Fake {
+        bin,
+        argv_log,
+        pids_log,
+    }
+}
+
+/// Fake `claude`, `codex` and `cursor-agent` for in-process servers, whose Terminals inherit
+/// this test process's environment: one shared directory, put in front of `PATH` once per
+/// test binary. Each launch ignores SIGHUP, logs into its working directory (see
+/// [`Fake::in_dir`]), prints `pid <pid> size <rows> <cols> args <argv>.` and sleeps.
+pub fn shared_fake_agents() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let bin = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fake-agents");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["claude", "codex", "cursor-agent"] {
+            // Written aside and renamed: another test binary may be running the old file.
+            let tmp = bin.join(format!(".{name}.{}", std::process::id()));
+            fs::write(
+                &tmp,
+                "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> argv.log\necho $$ >> pids.log\n\
+                 echo \"pid $$ size $(stty size) args $*.\"\nexec sleep 1000\n",
+            )
+            .unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::rename(&tmp, bin.join(name)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::env::set_var("PATH", path);
+    });
+}
+
+impl Fake {
+    /// The logs of [`shared_fake_agents`] launched in `cwd`.
+    pub fn in_dir(cwd: &Path) -> Fake {
+        shared_fake_agents();
+        Fake {
+            bin: PathBuf::new(),
+            argv_log: cwd.join("argv.log"),
+            pids_log: cwd.join("pids.log"),
+        }
+    }
+
+    pub fn path_env(&self) -> String {
+        format!(
+            "{}:{}",
+            self.bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    /// argv blocks, one per launch.
+    pub fn launches(&self) -> Vec<Vec<String>> {
+        let s = fs::read_to_string(&self.argv_log).unwrap_or_default();
+        let mut out = vec![];
+        let mut cur = vec![];
+        for l in s.lines() {
+            if l == "--" {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(l.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn wait_launches(&self, n: usize) -> Vec<Vec<String>> {
+        let deadline = Instant::now() + T;
+        loop {
+            let l = self.launches();
+            if l.len() >= n || Instant::now() >= deadline {
+                return l;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn wait_pids(&self, n: usize) -> Vec<i32> {
+        let deadline = Instant::now() + T;
+        loop {
+            let p = self.pids();
+            if p.len() >= n || Instant::now() >= deadline {
+                assert!(p.len() >= n, "only {} fake agent(s) started", p.len());
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn pids(&self) -> Vec<i32> {
+        fs::read_to_string(&self.pids_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+}
+
+/// Kills every fake agent ever launched, whatever happens in the test.
+pub struct FakeReaper(pub PathBuf);
+
+impl Drop for FakeReaper {
+    fn drop(&mut self) {
+        for l in fs::read_to_string(&self.0).unwrap_or_default().lines() {
+            if let Ok(p) = l.trim().parse::<i32>() {
+                if p > 1 {
+                    unsafe { libc::kill(p, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
+
+pub fn claude_spec(cwd: &Path, session: Option<&str>) -> LaunchSpec {
+    LaunchSpec {
+        agent: Some("claude".into()),
+        shell_mode: Some("claude".into()),
+        session_id: session.map(str::to_string),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
+pub fn make_jsonl(h: &TestHome, cwd: &Path, sid: &str) {
+    let dir = h
+        .home()
+        .join(".claude/projects")
+        .join(encode_project_name(&cwd.to_string_lossy()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
 }
 
 pub fn bin() -> &'static str {

@@ -41,6 +41,8 @@ pub struct HostStatus {
     pub daemon_version: Option<String>,
     pub desktop_version: String,
     pub protocol: Option<u32>,
+    /// The connected Daemon's hello capabilities; empty while not connected.
+    pub daemon_capabilities: Vec<String>,
     /// `linux` or `macos`, from the last probe.
     pub os: Option<String>,
     pub arch: Option<String>,
@@ -64,6 +66,7 @@ impl HostStatus {
             daemon_version: None,
             desktop_version: desktop_version.into(),
             protocol: None,
+            daemon_capabilities: Vec::new(),
             os: None,
             arch: None,
             incompatible_reason: None,
@@ -133,7 +136,7 @@ mod tests {
             serde_json::json!({
                 "host":"h_ab12cd34","status":"reconnecting","phase":"probing","lastError":null,
                 "errorHint":"host-key","daemonVersion":null,"desktopVersion":"1.5.0","protocol":null,
-                "os":null,"arch":null,"incompatibleReason":"daemon-older","nextRetryAt":null,
+                "daemonCapabilities":[],"os":null,"arch":null,"incompatibleReason":"daemon-older","nextRetryAt":null,
                 "sinceMs":1,"configGeneration":7
             })
         );

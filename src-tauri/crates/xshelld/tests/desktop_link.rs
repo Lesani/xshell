@@ -5,7 +5,7 @@
 mod common;
 mod desktop;
 
-use common::raw_spec;
+use common::{claude_spec, make_jsonl, raw_spec, shared_fake_agents, Fake, FakeReaper};
 use desktop::*;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -137,6 +137,55 @@ fn two_desktops_share_terminal() {
     let from = sb.len();
     marker(&fx.a.host(), &sa, t, "shared");
     sb.wait_from(from, "shared");
+}
+
+#[test]
+fn status_exposes_daemon_capabilities() {
+    let fx = Fx::new();
+    let s = fx.a.wait_usable();
+    assert!(
+        s.daemon_capabilities.iter().any(|c| c == "term.relaunch"),
+        "{:?}",
+        s.daemon_capabilities
+    );
+}
+
+/// A Relaunch keeps the Tab's sink: no exit, a reset, then the new process's output.
+#[test]
+fn relaunch_keeps_sink_no_exit() {
+    // Before the Daemon starts: it inherits the fake agents' PATH.
+    shared_fake_agents();
+    let fx = Fx::new();
+    fx.a.wait_usable();
+    let h = fx.a.host();
+    let cwd = fx.home.project("app");
+    let fake = Fake::in_dir(&cwd);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let sid = "11111111-2222-3333-4444-555555555555";
+    make_jsonl(&fx.home, &cwd, sid);
+    let t = Uuid::new_v4();
+    let sink = VecSink::new();
+    let old = open(&h, t, claude_spec(&cwd, Some(sid)), sink.clone()).unwrap();
+    sink.wait_from(0, &format!("pid {old} "));
+    // Only what arrives from the relaunch on: the open's replay starts with a reset too.
+    let from = sink.len();
+    let new = relaunch(&h, t, true).unwrap().expect("pid");
+    let text = sink.wait_from(from, &format!("pid {new} "));
+    let first = text.find(&format!("pid {new} ")).unwrap();
+    let reset = text.find("\x1bc").expect("a reset from the relaunch");
+    assert!(
+        reset < first,
+        "the reset must precede the new output: {text:?}"
+    );
+    fx.a.rec.wait_list("with the relaunched terminal", |l| {
+        l.iter()
+            .any(|i| i.terminal == t && i.pid == Some(new) && i.spec.skip_permissions == Some(true))
+    });
+    assert!(sink.exits.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.wait_launches(2)[1],
+        vec!["--dangerously-skip-permissions", "--resume", sid]
+    );
 }
 
 /// A Terminal that ignores SIGHUP delays the old Daemon's exit by its kill grace (2 s).

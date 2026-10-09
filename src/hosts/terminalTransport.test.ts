@@ -15,7 +15,7 @@ const ch = <T,>(i: number) => FakeChannel.all[i] as unknown as Ch<T>;
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a), Channel: FakeChannel }));
 
-import { RemoteTerminals, RetryableStartError, localShellOptions, mountTerminal, markClosing, pendingOpens, writeTerminal, resizeTerminal, type StartOptions } from "./terminalTransport";
+import { RemoteTerminals, RetryableStartError, localShellOptions, mountTerminal, markClosing, pendingOpens, relaunchTerminal, writeTerminal, resizeTerminal, type StartOptions } from "./terminalTransport";
 import type { Tab } from "../types";
 
 const H = "h_ab12cd34";
@@ -185,8 +185,8 @@ describe("local parity: terminal commands", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     const [cmd, args] = invoke.mock.calls[0];
     expect(cmd).toBe("spawn_terminal");
-    expect(Object.keys(args)).toEqual(["id", "sessionId", "cwd", "cols", "rows", "shellMode", "shellCommand", "shellId", "agent", "fullscreenRendering", "forceSyncOutput", "onData", "onExit"]);
-    expect({ ...args, onData: undefined, onExit: undefined }).toEqual({ id: "terminal-s1-abc", sessionId: "s1", cwd: "/home/u/p", cols: 120, rows: 40, shellMode: "claude", shellCommand: "bash", shellId: "bash", agent: "claude", fullscreenRendering: true, forceSyncOutput: false, onData: undefined, onExit: undefined });
+    expect(Object.keys(args)).toEqual(["id", "sessionId", "cwd", "cols", "rows", "shellMode", "shellCommand", "shellId", "agent", "fullscreenRendering", "forceSyncOutput", "skipPermissions", "onData", "onExit"]);
+    expect({ ...args, onData: undefined, onExit: undefined }).toEqual({ id: "terminal-s1-abc", sessionId: "s1", cwd: "/home/u/p", cols: 120, rows: 40, shellMode: "claude", shellCommand: "bash", shellId: "bash", agent: "claude", fullscreenRendering: true, forceSyncOutput: false, skipPermissions: null, onData: undefined, onExit: undefined });
     t.end();
     expect(invoke.mock.calls[1]).toEqual(["close_terminal", { id: "terminal-s1-abc" }]);
   });
@@ -409,5 +409,33 @@ describe("start retry loop", () => {
     const start = vi.fn(() => Promise.reject({ code: "remote", message: "no such dir" }));
     await expect(startWithRetry(H, start, new AbortController().signal, { statusVersion: () => 0, waitUsable: vi.fn() })).rejects.toMatchObject({ message: "no such dir" });
     expect(start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("skip permissions", () => {
+  const tab: Tab = { id: "terminal-s1-abc", type: "terminal", title: "T", sessionId: "s1", agent: "codex", projectPath: "/home/u/p", projectName: "p", skipPermissions: true };
+
+  it("spawn_terminal starts a flagged local tab with the flag", async () => {
+    invoke.mockResolvedValue(undefined);
+    const t = mountTerminal(tab, sinks().s);
+    await t.start({ cols: 80, rows: 24, ...localShellOptions(tab, "bash"), fullscreenRendering: true, forceSyncOutput: true });
+    expect(calls("spawn_terminal")[0][1]).toMatchObject({ skipPermissions: true });
+  });
+
+  it("relaunch routes local tabs to relaunch_terminal with their current session", async () => {
+    invoke.mockResolvedValue(true);
+    await relaunchTerminal({ ...tab, sessionId: "linked-later" }, false);
+    expect(invoke.mock.calls).toEqual([["relaunch_terminal", { id: "terminal-s1-abc", skipPermissions: false, sessionId: "linked-later", agent: "codex" }]]);
+  });
+
+  it("relaunch routes remote tabs to host_term_relaunch", async () => {
+    invoke.mockResolvedValue({ pid: 7 });
+    await relaunchTerminal({ id: "remote-u9", type: "terminal", title: "T", host: H, terminal: "u9", sessionId: "s" }, true);
+    expect(invoke.mock.calls).toEqual([["host_term_relaunch", { host: H, terminal: "u9", skipPermissions: true }]]);
+  });
+
+  it("a failed relaunch rejects with the Host's error", async () => {
+    invoke.mockRejectedValue({ code: "invalid", message: "nope" });
+    await expect(relaunchTerminal({ ...tab, host: H, terminal: "u9" }, true)).rejects.toEqual({ code: "invalid", message: "nope" });
   });
 });

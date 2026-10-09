@@ -210,6 +210,10 @@ pub fn close(h: &HostHandle, t: Uuid) {
     sync(|w| h.term_close(t, w)).unwrap_or_else(|e| panic!("term_close: {e:?}"));
 }
 
+pub fn relaunch(h: &HostHandle, t: Uuid, skip: bool) -> Result<Option<u32>, HostError> {
+    sync(|w| h.term_relaunch(t, skip, w))
+}
+
 pub fn upgrade(h: &HostHandle) -> Result<Value, HostError> {
     sync(|w| h.upgrade(w))
 }

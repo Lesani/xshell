@@ -3,7 +3,8 @@ import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
-import { localShellOptions, mountTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { skipPermsOn, skipPermsState } from "../tabs/skipPermissions";
 import { registry, HostUnknownError } from "../hosts/registry";
 import { useHostLive, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
@@ -14,7 +15,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw } from "lucide-react";
+import { GitBranch, ArrowUp, ArrowDown, RefreshCw, ChevronRight, ChevronDown, Plus, Minus, History, GitFork, Pencil, X as XIcon, Check, Search, AlertTriangle, Cloud, FolderTree, FileDiff, RotateCcw, ShieldOff } from "lucide-react";
 import { FileExplorerPanel, DRAG_PATH_MIME } from "./FileExplorerPanel";
 import { fileIconUrl, plainFolderIconUrl } from "../lib/fileIcons";
 import "@xterm/xterm/css/xterm.css";
@@ -167,6 +168,9 @@ interface TerminalTabProps {
   // want the cost figure visible in screen-shares.
   showTerminalHeaderStats: boolean;
   onBranchSwitch: (tabId: string, newSessionId: string, newTitle: string) => void;
+  // A Local Tab's agent restarted with skip permissions turned on or off. Remote Tabs learn
+  // it from the Host's terminals list instead.
+  onSkipPermissionsChange: (tabId: string, value: boolean) => void;
 }
 
 // Compact USD formatter for the header strip — keeps the value tight on narrow terminals
@@ -206,7 +210,7 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
 const PANEL_EDGE_RESERVE = 76;
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch }: TerminalTabProps) {
+export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -285,6 +289,13 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // when the on-disk session title changes. Surface that as a banner so the user knows.
   const [renameNotice, setRenameNotice] = useState<{ oldTitle: string; newTitle: string } | null>(null);
   const renameNoticeTimerRef = useRef<number | null>(null);
+  // Skip permissions. `ended` comes from the exit sink, which a relaunch never fires; the
+  // confirmation anchors at the activity-bar button; a failure shows as a dismissable banner.
+  const [ended, setEnded] = useState(false);
+  const [skipBusy, setSkipBusy] = useState(false);
+  const [skipConfirm, setSkipConfirm] = useState<DOMRect | null>(null);
+  const [skipError, setSkipError] = useState<string | null>(null);
+  const skipErrorTimerRef = useRef<number | null>(null);
   // Snapshot of session jsonls that already existed when this tab attached — plus any we've
   // observed since. Only files OUTSIDE this set count as fresh forks. Without this, resuming
   // an ancestor session in another tab would bump its mtime and trigger a false positive.
@@ -498,6 +509,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           setIsInitializing(false);
         }
         term.write("\r\n\x1b[90m[Session ended]\x1b[0m\r\n");
+        setEnded(true);
       },
     });
     const remoteHost = tabRef.current.host;
@@ -799,6 +811,34 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     setCheckoutError(null);
   }, []);
 
+  const showSkipError = useCallback((msg: string) => {
+    if (skipErrorTimerRef.current) window.clearTimeout(skipErrorTimerRef.current);
+    setSkipError(msg);
+    skipErrorTimerRef.current = window.setTimeout(() => setSkipError(null), 7000);
+  }, []);
+  const dismissSkipError = useCallback(() => {
+    if (skipErrorTimerRef.current) { window.clearTimeout(skipErrorTimerRef.current); skipErrorTimerRef.current = null; }
+    setSkipError(null);
+  }, []);
+  useEffect(() => () => { if (skipErrorTimerRef.current) window.clearTimeout(skipErrorTimerRef.current); }, []);
+
+  // Restart the agent with skip permissions set to `value`. Uses the current `tab`, whose
+  // session may have been linked or switched since the Terminal started.
+  const applySkipPermissions = useCallback(async (value: boolean) => {
+    setSkipConfirm(null);
+    hideTt();
+    setSkipBusy(true);
+    try {
+      await relaunchTerminal(tab, value);
+      if (!tab.host) onSkipPermissionsChange(tab.id, value);
+    } catch (err) {
+      const error = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
+      showSkipError(fmt("tab.skipPerms.failed", { error }));
+    } finally {
+      setSkipBusy(false);
+    }
+  }, [tab, onSkipPermissionsChange, showSkipError, hideTt]);
+
   // Switch to `branch`. When the working tree is dirty we ask for confirmation up front —
   // git itself may still allow the switch (non-conflicting changes), but the user wanted the
   // typical safety prompt. On failure we surface git's stderr verbatim.
@@ -1072,6 +1112,10 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   })();
   const remoteStateText = remoteState ? fmt(`terminal.remote.${remoteState}` as const, { host: hostName }) : null;
   const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
+  const agentLabel = AGENTS[tab.agent || "claude"].label;
+  const skipState = skipPermsState(tab, { live: hostLive, status: hostStatus, hostName, localEnded: ended, busy: skipBusy });
+  const skipOn = skipState.kind !== "hidden" && skipPermsOn(tab, hostLive);
+  const skipTooltip = skipState.kind === "disabled" ? skipState.reason : fmt(skipOn ? "tab.skipPerms.button.disable" : "tab.skipPerms.button.enable");
 
   const showStatsStrip = isClaudeSession && showTerminalHeaderStats && sessionStats?.is_authoritative_stats && sessionStats.context_limit > 0;
   const ctxPct = showStatsStrip ? Math.min(100, (sessionStats!.context_tokens / sessionStats!.context_limit) * 100) : 0;
@@ -1081,6 +1125,11 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       <div className="terminal-header" data-tauri-drag-region>
         {tab.host && <HostBadge host={tab.host} tooltip={fmt("terminal.header.hostBadge", { host: hostName })} tt={{ showTt, hideTt }} />}
         {remoteEnded && <span className="terminal-ended-chip">{fmt("terminal.remote.ended")}</span>}
+        {skipOn && (
+          <span className="terminal-skip-perms-chip" onMouseEnter={(e) => showTt(fmt("tab.skipPerms.chipTooltip", { agent: agentLabel }), e.currentTarget)} onMouseLeave={hideTt}>
+            <ShieldOff size={10} />{fmt("tab.skipPerms.chip")}
+          </span>
+        )}
         {tab.groupId && (
           <span className="terminal-header-label">
             {tab.projectName && <span className="terminal-header-project">{tab.projectName}</span>}
@@ -1126,6 +1175,13 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           <button className="branch-banner-btn" onClick={dismissRenameNotice} aria-label="Dismiss"><XIcon size={12} /></button>
         </div>
       )}
+      {skipError && (
+        <div className="branch-error-banner">
+          <AlertTriangle size={11} className="branch-error-icon" />
+          <span className="branch-error-text">{skipError}</span>
+          <button className="branch-error-dismiss" onClick={dismissSkipError} aria-label="Dismiss"><XIcon size={11} /></button>
+        </div>
+      )}
       <div className="terminal-body">
         <div
           className="terminal-container"
@@ -1163,6 +1219,12 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             <div className="terminal-loading-overlay">
               <div className="spinner" />
               <span>{remoteStateText ?? (isClaudeSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…")}</span>
+            </div>
+          )}
+          {skipBusy && (
+            <div className="terminal-loading-overlay terminal-relaunch-overlay">
+              <div className="spinner" />
+              <span>{fmt("tab.skipPerms.restarting", { agent: agentLabel })}</span>
             </div>
           )}
           {!isInitializing && remoteStateText && (
@@ -1273,6 +1335,18 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             >
               <FolderTree size={15} />
             </button>
+            {skipState.kind !== "hidden" && (
+              <button
+                className={`terminal-activity-btn ${skipOn ? "terminal-activity-danger" : ""}`}
+                disabled={skipState.kind === "disabled"}
+                onClick={(e) => { if (skipState.kind !== "available") return; hideTt(); setSkipConfirm(e.currentTarget.getBoundingClientRect()); }}
+                onMouseEnter={(e) => showTt(skipTooltip, e.currentTarget)}
+                onMouseLeave={hideTt}
+                aria-label={fmt(skipOn ? "tab.skipPerms.button.disable" : "tab.skipPerms.button.enable")}
+              >
+                <ShieldOff size={15} />
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1296,6 +1370,20 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
                 <button className="file-ctx-item file-ctx-danger" onClick={() => setGitCtx(c => c ? { ...c, confirmDiscard: true } : null)}><RotateCcw size={13} /><span>Discard changes</span></button>
               </>
             )}
+          </div>
+        </>
+      )}
+      {skipConfirm && (
+        // Both directions interrupt the running turn, so both ask first.
+        <>
+          <div className="file-ctx-backdrop" onClick={() => setSkipConfirm(null)} onContextMenu={(e) => { e.preventDefault(); setSkipConfirm(null); }} />
+          <div className="file-ctx-menu skip-perms-confirm" role="dialog" aria-label={fmt(skipOn ? "tab.skipPerms.confirmDisable.title" : "tab.skipPerms.confirmEnable.title")} style={{ left: Math.max(8, skipConfirm.left - 268), top: Math.min(skipConfirm.top, window.innerHeight - 190) }}>
+            <div className="skip-perms-confirm-title">{fmt(skipOn ? "tab.skipPerms.confirmDisable.title" : "tab.skipPerms.confirmEnable.title")}</div>
+            <div className="file-ctx-confirm">{fmt(skipOn ? "tab.skipPerms.confirmDisable.body" : "tab.skipPerms.confirmEnable.body", { agent: agentLabel })}</div>
+            {skipOn
+              ? <button className="file-ctx-item" onClick={() => applySkipPermissions(false)}><ShieldOff size={13} /><span>{fmt("tab.skipPerms.confirmDisable.confirm")}</span></button>
+              : <button className="file-ctx-item file-ctx-danger" onClick={() => applySkipPermissions(true)}><ShieldOff size={13} /><span>{fmt("tab.skipPerms.confirmEnable.confirm")}</span></button>}
+            <button className="file-ctx-item" onClick={() => setSkipConfirm(null)}><XIcon size={13} /><span>{fmt("tab.skipPerms.cancel")}</span></button>
           </div>
         </>
       )}

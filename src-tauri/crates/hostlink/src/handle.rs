@@ -36,6 +36,8 @@ pub trait TermSink: Send + Sync {
 }
 
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The hello capability of Daemons that serve `term.relaunch`.
+const RELAUNCH_CAPABILITY: &str = "term.relaunch";
 
 pub(crate) struct SinkSlot {
     sink: Arc<dyn TermSink>,
@@ -881,6 +883,47 @@ impl HostHandle {
         );
     }
 
+    /// `term.relaunch`: restart the Terminal with `skipPermissions` set to `skip`. Answers
+    /// the pid now running it. Refused without sending anything when the Daemon of the
+    /// current link does not advertise the `term.relaunch` capability.
+    pub fn term_relaunch(
+        &self,
+        t: Uuid,
+        skip: bool,
+        w: Box<dyn FnOnce(Result<Option<u32>, HostError>) + Send>,
+    ) {
+        let once = Once::new(w);
+        let sent = {
+            // The capability and the link are checked and used under one lock: `adopt`
+            // replaces both together.
+            let st = self.sh.lock();
+            Shared::usable_link(&st).and_then(|(l, _)| {
+                if !st
+                    .status
+                    .daemon_capabilities
+                    .iter()
+                    .any(|c| c == RELAUNCH_CAPABILITY)
+                {
+                    return Err(HostError::invalid(
+                        "this Host's xshelld cannot restart terminals; upgrade it first",
+                    ));
+                }
+                let o = once.clone();
+                l.request(
+                    ClientMsg::TermRelaunch {
+                        terminal: t,
+                        skip_permissions: skip,
+                    },
+                    self.sh.mc.term_timeout,
+                    Box::new(move |r: Reply| o.call(r.map(|v| opt_u32(&v, "pid")))),
+                )
+            })
+        };
+        if let Err(e) = sent {
+            once.call(Err(e));
+        }
+    }
+
     /// Connected: `daemon.upgrade`, then the supervisor waits for the old Daemon to close
     /// the link before reconnecting. Incompatible: SIGTERM the Daemon through its pidfile,
     /// then reconnect.
@@ -986,8 +1029,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::sync::mpsc;
     use xshell_core::launch::LaunchSpec;
-    use xshell_core::protocol::msg::ProtocolRange;
-    use xshell_core::protocol::msg::ServerMsg;
+    use xshell_core::protocol::msg::{Hello, ProtocolRange, ServerMsg};
 
     #[derive(Default)]
     pub struct VecSink {
@@ -1065,8 +1107,27 @@ pub(crate) mod tests {
         list: Vec<TerminalInfo>,
         limits: crate::link::LinkLimits,
     ) -> (Peer, Arc<Link>, u64, usize) {
+        connect_full(sh, list, limits, &[])
+    }
+
+    /// [`connect`] to a Daemon advertising `caps`, adopted the way the supervisor does.
+    fn connect_capable(sh: &Arc<Shared>, list: Vec<TerminalInfo>, caps: &[&str]) -> Peer {
+        connect_full(sh, list, crate::link::LinkLimits::default(), caps).0
+    }
+
+    fn connect_full(
+        sh: &Arc<Shared>,
+        list: Vec<TerminalInfo>,
+        limits: crate::link::LinkLimits,
+        caps: &[&str],
+    ) -> (Peer, Arc<Link>, u64, usize) {
         let (io, mut peer) = pair();
-        let mut b = hello_frame(1, 1, "1.5.0");
+        let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+        let mut b = msg_frame(&ServerMsg::Hello(Hello {
+            protocol: ProtocolRange { min: 1, max: 1 },
+            version: "1.5.0".into(),
+            capabilities: caps.clone(),
+        }));
         b.extend(terminals_frame(list));
         peer.write(&b);
         let gen = sh.begin_link(None);
@@ -1081,7 +1142,10 @@ pub(crate) mod tests {
         .unwrap();
         assert!(sh.wait_first_list(gen, Duration::from_secs(5)));
         let left = sh
-            .adopt(gen, &link, |st| st.status.set_kind(StatusKind::Connected))
+            .adopt(gen, &link, |st| {
+                st.status.set_kind(StatusKind::Connected);
+                st.status.daemon_capabilities = caps;
+            })
             .expect("adopted");
         peer.expect("hello");
         (peer, link, gen, left)
@@ -1510,5 +1574,63 @@ pub(crate) mod tests {
         }
         p2.expect("term.attach");
         assert_eq!(sent_on(&sh), 3);
+    }
+
+    /// Sends `term.close` and checks it is the next message on the wire, so nothing was
+    /// queued before it.
+    fn assert_nothing_sent(h: &HostHandle, peer: &mut Peer, t: Uuid) {
+        let (w, _rx) = res_slot();
+        h.term_close(t, w);
+        let next = peer.read_json();
+        assert_eq!(next["t"], "term.close", "{next}");
+    }
+
+    #[test]
+    fn relaunch_sent_with_capability() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let mut peer = connect_capable(&sh, vec![info(t)], &["term", "term.relaunch"]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.term_relaunch(t, true, w);
+        let m = peer.expect("term.relaunch");
+        assert_eq!(m["terminal"], json!(t));
+        assert_eq!(m["skipPermissions"], json!(true));
+        peer.reply(
+            m["id"].as_u64().unwrap(),
+            Ok(json!({"pid": 7, "relaunched": true})),
+        );
+        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(Some(7)));
+    }
+
+    #[test]
+    fn relaunch_refused_without_capability() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (mut peer, _link, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.term_relaunch(t, true, w);
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Invalid);
+        assert_nothing_sent(&h, &mut peer, t);
+    }
+
+    /// The capability belongs to the link it came with: after a reconnect to a Daemon
+    /// without it, the request is refused even though the previous Daemon had it.
+    #[test]
+    fn relaunch_refused_after_reconnect_to_incapable_daemon() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let _old = connect_capable(&sh, vec![info(t)], &["term.relaunch"]);
+        let (mut peer, _link, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.term_relaunch(t, false, w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
+        assert_nothing_sent(&h, &mut peer, t);
     }
 }

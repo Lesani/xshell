@@ -260,6 +260,7 @@ impl Sup {
         st.status.last_error = Some(f.message);
         st.status.error_hint = f.hint;
         st.status.protocol = None;
+        st.status.daemon_capabilities.clear();
         st.status.next_retry_at = Some(now_ms() + delay.as_millis() as u64);
         self.sh.publish(&mut st);
         delay
@@ -455,6 +456,7 @@ impl Sup {
             st.status.phase = None;
             st.status.daemon_version = Some(hello.version.clone());
             st.status.protocol = Some(negotiated);
+            st.status.daemon_capabilities = hello.capabilities.clone();
             st.status.last_error = mismatch.then(|| {
                 format!(
                     "xshelld {} is still running after the upgrade to {version}",

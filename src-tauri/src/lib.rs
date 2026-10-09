@@ -1,12 +1,9 @@
 mod hosts;
+mod local_pty;
 
-use portable_pty::{native_pty_system, PtySize};
-use std::collections::HashMap;
+use local_pty::LocalPtys;
 use std::fs;
-use std::io::{BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 use tauri::ipc::{Channel, Response};
 use tauri::State;
 use xshell_core::agents::AgentBinaryProbe;
@@ -23,13 +20,8 @@ use xshell_core::skills::ProjectSkills;
 use xshell_core::stats::{ClaudeCostSummary, GlobalRateLimits, StatuslineProbe};
 use xshell_core::{HostCtx, LaunchSpec};
 
-struct TerminalHandle {
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-}
-
 pub struct AppState {
-    terminals: Mutex<HashMap<String, TerminalHandle>>,
+    ptys: Arc<LocalPtys>,
 }
 
 #[tauri::command]
@@ -162,19 +154,20 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
-// PTY transport tuning. The flusher coalesces a short window after the first
-// byte so a burst ships as one binary chunk; MAX_IDLE is just a wakeup safety net. The pending
-// buffer is capped so a frontend that stalls can't grow it unbounded — on overflow we discard
-// the backlog and inject a hard reset rather than slice a CSI sequence in half.
-const FLUSH_COALESCE: Duration = Duration::from_millis(4);
+/// A Tab's output and exit channels.
+struct ChannelSink {
+    data: Channel<Response>,
+    exit: Channel<i32>,
+}
 
-const FLUSH_MAX_IDLE: Duration = Duration::from_millis(50);
-
-const READ_BUF: usize = 16 * 1024;
-
-const MAX_PENDING: usize = 4 * 1024 * 1024;
-
-use xshell_core::terminal::OVERFLOW_NOTICE;
+impl local_pty::Sink for ChannelSink {
+    fn data(&self, bytes: Vec<u8>) -> bool {
+        self.data.send(Response::new(bytes)).is_ok()
+    }
+    fn exit(&self, code: i32) {
+        let _ = self.exit.send(code);
+    }
+}
 
 // The argument list is the frontend IPC contract (`invoke('spawn_terminal', {...})`).
 #[allow(clippy::too_many_arguments)]
@@ -192,19 +185,10 @@ fn spawn_terminal(
     agent: Option<String>,
     fullscreen_rendering: Option<bool>,
     force_sync_output: Option<bool>,
+    skip_permissions: Option<bool>,
     on_data: Channel<Response>,
     on_exit: Channel<i32>,
 ) -> Result<(), String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Failed to open PTY: {}", e))?;
-
     let spec = LaunchSpec {
         agent,
         session_id,
@@ -214,115 +198,18 @@ fn spawn_terminal(
         shell_id,
         fullscreen_rendering,
         force_sync_output,
+        skip_permissions,
     };
-    let cmd = xshell_core::plan_command(&ctx(), &spec)?.to_command_builder();
-
-    let _child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn command: {}", e))?;
-    drop(pair.slave);
-
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("Failed to clone reader: {}", e))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("Failed to take writer: {}", e))?;
-
-    // ── PTY → frontend transport ─────────────────────────────────────────
-    // Reader thread does blocking reads of large chunks and appends RAW BYTES to a shared
-    // buffer. A separate flusher coalesces a short window so a burst (e.g. a full TUI repaint)
-    // ships as ONE binary Channel message instead of many JSON events. The frontend feeds the
-    // bytes straight to xterm, which reassembles multibyte/escape sequences across chunk
-    // boundaries — so the renderer only ever sees whole frames (no partial-frame jitter), and
-    // we never split a CSI sequence or a UTF-8 codepoint the way per-4KB from_utf8_lossy did.
-    let pending: Arc<(Mutex<Vec<u8>>, Condvar)> =
-        Arc::new((Mutex::new(Vec::with_capacity(READ_BUF)), Condvar::new()));
-    let done = Arc::new(AtomicBool::new(false));
-
-    let pending_r = pending.clone();
-    let done_r = done.clone();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut buf = [0u8; READ_BUF];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let (lock, cv) = &*pending_r;
-                    let mut g = lock.lock().unwrap();
-                    // Backpressure: discard the whole backlog (slicing it would corrupt xterm
-                    // mid-escape) and drop a hard reset + notice in its place.
-                    if g.len() + n > MAX_PENDING {
-                        g.clear();
-                        g.extend_from_slice(OVERFLOW_NOTICE);
-                    }
-                    g.extend_from_slice(&buf[..n]);
-                    cv.notify_one();
-                }
-            }
-        }
-        done_r.store(true, Ordering::Release);
-        pending_r.1.notify_one();
+    let sink = Arc::new(ChannelSink {
+        data: on_data,
+        exit: on_exit,
     });
-
-    // Flusher: wait for data, coalesce a burst into one chunk, send as binary. When the reader
-    // has hit EOF and the buffer is fully drained, emit the exit signal — same thread, so the
-    // exit never races ahead of the final output chunk.
-    let pending_f = pending;
-    let done_f = done;
-    std::thread::spawn(move || {
-        let (lock, cv) = &*pending_f;
-        loop {
-            {
-                let mut g = lock.lock().unwrap();
-                while g.is_empty() {
-                    if done_f.load(Ordering::Acquire) {
-                        let _ = on_exit.send(0);
-                        return;
-                    }
-                    let (next, _) = cv.wait_timeout(g, FLUSH_MAX_IDLE).unwrap();
-                    g = next;
-                }
-            }
-            std::thread::sleep(FLUSH_COALESCE);
-            let chunk = std::mem::take(&mut *lock.lock().unwrap());
-            if chunk.is_empty() {
-                continue;
-            }
-            if on_data.send(Response::new(chunk)).is_err() {
-                break;
-            }
-        }
-    });
-
-    state.terminals.lock().unwrap().insert(
-        id,
-        TerminalHandle {
-            writer: Box::new(writer),
-            master: pair.master,
-        },
-    );
-    Ok(())
+    state.ptys.spawn(id, spec, cols, rows, sink)
 }
 
 #[tauri::command]
 fn write_terminal(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
-    let mut terminals = state.terminals.lock().unwrap();
-    if let Some(handle) = terminals.get_mut(&id) {
-        handle
-            .writer
-            .write_all(data.as_bytes())
-            .map_err(|e| format!("Write failed: {}", e))?;
-        handle
-            .writer
-            .flush()
-            .map_err(|e| format!("Flush failed: {}", e))?;
-    }
-    Ok(())
+    state.ptys.write(&id, data.as_bytes())
 }
 
 #[tauri::command]
@@ -332,26 +219,32 @@ fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let terminals = state.terminals.lock().unwrap();
-    if let Some(handle) = terminals.get(&id) {
-        handle
-            .master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Resize failed: {}", e))?;
-    }
-    Ok(())
+    state.ptys.resize(&id, cols, rows)
 }
 
 #[tauri::command]
 fn close_terminal(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut terminals = state.terminals.lock().unwrap();
-    terminals.remove(&id);
+    state.ptys.close(&id);
     Ok(())
+}
+
+/// Restart a Terminal with `skipPermissions` changed, resuming `session_id` (the Tab's
+/// current session). Answers whether it restarted (`false`: the value already applied).
+#[tauri::command]
+async fn relaunch_terminal(
+    state: State<'_, AppState>,
+    id: String,
+    skip_permissions: bool,
+    session_id: Option<String>,
+    agent: Option<String>,
+) -> Result<bool, String> {
+    let ptys = state.ptys.clone();
+    // Ending the old process waits for it; keep that off the runtime workers.
+    tauri::async_runtime::spawn_blocking(move || {
+        ptys.relaunch(&id, skip_permissions, session_id, agent)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ── Host commands ──────────────────────────────────────────────────────
@@ -383,6 +276,7 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_term_resize",
     "host_term_close",
     "host_term_update",
+    "host_term_relaunch",
     "host_upgrade",
     "host_test",
 ];
@@ -393,6 +287,7 @@ const TERMINAL_COMMANDS: &[&str] = &[
     "write_terminal",
     "resize_terminal",
     "close_terminal",
+    "relaunch_terminal",
 ];
 
 // Built per call, as each command used to call `dirs::home_dir()` per call.
@@ -591,7 +486,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            terminals: Mutex::new(HashMap::new()),
+            ptys: Arc::new(LocalPtys::new(Arc::new(|spec| {
+                xshell_core::plan_command(&ctx(), spec)
+            }))),
         })
         .setup(|app| {
             use tauri::Manager as _;
@@ -641,6 +538,7 @@ pub fn run() {
             write_terminal,
             resize_terminal,
             close_terminal,
+            relaunch_terminal,
             hosts::commands::hosts_configure,
             hosts::commands::hosts_status,
             hosts::commands::hosts_kick,
@@ -652,6 +550,7 @@ pub fn run() {
             hosts::commands::host_term_resize,
             hosts::commands::host_term_close,
             hosts::commands::host_term_update,
+            hosts::commands::host_term_relaunch,
             hosts::commands::host_upgrade,
             hosts::commands::host_test,
             hosts::commands::list_ssh_hosts
@@ -707,7 +606,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 56);
+        assert_eq!(registered.len(), 58);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

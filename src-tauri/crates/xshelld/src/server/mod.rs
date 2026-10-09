@@ -1,8 +1,9 @@
 //! `xshelld serve`: the socket server, the Terminal registry and the Daemon lifecycle.
 //!
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
-//! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`. No lock is held across a
-//! blocking PTY or socket write: writers own their sockets, input threads own PTY writers.
+//! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
+//! `Terminal.input` are taken last and alone. No lock is held across a blocking PTY or
+//! socket write: writers own their sockets, input threads own PTY writers.
 
 mod calls;
 mod conn;
@@ -10,6 +11,7 @@ mod orphans;
 pub use orphans::Cleanup;
 mod outbox;
 mod registry;
+mod relaunch;
 mod size;
 mod terminal;
 
@@ -23,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 use xshell_core::terminal::state::Leader;
 use xshell_core::HostCtx;
 
@@ -57,6 +60,44 @@ pub struct Config {
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
+    /// Test hook: runs at the [`TestPoint`]s of a Terminal's start, exit and Relaunch.
+    #[doc(hidden)]
+    pub test_hook: Option<TestHook>,
+}
+
+/// Where a [`TestHook`] runs. Points other than [`TestPoint::ExitHandled`] run on the thread
+/// doing the work, with no lock held, so a hook may block to order a race.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestPoint {
+    /// A Relaunch was accepted and is about to start its worker thread (registry locked: do
+    /// not block). Returning `true` makes the thread start fail.
+    StartWorker,
+    /// The Relaunch worker signalled the old process.
+    Signalled,
+    /// The Relaunch worker stopped waiting for the old process; `exited` says whether it
+    /// ended in time. Returning `true` treats it as a timeout.
+    Waited { exited: bool },
+    /// A Relaunch started the replacement process `pid` and persisted its identity; none of
+    /// its threads run yet (registry locked: do not block on the Daemon).
+    ReplacementSpawned { pid: u32 },
+    /// A Terminal's reader and waiter threads are running and its input thread is next.
+    /// Returning `true` makes that thread start fail.
+    StartInput,
+    /// A process's exit was handled: published, held for a Relaunch, or dropped because its
+    /// Terminal was never listed.
+    ExitHandled { pid: Option<u32> },
+}
+
+/// A test hook: called with the Terminal and the point reached.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TestHook(pub Arc<dyn Fn(Uuid, TestPoint) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 
 impl Config {
@@ -77,6 +118,7 @@ impl Config {
             max_terminal_bytes: 256 * 1024,
             max_list_bytes: 16 * 1024 * 1024,
             cleanup_override: None,
+            test_hook: None,
         }
     }
 }
@@ -245,6 +287,13 @@ impl ServerHandle {
     pub fn size_tracked(&self) -> usize {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.values().map(|t| t.size_tracked()).sum()
+    }
+
+    /// Test hook: connections attached to the Terminals' output, summed.
+    #[doc(hidden)]
+    pub fn attached(&self) -> usize {
+        let reg = self.d.reg.lock().unwrap();
+        reg.terminals.values().map(|t| t.attached()).sum()
     }
 
     pub fn stopper(&self) -> Stopper {

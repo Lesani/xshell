@@ -3,7 +3,7 @@
 use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
-use super::{conn, Config, ConnId, ExitReason};
+use super::{conn, Config, ConnId, ExitReason, TestPoint};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -63,6 +63,20 @@ pub(crate) fn frame(msg: &ServerMsg) -> Option<Arc<[u8]>> {
 }
 
 impl Daemon {
+    /// Run the test hook at `point`; `false` when there is none.
+    pub fn test_point(&self, terminal: Uuid, point: TestPoint) -> bool {
+        self.cfg
+            .test_hook
+            .as_ref()
+            .is_some_and(|h| (h.0)(terminal, point))
+    }
+
+    /// Whether `t` is the Terminal listed under its UUID. A Relaunch lists a new one under the
+    /// same UUID, and a replacement that failed to start is never listed.
+    pub fn is_current(&self, reg: &Registry, t: &Arc<Terminal>) -> bool {
+        reg.terminals.get(&t.id).is_some_and(|c| Arc::ptr_eq(c, t))
+    }
+
     pub fn list(&self, reg: &Registry) -> Vec<TerminalInfo> {
         reg.terminals.values().map(|t| t.info()).collect()
     }

@@ -74,7 +74,7 @@ async function startLocal(tab: Tab, o: StartOptions, sinks: TerminalSinks) {
   const onExit = new Channel<number>();
   onExit.onmessage = (code) => sinks.exit(code);
   localChannels.set(tab.id, { onData, onExit });
-  await invoke("spawn_terminal", { id: tab.id, sessionId: tab.sessionId || null, cwd: tab.projectPath || ".", cols: o.cols, rows: o.rows, shellMode: o.shellMode, shellCommand: o.shellCommand, shellId: o.shellId, agent: tab.agent || null, fullscreenRendering: o.fullscreenRendering, forceSyncOutput: o.forceSyncOutput, onData, onExit });
+  await invoke("spawn_terminal", { id: tab.id, sessionId: tab.sessionId || null, cwd: tab.projectPath || ".", cols: o.cols, rows: o.rows, shellMode: o.shellMode, shellCommand: o.shellCommand, shellId: o.shellId, agent: tab.agent || null, fullscreenRendering: o.fullscreenRendering, forceSyncOutput: o.forceSyncOutput, skipPermissions: tab.skipPermissions ?? null, onData, onExit });
 }
 const localChannels = new Map<string, { onData: Channel<ArrayBuffer>; onExit: Channel<number> }>();
 
@@ -394,6 +394,18 @@ export function markClosing(tabs: Tab[]) {
 export function writeTerminal(tab: Tab, data: string) {
   if (tab.host && tab.terminal) invoke("host_term_input", { host: tab.host, terminal: tab.terminal, data }).catch(() => {});
   else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
+}
+
+// Restarts the agent with skipPermissions set to `value`, resuming its session; the Tab keeps
+// its output channels and sees a reset, then the new process. A local Terminal resumes the
+// Tab's current session (linked or switched after the start); a remote one the Daemon's.
+// Resolves once the new process runs.
+export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> {
+  if (tab.host && tab.terminal) {
+    await invoke("host_term_relaunch", { host: tab.host, terminal: tab.terminal, skipPermissions: value });
+  } else {
+    await invoke("relaunch_terminal", { id: tab.id, skipPermissions: value, sessionId: tab.sessionId || null, agent: tab.agent || null });
+  }
 }
 
 export function resizeTerminal(tab: Tab, cols: number, rows: number) {

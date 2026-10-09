@@ -215,6 +215,31 @@ mod tests {
     }
 
     #[test]
+    fn persisted_skip_permissions_roundtrip() {
+        let fx = Fixture::new();
+        let path = fx.dir.path().join("terminals.json");
+        let mut e = entry("/a");
+        e.spec.skip_permissions = Some(true);
+        save_atomic(&path, std::slice::from_ref(&e)).unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"skipPermissions\": true"));
+        assert_eq!(load(&path).unwrap().terminals, vec![e]);
+    }
+
+    #[test]
+    fn persisted_without_field_loads_none() {
+        let fx = Fixture::new();
+        let path = fx.write(
+            "terminals.json",
+            r#"{"version":1,"terminals":[{"terminal":"6f1c1f2e-8a4e-4b7c-9d2a-1b2c3d4e5f60",
+                "spec":{"cwd":"/w","sessionId":"s"},"cols":80,"rows":24,"createdAtMs":3}]}"#,
+        );
+        let l = load(&path).unwrap();
+        assert_eq!(l.terminals[0].spec.skip_permissions, None);
+    }
+
+    #[test]
     fn older_entries_without_leader_load() {
         let fx = Fixture::new();
         let path = fx.write(

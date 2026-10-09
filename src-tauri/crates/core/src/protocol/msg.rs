@@ -72,6 +72,14 @@ pub enum ClientMsg {
         #[serde(default)]
         meta: Option<Map<String, Value>>,
     },
+    /// End the Terminal's process and start it again under the same UUID with
+    /// `skipPermissions` changed, resuming its session. Gated on the `term.relaunch`
+    /// capability.
+    #[serde(rename = "term.relaunch", rename_all = "camelCase")]
+    TermRelaunch {
+        terminal: Uuid,
+        skip_permissions: bool,
+    },
     #[serde(rename = "daemon.upgrade")]
     DaemonUpgrade,
 }
@@ -87,6 +95,7 @@ const CLIENT_TYPES: &[&str] = &[
     "term.resize",
     "term.close",
     "term.update",
+    "term.relaunch",
     "daemon.upgrade",
 ];
 
@@ -390,6 +399,32 @@ mod tests {
     }
 
     #[test]
+    fn term_relaunch_camel_case() {
+        let id = Uuid::new_v4();
+        let msg = ClientMsg::TermRelaunch {
+            terminal: id,
+            skip_permissions: true,
+        };
+        let b = body(encode_msg(&msg, Some(4)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            format!(r#"{{"id":4,"t":"term.relaunch","terminal":"{id}","skipPermissions":true}}"#)
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(4), msg });
+    }
+
+    #[test]
+    fn term_relaunch_missing_field_invalid_keeps_id() {
+        let id = Uuid::new_v4();
+        let raw = json!({"t":"term.relaunch","id":5,"terminal":id});
+        let e = decode_inbound(raw.to_string().as_bytes()).unwrap_err();
+        assert!(
+            matches!(&e, DecodeError::Invalid { id: Some(5), t, .. } if t == "term.relaunch"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
     fn unknown_type_keeps_id() {
         assert_eq!(
             decode_inbound(br#"{"t":"nope","id":5}"#).unwrap_err(),
@@ -452,6 +487,27 @@ mod tests {
         let inb = decode_inbound(&b).unwrap();
         assert_eq!(inb.id, Some(3));
         assert_eq!(inb.msg, ClientMsg::DaemonUpgrade);
+    }
+
+    #[test]
+    fn terminals_roundtrip_skip_permissions() {
+        let list = ServerMsg::Terminals {
+            list: vec![TerminalInfo {
+                terminal: Uuid::new_v4(),
+                spec: LaunchSpec {
+                    session_id: Some("s".into()),
+                    skip_permissions: Some(true),
+                    ..Default::default()
+                },
+                meta: Map::new(),
+                created_at_ms: 5,
+                pid: Some(9),
+                exit_code: None,
+            }],
+        };
+        let b = body(encode_msg(&list, None).unwrap());
+        assert!(String::from_utf8_lossy(&b).contains("\"skipPermissions\":true"));
+        assert_eq!(decode_server(&b).unwrap(), list);
     }
 
     #[test]

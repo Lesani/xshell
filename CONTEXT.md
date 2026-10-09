@@ -40,6 +40,10 @@ A **Desktop**'s view of one **Terminal**.
 To bind a **Tab** to a live **Terminal** and replay the output it has not yet shown.
 _Avoid_: resume (reserved for an agent CLI reopening a session in a new process)
 
+**Relaunch**:
+To end a **Terminal**'s process and start an updated launch spec in its place (same **Terminal**, same **Tabs**), resuming the agent's session; used to turn an agent's skip-permissions flag on or off.
+_Avoid_: restart. A **Daemon** starting its **Terminals** again after its own restart restores them; that is not a Relaunch
+
 ### Projects
 
 **Project**:

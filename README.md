@@ -66,6 +66,7 @@ More agents are on the way — the registry is built to grow.
 - 📊 **Cost, context, and rate-limit tracking** per session and across your account.
 - 🪶 **Inline git panel** with diff counts and staging.
 - 🌐 **Remote hosts** over SSH, with shared terminals that keep running when you disconnect or quit xshell.
+- 🔓 **Per-tab skip permissions** for Claude Code and Codex, locally or remotely. Toggle permission bypass for one tab. Changing it interrupts the current run, restarts the agent in the same tab, and resumes the conversation.
 
 Built with Tauri 2 and Rust. Native on Windows, macOS, and Linux.
 
