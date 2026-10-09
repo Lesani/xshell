@@ -484,6 +484,7 @@ mod tests {
             ssh_target: "a".into(),
             color: None,
             daemon_command: None,
+            launch_prefixes: Default::default(),
         }])
         .unwrap();
         // The probe finished and the download is stuck on the silent server.

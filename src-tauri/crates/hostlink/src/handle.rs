@@ -38,6 +38,10 @@ pub trait TermSink: Send + Sync {
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The hello capability of Daemons that serve `term.relaunch`.
 const RELAUNCH_CAPABILITY: &str = "term.relaunch";
+/// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
+///
+/// [`LaunchSpec`]: xshell_core::launch::LaunchSpec
+const LAUNCH_PREFIX_CAPABILITY: &str = "launch.prefix";
 
 pub(crate) struct SinkSlot {
     sink: Arc<dyn TermSink>,
@@ -759,9 +763,25 @@ impl HostHandle {
         };
         let finish = Arc::new(Mutex::new(Some(finish)));
         let timeout = self.sh.mc.term_timeout;
+        let mut spec = spec;
         let sent = {
             let mut st = self.sh.lock();
             Shared::usable_link(&st).and_then(|(link, gen)| {
+                // The Host's configuration decides the prefix, never the request. A Daemon
+                // that predates prefixes would drop it and run the agent bare, so it is
+                // refused instead.
+                spec.launch.launch_prefix = st.cfg.launch_prefix(&spec.launch);
+                if spec.launch.launch_prefix.is_some()
+                    && !st
+                        .status
+                        .daemon_capabilities
+                        .iter()
+                        .any(|c| c == LAUNCH_PREFIX_CAPABILITY)
+                {
+                    return Err(HostError::invalid(
+                        "this Host's xshelld cannot run launch prefixes; upgrade it first",
+                    ));
+                }
                 let (j1, f1) = (joined.clone(), finish.clone());
                 let w_open: Waiter = Box::new(move |r| {
                     let mut j = j1.lock().unwrap();
@@ -1583,6 +1603,93 @@ pub(crate) mod tests {
         h.term_close(t, w);
         let next = peer.read_json();
         assert_eq!(next["t"], "term.close", "{next}");
+    }
+
+    fn open_spec(t: Uuid, launch: LaunchSpec) -> OpenSpec {
+        OpenSpec {
+            terminal: t,
+            launch,
+            cols: 80,
+            rows: 24,
+            meta: Map::new(),
+        }
+    }
+
+    fn prefixed_shared() -> Arc<Shared> {
+        let sh = shared();
+        sh.lock()
+            .cfg
+            .launch_prefixes
+            .insert("claude".into(), "wrap --x".into());
+        sh
+    }
+
+    #[test]
+    fn open_sends_configured_prefix() {
+        let sh = prefixed_shared();
+        let mut peer = connect_capable(&sh, vec![], &["term", "launch.prefix"]);
+        let h = handle(&sh);
+        let (w, _rx) = res_slot();
+        // A prefix in the request is replaced by the Host's.
+        let launch = LaunchSpec {
+            launch_prefix: Some(vec!["evil".into()]),
+            ..LaunchSpec::default()
+        };
+        h.term_open(
+            open_spec(Uuid::new_v4(), launch),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let open = peer.expect("term.open");
+        assert_eq!(open["spec"]["launchPrefix"], json!(["wrap", "--x"]));
+
+        // Agents without a prefix, and raw shells, are sent without one.
+        for launch in [
+            LaunchSpec {
+                agent: Some("codex".into()),
+                launch_prefix: Some(vec!["evil".into()]),
+                ..LaunchSpec::default()
+            },
+            LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..LaunchSpec::default()
+            },
+        ] {
+            let (w, _rx) = res_slot();
+            h.term_open(
+                open_spec(Uuid::new_v4(), launch),
+                Arc::new(VecSink::default()),
+                w,
+            );
+            let open = peer.expect("term.open");
+            assert!(open["spec"].get("launchPrefix").is_none(), "{open}");
+        }
+    }
+
+    #[test]
+    fn open_with_prefix_refused_without_capability() {
+        let sh = prefixed_shared();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let t = Uuid::new_v4();
+        let (w, rx) = res_slot();
+        h.term_open(
+            open_spec(t, LaunchSpec::default()),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Invalid);
+        assert_nothing_sent(&h, &mut peer, t);
+
+        // Without a prefix to run, the same Daemon opens the Terminal as before.
+        let (w, _rx) = res_slot();
+        let launch = LaunchSpec {
+            agent: Some("codex".into()),
+            ..LaunchSpec::default()
+        };
+        h.term_open(open_spec(t, launch), Arc::new(VecSink::default()), w);
+        peer.expect("term.open");
     }
 
     #[test]

@@ -1870,3 +1870,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .host-form-disclosure svg { transition: transform 0.15s; }
 .host-form-disclosure.open svg { transform: rotate(90deg); }
 .host-form-advanced { margin-top: 8px; }
+.host-form-subsection { display: block; margin-top: 14px; }
+.host-form-prefix { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; column-gap: 8px; margin-top: 6px; }
+.host-form-prefix-agent { font-size: 11px; color: var(--text-secondary); }
+.host-form-prefix .host-form-error { grid-column: 2; }

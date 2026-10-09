@@ -5533,6 +5533,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "uuid",
  "xshell-core",

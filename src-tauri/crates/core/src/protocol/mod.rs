@@ -16,7 +16,13 @@ pub const PROTOCOL: ProtocolRange = ProtocolRange {
     max: PROTOCOL_MAX,
 };
 /// Feature gates advertised in `hello` (additive; peers ignore unknown entries).
-pub const CAPABILITIES: &[&str] = &["call", "term", "daemon.upgrade", "term.relaunch"];
+pub const CAPABILITIES: &[&str] = &[
+    "call",
+    "term",
+    "daemon.upgrade",
+    "term.relaunch",
+    "launch.prefix",
+];
 
 #[cfg(test)]
 mod tests {
@@ -25,5 +31,10 @@ mod tests {
     #[test]
     fn capabilities_include_term_relaunch() {
         assert!(CAPABILITIES.contains(&"term.relaunch"));
+    }
+
+    #[test]
+    fn capabilities_include_launch_prefix() {
+        assert!(CAPABILITIES.contains(&"launch.prefix"));
     }
 }

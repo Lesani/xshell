@@ -81,9 +81,9 @@ function ConfirmDialog({ title, body, confirm, onConfirm, onCancel }: { title: s
 }
 
 function HostForm({ initial, onSave, onCancel }: { initial: HostConfig | null; onSave: (cfg: HostConfig) => void; onCancel: () => void }) {
-  const [values, setValues] = useState<HostFormValues>({ name: initial?.name ?? "", sshTarget: initial?.sshTarget ?? "", color: initial?.color, daemonCommand: initial?.daemonCommand ?? "" });
+  const [values, setValues] = useState<HostFormValues>({ name: initial?.name ?? "", sshTarget: initial?.sshTarget ?? "", color: initial?.color, daemonCommand: initial?.daemonCommand ?? "", launchPrefixes: { ...initial?.launchPrefixes } });
   const [errors, setErrors] = useState<HostFormErrors>({});
-  const [advanced, setAdvanced] = useState(!!initial?.daemonCommand);
+  const [advanced, setAdvanced] = useState(!!initial?.daemonCommand || Object.values(initial?.launchPrefixes ?? {}).some(Boolean));
   const [aliases, setAliases] = useState<string[]>([]);
   const [test, setTest] = useState<TestState>({ busy: false, text: null, ok: false });
 
@@ -138,6 +138,15 @@ function HostForm({ initial, onSave, onCancel }: { initial: HostConfig | null; o
                 <label className="edit-label">{fmt("hosts.form.daemonCommand.label")}</label>
                 <input className="edit-input host-form-mono" value={values.daemonCommand} placeholder={fmt("hosts.form.daemonCommand.placeholder")} spellCheck={false} onChange={(e) => set({ daemonCommand: e.target.value })} />
                 {errors.daemonCommand ? <div className="host-form-error">{errors.daemonCommand}</div> : <div className="edit-hint">{fmt("hosts.form.daemonCommand.help")}</div>}
+                <label className="edit-label host-form-subsection">{fmt("hosts.form.launchPrefix.label")}</label>
+                {AGENT_IDS.map(agent => (
+                  <div key={agent} className="host-form-prefix">
+                    <span className="host-form-prefix-agent">{AGENTS[agent].label}</span>
+                    <input className="edit-input host-form-mono" aria-label={`${fmt("hosts.form.launchPrefix.label")}: ${AGENTS[agent].label}`} value={values.launchPrefixes?.[agent] ?? ""} placeholder={fmt("hosts.form.launchPrefix.placeholder")} spellCheck={false} onChange={(e) => set({ launchPrefixes: { ...values.launchPrefixes, [agent]: e.target.value } })} />
+                    {errors[`launchPrefix.${agent}`] && <div className="host-form-error">{errors[`launchPrefix.${agent}`]}</div>}
+                  </div>
+                ))}
+                <div className="edit-hint">{fmt("hosts.form.launchPrefix.help")}</div>
               </div>
             )}
           </div>
