@@ -10,22 +10,18 @@ A desktop IDE that hosts AI coding-agent CLIs (Claude Code, Codex, Cursor, openc
 The xshell GUI application a person interacts with, on a computer or a phone.
 _Avoid_: client, app, frontend (when meaning the whole application)
 
-**Mobile Desktop**:
-A **Desktop** on a phone (Android or iOS). It drives agents on **Remote Hosts** with the same capabilities as any other **Desktop**, but has no **Local Host**: no agent ever runs on the phone.
-_Avoid_: companion, mobile client, remote app
-
 **Host**:
 A machine whose agents, files and session history xshell can drive; the **Desktop**'s own machine is the **Local Host**.
 _Avoid_: server, remote, box, machine
 
 **Local Host**:
-The **Host** the **Desktop** runs on, served in-process with no network hop.
+The **Host** the **Desktop** runs on, served by that **Desktop**'s **GUI-bound Daemon** (or a **Persistent Daemon** when opted in) over a local socket, with no network hop.
 
 **Remote Host**:
 Any **Host** other than the **Local Host**, reached through its **Daemon**.
 
 **Host Status**:
-A **Desktop**'s view of whether it can reach a **Remote Host**: connected, reconnecting, offline, or upgrade pending.
+A **Desktop**'s view of whether it can reach a **Host**: connected, reconnecting, offline, upgrade pending, xshell closed (its **Daemon** said goodbye to the **Relay** on a clean exit), unreachable (the **Relay** connection dropped without a goodbye), or needs update.
 
 **Daemon**:
 The headless `xshelld` process that serves one **Host**'s **Terminals** to any number of **Desktops**.
@@ -38,8 +34,8 @@ A **Daemon** started and ended by a **Desktop** on its own machine, so that mach
 A **Daemon** that outlives any **Desktop**, installed by opt-in on the **Local Host** or automatically on a **Remote Host**.
 
 **Mobile**:
-A **Desktop** on a phone that observes and steers **Terminals** on its **Ring**'s **Hosts** and runs no agents itself.
-_Avoid_: remote control (Claude Code's and Codex's feature it replaces), companion, phone client
+A **Desktop** on a phone that observes and steers agent **Terminals** on its **Ring**'s **Hosts**, with fewer rights than a computer **Desktop** (see Relationships); it has no **Local Host**, so no agent ever runs on the phone.
+_Avoid_: Mobile Desktop, remote control (Claude Code's and Codex's feature it replaces), companion, phone client, mobile client, remote app
 
 ### Terminals and tabs
 
@@ -116,7 +112,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 
 ## Relationships
 
-- A **Desktop** connects to zero or more **Remote Hosts**; a computer **Desktop** always has exactly one **Local Host**, a **Mobile Desktop** has none
+- A **Desktop** connects to zero or more **Remote Hosts**; a computer **Desktop** always has exactly one **Local Host**, a **Mobile** has none
 - A **Daemon** serves exactly one **Host** and accepts any number of **Desktops**; a **Host** runs at most one **Daemon** per user, shared by **Desktops** of any version
 - A **Desktop** reaches a **Daemon** either by initiating SSH or through its **Ring**'s **Relay**; a **Daemon** dials out only to that **Relay**, never to a **Desktop**
 - A **Host** appears on a **Mobile** while its **Daemon** is connected to the **Relay**; a **Mobile** never installs or starts a **Daemon**
@@ -124,6 +120,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 - A **Mobile** is woken when an **Agent Status** becomes needs you or finished, each switchable in settings; the **Daemon** decides and seals the payload, so the **Relay** learns only that some device should be woken
 - A **Daemon** streams raw **Terminal** output to a **Mobile** only while that **Terminal**'s **Terminal View** is on screen; the **Chat View** receives session updates, never screen redraws. That stream is at most 1 frame per second, rising to 10 per second for 3 seconds after the **Mobile** sends input
 - A **Relay** asks the **Push Gateway** to wake a **Mobile** only when no **Mobile** of its **Ring** is in the foreground; the **Push Gateway** never sees **Terminal** content
+- "Desktop" as a **Roster** role means a computer **Desktop**; a **Mobile** has its own role, never the desktop role
 - Only **Desktops** may change the **Roster**; **Mobiles** and headless **Daemons** are members that cannot add or remove anyone
 - A **Remote Host** joins its **Desktop**'s **Ring** automatically when that **Desktop** installs its **Daemon** over SSH; other machines pair with `xshelld pair`
 - A **Mobile** gates features per **Host** on the **Daemon**'s capabilities; when protocol ranges do not overlap it tells the user which side to update (the app, or the **Daemon** at a **Desktop**), and never upgrades a **Daemon** itself
