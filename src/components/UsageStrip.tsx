@@ -1,21 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { fanOutSourced, freshestRateLimits, mergeCodexUsage, sumCostSummaries } from "../hosts/aggregate";
+import { useHostsSnapshot, usableHosts } from "../hosts/useHosts";
+import { fmt } from "../hosts/strings";
 import { Sparkles } from "lucide-react";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { OpenAIIcon } from "./OpenAIIcon";
 import { ttProps, type TtFns } from "./Tooltip";
 import { timeAgo } from "../utils";
-import type { ClaudeCostSummary, CodexUsage, SessionInfo } from "../types";
-
-interface GlobalRateLimits {
-  five_hour_pct: number | null;
-  seven_day_pct: number | null;
-  five_hour_resets_at: number | null;
-  seven_day_resets_at: number | null;
-}
+import type { ClaudeCostSummary, CodexUsage, GlobalRateLimits, SessionInfo } from "../types";
 
 interface UsageStripProps {
-  recentSessions: SessionInfo[];
+  // Sessions for the today/week counters: live lists only — this computer plus usable Hosts
+  // whose list was fetched live (build it with liveRecentSessions). Never the cached lists
+  // of offline Hosts (amendment 24).
+  liveSessions: SessionInfo[];
   tt: TtFns;
   onOpenSettings: () => void;
 }
@@ -66,22 +64,26 @@ function Gauge({ label, pct, resetsAt, tt }: { label: string; pct: number | null
 // counts plus the Connect nudge. Codex needs no setup: rate limits and activity are read
 // straight from its rollout files, with a staleness note since they only update when
 // Codex actually runs.
-export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripProps) {
+export function UsageStrip({ liveSessions: recentSessions, tt, onOpenSettings }: UsageStripProps) {
   const [claudeCost, setClaudeCost] = useState<ClaudeCostSummary | null>(null);
   const [claudeLimits, setClaudeLimits] = useState<GlobalRateLimits | null>(null);
   const [codex, setCodex] = useState<CodexUsage | null>(null);
+  // How many Hosts (this computer included) contributed to the cost figures.
+  const [costSources, setCostSources] = useState(1);
+  // This computer plus every usable Remote Host; refreshed when that set changes.
+  const usableKey = usableHosts(useHostsSnapshot()).join(",");
 
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
-      invoke<ClaudeCostSummary>("get_claude_cost_summary").then(v => { if (!cancelled) setClaudeCost(v); }).catch(() => {});
-      invoke<GlobalRateLimits>("get_global_rate_limits").then(v => { if (!cancelled) setClaudeLimits(v); }).catch(() => {});
-      invoke<CodexUsage>("get_codex_usage").then(v => { if (!cancelled) setCodex(v); }).catch(() => {});
+      fanOutSourced<ClaudeCostSummary>("get_claude_cost_summary").then(r => { if (!cancelled && r.length) { setClaudeCost(sumCostSummaries(r.map(x => x.value))); setCostSources(r.length); } }).catch(() => {});
+      fanOutSourced<GlobalRateLimits>("get_global_rate_limits").then(r => { if (!cancelled && r.length) setClaudeLimits(freshestRateLimits(r.map(x => x.value))); }).catch(() => {});
+      fanOutSourced<CodexUsage>("get_codex_usage").then(r => { if (!cancelled && r.length) setCodex(mergeCodexUsage(r.map(x => x.value))); }).catch(() => {});
     };
     refresh();
     const timer = setInterval(refresh, 60000);
     return () => { cancelled = true; clearInterval(timer); };
-  }, []);
+  }, [usableKey]);
 
   const today = localDate(new Date());
   const weekDates = useMemo(() => new Set(lastNDates(7)), [today]);
@@ -108,6 +110,7 @@ export function UsageStrip({ recentSessions, tt, onOpenSettings }: UsageStripPro
         <div className="usage-card-head">
           <ClaudeChatIcon size={13} />
           <span className="usage-card-title">Claude Code</span>
+          {costSources > 1 && <span className="usage-hosts" {...ttProps(tt, fmt("usage.includesHosts", { n: costSources }))}>{fmt("usage.includesHosts", { n: costSources })}</span>}
           {connected && (
             <div className="usage-gauges">
               <Gauge label="5h" pct={claudeLimits?.five_hour_pct ?? null} resetsAt={claudeLimits?.five_hour_resets_at ?? null} tt={tt} />

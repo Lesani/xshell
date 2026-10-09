@@ -1,0 +1,196 @@
+name: CI
+on:
+  push: # every branch, so fork feature branches get CI before a PR
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  frontend:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npm run build # tsc && vite build (type-checks tests too)
+      - run: npm test # vitest run
+  rust:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        run: | # identical list to release.yml
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Includes xshelld's unit and integration tests (in-process server, real binary).
+      - run: cargo test --workspace --locked
+      - name: Guard - xshell-core stays Tauri-free
+        shell: bash # -eo pipefail: a failing cargo tree fails the step
+        run: |
+          tree=$(cargo tree -p xshell-core -e normal --prefix none --locked)
+          grep -q '^xshell-core ' <<<"$tree" # the tree really is core's
+          if grep -E '^(tauri|wry|webkit2gtk|gtk) ' <<<"$tree"; then
+            echo "::error::xshell-core depends on a Tauri/webview crate"
+            exit 1
+          fi
+      - name: Guard - home and temp dirs only come from HostCtx
+        shell: bash
+        run: |
+          test -d crates/core/src
+          set +e
+          hits=$(grep -rnE 'dirs::home_dir|env::temp_dir' crates/core/src --include='*.rs')
+          rc=$?
+          set -e
+          [ "$rc" -le 1 ] || { echo "::error::grep failed ($rc)"; exit 1; }
+          # Positive control: the pattern must still find the lookups in ctx.rs.
+          grep -q '^crates/core/src/ctx.rs:' <<<"$hits"
+          bad=$(grep -v '^crates/core/src/ctx.rs:' <<<"$hits" || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "::error::read the home or temp dir through HostCtx, not the process"
+            exit 1
+          fi
+  core:
+    # Core, xshelld and hostlink are Tauri-free, so they build without webview packages. These runners
+    # compile the #[cfg(windows)] and macOS paths that the Linux job never sees. xshelld is
+    # Unix-only: on Windows it compiles to a stub and its tests are empty.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo clippy -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-core -p xshelld -p xshell-hostlink --locked
+  xshelld-musl:
+    # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
+    # builds natively with musl-gcc on a runner of its own architecture. The release workflow
+    # builds the same way, so this proves the release path on every push.
+    name: xshelld-musl (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          cc_var="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          export "$cc_var=musl-gcc"
+          cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
+      - name: Static and runnable
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release-daemon/xshelld
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          "$bin" --version
+          ls -l "$bin"
+  e2e-ssh:
+    # The real ssh path: a throwaway sshd on the runner, auto-install of the musl xshelld from
+    # a binary directory, then a Terminal over it.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: cargo build -p xshelld --profile release-daemon --target x86_64-unknown-linux-musl --locked
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+      - name: Binary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/x86_64-unknown-linux-musl/release-daemon/xshelld "$RUNNER_TEMP/bin/xshelld-x86_64-unknown-linux-musl"
+      - name: Throwaway sshd on port 2222
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/xshell_e2e
+          cat ~/.ssh/xshell_e2e.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/hostkey"
+          cat > "$RUNNER_TEMP/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $RUNNER_TEMP/hostkey
+          PidFile $RUNNER_TEMP/sshd.pid
+          AuthorizedKeysFile .ssh/authorized_keys
+          UsePAM no
+          StrictModes no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          EOF
+          cat >> ~/.ssh/config <<EOF
+          Host xshell-e2e
+            HostName 127.0.0.1
+            Port 2222
+            IdentityFile ~/.ssh/xshell_e2e
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile $RUNNER_TEMP/kh
+          EOF
+          chmod 600 ~/.ssh/config
+          /usr/sbin/sshd -f "$RUNNER_TEMP/sshd_config" -E "$RUNNER_TEMP/sshd.log"
+          ssh -o BatchMode=yes xshell-e2e true
+      - name: e2e_ssh
+        run: cargo test -p xshelld --test e2e_ssh --locked -- --ignored --test-threads=1
+        env:
+          XSHELL_E2E_SSH_TARGET: xshell-e2e
+          XSHELL_E2E_BIN_DIR: ${{ runner.temp }}/bin
+      - name: sshd log
+        if: failure()
+        run: cat "$RUNNER_TEMP/sshd.log" || true

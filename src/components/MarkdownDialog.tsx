@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import type { HostId } from "../hosts/types";
 import { X, FolderOpen } from "lucide-react";
 import { useTooltip, ttProps } from "./Tooltip";
 import { renderMarkdown, stripFrontmatter } from "../markdown";
 
-interface Props { path: string | null; title?: string; onClose: () => void }
+// `host` set = the file lives on a Remote Host: read through the Daemon, no reveal.
+interface Props { path: string | null; title?: string; host?: HostId; onClose: () => void }
 
-export function MarkdownDialog({ path, title, onClose }: Props) {
+export function MarkdownDialog({ path, title, host, onClose }: Props) {
   const [content, setContent] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -14,12 +17,14 @@ export function MarkdownDialog({ path, title, onClose }: Props) {
 
   useEffect(() => {
     if (!path) return;
+    let alive = true; // ignore a response for a superseded (host, path)
     setLoading(true); setError(null); setContent("");
-    invoke<string>("read_text_file", { path })
-      .then(setContent)
-      .catch(e => setError(String(e)))
-      .finally(() => setLoading(false));
-  }, [path]);
+    hostInvoke<string>(host, "read_text_file", { path })
+      .then(c => { if (alive) setContent(c); })
+      .catch(e => { if (alive) setError(String(e)); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [path, host]);
 
   useEffect(() => {
     if (!path) return;
@@ -35,7 +40,7 @@ export function MarkdownDialog({ path, title, onClose }: Props) {
       <div className="md-dialog" onClick={e => e.stopPropagation()}>
         <div className="md-head">
           <span className="md-title">{title || path.split(/[\\/]/).pop()}</span>
-          <button className="md-head-btn" onClick={() => invoke("reveal_in_explorer", { path }).catch(() => {})} {...ttProps(tt, "Reveal in Explorer")}><FolderOpen size={13} /></button>
+          {!host && <button className="md-head-btn" onClick={() => invoke("reveal_in_explorer", { path }).catch(() => {})} {...ttProps(tt, "Reveal in Explorer")}><FolderOpen size={13} /></button>}
           <button className="md-head-btn" onClick={onClose} {...ttProps(tt, "Close")}><X size={14} /></button>
         </div>
         <div className="md-body">

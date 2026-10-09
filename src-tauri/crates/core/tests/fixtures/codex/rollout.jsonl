@@ -1,0 +1,8 @@
+{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"0199aaaa-bbbb-cccc-dddd-eeeeeeeeeeee","cwd":"/work/proj","cli_version":"0.50.0","git":{"branch":"main"}}}
+{"timestamp":"2026-01-01T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}
+{"timestamp":"2026-01-01T10:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"  fix the\nbug  "}}
+{"timestamp":"2026-01-01T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":20},"model_context_window":272000,"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20}}}}
+not json
+{"timestamp":"2026-01-02T09:00:00Z","type":"turn_context","payload":{"model":"gpt-5.1-codex"}}
+{"timestamp":"2026-01-02T09:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"second prompt"}}
+{"timestamp":"2026-01-02T09:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300,"output_tokens":50},"model_context_window":400000,"total_token_usage":{"input_tokens":400,"cached_input_tokens":200,"output_tokens":70}}}}

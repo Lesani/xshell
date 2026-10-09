@@ -3,7 +3,9 @@ import { Search, Terminal as TerminalIcon, Settings, X, PanelLeft, ChevronRight,
 import { useProjectImage } from "../hooks/useProjectImage";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AgentIcon, type AgentId } from "../agents";
-import { getAvailableShells } from "../shells";
+import { getAvailableShells, shellsForPlatform } from "../shells";
+import { registry } from "../hosts/registry";
+import { keyOf, keyOfTab, lookupKey, type ProjectKey } from "../hosts/projectKey";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, Tab } from "../types";
 
@@ -21,9 +23,9 @@ interface QuickActionsDialogProps {
   projectIcons: Record<string, ProjectSettings>;
   pinnedProjects: ProjectInfo[];
   contextProject: ProjectInfo | null;
-  hoveredProjectPath: string | null;
-  linkedProjectPath: string | null;
-  selectedProjectPath: string | null;
+  hoveredProjectKey: ProjectKey | null;
+  linkedProjectKey: ProjectKey | null;
+  selectedProjectKey: ProjectKey | null;
   hasActiveTab: boolean;
   installedAgents: Record<AgentId, boolean>;
   onSelectTab: (id: string) => void;
@@ -54,7 +56,7 @@ function ProjectMiniIcon({ iconValue, color, name }: { iconValue?: string; color
   return <div className="ts-project-icon" style={{ background: color || undefined }}>{iconValue || getInitials(name || "?")}</div>;
 }
 
-export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProjects, contextProject, hoveredProjectPath, linkedProjectPath, selectedProjectPath, hasActiveTab, installedAgents, onSelectTab, onCloseTab, onNewChat, onNewShell, onGoHome, onOpenSettings, onToggleSidebar, onClose }: QuickActionsDialogProps) {
+export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProjects, contextProject, hoveredProjectKey, linkedProjectKey, selectedProjectKey, hasActiveTab, installedAgents, onSelectTab, onCloseTab, onNewChat, onNewShell, onGoHome, onOpenSettings, onToggleSidebar, onClose }: QuickActionsDialogProps) {
   const ref = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -95,7 +97,8 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     const q = query.trim().toLowerCase();
     if (!q) return sortedTabs;
     return sortedTabs.filter(t => {
-      const customName = t.projectPath ? projectIcons[t.projectPath.toLowerCase()]?.customName : undefined;
+      const tk = keyOfTab(t);
+      const customName = tk ? projectIcons[lookupKey(tk)]?.customName : undefined;
       const projDisplayName = customName || t.projectName || "";
       const haystack = `${t.title} ${projDisplayName} ${t.shellId || ""}`.toLowerCase();
       return haystack.includes(q);
@@ -103,7 +106,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
   }, [sortedTabs, query, projectIcons]);
 
   // Project-context label used in the "New shell in <here>" hint.
-  const contextLabel = contextProject ? (projectIcons[contextProject.path.toLowerCase()]?.customName || contextProject.name) : "~";
+  const contextLabel = contextProject ? (projectIcons[lookupKey(keyOf(contextProject))]?.customName || contextProject.name) : "~";
 
   // Icon for the new-chat affordances: the single installed agent's mark, or a neutral
   // agent glyph when several are installed — which agent hosts the chat is resolved after
@@ -127,7 +130,9 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
   ], [hasActiveTab, activeTabId, contextLabel, newChatAgent, onCloseTab, onGoHome, onToggleSidebar, onOpenSettings]);
 
   // Available shells for the drill-down view.
-  const shells = useMemo(() => getAvailableShells(), []);
+  // Shells for the context project's Host (a Remote Host offers its own OS's shells).
+  const contextHost = contextProject?.host;
+  const shells = useMemo(() => contextHost ? shellsForPlatform(registry.getStatus(contextHost)?.os ?? "linux") : getAvailableShells(), [contextHost]);
 
   const filteredShells = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -146,7 +151,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     const q = query.trim().toLowerCase();
     if (!q) return pinnedProjects;
     return pinnedProjects.filter(p => {
-      const settings = projectIcons[p.path.toLowerCase()];
+      const settings = projectIcons[lookupKey(keyOf(p))];
       const display = settings?.customName || p.name;
       return `${display} ${p.path}`.toLowerCase().includes(q);
     });
@@ -215,7 +220,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
     el?.scrollIntoView({ block: "nearest" });
   }, [highlightIdx]);
 
-  const highlightPath = (hoveredProjectPath || linkedProjectPath || selectedProjectPath || "").toLowerCase();
+  const highlightKey = lookupKey(hoveredProjectKey || linkedProjectKey || selectedProjectKey || "");
 
   // Placeholder copy is mode-aware so it's always obvious what the input filters.
   const placeholder =
@@ -257,13 +262,14 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
           {view === "tabs" && filteredTabs.map((tab, i) => {
             const isHighlighted = i === highlightIdx;
             const isActive = tab.id === activeTabId;
-            const settings = tab.projectPath ? projectIcons[tab.projectPath.toLowerCase()] : undefined;
+            const tabKey = keyOfTab(tab);
+            const settings = tabKey ? projectIcons[lookupKey(tabKey)] : undefined;
             const customName = settings?.customName;
             const projDisplayName = customName || tab.projectName || (tab.projectPath ? "" : "~");
             const isRawShell = tab.shellMode === "raw";
             const displayTitle = isRawShell ? (projDisplayName || tab.title) : tab.title;
             const displaySubtitle = isRawShell ? tab.title : projDisplayName;
-            const matches = !!highlightPath && tab.projectPath && tab.projectPath.toLowerCase() === highlightPath;
+            const matches = !!highlightKey && tabKey && lookupKey(tabKey) === highlightKey;
             const showDivider = i > 0 && i === firstRawIdx;
             return (
               <div key={tab.id}>
@@ -322,11 +328,11 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
           )}
           {view === "new-chat-project" && filteredProjects.map((proj, i) => {
             const isHighlighted = i === highlightIdx;
-            const settings = projectIcons[proj.path.toLowerCase()];
+            const settings = projectIcons[lookupKey(keyOf(proj))];
             const display = settings?.customName || proj.name;
             return (
               <div
-                key={proj.path}
+                key={keyOf(proj)}
                 data-ts-idx={i}
                 className={`ts-row ${isHighlighted ? "highlighted" : ""}`}
                 onMouseEnter={() => handleHover(i)}

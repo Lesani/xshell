@@ -61,14 +61,25 @@ xshell/
 ├── src/                       # React frontend
 │   ├── components/            # UI components
 │   ├── hooks/                 # Custom React hooks
+│   ├── hosts/                 # Host routing, status, cache, and terminal reconciliation
 │   ├── App.tsx                # Tab shell + main app state
 │   ├── shells.ts              # Shell preset detection
 │   ├── layout.ts              # Pane split / drag layout
 │   └── types.ts               # Shared TypeScript types
-├── src-tauri/                 # Rust backend
-│   ├── src/lib.rs             # Tauri commands (PTY, stats, projects, skills, git)
+├── src-tauri/                 # Rust backend and Cargo workspace
+│   ├── src/lib.rs             # Tauri commands and thin wrappers over core
 │   ├── src/main.rs            # Entry point
+│   ├── src/hosts/             # Desktop host commands, events, and binary downloads
+│   ├── crates/core/           # xshell-core: Tauri-free host logic and protocol
+│   │   ├── src/dispatch.rs    # Method table for every host command
+│   │   ├── src/launch.rs      # Terminal launch spec → command plan
+│   │   └── tests/             # Integration tests and text fixtures
+│   ├── crates/xshelld/        # Daemon, terminal registry, and connect bridge
+│   ├── crates/hostlink/       # xshell-hostlink: SSH transport, install, and reconnect
 │   └── tauri.conf.json        # Tauri 2 configuration
+├── CONTEXT.md                 # Domain vocabulary
+├── docs/adr/                  # Architectural decisions
+├── docs/remote-hosts.md        # Remote hosts design and protocol
 ├── docs/screenshots/          # README screenshots
 └── .github/workflows/         # CI / release automation
 ```
@@ -80,6 +91,7 @@ xshell/
 - Check existing issues to avoid duplicates.
 - For significant changes, open an issue first to discuss the approach.
 - Keep your branch up to date with `main`.
+- Read [CONTEXT.md](./CONTEXT.md) for the vocabulary, [docs/adr/](./docs/adr/) for architectural decisions, and [docs/remote-hosts.md](./docs/remote-hosts.md) for the remote hosts design.
 
 ### Commit guidelines
 
@@ -96,9 +108,43 @@ xshell/
 
 ## Testing
 
-xshell does not yet have an automated test suite. Contributions to set one up — Vitest for the React side, `cargo test` for Rust — are very welcome.
+Run the automated tests before opening a PR:
 
-In the meantime, please manually test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
+```bash
+npm test                                  # Vitest (frontend unit tests)
+cd src-tauri
+cargo test --workspace --locked            # All Rust crates
+cargo test -p xshell-core --locked         # Core only
+cargo test -p xshelld -p xshell-hostlink --locked # Daemon and hostlink
+```
+
+Building the desktop crate needs the Tauri system dependencies (see Prerequisites). Core, Daemon, and hostlink tests need no Tauri system dependencies. Run Daemon tests on Linux or macOS; Windows builds a stub.
+
+Host-side logic belongs in `xshell-core`, not in `src/lib.rs`: a new command is a core function plus an entry in `dispatch.rs` (`METHODS` and the `match`), and the desktop gets a thin wrapper that keeps the frontend's parameter names. Core reads the home and temp directories only through `HostCtx`, never from `dirs::home_dir()` or `std::env::temp_dir()`.
+
+The ignored SSH tests need a disposable SSH host or account with non-interactive key access. They install `xshelld` and stop that account's Daemon during cleanup. From `src-tauri/`:
+
+```bash
+XSHELL_E2E_SSH_TARGET=xshell-e2e \
+XSHELL_E2E_BIN_DIR=/path/to/binaries \
+cargo test -p xshelld --test e2e_ssh --locked -- --ignored --test-threads=1
+```
+
+The binary directory must contain `xshelld-<triple>` for the host. See [.github/workflows/ci.yml](./.github/workflows/ci.yml) for the throwaway SSH setup.
+
+To use a locally built Daemon in `tauri dev`, build it from `src-tauri/`:
+
+```bash
+cargo build -p xshelld --profile release-daemon --target <triple> --locked
+```
+
+Use `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, or `x86_64-apple-darwin`. Install the Rust target and its compiler tools first; CI shows the x86_64 musl setup.
+
+The Desktop checks `xshelld-<triple>` beside its executable first. Debug builds then check `src-tauri/target/<triple>/release-daemon/xshelld` and, for the matching local platform, `src-tauri/target/release-daemon/xshelld`. These paths assume the default Cargo layout; lookup uses the executable's parent directory. Missing local binaries fall back to GitHub release downloads.
+
+CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, a check that `xshell-core` has no Tauri dependency, a check that core never reads the home or temp directory outside `HostCtx`, `cargo clippy` and `cargo test` for `xshell-core` on Windows and macOS, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
+
+Automated tests do not replace a manual pass: please also test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
 
 Manual checklist:
 
@@ -107,6 +153,7 @@ Manual checklist:
 - [ ] Terminal tabs open and accept input (both Claude and Raw modes)
 - [ ] Settings persist across restarts
 - [ ] For UI changes: both light and dark themes still look right
+- [ ] Remote hosts connect, share terminals across Desktops, survive disconnect/quit, reconnect, and restart terminals correctly after Upgrade now
 
 ## Reporting issues
 

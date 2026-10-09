@@ -1,0 +1,331 @@
+//! One Desktop connection: handshake, then a read loop that applies each message. Every
+//! handler is non-blocking (PTY writes go through input threads, calls get their own thread).
+//! Losing a connection detaches it everywhere and ends nothing.
+
+use super::calls::spawn_call;
+use super::outbox::{writer_loop, Outbox};
+use super::registry::{frame, now_ms, Daemon};
+use super::terminal::{self, Terminal};
+use super::{ConnId, ExitReason};
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::io::BufReader;
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use uuid::Uuid;
+use xshell_core::protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+use xshell_core::protocol::msg::{
+    decode_inbound, encode_res, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
+};
+use xshell_core::protocol::negotiate::negotiate;
+use xshell_core::protocol::{CAPABILITIES, PROTOCOL};
+
+pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
+    if let Some(id) = id {
+        ob.push_control(Arc::from(encode_res(id, r)));
+    }
+}
+
+fn push_error(ob: &Outbox, code: &str, message: String) {
+    if let Some(f) = frame(&ServerMsg::Error {
+        code: code.into(),
+        message,
+    }) {
+        ob.push_control(f);
+    }
+}
+
+struct Conn {
+    d: Arc<Daemon>,
+    id: ConnId,
+    ob: Arc<Outbox>,
+    /// Terminals this connection attached to or sized; all are released on disconnect.
+    touched: HashSet<Uuid>,
+    inflight: Arc<AtomicUsize>,
+}
+
+pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
+    let (wsock, asock) = match (sock.try_clone(), sock.try_clone()) {
+        (Ok(w), Ok(a)) => (w, a),
+        _ => return,
+    };
+    let ob = Outbox::new(d.cfg.conn_output_cap, d.cfg.conn_total_cap, Some(asock));
+    let (obw, stall) = (ob.clone(), d.cfg.write_stall_timeout);
+    if std::thread::Builder::new()
+        .name(format!("conn-{id}-w"))
+        .spawn(move || writer_loop(obw, wsock, stall))
+        .is_err()
+    {
+        return;
+    }
+    if let Some(f) = frame(&ServerMsg::Hello(Hello {
+        protocol: PROTOCOL,
+        version: env!("CARGO_PKG_VERSION").into(),
+        capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+    })) {
+        ob.push_control(f);
+    }
+
+    let mut reader = BufReader::new(&sock);
+    let _ = sock.set_read_timeout(Some(d.cfg.hello_timeout));
+    let theirs = match read_frame(&mut reader, MAX_FRAME_LEN) {
+        Ok(Some(Frame::Json(j))) => match decode_inbound(&j) {
+            Ok(Inbound {
+                msg: ClientMsg::Hello(h),
+                ..
+            }) => Some(h),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(theirs) = theirs else {
+        push_error(
+            &ob,
+            "expected_hello",
+            "the first message must be hello".into(),
+        );
+        ob.close();
+        return;
+    };
+    if let Err(m) = negotiate(PROTOCOL, theirs.protocol) {
+        push_error(&ob, "protocol_mismatch", m.to_string());
+        ob.close();
+        return;
+    }
+    let _ = sock.set_read_timeout(None);
+    {
+        let mut reg = d.reg.lock().unwrap();
+        if reg.closed {
+            drop(reg);
+            push_error(&ob, "shutting_down", "xshelld is exiting".into());
+            ob.close();
+            return;
+        }
+        reg.conns.insert(id, ob.clone());
+        d.touch_idle(&mut reg);
+        if let Some(f) = d.terminals_frame(&reg) {
+            ob.push_terminals(f);
+        }
+    }
+
+    let mut c = Conn {
+        d: d.clone(),
+        id,
+        ob: ob.clone(),
+        touched: HashSet::new(),
+        inflight: Arc::new(AtomicUsize::new(0)),
+    };
+    // A clean EOF lets queued replies drain; a protocol error drops them.
+    let mut clean = false;
+    loop {
+        match read_frame(&mut reader, MAX_FRAME_LEN) {
+            Ok(Some(Frame::Json(j))) => match decode_inbound(&j) {
+                Ok(m) => c.on_msg(m),
+                Err(DecodeError::Malformed(e)) => {
+                    crate::log!("INFO", "conn {id}: malformed message ({e}); closing");
+                    break;
+                }
+                Err(
+                    e @ (DecodeError::UnknownType { id, .. } | DecodeError::Invalid { id, .. }),
+                ) => reply(&ob, id, Err(e.to_string())),
+            },
+            Ok(Some(Frame::Output { .. })) => {
+                crate::log!("INFO", "conn {id}: output frame from a Desktop; closing");
+                break;
+            }
+            Ok(Some(Frame::Unknown { kind, .. })) => {
+                crate::log!("INFO", "conn {id}: skipping frame of unknown kind {kind}");
+            }
+            Ok(None) => {
+                clean = true;
+                break;
+            }
+            Err(e) => {
+                crate::log!("INFO", "conn {id}: {e}; closing");
+                break;
+            }
+        }
+        if !ob.is_open() {
+            break;
+        }
+    }
+
+    // Cleanup: detach everywhere, deregister. Terminals are never touched.
+    let terms: Vec<Arc<Terminal>> = {
+        let mut reg = d.reg.lock().unwrap();
+        reg.conns.remove(&id);
+        d.touch_idle(&mut reg);
+        c.touched
+            .iter()
+            .filter_map(|t| reg.terminals.get(t).cloned())
+            .collect()
+    };
+    for t in terms {
+        t.detach(id);
+    }
+    if clean {
+        ob.close();
+    } else {
+        ob.abort();
+    }
+}
+
+impl Conn {
+    fn terminal(&self, id: &Uuid) -> Result<Arc<Terminal>, String> {
+        self.d
+            .reg
+            .lock()
+            .unwrap()
+            .terminals
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("unknown terminal {id}"))
+    }
+
+    fn on_msg(&mut self, m: Inbound) {
+        let id = m.id;
+        let d = self.d.clone();
+        match m.msg {
+            ClientMsg::Hello(_) => reply(&self.ob, id, Err("already said hello".into())),
+            ClientMsg::Call { method, params } => {
+                spawn_call(&d, &self.ob, &self.inflight, id, method, params)
+            }
+            ClientMsg::TermOpen { spec } => {
+                let mut reg = d.reg.lock().unwrap();
+                let r = if reg.frozen {
+                    Err("xshelld is upgrading or shutting down".to_string())
+                } else if reg.terminals.contains_key(&spec.terminal) {
+                    Err(format!("terminal {} already exists", spec.terminal))
+                } else if let Err(e) = d.check_budget(&reg, spec.terminal, &spec.launch, &spec.meta)
+                {
+                    Err(e)
+                } else {
+                    terminal::spawn(
+                        &d,
+                        spec.terminal,
+                        spec.launch,
+                        spec.meta,
+                        spec.cols,
+                        spec.rows,
+                        now_ms(),
+                    )
+                };
+                match r {
+                    Ok(t) => {
+                        let pid = t.info().pid;
+                        reg.terminals.insert(t.id, t);
+                        d.persist(&reg);
+                        d.touch_idle(&mut reg);
+                        d.broadcast_terminals(&reg);
+                        drop(reg);
+                        reply(&self.ob, id, Ok(json!({ "pid": pid })));
+                    }
+                    Err(e) => {
+                        drop(reg);
+                        reply(&self.ob, id, Err(e));
+                    }
+                }
+            }
+            ClientMsg::TermAttach { terminal } => match self.terminal(&terminal) {
+                Ok(t) => {
+                    let dropped = t.attach(self.id, &self.ob, id);
+                    self.touched.insert(terminal);
+                    d.nudge_overflowed(dropped);
+                    t.nudge(d.cfg.nudge_delay);
+                }
+                Err(e) => reply(&self.ob, id, Err(e)),
+            },
+            ClientMsg::TermDetach { terminal } => {
+                let r = self.terminal(&terminal).map(|t| {
+                    t.detach(self.id);
+                    Value::Null
+                });
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::TermInput { terminal, data } => {
+                self.touched.insert(terminal);
+                let r = self.terminal(&terminal).and_then(|t| {
+                    // Typing can hand the size to this connection; persist it like a resize.
+                    if t.write_input(self.id, data)? {
+                        t.schedule_persist(&d);
+                    }
+                    Ok(Value::Null)
+                });
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::TermResize {
+                terminal,
+                cols,
+                rows,
+            } => {
+                self.touched.insert(terminal);
+                let r = self.terminal(&terminal).and_then(|t| {
+                    if t.resize(self.id, cols, rows)? {
+                        t.schedule_persist(&d);
+                    }
+                    Ok(Value::Null)
+                });
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::TermClose { terminal } => {
+                let mut reg = d.reg.lock().unwrap();
+                let r = match reg.terminals.get(&terminal).cloned() {
+                    None => Err(format!("unknown terminal {terminal}")),
+                    Some(t) if t.is_exited() => {
+                        // Nothing left to signal; the pid may already be reused.
+                        if !reg.frozen {
+                            reg.terminals.remove(&terminal);
+                            d.persist(&reg);
+                            d.touch_idle(&mut reg);
+                            d.broadcast_terminals(&reg);
+                        }
+                        Ok(Value::Null)
+                    }
+                    Some(t) => {
+                        t.kill(d.cfg.kill_grace);
+                        Ok(Value::Null)
+                    }
+                };
+                drop(reg);
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::TermUpdate {
+                terminal,
+                session_id,
+                meta,
+            } => {
+                let reg = d.reg.lock().unwrap();
+                let r = match reg.terminals.get(&terminal) {
+                    None => Err(format!("unknown terminal {terminal}")),
+                    Some(t) => {
+                        let (spec, meta) = t.updated(session_id, meta);
+                        d.check_budget(&reg, terminal, &spec, &meta).map(|_| {
+                            t.set_record(spec, meta);
+                            d.persist(&reg);
+                            d.broadcast_terminals(&reg);
+                            Value::Null
+                        })
+                    }
+                };
+                drop(reg);
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::DaemonUpgrade => {
+                {
+                    let mut reg = d.reg.lock().unwrap();
+                    if !reg.frozen {
+                        // The last word on disk before the Terminals are ended.
+                        d.persist(&reg);
+                        reg.frozen = true;
+                    }
+                }
+                reply(&self.ob, id, Ok(Value::Null));
+                let d2 = d.clone();
+                let _ = std::thread::Builder::new()
+                    .name("upgrade".into())
+                    .spawn(move || d2.exit(ExitReason::Upgrade));
+            }
+        }
+    }
+}

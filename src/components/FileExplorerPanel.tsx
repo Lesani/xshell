@@ -1,5 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { fmt } from "../hosts/strings";
+import { hostInvoke } from "../hosts/hostInvoke";
+import type { HostId } from "../hosts/types";
 import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon } from "lucide-react";
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
@@ -62,11 +65,16 @@ interface RowProps {
   hideTt: () => void;
 }
 
+// True inside a Remote Host's explorer: files are not on this computer, so rows cannot be
+// revealed — drag (path typed into the remote terminal) is the only file action.
+const RemoteRows = createContext(false);
+
 // Single presentational row, shared by the tree and the flat search results.
 function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContext, showTt, hideTt }: RowProps) {
+  const remote = useContext(RemoteRows);
   const agent = agentForDir(item);
   const iconUrl = agent ? "" : item.is_dir ? folderIconUrl(item.name, !!expanded) : fileIconUrl(item.name);
-  const tip = item.is_dir ? item.path : `${item.path} — click to reveal · drag to terminal`;
+  const tip = item.is_dir ? item.path : remote ? fmt("explorer.row.tooltipRemote") : `${item.path} — click to reveal · drag to terminal`;
   const onDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
     e.dataTransfer.setData("text/plain", item.path);
@@ -95,6 +103,7 @@ interface NodeProps {
   item: DirItem;
   depth: number;
   tick: number;
+  host?: HostId;
   activePath: string | null;
   onReveal: (path: string) => void;
   onContext: (x: number, y: number, item: DirItem) => void;
@@ -105,7 +114,7 @@ interface NodeProps {
 // One tree row + its lazily-loaded children. Children load on first expand and then stay
 // mounted (height-collapsed) so the open/close height transition is smooth and re-expanding
 // is instant. The grid-rows trick (0fr↔1fr) animates to the children's natural height.
-function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
+function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -114,19 +123,19 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
     if (!expanded || children !== null) return;
     let alive = true;
     setLoading(true);
-    invoke<DirItem[]>("list_dir", { path: item.path })
+    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path })
       .then((c) => { if (alive) setChildren(c); })
       .catch(() => { if (alive) setChildren([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [expanded, item.path, children]);
+  }, [expanded, item.path, children, host]);
 
   // Silent re-pull on each poll tick (only for an open, already-loaded folder) so additions /
   // deletions inside it show up live. Collapsed or unloaded folders are skipped.
   useEffect(() => {
     if (tick === 0 || !expanded || children === null) return;
     let alive = true;
-    invoke<DirItem[]>("list_dir", { path: item.path }).then((c) => { if (alive) setChildren(c); }).catch(() => {});
+    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path }).then((c) => { if (alive) setChildren(c); }).catch(() => {});
     return () => { alive = false; };
   }, [tick]);
 
@@ -143,7 +152,7 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
               ? (loading && expanded ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Loading…</div> : null)
               : children.length === 0
                 ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Empty</div>
-                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
+                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} host={host} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
           </div>
         </div>
       )}
@@ -153,7 +162,9 @@ function Node({ item, depth, tick, activePath, onReveal, onContext, showTt, hide
 
 interface PanelProps {
   rootPath: string;
-  terminalId: string;
+  host?: HostId;
+  // Types the given text into this panel's terminal (local PTY or Remote Terminal).
+  onWritePath: (data: string) => void;
   visible: boolean;
   showTt: (text: string, el: HTMLElement) => void;
   hideTt: () => void;
@@ -162,7 +173,7 @@ interface PanelProps {
 // Inner content of the file-explorer side panel — header (current dir + up/search/refresh) and
 // a scrollable area showing either the lazy tree or flat search results. TerminalTab wraps this
 // in the shared `.terminal-side-panel` + splitter, mirroring how the git panel is hosted.
-export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideTt }: PanelProps) {
+export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt, hideTt }: PanelProps) {
   // The browsable root. Starts at the terminal's cwd but the up-button can climb past it.
   const [cwd, setCwd] = useState(rootPath);
   const [roots, setRoots] = useState<DirItem[] | null>(null);
@@ -176,15 +187,16 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Reset to the terminal's cwd if the tab's project path changes underneath us.
-  useEffect(() => { setCwd(rootPath); }, [rootPath]);
+  // Keyed on (host, path): the same path on another Host is a different folder (amendment 23).
+  useEffect(() => { setCwd(rootPath); setRoots(null); }, [rootPath, host]);
 
   const load = useCallback((silent = false) => {
     if (!silent) setRefreshing(true);
-    invoke<DirItem[]>("list_dir", { path: cwd })
+    hostInvoke<DirItem[]>(host, "list_dir", { path: cwd })
       .then(setRoots)
       .catch(() => setRoots([]))
       .finally(() => { if (!silent) setRefreshing(false); });
-  }, [cwd]);
+  }, [cwd, host]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -210,11 +222,11 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
     if (!q) { setResults(null); setSearching(false); return; }
     setSearching(true);
     const t = window.setTimeout(() => {
-      invoke<DirItem[]>("search_dir", { root: cwd, query: q, limit: 300 })
+      hostInvoke<DirItem[]>(host, "search_dir", { root: cwd, query: q, limit: 300 })
         .then(setResults).catch(() => setResults([])).finally(() => setSearching(false));
     }, 220);
     return () => window.clearTimeout(t);
-  }, [query, searchOpen, cwd]);
+  }, [query, searchOpen, cwd, host]);
 
   useEffect(() => { if (searchOpen) searchInputRef.current?.focus(); }, [searchOpen]);
 
@@ -229,8 +241,9 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
     return () => window.removeEventListener("keydown", onKey);
   }, [ctx, searchOpen]);
 
-  const reveal = useCallback((path: string) => { invoke("reveal_in_explorer", { path }).catch(() => {}); }, []);
-  const writePath = useCallback((path: string) => { invoke("write_terminal", { id: terminalId, data: pathForTerminal(path) }).catch(() => {}); }, [terminalId]);
+  // Reveal is Local only; on a Remote Host it does nothing.
+  const reveal = useCallback((path: string) => { if (host) return; invoke("reveal_in_explorer", { path }).catch(() => {}); }, [host]);
+  const writePath = useCallback((path: string) => { onWritePath(pathForTerminal(path)); }, [onWritePath]);
   const openContext = useCallback((x: number, y: number, item: DirItem) => setCtx({ x, y, item }), []);
 
   // Tooltip with a hover delay (tree/search rows). The timer is cleared on leave so it never
@@ -248,7 +261,7 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
   const showingSearch = searchOpen && query.trim().length > 0;
 
   return (
-    <>
+    <RemoteRows.Provider value={!!host}>
       <div className="git-panel-header file-panel-header">
         <Folder size={13} className="file-panel-folder" />
         <span className="file-panel-title" onMouseEnter={(e) => showTt(cwd, e.currentTarget)} onMouseLeave={hideTt}>{baseName(cwd)}</span>
@@ -281,7 +294,7 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
           <>
             {roots === null && <div className="git-panel-empty">Loading…</div>}
             {roots !== null && roots.length === 0 && <div className="git-panel-empty">Empty folder</div>}
-            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
+            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} host={host} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
           </>
         )}
       </div>
@@ -289,11 +302,11 @@ export function FileExplorerPanel({ rootPath, terminalId, visible, showTt, hideT
         <>
           <div className="file-ctx-backdrop" onClick={() => setCtx(null)} onContextMenu={(e) => { e.preventDefault(); setCtx(null); }} />
           <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 80) }}>
-            <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>
+            {!host && <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>}
             <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>Write path to terminal</span></button>
           </div>
         </>
       )}
-    </>
+    </RemoteRows.Provider>
   );
 }

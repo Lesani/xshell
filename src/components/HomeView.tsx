@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderPlus, Plus, Trash2, GitBranch, Search, ArrowRight, ArrowUp, Pencil, Folder as FolderIcon, ChevronRight, X, FolderOpen, MessageSquare, Sparkles } from "lucide-react";
+import { FolderPlus, Plus, Trash2, GitBranch, Search, ArrowRight, ArrowUp, Pencil, Folder as FolderIcon, ChevronRight, X, FolderOpen, MessageSquare, Sparkles, AlertTriangle } from "lucide-react";
 import { SkillsPanel } from "./SkillsPanel";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { AGENTS, AgentIcon } from "../agents";
@@ -9,17 +9,23 @@ import { timeAgo, processSessions } from "../utils";
 import { useProjectImage } from "../hooks/useProjectImage";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo } from "../types";
+import { keyOf, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
+import { HostBadge } from "./HostBadge";
+import { registry } from "../hosts/registry";
+import { fmt } from "../hosts/strings";
 
 interface HomeViewProps {
   projects: ProjectInfo[];
   allProjects: ProjectInfo[];
-  activeCountByProject: Map<string, number>;
+  activeCountByProject: Map<string, number>; // keyed by lookupKey(ProjectKey)
   selectedProject: ProjectInfo | null;
   projectIcons: Record<string, ProjectSettings>;
   recentSessions: SessionInfo[];
   projectSessions: SessionInfo[];
-  openSessionIds: Set<string>;
-  sessionGroupName?: Record<string, string>;
+  // True when the project's session list came from the offline cache (amendment 24).
+  projectSessionsStale?: boolean;
+  openSessionIds: Set<string>;               // session keys (sessionKeyOf)
+  sessionGroupName?: Record<string, string>; // by session key
   loading: boolean;
   sessionsLoading: boolean;
   contextTreeEnabled: boolean;
@@ -34,9 +40,9 @@ interface HomeViewProps {
   onSelectProject: (project: ProjectInfo) => void;
   onNewChat: (project: ProjectInfo) => void;
   onAddProject: () => void;
-  onRemoveProject: (path: string) => void;
-  onEditProject: (path: string) => void;
-  onSaveFolders: (path: string, folders: SessionFolder[]) => void;
+  onRemoveProject: (key: ProjectKey) => void;
+  onEditProject: (key: ProjectKey) => void;
+  onSaveFolders: (key: ProjectKey, folders: SessionFolder[]) => void;
 }
 
 function genFolderId(): string {
@@ -391,6 +397,7 @@ function SessionRow({ session, isOpen, groupName, onClick, isDragging, onPointer
         {isOpen && <div className="session-open-dot" />}
       </div>
       <AgentIcon agent={session.agent} size={14} className={`session-item-prompt ${AGENTS[session.agent || "claude"].neutralIcon ? "session-item-prompt-neutral" : ""}`} />
+      {session.host && <HostBadge host={session.host} size="md" className="session-item-host" tooltip={fmt("home.session.hostBadge", { host: registry.hostName(session.host) })} tt={tt ?? null} />}
       <div className="session-item-content">
         <div className="session-item-title">{session.title}</div>
         <div className="session-item-meta">
@@ -434,7 +441,7 @@ function SessionsLoader() {
 
 function sortWithOpen(sessions: SessionInfo[], openIds: Set<string>): SessionInfo[] {
   const processed = processSessions(sessions);
-  return [...processed.filter(s => openIds.has(s.id)), ...processed.filter(s => !openIds.has(s.id))];
+  return [...processed.filter(s => openIds.has(sessionKeyOf(s))), ...processed.filter(s => !openIds.has(sessionKeyOf(s)))];
 }
 
 function SearchBar({ value, onChange, placeholder, onFocus, onBlur }: { value: string; onChange: (v: string) => void; placeholder?: string; onFocus?: () => void; onBlur?: () => void }) {
@@ -597,7 +604,7 @@ function Tile({ label, value, sub, accent }: { label: string; value: string; sub
 }
 
 function ProjectIcon({ project, projectIcons, size }: { project: ProjectInfo; projectIcons: Record<string, ProjectSettings>; size: number }) {
-  const settings = projectIcons[project.path.toLowerCase()];
+  const settings = projectIcons[lookupKey(keyOf(project))];
   const iconValue = settings?.icon;
   const displayName = settings?.customName || project.name;
   const imgSrc = useProjectImage(iconValue);
@@ -619,7 +626,7 @@ function filterSessions(sessions: SessionInfo[], query: string): SessionInfo[] {
   return sessions.filter(s => s.title.toLowerCase().includes(q) || s.project_name.toLowerCase().includes(q) || s.git_branch.toLowerCase().includes(q));
 }
 
-export function HomeView({ projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
+export function HomeView({ projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, projectSessionsStale, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
   const [search, setSearch] = useState("");
   // Scroll-driven collapse of the stats strip in the project detail view. Same UX the old
   // preview cards had: scroll down → strip slides up out of view; pull back up at the very
@@ -667,11 +674,11 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
   // Live-read folders for the selected project. A new array identity only when it actually changes.
   const folders: SessionFolder[] = useMemo(() => {
     if (!selectedProject) return [];
-    return projectIcons[selectedProject.path.toLowerCase()]?.folders || [];
+    return projectIcons[lookupKey(keyOf(selectedProject))]?.folders || [];
   }, [selectedProject, projectIcons]);
 
   // Reset search / any in-progress folder ops when project changes
-  useEffect(() => { setSearch(""); setRenamingFolderId(null); setFolderCtxMenu(null); setDragState(null); setStatsCollapsed(false); upAccumRef.current = 0; if (scrollRef.current) scrollRef.current.scrollTop = 0; }, [selectedProject?.path]);
+  useEffect(() => { setSearch(""); setRenamingFolderId(null); setFolderCtxMenu(null); setDragState(null); setStatsCollapsed(false); upAccumRef.current = 0; if (scrollRef.current) scrollRef.current.scrollTop = 0; }, [selectedProject ? keyOf(selectedProject) : undefined]);
 
   // Close the folder context menu on outside click or Escape
   useEffect(() => {
@@ -685,7 +692,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
 
   const persistFolders = useCallback((next: SessionFolder[]) => {
     if (!selectedProject) return;
-    onSaveFolders(selectedProject.path, next);
+    onSaveFolders(keyOf(selectedProject), next);
   }, [selectedProject, onSaveFolders]);
 
   const handleCreateFolder = useCallback(() => {
@@ -811,17 +818,20 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                 <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                   <ProjectIcon project={selectedProject} projectIcons={projectIcons} size={40} />
                   <div>
-                    <div className="sessions-view-title">{projectIcons[selectedProject.path.toLowerCase()]?.customName || selectedProject.name}</div>
-                    <div className="sessions-view-path">{selectedProject.path}</div>
+                    <div className="sessions-view-title">{projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name}</div>
+                    <div className="sessions-view-path">{selectedProject.host && <HostBadge host={selectedProject.host} size="md" className="sessions-view-host" tooltip={fmt("home.session.hostBadge", { host: registry.hostName(selectedProject.host) })} tt={tt} />}{selectedProject.path}</div>
                   </div>
                 </div>
                 <div className="sessions-view-header-actions">
-                  <button className="btn btn-ghost" onClick={() => invoke("reveal_in_explorer", { path: selectedProject.path }).catch(() => {})} onMouseEnter={(e) => showTt("Reveal in Explorer", e.currentTarget)} onMouseLeave={hideTt}><FolderOpen size={12} /></button>
-                  <button className="btn btn-ghost" onClick={() => onEditProject(selectedProject.path)} onMouseEnter={(e) => showTt("Edit project", e.currentTarget)} onMouseLeave={hideTt}><Pencil size={12} /></button>
-                  <button className="btn btn-ghost" onClick={() => onRemoveProject(selectedProject.path)} onMouseEnter={(e) => showTt("Remove from sidebar", e.currentTarget)} onMouseLeave={hideTt}><Trash2 size={12} /></button>
+                  {!selectedProject.host && <button className="btn btn-ghost" onClick={() => invoke("reveal_in_explorer", { path: selectedProject.path }).catch(() => {})} onMouseEnter={(e) => showTt("Reveal in Explorer", e.currentTarget)} onMouseLeave={hideTt}><FolderOpen size={12} /></button>}
+                  <button className="btn btn-ghost" onClick={() => onEditProject(keyOf(selectedProject))} onMouseEnter={(e) => showTt("Edit project", e.currentTarget)} onMouseLeave={hideTt}><Pencil size={12} /></button>
+                  <button className="btn btn-ghost" onClick={() => onRemoveProject(keyOf(selectedProject))} onMouseEnter={(e) => showTt("Remove from sidebar", e.currentTarget)} onMouseLeave={hideTt}><Trash2 size={12} /></button>
                 </div>
               </div>
             </div>
+            {selectedProject.host && projectSessionsStale && (
+              <div className="home-stale-banner"><AlertTriangle size={12} /><span>{fmt("home.project.stale", { host: registry.hostName(selectedProject.host) })}</span></div>
+            )}
             <button className={`continue-chip ${showChip ? "show" : ""}`} onClick={restoreStats} onMouseEnter={(e) => showTt("Show project stats", e.currentTarget)} onMouseLeave={hideTt}>
               <ArrowUp size={11} />
               <span>Project stats</span>
@@ -847,10 +857,10 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
               <SearchBar value={search} onChange={setSearch} placeholder={sessionsLoading ? "Loading..." : `Search through ${sortedAll.length} session${sortedAll.length !== 1 ? "s" : ""}...`} />
             </div>
 
-            <div className="project-detail-sessions" key={selectedProject.path}>
+            <div className="project-detail-sessions" key={keyOf(selectedProject)}>
           {sessionsLoading ? <SessionsLoader /> : isSearching ? (
             <div className="session-list">
-              {filteredAll.map(session => <SessionRow key={session.id} session={session} isOpen={openSessionIds.has(session.id)} groupName={sessionGroupName?.[session.id]} onClick={() => onOpenSession(session, selectedProject)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />)}
+              {filteredAll.map(session => <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />)}
               {filteredAll.length === 0 && <div className="empty-state"><div className="empty-state-desc">No sessions matching "{search}"</div></div>}
             </div>
           ) : (
@@ -861,7 +871,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                     // Session objects sorted by newest first (open ones still pinned to top for visibility)
                     const folderSessionObjs = folder.sessionIds.map(id => sessionById.get(id)).filter((s): s is SessionInfo => !!s);
                     const folderSessions = sortWithOpen(folderSessionObjs, openSessionIds);
-                    const activeInFolder = folderSessions.filter(s => openSessionIds.has(s.id)).length;
+                    const activeInFolder = folderSessions.filter(s => openSessionIds.has(sessionKeyOf(s))).length;
                     const isHoverTarget = dragState?.active && dragState.hoverFolderId === folder.id && dragState.sourceFolderId !== folder.id;
                     const isCollapsed = !!folder.collapsed;
                     const isRenaming = renamingFolderId === folder.id;
@@ -885,7 +895,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                             {folderSessions.length === 0 ? (
                               <div className="folder-empty">Drop sessions here</div>
                             ) : folderSessions.map(session => (
-                              <SessionRow key={session.id} session={session} isOpen={openSessionIds.has(session.id)} groupName={sessionGroupName?.[session.id]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, folder.id)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
+                              <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, folder.id)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
                             ))}
                           </div>
                         </div>
@@ -906,7 +916,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                 ) : (
                   <div className="session-list">
                     {ungrouped.map(session => (
-                      <SessionRow key={session.id} session={session} isOpen={openSessionIds.has(session.id)} groupName={sessionGroupName?.[session.id]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, null)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
+                      <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, null)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
                     ))}
                   </div>
                 )}
@@ -941,7 +951,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
           );
         })()}
         </div>
-        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} projectName={projectIcons[selectedProject.path.toLowerCase()]?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity") }} />}
+        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} host={selectedProject.host} projectName={projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity") }} />}
       </div>
     );
   }
@@ -981,11 +991,11 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                   <>
                     {visible.map(project => {
                       // Same source as the sidebar's green badge: open terminal tabs per project.
-                      const activeCount = activeCountByProject.get(project.path.toLowerCase()) || 0;
+                      const activeCount = activeCountByProject.get(lookupKey(keyOf(project))) || 0;
                       return (
-                        <div key={project.path} className={`project-pill ${activeCount > 0 ? "is-active" : ""}`} onClick={() => onSelectProject(project)} {...ttProps(tt, activeCount > 0 ? `${project.path} · ${activeCount} active session${activeCount === 1 ? "" : "s"}` : project.path)}>
+                        <div key={keyOf(project)} className={`project-pill ${activeCount > 0 ? "is-active" : ""}`} onClick={() => onSelectProject(project)} {...ttProps(tt, activeCount > 0 ? `${project.path} · ${activeCount} active session${activeCount === 1 ? "" : "s"}` : project.path)}>
                           <ProjectIcon project={project} projectIcons={projectIcons} size={20} />
-                          <span className="project-pill-name">{projectIcons[project.path.toLowerCase()]?.customName || project.name}</span>
+                          <span className="project-pill-name">{projectIcons[lookupKey(keyOf(project))]?.customName || project.name}</span>
                           {activeCount > 0 && <span className="project-pill-badge">{activeCount}</span>}
                         </div>
                       );
@@ -1019,7 +1029,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
         {sessionsLoading ? <SessionsLoader /> : (
           filtered.length > 0 ? (
             <div className="session-list">
-              {filtered.map(session => <SessionRow key={session.id} session={session} isOpen={openSessionIds.has(session.id)} groupName={sessionGroupName?.[session.id]} onClick={() => onOpenSession(session)} onAddAsTab={() => onOpenSessionBackground(session)} tt={tt} showMetrics={metricsForSession(session)} />)}
+              {filtered.map(session => <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session)} onAddAsTab={() => onOpenSessionBackground(session)} tt={tt} showMetrics={metricsForSession(session)} />)}
             </div>
           ) : search ? (
             <div className="empty-state"><div className="empty-state-desc">No sessions matching "{search}"</div></div>

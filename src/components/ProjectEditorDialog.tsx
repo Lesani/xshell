@@ -4,6 +4,9 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useProjectImage } from "../hooks/useProjectImage";
 import { ColorPicker } from "./ColorPicker";
 import type { ProjectInfo, ProjectSettings } from "../types";
+import { HostBadge } from "./HostBadge";
+import { registry } from "../hosts/registry";
+import { fmt } from "../hosts/strings";
 
 const EMOJI_OPTIONS = ["\u{1F680}", "\u{1F527}", "\u{1F4E6}", "\u{1F3AF}", "\u{1F4A1}", "\u{1F9EA}", "\u{1F4CA}", "\u{1F310}", "\u{26A1}", "\u{1F3A8}", "\u{1F52C}", "\u{1F4F1}", "\u{1F5A5}\u{FE0F}", "\u{1F5C4}\u{FE0F}", "\u{1F6E0}\u{FE0F}", "\u{1F4DD}", "\u{1F4BB}", "\u{1F4D6}"];
 
@@ -106,7 +109,7 @@ export function ProjectEditorDialog({ project, settings, onSave, onClose }: Prop
             <IconPreview mode={mode} letters={letters} emoji={emoji} imagePath={imagePath} name={effectiveName} color={color} />
             <div className="edit-preview-info">
               <div className="edit-preview-name">{effectiveName}</div>
-              <div className="edit-preview-path" title={project.path}>{project.path}</div>
+              <div className="edit-preview-path" title={project.host ? fmt("sidebar.project.hostTooltip", { project: project.path, host: registry.hostName(project.host) }) : project.path}>{project.host && <HostBadge host={project.host} size="md" className="edit-preview-host" />}{project.path}</div>
             </div>
           </div>
 

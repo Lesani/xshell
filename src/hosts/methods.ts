@@ -1,0 +1,64 @@
+// Host-side commands: every command the Daemon serves through `call`. Must equal
+// `xshell_core::METHODS` (src-tauri/crates/core/src/dispatch.rs) — hostMethods.test.ts
+// checks it. Desktop-only commands (open_url, reveal_in_explorer, read_image_base64,
+// terminal commands, settings, updater) are not in this list and keep calling `invoke`.
+export const HOST_METHODS = [
+  "list_claude_projects",
+  "get_sessions",
+  "get_all_recent_sessions",
+  "get_session_messages",
+  "save_dropped_file",
+  "read_text_file",
+  "list_dir",
+  "search_dir",
+  "get_username",
+  "get_home_dir",
+  "get_project_skills",
+  "get_project_memories",
+  "get_git_status",
+  "get_git_log",
+  "git_diff",
+  "git_stage",
+  "git_unstage",
+  "git_discard",
+  "list_git_branches",
+  "git_checkout",
+  "list_project_session_ids",
+  "detect_session_branch",
+  "probe_statusline_setup",
+  "get_global_rate_limits",
+  "detect_agent_binary",
+  "list_codex_projects",
+  "list_cursor_projects",
+  "list_opencode_projects",
+  "list_antigravity_projects",
+  "get_codex_context",
+  "get_cursor_context",
+  "get_opencode_context",
+  "get_antigravity_context",
+  "get_claude_cost_summary",
+  "get_codex_usage",
+] as const;
+
+export type HostMethod = typeof HOST_METHODS[number];
+
+// Read calls whose last result is kept per Host so an offline Host still shows its data
+// (marked stale). Only these fall back to the cache.
+export const CACHEABLE_METHODS: ReadonlySet<HostMethod> = new Set<HostMethod>([
+  "list_claude_projects",
+  "get_all_recent_sessions",
+  "get_sessions",
+  "list_codex_projects",
+  "list_cursor_projects",
+  "list_opencode_projects",
+  "list_antigravity_projects",
+  "get_project_skills",
+  "get_project_memories",
+  "get_codex_context",
+  "get_cursor_context",
+  "get_opencode_context",
+  "get_antigravity_context",
+  "get_claude_cost_summary",
+  "get_codex_usage",
+  "get_global_rate_limits",
+]);

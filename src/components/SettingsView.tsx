@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot } from "lucide-react";
+import { hostInvoke } from "../hosts/hostInvoke";
+import { fmt } from "../hosts/strings";
+import type { HostConfig } from "../hosts/types";
+import { HostsSettings } from "./HostsSettings";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -14,6 +18,9 @@ import { renderMarkdown } from "../markdown";
 export type ThemeMode = "dark" | "light";
 
 interface SettingsViewProps {
+  // Settings → Hosts: persist the Host list / remove one Host (App owns tabs and layout).
+  onSaveHosts: (hosts: HostConfig[]) => Promise<void>;
+  onRemoveHost: (id: string) => Promise<void>;
   theme: ThemeMode;
   onSetTheme: (theme: ThemeMode) => void;
   defaultAgent: "ask" | AgentId;
@@ -61,11 +68,12 @@ interface SettingsViewProps {
   updateInfo: UpdateInfo;
 }
 
-type Category = "appearance" | "agents" | "terminal" | "behavior" | "about";
+type Category = "appearance" | "agents" | "hosts" | "terminal" | "behavior" | "about";
 
 const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "agents",     label: "Agents",     icon: Bot },
+  { id: "hosts",      label: fmt("settings.nav.hosts"), icon: Server },
   { id: "terminal",   label: "Terminal",   icon: TerminalIcon },
   { id: "behavior",   label: "Behavior",   icon: SettingsIcon },
   { id: "about",      label: "About",      icon: Info },
@@ -167,7 +175,7 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -188,7 +196,7 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
 
   useEffect(() => {
     let cancelled = false;
-    invoke<{ stats_dir_present: boolean; stats_session_count: number }>("probe_statusline_setup")
+    hostInvoke<{ stats_dir_present: boolean; stats_session_count: number }>(undefined, "probe_statusline_setup")
       .then(p => { if (!cancelled) setStatslineConfigured(p.stats_dir_present && p.stats_session_count > 0); })
       .catch(() => { if (!cancelled) setStatslineConfigured(false); });
     return () => { cancelled = true; };
@@ -197,7 +205,7 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
   const probeAgents = useCallback(() => {
     AGENT_IDS.forEach(id => {
       setAgentProbes(prev => ({ ...prev, [id]: { loading: true, probe: prev[id].probe } }));
-      invoke<AgentProbe>("detect_agent_binary", { binary: AGENTS[id].binary })
+      hostInvoke<AgentProbe>(undefined, "detect_agent_binary", { binary: AGENTS[id].binary })
         .then(probe => setAgentProbes(prev => ({ ...prev, [id]: { loading: false, probe } })))
         .catch(() => setAgentProbes(prev => ({ ...prev, [id]: { loading: false, probe: null } })));
     });
@@ -245,6 +253,8 @@ export function SettingsView({ theme, onSetTheme, defaultAgent, onSetDefaultAgen
               </Section>
             </>
           )}
+
+          {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} />}
 
           {active === "agents" && (
             <>

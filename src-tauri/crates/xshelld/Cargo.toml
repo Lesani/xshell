@@ -1,0 +1,31 @@
+[package]
+name = "xshelld"
+version = "1.5.0"
+edition = "2021"
+license = "MIT"
+publish = false
+# File::try_lock (the single-instance lock) is stable since 1.89.
+rust-version = "1.89"
+description = "xshell Remote Host daemon"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "xshelld"
+path = "src/main.rs"
+
+[dependencies]
+xshell-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+portable-pty = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+xshell-hostlink = { path = "../hostlink" }

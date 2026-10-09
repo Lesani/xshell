@@ -1,0 +1,11 @@
+{
+  // Project config: JSONC with comments and trailing commas.
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["docs/rules.md", "missing.md", "glob/*.md", "AGENTS.md",],
+  "mcp": {
+    "local": { "type": "local", "command": ["npx", "-y", "srv"] },
+    "remote": { "type": "remote", "url": "https://r.example" },
+    /* no command or url */
+    "bare": {},
+  },
+}

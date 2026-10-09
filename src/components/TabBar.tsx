@@ -1,12 +1,16 @@
 import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { hostInvoke } from "../hosts/hostInvoke";
+import { keyOf, keyOfTab, lookupKey, sameKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
 import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { timeAgo, processSessions } from "../utils";
 import type { ProjectInfo, ProjectSettings, SessionInfo, Tab, Group } from "../types";
-import { getAvailableShells } from "../shells";
+import { getAvailableShells, shellsForPlatform } from "../shells";
+import { registry } from "../hosts/registry";
+import { useHostsSnapshot } from "../hosts/useHosts";
+import { fmt } from "../hosts/strings";
 import { collectLeafIds } from "../layout";
 import { Layers } from "lucide-react";
 import { useDragReorder } from "../hooks/useDragReorder";
@@ -40,10 +44,10 @@ interface TabBarProps {
   closingTabIds: Set<string>;
   activeTabId: string;
   selectedProject: ProjectInfo | null;
-  hoveredProjectPath: string | null;
-  linkedProjectPath: string | null;
+  hoveredProjectKey: ProjectKey | null;
+  linkedProjectKey: ProjectKey | null;
   activeTabProject: ProjectInfo | null;
-  openSessionIds: Set<string>;
+  openSessionIds: Set<string>; // session keys (host-qualified for remote sessions)
   projectIcons: Record<string, ProjectSettings>;
   pinnedProjects: ProjectInfo[];
   sidebarCollapsed: boolean;
@@ -72,10 +76,12 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
   // Fetch fresh sessions on open (only when a project is in context)
   useEffect(() => {
     if (!project?.encoded_name) { setSessions([]); return; }
-    invoke<SessionInfo[]>("get_sessions", { encodedName: project.encoded_name })
-      .then(setSessions)
-      .catch(() => setSessions([]));
-  }, [project?.encoded_name]);
+    let alive = true;
+    hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName: project.encoded_name })
+      .then(v => { if (alive) setSessions(project.host ? v.map(s => ({ ...s, host: project.host })) : v); })
+      .catch(() => { if (alive) setSessions([]); });
+    return () => { alive = false; };
+  }, [project?.encoded_name, project?.host]);
 
   // Close on click outside (ignore clicks on the anchor so toggling works)
   useEffect(() => {
@@ -92,7 +98,7 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
   }, [onClose, anchorEl]);
 
   // Filter out sessions that are already open in tabs
-  const filtered = (sessions || []).filter(s => !openSessionIds.has(s.id));
+  const filtered = (sessions || []).filter(s => !openSessionIds.has(sessionKeyOf(s)));
   const sorted = processSessions(filtered).slice(0, 5);
 
   // Prefer opening rightward from the anchor (readable when anchor is far left).
@@ -104,7 +110,8 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
     ? { top, left: Math.max(4, anchorRect.left) }
     : { top, right: Math.max(4, window.innerWidth - anchorRect.right) };
 
-  const shells = getAvailableShells();
+  // A Remote Host offers its own OS's shells, never the Desktop's.
+  const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();
   // If there's no project, collapsing the shells makes no sense — there's nothing else in the dropdown.
   const [shellsOpen, setShellsOpen] = useState(!project);
   // With one agent installed the new-chat entry stays a single row for that agent; with
@@ -174,7 +181,7 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
           {sessions === null && <div className="tab-dropdown-loading"><div className="spinner-small" /></div>}
           {sessions !== null && sorted.length === 0 && <div className="tab-dropdown-empty">{sessions.length === 0 ? "No sessions yet" : "All sessions are already open"}</div>}
           {sorted.map(s => (
-            <div key={s.id} className="tab-dropdown-item" onClick={() => { onPick(s); onClose(); }}>
+            <div key={sessionKeyOf(s)} className="tab-dropdown-item" onClick={() => { onPick(s); onClose(); }}>
               <AgentIcon agent={s.agent} size={13} className={`tab-dropdown-prompt ${AGENTS[s.agent || "claude"].neutralIcon ? "tab-dropdown-icon-neutral" : ""}`} />
               <div className="tab-dropdown-item-content">
                 <div className="tab-dropdown-item-title">{s.title}</div>
@@ -202,9 +209,11 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectPath, linkedProjectPath, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
-  const highlightPath = hoveredProjectPath || linkedProjectPath || selectedProject?.path || null;
+  const hostsSnap = useHostsSnapshot();
+  const hostNameOf = (h: string) => hostsSnap.configs.find(c => c.id === h)?.name || h;
+  const highlightKey = hoveredProjectKey || linkedProjectKey || (selectedProject ? keyOf(selectedProject) : null);
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -350,15 +359,17 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               );
             }
             const tab = entry.tab;
-            const matches = highlightPath && tab.projectPath && tab.projectPath.toLowerCase() === highlightPath.toLowerCase();
+            const tabKey = keyOfTab(tab);
+            const matches = highlightKey && tabKey && sameKey(tabKey, highlightKey);
             const isClosing = closingTabIds.has(tab.id);
-            const projectSettings = tab.projectPath ? projectIcons[tab.projectPath.toLowerCase()] : undefined;
+            const projectSettings = tabKey ? projectIcons[lookupKey(tabKey)] : undefined;
             const customName = projectSettings?.customName;
             const projectDisplayName = customName || tab.projectName || "";
             const isRawShell = tab.shellMode === "raw";
             const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
             const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
-            const tooltipText = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const baseTooltip = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const tooltipText = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
             return (
               <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
@@ -385,7 +396,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
       </div>
 
       {(() => {
-        const activeDisplayName = activeTabProject ? (projectIcons[activeTabProject.path.toLowerCase()]?.customName || activeTabProject.name) : null;
+        const activeDisplayName = activeTabProject ? (projectIcons[lookupKey(keyOf(activeTabProject))]?.customName || activeTabProject.name) : null;
         const defaultShellName = activeTabProject
           ? `Open ${defaultShell} in ${activeDisplayName}`
           : `Open ${defaultShell} in home`;
@@ -425,7 +436,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
       </div>
 
       {dropdown && (
-        <RecentSessionsDropdown project={activeTabProject} displayName={activeTabProject ? (projectIcons[activeTabProject.path.toLowerCase()]?.customName || activeTabProject.name) : ""} openSessionIds={openSessionIds} anchorRect={dropdown.rect} anchorEl={dropdown.el} installedAgents={installedAgents} onPick={(s) => activeTabProject && onOpenSession(s, activeTabProject)} onPickShell={(id, name) => onNewShell(activeTabProject, id, name)} onNewChat={onNewChatInActive} onClose={() => setDropdown(null)} />
+        <RecentSessionsDropdown project={activeTabProject} displayName={activeTabProject ? (projectIcons[lookupKey(keyOf(activeTabProject))]?.customName || activeTabProject.name) : ""} openSessionIds={openSessionIds} anchorRect={dropdown.rect} anchorEl={dropdown.el} installedAgents={installedAgents} onPick={(s) => activeTabProject && onOpenSession(s, activeTabProject)} onPickShell={(id, name) => onNewShell(activeTabProject, id, name)} onNewChat={onNewChatInActive} onClose={() => setDropdown(null)} />
       )}
 
       {tooltip && <TabTooltip text={tooltip.text} rect={tooltip.rect} />}
@@ -437,9 +448,9 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
           projectIcons={projectIcons}
           pinnedProjects={pinnedProjects}
           contextProject={activeTabProject}
-          hoveredProjectPath={hoveredProjectPath}
-          linkedProjectPath={linkedProjectPath}
-          selectedProjectPath={selectedProject?.path || null}
+          hoveredProjectKey={hoveredProjectKey}
+          linkedProjectKey={linkedProjectKey}
+          selectedProjectKey={selectedProject ? keyOf(selectedProject) : null}
           hasActiveTab={!!tabs.find(t => t.id === activeTabId)}
           installedAgents={installedAgents}
           onSelectTab={onSelectTab}
