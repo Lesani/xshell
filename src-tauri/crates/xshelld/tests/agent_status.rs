@@ -2,18 +2,19 @@
 //! Agent Status from agent hooks, end to end against an in-process server and the real hook
 //! client (`xshelld event`).
 //!
-//! The fake `claude` and `codex` log their argv and `XSHELL_*` environment, then run shell
-//! lines the test writes to their control FIFO (`ctl.<pid>` in the working directory), in
-//! their own environment, as a real agent's hook child would. Never Terminal input: the
-//! input heuristics must not stand in for a hook that did not fire.
+//! The fake `claude` and `codex` log their argv and `XSHELL_*` environment, then run the
+//! numbered control files the test writes (`ctl.<pid>.<n>` in the working directory), one
+//! at a time and in order, in their own environment, as a real agent's hook child would,
+//! and acknowledge each (`ack.<pid>.<n>`) once it has finished. Never Terminal input: the
+//! input heuristics must not stand in for a hook that did not fire. (A FIFO reopened per
+//! command lost a command written while the fake was closing it after the previous one.)
 
 mod common;
 
 use common::*;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -38,9 +39,10 @@ fn hook_fake_agents() {
             fs::write(
                 &tmp,
                 "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> argv.log\n\
-                 env | grep '^XSHELL_' >> env.log\nctl=\"$PWD/ctl.$$\"\nmkfifo \"$ctl\"\n\
-                 echo $$ >> pids.log\necho \"ready $$.\"\n\
-                 while :; do while IFS= read -r l; do eval \"$l\"; done < \"$ctl\"; done\n",
+                 env | grep '^XSHELL_' >> env.log\necho $$ >> pids.log\necho \"ready $$.\"\n\
+                 n=0\nwhile :; do\n  f=\"$PWD/ctl.$$.$n\"\n\
+                   if [ -f \"$f\" ]; then . \"$f\"; : > \"$PWD/ack.$$.$n\"; n=$((n + 1));\n\
+                   else sleep 0.02; fi\ndone\n",
             )
             .unwrap();
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -81,6 +83,8 @@ struct Env {
     fake: Fake,
     _reaper: FakeReaper,
     user_config: Vec<(PathBuf, Option<SystemTime>)>,
+    /// Control files handed to each fake (by pid) so far.
+    sent: std::sync::Mutex<std::collections::HashMap<i32, u32>>,
 }
 
 fn env() -> Env {
@@ -104,6 +108,7 @@ fn env() -> Env {
         cwd,
         fake,
         user_config,
+        sent: Default::default(),
     }
 }
 
@@ -148,27 +153,32 @@ impl Env {
         *self.fake.pids().last().expect("a fake agent")
     }
 
-    /// Run `line` in the newest fake agent's environment.
+    /// Run `line` in the newest fake agent's environment and wait until it has finished (a
+    /// hook command has its answer from the Daemon by then).
     fn run(&self, line: &str) {
-        let fifo = self.cwd.join(format!("ctl.{}", self.pid()));
+        let ack = self.send(line);
         let deadline = Instant::now() + T;
-        loop {
-            // Non-blocking: fails while the fake is between two reads, or gone.
-            match fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo)
-            {
-                Ok(mut f) => {
-                    f.write_all(format!("{line}\n").as_bytes()).unwrap();
-                    return;
-                }
-                Err(e) => {
-                    assert!(Instant::now() < deadline, "{}: {e}", fifo.display());
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+        while !ack.exists() {
+            assert!(Instant::now() < deadline, "{line:?} not run within {T:?}");
+            std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Hand `line` to the newest fake agent; returns the file that acknowledges it. For a
+    /// line that ends the fake, which never acknowledges.
+    fn send(&self, line: &str) -> PathBuf {
+        let pid = self.pid();
+        let n = {
+            let mut sent = self.sent.lock().unwrap();
+            let n = sent.entry(pid).or_insert(0);
+            *n += 1;
+            *n - 1
+        };
+        // Written aside and renamed, so the fake never runs half a file.
+        let tmp = self.cwd.join(format!(".ctl.{pid}.{n}"));
+        fs::write(&tmp, format!("{line}\n")).unwrap();
+        fs::rename(&tmp, self.cwd.join(format!("ctl.{pid}.{n}"))).unwrap();
+        self.cwd.join(format!("ack.{pid}.{n}"))
     }
 
     /// The newest launch's raw argv.
@@ -402,7 +412,7 @@ fn exit_sets_ended() {
     let t = e.open("claude", Some(SID));
     e.claude_hook("UserPromptSubmit");
     e.wait(t, Some(Working));
-    e.run("exit 0");
+    e.send("exit 0");
     let info =
         e.c.terminals_where(|l| l.iter().any(|i| i.terminal == t && i.exit_code.is_some()));
     let i = info.iter().find(|i| i.terminal == t).unwrap();
@@ -421,7 +431,7 @@ fn wrapper_reports_agent_end() {
     e.c.attach(t);
     e.type_in(t, "\r");
     e.wait(t, Some(Working));
-    e.run("exit 0");
+    e.send("exit 0");
     let info = e.wait(t, Some(Ended));
     assert_eq!(info.exit_code, None, "the shell stays");
     // Shell input never brings the ended run back.
