@@ -1,8 +1,10 @@
+use crate::agent_status::{hook_agent, HookAgent};
 use crate::claude::encode_project_name;
 use crate::ctx::HostCtx;
 use portable_pty::CommandBuilder;
 use std::path::PathBuf;
 
+pub use crate::agent_status::TerminalHooks;
 pub use xshell_protocol::LaunchSpec;
 
 /// The process a [`LaunchSpec`] resolves to, as plain data. `env` holds only the variables
@@ -183,8 +185,22 @@ pub fn resume_args(
 /// Resolve a terminal tab's launch request to the program, arguments, environment overrides
 /// and working directory to spawn in its PTY.
 pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, String> {
+    plan_command_with(ctx, spec, None)
+}
+
+/// [`plan_command`], with the agent set up to report its Agent Status through `hooks`. Only
+/// agents with hooks (Claude Code, Codex) outside raw shells get them; the rest plan as
+/// without. Claude Code gets `--settings <hooks file>`, Codex its `-c` overrides, both the
+/// `XSHELL_TERMINAL_ID`/`XSHELL_EVENT_SOCKET` variables, and a shell wrapper reports the
+/// agent's end itself, since the shell outlives it.
+pub fn plan_command_with(
+    ctx: &HostCtx,
+    spec: &LaunchSpec,
+    hooks: Option<TerminalHooks>,
+) -> Result<CommandPlan, String> {
     let mode = spec.shell_mode.as_deref().unwrap_or("claude");
     let agent_bin = agent_binary(spec.agent.as_deref());
+    let hooked = hook_agent(spec).zip(hooks);
     // The resume check uses the raw cwd, before the empty-cwd fallback below.
     let mut agent_args = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
     if mode != "raw" && spec.skip_permissions == Some(true) {
@@ -193,6 +209,15 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
             let at = usize::from(agent_args.first().is_some_and(|a| a == "resume"));
             agent_args.insert(at, flag.to_string());
         }
+    }
+    match hooked {
+        Some((HookAgent::Claude, h)) => {
+            agent_args.push("--settings".into());
+            agent_args.push(h.hooks.claude_settings.to_string_lossy().into_owned());
+        }
+        // Last: `codex resume [flag] <id>` takes `-c` after its positionals too.
+        Some((HookAgent::Codex, h)) => agent_args.extend(h.hooks.codex_overrides()),
+        None => {}
     }
     let shell_kind = spec.shell_id.as_deref().unwrap_or("");
     // Override the frontend-supplied `bash.exe` for the Git Bash preset with an absolute path
@@ -247,12 +272,18 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
                     s.push_str(&a.replace('\'', "''"));
                     s.push('\'');
                 }
+                if let Some((_, h)) = hooked {
+                    s.push_str("; ");
+                    s.push_str(&h.hooks.ended_command_powershell());
+                }
                 (
                     shell.to_string(),
                     vec!["-NoLogo".into(), "-NoExit".into(), "-Command".into(), s],
                 )
             }
             "cmd" => {
+                // No end report: `cmd` runs on Windows only, where Local Host Terminals get
+                // no hooks yet (xshell#24).
                 let mut args = vec!["/K".to_string(), exec.to_string()];
                 args.extend(exec_args.iter().cloned());
                 (shell.to_string(), args)
@@ -270,6 +301,11 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
                 for a in &exec_args {
                     s.push(' ');
                     s.push_str(&q(a));
+                }
+                // The shell outlives the agent: it reports the agent's end.
+                if let Some((_, h)) = hooked {
+                    s.push_str("; ");
+                    s.push_str(&h.hooks.ended_command_posix());
                 }
                 // Keep the shell alive after the agent exits so the user retains a prompt.
                 let basename = std::path::Path::new(shell)
@@ -310,6 +346,9 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
     // when xterm sees half-drawn frames. Requires Claude Code ≥ 2.1.129.
     if mode != "raw" && agent_bin == "claude" && spec.force_sync_output.unwrap_or(true) {
         env.push(("CLAUDE_CODE_FORCE_SYNC_OUTPUT".into(), "1".into()));
+    }
+    if let Some((_, h)) = hooked {
+        env.extend(h.env());
     }
     // Empty cwd → fall back to the user's home directory (raw shells launched from home view).
     let cwd = if spec.cwd.is_empty() {
@@ -1044,5 +1083,202 @@ mod tests {
                 "no session to resume"
             );
         }
+    }
+
+    // ── Agent hooks ──
+
+    fn hooks() -> crate::agent_status::AgentHooks {
+        crate::agent_status::AgentHooks {
+            exe: "/opt/x shell/xshelld".into(),
+            endpoint: "/run/x/daemon.sock".into(),
+            claude_settings: "/h/.xshell/daemon/claude-hooks.json".into(),
+        }
+    }
+
+    const TID: &str = "6f1c1a8e-0000-4000-8000-000000000001";
+
+    fn hooked(ctx: &HostCtx, s: &LaunchSpec, h: &crate::agent_status::AgentHooks) -> CommandPlan {
+        plan_command_with(
+            ctx,
+            s,
+            Some(TerminalHooks {
+                hooks: h,
+                terminal: TID.parse().unwrap(),
+                run: 3,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn hook_env() -> Vec<(String, String)> {
+        env(&[
+            ("XSHELL_TERMINAL_ID", &format!("{TID}.3")),
+            ("XSHELL_EVENT_SOCKET", "/run/x/daemon.sock"),
+        ])
+    }
+
+    fn codex_overrides() -> Vec<String> {
+        hooks().codex_overrides()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_claude_with_hooks_adds_settings_and_env() {
+        let fx = Fixture::new();
+        let h = hooks();
+        let plan = hooked(
+            &fx.ctx(),
+            &LaunchSpec {
+                session_id: Some("sid".into()),
+                ..spec("/w")
+            },
+            &h,
+        );
+        assert_eq!(plan.program, "claude");
+        assert_eq!(
+            plan.args,
+            strings(&[
+                "--session-id",
+                "sid",
+                "--settings",
+                "/h/.xshell/daemon/claude-hooks.json"
+            ])
+        );
+        let mut want = plan_env(CLAUDE_ENV);
+        want.extend(hook_env());
+        assert_eq!(plan.env, want);
+        assert_builder(&plan);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_codex_with_hooks_appends_overrides_after_resume() {
+        let fx = Fixture::new();
+        let h = hooks();
+        let plan = hooked(
+            &fx.ctx(),
+            &LaunchSpec {
+                agent: Some("codex".into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            },
+            &h,
+        );
+        let mut want = strings(&["resume", "id1"]);
+        want.extend(codex_overrides());
+        assert_eq!(plan.args, want);
+        let mut env = plan_env(&[]);
+        env.extend(hook_env());
+        assert_eq!(plan.env, env);
+        // A new chat: the overrides are the only arguments.
+        let bare = hooked(
+            &fx.ctx(),
+            &LaunchSpec {
+                agent: Some("codex".into()),
+                ..spec("/w")
+            },
+            &h,
+        );
+        assert_eq!(bare.args, codex_overrides());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_codex_hooks_with_skip_permissions() {
+        let fx = Fixture::new();
+        let h = hooks();
+        let plan = hooked(
+            &fx.ctx(),
+            &skipping(LaunchSpec {
+                agent: Some("codex".into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            }),
+            &h,
+        );
+        let mut want = strings(&[
+            "resume",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "id1",
+        ]);
+        want.extend(codex_overrides());
+        assert_eq!(plan.args, want);
+        let claude = hooked(&fx.ctx(), &skipping(spec("/w")), &h);
+        assert_eq!(
+            claude.args,
+            strings(&[
+                "--dangerously-skip-permissions",
+                "--settings",
+                "/h/.xshell/daemon/claude-hooks.json"
+            ])
+        );
+    }
+
+    #[test]
+    fn launch_hooks_ignored_for_raw_and_other_agents() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        let h = hooks();
+        let raw = LaunchSpec {
+            shell_mode: Some("raw".into()),
+            shell_command: Some("zsh".into()),
+            ..spec("/w")
+        };
+        assert_eq!(hooked(&ctx, &raw, &h), plan_command(&ctx, &raw).unwrap());
+        for agent in ["cursor", "opencode", "antigravity"] {
+            let s = LaunchSpec {
+                agent: Some(agent.into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            };
+            assert_eq!(
+                hooked(&ctx, &s, &h),
+                plan_command(&ctx, &s).unwrap(),
+                "{agent}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_hooks_inside_shell_wrapper() {
+        let fx = Fixture::new();
+        let h = hooks();
+        let wrapped = |shell_id: &str, shell: &str, agent: &str| {
+            hooked(
+                &fx.ctx(),
+                &LaunchSpec {
+                    agent: Some(agent.into()),
+                    shell_id: Some(shell_id.into()),
+                    shell_command: Some(shell.into()),
+                    ..spec("/w")
+                },
+                &h,
+            )
+        };
+        let bash = wrapped("bash", "/bin/bash", "claude");
+        assert_eq!(
+            bash.args,
+            strings(&[
+                "-i",
+                "-c",
+                "claude '--settings' '/h/.xshell/daemon/claude-hooks.json'; \
+                 '/opt/x shell/xshelld' event - ended; exec bash -i"
+            ])
+        );
+        assert!(bash.env.ends_with(&hook_env()));
+        let zsh = wrapped("zsh", "zsh", "codex");
+        let s = &zsh.args[2];
+        assert!(s.starts_with("codex '-c' 'notify=["), "{s}");
+        assert!(
+            s.ends_with("; '/opt/x shell/xshelld' event - ended; exec zsh -i"),
+            "{s}"
+        );
+        let pwsh = wrapped("pwsh", "pwsh", "claude");
+        assert_eq!(
+            pwsh.args[3],
+            "& 'claude' '--settings' '/h/.xshell/daemon/claude-hooks.json'; \
+             & '/opt/x shell/xshelld' 'event' '-' 'ended'"
+        );
     }
 }

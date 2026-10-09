@@ -1,6 +1,7 @@
 //! Tauri-free core of xshell: everything the desktop app and a remote host daemon share.
 
 pub mod agent_context;
+pub mod agent_status;
 pub mod agents;
 pub mod antigravity;
 pub mod claude;
@@ -25,4 +26,4 @@ pub(crate) mod testutil;
 
 pub use ctx::HostCtx;
 pub use dispatch::{dispatch, METHODS};
-pub use launch::{plan_command, CommandPlan, LaunchSpec};
+pub use launch::{plan_command, plan_command_with, CommandPlan, LaunchSpec};

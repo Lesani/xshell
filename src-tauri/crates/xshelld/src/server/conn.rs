@@ -2,6 +2,7 @@
 //! Every handler is non-blocking (PTY writes go through input threads, calls get their own
 //! thread). Losing a connection detaches it everywhere and ends nothing.
 
+use super::agent;
 use super::calls::spawn_call;
 use super::outbox::{writer_loop, Outbox};
 use super::registry::{frame, now_ms, Daemon};
@@ -262,6 +263,7 @@ impl Conn {
                 // Not under the registry lock: input is the hot path. Input that reaches a
                 // Terminal a Relaunch is replacing is dropped like input to an ended one.
                 let r = self.terminal(&terminal).and_then(|t| {
+                    t.note_input(&d, data.as_bytes());
                     // Typing can hand the size to this connection; persist it like a resize.
                     if t.write_input(self.id, data)? {
                         t.schedule_persist(&d);
@@ -337,6 +339,12 @@ impl Conn {
                 terminal,
                 skip_permissions,
             } => relaunch::start(&d, &self.ob, id, terminal, skip_permissions, self.role),
+            // From agent hooks on this Host; role::check refuses it for a Mobile (#6).
+            ClientMsg::TermEvent {
+                terminal,
+                run,
+                status,
+            } => agent::on_event(&d, &self.ob, id, terminal, run, status),
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();

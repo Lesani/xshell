@@ -205,6 +205,8 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         // Desktop bookkeeping; a session id set here would reach a later Relaunch.
         ClientMsg::TermUpdate { .. } => Err(forbidden("term.update")),
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
+        // Agent hooks report from the Host itself, over the local socket, never from a phone.
+        ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
     }
 }
 
@@ -717,6 +719,8 @@ mod tests {
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
             next_conn: AtomicU64::new(1),
+            hooks: None,
+            next_run: AtomicU64::new(1),
         })
     }
 

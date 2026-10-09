@@ -142,6 +142,8 @@ pub fn open_msg(id: Uuid, launch: LaunchSpec) -> ClientMsg {
 
 pub fn config(h: &TestHome) -> Config {
     let mut c = Config::new(h.home(), h.paths());
+    // `current_exe` is this test binary: hooks run the real hook client.
+    c.event_exe = Some(bin().into());
     c.kill_grace = Duration::from_millis(300);
     c.write_stall_timeout = Duration::from_secs(1);
     c.resize_persist_delay = Duration::from_millis(200);
@@ -286,8 +288,28 @@ impl Fake {
         )
     }
 
-    /// argv blocks, one per launch.
+    /// argv blocks, one per launch, without the Agent Status hook arguments xshell adds
+    /// (`--settings <file>` for Claude, `-c <override>` for Codex; see [`Fake::raw_launches`]).
     pub fn launches(&self) -> Vec<Vec<String>> {
+        self.raw_launches()
+            .into_iter()
+            .map(|argv| {
+                let mut out = vec![];
+                let mut it = argv.into_iter();
+                while let Some(a) = it.next() {
+                    if a == "--settings" || a == "-c" {
+                        it.next();
+                    } else {
+                        out.push(a);
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// argv blocks, one per launch, as the agent got them.
+    pub fn raw_launches(&self) -> Vec<Vec<String>> {
         let s = fs::read_to_string(&self.argv_log).unwrap_or_default();
         let mut out = vec![];
         let mut cur = vec![];

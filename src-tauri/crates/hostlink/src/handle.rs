@@ -1101,6 +1101,7 @@ pub(crate) mod tests {
             created_at_ms: 1,
             pid: Some(2),
             exit_code: None,
+            agent_status: None,
         }
     }
 

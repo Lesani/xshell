@@ -16,6 +16,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use xshell_core::agent_status::{AgentStatus, TerminalHooks, Tracker};
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
@@ -96,6 +97,11 @@ pub(crate) struct Terminal {
     /// For a Terminal restored without a process: the previous run's leader, kept in the
     /// state file so a later start retries ending it.
     kept_leader: Option<Leader>,
+    /// This process's run: unique per Daemon start and process, so a hook of a process a
+    /// Relaunch or restart replaced never reports for its successor.
+    pub run: u64,
+    /// The Agent Status of this run. Locked last, never across another lock.
+    status: Mutex<Tracker>,
 }
 
 /// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
@@ -157,7 +163,14 @@ pub(crate) fn spawn_with(
     if !spec.cwd.is_empty() && !Path::new(&spec.cwd).is_dir() {
         return Err(format!("working directory does not exist: {}", spec.cwd).into());
     }
-    let plan = xshell_core::plan_command(&d.ctx, &spec)?;
+    let run = d.next_run.fetch_add(1, Ordering::SeqCst);
+    let hooks = d.hooks.as_ref().map(|hooks| TerminalHooks {
+        hooks,
+        terminal: id,
+        run,
+    });
+    let plan = xshell_core::plan_command_with(&d.ctx, &spec, hooks)?;
+    let tracker = Tracker::new(&spec);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows,
@@ -219,6 +232,8 @@ pub(crate) fn spawn_with(
         last_overflow_nudge: Mutex::new(None),
         persist_pending: AtomicBool::new(false),
         kept_leader: None,
+        run,
+        status: Mutex::new(tracker),
     });
     let tag = short(&id);
 
@@ -306,6 +321,28 @@ impl Terminal {
             }
         }
         d.nudge_overflowed(dropped);
+        if self.status.lock().unwrap().on_output(bytes) {
+            super::agent::changed(d, self);
+        }
+    }
+
+    /// A hook's report for process `run`.
+    pub fn on_agent_event(&self, run: u64, status: AgentStatus) -> Result<bool, String> {
+        let mut tracker = self.status.lock().unwrap();
+        if tracker.agent().is_none() {
+            return Err("not an agent terminal".into());
+        }
+        if run != self.run {
+            return Err("stale run".into());
+        }
+        tracker.on_event(status)
+    }
+
+    /// Input about to be written: it may answer a prompt or interrupt a turn.
+    pub fn note_input(&self, d: &Daemon, data: &[u8]) {
+        if self.status.lock().unwrap().on_input(data) {
+            super::agent::changed(d, self);
+        }
     }
 
     /// Runs once the process has exited and its output is drained. During a Relaunch the
@@ -335,6 +372,8 @@ impl Terminal {
     /// Mark the Terminal ended and tell every connection, unless the Daemon is upgrading or
     /// shutting down or this Terminal is not the one listed under its UUID.
     fn finish_exit(self: &Arc<Self>, d: &Arc<Daemon>, reg: &mut Registry, code: i32) {
+        // Published by the `terminals` list below.
+        self.status.lock().unwrap().on_exit();
         {
             let mut o = self.out.lock().unwrap();
             o.exit_code = Some(code);
@@ -709,6 +748,7 @@ impl Terminal {
             created_at_ms: r.created_at_ms,
             pid: self.pid,
             exit_code,
+            agent_status: self.status.lock().unwrap().status(),
         }
     }
 
@@ -759,6 +799,8 @@ pub(crate) const UNRESOLVED_EXIT: i32 = -1;
 /// A restored Terminal without a process: listed as exited (`UNRESOLVED_EXIT`), its record
 /// and previous leader kept in the state file until `term.close` removes it.
 pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal> {
+    let mut status = Tracker::new(&p.spec);
+    status.on_exit();
     let t = Terminal {
         id: p.terminal,
         record: Mutex::new(Record {
@@ -790,6 +832,8 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         last_overflow_nudge: Mutex::new(None),
         persist_pending: AtomicBool::new(false),
         kept_leader: p.leader,
+        run: d.next_run.fetch_add(1, Ordering::SeqCst),
+        status: Mutex::new(status),
     };
     Arc::new(t)
 }

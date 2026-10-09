@@ -130,6 +130,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::TermUpdate { .. } => "term.update",
         ClientMsg::TermRelaunch { .. } => "term.relaunch",
         ClientMsg::DaemonUpgrade => "daemon.upgrade",
+        ClientMsg::TermEvent { .. } => "term.event",
     }
 }
 
@@ -738,6 +739,7 @@ mod tests {
             created_at_ms: 1,
             pid: Some(2),
             exit_code: None,
+            agent_status: None,
         }
     }
 

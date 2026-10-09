@@ -30,6 +30,16 @@ pub fn main_entry() -> i32 {
             print!("{}", cli::USAGE);
             return 0;
         }
+        Command::Event(args) => {
+            // The hook client: no login environment, no logging, always exit 0.
+            let home = std::env::var_os("XSHELLD_HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            let sock = std::env::var_os("XSHELLD_SOCKET").map(PathBuf::from);
+            let default = home.map(|h| paths::resolve(&h, xdg.as_deref(), sock.as_deref()).socket);
+            return xshell_core::agent_status::event_main(&args, &|k| std::env::var_os(k), default);
+        }
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
     };

@@ -14,6 +14,9 @@ pub struct Paths {
     pub pid: PathBuf,
     /// `home/.xshell/daemon/terminals.json`.
     pub state: PathBuf,
+    /// `home/.xshell/daemon/claude-hooks.json`: the Claude Code settings naming the agent
+    /// hooks, passed to each Claude Terminal with `--settings`.
+    pub claude_hooks: PathBuf,
     /// `home/.xshell/log/xshelld.log`.
     pub log: PathBuf,
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
@@ -51,6 +54,10 @@ pub fn resolve(
         pid: sdir.join("daemon.pid"),
         socket,
         state: home.join(".xshell").join("daemon").join("terminals.json"),
+        claude_hooks: home
+            .join(".xshell")
+            .join("daemon")
+            .join("claude-hooks.json"),
         log: home.join(".xshell").join("log").join("xshelld.log"),
         tmp,
     }
@@ -127,6 +134,10 @@ mod tests {
         assert_eq!(p.socket, PathBuf::from("/h/.xshell/run/daemon.sock"));
         assert_eq!(p.lock, PathBuf::from("/h/.xshell/run/daemon.lock"));
         assert_eq!(p.state, PathBuf::from("/h/.xshell/daemon/terminals.json"));
+        assert_eq!(
+            p.claude_hooks,
+            PathBuf::from("/h/.xshell/daemon/claude-hooks.json")
+        );
         assert_eq!(p.log, PathBuf::from("/h/.xshell/log/xshelld.log"));
         assert_eq!(p.tmp, PathBuf::from("/h/.xshell/tmp"));
         // A relative XDG_RUNTIME_DIR is invalid per the spec and ignored.

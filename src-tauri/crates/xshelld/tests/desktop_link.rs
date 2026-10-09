@@ -288,10 +288,12 @@ fn launch_prefix_wraps_agent_and_survives_relaunch_on(via: Via) {
         ]
     );
     let lines = std::fs::read_to_string(&log).unwrap();
+    // The Agent Status hooks follow the agent's own arguments.
+    let hooks = format!("--settings|{}|", fx.home.paths().claude_hooks.display());
     assert_eq!(
         lines,
         format!(
-            "--tag|claude|--resume|{sid}|\n--tag|claude|--dangerously-skip-permissions|--resume|{sid}|\n"
+            "--tag|claude|--resume|{sid}|{hooks}\n--tag|claude|--dangerously-skip-permissions|--resume|{sid}|{hooks}\n"
         )
     );
     // The prefix change was applied without a reconnect.

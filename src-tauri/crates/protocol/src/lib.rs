@@ -24,6 +24,7 @@ pub const CAPABILITIES: &[&str] = &[
     "daemon.upgrade",
     "term.relaunch",
     "launch.prefix",
+    "agent.status",
 ];
 
 #[cfg(test)]
@@ -33,6 +34,11 @@ mod tests {
     #[test]
     fn capabilities_include_term_relaunch() {
         assert!(CAPABILITIES.contains(&"term.relaunch"));
+    }
+
+    #[test]
+    fn capabilities_include_agent_status() {
+        assert!(CAPABILITIES.contains(&"agent.status"));
     }
 
     #[test]

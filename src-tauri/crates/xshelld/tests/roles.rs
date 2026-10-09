@@ -280,6 +280,22 @@ fn mobile_refuses_daemon_upgrade_desktop_upgrades() {
 }
 
 #[test]
+fn mobile_refuses_term_event_desktop_reports() {
+    let mut e = env();
+    let t = e.desk_open(e.claude());
+    let ev = |run| ClientMsg::TermEvent {
+        terminal: t,
+        run,
+        status: xshell_protocol::msg::AgentStatus::NeedsYou,
+    };
+    // Hooks report from the Host itself; a phone never does.
+    refused(e.mob.request(&ev(0)));
+    // A Desktop connection gets past the role check (the run decides).
+    let d = e.desk.request(&ev(0)).unwrap_err();
+    assert_eq!(d, "stale run");
+}
+
+#[test]
 fn mobile_refuses_ops_on_shell_terminal() {
     let mut e = env();
     // A raw shell, and an agent under a launch prefix that is really a shell.

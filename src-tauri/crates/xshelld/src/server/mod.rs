@@ -2,9 +2,11 @@
 //!
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
-//! `Terminal.input` are taken last and alone. No lock is held across a blocking PTY or
+//! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status) is taken
+//! last, and nothing is locked while it is held. No lock is held across a blocking PTY or
 //! socket write: writers own their sockets, input threads own PTY writers.
 
+mod agent;
 mod calls;
 mod conn;
 mod orphans;
@@ -59,6 +61,9 @@ pub struct Config {
     pub max_terminal_bytes: usize,
     /// Largest serialized `terminals` list; keeps it far below the 64 MiB frame limit.
     pub max_list_bytes: usize,
+    /// The agent hook client agents run (`<exe> event …`): this executable by default.
+    /// `None` launches agents without hooks, so they report no Agent Status.
+    pub event_exe: Option<PathBuf>,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -119,6 +124,7 @@ impl Config {
             resize_persist_delay: Duration::from_secs(1),
             max_terminal_bytes: 256 * 1024,
             max_list_bytes: 16 * 1024 * 1024,
+            event_exe: std::env::current_exe().ok(),
             cleanup_override: None,
             test_hook: None,
         }
@@ -201,6 +207,7 @@ impl Server {
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
         xshell_core::files::cleanup_old_dropped_files(&ctx);
+        let hooks = agent::hooks(&cfg);
         let d = Arc::new(Daemon {
             cfg,
             ctx: Arc::new(ctx),
@@ -211,6 +218,10 @@ impl Server {
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(Some(lock)),
             next_conn: AtomicU64::new(1),
+            hooks,
+            // Runs are told apart across restarts too: a hook of the previous Daemon's
+            // process never matches a restored Terminal's run.
+            next_run: AtomicU64::new(registry::now_ms()),
         });
         d.restore();
         let da = d.clone();

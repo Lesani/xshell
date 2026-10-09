@@ -82,6 +82,55 @@ pub enum ClientMsg {
     },
     #[serde(rename = "daemon.upgrade")]
     DaemonUpgrade,
+    /// An agent hook reporting the Agent Status of the Terminal it runs in. Sent by the hook
+    /// client on the Host itself (`xshelld event`, or the Desktop executable for Local Host
+    /// Terminals), never by a Desktop's UI. `run` names the Terminal's process (a Relaunch
+    /// or restore starts a new run): a report for an older run is refused. Gated on the
+    /// `agent.status` capability.
+    #[serde(rename = "term.event")]
+    TermEvent {
+        terminal: Uuid,
+        #[serde(default)]
+        run: u64,
+        status: AgentStatus,
+    },
+}
+
+/// What an agent Terminal is doing, as its agent's hooks report it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentStatus {
+    Working,
+    /// A Permission Prompt or another question blocks the turn.
+    NeedsYou,
+    /// The turn ended.
+    Finished,
+    /// The agent exited. Final for the run.
+    Ended,
+}
+
+impl AgentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentStatus::Working => "working",
+            AgentStatus::NeedsYou => "needs-you",
+            AgentStatus::Finished => "finished",
+            AgentStatus::Ended => "ended",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AgentStatus> {
+        serde_json::from_value(Value::String(s.to_string())).ok()
+    }
+}
+
+/// `TerminalInfo.agent_status`: a value this side does not know (a newer Daemon's) reads as
+/// absent, so one unknown status never fails the whole `terminals` list.
+fn lenient_agent_status<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<AgentStatus>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Every `t` a Desktop may send in protocol 1.
@@ -97,6 +146,7 @@ const CLIENT_TYPES: &[&str] = &[
     "term.update",
     "term.relaunch",
     "daemon.upgrade",
+    "term.event",
 ];
 
 /// `term.open`'s spec: a launch spec plus the Desktop-chosen UUID, initial size and opaque
@@ -123,6 +173,15 @@ pub struct TerminalInfo {
     pub pid: Option<u32>,
     /// `Some` once the process ended; the Terminal stays listed until `term.close`.
     pub exit_code: Option<i32>,
+    /// The Agent Status of an agent Terminal whose agent reports one. Absent for shells,
+    /// agents without hooks, before the first report, and from Daemons without the
+    /// `agent.status` capability.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_agent_status"
+    )]
+    pub agent_status: Option<AgentStatus>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -503,6 +562,7 @@ mod tests {
                 created_at_ms: 5,
                 pid: Some(9),
                 exit_code: None,
+                agent_status: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -521,6 +581,7 @@ mod tests {
                 created_at_ms: 5,
                 pid: Some(9),
                 exit_code: None,
+                agent_status: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -533,6 +594,126 @@ mod tests {
         assert_eq!(
             decode_server(&body(encode_msg(&exit, None).unwrap())).unwrap(),
             exit
+        );
+    }
+
+    fn info_with(status: Option<AgentStatus>) -> TerminalInfo {
+        TerminalInfo {
+            terminal: Uuid::new_v4(),
+            spec: LaunchSpec::default(),
+            meta: Map::new(),
+            created_at_ms: 5,
+            pid: Some(9),
+            exit_code: None,
+            agent_status: status,
+        }
+    }
+
+    #[test]
+    fn term_event_roundtrip() {
+        let id = Uuid::new_v4();
+        let msg = ClientMsg::TermEvent {
+            terminal: id,
+            run: 3,
+            status: AgentStatus::NeedsYou,
+        };
+        let b = body(encode_msg(&msg, Some(1)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            format!(
+                r#"{{"id":1,"t":"term.event","terminal":"{id}","run":3,"status":"needs-you"}}"#
+            )
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(1), msg });
+        // `run` is additive: a report without one is run 0.
+        let raw = json!({"t":"term.event","terminal":id,"status":"working"});
+        assert_eq!(
+            decode_inbound(raw.to_string().as_bytes()).unwrap().msg,
+            ClientMsg::TermEvent {
+                terminal: id,
+                run: 0,
+                status: AgentStatus::Working
+            }
+        );
+    }
+
+    #[test]
+    fn terminals_agent_status_kebab_case() {
+        let list = ServerMsg::Terminals {
+            list: vec![info_with(Some(AgentStatus::NeedsYou))],
+        };
+        let b = body(encode_msg(&list, None).unwrap());
+        assert!(String::from_utf8_lossy(&b).contains(r#""agentStatus":"needs-you""#));
+        assert_eq!(decode_server(&b).unwrap(), list);
+        for (s, wire) in [
+            (AgentStatus::Working, "working"),
+            (AgentStatus::NeedsYou, "needs-you"),
+            (AgentStatus::Finished, "finished"),
+            (AgentStatus::Ended, "ended"),
+        ] {
+            assert_eq!(serde_json::to_value(s).unwrap(), json!(wire));
+            assert_eq!(s.as_str(), wire);
+            assert_eq!(AgentStatus::parse(wire), Some(s));
+        }
+        assert_eq!(AgentStatus::parse("bogus"), None);
+    }
+
+    #[test]
+    fn terminals_agent_status_omitted_when_none() {
+        let b = body(
+            encode_msg(
+                &ServerMsg::Terminals {
+                    list: vec![info_with(None)],
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(!String::from_utf8_lossy(&b).contains("agentStatus"));
+    }
+
+    #[test]
+    fn terminal_info_without_agent_status_decodes() {
+        // An older Daemon's entry.
+        let id = Uuid::new_v4();
+        let raw = json!({"t":"terminals","list":[{"terminal":id,"spec":{"cwd":"/w"},"meta":{},
+            "createdAtMs":1,"pid":2,"exitCode":null}]});
+        let ServerMsg::Terminals { list } = decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(list[0].agent_status, None);
+    }
+
+    #[test]
+    fn terminals_unknown_agent_status_decodes_as_none() {
+        // A newer Daemon's status this side does not know never fails the list.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let raw = json!({"t":"terminals","list":[
+            {"terminal":a,"spec":{"cwd":"/w"},"meta":{},"createdAtMs":1,"pid":2,"exitCode":null,
+             "agentStatus":"thinking-hard"},
+            {"terminal":b,"spec":{"cwd":"/w"},"meta":{},"createdAtMs":1,"pid":3,"exitCode":null,
+             "agentStatus":"finished"},
+            {"terminal":b,"spec":{"cwd":"/w"},"meta":{},"createdAtMs":1,"pid":3,"exitCode":null,
+             "agentStatus":7}]});
+        let ServerMsg::Terminals { list } = decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].agent_status, None);
+        assert_eq!(list[1].agent_status, Some(AgentStatus::Finished));
+        assert_eq!(list[2].agent_status, None);
+    }
+
+    #[test]
+    fn term_event_unknown_status_invalid_keeps_id() {
+        let id = Uuid::new_v4();
+        let raw = json!({"t":"term.event","id":9,"terminal":id,"run":1,"status":"bogus"});
+        let e = decode_inbound(raw.to_string().as_bytes()).unwrap_err();
+        assert!(
+            matches!(&e, DecodeError::Invalid { id: Some(9), t, .. } if t == "term.event"),
+            "{e:?}"
         );
     }
 }

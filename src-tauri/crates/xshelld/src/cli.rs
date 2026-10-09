@@ -1,5 +1,6 @@
-//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`, `xshelld --version`.
-//! Each flag falls back to an environment variable. Hand-parsed: three commands, three flags.
+//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`, `xshelld --version`,
+//! and `xshelld event …`, the agent hook client. Each flag falls back to an environment
+//! variable. Hand-parsed: four commands, three flags.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -9,6 +10,9 @@ use std::time::Duration;
 pub enum Command {
     Serve(Opts),
     Connect(Opts),
+    /// `event <terminal|-> <status> [payload] [--socket PATH] [-v]`: report an agent hook
+    /// (see `xshell_core::agent_status::event_main`), parsed there.
+    Event(Vec<OsString>),
     Version,
     Help,
 }
@@ -29,6 +33,7 @@ usage: xshelld <command> [options]
 commands:
   connect     bridge stdin/stdout to the Daemon, starting it if needed
   serve       run the Daemon in the foreground
+  event       report an agent's status (run by agent hooks inside Terminals)
   --version   print name, version and protocol range as one line of JSON
 
 options:
@@ -80,6 +85,7 @@ pub fn parse(
     match cmd {
         "--version" | "-V" | "version" => return Ok(Command::Version),
         "--help" | "-h" | "help" => return Ok(Command::Help),
+        "event" => return Ok(Command::Event(args.collect())),
         "serve" | "connect" => {}
         other => return Err(format!("unknown command: {other}")),
     }
@@ -173,6 +179,32 @@ mod tests {
         assert!(run(&["frobnicate"], &[]).is_err());
         assert_eq!(run(&["--version"], &[]), Ok(Command::Version));
         assert_eq!(run(&[], &[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn parses_event_command() {
+        // Everything after `event` is the hook client's, flags included.
+        assert_eq!(
+            run(
+                &[
+                    "event",
+                    "-",
+                    "finished",
+                    "--socket",
+                    "/s",
+                    "{\"type\":\"x\"}"
+                ],
+                &[]
+            ),
+            Ok(Command::Event(
+                ["-", "finished", "--socket", "/s", "{\"type\":\"x\"}"]
+                    .iter()
+                    .map(OsString::from)
+                    .collect()
+            ))
+        );
+        assert_eq!(run(&["event"], &[]), Ok(Command::Event(vec![])));
+        assert!(USAGE.contains("event"));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod agent_events;
 mod hosts;
 mod local_pty;
 
@@ -22,6 +24,70 @@ use xshell_core::{HostCtx, LaunchSpec};
 
 pub struct AppState {
     ptys: Arc<LocalPtys>,
+}
+
+/// The command line the Desktop executable handles itself, before any window: `event …`, the
+/// agent hook client of Local Host Terminals. `None`: start the app.
+fn cli_args(args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
+    (args.get(1)? == "event").then(|| &args[2..])
+}
+
+/// Run a command line that is not the app (see [`cli_args`]) and return its exit code. Called
+/// from `main` before Tauri starts.
+pub fn run_cli() -> Option<i32> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let rest = cli_args(&args)?;
+    Some(xshell_core::agent_status::event_main(
+        rest,
+        &|k| std::env::var_os(k),
+        None,
+    ))
+}
+
+/// Payload of the `local:agent-status` event: a Local Host Tab's Agent Status (`None`: none),
+/// numbered so the frontend keeps the latest when events arrive out of order.
+#[cfg(unix)]
+#[derive(serde::Serialize, Clone)]
+struct LocalAgentStatus {
+    id: String,
+    status: Option<xshell_core::agent_status::AgentStatus>,
+    seq: u64,
+}
+
+#[cfg(unix)]
+struct AgentEventSocket(agent_events::EventSocket);
+
+/// Agent Status for Local Host Tabs: publish changes to the frontend, then open the event
+/// socket and enable the agents' hooks. Without a socket, agents launch as before.
+#[cfg(unix)]
+fn setup_agent_status(app: &tauri::App) {
+    use tauri::{Emitter as _, Manager as _};
+    let ptys = app.state::<AppState>().ptys.clone();
+    let handle = app.handle().clone();
+    ptys.set_observer(Arc::new(move |id, status, seq| {
+        let _ = handle.emit(
+            "local:agent-status",
+            LocalAgentStatus {
+                id: id.to_string(),
+                status,
+                seq,
+            },
+        );
+    }));
+    let home = dirs::home_dir();
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let socket = agent_events::socket_path(home.as_deref(), xdg.as_deref(), std::process::id());
+    let (Ok(exe), Ok(data), Some(socket)) =
+        (std::env::current_exe(), app.path().app_data_dir(), socket)
+    else {
+        return;
+    };
+    match agent_events::start(ptys, exe, &data.join("agent-hooks"), socket) {
+        Ok(s) => {
+            app.manage(AgentEventSocket(s));
+        }
+        Err(e) => eprintln!("xshell: agents launch without status hooks: {e}"),
+    }
 }
 
 #[tauri::command]
@@ -488,13 +554,15 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
-            ptys: Arc::new(LocalPtys::new(Arc::new(|spec| {
-                xshell_core::plan_command(&ctx(), spec)
+            ptys: Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
+                xshell_core::plan_command_with(&ctx(), spec, hooks)
             }))),
         })
         .setup(|app| {
             use tauri::Manager as _;
             app.manage(hosts::Hosts::new(app.handle()));
+            #[cfg(unix)]
+            setup_agent_status(app);
             // The main window is built here, after the state its page calls into, rather than
             // from tauri.conf.json (`create: false`): the config cannot enable clipboard
             // access. Without it WebKitGTK rejects `navigator.clipboard` reads, so Ctrl+V and
@@ -580,6 +648,10 @@ pub fn run() {
                 if let Some(h) = app.try_state::<hosts::Hosts>() {
                     h.manager.shutdown();
                 }
+                #[cfg(unix)]
+                if let Some(s) = app.try_state::<AgentEventSocket>() {
+                    s.0.remove();
+                }
             }
         });
 }
@@ -600,6 +672,15 @@ mod tests {
             .map(|s| s.trim().rsplit("::").next().unwrap_or("").to_string())
             .filter(|s| !s.is_empty())
             .collect()
+    }
+
+    #[test]
+    fn cli_only_takes_event() {
+        let a = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let ev = a(&["xshell", "event", "-", "working"]);
+        assert_eq!(cli_args(&ev), Some(&ev[2..]));
+        assert_eq!(cli_args(&a(&["xshell"])), None);
+        assert_eq!(cli_args(&a(&["xshell", "--flag"])), None);
     }
 
     #[test]

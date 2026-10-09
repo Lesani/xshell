@@ -29,6 +29,10 @@ pub(crate) struct Daemon {
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
     pub next_conn: AtomicU64,
+    /// How agents report their Agent Status; `None` when they launch without hooks.
+    pub hooks: Option<xshell_core::agent_status::AgentHooks>,
+    /// The next Terminal process's run number (see `Terminal::run`).
+    pub next_run: AtomicU64,
 }
 
 #[derive(Default)]

@@ -27,6 +27,15 @@ fn hello_negotiates_and_sends_terminals() {
 }
 
 #[test]
+fn hello_advertises_agent_status() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::connect(&srv.socket);
+    let (hello, _) = c.hello(range(1, 1));
+    assert!(hello.capabilities.iter().any(|c| c == "agent.status"));
+}
+
+#[test]
 fn hello_no_overlap_rejected() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});

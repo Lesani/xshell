@@ -327,7 +327,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .tab-item-close:hover { opacity: 1 !important; background: var(--bg-active); color: var(--text-primary); }
 
 /* Small thin tooltip for tabs */
-.tab-tooltip { position: fixed; transform: translateX(-50%); background: var(--bg-deep); color: var(--text-secondary); font-size: 10px; font-weight: 400; padding: 3px 7px; border-radius: var(--radius-sm); white-space: nowrap; pointer-events: none; z-index: 2500; border: 1px solid var(--border-default); animation: fadeIn 0.12s ease; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+.tab-tooltip { position: fixed; transform: translateX(-50%); background: var(--bg-deep); color: var(--text-secondary); font-size: 10px; font-weight: 400; padding: 3px 7px; border-radius: var(--radius-sm); white-space: pre; pointer-events: none; z-index: 2500; border: 1px solid var(--border-default); animation: fadeIn 0.12s ease; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
 
 /* Tab action buttons (+ and chevron) */
 .tab-actions { display: flex; align-items: center; gap: 2px; padding: 0 4px; flex-shrink: 0; }
@@ -701,6 +701,16 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .skip-perms-confirm-title { padding: 7px 10px 0; font-size: 12px; font-weight: 600; color: var(--text-primary); }
 .tab-skip-perms-icon { flex-shrink: 0; color: var(--accent-coral); transition: opacity 0.1s; }
 .tab-item:hover .tab-skip-perms-icon { opacity: 0; }
+/* Agent Status dot (tabs/agentStatus.ts). */
+.tab-agent-status { flex-shrink: 0; width: 7px; height: 7px; border-radius: 50%; box-sizing: border-box; transition: opacity 0.1s; }
+.tab-agent-status-working { background: var(--accent-coral); animation: agentStatusPulse 1.4s ease-in-out infinite; }
+.tab-agent-status-needs-you { background: #e5a50a; }
+.tab-agent-status-finished { background: var(--success); }
+.tab-agent-status-ended { background: transparent; border: 1.5px solid var(--text-muted); }
+.tab-agent-status-stale { opacity: 0.45; animation: none; }
+.tab-item:hover .tab-agent-status { opacity: 0; }
+@keyframes agentStatusPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .tab-agent-status-working { animation: none; } }
 /* min-height keeps the git and file-explorer headers the same height so their bottom dividers
    line up. The git header is the taller of the two (its branch dropdown button adds padding +
    border); this pins both to that height regardless of which controls each one carries. */

@@ -31,3 +31,5 @@ libc = { workspace = true }
 md5 = { workspace = true }
 tempfile = "3"
 xshell-hostlink = { path = "../hostlink" }
+# Reads the Codex `-c notify=…` override in tests the way Codex does.
+toml = "0.9"

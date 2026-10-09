@@ -125,6 +125,16 @@ export const S = {
   "tab.skipPerms.tabTooltip": "Skip permissions is on",
   "tab.skipPerms.restarting": "Restarting {agent}…",
   "tab.skipPerms.failed": "Couldn't change permission settings: {error}",
+  "tab.agentStatus.working": "Working",
+  "tab.agentStatus.needsYou": "Needs you: waiting for permission or an answer",
+  "tab.agentStatus.finished": "Finished: the agent's turn is complete",
+  "tab.agentStatus.ended": "Ended: the agent exited",
+  "tab.agentStatus.short.working": "Working",
+  "tab.agentStatus.short.needsYou": "Needs you",
+  "tab.agentStatus.short.finished": "Finished",
+  "tab.agentStatus.short.ended": "Ended",
+  "tab.agentStatus.stale": "{status} (last known)\n{host} is not connected",
+  "tab.agentStatus.aria": "Agent status: {status}",
 } as const;
 
 export type StringKey = keyof typeof S;

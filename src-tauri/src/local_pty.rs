@@ -12,14 +12,21 @@
 //! never for a run a Relaunch is replacing. A write blocks while the PTY's input queue is
 //! full (the process does not read), so it holds only its run's [`WriterCell`], which no
 //! other path ever waits for: close and Relaunch always get through.
+//!
+//! Agent Status: each Terminal has a token, the id its agent's hooks report under (Tab ids
+//! are guessable, the token is not), and a [`Tracker`] for the current run in
+//! `LocalTerminal.agent`, which is locked last and alone. Changes go to the observer outside
+//! every lock, numbered, so a later change always wins over an earlier one.
 
 use portable_pty::{native_pty_system, Child, ChildKiller, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use xshell_core::launch::{relaunch_spec, CommandPlan, LaunchSpec};
+use uuid::Uuid;
+use xshell_core::agent_status::{AgentHooks, AgentStatus, Tracker};
+use xshell_core::launch::{relaunch_spec, CommandPlan, LaunchSpec, TerminalHooks};
 use xshell_core::terminal::replay::RESET;
 use xshell_core::terminal::OVERFLOW_NOTICE;
 
@@ -42,8 +49,37 @@ pub trait Sink: Send + Sync {
     fn exit(&self, code: i32);
 }
 
-/// Resolves a launch spec to the process to start.
-pub type Planner = Arc<dyn Fn(&LaunchSpec) -> Result<CommandPlan, String> + Send + Sync>;
+/// Resolves a launch spec to the process to start, with the agent's status hooks if any.
+pub type Planner =
+    Arc<dyn Fn(&LaunchSpec, Option<TerminalHooks>) -> Result<CommandPlan, String> + Send + Sync>;
+
+/// Told each Agent Status change of a Tab's Terminal: the Tab id, the status (`None`: none,
+/// after a Relaunch or once closed) and a number that grows with every change.
+pub type Observer = Arc<dyn Fn(&str, Option<AgentStatus>, u64) + Send + Sync>;
+
+/// Where Agent Status changes go, shared by every Terminal.
+#[derive(Default)]
+struct AgentOut {
+    seq: AtomicU64,
+    observer: OnceLock<Observer>,
+}
+
+/// The current run's Agent Status.
+struct AgentRun {
+    run: u64,
+    tracker: Tracker,
+    /// The Terminal was closed: nothing changes any more.
+    closed: bool,
+    /// The Terminal is listed under its Tab id. Until then its tracker follows the run, but
+    /// nothing is published: a Terminal it replaces must clear the Tab first.
+    published: bool,
+}
+
+/// A change to publish once the locks are released.
+struct Change {
+    status: Option<AgentStatus>,
+    seq: u64,
+}
 
 /// Where a [`Hook`] runs. Tests use it to order races; it runs with no lock held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +131,8 @@ struct St {
 
 struct LocalTerminal {
     id: String,
+    /// What the agent's hooks report under; kept across Relaunches.
+    token: Uuid,
     sink: Arc<dyn Sink>,
     st: Mutex<St>,
     cv: Condvar,
@@ -102,6 +140,8 @@ struct LocalTerminal {
     /// tears the pseudoconsole down).
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<WriterCell>>,
+    agent: Mutex<AgentRun>,
+    agent_out: Arc<AgentOut>,
 }
 
 /// A started process before its threads run.
@@ -123,6 +163,10 @@ pub struct LocalPtys {
     /// End a run by terminating it and closing its pseudoconsole (Windows, which has no
     /// hangup) rather than only by signals. Settable so tests run that path everywhere.
     pub(crate) close_console: bool,
+    /// How agents report their Agent Status, once the event socket is up. Unset (no hooks)
+    /// until then, on Windows, and when the socket or settings file failed.
+    hooks: OnceLock<AgentHooks>,
+    agent_out: Arc<AgentOut>,
 }
 
 fn start(plan: &CommandPlan, size: PtySize) -> Result<Started, String> {
@@ -159,7 +203,64 @@ impl LocalPtys {
             exit_timeout: Duration::from_secs(5),
             hook: None,
             close_console: cfg!(windows),
+            hooks: OnceLock::new(),
+            agent_out: Arc::default(),
         }
+    }
+
+    /// Launch agents with status hooks from now on. Only the first call counts.
+    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_hooks(&self, hooks: AgentHooks) {
+        let _ = self.hooks.set(hooks);
+    }
+
+    /// Where Agent Status changes go. Only the first call counts.
+    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn set_observer(&self, observer: Observer) {
+        let _ = self.agent_out.observer.set(observer);
+    }
+
+    fn plan(&self, spec: &LaunchSpec, token: Uuid, run: u64) -> Result<CommandPlan, String> {
+        let hooks = self.hooks.get().map(|hooks| TerminalHooks {
+            hooks,
+            terminal: token,
+            run,
+        });
+        (self.planner)(spec, hooks)
+    }
+
+    /// A hook's report: `token` names the Terminal, `run` its process.
+    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn on_agent_event(&self, token: Uuid, run: u64, status: AgentStatus) -> Result<(), String> {
+        let t = self
+            .terms
+            .lock()
+            .unwrap()
+            .values()
+            .find(|t| t.token == token)
+            .cloned()
+            .ok_or_else(|| format!("unknown terminal {token}"))?;
+        let change = {
+            let mut a = t.agent.lock().unwrap();
+            if a.closed {
+                return Err(format!("unknown terminal {token}"));
+            }
+            if a.tracker.agent().is_none() {
+                return Err("not an agent terminal".into());
+            }
+            if a.run != run {
+                return Err("stale run".into());
+            }
+            let changed = a.tracker.on_event(status)?;
+            changed.then(|| t.change(&a))
+        };
+        if let Some(c) = change {
+            t.emit(c);
+        }
+        Ok(())
     }
 
     fn hook(&self, id: &str, p: Point) -> bool {
@@ -179,7 +280,9 @@ impl LocalPtys {
         rows: u16,
         sink: Arc<dyn Sink>,
     ) -> Result<(), String> {
-        let plan = (self.planner)(&spec)?;
+        let token = Uuid::new_v4();
+        let plan = self.plan(&spec, token, 0)?;
+        let tracker = Tracker::new(&spec);
         let s = start(
             &plan,
             PtySize {
@@ -191,6 +294,7 @@ impl LocalPtys {
         )?;
         let t = Arc::new(LocalTerminal {
             id: id.clone(),
+            token,
             sink,
             st: Mutex::new(St {
                 phase: Phase::Live,
@@ -204,6 +308,13 @@ impl LocalPtys {
             cv: Condvar::new(),
             master: Mutex::new(Some(s.master)),
             writer: Mutex::new(Some(Arc::new(Mutex::new(s.writer)))),
+            agent: Mutex::new(AgentRun {
+                run: 0,
+                tracker,
+                closed: false,
+                published: false,
+            }),
+            agent_out: self.agent_out.clone(),
         });
         if let Err(e) = self.run_threads(&t, 0, s.reader, s.child) {
             // Nothing was listed or shown yet: no exit to publish.
@@ -211,11 +322,25 @@ impl LocalPtys {
             drop(t.take_pty());
             return Err(e);
         }
-        let old_pty = {
+        // Under the map lock: the Terminal replaced clears the Tab, then this one's status
+        // (if its run already reported) is published, numbered in that order.
+        let (old, opened) = {
             let mut terms = self.terms.lock().unwrap();
-            terms.insert(id, t).map(|old| old.mark_closing())
+            let old = terms.insert(id, t.clone()).map(|old| {
+                let cleared = old.agent_close();
+                (old.mark_closing(), cleared, old)
+            });
+            (old, t.agent_publish())
         };
-        drop(old_pty);
+        if let Some((pty, cleared, old)) = old {
+            drop(pty);
+            if let Some(c) = cleared {
+                old.emit(c);
+            }
+        }
+        if let Some(c) = opened {
+            t.emit(c);
+        }
         Ok(())
     }
 
@@ -223,6 +348,7 @@ impl LocalPtys {
         let Some(t) = self.get(id) else {
             return Ok(());
         };
+        t.agent_change(None, |tr| tr.on_input(data));
         let cell = t.writer.lock().unwrap().clone();
         let Some(cell) = cell else {
             return Ok(());
@@ -258,11 +384,20 @@ impl LocalPtys {
     pub fn close(&self, id: &str) {
         // Marked under the map lock, which a Relaunch holds while it starts the replacement:
         // a Terminal is either replaced before it is closed or closed before it is replaced.
-        let pty = {
+        let t = {
             let mut terms = self.terms.lock().unwrap();
-            terms.remove(id).map(|t| t.mark_closing())
+            // Numbered under the map lock: a Terminal spawned under this Tab id later is
+            // numbered after it.
+            terms
+                .remove(id)
+                .map(|t| (t.mark_closing(), t.agent_close(), t))
         };
-        drop(pty);
+        if let Some((pty, cleared, t)) = t {
+            drop(pty);
+            if let Some(c) = cleared {
+                t.emit(c);
+            }
+        }
     }
 
     /// End the Terminal's process and start it again with `skipPermissions` set to `skip`,
@@ -315,40 +450,71 @@ impl LocalPtys {
         }
         let timed_out = self.hook(id, Point::Waited { done }) || !done;
 
+        let (r, changes) = self.finish_relaunch(&t, id, next, size, timed_out);
+        for c in changes {
+            t.emit(c);
+        }
+        r
+    }
+
+    /// The end of a Relaunch, under the locks: start the replacement, or publish the exit
+    /// held back in the meantime. Returns the Agent Status change to publish after.
+    fn finish_relaunch(
+        &self,
+        t: &Arc<LocalTerminal>,
+        id: &str,
+        next: LaunchSpec,
+        size: PtySize,
+        timed_out: bool,
+    ) -> (Result<bool, String>, Vec<Change>) {
         let terms = self.terms.lock().unwrap();
         let mut st = t.st.lock().unwrap();
-        let listed = terms.get(id).is_some_and(|c| Arc::ptr_eq(c, &t));
+        let listed = terms.get(id).is_some_and(|c| Arc::ptr_eq(c, t));
         if st.phase == Phase::Closing || !listed {
-            return Err("terminal was closed during the relaunch".into());
+            return (
+                Err("terminal was closed during the relaunch".into()),
+                vec![],
+            );
         }
         if timed_out {
             // Nothing replaces the process. Publish an exit held back in the meantime, once.
             if st.drained {
                 st.phase = Phase::Exited;
                 t.sink.exit(0);
-            } else {
-                st.phase = Phase::Live;
+                let ended = t.agent_update(Some(st.run), |tr| tr.on_exit());
+                return (
+                    Err("previous process did not exit".into()),
+                    ended.into_iter().collect(),
+                );
             }
-            return Err("previous process did not exit".into());
+            st.phase = Phase::Live;
+            return (Err("previous process did not exit".into()), vec![]);
         }
-        let started = (self.planner)(&next).and_then(|plan| start(&plan, size));
+        // The new run starts with no Agent Status, before its process exists: its first
+        // output and hook reports already count for it.
+        let mut changes: Vec<Change> = t.agent_reset(st.run + 1, &next).into_iter().collect();
+        let started = self
+            .plan(&next, t.token, st.run + 1)
+            .and_then(|plan| start(&plan, size));
         let s = match started {
             Ok(s) => s,
             Err(e) => {
                 st.phase = Phase::Exited;
                 t.sink.exit(0);
-                return Err(format!("restart failed: {e}"));
+                changes.extend(t.agent_update(Some(st.run + 1), |tr| tr.on_exit()));
+                return (Err(format!("restart failed: {e}")), changes);
             }
         };
         // Before the new run's flusher can send anything.
         t.sink.data(RESET.to_vec());
         let (pid, killer) = (s.child.process_id(), s.child.clone_killer());
         // The new run's threads wait for `st`, held here, before they touch the Terminal.
-        if let Err(e) = self.run_threads(&t, st.run + 1, s.reader, s.child) {
+        if let Err(e) = self.run_threads(t, st.run + 1, s.reader, s.child) {
             // The replacement was ended and reaped; the Tab sees the run end, once.
             st.phase = Phase::Exited;
             t.sink.exit(0);
-            return Err(format!("restart failed: {e}"));
+            changes.extend(t.agent_update(Some(st.run + 1), |tr| tr.on_exit()));
+            return (Err(format!("restart failed: {e}")), changes);
         }
         st.spec = next;
         st.run += 1;
@@ -361,7 +527,7 @@ impl LocalPtys {
         // nothing reads any more.
         *t.master.lock().unwrap() = Some(s.master);
         *t.writer.lock().unwrap() = Some(Arc::new(Mutex::new(s.writer)));
-        Ok(true)
+        (Ok(true), changes)
     }
 
     /// Start run `run`'s reader, flusher and waiter. If one cannot start, the child is
@@ -397,6 +563,7 @@ impl LocalPtys {
 
         let pending_r = pending.clone();
         let done_r = done.clone();
+        let tr = t.clone();
         thread("read")
             .spawn(move || {
                 let mut reader = BufReader::new(reader);
@@ -415,6 +582,8 @@ impl LocalPtys {
                             }
                             g.extend_from_slice(&buf[..n]);
                             cv.notify_one();
+                            drop(g);
+                            tr.agent_change(Some(run), |a| a.on_output(&buf[..n]));
                         }
                     }
                 }
@@ -500,7 +669,81 @@ impl LocalTerminal {
         if publish {
             self.sink.exit(0);
         }
+        drop(st);
+        if publish {
+            self.agent_change(Some(run), |a| a.on_exit());
+        }
         Some(publish)
+    }
+
+    /// The current Agent Status change, numbered. Called with `agent` locked.
+    fn change(&self, a: &AgentRun) -> Change {
+        Change {
+            status: a.tracker.status(),
+            seq: self.agent_out.seq.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    /// Apply `f` to run `run`'s tracker (the current run's with `None`); the change to
+    /// publish, if it changed anything.
+    fn agent_update(
+        &self,
+        run: Option<u64>,
+        f: impl FnOnce(&mut Tracker) -> bool,
+    ) -> Option<Change> {
+        let mut a = self.agent.lock().unwrap();
+        if a.closed || run.is_some_and(|r| r != a.run) {
+            return None;
+        }
+        (f(&mut a.tracker) && a.published).then(|| self.change(&a))
+    }
+
+    /// The Terminal is now listed: publish its status from here on, and now if its run has
+    /// one already. Called under the map lock.
+    fn agent_publish(&self) -> Option<Change> {
+        let mut a = self.agent.lock().unwrap();
+        a.published = true;
+        (!a.closed && a.tracker.status().is_some()).then(|| self.change(&a))
+    }
+
+    /// [`LocalTerminal::agent_update`], published. Call with no lock held.
+    fn agent_change(&self, run: Option<u64>, f: impl FnOnce(&mut Tracker) -> bool) {
+        if let Some(c) = self.agent_update(run, f) {
+            self.emit(c);
+        }
+    }
+
+    /// Start run `run`'s tracker afresh; the change to publish (no status) unless the
+    /// Terminal is closed.
+    fn agent_reset(&self, run: u64, spec: &LaunchSpec) -> Option<Change> {
+        let mut a = self.agent.lock().unwrap();
+        if a.closed {
+            return None;
+        }
+        a.run = run;
+        a.tracker = Tracker::new(spec);
+        a.published.then(|| self.change(&a))
+    }
+
+    /// The Terminal is gone: nothing changes its status any more. Returns the change that
+    /// clears its Tab, to publish once the locks are released; call it under the map lock,
+    /// so whatever is listed under the Tab id next is numbered after it.
+    fn agent_close(&self) -> Option<Change> {
+        let mut a = self.agent.lock().unwrap();
+        if a.closed {
+            return None;
+        }
+        a.closed = true;
+        a.published.then(|| Change {
+            status: None,
+            seq: self.agent_out.seq.fetch_add(1, Ordering::SeqCst),
+        })
+    }
+
+    fn emit(&self, c: Change) {
+        if let Some(o) = self.agent_out.observer.get() {
+            o(&self.id, c.status, c.seq);
+        }
     }
 
     /// Whether the current run's child is reaped and its output drained, waiting until
@@ -616,8 +859,11 @@ mod teardown_tests {
     fn local_relaunch_console_teardown_keeps_size() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = xshell_core::HostCtx::with_home(dir.path().join("home"), dir.path().join("tmp"));
-        let planner: Planner =
-            Arc::new(move |spec| Ok(idle_child(xshell_core::plan_command(&ctx, spec)?)));
+        let planner: Planner = Arc::new(move |spec, hooks| {
+            Ok(idle_child(xshell_core::plan_command_with(
+                &ctx, spec, hooks,
+            )?))
+        });
         let mut ptys = LocalPtys::new(planner);
         ptys.kill_grace = Duration::from_millis(200);
         ptys.close_console = true;
@@ -746,12 +992,12 @@ mod tests {
         let ctx = HostCtx::with_home(dir.path().join("home"), dir.path().join("tmp"));
         let launches: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
         let l = launches.clone();
-        let planner: Planner = Arc::new(move |spec| {
+        let planner: Planner = Arc::new(move |spec, hooks| {
             let mut l = l.lock().unwrap();
             if fail_after.is_some_and(|n| l.len() >= n) {
                 return Err("refused by the test planner".into());
             }
-            let p = xshell_core::plan_command(&ctx, spec)?;
+            let p = xshell_core::plan_command_with(&ctx, spec, hooks)?;
             l.push(p.args.clone());
             let mut args = vec!["-c".to_string(), script.to_string(), "agent".to_string()];
             args.extend(p.args);
@@ -1143,5 +1389,300 @@ mod tests {
         f.ptys.close("t");
         f.spawn("claude", Some(SID));
         f.sink.wait_for(&format!("args --session-id {SID}."));
+    }
+
+    // ── Agent Status ──
+
+    /// Prints its hook variables, then exits on a line of input.
+    const HOOKED: &str = "trap '' HUP\necho \"pid $$ args $*.\"\n\
+        echo \"hook $XSHELL_TERMINAL_ID $XSHELL_EVENT_SOCKET end\"\nread line\nexit 0";
+
+    type Seen = Arc<Mutex<Vec<(String, Option<AgentStatus>, u64)>>>;
+
+    /// A fixture whose agents launch with hooks over a real event socket in a fresh app-data
+    /// dir, and an observer recording every change.
+    fn hooked_fx() -> (Fx, crate::agent_events::EventSocket, Seen) {
+        let f = fx_with(HOOKED, None, |_| {});
+        let seen: Seen = Arc::default();
+        let s = seen.clone();
+        f.ptys.set_observer(Arc::new(move |id, st, seq| {
+            s.lock().unwrap().push((id.to_string(), st, seq));
+        }));
+        let sock = crate::agent_events::start(
+            f.ptys.clone(),
+            "/opt/xshell/xshell".into(),
+            &f.dir.path().join("data/agent-hooks"),
+            f.dir.path().join("run/xshell/desktop-1.sock"),
+        )
+        .unwrap();
+        (f, sock, seen)
+    }
+
+    /// The newest run's `(token, run, socket)` as its hooks see them.
+    fn hook_env(f: &Fx) -> (Uuid, u64, std::path::PathBuf) {
+        let text = f.sink.wait_for(" end");
+        let line = text.rsplit("hook ").next().unwrap();
+        let mut w = line.split_whitespace();
+        let (id, sock) = (w.next().unwrap(), w.next().unwrap());
+        let (token, run) = id.rsplit_once('.').unwrap();
+        (token.parse().unwrap(), run.parse().unwrap(), sock.into())
+    }
+
+    fn statuses(seen: &Seen) -> Vec<Option<AgentStatus>> {
+        let v = seen.lock().unwrap();
+        // Numbered in the order they happened.
+        assert!(v.windows(2).all(|w| w[0].2 < w[1].2), "{v:?}");
+        v.iter().map(|e| e.1).collect()
+    }
+
+    fn send(sock: &std::path::Path, token: Uuid, run: u64, s: AgentStatus) -> Result<(), String> {
+        xshell_core::agent_status::send_event(sock, token, run, s)
+    }
+
+    #[test]
+    fn local_hook_event_sets_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let (f, sock, seen) = hooked_fx();
+        f.spawn("claude", Some(SID));
+        let (token, run, endpoint) = hook_env(&f);
+        assert_eq!(endpoint, sock.path);
+        assert_eq!(run, 0);
+        // The settings file, written into the fresh app-data dir before any launch.
+        let settings = f.dir.path().join("data/agent-hooks/claude-settings.json");
+        assert_eq!(
+            f.launches()[0],
+            [
+                "--session-id",
+                SID,
+                "--settings",
+                &settings.to_string_lossy()
+            ]
+        );
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&settings), 0o600);
+        assert_eq!(mode(settings.parent().unwrap()), 0o700);
+        assert_eq!(mode(&sock.path), 0o600);
+        assert_eq!(mode(sock.path.parent().unwrap()), 0o700);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/opt/xshell/xshell' event - finished"
+        );
+
+        assert_eq!(send(&sock.path, token, run, AgentStatus::NeedsYou), Ok(()));
+        assert_eq!(send(&sock.path, token, run, AgentStatus::NeedsYou), Ok(()));
+        // Typing does not answer for Claude; an interrupt ends the turn.
+        f.ptys.write("t", b"1").unwrap();
+        f.ptys.write("t", b"\x1b").unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("t".to_string(), Some(AgentStatus::NeedsYou), 0),
+                ("t".to_string(), Some(AgentStatus::Finished), 1),
+            ]
+        );
+        sock.remove();
+        assert!(!sock.path.exists());
+    }
+
+    #[test]
+    fn local_exit_sets_ended() {
+        let (f, sock, seen) = hooked_fx();
+        f.spawn("codex", None);
+        let (token, run, _) = hook_env(&f);
+        // Codex: Enter starts a turn.
+        f.ptys.write("t", b"\r").unwrap();
+        assert_eq!(f.sink.wait_exit(), vec![0]);
+        let deadline = Instant::now() + T;
+        while statuses(&seen).last() != Some(&Some(AgentStatus::Ended)) {
+            assert!(Instant::now() < deadline, "{:?}", statuses(&seen));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            statuses(&seen),
+            vec![Some(AgentStatus::Working), Some(AgentStatus::Ended)]
+        );
+        // Ended is final.
+        assert_eq!(send(&sock.path, token, run, AgentStatus::Working), Ok(()));
+        assert_eq!(statuses(&seen).len(), 2);
+    }
+
+    #[test]
+    fn local_relaunch_keeps_token_resets_status() {
+        let (f, sock, seen) = hooked_fx();
+        f.spawn("claude", Some(SID));
+        let (token, run, _) = hook_env(&f);
+        send(&sock.path, token, run, AgentStatus::Working).unwrap();
+        assert_eq!(f.relaunch(true, "claude", Some(SID)), Ok(true));
+        f.sink.wait_for("args --dangerously-skip-permissions");
+        let (token2, run2, _) = hook_env(&f);
+        assert_eq!(token2, token);
+        assert_eq!(run2, run + 1);
+        // The new run starts with no status; the old run's late SessionEnd is refused.
+        assert_eq!(
+            send(&sock.path, token, run, AgentStatus::Ended),
+            Err("stale run".into())
+        );
+        send(&sock.path, token, run2, AgentStatus::NeedsYou).unwrap();
+        assert_eq!(
+            statuses(&seen),
+            vec![
+                Some(AgentStatus::Working),
+                None,
+                Some(AgentStatus::NeedsYou)
+            ]
+        );
+        // Closing clears the Tab's status, and nothing reports for it afterwards.
+        f.ptys.close("t");
+        assert_eq!(statuses(&seen).last(), Some(&None));
+        let n = statuses(&seen).len();
+        assert!(send(&sock.path, token, run2, AgentStatus::Finished)
+            .unwrap_err()
+            .starts_with("unknown terminal"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(statuses(&seen).len(), n);
+    }
+
+    #[test]
+    fn local_unknown_token_rejected() {
+        let (f, sock, seen) = hooked_fx();
+        f.spawn("claude", Some(SID));
+        hook_env(&f);
+        let other = Uuid::new_v4();
+        assert_eq!(
+            send(&sock.path, other, 0, AgentStatus::Working),
+            Err(format!("unknown terminal {other}"))
+        );
+        assert!(statuses(&seen).is_empty());
+    }
+
+    #[test]
+    fn local_shells_and_hookless_agents_get_no_hooks() {
+        let (f, sock, _seen) = hooked_fx();
+        f.spawn("cursor", Some(SID));
+        let text = f.sink.wait_for(" end");
+        assert!(text.contains("hook   end"), "{text:?}");
+        assert_eq!(
+            f.launches()[0],
+            ["--resume=11111111-2222-3333-4444-555555555555"]
+        );
+        drop(sock);
+    }
+
+    /// Asks for approval the moment it starts, like Codex resuming into a pending prompt.
+    const PROMPTS_AT_ONCE: &str = "trap '' HUP\necho \"pid $$ args $*.\"\n\
+        printf '\\033]9;Approval requested: ls\\007'\n\
+        echo \"hook $XSHELL_TERMINAL_ID $XSHELL_EVENT_SOCKET end\"\nread line\nexit 0";
+
+    /// The Tab's status as the frontend keeps it: the change numbered last wins.
+    fn latest(seen: &Seen, id: &str) -> Option<Option<AgentStatus>> {
+        let v = seen.lock().unwrap();
+        v.iter()
+            .filter(|e| e.0 == id)
+            .max_by_key(|e| e.2)
+            .map(|e| e.1)
+    }
+
+    fn wait_latest(seen: &Seen, id: &str, want: Option<AgentStatus>) {
+        let deadline = Instant::now() + T;
+        while latest(seen, id) != Some(want) {
+            assert!(Instant::now() < deadline, "{:?}", seen.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Every run after the first is held before its waiter starts (its reader already runs,
+    /// and inside a Relaunch the Terminal's locks are held) long enough for its prompt to
+    /// be read: a change published too early, or dropped, shows.
+    fn prompting_fx() -> (Fx, crate::agent_events::EventSocket, Seen) {
+        let runs = Arc::new(AtomicU64::new(0));
+        let f = fx_with(PROMPTS_AT_ONCE, None, move |p| {
+            p.hook = Some(Arc::new(move |_, point| {
+                if matches!(point, Point::StartWaiter { .. })
+                    && runs.fetch_add(1, Ordering::SeqCst) > 0
+                {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                false
+            }))
+        });
+        let seen: Seen = Arc::default();
+        let s = seen.clone();
+        f.ptys.set_observer(Arc::new(move |id, st, seq| {
+            s.lock().unwrap().push((id.to_string(), st, seq));
+        }));
+        let sock = crate::agent_events::start(
+            f.ptys.clone(),
+            "/opt/xshell/xshell".into(),
+            &f.dir.path().join("data/agent-hooks"),
+            f.dir.path().join("run/xshell/desktop-1.sock"),
+        )
+        .unwrap();
+        (f, sock, seen)
+    }
+
+    /// The replacement's first output is scanned for its own run: the reset for the new run
+    /// is in place before the replacement exists.
+    #[test]
+    fn local_relaunch_osc9_at_start_is_kept() {
+        for _ in 0..5 {
+            let (f, _sock, seen) = prompting_fx();
+            f.spawn("codex", Some("c1"));
+            wait_latest(&seen, "t", Some(AgentStatus::NeedsYou));
+            assert_eq!(f.relaunch(true, "codex", Some("c1")), Ok(true));
+            f.sink
+                .wait_for("args resume --dangerously-bypass-approvals-and-sandbox");
+            f.sink.wait_for("hook ");
+            let n = seen.lock().unwrap().len();
+            // Reset, then the replacement's prompt, in that order.
+            let deadline = Instant::now() + T;
+            while seen.lock().unwrap().len() < n.max(3) {
+                assert!(Instant::now() < deadline, "{:?}", seen.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            wait_latest(&seen, "t", Some(AgentStatus::NeedsYou));
+            // In number order: emission may overtake, the frontend keeps the latest number.
+            let mut v = seen.lock().unwrap().clone();
+            v.sort_by_key(|e| e.2);
+            assert_eq!(
+                v.iter().map(|e| e.1).collect::<Vec<_>>(),
+                vec![
+                    Some(AgentStatus::NeedsYou),
+                    None,
+                    Some(AgentStatus::NeedsYou)
+                ],
+                "{v:?}"
+            );
+        }
+    }
+
+    /// A Terminal spawned under a Tab id already in use: the old one's clear is numbered
+    /// before anything the new one reports, so the new badge stays.
+    #[test]
+    fn local_replacement_under_same_tab_keeps_its_badge() {
+        for _ in 0..5 {
+            let (f, _sock, seen) = prompting_fx();
+            f.spawn("codex", None);
+            wait_latest(&seen, "t", Some(AgentStatus::NeedsYou));
+            let n = f.sink.text().matches("hook ").count();
+            f.spawn("codex", None);
+            let deadline = Instant::now() + T;
+            while f.sink.text().matches("hook ").count() <= n {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The old Terminal's clear and the new one's prompt both arrive; the prompt wins.
+            let deadline = Instant::now() + T;
+            while !seen.lock().unwrap().iter().any(|e| e.1.is_none()) {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            wait_latest(&seen, "t", Some(AgentStatus::NeedsYou));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(latest(&seen, "t"), Some(Some(AgentStatus::NeedsYou)));
+            f.ptys.close("t");
+            assert_eq!(latest(&seen, "t"), Some(None));
+        }
     }
 }
