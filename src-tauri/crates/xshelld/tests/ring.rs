@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use xshell_protocol::msg::ClientMsg;
+use xshell_protocol::msg::{ClientMsg, JoinExpect, MEMBERSHIP_CHANGED};
 use xshell_protocol::ring::relay::contract::{self, Recorder};
 use xshell_protocol::ring::relay::test_relay::{TestRelay, TestRelayOptions};
 use xshell_protocol::ring::relay::wire::{MemberPresence, Presence};
@@ -108,7 +108,27 @@ fn tokens(c: &RosterChain) -> Vec<String> {
 }
 
 fn join(c: &mut Client, tokens: Vec<String>) -> Result<Value, String> {
-    c.request(&ClientMsg::RingJoin { rosters: tokens })
+    c.request(&ClientMsg::RingJoin {
+        rosters: tokens,
+        expect: None,
+    })
+}
+
+/// A conditional `ring.join`: only while the Host is in `ring_id` (`None`: in no Ring), at
+/// `version` when given.
+fn cjoin(
+    c: &mut Client,
+    tokens: Vec<String>,
+    ring_id: Option<&str>,
+    version: Option<u64>,
+) -> Result<Value, String> {
+    c.request(&ClientMsg::RingJoin {
+        rosters: tokens,
+        expect: Some(JoinExpect {
+            ring_id: ring_id.map(String::from),
+            version,
+        }),
+    })
 }
 
 fn presence(r: &TestRelay, ring: &Ring, key: &SignKey) -> Option<Presence> {
@@ -224,7 +244,10 @@ fn mobile_cannot_use_ring_messages() {
     let mut m = Client::in_process(&srv, Role::Mobile);
     for msg in [
         ClientMsg::RingIdentity,
-        ClientMsg::RingJoin { rosters: vec![] },
+        ClientMsg::RingJoin {
+            rosters: vec![],
+            expect: None,
+        },
     ] {
         let e = m.request(&msg).unwrap_err();
         assert!(e.starts_with("forbidden for mobile"), "{e}");
@@ -501,6 +524,92 @@ fn follows_new_roster_relay_url() {
     assert_eq!(identity(&mut c).raw["ring"]["relayUrl"], b.url());
 }
 
+#[test]
+fn conditional_join_checks_the_membership() {
+    let r = relay();
+    let h = TestHome::new();
+    let srv = server(&h);
+    let mut c = desktop(&srv);
+    let id = identity(&mut c);
+    let mut ring = Ring::new(&r.url(), &id, RingRole::Daemon);
+    let rid = ring.chain.ring_id().as_str().to_string();
+    // Unpaired: a join expecting some Ring is refused, one expecting none goes through.
+    assert_eq!(
+        cjoin(&mut c, ring.tokens(), Some(&rid), None).unwrap_err(),
+        MEMBERSHIP_CHANGED
+    );
+    assert!(identity(&mut c).raw["ring"].is_null());
+    assert_eq!(
+        cjoin(&mut c, ring.tokens(), None, None).unwrap()["version"],
+        2
+    );
+    // Now in that Ring: "none" no longer holds, the Ring does, at its version.
+    ring.next(|d| d.relay_url = r.url() + "/");
+    assert_eq!(
+        cjoin(&mut c, ring.tokens(), None, None).unwrap_err(),
+        MEMBERSHIP_CHANGED
+    );
+    assert_eq!(
+        cjoin(&mut c, ring.tokens(), Some(&rid), Some(1)).unwrap_err(),
+        MEMBERSHIP_CHANGED
+    );
+    assert_eq!(stored_versions(&h), 2, "nothing stored by a refusal");
+    assert_eq!(
+        cjoin(&mut c, ring.tokens(), Some(&rid), Some(2)).unwrap()["version"],
+        3
+    );
+    // Another Ring, expecting the current one at its version: the Host moves.
+    let other = Ring::new(&r.url(), &id, RingRole::Daemon);
+    assert_eq!(
+        cjoin(&mut c, other.tokens(), Some(&rid), Some(3)).unwrap()["version"],
+        2
+    );
+    assert_eq!(
+        identity(&mut c).raw["ring"]["ringId"],
+        other.chain.ring_id().as_str()
+    );
+    srv.shutdown();
+}
+
+/// Two Desktops both saw the Host unpaired; their conditional joins race. Exactly one
+/// wins, and the Host stays in the winner's Ring.
+#[test]
+fn competing_conditional_joins_leave_one_ring() {
+    let r = relay();
+    for _ in 0..4 {
+        let h = TestHome::new();
+        let srv = server(&h);
+        let mut a = desktop(&srv);
+        let mut b = desktop(&srv);
+        let id = identity(&mut a);
+        assert!(identity(&mut b).raw["ring"].is_null());
+        let ra = Ring::new(&r.url(), &id, RingRole::Daemon);
+        let rb = Ring::new(&r.url(), &id, RingRole::Daemon);
+        // Both identity replies are in; now both join at once.
+        let barrier = std::sync::Barrier::new(2);
+        let (x, y) = std::thread::scope(|s| {
+            let ja = s.spawn(|| {
+                barrier.wait();
+                cjoin(&mut a, ra.tokens(), None, None)
+            });
+            let jb = s.spawn(|| {
+                barrier.wait();
+                cjoin(&mut b, rb.tokens(), None, None)
+            });
+            (ja.join().unwrap(), jb.join().unwrap())
+        });
+        assert!(x.is_ok() != y.is_ok(), "exactly one wins: {x:?} {y:?}");
+        let (winner, loser) = if x.is_ok() { (&ra, &y) } else { (&rb, &x) };
+        assert_eq!(loser.as_ref().unwrap_err(), MEMBERSHIP_CHANGED);
+        let mut c = desktop(&srv);
+        assert_eq!(
+            identity(&mut c).raw["ring"]["ringId"],
+            winner.chain.ring_id().as_str()
+        );
+        srv.shutdown();
+    }
+}
+
 /// The Desktop side end to end: `DesktopRing` over a real host link to this Daemon.
 #[test]
 fn desktop_ring_enables_and_sees_local_daemon() {
@@ -528,7 +637,8 @@ fn desktop_ring_enables_and_sees_local_daemon() {
     let desk = desktop::socket_desk(&srv.socket, tap, |_| {});
     desk.wait_usable();
     let host = desk.host();
-    let id = sync(|w| host.ring_identity(w)).expect("ring.identity");
+    let gen = host.status().link_generation;
+    let id = sync(|w| host.ring_identity(gen, w)).expect("ring.identity");
     let local = LocalIdentity::from_json(&id).unwrap();
 
     let app = tempfile::tempdir().unwrap();
@@ -539,7 +649,7 @@ fn desktop_ring_enables_and_sees_local_daemon() {
     let v = ring.enable(Some(local.clone()), false).unwrap();
     assert_eq!(v.members.len(), 2);
     let chain = ring.chain().unwrap();
-    let joined = sync(|w| host.ring_join(tokens(&chain), w)).expect("ring.join");
+    let joined = sync(|w| host.ring_join(tokens(&chain), None, gen, w)).expect("ring.join");
     assert_eq!(joined["version"], 1);
     wait_until("the Daemon connected, as the Desktop sees it", || {
         ring.view()
@@ -550,7 +660,7 @@ fn desktop_ring_enables_and_sees_local_daemon() {
     // Moving the Ring moves this Daemon too.
     let b = relay();
     let c = ring.set_relay_url(&b.url()).unwrap();
-    sync(|w| host.ring_join(tokens(&c), w)).expect("ring.join");
+    sync(|w| host.ring_join(tokens(&c), None, gen, w)).expect("ring.join");
     let rid = c.ring_id().clone();
     wait_until("the Daemon on the new relay", || {
         b.presence(&rid, &local.sign_key).is_some_and(|p| p.online)

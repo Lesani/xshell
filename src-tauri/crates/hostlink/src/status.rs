@@ -53,6 +53,10 @@ pub struct HostStatus {
     pub since_ms: u64,
     /// Changes whenever the Host's connection settings are replaced; Tabs re-attach then.
     pub config_generation: u64,
+    /// The link generation that last became usable: a request meant for that connection
+    /// names it ([`crate::HostHandle::ring_identity`]). Not for the frontend.
+    #[serde(skip)]
+    pub link_generation: u64,
 }
 
 impl HostStatus {
@@ -73,6 +77,7 @@ impl HostStatus {
             next_retry_at: None,
             since_ms: now_ms(),
             config_generation,
+            link_generation: 0,
         }
     }
 

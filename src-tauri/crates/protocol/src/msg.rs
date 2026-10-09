@@ -102,8 +102,30 @@ pub enum ClientMsg {
     /// Join (or follow) a Ring: the whole Roster chain from version 1, as tokens. The chain
     /// must verify and its head must list this Host as a `daemon`; a chain of the same Ring
     /// must extend the stored one. Desktop only; gated on the `ring` capability.
+    ///
+    /// With `expect` (gated on `ring.cjoin`; an older Daemon ignores the field) the join is
+    /// conditional: refused with [`MEMBERSHIP_CHANGED`] unless this Host's membership, as
+    /// `ring.identity` reports it, is still the expected one.
     #[serde(rename = "ring.join")]
-    RingJoin { rosters: Vec<String> },
+    RingJoin {
+        rosters: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<JoinExpect>,
+    },
+}
+
+/// The refusal of a conditional `ring.join` whose expected membership no longer holds.
+pub const MEMBERSHIP_CHANGED: &str = "membership changed";
+
+/// What a conditional `ring.join` expects this Host's membership to be.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinExpect {
+    /// The Ring the Host is in now; `null`: it is in none.
+    pub ring_id: Option<String>,
+    /// When set, that Ring's head version must be exactly this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
 }
 
 /// What an agent Terminal is doing, as its agent's hooks report it.
@@ -570,6 +592,7 @@ mod tests {
         assert_eq!(decode_inbound(&b).unwrap().msg, ClientMsg::RingIdentity);
         let join = ClientMsg::RingJoin {
             rosters: vec!["xro1.a.b".into()],
+            expect: None,
         };
         let b = body(encode_msg(&join, Some(5)).unwrap());
         assert_eq!(
@@ -577,6 +600,31 @@ mod tests {
             r#"{"id":5,"t":"ring.join","rosters":["xro1.a.b"]}"#
         );
         assert_eq!(decode_inbound(&b).unwrap().msg, join);
+        // Conditional: an unpaired Host, then one in a given Ring at a given version.
+        let cjoin = ClientMsg::RingJoin {
+            rosters: vec!["xro1.a.b".into()],
+            expect: Some(JoinExpect {
+                ring_id: None,
+                version: None,
+            }),
+        };
+        let b = body(encode_msg(&cjoin, Some(7)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":7,"t":"ring.join","rosters":["xro1.a.b"],"expect":{"ringId":null}}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap().msg, cjoin);
+        let raw = json!({"t":"ring.join","id":8,"rosters":[],"expect":{"ringId":"r","version":3}});
+        assert_eq!(
+            decode_inbound(raw.to_string().as_bytes()).unwrap().msg,
+            ClientMsg::RingJoin {
+                rosters: vec![],
+                expect: Some(JoinExpect {
+                    ring_id: Some("r".into()),
+                    version: Some(3)
+                })
+            }
+        );
         let raw = json!({"t":"ring.join","id":6});
         assert!(matches!(
             decode_inbound(raw.to_string().as_bytes()),

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { canEnable, canSave, connectionLine, startsOver, initialForm, isDirty, localLine, moveLine, presenceChip, presenceKey, problemLine, relayChoice, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { canClaim, canEnable, canSave, connectionLine, hostLine, startsOver, initialForm, isDirty, localLine, moveLine, presenceChip, presenceKey, problemLine, relayChoice, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
-import type { MemberView, RingStatus } from "./types";
+import type { HostRingState, MemberView, RingStatus } from "./types";
 
 const HOSTED = "wss://relay.xshell.app";
 
@@ -21,12 +21,13 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     problemDetail: null,
     members: [],
     local: "daemon",
+    hosts: [],
     ...over,
   };
 }
 
 function member(kind: MemberView["presence"]["kind"], over: Partial<MemberView> = {}): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, presence: { kind }, ...over };
+  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, presence: { kind }, ...over };
 }
 
 describe("presence", () => {
@@ -81,6 +82,28 @@ describe("connection line", () => {
     expect(localLine(status({ local: "too-old" }))).toBe(fmt("mobile.local.tooOld"));
     expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toContain("/p/ring.json.bad-1");
     expect(problemLine(status())).toBeNull();
+  });
+});
+
+describe("remote hosts", () => {
+  const host = (state: HostRingState["state"], error?: string): HostRingState => ({ host: "h_aaaaaaaa", name: "build-box", state, error });
+
+  it("says why a Host is not among the devices", () => {
+    expect(hostLine(host("too-old"))).toBe("Update xshelld on build-box in Settings → Hosts to make it reachable from your phone.");
+    expect(hostLine(host("other-ring"))).toBe("build-box is paired with another set of devices. Pairing here will end their mobile access to it.");
+    expect(hostLine(host("full"))).toBe("build-box can't join your devices. You've reached the limit of 64. Remove a device, then try again.");
+    expect(hostLine(host("failed", "timed out"))).toBe("Couldn't pair build-box: timed out");
+    expect(fmt("mobile.host.claim")).toBe("Pair with this desktop");
+  });
+
+  it("offers pairing only for a Host of another set of devices", () => {
+    expect(canClaim(host("other-ring"))).toBe(true);
+    for (const s of ["too-old", "full", "failed"] as const) expect(canClaim(host(s))).toBe(false);
+  });
+
+  it("lists nothing when every Host joined", () => {
+    expect(status().hosts).toEqual([]);
+    expect(status().hosts.map(hostLine)).toEqual([]);
   });
 });
 

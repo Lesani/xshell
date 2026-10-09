@@ -474,6 +474,24 @@ impl TransportFactory for SocketFactory {
     }
 }
 
+/// Each Host reached directly on its own Daemon's socket, by Host id (several Remote Hosts,
+/// each an in-process Daemon in its own test home).
+pub struct MapFactory {
+    pub paths: std::collections::HashMap<String, PathBuf>,
+}
+
+impl TransportFactory for MapFactory {
+    fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+        // Never used: a direct Host runs no command.
+        Box::new(LocalShellTransport::default())
+    }
+
+    fn direct(&self, cfg: &HostConfig) -> Option<Box<dyn Dialer>> {
+        let path = self.paths.get(&cfg.id)?.clone();
+        Some(Box::new(xshell_hostlink::UnixSocketDialer { path }))
+    }
+}
+
 /// Where the current connection stood: its transport process, or its dial.
 #[derive(Debug, Clone, Copy)]
 pub enum Mark {

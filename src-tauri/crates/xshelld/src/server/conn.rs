@@ -410,7 +410,9 @@ impl Conn {
             }
             ClientMsg::RingIdentity => reply(&self.ob, id, d.ring.identity()),
             // Never blocks: leaving another Ring says goodbye on a thread of its own.
-            ClientMsg::RingJoin { rosters } => reply(&self.ob, id, d.ring.join(&rosters)),
+            ClientMsg::RingJoin { rosters, expect } => {
+                reply(&self.ob, id, d.ring.join(&rosters, expect.as_ref()))
+            }
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();

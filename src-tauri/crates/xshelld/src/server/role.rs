@@ -698,7 +698,10 @@ mod tests {
             session_id: None,
             meta: None,
         };
-        let join = ClientMsg::RingJoin { rosters: vec![] };
+        let join = ClientMsg::RingJoin {
+            rosters: vec![],
+            expect: None,
+        };
         for m in [
             &upd,
             &ClientMsg::DaemonUpgrade,

@@ -1,5 +1,5 @@
 import { fmt, type StringKey } from "./strings";
-import type { MemberRole, MemberView, RingStatus } from "./types";
+import type { HostRingState, MemberRole, MemberView, RingStatus } from "./types";
 
 // Settings → Mobile, the pure part: status lines, labels and the Relay URL form.
 
@@ -54,6 +54,23 @@ export function localLine(s: Pick<RingStatus, "local">): string | null {
   if (s.local === "in-process") return fmt("mobile.local.inProcess");
   if (s.local === "too-old") return fmt("mobile.local.tooOld");
   return null;
+}
+
+const HOST_KEY: Record<HostRingState["state"], StringKey> = {
+  "too-old": "mobile.host.tooOld",
+  "other-ring": "mobile.host.otherRing",
+  full: "mobile.host.full",
+  failed: "mobile.host.failed",
+};
+
+// The note for a Remote Host that is not in the Ring.
+export function hostLine(h: HostRingState): string {
+  return fmt(HOST_KEY[h.state], { name: h.name, error: h.error ?? "" });
+}
+
+// Whether the note offers "Pair with this desktop".
+export function canClaim(h: HostRingState): boolean {
+  return h.state === "other-ring";
 }
 
 // Whether Enable is the deliberate start-over after unreadable settings were set aside (the

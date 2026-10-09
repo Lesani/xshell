@@ -33,5 +33,10 @@ export function useRing() {
     if (mounted.current) setStatus(s);
   }, []);
 
-  return { status, enable, setRelayUrl };
+  const claimHost = useCallback(async (host: string) => {
+    const s = await invoke<RingStatus>("ring_claim_host", { host });
+    if (mounted.current) setStatus(s);
+  }, []);
+
+  return { status, enable, setRelayUrl, claimHost };
 }

@@ -20,6 +20,10 @@ use xshell_protocol::msg::{ProtocolRange, TerminalInfo};
 pub trait Observer: Send + Sync {
     fn status(&self, s: &HostStatus);
     fn terminals(&self, host: &str, list: &[TerminalInfo]);
+    /// `configure` changed a Host's display settings (its name, say) without touching its
+    /// connection. Called outside any Host's lock; must not block or call back into the
+    /// manager either.
+    fn renamed(&self, _host: &str) {}
 }
 
 pub struct ManagerConfig {
@@ -137,7 +141,11 @@ impl Manager {
                         joins.extend(h.stop_begin());
                         replaced.push((h.clone(), cfg.clone()));
                     } else {
+                        let before = h.config().name;
                         h.set_display(cfg.clone());
+                        if before != cfg.name {
+                            self.mc.observer.renamed(&cfg.id);
+                        }
                     }
                     next.push(h.clone());
                 }

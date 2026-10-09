@@ -8,9 +8,11 @@
 //! Connector's callbacks persist newer chains through the same transactions and never hold a
 //! lock of their own while they do.
 
-use super::store::{RingState, Store};
+use super::store::{HostMember, RingState, Store};
+use crate::LOCAL_HOST_ID;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -18,10 +20,11 @@ use xshell_protocol::ring::relay::{
     ByeReason, Connector, ConnectorConfig, ConnectorEvents, LinkState, MemberPresence, MoveJob,
     MoveState, RingClientConfig, RingTimeouts,
 };
+use xshell_protocol::ring::roster::MAX_MEMBERS;
 use xshell_protocol::ring::url::RelayUrl;
 use xshell_protocol::ring::{
-    verify_genesis, DeviceKeys, Member, NoiseKey, RingId, Role, Roster, RosterChain, SignKey,
-    SignedRoster,
+    member_name, verify_genesis, DeviceKeys, Member, NoiseKey, RingId, Role, Roster, RosterChain,
+    SignKey, SignedRoster,
 };
 
 /// The local Daemon's Ring identity, from its `ring.identity` answer.
@@ -44,6 +47,203 @@ impl LocalIdentity {
             noise_key: NoiseKey::parse(s("noiseKey")?).map_err(|e| e.to_string())?,
             name: xshell_protocol::ring::member_name(s("name").unwrap_or(""), "this computer"),
         })
+    }
+}
+
+/// A Host whose Daemon belongs in the Ring, as the caller sees it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRef {
+    /// The Host's id; [`crate::LOCAL_HOST_ID`] for the Local Host.
+    pub id: String,
+    /// Its member name: the Settings → Hosts name (the hostname for the Local Host).
+    pub name: String,
+    /// Where it is reached ([`HostMember::target`]); ignored for the Local Host.
+    pub target: String,
+}
+
+/// What [`DesktopRing::ensure_host_daemons`] did for one Host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostOutcome {
+    /// Its Daemon is in the head as a `daemon`: it can join.
+    Joined,
+    /// Its key is in the Ring with another role: refused for this Host only.
+    OtherRole,
+    /// The Roster has no room for it.
+    Full,
+    /// Its identity was for a connection that is no longer current: discarded.
+    Stale,
+    /// The batch was decided for a Ring that is no longer this Desktop's: discarded.
+    RingChanged,
+}
+
+/// Per Host id, what [`DesktopRing::ensure_host_daemons`] did.
+pub type HostOutcomes = Vec<(String, HostOutcome)>;
+
+/// The changes one batch makes ([`plan_hosts`]).
+struct HostPlan {
+    remove: Vec<SignKey>,
+    add: Vec<Member>,
+    rename: Vec<(SignKey, String)>,
+    /// Every Host's key (and target) afterwards, the Local Host's included.
+    after: BTreeMap<String, (SignKey, String)>,
+    outcomes: Vec<(String, HostOutcome)>,
+}
+
+impl HostPlan {
+    fn edits_roster(&self) -> bool {
+        !self.remove.is_empty() || !self.add.is_empty() || !self.rename.is_empty()
+    }
+}
+
+/// Every Host's key before a batch: the Remote Hosts' entries and the Local Host.
+fn mapping(s: &RingState) -> BTreeMap<String, (SignKey, String)> {
+    let mut m: BTreeMap<String, (SignKey, String)> = s
+        .host_members
+        .iter()
+        .map(|(id, h)| (id.clone(), (h.sign_key, h.target.clone())))
+        .collect();
+    if let Some(k) = s.local_member {
+        m.insert(LOCAL_HOST_ID.to_string(), (k, String::new()));
+    }
+    m
+}
+
+/// What the batch changes, decided on the whole batch at once:
+/// - a key already in the head as a `daemon` only updates the mapping (Host entries that
+///   reach the same Daemon share its member);
+/// - a key in the head with another role is refused for that Host;
+/// - a new key is added; the Host's previous key is removed in the same version only when
+///   it is a reinstall (the same place, a new key) and no Host, the Local Host included,
+///   maps to it afterwards. A Host retargeted elsewhere keeps its old member (#22 removes
+///   members);
+/// - the member's name is that of the Host with the smallest id that maps to it, when that
+///   Host is in the batch;
+/// - new keys that do not fit under [`MAX_MEMBERS`] are refused as `full`, the last (by
+///   their owner's id) first.
+fn plan_hosts(s: &RingState, batch: &[&(HostRef, LocalIdentity)], now: u64) -> HostPlan {
+    let head = s.chain.head().roster();
+    let before = mapping(s);
+    // One entry per Host (the last given), in id order.
+    let mut want: BTreeMap<&str, &(HostRef, LocalIdentity)> = BTreeMap::new();
+    for e in batch {
+        want.insert(e.0.id.as_str(), e);
+    }
+    let mut outcomes = Vec::new();
+    let mut candidates = Vec::new();
+    for (id, e) in &want {
+        match head.member(&e.1.sign_key) {
+            Some(m) if m.role != Role::Daemon => {
+                outcomes.push((id.to_string(), HostOutcome::OtherRole))
+            }
+            _ => candidates.push(*e),
+        }
+    }
+    let target = |h: &HostRef| {
+        if h.id == LOCAL_HOST_ID {
+            String::new()
+        } else {
+            h.target.clone()
+        }
+    };
+    let reinstall = |h: &HostRef, old_target: &str| h.id == LOCAL_HOST_ID || h.target == old_target;
+    let mut rejected: Vec<SignKey> = Vec::new();
+    let (after, remove, new_keys) = loop {
+        let accepted: Vec<_> = candidates
+            .iter()
+            .filter(|e| !rejected.contains(&e.1.sign_key))
+            .collect();
+        let mut after = before.clone();
+        for e in &accepted {
+            after.insert(e.0.id.clone(), (e.1.sign_key, target(&e.0)));
+        }
+        let mut new_keys: Vec<SignKey> = Vec::new();
+        for e in &accepted {
+            if head.member(&e.1.sign_key).is_none() && !new_keys.contains(&e.1.sign_key) {
+                new_keys.push(e.1.sign_key);
+            }
+        }
+        let mut remove: Vec<SignKey> = Vec::new();
+        // New keys that replace a removed one (net zero members).
+        let mut replacing: Vec<SignKey> = Vec::new();
+        for e in &accepted {
+            let Some((old, _)) = before.get(&e.0.id) else {
+                continue;
+            };
+            if *old == e.1.sign_key || remove.contains(old) {
+                continue;
+            }
+            let still_mapped = after.values().any(|(k, _)| k == old);
+            // Every Host moving away from `old` must be a reinstall, not a retarget.
+            let all_reinstalls = accepted.iter().all(|x| match before.get(&x.0.id) {
+                Some((k, t)) if k == old && x.1.sign_key != *old => reinstall(&x.0, t),
+                _ => true,
+            });
+            let daemon = head.member(old).is_some_and(|m| m.role == Role::Daemon);
+            if !still_mapped && all_reinstalls && daemon {
+                remove.push(*old);
+                for x in &accepted {
+                    let moved = before.get(&x.0.id).is_some_and(|(k, _)| k == old);
+                    if moved && new_keys.contains(&x.1.sign_key) {
+                        replacing.push(x.1.sign_key);
+                    }
+                }
+            }
+        }
+        let count = head.members.len() - remove.len() + new_keys.len();
+        if count <= MAX_MEMBERS {
+            break (after, remove, new_keys);
+        }
+        // `count` exceeds the (valid) head's size only through new keys. Refuse additions
+        // first (the last by owner id), keeping the one-for-one replacements that fit.
+        let pick = new_keys
+            .iter()
+            .rev()
+            .find(|k| !replacing.contains(k))
+            .or(new_keys.last())
+            .expect("a new key");
+        rejected.push(*pick);
+    };
+    for e in &candidates {
+        let o = if rejected.contains(&e.1.sign_key) {
+            HostOutcome::Full
+        } else {
+            HostOutcome::Joined
+        };
+        outcomes.push((e.0.id.clone(), o));
+    }
+    // The name each mapped key should carry: its smallest-id Host's, when that one is in the
+    // batch (`after` iterates in id order, so the first owner is the smallest).
+    let name_of = |key: &SignKey| -> Option<String> {
+        let (owner, _) = after.iter().find(|(_, (k, _))| k == key)?;
+        let e = want.get(owner.as_str())?;
+        Some(member_name(&e.0.name, &e.1.name))
+    };
+    let mut add = Vec::new();
+    for k in &new_keys {
+        let e = candidates
+            .iter()
+            .find(|e| e.1.sign_key == *k)
+            .expect("a new key has a candidate");
+        let name = name_of(k).unwrap_or_else(|| member_name(&e.0.name, &e.1.name));
+        add.push(Member::new(&name, Role::Daemon, *k, e.1.noise_key, now));
+    }
+    let mut rename = Vec::new();
+    for m in &head.members {
+        if m.role != Role::Daemon || remove.contains(&m.sign_key) {
+            continue;
+        }
+        if let Some(name) = name_of(&m.sign_key) {
+            if name != m.name {
+                rename.push((m.sign_key, name));
+            }
+        }
+    }
+    HostPlan {
+        remove,
+        add,
+        rename,
+        after,
+        outcomes,
     }
 }
 
@@ -129,6 +329,8 @@ pub struct MemberView {
     pub sign_key: SignKey,
     pub this_app: bool,
     pub this_computer: bool,
+    /// The configured Remote Host (the smallest id) whose Daemon this member is.
+    pub host_id: Option<String>,
     pub presence: PresenceView,
 }
 
@@ -377,7 +579,8 @@ impl DesktopRing {
                 }
                 unchanged = cur.chain == s.chain
                     && cur.pending_move == s.pending_move
-                    && cur.local_member == s.local_member;
+                    && cur.local_member == s.local_member
+                    && cur.host_members == s.host_members;
             }
             let other_ring = l
                 .state
@@ -588,6 +791,7 @@ impl DesktopRing {
             chain: RosterChain::from_chain(vec![genesis]).map_err(|e| e.to_string())?,
             local_member: local.map(|d| d.sign_key),
             pending_move: None,
+            host_members: BTreeMap::new(),
         })
     }
 
@@ -631,63 +835,123 @@ impl DesktopRing {
     }
 
     /// The local Daemon is in the head under `local`'s key, as a `daemon`: added in a new
-    /// version, or replacing an older key of this computer. Idempotent. `None`: no Ring.
+    /// version, or replacing an older key of this computer that no other Host maps to.
+    /// Idempotent. `None`: no Ring.
     pub fn ensure_local_daemon(
         &self,
         local: &LocalIdentity,
     ) -> Result<Option<RosterChain>, String> {
-        let (chain, changed) = {
+        let h = HostRef {
+            id: LOCAL_HOST_ID.to_string(),
+            name: local.name.clone(),
+            target: String::new(),
+        };
+        match self.ensure_host_daemons(&[(h, local.clone())], &|_| true, None)? {
+            None => Ok(None),
+            Some((c, out)) => match out.first().map(|o| o.1) {
+                Some(HostOutcome::OtherRole) => {
+                    Err("this computer's key is in the ring with another role".into())
+                }
+                Some(HostOutcome::Full) => Err(format!(
+                    "the ring already has the maximum of {MAX_MEMBERS} devices"
+                )),
+                _ => Ok(Some(c)),
+            },
+        }
+    }
+
+    /// Every Daemon of `batch` in the head as a `daemon` ([`plan_hosts`] has the rules), in
+    /// one transaction: at most one new Roster version for the whole batch. An entry for
+    /// which `valid` (called once each, inside the transaction) is false is discarded as
+    /// [`HostOutcome::Stale`]. With `ring`, the batch was decided for that Ring: when the
+    /// state on disk is another Ring's, nothing changes and every entry is
+    /// [`HostOutcome::RingChanged`]. Idempotent. `None`: no Ring.
+    pub fn ensure_host_daemons(
+        &self,
+        batch: &[(HostRef, LocalIdentity)],
+        valid: &dyn Fn(&str) -> bool,
+        ring: Option<&RingId>,
+    ) -> Result<Option<(RosterChain, HostOutcomes)>, String> {
+        let (chain, outcomes, changed) = {
             let _c = self.lock_commit();
             let r = self.tx(|cur, _| {
                 let Some(mut s) = cur else {
                     return Ok((None, None));
                 };
-                let head = s.chain.head();
-                match head.member(&local.sign_key) {
-                    Some(m) if m.role == Role::Daemon => {
-                        if s.local_member == Some(local.sign_key) {
-                            return Ok((None, Some((s, false))));
-                        }
-                        s.local_member = Some(local.sign_key);
-                        return Ok((Some(s.clone()), Some((s, false))));
-                    }
-                    Some(_) => {
-                        return Err("this computer's key is in the ring with another role".into())
-                    }
-                    None => {}
+                if ring.is_some_and(|r| r != s.chain.ring_id()) {
+                    let out = batch
+                        .iter()
+                        .map(|e| (e.0.id.clone(), HostOutcome::RingChanged))
+                        .collect();
+                    return Ok((None, Some((s, out, false))));
                 }
-                let stale = s.local_member.filter(|k| head.member(k).is_some());
-                let next = head
-                    .next(&*s.keys, now(), |d| {
-                        if let Some(k) = stale {
-                            d.remove(&k);
-                        }
-                        d.add(Member::new(
-                            &local.name,
-                            Role::Daemon,
-                            local.sign_key,
-                            local.noise_key,
-                            now(),
-                        ));
+                let mut outcomes = Vec::new();
+                let mut live = Vec::new();
+                for e in batch {
+                    if valid(&e.0.id) {
+                        live.push(e);
+                    } else {
+                        outcomes.push((e.0.id.clone(), HostOutcome::Stale));
+                    }
+                }
+                let t = now();
+                let p = plan_hosts(&s, &live, t);
+                outcomes.extend(p.outcomes.iter().cloned());
+                let mut dirty = p.after != mapping(&s);
+                if p.edits_roster() {
+                    let next = s
+                        .chain
+                        .head()
+                        .next(&*s.keys, t, |d| {
+                            for k in &p.remove {
+                                d.remove(k);
+                            }
+                            for (k, name) in &p.rename {
+                                if let Some(m) = d.members.iter_mut().find(|m| m.sign_key == *k) {
+                                    m.name = name.clone();
+                                }
+                            }
+                            for m in &p.add {
+                                d.add(m.clone());
+                            }
+                        })
+                        .map_err(|e| e.to_string())?;
+                    s.chain
+                        .accept(std::slice::from_ref(&next))
+                        .map_err(|e| e.to_string())?;
+                    dirty = true;
+                }
+                s.local_member = p.after.get(LOCAL_HOST_ID).map(|(k, _)| *k);
+                s.host_members = p
+                    .after
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != LOCAL_HOST_ID)
+                    .map(|(id, (k, t))| {
+                        (
+                            id.clone(),
+                            HostMember {
+                                sign_key: *k,
+                                target: t.clone(),
+                            },
+                        )
                     })
-                    .map_err(|e| e.to_string())?;
-                s.chain
-                    .accept(std::slice::from_ref(&next))
-                    .map_err(|e| e.to_string())?;
-                s.local_member = Some(local.sign_key);
-                Ok((Some(s.clone()), Some((s, true))))
+                    .collect();
+                let out = (s.clone(), outcomes, dirty);
+                Ok((dirty.then_some(s), Some(out)))
             })?;
-            let Some((s, changed)) = r else {
+            let Some((s, outcomes, changed)) = r else {
                 return Ok(None);
             };
-            self.hook();
-            self.adopt(s.clone());
-            (s.chain, changed)
+            if changed {
+                self.hook();
+                self.adopt(s.clone());
+            }
+            (s.chain, outcomes, changed)
         };
         if changed {
             self.emit();
         }
-        Ok(Some(chain))
+        Ok(Some((chain, outcomes)))
     }
 
     /// The chain held, if a Ring exists.
@@ -797,6 +1061,12 @@ impl DesktopRing {
                     sign_key: m.sign_key,
                     this_app: m.sign_key == me,
                     this_computer: s.local_member == Some(m.sign_key),
+                    // `host_members` iterates in id order: the first is the smallest.
+                    host_id: s
+                        .host_members
+                        .iter()
+                        .find(|(_, h)| h.sign_key == m.sign_key)
+                        .map(|(id, _)| id.clone()),
                     presence,
                 }
             })
@@ -1286,6 +1556,425 @@ mod tests {
         assert!(!v.enabled && v.members.is_empty());
         assert_eq!(ring.enable(None, false).unwrap_err(), START_OVER_REQUIRED);
         assert!(ring.enable(None, true).unwrap().enabled);
+        ring.quit();
+    }
+
+    fn href(id: &str, name: &str, target: &str) -> HostRef {
+        HostRef {
+            id: id.into(),
+            name: name.into(),
+            target: target.into(),
+        }
+    }
+
+    fn quiet(t: &tempfile::TempDir) -> Arc<DesktopRing> {
+        let (ring, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
+        ring.enable(None, false).unwrap();
+        ring
+    }
+
+    fn all(_: &str) -> bool {
+        true
+    }
+
+    fn ensure(
+        ring: &DesktopRing,
+        batch: &[(HostRef, LocalIdentity)],
+    ) -> (RosterChain, Vec<(String, HostOutcome)>) {
+        ring.ensure_host_daemons(batch, &all, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn has(ring: &DesktopRing, id: &LocalIdentity) -> bool {
+        ring.chain().unwrap().head().member(&id.sign_key).is_some()
+    }
+
+    fn stored(t: &tempfile::TempDir) -> RingState {
+        Store::new(t.path().join("ring")).load().unwrap().0.unwrap()
+    }
+
+    #[test]
+    fn ensure_host_daemons_batches_into_one_version() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let (_, b) = identity();
+        let (c, out) = ensure(
+            &ring,
+            &[
+                (href("h_aaaaaaaa", "Alpha", "a|"), a.clone()),
+                (href("h_bbbbbbbb", "Beta", "b|"), b.clone()),
+            ],
+        );
+        assert_eq!(c.head().version(), 2, "one version for the batch");
+        assert_eq!(
+            out,
+            [
+                ("h_aaaaaaaa".to_string(), HostOutcome::Joined),
+                ("h_bbbbbbbb".to_string(), HostOutcome::Joined)
+            ]
+        );
+        assert_eq!(c.head().member(&a.sign_key).unwrap().name, "Alpha");
+        assert_eq!(c.head().member(&b.sign_key).unwrap().role, Role::Daemon);
+        let s = stored(&t);
+        assert_eq!(s.host_members["h_aaaaaaaa"].sign_key, a.sign_key);
+        assert_eq!(s.host_members["h_bbbbbbbb"].target, "b|");
+        assert_eq!(s.local_member, None);
+        ring.quit();
+    }
+
+    #[test]
+    fn ensure_host_daemons_is_idempotent() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let batch = [(href("h_aaaaaaaa", "Alpha", "a|"), a)];
+        ensure(&ring, &batch);
+        let sig = Store::new(t.path().join("ring")).signature();
+        let (c, out) = ensure(&ring, &batch);
+        assert_eq!(c.head().version(), 2);
+        assert_eq!(out[0].1, HostOutcome::Joined);
+        assert_eq!(
+            Store::new(t.path().join("ring")).signature(),
+            sig,
+            "nothing written"
+        );
+        ring.quit();
+    }
+
+    #[test]
+    fn no_ring_adds_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
+        let (_, a) = identity();
+        let r = ring
+            .ensure_host_daemons(&[(href("h_aaaaaaaa", "A", "a|"), a)], &all, None)
+            .unwrap();
+        assert!(r.is_none());
+        assert!(!ring.view().enabled);
+        ring.quit();
+    }
+
+    #[test]
+    fn reinstalled_host_replaces_its_old_key() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, old) = identity();
+        let (_, new) = identity();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), old.clone())]);
+        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), new.clone())]);
+        assert_eq!(c.head().version(), 3);
+        assert!(c.head().member(&old.sign_key).is_none(), "replaced");
+        assert!(c.head().member(&new.sign_key).is_some());
+        assert_eq!(c.head().roster().members.len(), 2);
+        ring.quit();
+    }
+
+    /// A Host pointed at another machine keeps the old machine's member (#22 removes it).
+    #[test]
+    fn retargeted_host_keeps_its_old_member() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, old) = identity();
+        let (_, new) = identity();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), old.clone())]);
+        ensure(
+            &ring,
+            &[(href("h_aaaaaaaa", "A", "elsewhere|"), new.clone())],
+        );
+        assert!(has(&ring, &old) && has(&ring, &new));
+        assert_eq!(stored(&t).host_members["h_aaaaaaaa"].sign_key, new.sign_key);
+        ring.quit();
+    }
+
+    /// Two Host entries reaching one Daemon share its member, named after the entry with
+    /// the smallest id; one of them reinstalling does not remove the key the other still
+    /// maps to.
+    #[test]
+    fn two_host_entries_share_one_daemon_member() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, d) = identity();
+        let (c, out) = ensure(
+            &ring,
+            &[
+                (href("h_bbbbbbbb", "Bee", "b|"), d.clone()),
+                (href("h_aaaaaaaa", "Ay", "a|"), d.clone()),
+            ],
+        );
+        assert_eq!(c.head().version(), 2);
+        assert_eq!(c.head().roster().members.len(), 2, "one member");
+        assert_eq!(c.head().member(&d.sign_key).unwrap().name, "Ay");
+        assert!(out.iter().all(|(_, o)| *o == HostOutcome::Joined));
+        // h_bbbbbbbb now reports a new key at the same place: h_aaaaaaaa still maps to the
+        // old one, so it stays.
+        let (_, n) = identity();
+        ensure(&ring, &[(href("h_bbbbbbbb", "Bee", "b|"), n.clone())]);
+        assert!(has(&ring, &d) && has(&ring, &n));
+        ring.quit();
+    }
+
+    /// The Local Host and a Remote Host entry for the same computer, in either order and in
+    /// one batch or two: one member, and a reinstall seen by both replaces it.
+    #[test]
+    fn local_and_remote_alias_share_one_member_in_both_orders() {
+        for order in 0..3 {
+            let t = tempfile::tempdir().unwrap();
+            let ring = quiet(&t);
+            let (_, d) = identity();
+            let local = (href(LOCAL_HOST_ID, "host", ""), d.clone());
+            let remote = (href("h_aaaaaaaa", "Me again", "me|"), d.clone());
+            match order {
+                0 => drop(ensure(&ring, &[local.clone(), remote.clone()])),
+                1 => drop(ensure(&ring, &[remote.clone(), local.clone()])),
+                _ => {
+                    ring.ensure_local_daemon(&d).unwrap();
+                    ensure(&ring, std::slice::from_ref(&remote));
+                }
+            }
+            let c = ring.chain().unwrap();
+            assert_eq!(c.head().roster().members.len(), 2, "order {order}");
+            let v = ring.view();
+            let m = v.members.iter().find(|m| m.sign_key == d.sign_key).unwrap();
+            assert!(m.this_computer);
+            assert_eq!(m.host_id.as_deref(), Some("h_aaaaaaaa"));
+            // The smallest id names it: "h_…" sorts before "local".
+            assert_eq!(m.name, "Me again", "order {order}");
+            // Only the Local Host reports the new key: the Remote entry still maps to the
+            // old one, which stays.
+            let (_, n) = identity();
+            ring.ensure_local_daemon(&n).unwrap();
+            assert!(has(&ring, &d) && has(&ring, &n), "order {order}");
+            // Now the Remote entry sees it too: the old key is nobody's and goes.
+            let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "Me again", "me|"), n.clone())]);
+            assert!(c.head().member(&d.sign_key).is_none(), "order {order}");
+            assert_eq!(c.head().roster().members.len(), 2);
+            ring.quit();
+        }
+    }
+
+    #[test]
+    fn rename_updates_member_name_keeping_added_at() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "Old", "a|"), a.clone())]);
+        let before = c.head().member(&a.sign_key).unwrap().clone();
+        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "New", "a|"), a.clone())]);
+        assert_eq!(c.head().version(), 3, "a name-only version");
+        let after = c.head().member(&a.sign_key).unwrap();
+        assert_eq!(after.name, "New");
+        assert_eq!(after.added_at, before.added_at);
+        assert_eq!(after.noise_key, before.noise_key);
+        ring.quit();
+    }
+
+    fn fill(ring: &DesktopRing, n: usize) {
+        let batch: Vec<_> = (0..n)
+            .map(|i| (href(&format!("h_{i:08}"), "x", "x|"), identity().1))
+            .collect();
+        ensure(ring, &batch);
+    }
+
+    #[test]
+    fn full_roster_marks_host_full() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        // The Desktop plus 62: room for one more.
+        fill(&ring, MAX_MEMBERS - 2);
+        let (_, a) = identity();
+        let (_, b) = identity();
+        let (c, out) = ensure(
+            &ring,
+            &[
+                (href("h_zzzzzzza", "A", "a|"), a.clone()),
+                (href("h_zzzzzzzb", "B", "b|"), b.clone()),
+            ],
+        );
+        assert_eq!(c.head().roster().members.len(), MAX_MEMBERS);
+        assert_eq!(
+            out,
+            [
+                ("h_zzzzzzza".to_string(), HostOutcome::Joined),
+                ("h_zzzzzzzb".to_string(), HostOutcome::Full)
+            ]
+        );
+        assert!(has(&ring, &a) && !has(&ring, &b));
+        assert!(!stored(&t).host_members.contains_key("h_zzzzzzzb"));
+        ring.quit();
+    }
+
+    #[test]
+    fn replacement_at_capacity_works() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        fill(&ring, MAX_MEMBERS - 2);
+        let (_, old) = identity();
+        ensure(&ring, &[(href("h_zzzzzzza", "A", "a|"), old.clone())]);
+        assert_eq!(
+            ring.chain().unwrap().head().roster().members.len(),
+            MAX_MEMBERS
+        );
+        let (_, new) = identity();
+        let (c, out) = ensure(&ring, &[(href("h_zzzzzzza", "A", "a|"), new.clone())]);
+        assert_eq!(out[0].1, HostOutcome::Joined);
+        assert_eq!(c.head().roster().members.len(), MAX_MEMBERS);
+        assert!(has(&ring, &new) && !has(&ring, &old));
+        ring.quit();
+    }
+
+    /// At capacity, a new Host and a reinstalled one in one batch, in either order: the
+    /// reinstall replaces its key, the addition is refused.
+    #[test]
+    fn replacement_kept_before_an_addition_at_capacity() {
+        for flip in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let ring = quiet(&t);
+            fill(&ring, MAX_MEMBERS - 2);
+            let (_, old) = identity();
+            ensure(&ring, &[(href("h_zzzzzzzb", "B", "b|"), old.clone())]);
+            assert_eq!(
+                ring.chain().unwrap().head().roster().members.len(),
+                MAX_MEMBERS
+            );
+            let (_, a) = identity();
+            let (_, new) = identity();
+            let mut batch = vec![
+                (href("h_zzzzzzza", "A", "a|"), a.clone()),
+                (href("h_zzzzzzzb", "B", "b|"), new.clone()),
+            ];
+            if flip {
+                batch.reverse();
+            }
+            let (c, mut out) = ensure(&ring, &batch);
+            out.sort();
+            assert_eq!(
+                out,
+                [
+                    ("h_zzzzzzza".to_string(), HostOutcome::Full),
+                    ("h_zzzzzzzb".to_string(), HostOutcome::Joined)
+                ],
+                "flip {flip}"
+            );
+            assert_eq!(c.head().roster().members.len(), MAX_MEMBERS);
+            assert!(has(&ring, &new) && !has(&ring, &old) && !has(&ring, &a));
+            ring.quit();
+        }
+    }
+
+    #[test]
+    fn a_batch_for_another_ring_changes_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let other = RingId::derive(&identity().1.sign_key);
+        let (_, a) = identity();
+        let sig = Store::new(t.path().join("ring")).signature();
+        let (c, out) = ring
+            .ensure_host_daemons(
+                &[(href("h_aaaaaaaa", "A", "a|"), a.clone())],
+                &all,
+                Some(&other),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, [("h_aaaaaaaa".to_string(), HostOutcome::RingChanged)]);
+        assert_eq!(c.head().version(), 1);
+        assert!(stored(&t).host_members.is_empty());
+        assert_eq!(Store::new(t.path().join("ring")).signature(), sig);
+        ring.quit();
+    }
+
+    #[test]
+    fn other_role_refused_for_that_host_only() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        // This Desktop's own key, reported by a Host: refused; the other Host is added.
+        let me = ring.view().members[0].sign_key;
+        let mut mine = identity().1;
+        mine.sign_key = me;
+        let (_, b) = identity();
+        let (c, out) = ensure(
+            &ring,
+            &[
+                (href("h_aaaaaaaa", "A", "a|"), mine),
+                (href("h_bbbbbbbb", "B", "b|"), b.clone()),
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                ("h_aaaaaaaa".to_string(), HostOutcome::OtherRole),
+                ("h_bbbbbbbb".to_string(), HostOutcome::Joined)
+            ]
+        );
+        assert_eq!(c.head().member(&me).unwrap().role, Role::Desktop);
+        assert!(has(&ring, &b));
+        assert!(!stored(&t).host_members.contains_key("h_aaaaaaaa"));
+        ring.quit();
+    }
+
+    #[test]
+    fn stale_identities_are_discarded_in_the_transaction() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let (_, b) = identity();
+        let (c, out) = ring
+            .ensure_host_daemons(
+                &[
+                    (href("h_aaaaaaaa", "A", "a|"), a.clone()),
+                    (href("h_bbbbbbbb", "B", "b|"), b.clone()),
+                ],
+                &|id| id != "h_aaaaaaaa",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(out.contains(&("h_aaaaaaaa".to_string(), HostOutcome::Stale)));
+        assert!(c.head().member(&a.sign_key).is_none());
+        assert!(c.head().member(&b.sign_key).is_some());
+        ring.quit();
+    }
+
+    #[test]
+    fn member_view_carries_host_id() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let (_, l) = identity();
+        ring.ensure_local_daemon(&l).unwrap();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a.clone())]);
+        let v = ring.view();
+        let of = |k: &SignKey| v.members.iter().find(|m| m.sign_key == *k).unwrap();
+        assert_eq!(of(&a.sign_key).host_id.as_deref(), Some("h_aaaaaaaa"));
+        assert_eq!(of(&l.sign_key).host_id, None);
+        assert!(of(&l.sign_key).this_computer);
+        let json = serde_json::to_value(of(&a.sign_key)).unwrap();
+        assert_eq!(json["hostId"], "h_aaaaaaaa");
+        ring.quit();
+    }
+
+    /// A Host added while a Relay move is still owed reaches the new Relay too.
+    #[test]
+    fn a_host_added_during_a_pending_move_reaches_the_new_relay() {
+        let (one, two) = (relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &one.url()));
+        let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
+        wait_view(&ring, "connected", connected);
+        one.refuse_roster_puts(true);
+        ring.set_relay_url(&two.url()).unwrap();
+        let (_, a) = identity();
+        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a)]);
+        assert_eq!(c.head().version(), 3);
+        assert!(ring.view().moving.is_some());
+        one.refuse_roster_puts(false);
+        let deadline = Instant::now() + WAIT;
+        while two.head_version(&rid) != Some(3) {
+            assert!(Instant::now() < deadline, "v3 on the new relay");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         ring.quit();
     }
 

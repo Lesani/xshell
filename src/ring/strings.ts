@@ -1,5 +1,5 @@
-// Every user-facing string of Settings → Mobile (#8): the binding copy table and the adopted
-// review copy, verbatim. `{param}` placeholders are filled by fmt().
+// Every user-facing string of Settings → Mobile (#8, #21): the binding copy tables and the
+// adopted review copy, verbatim. `{param}` placeholders are filled by fmt().
 
 export const S = {
   "settings.nav.mobile": "Mobile",
@@ -41,6 +41,11 @@ export const S = {
   "mobile.conn.otherWindow": "Another xshell window manages the connection to your devices.",
   "mobile.problem.recovered": "Couldn't read your mobile access settings. Saved the old file at {path}. Enable mobile access again, then pair your devices again.",
   "mobile.problem.unreadable": "Couldn't read your mobile access settings. Mobile access is unavailable: {error}",
+  "mobile.host.tooOld": "Update xshelld on {name} in Settings → Hosts to make it reachable from your phone.",
+  "mobile.host.otherRing": "{name} is paired with another set of devices. Pairing here will end their mobile access to it.",
+  "mobile.host.claim": "Pair with this desktop",
+  "mobile.host.full": "{name} can't join your devices. You've reached the limit of 64. Remove a device, then try again.",
+  "mobile.host.failed": "Couldn't pair {name}: {error}",
 } as const;
 
 export type StringKey = keyof typeof S;

@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { Smartphone } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canEnable, canSave, connectionLine, errorText, initialForm, localLine, moveLine, presenceChip, presenceKey, problemLine, roleKey, startsOver, targetUrl, urlError, type RelayForm } from "../ring/mobileSettings";
+import { canClaim, canEnable, canSave, connectionLine, errorText, hostLine, initialForm, localLine, moveLine, presenceChip, presenceKey, problemLine, roleKey, startsOver, targetUrl, urlError, type RelayForm } from "../ring/mobileSettings";
 import { useRing } from "../ring/useRing";
-import type { MemberView, RingStatus } from "../ring/types";
+import type { HostRingState, MemberView, RingStatus } from "../ring/types";
 
-// Settings → Mobile (#8): enable Mobile access (creates the Ring), choose its Relay, and see
-// the Ring's devices and how they stand.
+// Settings → Mobile (#8, #21): enable Mobile access (creates the Ring), choose its Relay, see
+// the Ring's devices and how they stand, and which Remote Hosts could not join.
 
 function MemberRow({ m, s }: { m: MemberView; s: RingStatus }) {
   const key = presenceKey(m, s);
@@ -23,6 +23,33 @@ function MemberRow({ m, s }: { m: MemberView; s: RingStatus }) {
         </div>
         <span className={`host-chip host-chip-${presenceChip(key)}`}><span className="host-chip-dot" />{fmt(key)}</span>
       </div>
+    </div>
+  );
+}
+
+function HostNote({ h, onClaim }: { h: HostRingState; onClaim: (host: string) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const claim = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onClaim(h.host);
+    } catch (e) {
+      setError(fmt("mobile.host.failed", { name: h.name, error: errorText(e) }));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className={`host-row-note ${h.state === "too-old" ? "" : "host-row-warn"}`}>
+      {hostLine(h)}
+      {canClaim(h) && (
+        <div className="host-row-actions">
+          <button className="btn settings-action-btn" disabled={busy} onClick={claim}>{fmt("mobile.host.claim")}</button>
+        </div>
+      )}
+      {error && <div className="host-form-error">{error}</div>}
     </div>
   );
 }
@@ -80,7 +107,7 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
   );
 }
 
-export function MobileSettingsView({ s, onEnable, onSaveRelay }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void> }) {
+export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void> }) {
   const [enabling, setEnabling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const enable = async () => {
@@ -121,6 +148,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay }: { s: RingStatus
             <div className="edit-field">
               <label className="edit-label">{fmt("mobile.members.title")}</label>
               {s.members.map(m => <MemberRow key={m.signKey} m={m} s={s} />)}
+              {s.hosts.map(h => <HostNote key={h.host} h={h} onClaim={onClaimHost} />)}
             </div>
           </>
         )}
@@ -131,7 +159,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay }: { s: RingStatus
 }
 
 export function MobileSettings() {
-  const { status, enable, setRelayUrl } = useRing();
+  const { status, enable, setRelayUrl, claimHost } = useRing();
   if (!status) return null;
-  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} />;
+  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} />;
 }

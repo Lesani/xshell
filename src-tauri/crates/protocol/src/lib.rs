@@ -30,6 +30,8 @@ pub const CAPABILITIES: &[&str] = &[
     "launch.prefix",
     "agent.status",
     "ring",
+    // `ring.join` takes `expect` (a conditional join).
+    "ring.cjoin",
 ];
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -62,6 +64,7 @@ mod tests {
     #[test]
     fn capabilities_include_ring() {
         assert!(CAPABILITIES.contains(&"ring"));
+        assert!(CAPABILITIES.contains(&"ring.cjoin"));
     }
 
     #[test]

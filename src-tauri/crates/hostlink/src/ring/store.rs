@@ -4,8 +4,12 @@
 //! ```json
 //! {"v":1,"signSeed":"b64u","noiseSeed":"b64u","rosters":["xro1…",…],
 //!  "localMember":"<signKey>"|null,
-//!  "pendingMove":{"source":"wss://old","from":N,"target":M}|null}
+//!  "pendingMove":{"source":"wss://old","from":N,"target":M}|null,
+//!  "hostMembers":{"<hostId>":{"signKey":"<signKey>","target":"…"},…}}
 //! ```
+//!
+//! `hostMembers` (the Remote Hosts' Daemons as last added to the Roster) is written only
+//! when not empty, so a Ring without Remote Hosts keeps the earlier shape.
 //!
 //! Every change is a transaction ([`Store::transact`]): an in-process mutex and an exclusive
 //! lock on `ring.lock` (so a second app instance waits), the state reloaded from disk, the
@@ -20,6 +24,7 @@
 //! that is a symlink or another user's is refused, and broader modes are tightened.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +43,20 @@ pub struct RingState {
     pub local_member: Option<SignKey>,
     /// A Relay move still owed to the old Relay (see `Connector`).
     pub pending_move: Option<MoveJob>,
+    /// Per configured Remote Host (by id): the sign key of its Daemon, as last added to the
+    /// Roster.
+    pub host_members: BTreeMap<String, HostMember>,
+}
+
+/// A Remote Host's Daemon in the Roster.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostMember {
+    pub sign_key: SignKey,
+    /// Where the Host was reached when its key was recorded (its SSH target and Daemon
+    /// command): a new key at the same place is a reinstall, at another place another
+    /// machine.
+    pub target: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -59,6 +78,8 @@ struct File {
     rosters: Vec<String>,
     local_member: Option<SignKey>,
     pending_move: Option<PendingFile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    host_members: BTreeMap<String, HostMember>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -253,14 +274,32 @@ impl Store {
                 from: j.from,
                 target: j.target,
             }),
+            host_members: s.host_members.clone(),
         };
-        // Serialized into a buffer sized up front (no reallocation copies the seeds) and wiped
-        // on drop.
-        let cap = 1024 + f.rosters.iter().map(|t| t.len() + 3).sum::<usize>();
-        let mut json = Zeroizing::new(Vec::with_capacity(cap));
-        serde_json::to_writer(&mut *json, &f).map_err(|e| e.to_string())?;
+        let json = encode(&f)?;
         write_private(&self.file(), &json).map_err(|e| e.to_string())
     }
+}
+
+/// An upper bound of `f`'s JSON: every free-form string counted as if each byte were
+/// escaped (`\u00XX`, 6 bytes); the tokens are base64url and dots, never escaped.
+fn capacity(f: &File) -> usize {
+    let esc = |s: &str| 6 * s.len() + 2;
+    // The keys, the seeds, `localMember`, the numbers and the punctuation.
+    1024 + f.rosters.iter().map(|t| t.len() + 3).sum::<usize>()
+        + f.pending_move.as_ref().map_or(0, |p| esc(&p.source))
+        + f.host_members
+            .iter()
+            .map(|(id, m)| esc(id) + esc(&m.target) + 96)
+            .sum::<usize>()
+}
+
+/// Serialized into a buffer sized up front (no reallocation leaves a copy of the seeds
+/// behind) and wiped on drop.
+fn encode(f: &File) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut json = Zeroizing::new(Vec::with_capacity(capacity(f)));
+    serde_json::to_writer(&mut *json, f).map_err(|e| e.to_string())?;
+    Ok(json)
 }
 
 fn parse(bytes: &[u8]) -> Result<RingState, String> {
@@ -279,6 +318,7 @@ fn parse(bytes: &[u8]) -> Result<RingState, String> {
             from: p.from,
             target: p.target,
         }),
+        host_members: f.host_members.clone(),
     })
 }
 
@@ -444,7 +484,137 @@ mod tests {
                 from: 1,
                 target: 2,
             }),
+            host_members: BTreeMap::new(),
         }
+    }
+
+    fn key() -> SignKey {
+        DeviceKeys::generate().unwrap().sign_key()
+    }
+
+    #[test]
+    fn old_file_without_host_members_parses() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let s = Store::new(dir.clone());
+        s.transact(|_, _| Ok((Some(state()), ()))).unwrap();
+        // #8's shape, exactly: no `hostMembers` key.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("ring.json")).unwrap()).unwrap();
+        let keys: Vec<_> = raw.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                "localMember",
+                "noiseSeed",
+                "pendingMove",
+                "rosters",
+                "signSeed",
+                "v"
+            ]
+        );
+        let got = s.load().unwrap().0.unwrap();
+        assert!(got.host_members.is_empty());
+    }
+
+    #[test]
+    fn empty_host_members_not_written() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let s = Store::new(dir.clone());
+        s.transact(|_, _| Ok((Some(state()), ()))).unwrap();
+        let text = fs::read_to_string(dir.join("ring.json")).unwrap();
+        assert!(!text.contains("hostMembers"), "{text}");
+    }
+
+    #[test]
+    fn host_members_round_trip() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let s = Store::new(dir.clone());
+        let mut st = state();
+        let (a, b) = (key(), key());
+        st.host_members.insert(
+            "h_aaaaaaaa".into(),
+            HostMember {
+                sign_key: a,
+                target: "dev|".into(),
+            },
+        );
+        st.host_members.insert(
+            "h_bbbbbbbb".into(),
+            HostMember {
+                sign_key: b,
+                target: "box|~/xd".into(),
+            },
+        );
+        s.transact(|_, _| Ok((Some(st.clone()), ()))).unwrap();
+        let text = fs::read_to_string(dir.join("ring.json")).unwrap();
+        assert!(
+            text.contains("\"hostMembers\":{\"h_aaaaaaaa\":{\"signKey\""),
+            "{text}"
+        );
+        let got = s.load().unwrap().0.unwrap();
+        assert_eq!(got.host_members, st.host_members);
+    }
+
+    /// The buffer holding the seeds is never reallocated (no copy left behind), whatever
+    /// the Hosts' ids and targets need escaped, at the Roster's limits.
+    #[test]
+    fn serialization_never_reallocates() {
+        use xshell_protocol::ring::roster::MAX_MEMBERS;
+        use xshell_protocol::ring::{Member, Role};
+        let mut st = state();
+        let keys = st.keys.clone();
+        let mut next = st.chain.head().clone();
+        for i in 0..MAX_MEMBERS - 1 {
+            let k = DeviceKeys::generate().unwrap();
+            let long = format!("{i}-{}", "\u{1}\"".repeat(20));
+            let name = xshell_protocol::ring::member_name(&long, "x");
+            next = next
+                .next(&*keys, 1, |d| {
+                    d.add(Member::new(
+                        &name,
+                        Role::Daemon,
+                        k.sign_key(),
+                        k.noise_key(),
+                        1,
+                    ))
+                })
+                .unwrap();
+            st.chain.accept(std::slice::from_ref(&next)).unwrap();
+            st.host_members.insert(
+                format!("h_{i:08}\u{1}\"\\"),
+                HostMember {
+                    sign_key: k.sign_key(),
+                    target: "\u{2}\"".repeat(40),
+                },
+            );
+        }
+        st.pending_move.as_mut().unwrap().source = "\u{3}".repeat(200);
+        let (sign, noise) = st.keys.seeds();
+        let f = File {
+            v: 1,
+            sign_seed: SecretSeed::new(&sign),
+            noise_seed: SecretSeed::new(&noise),
+            rosters: st
+                .chain
+                .versions()
+                .iter()
+                .map(|r| r.token().to_string())
+                .collect(),
+            local_member: Some(key()),
+            pending_move: st.pending_move.as_ref().map(|j| PendingFile {
+                source: j.source.clone(),
+                from: j.from,
+                target: j.target,
+            }),
+            host_members: st.host_members.clone(),
+        };
+        let cap = capacity(&f);
+        let json = encode(&f).unwrap();
+        assert_eq!(json.capacity(), cap, "reallocated");
+        assert!(json.len() <= cap);
     }
 
     #[test]

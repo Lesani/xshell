@@ -1,13 +1,18 @@
 //! The Desktop's side of the Ring (no Tauri): its keys and the Roster it signs, kept in one
 //! private file ([`store`]), and its Relay connection, through which Settings → Mobile shows
-//! the Ring's members ([`desktop::DesktopRing`]).
+//! the Ring's members ([`desktop::DesktopRing`]); and the worker that keeps every Host's
+//! Daemon in the Ring ([`sync`]).
 
 pub mod desktop;
 pub mod store;
+pub mod sync;
 
 pub use desktop::{
-    DesktopRing, DesktopRingConfig, LocalIdentity, MemberView, PresenceView, RingObserver, RingView,
+    DesktopRing, DesktopRingConfig, HostOutcome, HostRef, LocalIdentity, MemberView, PresenceView,
+    RingObserver, RingView,
 };
+pub use store::HostMember;
+pub use sync::{HostRingState, HostSync, SyncWorker};
 
 /// The Hosted Relay, preset when a Ring is created. A placeholder until the domain is
 /// confirmed before release.

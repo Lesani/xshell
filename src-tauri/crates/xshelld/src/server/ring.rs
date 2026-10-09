@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use xshell_protocol::msg::{JoinExpect, MEMBERSHIP_CHANGED};
 use xshell_protocol::ring::relay::{
     ByeReason, Connector, ConnectorConfig, ConnectorEvents, LinkState, RingClientConfig,
     RingTimeouts,
@@ -447,6 +448,7 @@ impl Ring {
             .joined
             .as_ref()
             .map(|j| j.connector.state());
+        // The membership a conditional join compares against (see `membership`).
         let ring = match (chain, state) {
             (Some(c), Some(s)) => {
                 let (state, error) = link_json(&s);
@@ -471,8 +473,10 @@ impl Ring {
         }))
     }
 
-    /// `ring.join`: trust `tokens` (a whole chain from version 1) and connect.
-    pub fn join(&self, tokens: &[String]) -> Result<Value, String> {
+    /// `ring.join`: trust `tokens` (a whole chain from version 1) and connect. With
+    /// `expect`, only while this Host's membership (as `ring.identity` reports it) is still
+    /// the expected one, checked under the same locks as the commit.
+    pub fn join(&self, tokens: &[String], expect: Option<&JoinExpect>) -> Result<Value, String> {
         let refused = |e: RosterError| format!("roster refused: {}", e.as_code());
         let chain = RosterChain::from_tokens(tokens).map_err(refused)?;
         let keys = self.keys(true)?.ok_or("no keys")?;
@@ -490,6 +494,11 @@ impl Ring {
             h();
         }
         let mut cur = self.persist.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(x) = expect {
+            if !expected(x, membership(cur.as_ref(), &life)) {
+                return Err(MEMBERSHIP_CHANGED.into());
+            }
+        }
         let same_ring = cur.as_ref().is_some_and(|c| c.ring_id() == chain.ring_id());
         let next = match cur.as_ref() {
             Some(c) if same_ring => {
@@ -536,6 +545,23 @@ impl Ring {
         for h in retiring {
             let _ = h.join();
         }
+    }
+}
+
+/// This Host's membership: the stored Ring and its head version, while a Connector runs for
+/// it. The same rule `ring.identity` reports `ring` by.
+fn membership(chain: Option<&RosterChain>, life: &Life) -> Option<(String, u64)> {
+    match (chain, &life.joined) {
+        (Some(c), Some(_)) => Some((c.ring_id().as_str().to_string(), c.head().version())),
+        _ => None,
+    }
+}
+
+fn expected(x: &JoinExpect, now: Option<(String, u64)>) -> bool {
+    match (&x.ring_id, now) {
+        (None, None) => true,
+        (Some(want), Some((id, version))) => *want == id && x.version.is_none_or(|v| v == version),
+        _ => false,
     }
 }
 
@@ -608,7 +634,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
         }));
         let r = ring.clone();
-        let joiner = std::thread::spawn(move || r.join(&tokens));
+        let joiner = std::thread::spawn(move || r.join(&tokens, None));
         wait_boundary.recv().unwrap();
         // Stop while the join sits between its check and its install.
         let r = ring.clone();
@@ -626,7 +652,7 @@ mod tests {
         // And a join after the drain is refused.
         *ring.install_hook.lock().unwrap() = None;
         let tokens = vec![g.token().to_string(), v2.token().to_string()];
-        assert_eq!(ring.join(&tokens).unwrap_err(), "xshelld is exiting");
+        assert_eq!(ring.join(&tokens, None).unwrap_err(), "xshelld is exiting");
     }
 
     #[test]

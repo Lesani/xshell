@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_protocol::msg::{ClientMsg, OpenSpec, TerminalInfo};
+use xshell_protocol::msg::{ClientMsg, JoinExpect, OpenSpec, TerminalInfo};
 
 /// Where one Tab's output goes.
 pub trait TermSink: Send + Sync {
@@ -40,6 +40,10 @@ const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAUNCH_CAPABILITY: &str = "term.relaunch";
 /// The hello capability of Daemons that serve `ring.identity` and `ring.join`.
 pub const RING_CAPABILITY: &str = "ring";
+/// `ring.join` takes `expect`: the Daemon refuses the join unless its membership is still
+/// the expected one.
+pub const RING_CJOIN_CAPABILITY: &str = "ring.cjoin";
+const RING_REFUSED: &str = "this Host's xshelld cannot join a ring; upgrade it first";
 /// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
 ///
 /// [`LaunchSpec`]: xshell_core::launch::LaunchSpec
@@ -320,6 +324,7 @@ impl Shared {
         st.atts.retain(|t, _| listed.contains(t));
         let left = self.reattach_locked(&mut st, gen, link);
         set(&mut st);
+        st.status.link_generation = gen;
         self.publish(&mut st);
         self.cv.notify_all();
         Some(left)
@@ -946,21 +951,29 @@ impl HostHandle {
         }
     }
 
-    /// A request sent only when the Daemon of the current link advertises `capability`;
-    /// refused with `refusal` without sending anything otherwise.
-    fn gated(&self, msg: ClientMsg, capability: &str, refusal: &str, w: Waiter) {
+    /// A request sent only when the Daemon of the current link advertises every one of
+    /// `capabilities`; refused with `refusal` without sending anything otherwise. With
+    /// `link_gen`, only on that link generation (the connection the caller saw): after a
+    /// reconnect it is refused as offline, unsent.
+    fn gated(
+        &self,
+        msg: ClientMsg,
+        capabilities: &[&str],
+        refusal: &str,
+        link_gen: Option<u64>,
+        w: Waiter,
+    ) {
         let once = Once::new(w);
         let sent = {
-            // The capability and the link are checked and used under one lock: `adopt`
-            // replaces both together.
+            // The capability, the generation and the link are checked and used under one
+            // lock: `adopt` replaces them together.
             let st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(l, _)| {
-                if !st
-                    .status
-                    .daemon_capabilities
-                    .iter()
-                    .any(|c| c == capability)
-                {
+            Shared::usable_link(&st).and_then(|(l, gen)| {
+                if link_gen.is_some_and(|g| g != gen) {
+                    return Err(HostError::offline(format!("{} reconnected", st.cfg.name)));
+                }
+                let has = |c: &&str| st.status.daemon_capabilities.iter().any(|x| x == c);
+                if !capabilities.iter().all(has) {
                     return Err(HostError::invalid(refusal));
                 }
                 let o = once.clone();
@@ -972,23 +985,39 @@ impl HostHandle {
         }
     }
 
-    /// `ring.identity`: the Host's Ring keys, name and membership. Refused without sending
-    /// anything when the Daemon does not advertise the `ring` capability.
-    pub fn ring_identity(&self, w: Waiter) {
+    /// `ring.identity`: the Host's Ring keys, name and membership, on link generation
+    /// `link_gen` only ([`HostStatus::link_generation`]). Refused without sending anything
+    /// when the Daemon does not advertise the `ring` capability.
+    pub fn ring_identity(&self, link_gen: u64, w: Waiter) {
         self.gated(
             ClientMsg::RingIdentity,
-            RING_CAPABILITY,
-            "this Host's xshelld cannot join a ring; upgrade it first",
+            &[RING_CAPABILITY],
+            RING_REFUSED,
+            Some(link_gen),
             w,
         );
     }
 
-    /// `ring.join` with the whole Roster chain. Refused like [`HostHandle::ring_identity`].
-    pub fn ring_join(&self, rosters: Vec<String>, w: Waiter) {
+    /// `ring.join` with the whole Roster chain, on link generation `link_gen` only. Refused
+    /// like [`HostHandle::ring_identity`]; with `expect` (a conditional join) also when the
+    /// Daemon does not advertise `ring.cjoin`, since an older one would ignore the condition.
+    pub fn ring_join(
+        &self,
+        rosters: Vec<String>,
+        expect: Option<JoinExpect>,
+        link_gen: u64,
+        w: Waiter,
+    ) {
+        let caps: &[&str] = if expect.is_some() {
+            &[RING_CAPABILITY, RING_CJOIN_CAPABILITY]
+        } else {
+            &[RING_CAPABILITY]
+        };
         self.gated(
-            ClientMsg::RingJoin { rosters },
-            RING_CAPABILITY,
-            "this Host's xshelld cannot join a ring; upgrade it first",
+            ClientMsg::RingJoin { rosters, expect },
+            caps,
+            RING_REFUSED,
+            Some(link_gen),
             w,
         );
     }
@@ -1842,17 +1871,75 @@ pub(crate) mod tests {
         let sh = shared();
         let mut peer = connect_capable(&sh, vec![], &["term", "ring"]);
         let h = handle(&sh);
+        let gen = h.status().link_generation;
+        assert_eq!(gen, h.link_generation());
         let (w, rx) = res_slot();
-        h.ring_join(vec!["xro1.a.b".into()], w);
+        h.ring_join(vec!["xro1.a.b".into()], None, gen, w);
         let m = peer.expect("ring.join");
         assert_eq!(m["rosters"], json!(["xro1.a.b"]));
+        assert!(m.get("expect").is_none());
         peer.reply(m["id"].as_u64().unwrap(), Ok(json!({"version": 1})));
         assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"version": 1})));
         let (w, rx) = res_slot();
-        h.ring_identity(w);
+        h.ring_identity(gen, w);
         let m = peer.expect("ring.identity");
         peer.reply(m["id"].as_u64().unwrap(), Ok(json!({"name": "x"})));
         assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"name": "x"})));
+    }
+
+    /// A conditional join needs `ring.cjoin`: an older Daemon would ignore the condition.
+    #[test]
+    fn conditional_ring_join_needs_cjoin() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let expect = || {
+            Some(JoinExpect {
+                ring_id: None,
+                version: None,
+            })
+        };
+        let mut peer = connect_capable(&sh, vec![], &["term", "ring"]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.ring_join(vec![], expect(), h.status().link_generation, w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
+        assert_nothing_sent(&h, &mut peer, t);
+        let mut peer = connect_capable(&sh, vec![], &["term", "ring", "ring.cjoin"]);
+        let (w, rx) = res_slot();
+        h.ring_join(vec![], expect(), h.status().link_generation, w);
+        let m = peer.expect("ring.join");
+        assert_eq!(m["expect"], json!({"ringId": null}));
+        peer.reply(m["id"].as_u64().unwrap(), Ok(json!({"version": 1})));
+        assert!(rx.recv_timeout(T5).unwrap().is_ok());
+    }
+
+    /// A request for the connection the caller saw is never sent on a newer one.
+    #[test]
+    fn ring_requests_are_fenced_to_their_link_generation() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let _old = connect_capable(&sh, vec![], &["term", "ring"]);
+        let h = handle(&sh);
+        let seen = h.status().link_generation;
+        // A reconnect between the caller's check and its dispatch.
+        let mut peer = connect_capable(&sh, vec![], &["term", "ring"]);
+        assert!(h.status().link_generation > seen);
+        let (w, rx) = res_slot();
+        h.ring_identity(seen, w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (w, rx) = res_slot();
+        h.ring_join(vec![], None, seen, w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        assert_nothing_sent(&h, &mut peer, t);
     }
 
     #[test]
@@ -1861,14 +1948,15 @@ pub(crate) mod tests {
         let t = Uuid::new_v4();
         let (mut peer, _link, _) = connect(&sh, vec![]);
         let h = handle(&sh);
+        let gen = h.status().link_generation;
         let (w, rx) = res_slot();
-        h.ring_join(vec![], w);
+        h.ring_join(vec![], None, gen, w);
         assert_eq!(
             rx.recv_timeout(T5).unwrap().unwrap_err().code,
             HostErrorCode::Invalid
         );
         let (w, rx) = res_slot();
-        h.ring_identity(w);
+        h.ring_identity(gen, w);
         assert_eq!(
             rx.recv_timeout(T5).unwrap().unwrap_err().code,
             HostErrorCode::Invalid
