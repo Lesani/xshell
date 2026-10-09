@@ -444,10 +444,23 @@ fn reconnects_after_relay_drops_it() {
     let ring = Ring::new(&r.url(), &id, RingRole::Daemon);
     join(&mut c, ring.tokens()).unwrap();
     wait_presence(&r, &ring, &id.sign, online);
-    for _ in 0..3 {
+    // The Desktop's view of the Relay's presence pushes: each drop and reconnect shows up
+    // as an event, however short the gap (sampling the record can miss it).
+    let (_desk, rec) = ring.desk_client(&r);
+    let count = |want: fn(&MemberPresence) -> bool| {
+        rec.events()
+            .iter()
+            .filter(|e| {
+                matches!(e, contract::Event::Presence { key, presence }
+                    if *key == id.sign && want(presence))
+            })
+            .count()
+    };
+    for n in 1..=3 {
         assert!(r.kick(ring.chain.ring_id(), &id.sign, 1011));
-        wait_presence(&r, &ring, &id.sign, |m| !online(m));
-        wait_presence(&r, &ring, &id.sign, online);
+        wait_until("dropped and back", || {
+            count(|m| matches!(m, MemberPresence::Unreachable { .. })) >= n && count(online) >= n
+        });
     }
     srv.shutdown();
 }
