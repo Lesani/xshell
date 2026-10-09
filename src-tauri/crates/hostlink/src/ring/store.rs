@@ -327,7 +327,9 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Creates `dir` (and parents) private: on Unix 0700, owned by this user, not a symlink.
+/// Creates `dir` (and parents) private: on Unix 0700, owned by this user, not a symlink; on
+/// Windows owned by this user with a protected user-only DACL, not a reparse point (see
+/// `xshell_core::private_fs`).
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -358,36 +360,53 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // TODO(#24): a user-only DACL (the SDDL helpers #24 brings); for now only the
-        // symlink check.
-        fs::create_dir_all(dir)?;
-        let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir() {
-            return Err(io::Error::other(format!(
-                "{} is not a directory (a symlink?); refusing it",
-                dir.display()
-            )));
-        }
-        Ok(())
+        xshell_core::private_fs::ensure_dir(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::create_dir_all(dir)
     }
 }
 
 pub(crate) fn open_lock(p: &Path) -> io::Result<fs::File> {
-    let mut o = fs::OpenOptions::new();
-    o.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        xshell_core::private_fs::open_or_create(p)
     }
-    o.open(p)
+    #[cfg(not(windows))]
+    {
+        let mut o = fs::OpenOptions::new();
+        o.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        o.open(p)
+    }
 }
 
 /// `path` read if it is a regular file of ours (not a symlink), a broader mode tightened.
 /// `None`: it does not exist.
 pub fn read_private(path: &Path) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    #[cfg(windows)]
+    {
+        let Some(f) = xshell_core::private_fs::open_read(path)? else {
+            return Ok(None);
+        };
+        let len = f.metadata()?.len() as usize;
+        let mut buf = Zeroizing::new(Vec::with_capacity(len + 1));
+        (&f).read_to_end(&mut buf)?;
+        Ok(Some(buf))
+    }
+    #[cfg(not(windows))]
+    read_private_unix(path)
+}
+
+#[cfg(not(windows))]
+fn read_private_unix(path: &Path) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -447,14 +466,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ));
     let tmp = PathBuf::from(name);
     let r = (|| {
-        let mut o = fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut f = o.open(&tmp)?;
+        #[cfg(windows)]
+        let mut f = xshell_core::private_fs::create_new(&tmp)?;
+        #[cfg(not(windows))]
+        let mut f = {
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            o.open(&tmp)?
+        };
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);

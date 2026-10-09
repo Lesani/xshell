@@ -6,15 +6,23 @@
 //!
 //! A Daemon that already runs for this user is used instead (ADR-0003) and never signalled by
 //! the Desktop, except by a switch or an upgrade the user confirmed.
+//!
+//! On Windows the Daemon listens on this user's named pipe, and only the GUI-bound mode
+//! exists (the setting is unsupported there). The Desktop creates a kill-on-close Job Object
+//! for its life and starts the Daemon with `--job`, so the Daemon and every Terminal end
+//! with the Desktop however it ends; at quit it sets the Daemon's stop event.
 
 use crate::cancel::CancelToken;
-use crate::dial::{connect_unix, DialError, Dialed, Dialer, CONNECT_TIMEOUT};
+use crate::dial::{connect_local, DialError, Dialed, Dialer, LocalStream, CONNECT_TIMEOUT};
 pub use crate::errors::SwitchError;
 use crate::handle::HostHandle;
 use crate::status::StatusKind;
 use std::ffi::OsString;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +51,12 @@ pub fn local_socket_path(home: &Path, xdg_runtime_dir: Option<&Path>) -> PathBuf
         Some(x) => x.join("xshell").join("daemon.sock"),
         None => home.join(".xshell").join("run").join("daemon.sock"),
     }
+}
+
+/// This user's Daemon pipe on Windows, as `xshelld`'s `paths::resolve` names it.
+#[cfg(windows)]
+pub fn local_pipe_name() -> io::Result<PathBuf> {
+    xshell_core::pipe::default_pipe_name()
 }
 
 /// The Daemon's log, as `xshelld`'s `paths::resolve` places it.
@@ -126,14 +140,20 @@ pub struct LocalDaemon {
     pub log: PathBuf,
     home: PathBuf,
     socket: PathBuf,
+    /// Where a Persistent Daemon is installed (Unix only).
+    #[cfg_attr(windows, allow(dead_code))]
     version: String,
     /// The mode new Daemons start in: the setting.
     persistent: AtomicBool,
     keeper: Mutex<mpsc::Sender<(Command, SpawnReply)>>,
     child: Mutex<Option<Spawned>>,
     quitting: AtomicBool,
+    /// Windows: the kill-on-close job every GUI-bound Daemon joins (`--job`), held for this
+    /// value's life: when the Desktop ends, the OS ends the Daemon and its Terminals.
+    #[cfg(windows)]
+    job: (xshell_core::job::Job, String),
     /// Test hook: runs in `stop_verified` between the verification and the signal.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     before_signal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -147,6 +167,15 @@ impl LocalDaemon {
                     let _ = reply.send(cmd.spawn());
                 }
             })?;
+        #[cfg(windows)]
+        let job = {
+            let name = format!(
+                r"Local\xshell-desktop-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            );
+            (xshell_core::job::Job::new_named(&name)?, name)
+        };
         Ok(Self {
             log: local_log_path(&cfg.home),
             bin: cfg.bin,
@@ -158,7 +187,9 @@ impl LocalDaemon {
             keeper: Mutex::new(tx),
             child: Mutex::new(None),
             quitting: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(windows)]
+            job,
+            #[cfg(all(test, unix))]
             before_signal: Mutex::new(None),
         })
     }
@@ -218,11 +249,20 @@ impl LocalDaemon {
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .current_dir("/")
-            // Its own process group: Ctrl+C in the terminal `tauri dev` runs in reaches the
-            // Desktop only, which then ends the Daemon in order.
-            .process_group(0);
+            .stderr(Stdio::null());
+        // Its own process group: Ctrl+C in the terminal `tauri dev` runs in reaches the
+        // Desktop only, which then ends the Daemon in order.
+        #[cfg(unix)]
+        cmd.current_dir("/").process_group(0);
+        #[cfg(windows)]
+        {
+            /// `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`.
+            const FLAGS: u32 = 0x0000_0200 | 0x0800_0000;
+            cmd.arg("--job")
+                .arg(&self.job.1)
+                .current_dir(&self.home)
+                .creation_flags(FLAGS);
+        }
         let (tx, rx) = mpsc::channel();
         self.keeper
             .lock()
@@ -235,6 +275,15 @@ impl LocalDaemon {
 
     /// Install this Desktop's `xshelld` under `~/.xshell/server/<version>` and start it there
     /// in a new session, its output to the Daemon log, as `xshelld connect` would.
+    #[cfg(windows)]
+    fn spawn_persistent(&self) -> io::Result<Child> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a Persistent Daemon is not available on Windows",
+        ))
+    }
+
+    #[cfg(unix)]
     fn spawn_persistent(&self) -> io::Result<Child> {
         let exe = crate::install::install_local(&self.bin, &self.home, &self.version)?;
         let log = open_log(&self.log)?;
@@ -305,7 +354,8 @@ impl LocalDaemon {
         self.running_child(Some(Kind::GuiBound))
     }
 
-    /// Quitting: SIGTERM a GUI-bound child (an orderly shutdown that ends its Terminals) and
+    /// Quitting: stop a GUI-bound child in order (SIGTERM; Windows: its stop event), which
+    /// ends its Terminals, and
     /// start no other. A Persistent child, even one still starting, is left running and only
     /// waited for; a Daemon we did not start is left alone.
     pub fn hang_up(&self) {
@@ -314,7 +364,7 @@ impl LocalDaemon {
         match slot.take() {
             Some(mut s) if s.kind == Kind::GuiBound => {
                 if matches!(s.child.try_wait(), Ok(None)) {
-                    unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
+                    request_stop(&mut s.child);
                 }
                 *slot = Some(s);
             }
@@ -354,7 +404,7 @@ impl LocalDaemon {
         };
         let mut child = s.child;
         if matches!(child.try_wait(), Ok(None)) {
-            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            request_stop(&mut child);
         }
         wait_or_kill(child, Instant::now() + within);
         true
@@ -362,7 +412,7 @@ impl LocalDaemon {
 
     /// Whether a Daemon answers on the socket.
     fn listening(&self) -> bool {
-        connect_unix(&self.socket, &CancelToken::new(), Duration::from_secs(2)).is_ok()
+        connect_local(&self.socket, &CancelToken::new(), Duration::from_secs(2)).is_ok()
     }
 
     /// SIGTERM the Persistent Daemon serving the socket, once its pidfile and the socket agree
@@ -373,9 +423,17 @@ impl LocalDaemon {
     /// The signal goes through a handle pinned to the verified process, so a Daemon that exits
     /// and is replaced in between is never signalled: a pidfd on Linux; on macOS a re-check of
     /// the socket's peer and the process start time just before `kill` (best effort).
+    #[cfg(windows)]
+    pub fn stop_verified(&self, _within: Duration) -> Result<(), SwitchError> {
+        Err(SwitchError::Failed(
+            "a Persistent Daemon is not available on Windows".into(),
+        ))
+    }
+
+    #[cfg(unix)]
     pub fn stop_verified(&self, within: Duration) -> Result<(), SwitchError> {
         let failed = |m: String| SwitchError::Failed(m);
-        let s = match connect_unix(&self.socket, &CancelToken::new(), Duration::from_secs(2)) {
+        let s = match connect_local(&self.socket, &CancelToken::new(), Duration::from_secs(2)) {
             Ok(s) => s,
             Err(e) if e.no_listener() => return Ok(()),
             Err(e) => return Err(failed(format!("{e:?}"))),
@@ -418,7 +476,7 @@ impl LocalDaemon {
         loop {
             let gone = pinned.exited()
                 || matches!(
-                    connect_unix(&self.socket, &CancelToken::new(), Duration::from_millis(500)),
+                    connect_local(&self.socket, &CancelToken::new(), Duration::from_millis(500)),
                     Err(e) if e.no_listener()
                 );
             if gone {
@@ -456,6 +514,11 @@ impl LocalDaemon {
         confirmed: usize,
         timeout: Duration,
     ) -> Result<(), SwitchError> {
+        if cfg!(windows) && persistent {
+            return Err(SwitchError::Failed(
+                "a Persistent Daemon is not available on Windows".into(),
+            ));
+        }
         let prev = self.persistent.swap(persistent, Ordering::SeqCst);
         let want = mode_name(persistent);
         if usable(host)
@@ -661,7 +724,22 @@ fn wait_or_kill(mut c: Child, deadline: Instant) {
     let _ = c.wait();
 }
 
+/// Ask a GUI-bound child to shut down in order: SIGTERM, on Windows its stop event. A child
+/// that has no stop event yet has started nothing, so it is killed.
+#[cfg(unix)]
+fn request_stop(child: &mut Child) {
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+}
+
+#[cfg(windows)]
+fn request_stop(child: &mut Child) {
+    if xshell_core::pipe::set_stop_event(child.id()).is_err() {
+        let _ = child.kill();
+    }
+}
+
 /// Open the Daemon log for appending (0600, its directory 0700), as `xshelld` does.
+#[cfg(unix)]
 fn open_log(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(dir) = path.parent() {
@@ -678,6 +756,7 @@ fn open_log(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// The pid of the process serving the other end of a Unix socket.
+#[cfg(unix)]
 fn peer_pid(s: &std::os::unix::net::UnixStream) -> io::Result<i32> {
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
@@ -725,6 +804,7 @@ fn peer_pid(s: &std::os::unix::net::UnixStream) -> io::Result<i32> {
 }
 
 /// A process, pinned so a signal never reaches another one that later got its pid.
+#[cfg(unix)]
 struct Pinned {
     pid: i32,
     #[cfg(target_os = "linux")]
@@ -733,6 +813,7 @@ struct Pinned {
     start: Option<(u64, u64)>,
 }
 
+#[cfg(unix)]
 impl Pinned {
     /// The server at the other end of `s`, while `s` is still connected.
     fn peer(s: &std::os::unix::net::UnixStream) -> io::Result<Pinned> {
@@ -810,7 +891,7 @@ impl Pinned {
         {
             // Best effort: the socket's server and the process start time must be unchanged
             // right before the kill.
-            let still = connect_unix(socket, &CancelToken::new(), Duration::from_secs(2))
+            let still = connect_local(socket, &CancelToken::new(), Duration::from_secs(2))
                 .ok()
                 .and_then(|s| peer_pid(&s).ok())
                 == Some(self.pid);
@@ -872,12 +953,8 @@ pub struct LocalDialer {
 }
 
 impl LocalDialer {
-    fn connected(
-        &self,
-        s: std::os::unix::net::UnixStream,
-        cancel: &CancelToken,
-    ) -> Result<Dialed, DialError> {
-        Dialed::from_unix_stream(s, cancel).map_err(|e| {
+    fn connected(&self, s: LocalStream, cancel: &CancelToken) -> Result<Dialed, DialError> {
+        Dialed::from_local_stream(s, cancel).map_err(|e| {
             DialError::failed(
                 format!("cannot connect to {}: {e}", self.daemon.socket.display()),
                 None,
@@ -893,7 +970,7 @@ impl LocalDialer {
 impl Dialer for LocalDialer {
     fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError> {
         let socket = &self.daemon.socket;
-        match connect_unix(socket, cancel, CONNECT_TIMEOUT) {
+        match connect_local(socket, cancel, CONNECT_TIMEOUT) {
             Ok(s) => return self.connected(s, cancel),
             Err(e) if e.no_listener() => {}
             Err(e) => return Err(e),
@@ -910,7 +987,7 @@ impl Dialer for LocalDialer {
             }
             delay = (delay * 2).min(Duration::from_millis(200));
             let left = deadline.saturating_duration_since(Instant::now());
-            match connect_unix(socket, cancel, left.max(Duration::from_millis(1))) {
+            match connect_local(socket, cancel, left.max(Duration::from_millis(1))) {
                 Ok(s) => {
                     self.daemon.listening_now();
                     return self.connected(s, cancel);
@@ -960,7 +1037,7 @@ impl Dialer for LocalDialer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

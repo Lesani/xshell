@@ -365,6 +365,18 @@ impl AgentHooks {
         )
     }
 
+    /// The same for a `cmd /K` wrapper: arguments chained after the agent's with `&`, so cmd
+    /// runs the report once the agent exits.
+    pub fn ended_args_cmd(&self) -> Vec<String> {
+        vec![
+            "&".into(),
+            self.exe.to_string_lossy().into_owned(),
+            "event".into(),
+            "-".into(),
+            AgentStatus::Ended.as_str().into(),
+        ]
+    }
+
     /// The same for a PowerShell wrapper.
     pub fn ended_command_powershell(&self) -> String {
         format!(
@@ -479,7 +491,7 @@ fn plan_event(
 
 /// How long the hook client may take in all, connecting included. A hook must never hold
 /// the agent up for long: Claude Code waits for it.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Send one `term.event` and wait for its `res`, all within [`CLIENT_TIMEOUT`].
@@ -690,7 +702,68 @@ mod deadline_io {
     }
 }
 
-#[cfg(not(unix))]
+/// Send one `term.event` and wait for its `res`, all within [`CLIENT_TIMEOUT`]: over the
+/// Daemon's named pipe, every read and write waiting only for the time left.
+#[cfg(windows)]
+pub fn send_event(
+    socket: &Path,
+    terminal: Uuid,
+    run: u64,
+    status: AgentStatus,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + CLIENT_TIMEOUT;
+    let s = crate::pipe::connect(socket, deadline, &|| false)
+        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    exchange(
+        &mut PipeDeadline { s, deadline },
+        terminal,
+        run,
+        status,
+        Some(deadline),
+    )
+}
+
+/// A pipe bound by an absolute deadline: each operation waits only for the time left.
+#[cfg(windows)]
+struct PipeDeadline {
+    s: crate::pipe::PipeStream,
+    deadline: std::time::Instant,
+}
+
+#[cfg(windows)]
+impl PipeDeadline {
+    fn left(&self) -> io::Result<std::time::Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        Ok(left)
+    }
+}
+
+#[cfg(windows)]
+impl Read for PipeDeadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.s.read_within(buf, Some(left))
+    }
+}
+
+#[cfg(windows)]
+impl Write for PipeDeadline {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.s.write_within(buf, Some(left))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn send_event(socket: &Path, _: Uuid, _: u64, _: AgentStatus) -> Result<(), String> {
     Err(format!(
         "no event socket on this platform ({})",
@@ -700,7 +773,7 @@ pub fn send_event(socket: &Path, _: Uuid, _: u64, _: AgentStatus) -> Result<(), 
 
 /// The client side of one event connection: hello, `term.event` with id 1, then frames
 /// until its `res`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn exchange(
     s: &mut (impl Read + Write),
     terminal: Uuid,
@@ -1412,6 +1485,141 @@ mod tests {
         assert_eq!(
             *got.lock().unwrap(),
             vec![(known, 4, NeedsYou), (other, 1, Working)]
+        );
+    }
+
+    // ── The hook client over a named pipe (Windows) ──
+
+    #[cfg(windows)]
+    fn unique_pipe() -> PathBuf {
+        PathBuf::from(format!(r"\\.\pipe\xshell-test-{}", Uuid::new_v4().simple()))
+    }
+
+    #[cfg(windows)]
+    fn event_over(pipe: &Path) -> std::time::Duration {
+        let id = Uuid::new_v4();
+        let t = std::time::Instant::now();
+        let a = args(&[
+            "--socket",
+            &pipe.to_string_lossy(),
+            &id.to_string(),
+            "working",
+        ]);
+        assert_eq!(event_main(&a, &envmap(&[]), None), 0);
+        t.elapsed()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn send_event_over_pipe() {
+        use std::sync::{Arc, Mutex};
+        let pipe = unique_pipe();
+        let l = crate::pipe::PipeListener::bind(&pipe).unwrap();
+        let got: Arc<Mutex<Vec<(Uuid, u64, AgentStatus)>>> = Arc::default();
+        let g = got.clone();
+        let known = Uuid::new_v4();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let s = l.accept().unwrap();
+                let g = g.clone();
+                serve_event_conn(s, "1.0", move |t, run, st| {
+                    g.lock().unwrap().push((t, run, st));
+                    if t == known {
+                        Ok(())
+                    } else {
+                        Err("unknown terminal".into())
+                    }
+                });
+            }
+        });
+        assert_eq!(send_event(&pipe, known, 4, NeedsYou), Ok(()));
+        let other = Uuid::new_v4();
+        assert_eq!(
+            send_event(&pipe, other, 1, Working),
+            Err("unknown terminal".into())
+        );
+        server.join().unwrap();
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![(known, 4, NeedsYou), (other, 1, Working)]
+        );
+        // Nobody serves the name any more: the client gives up at once, exit 0.
+        let t = std::time::Instant::now();
+        assert_eq!(
+            event_main(
+                &args(&[
+                    "--socket",
+                    &pipe.to_string_lossy(),
+                    &known.to_string(),
+                    "working"
+                ]),
+                &envmap(&[]),
+                None
+            ),
+            0
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A server that accepts and never answers: the first frame never completes.
+    #[cfg(windows)]
+    #[test]
+    fn event_client_deadline_covers_a_mute_pipe() {
+        let pipe = unique_pipe();
+        let l = crate::pipe::PipeListener::bind(&pipe).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let s = l.accept().unwrap();
+            let _ = rx.recv();
+            drop(s);
+        });
+        let took = event_over(&pipe);
+        let _ = tx.send(());
+        assert!(
+            took >= CLIENT_TIMEOUT - std::time::Duration::from_millis(100),
+            "{took:?}"
+        );
+        assert!(
+            took < CLIENT_TIMEOUT + std::time::Duration::from_millis(500),
+            "{took:?}"
+        );
+    }
+
+    /// A peer that answers hello and then trickles other frames, never the `res`.
+    #[cfg(windows)]
+    #[test]
+    fn event_client_deadline_covers_a_trickling_pipe() {
+        use xshell_protocol::msg::ServerMsg;
+        let pipe = unique_pipe();
+        let l = crate::pipe::PipeListener::bind(&pipe).unwrap();
+        std::thread::spawn(move || {
+            let Ok(mut s) = l.accept() else { return };
+            let hello = ServerMsg::Hello(Hello {
+                protocol: PROTOCOL,
+                version: "x".into(),
+                capabilities: vec![],
+            });
+            if s.write_all(&encode_msg(&hello, None).unwrap()).is_err() {
+                return;
+            }
+            let frame = encode_msg(&ServerMsg::Terminals { list: vec![] }, None).unwrap();
+            loop {
+                for b in &frame {
+                    if s.write_all(&[*b]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+        let took = event_over(&pipe);
+        assert!(
+            took >= CLIENT_TIMEOUT - std::time::Duration::from_millis(100),
+            "{took:?}"
+        );
+        assert!(
+            took < CLIENT_TIMEOUT + std::time::Duration::from_millis(500),
+            "{took:?}"
         );
     }
 }

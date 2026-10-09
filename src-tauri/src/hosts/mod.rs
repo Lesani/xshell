@@ -11,11 +11,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager as _};
-#[cfg(unix)]
-use xshell_hostlink::LOCAL_HOST_ID;
 use xshell_hostlink::{
     HostConfig, HostStatus, Manager, ManagerConfig, Observer, SshTransport, TermSink, Transport,
-    TransportFactory,
+    TransportFactory, LOCAL_HOST_ID,
 };
 use xshell_protocol::msg::TerminalInfo;
 
@@ -24,7 +22,6 @@ pub struct Hosts {
     /// How local Tabs run, as resolved at startup.
     pub local_mode: local::LocalMode,
     /// The Daemon this app may start for the Local Host (Daemon mode only).
-    #[cfg(unix)]
     pub local_daemon: Option<Arc<xshell_hostlink::LocalDaemon>>,
     /// `settings.json`, for the Persistent Daemon setting.
     pub store: Option<Arc<dyn local::SettingStore>>,
@@ -69,10 +66,8 @@ impl Hosts {
                 None
             }
         };
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut local_mode =
             local::resolve_daemon_binary(exe_dir.as_deref(), &|k| std::env::var_os(k));
-        #[cfg(unix)]
         let local_daemon = match &local_mode {
             local::LocalMode::Daemon { bin } => match local_daemon(bin.clone(), &version) {
                 Ok(d) => Some(d),
@@ -84,7 +79,6 @@ impl Hosts {
             local::LocalMode::InProcess { .. } => None,
         };
         // Before the Local Host starts dialing: the first Daemon starts in the stored mode.
-        #[cfg(unix)]
         if let Some(d) = &local_daemon {
             let on = local::persistent_supported(&local_mode, linux_or_macos())
                 && local::read_persistent(store.as_deref());
@@ -103,7 +97,6 @@ impl Hosts {
             .app_cache_dir()
             .unwrap_or_else(|_| std::env::temp_dir().join("xshell-cache"));
         let factory = SshFactory {
-            #[cfg(unix)]
             local: local_daemon.clone(),
         };
         let cfg = ManagerConfig::new(
@@ -113,7 +106,6 @@ impl Hosts {
             Arc::new(TauriObserver(app.clone())),
         );
         let manager = Arc::new(Manager::new(cfg));
-        #[cfg(unix)]
         if local_daemon.is_some() {
             manager.set_local(HostConfig {
                 id: LOCAL_HOST_ID.into(),
@@ -127,7 +119,6 @@ impl Hosts {
         Self {
             manager,
             local_mode,
-            #[cfg(unix)]
             local_daemon,
             store,
             switch_lock: tokio::sync::Mutex::new(()),
@@ -137,7 +128,6 @@ impl Hosts {
     /// What `local_host_info` answers.
     pub fn local_info(&self) -> local::LocalHostInfo {
         let supported = local::persistent_supported(&self.local_mode, linux_or_macos());
-        #[cfg(unix)]
         let p = match (&self.local_daemon, supported) {
             (Some(d), true) => {
                 let usable = self.manager.host(LOCAL_HOST_ID).is_some_and(|h| {
@@ -156,11 +146,6 @@ impl Hosts {
             }
             _ => local::PersistentInfo::default(),
         };
-        #[cfg(not(unix))]
-        let p = {
-            let _ = supported;
-            local::PersistentInfo::default()
-        };
         self.local_mode.info(p)
     }
 
@@ -169,30 +154,32 @@ impl Hosts {
     /// within about 8 s) before killing it. A Persistent Daemon, and a Daemon this app did
     /// not start, are left alone.
     pub fn quit(&self) {
-        #[cfg(unix)]
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        #[cfg(unix)]
         if let Some(d) = &self.local_daemon {
             d.hang_up();
         }
         // Kill every ssh; Remote Daemons and their Terminals keep running.
         self.manager.shutdown();
-        #[cfg(unix)]
         if let Some(d) = &self.local_daemon {
             d.reap(deadline);
         }
     }
 }
 
-/// The Local Host's Daemon, reached on this user's Daemon socket.
-#[cfg(unix)]
+/// The Local Host's Daemon, reached on this user's Daemon socket (Windows: named pipe).
 fn local_daemon(
     bin: std::path::PathBuf,
     version: &str,
 ) -> Result<Arc<xshell_hostlink::LocalDaemon>, String> {
     let home = dirs::home_dir().ok_or("the home directory is unknown")?;
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-    let socket = xshell_hostlink::local::local_socket_path(&home, xdg.as_deref());
+    #[cfg(unix)]
+    let socket = {
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        xshell_hostlink::local::local_socket_path(&home, xdg.as_deref())
+    };
+    #[cfg(windows)]
+    let socket = xshell_hostlink::local::local_pipe_name()
+        .map_err(|e| format!("cannot name this user's Daemon pipe: {e}"))?;
     xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
         bin,
         env: vec![],
@@ -201,7 +188,7 @@ fn local_daemon(
         version: version.into(),
     })
     .map(Arc::new)
-    .map_err(|e| format!("cannot start the keeper thread: {e}"))
+    .map_err(|e| format!("cannot set up the Local Host's Daemon: {e}"))
 }
 
 #[derive(Serialize, Clone)]
@@ -252,7 +239,6 @@ impl TermSink for ChannelSink {
 }
 
 struct SshFactory {
-    #[cfg(unix)]
     local: Option<Arc<xshell_hostlink::LocalDaemon>>,
 }
 
@@ -261,8 +247,7 @@ impl TransportFactory for SshFactory {
         Box::new(SshTransport::new(cfg.ssh_target.clone()))
     }
 
-    /// The Local Host: this user's Daemon socket, starting its Daemon if need be.
-    #[cfg(unix)]
+    /// The Local Host: this user's Daemon socket (pipe), starting its Daemon if need be.
     fn direct(&self, cfg: &HostConfig) -> Option<Box<dyn xshell_hostlink::Dialer>> {
         if cfg.id != LOCAL_HOST_ID {
             return None;

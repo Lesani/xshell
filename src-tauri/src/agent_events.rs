@@ -1,7 +1,8 @@
 //! The Desktop's agent event socket: Local Host Terminals run in this process, so their
 //! agents' hooks report here, through the Desktop executable itself (`xshell event …`, see
-//! `run_cli`). Unix only: on Windows, Local Host Terminals get their Agent Status once they
-//! move to the GUI-bound Daemon (xshell#24), and launch without hooks until then.
+//! `run_cli`). Unix only: on Windows, Local Host Terminals report through the GUI-bound
+//! Daemon's pipe (xshell#24); Tabs that run in this process there (no bundled Daemon)
+//! launch without hooks.
 
 use crate::local_pty::LocalPtys;
 use std::fs;

@@ -58,7 +58,6 @@ pub fn local_host_info(state: State<'_, Hosts>) -> super::local::LocalHostInfo {
 }
 
 /// How long a switch may take for its Daemon to come up before it is undone.
-#[cfg(unix)]
 const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Turn the Persistent Daemon setting on or off: the local Terminals move to a Daemon of the
@@ -72,44 +71,35 @@ pub async fn local_daemon_set_persistent(
     enabled: bool,
     confirmed: u32,
 ) -> Result<super::local::LocalHostInfo, String> {
+    use super::local::{apply_switch, persistent_supported};
     let _one = state.switch_lock.lock().await;
-    #[cfg(unix)]
-    {
-        use super::local::{apply_switch, persistent_supported};
-        let supported = persistent_supported(&state.local_mode, super::linux_or_macos());
-        let (Some(d), Some(store), true) =
-            (state.local_daemon.clone(), state.store.clone(), supported)
-        else {
-            return Err("unsupported".into());
-        };
-        let host = state
-            .manager
-            .host(xshell_hostlink::LOCAL_HOST_ID)
-            .ok_or("unsupported")?;
-        let r = tauri::async_runtime::spawn_blocking(move || {
-            let mut first = true;
-            apply_switch(&*store, enabled, |target| {
-                // A reconciliation after a failed save restarts what the user already agreed
-                // to restart.
-                let n = if first {
-                    confirmed as usize
-                } else {
-                    usize::MAX
-                };
-                first = false;
-                let r = d.switch(&host, target, n, SWITCH_TIMEOUT);
-                (r, d.persistent())
-            })
+    let supported = persistent_supported(&state.local_mode, super::linux_or_macos());
+    let (Some(d), Some(store), true) = (state.local_daemon.clone(), state.store.clone(), supported)
+    else {
+        return Err("unsupported".into());
+    };
+    let host = state
+        .manager
+        .host(xshell_hostlink::LOCAL_HOST_ID)
+        .ok_or("unsupported")?;
+    let r = tauri::async_runtime::spawn_blocking(move || {
+        let mut first = true;
+        apply_switch(&*store, enabled, |target| {
+            // A reconciliation after a failed save restarts what the user already agreed
+            // to restart.
+            let n = if first {
+                confirmed as usize
+            } else {
+                usize::MAX
+            };
+            first = false;
+            let r = d.switch(&host, target, n, SWITCH_TIMEOUT);
+            (r, d.persistent())
         })
-        .await
-        .map_err(|e| format!("failed:{e}"))?;
-        r.map(|_| state.local_info())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (enabled, confirmed);
-        Err("unsupported".into())
-    }
+    })
+    .await
+    .map_err(|e| format!("failed:{e}"))?;
+    r.map(|_| state.local_info())
 }
 
 #[tauri::command]

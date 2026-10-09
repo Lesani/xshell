@@ -209,14 +209,14 @@ impl LocalPtys {
     }
 
     /// Launch agents with status hooks from now on. Only the first call counts.
-    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    // Unused on Windows: in-process Tabs there have no event socket (their Daemon's do).
     #[cfg_attr(windows, allow(dead_code))]
     pub fn set_hooks(&self, hooks: AgentHooks) {
         let _ = self.hooks.set(hooks);
     }
 
     /// Where Agent Status changes go. Only the first call counts.
-    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    // Unused on Windows: in-process Tabs there have no event socket (their Daemon's do).
     #[cfg_attr(windows, allow(dead_code))]
     pub fn set_observer(&self, observer: Observer) {
         let _ = self.agent_out.observer.set(observer);
@@ -232,7 +232,7 @@ impl LocalPtys {
     }
 
     /// A hook's report: `token` names the Terminal, `run` its process.
-    // Unused on Windows until its Local Host Terminals report (xshell#24).
+    // Unused on Windows: in-process Tabs there have no event socket (their Daemon's do).
     #[cfg_attr(windows, allow(dead_code))]
     pub fn on_agent_event(&self, token: Uuid, run: u64, status: AgentStatus) -> Result<(), String> {
         let t = self

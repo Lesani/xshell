@@ -1,7 +1,8 @@
 //! How the supervisor reaches a Daemon: a [`Dialer`] yields a byte stream ([`LinkIo`]) and
 //! the [`Connection`] behind it. A Remote Host runs `xshelld connect` through its transport
 //! ([`CommandDialer`]); a Daemon on this machine is reached directly over its local socket
-//! ([`UnixSocketDialer`]). A Windows named-pipe dialer implements the same trait.
+//! ([`UnixSocketDialer`]), on Windows over its named pipe ([`NamedPipeDialer`]).
+//! [`connect_local`] and [`LocalStream`] name whichever this platform uses.
 
 use crate::cancel::CancelToken;
 use crate::errors::{classify_ssh_failure, HostErrorHint};
@@ -155,6 +156,157 @@ impl Connection for Proc {
 pub(crate) use unix::{connect_nb, Pending};
 #[cfg(unix)]
 pub use unix::{connect_unix, UnixSocketDialer, CONNECT_TIMEOUT};
+#[cfg(windows)]
+pub use win::{connect_pipe, NamedPipeDialer, CONNECT_TIMEOUT};
+
+/// The stream to a Daemon on this machine: a Unix socket, or a named pipe on Windows.
+#[cfg(unix)]
+pub type LocalStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub type LocalStream = xshell_core::pipe::PipeStream;
+
+/// Connect to the Daemon endpoint `path` on this machine (see [`connect_unix`] and
+/// `connect_pipe`): bounded by `timeout`, prompt on `cancel`. A missing Daemon fails with
+/// [`DialError::no_listener`].
+#[cfg(unix)]
+pub fn connect_local(
+    path: &std::path::Path,
+    cancel: &CancelToken,
+    timeout: Duration,
+) -> Result<LocalStream, DialError> {
+    connect_unix(path, cancel, timeout)
+}
+
+#[cfg(windows)]
+pub fn connect_local(
+    path: &std::path::Path,
+    cancel: &CancelToken,
+    timeout: Duration,
+) -> Result<LocalStream, DialError> {
+    connect_pipe(path, cancel, timeout)
+}
+
+impl Dialed {
+    /// A connected local stream as a link stream, shut down when `cancel` fires, when the
+    /// connection ends, and when it is dropped.
+    pub fn from_local_stream(s: LocalStream, cancel: &CancelToken) -> std::io::Result<Dialed> {
+        #[cfg(unix)]
+        {
+            Dialed::from_unix_stream(s, cancel)
+        }
+        #[cfg(windows)]
+        {
+            Dialed::from_pipe_stream(s, cancel)
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use crate::cancel::CancelHook;
+    use std::io;
+    use std::net::Shutdown;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+    use xshell_core::pipe::PipeStream;
+
+    /// A pipe that exists answers at once; this only bounds every instance being busy.
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// A Daemon's named pipe on this machine (`\\.\pipe\xshelld-<SID>`).
+    pub struct NamedPipeDialer {
+        pub name: PathBuf,
+    }
+
+    impl Dialer for NamedPipeDialer {
+        fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError> {
+            let stream = connect_pipe(&self.name, cancel, CONNECT_TIMEOUT)?;
+            Dialed::from_pipe_stream(stream, cancel).map_err(|e| failed(&self.name, e))
+        }
+
+        fn describe(&self) -> String {
+            self.name.display().to_string()
+        }
+    }
+
+    fn failed(name: &Path, e: io::Error) -> DialError {
+        DialError::Failed {
+            message: format!("cannot connect to {}: {e}", name.display()),
+            hint: None,
+            kind: Some(e.kind()),
+        }
+    }
+
+    /// Connect to the pipe `name`, never blocking past `timeout` or a cancel: while every
+    /// instance is busy it waits in short steps, re-checking the token. The pipe must be
+    /// owned by this user.
+    pub fn connect_pipe(
+        name: &Path,
+        cancel: &CancelToken,
+        timeout: Duration,
+    ) -> Result<PipeStream, DialError> {
+        let deadline = Instant::now() + timeout;
+        match xshell_core::pipe::connect(name, deadline, &|| cancel.is_cancelled()) {
+            Ok(s) => Ok(s),
+            Err(_) if cancel.is_cancelled() => Err(DialError::Cancelled),
+            Err(e) => Err(failed(name, e)),
+        }
+    }
+
+    /// A pipe has no process to kill: shutting it down ends the link's reader and writer.
+    struct PipeConn {
+        stream: PipeStream,
+        _hook: CancelHook,
+    }
+
+    impl Connection for PipeConn {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn end(&self) {
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
+
+        fn diagnose(&self, link_message: String) -> Diagnosis {
+            Diagnosis {
+                message: link_message,
+                hint: None,
+                reinstall: false,
+            }
+        }
+    }
+
+    impl Drop for PipeConn {
+        fn drop(&mut self) {
+            self.end();
+        }
+    }
+
+    impl Dialed {
+        /// A connected pipe as a link stream, shut down when `cancel` fires (at once when it
+        /// already has), when the connection ends, and when it is dropped.
+        pub fn from_pipe_stream(stream: PipeStream, cancel: &CancelToken) -> io::Result<Dialed> {
+            let read = stream.try_clone()?;
+            let write = stream.try_clone()?;
+            let on_cancel = stream.try_clone()?;
+            let hook = cancel.on_cancel(move || {
+                let _ = on_cancel.shutdown(Shutdown::Both);
+            });
+            Ok(Dialed {
+                io: LinkIo {
+                    read: Box::new(read),
+                    write: Box::new(write),
+                },
+                conn: Box::new(PipeConn {
+                    stream,
+                    _hook: hook,
+                }),
+            })
+        }
+    }
+}
 
 #[cfg(unix)]
 mod unix {
@@ -587,5 +739,130 @@ mod tests {
         assert_eq!(cancelled, Some(true));
         assert!(start.elapsed() < Duration::from_secs(1));
         drop(l);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use crate::link::testpeer::{hello_frame, terminals_frame, Ev, Rec};
+    use crate::link::Link;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+    use xshell_core::pipe::{PipeListener, PipeStream};
+    use xshell_protocol::msg::ProtocolRange;
+
+    const R11: ProtocolRange = ProtocolRange { min: 1, max: 1 };
+    const T5: Duration = Duration::from_secs(5);
+
+    fn unique() -> PathBuf {
+        PathBuf::from(format!(
+            r"\\.\pipe\xshell-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Accepts once and greets like a Daemon; hands the server side back.
+    fn greeter(name: &Path) -> std::thread::JoinHandle<PipeStream> {
+        let l = PipeListener::bind(name).unwrap();
+        std::thread::spawn(move || {
+            let mut s = l.accept().unwrap();
+            let mut b = hello_frame(1, 1, "1.5.0");
+            b.extend(terminals_frame(vec![]));
+            s.write_all(&b).unwrap();
+            s
+        })
+    }
+
+    fn dial(name: &Path, cancel: &CancelToken) -> Dialed {
+        NamedPipeDialer { name: name.into() }
+            .dial(cancel)
+            .unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    /// Read until end of file (bounded), skipping what the Desktop sent.
+    fn reads_eof(s: &PipeStream, within: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + within;
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            match s.read_within(&mut buf, Some(Duration::from_millis(50))) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(format!("no EOF within {within:?}"))
+    }
+
+    #[test]
+    fn pipe_dial_establishes_link() {
+        let name = unique();
+        let peer = greeter(&name);
+        let d = dial(&name, &CancelToken::new());
+        assert_eq!(d.conn.pid(), None);
+        let rec = Rec::new();
+        let (link, hello, _) = Link::establish(d.io, R11, "1.5.0", rec.clone(), T5).unwrap();
+        assert_eq!(hello.version, "1.5.0");
+        link.close();
+        drop(peer.join().unwrap());
+    }
+
+    #[test]
+    fn pipe_dial_missing_is_no_listener() {
+        let name = unique();
+        match (NamedPipeDialer { name: name.clone() }).dial(&CancelToken::new()) {
+            Err(e) => {
+                assert!(e.no_listener(), "{e:?}");
+                let DialError::Failed { message, .. } = e else {
+                    unreachable!()
+                };
+                assert!(message.contains(&name.display().to_string()), "{message}");
+            }
+            Ok(_) => panic!("connected to nothing"),
+        }
+    }
+
+    #[test]
+    fn pipe_cancel_shuts_stream() {
+        let name = unique();
+        let peer = greeter(&name);
+        let cancel = CancelToken::new();
+        let d = dial(&name, &cancel);
+        let rec = Rec::new();
+        let (_link, _, _) = Link::establish(d.io, R11, "1.5.0", rec.clone(), T5).unwrap();
+        let _server = peer.join().unwrap();
+        let start = Instant::now();
+        cancel.cancel();
+        rec.wait_for(|e| e.iter().any(|e| matches!(e, Ev::Closed(_))));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(d.conn);
+    }
+
+    #[test]
+    fn pipe_end_and_drop_shut_stream() {
+        let name = unique();
+        let peer = greeter(&name);
+        let d = dial(&name, &CancelToken::new());
+        let server = peer.join().unwrap();
+        d.conn.end();
+        reads_eof(&server, Duration::from_secs(2)).expect("EOF after end");
+
+        let name = unique();
+        let peer = greeter(&name);
+        let d = dial(&name, &CancelToken::new());
+        let server = peer.join().unwrap();
+        // The link halves are still open: only dropping the connection shuts the pipe.
+        let io = d.io;
+        drop(d.conn);
+        reads_eof(&server, Duration::from_secs(2)).expect("EOF after drop");
+        drop(io);
+        let mut rest = Vec::new();
+        let _ = (&server).read_to_end(&mut rest);
     }
 }

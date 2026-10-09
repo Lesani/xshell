@@ -3,11 +3,11 @@
 use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
+use super::transport::{self, Listener};
 use super::{conn, Config, ConnId, ExitReason, Role, TestPoint};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -265,8 +265,9 @@ impl Daemon {
         true
     }
 
-    pub fn accept_loop(self: Arc<Self>, listener: UnixListener) {
-        for s in listener.incoming() {
+    pub fn accept_loop(self: Arc<Self>, listener: Listener) {
+        loop {
+            let s = transport::accept(&listener);
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
@@ -355,7 +356,7 @@ impl Daemon {
 
         self.stopping.store(true, Ordering::SeqCst);
         // Wake the accept loop.
-        let _ = UnixStream::connect(&self.cfg.paths.socket);
+        transport::wake(&self.cfg.paths.socket);
         let conns: Vec<Arc<Outbox>> = {
             let mut reg = self.reg.lock().unwrap();
             reg.closed = true;
@@ -368,7 +369,7 @@ impl Daemon {
         for ob in &conns {
             ob.wait_done(deadline);
         }
-        let _ = fs::remove_file(&self.cfg.paths.socket);
+        let _ = transport::remove_endpoint(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
         if let Some(h) = bye {
             let _ = h.join();

@@ -6,25 +6,56 @@
 //! it reports [`Cleanup::Unresolved`] and the Terminal is not relaunched.
 
 use std::time::{Duration, Instant};
-use xshell_core::terminal::state::{Leader, ProcIdentity};
+use xshell_core::terminal::state::Leader;
+#[cfg(unix)]
+use xshell_core::terminal::state::ProcIdentity;
 
 /// After SIGKILL, how long to wait for leftovers to disappear before giving up.
+#[cfg(unix)]
 const KILL_WAIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
-/// SIGKILL each process group in `groups` that still exists at `at`, waiting until then
-/// while any does: an orderly exit never leaves a hangup-ignoring member of a Terminal's
-/// group running once the Daemon, and with it every kill timer, is gone.
-pub(crate) fn escalate_groups(groups: &[i32], at: Instant) {
-    let exists = |g: i32| unsafe { libc::killpg(g, 0) } == 0;
+/// What a hung-up Terminal's escalation ends: a process group (Unix), or the Terminal's Job
+/// Object (Windows), kept open until the escalation has run.
+#[cfg(unix)]
+pub(crate) type Group = i32;
+#[cfg(windows)]
+pub(crate) type Group = std::sync::Arc<xshell_core::job::Job>;
+
+/// Whether anything of `g` still runs.
+#[cfg(unix)]
+pub(crate) fn group_alive(g: &Group) -> bool {
+    unsafe { libc::killpg(*g, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub(crate) fn group_alive(g: &Group) -> bool {
+    g.active_processes().is_ok_and(|n| n > 0)
+}
+
+/// End all of `g` now.
+#[cfg(unix)]
+pub(crate) fn kill_group(g: &Group) {
+    unsafe { libc::killpg(*g, libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+pub(crate) fn kill_group(g: &Group) {
+    let _ = g.terminate(1);
+}
+
+/// Kill each group in `groups` that still has a process at `at`, waiting until then while
+/// any does: an orderly exit never leaves a hangup-ignoring member of a Terminal running once
+/// the Daemon, and with it every kill timer, is gone.
+pub(crate) fn escalate_groups(groups: &[Group], at: Instant) {
     loop {
-        let left: Vec<i32> = groups.iter().copied().filter(|&g| exists(g)).collect();
+        let left: Vec<&Group> = groups.iter().filter(|g| group_alive(g)).collect();
         if left.is_empty() {
             return;
         }
         if Instant::now() >= at {
             for g in left {
-                unsafe { libc::killpg(g, libc::SIGKILL) };
+                kill_group(g);
             }
             return;
         }
@@ -32,18 +63,27 @@ pub(crate) fn escalate_groups(groups: &[i32], at: Instant) {
     }
 }
 
-/// Hung-up process groups whose SIGKILL is due at a given time, until their kill timer has
-/// run. A Terminal closed by a Desktop leaves the list at once, but its timer may still be
-/// pending when the Daemon exits; [`Escalations::drain`] fires those first.
+/// Kill each group in `groups` that still has a process (a kill timer that ran out).
+pub(crate) fn kill_remaining(groups: &[Group]) {
+    for g in groups {
+        if group_alive(g) {
+            kill_group(g);
+        }
+    }
+}
+
+/// Hung-up groups whose kill is due at a given time, until their kill timer has run. A
+/// Terminal closed by a Desktop leaves the list at once, but its timer may still be pending
+/// when the Daemon exits; [`Escalations::drain`] fires those first.
 #[derive(Default)]
 pub(crate) struct Escalations {
-    pending: std::sync::Mutex<std::collections::HashMap<u64, (Vec<i32>, Instant)>>,
+    pending: std::sync::Mutex<std::collections::HashMap<u64, (Vec<Group>, Instant)>>,
     next: std::sync::atomic::AtomicU64,
 }
 
 impl Escalations {
-    /// `groups` get their SIGKILL at `at`; returns the entry for [`Escalations::done`].
-    pub fn add(&self, groups: Vec<i32>, at: Instant) -> u64 {
+    /// `groups` get killed at `at`; returns the entry for [`Escalations::done`].
+    pub fn add(&self, groups: Vec<Group>, at: Instant) -> u64 {
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.pending.lock().unwrap().insert(id, (groups, at));
         id
@@ -55,7 +95,7 @@ impl Escalations {
 
     /// Escalate every pending entry now, each when it is due but no later than `deadline`.
     pub fn drain(&self, deadline: Instant) {
-        let mut all: Vec<(Vec<i32>, Instant)> = self
+        let mut all: Vec<(Vec<Group>, Instant)> = self
             .pending
             .lock()
             .unwrap()
@@ -131,6 +171,7 @@ pub(crate) fn start_time(_pid: i32) -> Option<u64> {
 }
 
 /// The identity of `pid` right now.
+#[cfg(unix)]
 pub(crate) fn identity(pid: i32) -> ProcIdentity {
     ProcIdentity {
         pid,
@@ -139,6 +180,7 @@ pub(crate) fn identity(pid: i32) -> ProcIdentity {
 }
 
 /// `who` is still the very process that was recorded.
+#[cfg(unix)]
 fn confirmed(who: &ProcIdentity) -> bool {
     who.pid > 1 && who.start_time.is_some() && start_time(who.pid) == who.start_time
 }
@@ -389,7 +431,7 @@ pub(crate) fn end_leftovers(leader: &Leader, grace: Duration) -> Cleanup {
 
 /// Elsewhere there is no way to confirm a process's identity: nothing is signalled, and a
 /// recorded leader that may still be running leaves the outcome unresolved.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn end_leftovers(leader: &Leader, _grace: Duration) -> Cleanup {
     let _ = confirmed;
     if unsafe { libc::kill(leader.pid as i32, 0) } == 0 {
@@ -399,7 +441,14 @@ pub(crate) fn end_leftovers(leader: &Leader, _grace: Duration) -> Cleanup {
     }
 }
 
-#[cfg(test)]
+/// Windows: nothing of a previous run can be left. Every Terminal ran in a kill-on-close Job
+/// Object only the Daemon held, so the OS ended them all when that Daemon ended.
+#[cfg(windows)]
+pub(crate) fn end_leftovers(_leader: &Leader, _grace: Duration) -> Cleanup {
+    Cleanup::Empty
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;

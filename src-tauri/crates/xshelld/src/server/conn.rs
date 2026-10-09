@@ -9,11 +9,11 @@ use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
 use super::role::{self, Role};
 use super::terminal::{self, Terminal};
+use super::transport::Stream;
 use super::{ConnId, ExitReason, TestPoint};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,7 +55,7 @@ struct Conn {
     inflight: Arc<AtomicUsize>,
 }
 
-pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId, role: Role) {
+pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role) {
     let (wsock, asock) = match (sock.try_clone(), sock.try_clone()) {
         (Ok(w), Ok(a)) => (w, a),
         _ => return,

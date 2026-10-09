@@ -1,4 +1,5 @@
-//! `xshelld serve`: the socket server, the Terminal registry and the Daemon lifecycle.
+//! `xshelld serve`: the socket (Windows: named pipe) server, the Terminal registry and the
+//! Daemon lifecycle.
 //!
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
@@ -18,16 +19,17 @@ mod relaunch;
 mod ring;
 mod role;
 pub use role::Role;
+mod signals;
+pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
 mod terminal;
+pub mod transport;
 
-use crate::paths::{check_socket_path_len, ensure_private_dir, write_mode, Mode, Paths};
+use crate::paths::{check_endpoint, ensure_private_dir, private_file, write_mode, Mode, Paths};
 use registry::{Daemon, Registry};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -69,6 +71,9 @@ pub struct Config {
     /// The agent hook client agents run (`<exe> event …`): this executable by default.
     /// `None` launches agents without hooks, so they report no Agent Status.
     pub event_exe: Option<PathBuf>,
+    /// Windows: the `xshelld` whose `job-exec` starts each Terminal inside its Job Object
+    /// (this executable by default). `None`: the job is assigned after the start.
+    pub job_launcher: Option<PathBuf>,
     /// Run for the xshell app on this machine (ADR-0005): no idle exit, no `daemon.upgrade`,
     /// and the mode marker says `gui-bound`. `None`: a Persistent Daemon.
     pub gui_bound: Option<GuiBound>,
@@ -194,6 +199,7 @@ impl Config {
             max_terminal_bytes: 256 * 1024,
             max_list_bytes: 16 * 1024 * 1024,
             event_exe: std::env::current_exe().ok(),
+            job_launcher: std::env::current_exe().ok(),
             gui_bound: None,
             abort: None,
             ring_backoff_unit: Duration::from_secs(1),
@@ -259,8 +265,9 @@ impl Server {
     /// Lock, bind, restore the persisted Terminals, then serve in background threads.
     pub fn start(cfg: Config) -> Result<ServerHandle, StartError> {
         let paths = cfg.paths.clone();
-        check_socket_path_len(&paths.socket)?;
-        ensure_private_dir(paths.socket_dir())?;
+        check_endpoint(&paths.socket)?;
+        // The lock's directory: the socket's on Unix.
+        ensure_private_dir(paths.lock.parent().unwrap_or(Path::new("/")))?;
         for p in [&paths.state, &paths.log] {
             if let Some(dir) = p.parent() {
                 ensure_private_dir(dir)?;
@@ -268,13 +275,14 @@ impl Server {
         }
         ensure_private_dir(&paths.tmp)?;
 
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&paths.lock)?;
+        let lock = private_file(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+        .open(&paths.lock)?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => return Err(StartError::AlreadyRunning),
@@ -301,21 +309,18 @@ impl Server {
             )
         })?;
         // Holding the lock makes the socket ours: a leftover one is stale.
-        let mut pidf = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&paths.pid)?;
+        let mut pidf = private_file(
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&paths.pid)?;
         starting.pid = true;
         writeln!(pidf, "{}", std::process::id())?;
-        match fs::remove_file(&paths.socket) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-        let listener = UnixListener::bind(&paths.socket)?;
+        transport::remove_endpoint(&paths.socket)?;
+        let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
-        fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
         xshell_core::files::cleanup_old_dropped_files(&ctx);
@@ -395,7 +400,7 @@ impl Drop for Starting<'_> {
             return;
         };
         if self.socket {
-            let _ = fs::remove_file(&self.paths.socket);
+            let _ = transport::remove_endpoint(&self.paths.socket);
         }
         if self.pid {
             let _ = fs::remove_file(&self.paths.pid);
@@ -470,8 +475,8 @@ impl ServerHandle {
     /// Test hook: a connection served in this process with `role`, as a transport other than
     /// the socket would hand it over. Returns the client's end.
     #[doc(hidden)]
-    pub fn connect_in_process(&self, role: Role) -> io::Result<UnixStream> {
-        let (client, server) = UnixStream::pair()?;
+    pub fn connect_in_process(&self, role: Role) -> io::Result<transport::Stream> {
+        let (client, server) = transport::pair()?;
         let id = self.d.next_conn.fetch_add(1, Ordering::SeqCst);
         let d = self.d.clone();
         std::thread::Builder::new()
@@ -515,19 +520,6 @@ pub fn run_serve(mut cfg: Config, stop: Arc<StopLatch>) -> i32 {
     0
 }
 
-/// Fire `stop` on SIGTERM, SIGINT or SIGHUP, from a thread of its own. The caller must have
-/// blocked those signals (see [`block_exit_signals`]) before starting any thread.
-pub fn watch_exit_signals(stop: Arc<StopLatch>) -> io::Result<()> {
-    std::thread::Builder::new()
-        .name("signals".into())
-        .spawn(move || loop {
-            let sig = wait_exit_signal();
-            crate::log!("INFO", "signal {sig}: shutting down");
-            stop.trigger();
-        })?;
-    Ok(())
-}
-
 /// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits
 /// (at most 30 s) until `<path>` exists before exiting, so a test can order its exit after
 /// `connect` has already bridged to the winner.
@@ -538,35 +530,5 @@ fn hold_loser_for_tests() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !std::path::Path::new(&p).exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn exit_signal_set() -> libc::sigset_t {
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::sigaddset(&mut set, s);
-        }
-        set
-    }
-}
-
-/// Block the exit signals in this thread and every thread it spawns afterwards, so only the
-/// `sigwait` thread sees them. Children get a clean mask: std and portable-pty reset it.
-pub fn block_exit_signals() {
-    let set = exit_signal_set();
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-    }
-}
-
-fn wait_exit_signal() -> i32 {
-    let set = exit_signal_set();
-    let mut sig: libc::c_int = 0;
-    loop {
-        if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
-            return sig;
-        }
     }
 }

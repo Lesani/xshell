@@ -104,6 +104,10 @@ pub(crate) struct Terminal {
     status: Mutex<Tracker>,
     /// The Daemon's pending SIGKILLs, which [`Terminal::kill`] adds to.
     escalations: Arc<super::orphans::Escalations>,
+    /// Windows: the kill-on-close Job Object the process runs in, with everything it
+    /// starts. Closing it (the Terminal and its escalation dropped) ends them all.
+    #[cfg(windows)]
+    job: Option<Arc<xshell_core::job::Job>>,
 }
 
 /// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
@@ -181,10 +185,45 @@ pub(crate) fn spawn_with(
             pixel_height: 0,
         })
         .map_err(|e| format!("failed to open PTY: {e}"))?;
-    let mut child = pair
-        .slave
-        .spawn_command(plan.to_command_builder())
-        .map_err(|e| format!("failed to start {}: {e}", plan.program))?;
+    // Windows: until the Terminal exists, a failure hands the console to a cleanup thread
+    // that drains it (closing it may wait for that) and ends whatever started, so nothing
+    // here blocks under the registry lock.
+    #[cfg(windows)]
+    let mut pair = win::SpawnGuard::new(pair, id);
+    #[cfg(unix)]
+    let cmd = plan.to_command_builder();
+    #[cfg(windows)]
+    let (job, cmd) = {
+        let name = format!(
+            r"Local\xshelld-term-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        );
+        let job = xshell_core::job::Job::new_named(&name)
+            .map_err(|e| format!("failed to create the terminal's job: {e}"))?;
+        let job = Arc::new(job);
+        pair.job = Some(job.clone());
+        let launcher = d.cfg.job_launcher.as_deref();
+        (job, win::command(&plan, launcher, &name))
+    };
+    #[cfg(unix)]
+    let spawned_child = pair.slave.spawn_command(cmd);
+    #[cfg(windows)]
+    let spawned_child = pair.slave().spawn_command(cmd);
+    let mut child = spawned_child.map_err(|e| format!("failed to start {}: {e}", plan.program))?;
+    // Without the launcher (an in-process server), the job is assigned from here: a process
+    // the child starts before that escapes it.
+    #[cfg(windows)]
+    if d.cfg.job_launcher.is_none() {
+        let assigned = child
+            .as_raw_handle()
+            .ok_or_else(|| std::io::Error::other("no process handle"))
+            .and_then(|h| job.assign(h));
+        if let Err(e) = assigned {
+            let _ = child.kill();
+            return Err(format!("failed to put {} in its job: {e}", plan.program).into());
+        }
+    }
     let pid = child.process_id();
     let start_time = pid.and_then(|p| super::orphans::start_time(p as i32));
     if let Some(pid) = pid {
@@ -197,15 +236,28 @@ pub(crate) fn spawn_with(
             }],
         });
     }
+    #[cfg(unix)]
     drop(pair.slave);
-    let reader = pair
-        .master
+    #[cfg(windows)]
+    pair.release_slave();
+    #[cfg(unix)]
+    let pty_master = &pair.master;
+    #[cfg(windows)]
+    let pty_master = pair.master();
+    let pty = pty_master
         .try_clone_reader()
-        .map_err(|e| format!("failed to clone PTY reader: {e}"))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("failed to take PTY writer: {e}"))?;
+        .map_err(|e| format!("failed to clone PTY reader: {e}"))
+        .and_then(|r| {
+            pty_master
+                .take_writer()
+                .map(|w| (r, w))
+                .map_err(|e| format!("failed to take PTY writer: {e}"))
+        });
+    let (reader, writer) = pty?;
+    #[cfg(windows)]
+    let master = pair.into_master();
+    #[cfg(unix)]
+    let master = pair.master;
     let (tx, rx) = sync_channel::<Vec<u8>>(INPUT_BACKLOG);
     let t = Arc::new(Terminal {
         id,
@@ -217,7 +269,7 @@ pub(crate) fn spawn_with(
             replacement: None,
         }),
         io: Mutex::new(TermIo {
-            master: Some(pair.master),
+            master: Some(master),
             arb: SizeArbiter::new(cols, rows),
         }),
         out: Mutex::new(TermOutput {
@@ -237,6 +289,8 @@ pub(crate) fn spawn_with(
         run,
         status: Mutex::new(tracker),
         escalations: d.escalations.clone(),
+        #[cfg(windows)]
+        job: Some(job),
     });
     let tag = short(&id);
 
@@ -256,10 +310,36 @@ pub(crate) fn spawn_with(
                     -1
                 }
             };
-            // `term.exit` follows the last output: wait for the reader to see EOF.
+            // A ConPTY's output never ends while the console lives: close it now, while the
+            // reader drains what is left. Whatever the process left in its job (a detached
+            // descendant) ends after the grace, listed Terminal or not.
+            #[cfg(windows)]
+            {
+                if let Some(job) = &tw.job {
+                    tw.kill_after(vec![job.clone()], dw.cfg.kill_grace);
+                }
+                let master = tw.io.lock().unwrap().master.take();
+                drop(master);
+            }
+            // `term.exit` follows the last output: wait for the reader to see EOF. Windows:
+            // bounded, in case the closed console never ends its output.
+            #[cfg(windows)]
+            let drained_by = Some(Instant::now() + win::DRAIN_WAIT);
+            #[cfg(not(windows))]
+            let drained_by: Option<Instant> = None;
             let mut l = tw.life.lock().unwrap();
             while !l.reader_done {
-                l = tw.life_cv.wait(l).unwrap();
+                match drained_by {
+                    None => l = tw.life_cv.wait(l).unwrap(),
+                    Some(by) => {
+                        let left = by.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            crate::log!("WARN", "output of terminal {} never ended", tw.id);
+                            break;
+                        }
+                        l = tw.life_cv.wait_timeout(l, left).unwrap().0;
+                    }
+                }
             }
             drop(l);
             tw.publish_exit(&dw, code);
@@ -300,9 +380,24 @@ pub(crate) fn spawn_with(
 impl Terminal {
     fn read_loop(&self, d: &Arc<Daemon>, mut reader: Box<dyn Read + Send>) {
         let mut buf = vec![0u8; READ_BUF];
+        #[cfg(windows)]
+        let mut startup = win::StartupQuery::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
+                #[cfg(windows)]
+                Ok(n) => {
+                    let (out, answer) = startup.feed(&buf[..n]);
+                    if answer {
+                        if let Some(tx) = self.input.lock().unwrap().as_ref() {
+                            let _ = tx.try_send(win::CURSOR_AT_ORIGIN.to_vec());
+                        }
+                    }
+                    if !out.is_empty() {
+                        self.on_output(d, &out);
+                    }
+                }
+                #[cfg(not(windows))]
                 Ok(n) => self.on_output(d, &buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 // EIO once every slave fd is closed.
@@ -661,6 +756,7 @@ impl Terminal {
 
     /// The process groups ending the Terminal signals: the session leader's and the
     /// foreground job's.
+    #[cfg(unix)]
     fn groups(&self) -> Vec<i32> {
         let mut groups: Vec<i32> = self.pid.map(|p| p as i32).into_iter().collect();
         let fg = self
@@ -678,16 +774,27 @@ impl Terminal {
         groups
     }
 
+    /// What ending the Terminal kills after the grace: its process groups (Windows: its job).
+    #[cfg(unix)]
+    fn kill_groups(&self) -> Vec<super::orphans::Group> {
+        self.groups()
+    }
+
+    #[cfg(windows)]
+    fn kill_groups(&self) -> Vec<super::orphans::Group> {
+        self.job.iter().cloned().collect()
+    }
+
     /// [`Terminal::kill`], then wait until the process has exited and every group it
     /// signalled is gone, or until `deadline`. Answers whether they are gone.
     pub fn end_and_wait(self: &Arc<Self>, grace: Duration, deadline: Instant) -> bool {
-        let groups = self.groups();
+        let groups = self.kill_groups();
         self.kill(grace);
         if !self.wait_exited(deadline) {
             return false;
         }
         loop {
-            if groups.iter().all(|&g| unsafe { libc::killpg(g, 0) } != 0) {
+            if !groups.iter().any(super::orphans::group_alive) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -697,6 +804,7 @@ impl Terminal {
         }
     }
 
+    #[cfg(unix)]
     fn hang_up(self: &Arc<Self>, grace: Duration, closing: bool) {
         let groups = self.groups();
         {
@@ -709,18 +817,41 @@ impl Terminal {
                 unsafe { libc::killpg(g, libc::SIGHUP) };
             }
         }
-        // Recorded until the timer ran, so an exit in between still sends the SIGKILL.
+        self.kill_after(groups, grace);
+    }
+
+    /// Windows: closing the ConPTY is the hangup (every process attached to it gets
+    /// `CTRL_CLOSE_EVENT`); after `grace` the Terminal's job ends whatever is left of its
+    /// tree, detached processes included.
+    #[cfg(windows)]
+    fn hang_up(self: &Arc<Self>, grace: Duration, closing: bool) {
+        {
+            let mut l = self.life.lock().unwrap();
+            if l.exited.is_some() {
+                return;
+            }
+            l.closing |= closing;
+        }
+        // Closing may wait for the console's output to drain: never under a lock.
+        let master = self.io.lock().unwrap().master.take();
+        if let Some(m) = master {
+            win::close_console(m, &self.id);
+        }
+        if let Some(job) = &self.job {
+            self.kill_after(vec![job.clone()], grace);
+        }
+    }
+
+    /// Kill what is left of `groups` after `grace`. Recorded until the timer ran, so an exit
+    /// in between, or the Daemon's own exit, still kills them.
+    fn kill_after(&self, groups: Vec<super::orphans::Group>, grace: Duration) {
         let esc = self.escalations.clone();
         let entry = esc.add(groups.clone(), Instant::now() + grace);
         let r = std::thread::Builder::new()
             .name(format!("pty-kill-{}", short(&self.id)))
             .spawn(move || {
                 std::thread::sleep(grace);
-                for g in groups {
-                    if unsafe { libc::killpg(g, 0) } == 0 {
-                        unsafe { libc::killpg(g, libc::SIGKILL) };
-                    }
-                }
+                super::orphans::kill_remaining(&groups);
                 esc.done(entry);
             });
         if let Err(e) = r {
@@ -792,10 +923,12 @@ impl Terminal {
         // An exited Terminal has no process left to end; its pid may already be reused.
         let pid = self.pid.filter(|_| !self.is_exited());
         let leader = pid.map(|pid| {
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut groups = vec![ProcIdentity {
                 pid: pid as i32,
                 start_time: self.start_time,
             }];
+            #[cfg(unix)]
             if let Some(g) = io.master.as_ref().and_then(|m| m.process_group_leader()) {
                 if g != pid as i32 {
                     groups.push(super::orphans::identity(g));
@@ -868,6 +1001,220 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         run: d.next_run.fetch_add(1, Ordering::SeqCst),
         status: Mutex::new(status),
         escalations: d.escalations.clone(),
+        #[cfg(windows)]
+        job: None,
     };
     Arc::new(t)
+}
+
+#[cfg(windows)]
+mod win {
+    use portable_pty::{CommandBuilder, MasterPty, PtyPair, SlavePty};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use xshell_core::job::Job;
+
+    /// How long a Terminal's output may go on after its process exited and its console was
+    /// closed.
+    pub(super) const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// What a ConPTY created to inherit the cursor (as portable-pty creates it) prints first.
+    const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+    /// The answer: the cursor is at the top left.
+    pub(super) const CURSOR_AT_ORIGIN: &[u8] = b"\x1b[1;1R";
+
+    /// The ConPTY's startup cursor query. It renders nothing until the query is answered, and
+    /// a Terminal may have no Desktop attached (a restore), so the Daemon answers it and keeps
+    /// it out of the output: a Desktop replaying the output must not answer it again.
+    #[derive(Default)]
+    pub(super) struct StartupQuery {
+        head: Vec<u8>,
+        done: bool,
+    }
+
+    impl StartupQuery {
+        /// The output to pass on, and whether the query was seen (answer it now).
+        pub(super) fn feed(&mut self, bytes: &[u8]) -> (Vec<u8>, bool) {
+            if self.done {
+                return (bytes.to_vec(), false);
+            }
+            self.head.extend_from_slice(bytes);
+            if self.head.starts_with(CURSOR_QUERY) {
+                self.done = true;
+                return (self.head.split_off(CURSOR_QUERY.len()), true);
+            }
+            if CURSOR_QUERY.starts_with(&self.head) {
+                return (Vec::new(), false);
+            }
+            self.done = true;
+            (std::mem::take(&mut self.head), false)
+        }
+    }
+
+    use std::path::Path;
+    use uuid::Uuid;
+    use xshell_core::CommandPlan;
+
+    /// The Terminal's command. With a `launcher` (this `xshelld`), the process is
+    /// `xshelld job-exec <job> -- <program> <args…>`: it joins the job itself before it starts
+    /// the program, so nothing the program starts escapes the job.
+    ///
+    /// `CommandBuilder::new` reloads the registry's environment over this process's: ours is
+    /// put back, PATH included (followed by registry entries it lacks, such as a tool
+    /// installed since the Desktop started), then the plan's variables.
+    pub(super) fn command(
+        plan: &CommandPlan,
+        launcher: Option<&Path>,
+        job: &str,
+    ) -> CommandBuilder {
+        let mut cmd = match launcher {
+            Some(exe) => {
+                let mut c = CommandBuilder::new(exe);
+                c.args(["job-exec", job, "--"]);
+                c.arg(&plan.program);
+                c
+            }
+            None => CommandBuilder::new(&plan.program),
+        };
+        for a in &plan.args {
+            cmd.arg(a);
+        }
+        let registry_path = cmd
+            .get_env("PATH")
+            .map(|p| p.to_string_lossy().into_owned());
+        for (k, v) in std::env::vars_os() {
+            cmd.env(k, v);
+        }
+        if let (Ok(ours), Some(reg)) = (std::env::var("PATH"), registry_path) {
+            let mut all: Vec<&str> = ours.split(';').filter(|e| !e.is_empty()).collect();
+            for e in reg.split(';').filter(|e| !e.is_empty()) {
+                if !all.iter().any(|a| a.eq_ignore_ascii_case(e)) {
+                    all.push(e);
+                }
+            }
+            cmd.env("PATH", all.join(";"));
+        }
+        for (k, v) in &plan.env {
+            cmd.env(k, v);
+        }
+        cmd.cwd(&plan.cwd);
+        cmd
+    }
+
+    /// A ConPTY and the Terminal's job while the Terminal is being started. Dropped before
+    /// [`SpawnGuard::into_master`] (a failed start), it ends the job's processes and hands
+    /// the console to [`abandon_console`].
+    pub(super) struct SpawnGuard {
+        master: Option<Box<dyn MasterPty + Send>>,
+        slave: Option<Box<dyn SlavePty + Send>>,
+        pub(super) job: Option<Arc<Job>>,
+        id: Uuid,
+    }
+
+    impl SpawnGuard {
+        pub(super) fn new(pair: PtyPair, id: Uuid) -> SpawnGuard {
+            SpawnGuard {
+                master: Some(pair.master),
+                slave: Some(pair.slave),
+                job: None,
+                id,
+            }
+        }
+
+        pub(super) fn master(&self) -> &(dyn MasterPty + Send) {
+            self.master.as_deref().expect("held until handed on")
+        }
+
+        pub(super) fn slave(&self) -> &(dyn SlavePty + Send) {
+            self.slave.as_deref().expect("held until released")
+        }
+
+        /// Drop the slave (the started process holds the console now). It shares the
+        /// console with the master, so this closes nothing yet.
+        pub(super) fn release_slave(&mut self) {
+            self.slave.take();
+        }
+
+        /// The start succeeded: the Terminal owns the console from now on.
+        pub(super) fn into_master(mut self) -> Box<dyn MasterPty + Send> {
+            self.master.take().expect("held until handed on")
+        }
+    }
+
+    impl Drop for SpawnGuard {
+        fn drop(&mut self) {
+            let Some(master) = self.master.take() else {
+                return;
+            };
+            if let Some(job) = &self.job {
+                let _ = job.terminate(1);
+            }
+            abandon_console(master, self.slave.take(), self.id);
+        }
+    }
+
+    /// Close a console nobody reads, off this thread: its output is drained (and its startup
+    /// cursor query answered) so the close can complete.
+    pub(super) fn abandon_console(
+        master: Box<dyn MasterPty + Send>,
+        slave: Option<Box<dyn SlavePty + Send>>,
+        id: Uuid,
+    ) {
+        let r = std::thread::Builder::new()
+            .name(format!("pty-abandon-{}", &id.simple().to_string()[..8]))
+            .spawn(move || {
+                let reader = master.try_clone_reader().ok();
+                let mut writer = master.take_writer().ok();
+                if let Some(mut reader) = reader {
+                    let _ = std::thread::Builder::new()
+                        .name("pty-drain".into())
+                        .spawn(move || {
+                            let mut q = StartupQuery::default();
+                            let mut buf = [0u8; 4096];
+                            while let Ok(n) = reader.read(&mut buf) {
+                                if n == 0 {
+                                    break;
+                                }
+                                if q.feed(&buf[..n]).1 {
+                                    if let Some(w) = writer.as_mut() {
+                                        let _ = w.write_all(CURSOR_AT_ORIGIN);
+                                    }
+                                }
+                            }
+                        });
+                }
+                drop(slave);
+                drop(master);
+            });
+        if let Err(e) = r {
+            crate::log!("ERROR", "cannot close the console of {id} off-thread: {e}");
+        }
+    }
+
+    /// Close a ConPTY on a thread of its own: `ClosePseudoConsole` may wait until the
+    /// console's output is drained.
+    pub(super) fn close_console(m: Box<dyn MasterPty + Send>, id: &Uuid) {
+        let r = std::thread::Builder::new()
+            .name(format!("pty-close-{}", &id.simple().to_string()[..8]))
+            .spawn(move || drop(m));
+        if let Err(e) = r {
+            crate::log!("ERROR", "cannot close the console of {id} off-thread: {e}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn startup_query_is_answered_and_dropped() {
+            let mut q = StartupQuery::default();
+            assert_eq!(q.feed(b"\x1b["), (vec![], false));
+            assert_eq!(q.feed(b"6nhello"), (b"hello".to_vec(), true));
+            assert_eq!(q.feed(b"\x1b[6n"), (b"\x1b[6n".to_vec(), false));
+            let mut q = StartupQuery::default();
+            assert_eq!(q.feed(b"\x1b[2J"), (b"\x1b[2J".to_vec(), false));
+            assert_eq!(q.feed(b"\x1b[6n"), (b"\x1b[6n".to_vec(), false));
+        }
+    }
 }

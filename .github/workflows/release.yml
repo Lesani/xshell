@@ -14,14 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux and macOS bundle the xshelld sidecar (tauri.daemon.conf.json): local
-          # Terminals run in a GUI-bound Daemon (ADR-0005). Windows does not yet (#24).
+          # Every platform bundles the xshelld sidecar (tauri.daemon.conf.json): local
+          # Terminals run in a GUI-bound Daemon (ADR-0005; Windows since #24).
           - platform: macos-latest
             args: '--target universal-apple-darwin --config src-tauri/tauri.daemon.conf.json'
           - platform: ubuntu-22.04
             args: '--config src-tauri/tauri.daemon.conf.json'
           - platform: windows-latest
-            args: ''
+            args: '--config src-tauri/tauri.daemon.conf.json'
 
     runs-on: ${{ matrix.platform }}
 
@@ -62,9 +62,8 @@ jobs:
 
       # The sidecar the app starts as its GUI-bound Daemon. Its own profile keeps
       # `panic = "unwind"` (see Cargo.toml). Tauri finds it as binaries/xshelld-<triple> and
-      # installs it as `xshelld` next to the app's executable.
+      # installs it as `xshelld` (`xshelld.exe`) next to the app's executable.
       - name: Build the xshelld sidecar
-        if: matrix.platform != 'windows-latest'
         shell: bash
         working-directory: src-tauri
         run: |
@@ -79,7 +78,11 @@ jobs:
           else
             cargo build -p xshelld --profile release-daemon --locked
             triple="$(rustc -vV | sed -n 's/^host: //p')"
-            cp target/release-daemon/xshelld "binaries/xshelld-$triple"
+            if [ "${{ matrix.platform }}" = windows-latest ]; then
+              cp target/release-daemon/xshelld.exe "binaries/xshelld-$triple.exe"
+            else
+              cp target/release-daemon/xshelld "binaries/xshelld-$triple"
+            fi
           fi
 
       - name: Build and publish (Tauri)
@@ -94,6 +97,12 @@ jobs:
           releaseBody: |
             See the assets below to download and install this version.
 
+            **Windows:** the installers run local terminals in xshell's own background
+            process (`xshelld.exe`), so they keep running while a window reloads. For a
+            portable copy, use `xshell_<version>_windows-portable.zip`: keep `xshell.exe` and
+            `xshelld.exe` together in one folder. The single `xshell_<version>_x64.exe` runs
+            local terminals inside the app, as before.
+
             Binaries are not yet code-signed:
             - **Windows:** SmartScreen will warn — click *More info → Run anyway*.
             - **macOS:** right-click the app → *Open* (twice) on first launch.
@@ -102,8 +111,10 @@ jobs:
           args: ${{ matrix.args }}
 
       # Upload the raw xshell.exe (portable build, no installer wrapper) so the
-      # npm wrapper can fetch it directly without triggering a UAC install dialog.
-      - name: Upload portable Windows binary
+      # npm wrapper can fetch it directly without triggering a UAC install dialog. Without a
+      # sidecar next to it, it runs local Terminals in the app. The portable zip carries
+      # xshelld.exe next to it, where the app finds its Daemon.
+      - name: Upload portable Windows binaries
         if: matrix.platform == 'windows-latest'
         shell: bash
         env:
@@ -111,7 +122,12 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           cp src-tauri/target/release/xshell.exe "xshell_${VERSION}_x64.exe"
-          gh release upload "${GITHUB_REF_NAME}" "xshell_${VERSION}_x64.exe" --clobber
+          mkdir portable
+          cp src-tauri/target/release/xshell.exe portable/xshell.exe
+          cp src-tauri/target/release-daemon/xshelld.exe portable/xshelld.exe
+          (cd portable && 7z a "../xshell_${VERSION}_windows-portable.zip" xshell.exe xshelld.exe)
+          gh release upload "${GITHUB_REF_NAME}" "xshell_${VERSION}_x64.exe" \
+            "xshell_${VERSION}_windows-portable.zip" --clobber
 
   # The Desktop downloads xshelld-<triple> and its .sha256 from the release of its own
   # version (src-tauri/src/hosts/binaries.rs). The sidecar is a sha256sum line.

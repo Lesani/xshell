@@ -580,6 +580,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn known_project_canonical_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -604,6 +605,7 @@ mod tests {
         assert!(!known_project(&ctx2, &format!("{}x", s(&gone))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_storage_containment() {
         let dir = tempfile::tempdir().unwrap();

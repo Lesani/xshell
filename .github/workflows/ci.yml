@@ -89,8 +89,9 @@ jobs:
           fi
   core:
     # Core, xshelld and hostlink are Tauri-free, so they build without webview packages. These runners
-    # compile the #[cfg(windows)] and macOS paths that the Linux job never sees. xshelld is
-    # Unix-only: on Windows it compiles to a stub and its tests are empty.
+    # compile the #[cfg(windows)] and macOS paths that the Linux job never sees. On Windows
+    # xshelld is the GUI-bound Daemon over a named pipe: its `windows` test runs it as real
+    # processes (ConPTY, Job Objects) and prints the Daemon log of a failing test.
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +113,10 @@ jobs:
       # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.
       - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol --all-features --locked
+      # The Desktop's Windows paths (the Local Host's Daemon among them) compile with MSVC.
+      - name: Desktop compiles for Windows
+        if: matrix.os == 'windows-latest'
+        run: cargo check -p xshell --locked
   xshelld-musl:
     # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
     # builds natively with musl-gcc on a runner of its own architecture. The release workflow

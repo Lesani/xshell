@@ -7,18 +7,32 @@
 //! instead, so entries set only in rc files (nvm, asdf, pyenv in
 //! `.bashrc`/`.zshrc`) apply as they did when the app ran agents inside the user's shell;
 //! it falls back to the login-only PATH.
+//!
+//! Windows has no login shell: Terminals inherit what the Desktop gave the Daemon. There
+//! `CommandBuilder::new` reloads the registry's environment over the process's, so each
+//! Terminal's spawn sets this environment again (see `server::terminal`).
 
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const MARKER: &str = "__XSHELL_PATH__";
+#[cfg(unix)]
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `interactive`: also source the rc files (GUI-bound or `--interactive-env`). `cancelled` aborts a slow shell.
 pub fn prepare(interactive: bool, cancelled: &dyn Fn() -> bool) {
+    // Windows has no login shell: Terminals take the environment the Desktop gave us.
+    #[cfg(windows)]
+    let _ = (interactive, cancelled);
+    #[cfg(unix)]
     if std::env::var_os("XSHELLD_LOGIN_ENV").as_deref() != Some("0".as_ref()) {
         let mut found = None;
         if interactive {
@@ -53,6 +67,7 @@ pub fn prepare(interactive: bool, cancelled: &dyn Fn() -> bool) {
 /// `$SHELL -l -c` (`-l -i -c` when `interactive`) prints the login PATH after a marker, so
 /// profile noise is ignored. The shell runs in its own session: an interactive shell then
 /// finds no terminal to take over, and a timeout ends it with everything it started.
+#[cfg(unix)]
 fn login_path(interactive: bool, cancelled: &dyn Fn() -> bool) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
     let shell = std::env::var_os("SHELL")
@@ -139,9 +154,14 @@ pub fn parse_marker(out: &str) -> Option<String> {
 
 /// Prepend the login PATH entries that are missing from `cur`, keeping their order.
 pub fn merge_path(cur: &str, login: &str) -> String {
-    let have: Vec<&str> = cur.split(':').filter(|s| !s.is_empty()).collect();
+    merge_path_with(cur, login, ':')
+}
+
+/// [`merge_path`] for lists separated by `sep` (`;` on Windows).
+pub fn merge_path_with(cur: &str, login: &str, sep: char) -> String {
+    let have: Vec<&str> = cur.split(sep).filter(|s| !s.is_empty()).collect();
     let mut add: Vec<&str> = Vec::new();
-    for e in login.split(':').filter(|s| !s.is_empty()) {
+    for e in login.split(sep).filter(|s| !s.is_empty()) {
         if !have.contains(&e) && !add.contains(&e) {
             add.push(e);
         }
@@ -151,7 +171,7 @@ pub fn merge_path(cur: &str, login: &str) -> String {
     }
     let mut v = add;
     v.extend(have);
-    v.join(":")
+    v.join(&sep.to_string())
 }
 
 #[cfg(test)]
@@ -168,5 +188,9 @@ mod tests {
         assert_eq!(merge_path("/b:/c", "/a:/b:/d"), "/a:/d:/b:/c");
         assert_eq!(merge_path("/a:/b", "/b:/a"), "/a:/b");
         assert_eq!(merge_path("", "/a"), "/a");
+        assert_eq!(
+            merge_path_with(r"C:\b;C:\c", r"C:\a;C:\b", ';'),
+            r"C:\a;C:\b;C:\c"
+        );
     }
 }

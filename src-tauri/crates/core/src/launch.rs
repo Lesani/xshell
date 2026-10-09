@@ -282,10 +282,19 @@ pub fn plan_command_with(
                 )
             }
             "cmd" => {
-                // No end report: `cmd` runs on Windows only, where Local Host Terminals get
-                // no hooks yet (xshell#24).
-                let mut args = vec!["/K".to_string(), exec.to_string()];
+                // cmd /K call <agent> <args…> & <exe> event - ended: the shell outlives the
+                // agent, so it reports the agent's end. `call` first keeps cmd from stripping
+                // the quotes around a quoted path later on the line (its rule for a command
+                // line that starts with a quote).
+                let mut args = vec!["/K".to_string()];
+                if hooked.is_some() {
+                    args.push("call".into());
+                }
+                args.push(exec.to_string());
                 args.extend(exec_args.iter().cloned());
+                if let Some((_, h)) = hooked {
+                    args.extend(h.hooks.ended_args_cmd());
+                }
                 (shell.to_string(), args)
             }
             "gitbash" | "bash" | "zsh" | "fish" => {
@@ -1240,6 +1249,37 @@ mod tests {
                 "{agent}"
             );
         }
+    }
+
+    #[test]
+    fn launch_cmd_wrapper_reports_agent_end() {
+        let fx = Fixture::new();
+        let h = hooks();
+        let plan = hooked(
+            &fx.ctx(),
+            &LaunchSpec {
+                agent: Some("codex".into()),
+                shell_id: Some("cmd".into()),
+                shell_command: Some("cmd.exe".into()),
+                ..spec("/w")
+            },
+            &h,
+        );
+        assert_eq!(plan.program, "cmd.exe");
+        let mut want = strings(&["/K", "call", "codex"]);
+        want.extend(h.codex_overrides());
+        want.extend(strings(&[
+            "&",
+            "/opt/x shell/xshelld",
+            "event",
+            "-",
+            "ended",
+        ]));
+        assert_eq!(plan.args, want);
+        assert_eq!(
+            h.ended_args_cmd(),
+            strings(&["&", "/opt/x shell/xshelld", "event", "-", "ended"])
+        );
     }
 
     #[cfg(not(windows))]

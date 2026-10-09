@@ -1477,7 +1477,9 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("ring");
         super::super::store::ensure_private_dir(&dir).unwrap();
-        std::fs::write(dir.join("ring.json"), b"{\"v\":1,\"signSe").unwrap();
+        // Written as the store writes (on Windows owned by this user: an elevated token's
+        // plain write is owned by Administrators, which the store refuses).
+        super::super::store::write_private(&dir.join("ring.json"), b"{\"v\":1,\"signSe").unwrap();
         let (ring, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
         let v = ring.view();
         assert!(!v.enabled);

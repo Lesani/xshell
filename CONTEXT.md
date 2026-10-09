@@ -15,7 +15,7 @@ A machine whose agents, files and session history xshell can drive; the **Deskto
 _Avoid_: server, remote, box, machine
 
 **Local Host**:
-The **Host** the **Desktop** runs on, served by that **Desktop**'s **GUI-bound Daemon** (or a **Persistent Daemon** when opted in) over a local socket, with no network hop.
+The **Host** the **Desktop** runs on, served by that **Desktop**'s **GUI-bound Daemon** (or a **Persistent Daemon** when opted in, Linux and macOS only) over a local socket (a per-user named pipe on Windows), with no network hop.
 
 **Remote Host**:
 Any **Host** other than the **Local Host**, reached through its **Daemon**.

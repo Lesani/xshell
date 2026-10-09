@@ -8,13 +8,17 @@
 //! - `roster.json` `{"v":1,"rosters":["xro1…",…]}`, the whole verified chain from version 1.
 //!
 //! Both are 0600, written through an exclusive temp file and a rename. An existing file that
-//! is a symlink or another user's is refused; one with a broader mode is tightened.
+//! is a symlink or another user's is refused; one with a broader mode is tightened. On
+//! Windows the same holds with owners and a protected user-only DACL in place of modes,
+//! and reparse points refused (`xshell_core::private_fs`).
 
+#[cfg(unix)]
 use crate::paths::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +55,18 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Opens `path` for reading if it is a regular file of ours (not a symlink); tightens a mode
 /// broader than 0600. `None`: it does not exist.
+#[cfg(windows)]
+pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    let Some(f) = xshell_core::private_fs::open_read(path)? else {
+        return Ok(None);
+    };
+    let len = f.metadata()?.len() as usize;
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(len + 1));
+    (&f).read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+#[cfg(unix)]
 pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let f = match fs::OpenOptions::new()
         .read(true)
@@ -109,6 +125,9 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ));
     let tmp = PathBuf::from(name);
     let r = (|| {
+        #[cfg(windows)]
+        let mut f = xshell_core::private_fs::create_new(&tmp)?;
+        #[cfg(unix)]
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -126,6 +145,13 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// This Host's name for the Roster: its hostname, cleaned up.
+#[cfg(windows)]
+pub(crate) fn host_name() -> String {
+    let raw = std::env::var("COMPUTERNAME").unwrap_or_default();
+    member_name(&raw, FALLBACK_NAME)
+}
+
+#[cfg(unix)]
 pub(crate) fn host_name() -> String {
     let mut buf = [0u8; 256];
     let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
@@ -153,6 +179,13 @@ impl Store {
     }
 
     fn ensure_dir(&self) -> io::Result<()> {
+        // Windows: created owned by this user with a user-only DACL, or made so (see
+        // `xshell_core::private_fs`).
+        #[cfg(windows)]
+        {
+            xshell_core::private_fs::ensure_dir(&self.dir)
+        }
+        #[cfg(unix)]
         ensure_private_dir(&self.dir)
     }
 
@@ -575,8 +608,10 @@ fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    #[cfg(unix)]
     #[test]
     fn private_files_refuse_symlinks_and_tighten_modes() {
         let t = tempfile::tempdir().unwrap();

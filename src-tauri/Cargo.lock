@@ -5915,6 +5915,7 @@ dependencies = [
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "windows-sys 0.61.2",
  "xshell-protocol",
 ]
 
@@ -5969,6 +5970,7 @@ dependencies = [
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "windows-sys 0.61.2",
  "xshell-core",
  "xshell-hostlink",
  "xshell-protocol",

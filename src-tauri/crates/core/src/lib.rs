@@ -11,10 +11,14 @@ pub mod cursor;
 pub mod dispatch;
 pub mod files;
 pub mod git;
+#[cfg(windows)]
+pub mod job;
 pub mod launch;
 pub mod memories;
 pub mod opencode;
 pub mod paths;
+pub mod pipe;
+pub mod private_fs;
 pub mod sessions;
 pub mod skills;
 pub mod stats;

@@ -1,6 +1,7 @@
 //! How the Local Host runs its Terminals: in a Daemon (ADR-0005) when the app finds its
 //! `xshelld`, otherwise in this process as before. The Daemon is GUI-bound unless the
-//! Persistent Daemon setting (#25, Linux and macOS) is on.
+//! Persistent Daemon setting (#25, Linux and macOS) is on; on Windows it is always
+//! GUI-bound (#24).
 
 use serde::Serialize;
 use serde_json::Value;
@@ -177,18 +178,17 @@ pub fn apply_switch(
 
 /// The Daemon binary, in this order:
 /// 1. `XSHELL_DAEMON_BIN` (development and tests);
-/// 2. `xshelld` next to the app's executable: the bundled sidecar (Tauri strips the target
-///    triple from sidecar names), and `target/debug/xshelld` under `tauri dev`.
+/// 2. `xshelld` (`xshelld.exe` on Windows) next to the app's executable: the bundled sidecar
+///    (Tauri strips the target triple from sidecar names), the one in the portable zip, and
+///    `target/debug/xshelld` under `tauri dev`.
 ///
-/// `XSHELL_LOCAL_DAEMON=0` keeps local Tabs in this process. Windows always does (#24).
+/// `XSHELL_LOCAL_DAEMON=0` keeps local Tabs in this process, as does an app without one
+/// (the bare portable `xshell.exe`).
 pub fn resolve_daemon_binary(
     exe_dir: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> LocalMode {
     let in_process = |reason: String| LocalMode::InProcess { reason };
-    if cfg!(not(unix)) {
-        return in_process("local terminals run in the app on this platform".into());
-    }
     if env("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
         return in_process("XSHELL_LOCAL_DAEMON=0".into());
     }
@@ -203,12 +203,17 @@ pub fn resolve_daemon_binary(
     let Some(dir) = exe_dir else {
         return in_process("the app's directory is unknown".into());
     };
-    let bin = dir.join("xshelld");
+    let bin = dir.join(daemon_file_name());
     if bin.is_file() {
         LocalMode::Daemon { bin }
     } else {
         in_process(format!("no xshelld in {}", dir.display()))
     }
+}
+
+/// The Daemon's file name on this platform.
+pub fn daemon_file_name() -> String {
+    format!("xshelld{}", std::env::consts::EXE_SUFFIX)
 }
 
 #[cfg(test)]
@@ -224,7 +229,6 @@ mod tests {
         resolve_daemon_binary(dir, &|k| env.get(k).cloned())
     }
 
-    #[cfg(unix)]
     #[test]
     fn daemon_binary_resolution_order() {
         let t = tempfile::tempdir().unwrap();
@@ -245,13 +249,20 @@ mod tests {
             }
         );
 
-        // The sidecar next to the executable.
-        std::fs::write(exe_dir.join("xshelld"), "").unwrap();
+        // The sidecar next to the executable: `xshelld.exe` on Windows, and only that.
+        let sidecar = exe_dir.join(daemon_file_name());
+        if cfg!(windows) {
+            std::fs::write(exe_dir.join("xshelld"), "").unwrap();
+            assert!(matches!(
+                resolve(Some(&exe_dir), &[]),
+                LocalMode::InProcess { .. }
+            ));
+            assert_eq!(daemon_file_name(), "xshelld.exe");
+        }
+        std::fs::write(&sidecar, "").unwrap();
         assert_eq!(
             resolve(Some(&exe_dir), &[]),
-            LocalMode::Daemon {
-                bin: exe_dir.join("xshelld")
-            }
+            LocalMode::Daemon { bin: sidecar }
         );
         assert_eq!(
             resolve(Some(&exe_dir), &[]).info(Default::default()).mode,

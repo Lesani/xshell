@@ -1,8 +1,8 @@
 //! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`,
 //! `xshelld serve [--gui-bound --parent-pid PID] [--interactive-env]`, `xshelld --version`,
-//! and `xshelld event …`, the agent hook client. `--home`, `--socket` and
-//! `--idle-timeout-ms` fall back to an environment variable. Hand-parsed: four commands, six
-//! flags.
+//! `xshelld event …`, the agent hook client, and (Windows) `xshelld job-exec`, the launcher
+//! of each Terminal. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
+//! environment variable. Hand-parsed: five commands, seven flags.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -15,6 +15,13 @@ pub enum Command {
     /// `event <terminal|-> <status> [payload] [--socket PATH] [-v]`: report an agent hook
     /// (see `xshell_core::agent_status::event_main`), parsed there.
     Event(Vec<OsString>),
+    /// `job-exec <job> -- <program> [args…]`: join the Job Object `job`, then run `program`
+    /// and exit with its code (Windows; how the Daemon starts each Terminal).
+    JobExec {
+        job: String,
+        program: OsString,
+        args: Vec<OsString>,
+    },
     Version,
     Help,
 }
@@ -35,6 +42,9 @@ pub struct Opts {
     /// Daemon does. The app passes it when it starts a Persistent Daemon (ADR-0005), so its
     /// agents find what they found in the GUI-bound one.
     pub interactive_env: bool,
+    /// `serve --gui-bound --job NAME` (Windows): join the app's Job Object first, so the
+    /// Daemon and its Terminals end with the app however it ends.
+    pub job: Option<String>,
 }
 
 pub const USAGE: &str = "\
@@ -57,6 +67,7 @@ serve options:
   --parent-pid PID   the app's process id (required with --gui-bound)
   --interactive-env  take PATH from an interactive login shell (rc files too);
                      implied by --gui-bound
+  --job NAME         Windows: join the app's job object first (with --gui-bound)
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
@@ -104,6 +115,7 @@ pub fn parse(
         "--version" | "-V" | "version" => return Ok(Command::Version),
         "--help" | "-h" | "help" => return Ok(Command::Help),
         "event" => return Ok(Command::Event(args.collect())),
+        "job-exec" => return parse_job_exec(args),
         "serve" | "connect" => {}
         other => return Err(format!("unknown command: {other}")),
     }
@@ -126,6 +138,14 @@ pub fn parse(
             "--idle-timeout-ms" => opts.idle_timeout = Some(parse_ms(&value()?, &flag)?),
             "--gui-bound" if inline.is_none() => opts.gui_bound = true,
             "--interactive-env" if inline.is_none() => opts.interactive_env = true,
+            "--job" => {
+                let v = value()?;
+                let name = v
+                    .to_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("--job: expected a job name, got {v:?}"))?;
+                opts.job = Some(name.to_string());
+            }
             "--parent-pid" => {
                 let v = value()?;
                 let pid = v
@@ -143,6 +163,9 @@ pub fn parse(
     }
     if cmd == "connect" && opts.interactive_env {
         return Err("--interactive-env is an option of serve only".into());
+    }
+    if opts.job.is_some() && !(cmd == "serve" && opts.gui_bound) {
+        return Err("--job is an option of serve --gui-bound only".into());
     }
     if opts.gui_bound != opts.parent_pid.is_some() {
         return Err("--gui-bound and --parent-pid go together".into());
@@ -162,6 +185,25 @@ pub fn parse(
         Command::Serve(opts)
     } else {
         Command::Connect(opts)
+    })
+}
+
+/// `job-exec <job> -- <program> [args…]`.
+fn parse_job_exec(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let usage = || "usage: xshelld job-exec <job> -- <program> [args...]".to_string();
+    let job = args
+        .next()
+        .and_then(|j| j.into_string().ok())
+        .filter(|j| !j.is_empty())
+        .ok_or_else(usage)?;
+    if args.next().as_deref() != Some("--".as_ref()) {
+        return Err(usage());
+    }
+    let program = args.next().ok_or_else(usage)?;
+    Ok(Command::JobExec {
+        job,
+        program,
+        args: args.collect(),
     })
 }
 
@@ -288,6 +330,57 @@ mod tests {
         assert!(run(&["connect", "--gui-bound", "--parent-pid", "4242"], &[]).is_err());
         assert!(run(&["connect", "--parent-pid", "4242"], &[]).is_err());
         assert!(run(&["connect", "--gui-bound"], &[]).is_err());
+    }
+
+    #[test]
+    fn job_requires_gui_bound() {
+        assert_eq!(
+            run(
+                &[
+                    "serve",
+                    "--gui-bound",
+                    "--parent-pid",
+                    "9",
+                    "--job",
+                    "Local\\j"
+                ],
+                &[]
+            ),
+            Ok(Command::Serve(Opts {
+                gui_bound: true,
+                parent_pid: Some(9),
+                job: Some("Local\\j".into()),
+                ..Default::default()
+            }))
+        );
+        assert!(run(&["serve", "--job", "j"], &[]).is_err());
+        assert!(run(&["connect", "--job", "j"], &[]).is_err());
+        assert!(run(&["serve", "--gui-bound", "--parent-pid", "9", "--job"], &[]).is_err());
+        assert!(run(
+            &["serve", "--gui-bound", "--parent-pid", "9", "--job="],
+            &[]
+        )
+        .is_err());
+        assert!(USAGE.contains("--job"));
+    }
+
+    #[test]
+    fn parses_job_exec() {
+        assert_eq!(
+            run(
+                &["job-exec", "J", "--", "cmd.exe", "/C", "x", "--home"],
+                &[]
+            ),
+            Ok(Command::JobExec {
+                job: "J".into(),
+                program: "cmd.exe".into(),
+                args: ["/C", "x", "--home"].iter().map(OsString::from).collect(),
+            })
+        );
+        assert!(run(&["job-exec"], &[]).is_err());
+        assert!(run(&["job-exec", "J", "cmd.exe"], &[]).is_err());
+        assert!(run(&["job-exec", "J", "--"], &[]).is_err());
+        assert!(run(&["job-exec", "", "--", "x"], &[]).is_err());
     }
 
     #[test]

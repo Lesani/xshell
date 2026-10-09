@@ -6,10 +6,10 @@
 //! Control frames are never dropped; if they alone exceed the total cap, the peer is
 //! disconnected. A peer that makes no write progress for `write_stall_timeout` is dropped.
 
+use super::transport::Stream;
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -61,11 +61,11 @@ pub(crate) struct Outbox {
     output_cap: usize,
     total_cap: usize,
     /// A handle on the connection's socket, to cut a writer stuck on a dead peer.
-    sock: Option<UnixStream>,
+    sock: Option<Stream>,
 }
 
 impl Outbox {
-    pub fn new(output_cap: usize, total_cap: usize, sock: Option<UnixStream>) -> Arc<Self> {
+    pub fn new(output_cap: usize, total_cap: usize, sock: Option<Stream>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 q: VecDeque::new(),
@@ -269,7 +269,7 @@ fn write_batch<W: Write>(w: &mut W, batch: Vec<Out>) -> std::io::Result<()> {
 }
 
 /// Drain `ob` into `sock` until it is closed or a write fails or stalls.
-pub(crate) fn writer_loop(ob: Arc<Outbox>, sock: UnixStream, stall: Duration) {
+pub(crate) fn writer_loop(ob: Arc<Outbox>, sock: Stream, stall: Duration) {
     let _ = sock.set_write_timeout(Some(stall));
     let mut w = BufWriter::with_capacity(WRITE_BUF, &sock);
     while let Some(batch) = ob.next_batch() {
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn writer_merges_adjacent_output() {
-        let (a, mut b) = UnixStream::pair().unwrap();
+        let (a, mut b) = super::super::transport::pair().unwrap();
         let ob = Outbox::new(1 << 20, 1 << 21, None);
         let t1 = Uuid::new_v4();
         for chunk in [&b"one "[..], b"two ", b"three"] {
