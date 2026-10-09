@@ -495,6 +495,20 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager as _;
             app.manage(hosts::Hosts::new(app.handle()));
+            // The main window is built here, after the state its page calls into, rather than
+            // from tauri.conf.json (`create: false`): the config cannot enable clipboard
+            // access. Without it WebKitGTK rejects `navigator.clipboard` reads, so Ctrl+V and
+            // right-click paste did nothing on Linux. macOS ignores the flag.
+            let main = app
+                .config()
+                .app
+                .windows
+                .first()
+                .ok_or("tauri.conf.json defines no window")?
+                .clone();
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &main)?
+                .enable_clipboard_access()
+                .build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
