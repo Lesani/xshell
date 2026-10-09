@@ -171,6 +171,16 @@ pub fn alive(pid: i32) -> bool {
             }
         }
     }
+    // macOS has no /proc: ask ps for the state (`Z` for a zombie).
+    #[cfg(not(target_os = "linux"))]
+    if let Ok(o) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        if String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z') {
+            return false;
+        }
+    }
     true
 }
 
