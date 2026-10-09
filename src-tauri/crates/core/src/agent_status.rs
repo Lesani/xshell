@@ -1255,6 +1255,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     use std::time::Duration;
 
     #[cfg(unix)]
