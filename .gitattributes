@@ -1,0 +1,2 @@
+# Test vectors are compared byte for byte; keep LF on every OS.
+src-tauri/crates/protocol/testdata/** text eol=lf
