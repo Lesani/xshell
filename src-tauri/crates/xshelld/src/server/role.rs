@@ -210,6 +210,8 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         // Ring membership is the Desktop's to manage.
         ClientMsg::RingIdentity => Err(forbidden("ring.identity")),
         ClientMsg::RingJoin { .. } => Err(forbidden("ring.join")),
+        // A Mobile's own push registration; the handler refuses anyone else.
+        ClientMsg::PushRegister { .. } | ClientMsg::PushUnregister => Ok(()),
     }
 }
 
@@ -719,6 +721,18 @@ mod tests {
             check(Role::Mobile, &ctx, &ClientMsg::TermClose { terminal: t }),
             Ok(())
         );
+        // A Mobile's own push registration passes; the handler refuses everyone else.
+        let reg = ClientMsg::PushRegister {
+            blob: "xpb1.a.b".into(),
+            seal_key: "k".into(),
+            triggers: xshell_protocol::msg::PushTriggers {
+                needs_you: true,
+                finished: true,
+            },
+        };
+        for m in [&reg, &ClientMsg::PushUnregister] {
+            assert_eq!(check(Role::Mobile, &ctx, m), Ok(()));
+        }
     }
 
     fn daemon(dir: &Path) -> Arc<Daemon> {
@@ -742,6 +756,15 @@ mod tests {
                 Default::default(),
                 std::time::Duration::from_secs(60),
             ),
+            push: Arc::new(crate::server::push::Push::new(
+                dir.join("ring"),
+                crate::server::push::PushConfig {
+                    window: std::time::Duration::from_secs(10),
+                    timeout: std::time::Duration::from_secs(20),
+                    retry: std::time::Duration::from_secs(2),
+                    hooks: Default::default(),
+                },
+            )),
         })
     }
 

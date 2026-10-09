@@ -2,9 +2,10 @@
 
 How a device joins a **Ring** (**Pairing**) and how members then talk to each other end
 to end through the **Relay**. The Relay's side (the pairing pipe and envelopes) is in
-`RELAY.md`; this document is what both endpoints must agree on. Design: ADR-0004 and
+`RELAY.md`; this document is what both endpoints must agree on. Design: ADR-0004,
 ADR-0010. `ring::pairing` and `ring::noise` implement it sans-IO; `ring::relay::pair` and
-`ring::relay::sessions` drive it over a Relay connection.
+`ring::relay::sessions` drive it over a Relay connection. Push, which rides on these
+sessions, is in `PUSH.md`.
 
 All byte strings below are ASCII unless said otherwise, `\n` is LF, `‖` is concatenation,
 and `b64u` is the strict base64url of `RELAY.md` section 2. JSON is strict in the same way
@@ -170,3 +171,9 @@ Either side ends a session, and its stream fails, when:
 An initiator that gets no HS2 within 5 s tries again with a new `sid`, for up to 15 s: a
 Daemon may not yet have the head that lists a device paired a moment ago (a Relay client
 drops envelopes from senders not in its head).
+
+## 7. Push
+
+A Daemon wakes a Mobile through the Push Gateway with a payload sealed to that Mobile's
+seal key, registered over the session (`push.register`). The registration, the sealed
+payload, the freshness rule and the limits are in `PUSH.md`.

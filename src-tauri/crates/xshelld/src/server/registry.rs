@@ -37,6 +37,8 @@ pub(crate) struct Daemon {
     pub escalations: Arc<orphans::Escalations>,
     /// This Host's Ring membership and Relay connection.
     pub ring: super::ring::Ring,
+    /// Push notifications to the Ring's Mobiles.
+    pub push: Arc<super::push::Push>,
 }
 
 #[derive(Default)]
@@ -278,7 +280,7 @@ impl Daemon {
                     // The socket carries Desktops only: local ones and `xshelld connect`.
                     let r = std::thread::Builder::new()
                         .name(format!("conn-{id}-r"))
-                        .spawn(move || conn::handle(d, sock, id, Role::Desktop));
+                        .spawn(move || conn::handle(d, sock, id, Role::Desktop, None));
                     if let Err(e) = r {
                         crate::log!("ERROR", "cannot start connection thread: {e}");
                     }
@@ -321,6 +323,7 @@ impl Daemon {
         if self.exiting.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.push.stop();
         // The goodbye runs alongside ending the Terminals and is over before the lock is
         // released, so an upgraded successor connects only after it.
         let me = self.clone();
@@ -374,6 +377,9 @@ impl Daemon {
         if let Some(h) = bye {
             let _ = h.join();
         }
+        // The Relay connection is gone, so pushes in flight end at once; none writes once
+        // the lock is released.
+        self.push.shutdown(Instant::now() + Duration::from_secs(5));
         // Released last: a successor may start as soon as this is gone.
         // Unlocked explicitly: a child forked meanwhile may still share the file.
         if let Some(l) = self.lock_file.lock().unwrap().take() {

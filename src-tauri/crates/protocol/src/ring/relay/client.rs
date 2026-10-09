@@ -10,8 +10,8 @@ use super::io::{self, Handler, IoConfig, Outbox};
 use super::transport::{self, Conn};
 use super::wire::{
     auth_message, check_payload, decode_relay, entitlement_well_formed, ByeReason, ClientFrame,
-    CloseReason, ErrorCode, MemberPresence, Presence, RelayFrame, MAX_ENVELOPE_PAYLOAD, MAX_FRAME,
-    RELAY_PROTOCOL,
+    CloseReason, ErrorCode, MemberPresence, Presence, RelayFrame, CAP_FOREGROUND, CAP_PUSH,
+    MAX_ENVELOPE_PAYLOAD, MAX_FRAME, RELAY_PROTOCOL,
 };
 use rustls::ClientConfig;
 use std::collections::HashMap;
@@ -126,6 +126,8 @@ struct Pending {
 
 struct State {
     chain: RosterChain,
+    /// What the Relay listed in `welcome.caps`.
+    caps: Vec<String>,
     presence: HashMap<SignKey, Presence>,
     entitlement: Option<String>,
     limited: bool,
@@ -389,7 +391,7 @@ fn authenticate(
             presence,
             entitlement,
             limited,
-            ..
+            caps,
         } => {
             if you != me {
                 return Err(RingError::Protocol("welcome for another key".into()));
@@ -399,6 +401,7 @@ fn authenticate(
                 entitlement,
                 limited,
                 relay_head: roster_version,
+                caps,
             }
         }
         RelayFrame::Error { code, detail, .. } => return Err(RingError::Relay { code, detail }),
@@ -417,6 +420,35 @@ struct Welcomed {
     entitlement: Option<String>,
     limited: bool,
     relay_head: u64,
+    caps: Vec<String>,
+}
+
+/// A queued request's answer.
+pub struct Ticket {
+    id: u64,
+    rx: mpsc::Receiver<Result<(), RingError>>,
+    state: Arc<Mutex<State>>,
+}
+
+impl Ticket {
+    /// Waits up to `timeout` for the answer; `Err(Timeout)` leaves the outcome unknown.
+    pub fn wait(self, timeout: Duration) -> Result<(), RingError> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => {
+                lock(&self.state).waiting.remove(&self.id);
+                Err(RingError::Timeout)
+            }
+        }
+    }
+}
+
+/// What a Daemon asks the Relay to forward to the Push Gateway (section 18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRequest {
+    pub blob: String,
+    pub sealed_payload: String,
+    pub collapse_id: String,
 }
 
 /// One `roster.get` round: the versions after `since` and whether more remain.
@@ -563,6 +595,7 @@ impl RingClient {
             entitlement,
             limited,
             relay_head,
+            caps,
         } = w;
 
         // Catch up with a Relay that is ahead, verifying every version.
@@ -597,6 +630,7 @@ impl RingClient {
             .collect();
         let state = Arc::new(Mutex::new(State {
             chain,
+            caps,
             presence,
             entitlement,
             limited,
@@ -651,7 +685,10 @@ impl RingClient {
             .map(|m| MemberStatus {
                 member: m.clone(),
                 presence: if m.sign_key == self.me && !st.closed {
-                    MemberPresence::Online { since: None }
+                    MemberPresence::Online {
+                        since: None,
+                        foreground_until: None,
+                    }
                 } else {
                     st.presence
                         .get(&m.sign_key)
@@ -712,11 +749,12 @@ impl RingClient {
         )
     }
 
-    fn request(
+    /// Queues a request (never blocks); its answer comes through the ticket.
+    fn request_start(
         &self,
         accept: Option<String>,
         frame: impl FnOnce(u64) -> ClientFrame,
-    ) -> Result<(), RingError> {
+    ) -> Result<Ticket, RingError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(1);
         {
@@ -730,13 +768,20 @@ impl RingClient {
             lock(&self.state).waiting.remove(&id);
             return Err(e);
         }
-        match rx.recv_timeout(self.timeouts.request) {
-            Ok(r) => r,
-            Err(_) => {
-                lock(&self.state).waiting.remove(&id);
-                Err(RingError::Timeout)
-            }
-        }
+        Ok(Ticket {
+            id,
+            rx,
+            state: self.state.clone(),
+        })
+    }
+
+    fn request(
+        &self,
+        accept: Option<String>,
+        timeout: Duration,
+        frame: impl FnOnce(u64) -> ClientFrame,
+    ) -> Result<(), RingError> {
+        self.request_start(accept, frame)?.wait(timeout)
     }
 
     /// Uploads the next Roster version and waits for the Relay to accept it. It must extend
@@ -747,12 +792,14 @@ impl RingClient {
             .extended(std::slice::from_ref(next))?;
         // On `ok` the IO thread accepts the version through the same path as the Relay's
         // broadcast, so `RingEvents::roster` fires exactly once whichever arrives first.
-        self.request(Some(next.token().to_string()), |id| {
-            ClientFrame::RosterPut {
+        self.request(
+            Some(next.token().to_string()),
+            self.timeouts.request,
+            |id| ClientFrame::RosterPut {
                 id,
                 roster: next.token().to_string(),
-            }
-        })
+            },
+        )
     }
 
     /// Stores a Push Gateway entitlement token in the Ring's slot on the Relay.
@@ -760,9 +807,56 @@ impl RingClient {
         if !entitlement_well_formed(token) {
             return Err(RingError::Invalid("not an entitlement token".into()));
         }
-        self.request(None, |id| ClientFrame::EntitlementPut {
+        self.request(None, self.timeouts.request, |id| {
+            ClientFrame::EntitlementPut {
+                id,
+                token: token.to_string(),
+            }
+        })
+    }
+
+    /// What the Relay listed in `welcome.caps` (`foreground`, `push`, …).
+    pub fn relay_caps(&self) -> Vec<String> {
+        lock(&self.state).caps.clone()
+    }
+
+    fn has_cap(&self, cap: &str) -> bool {
+        lock(&self.state).caps.iter().any(|c| c == cap)
+    }
+
+    /// A Mobile entering or leaving the foreground (fire and forget). `Ok(false)`: the Relay
+    /// does not list `foreground`, so nothing was sent.
+    pub fn set_foreground(&self, foreground: bool) -> Result<bool, RingError> {
+        if !self.has_cap(CAP_FOREGROUND) {
+            return Ok(false);
+        }
+        self.outbox
+            .send_text(ClientFrame::State { foreground }.encode())?;
+        Ok(true)
+    }
+
+    /// Asks the Relay to forward one push to the Push Gateway and waits up to `timeout` for
+    /// its answer. A Relay that does not list `push` is never asked:
+    /// `Err(Relay{unsupported})`. `Err(Timeout)` leaves the outcome unknown.
+    pub fn push(&self, req: &PushRequest, timeout: Duration) -> Result<(), RingError> {
+        self.push_start(req)?.wait(timeout)
+    }
+
+    /// [`RingClient::push`] in two steps: queues the frame without blocking (so a caller can
+    /// do it under its own locks, right after its last check) and returns the ticket its
+    /// answer comes through.
+    pub fn push_start(&self, req: &PushRequest) -> Result<Ticket, RingError> {
+        if !self.has_cap(CAP_PUSH) {
+            return Err(RingError::Relay {
+                code: ErrorCode::Unsupported,
+                detail: Some(CAP_PUSH.into()),
+            });
+        }
+        self.request_start(None, |id| ClientFrame::Push {
             id,
-            token: token.to_string(),
+            blob: req.blob.clone(),
+            sealed_payload: req.sealed_payload.clone(),
+            collapse_id: req.collapse_id.clone(),
         })
     }
 

@@ -2,6 +2,8 @@
 //! binary, and a protocol client built only from xshell-protocol's codec.
 #![allow(dead_code)]
 
+pub mod ring;
+
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;

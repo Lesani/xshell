@@ -23,6 +23,7 @@ use xshell_protocol::msg::{
     decode_inbound, encode_res, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
 };
 use xshell_protocol::negotiate::negotiate;
+use xshell_protocol::ring::Member;
 use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE, PROTOCOL};
 
 /// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
@@ -49,13 +50,16 @@ struct Conn {
     id: ConnId,
     /// Set by the transport; no message changes it.
     role: Role,
+    /// The Ring member a Relay session came from, as the head listed it; `None` for the
+    /// local socket and SSH.
+    peer: Option<Member>,
     ob: Arc<Outbox>,
     /// Terminals this connection attached to or sized; all are released on disconnect.
     touched: HashSet<Uuid>,
     inflight: Arc<AtomicUsize>,
 }
 
-pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role) {
+pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer: Option<Member>) {
     let (wsock, asock) = match (sock.try_clone(), sock.try_clone()) {
         (Ok(w), Ok(a)) => (w, a),
         _ => return,
@@ -123,6 +127,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role) {
         d: d.clone(),
         id,
         role,
+        peer,
         ob: ob.clone(),
         touched: HashSet::new(),
         inflight: Arc::new(AtomicUsize::new(0)),
@@ -412,6 +417,20 @@ impl Conn {
             // Never blocks: leaving another Ring says goodbye on a thread of its own.
             ClientMsg::RingJoin { rosters, expect } => {
                 reply(&self.ob, id, d.ring.join(&rosters, expect.as_ref()))
+            }
+            // Only from a Mobile's session: the registration is bound to its Roster entry.
+            ClientMsg::PushRegister {
+                blob,
+                seal_key,
+                triggers,
+            } => {
+                let peer = self.peer.as_ref().filter(|_| self.role == Role::Mobile);
+                let r = d.push.register(peer, &blob, &seal_key, triggers);
+                reply(&self.ob, id, r)
+            }
+            ClientMsg::PushUnregister => {
+                let peer = self.peer.as_ref().filter(|_| self.role == Role::Mobile);
+                reply(&self.ob, id, d.push.unregister(peer))
             }
             ClientMsg::DaemonUpgrade => {
                 {

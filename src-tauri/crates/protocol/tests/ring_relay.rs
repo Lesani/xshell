@@ -70,12 +70,97 @@ scenario!(
     pair_pipe_refuses_third,
     pair_pipe_caps_messages,
     pair_pipe_closes_peer,
+    state_foreground_reaches_presence,
+    state_foreground_clears_on_bye_and_drop,
+    state_refused_from_non_mobile,
+    push_unavailable_without_gateway,
+);
+
+/// A Relay forwarding to a fake gateway of its own, so scripted replies never cross tests.
+fn push_relay() -> (TestRelay, Arc<FakeGateway>) {
+    let gw = Arc::new(FakeGateway::start());
+    let r = TestRelay::start_with(TestRelayOptions {
+        auth_timeout: Duration::from_millis(500),
+        push_gateway: Some(gw.url()),
+        push_timeout: Duration::from_secs(2),
+        ..TestRelayOptions::default()
+    });
+    (r, gw)
+}
+
+macro_rules! push_scenario {
+    ($($name:ident),* $(,)?) => {$(
+        #[test]
+        fn $name() {
+            let (r, gw) = push_relay();
+            let mut t = r.target();
+            t.fake_gateway = Some(gw);
+            contract::$name(&t);
+        }
+    )*};
+}
+
+push_scenario!(
+    push_forwards_exactly_once_verbatim,
+    push_refused_while_a_mobile_is_foreground,
+    push_refused_from_non_daemon,
+    push_relays_gateway_refusal_detail,
+    push_bad_fields_refused,
 );
 
 #[test]
+fn state_foreground_lease_expires() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        foreground_lease: Duration::from_millis(1500),
+        ..TestRelayOptions::default()
+    });
+    contract::state_foreground_lease_expires(&r.target());
+}
+
+#[test]
 fn every_scenario_is_listed_and_run_here() {
-    // The macro above and SCENARIOS must not drift apart.
-    assert_eq!(SCENARIOS.len(), 34);
+    // The macros above and the lists must not drift apart.
+    assert_eq!(SCENARIOS.len(), 37);
+    assert_eq!(PUSH_SCENARIOS.len(), 5);
+    assert_eq!(PUSH_UNAVAILABLE_SCENARIOS.len(), 1);
+    assert_eq!(FOREGROUND_LEASE_SCENARIOS.len(), 1);
+}
+
+#[test]
+fn push_gateway_timeout_is_unreachable() {
+    let (r, gw) = push_relay();
+    gw.set_delay(Duration::from_secs(3));
+    let t = r.target();
+    let ring = TestRing::new(&t.url);
+    let (d, _) = connect(&t, &ring.chain, ring.daemon.clone());
+    match d.push(&contract::push_request(), WAIT) {
+        Err(RingError::Relay { code, detail }) => {
+            assert_eq!(code, ErrorCode::PushFailed);
+            assert_eq!(detail.as_deref(), Some("unreachable"));
+        }
+        other => panic!("expected unreachable, got {other:?}"),
+    }
+    assert_eq!(r.push_frames(), 1);
+}
+
+#[test]
+fn push_counts_toward_the_quota() {
+    let gw = Arc::new(FakeGateway::start());
+    let r = TestRelay::start_with(TestRelayOptions {
+        push_gateway: Some(gw.url()),
+        quota_frames_per_day: Some(2),
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    let ring = TestRing::new(&t.url);
+    let (d, _) = connect(&t, &ring.chain, ring.daemon.clone());
+    d.push(&contract::push_request(), WAIT).expect("first");
+    d.push(&contract::push_request(), WAIT).expect("second");
+    match d.push(&contract::push_request(), WAIT) {
+        Err(RingError::Relay { code, .. }) => assert_eq!(code, ErrorCode::Quota),
+        other => panic!("expected quota, got {other:?}"),
+    }
+    assert_eq!(gw.requests().len(), 2);
 }
 
 #[test]
@@ -243,6 +328,8 @@ fn relay_asserted_sender_and_presence_are_only_assertions() {
         online: true,
         last_seen: Some(1),
         last_reason: None,
+        foreground: false,
+        foreground_until: None,
     });
     r.inject(&ring.ring_id(), &me, &fake.encode());
     assert!(rec.wait_presence(&ring.daemon.sign_key(), |p| matches!(
@@ -383,6 +470,8 @@ fn trickled_tls_records_do_not_stall_sends_or_keepalive() {
         pair_opens_per_minute: None,
         pair_ttl: None,
         client_ip_header: None,
+        fake_gateway: None,
+        foreground_lease: None,
     };
     r.set_origin(&t.origin());
     let ring = TestRing::new(&t.url);
@@ -1139,6 +1228,8 @@ fn session_frames_before_welcome_fail_the_connect() {
         pair_opens_per_minute: None,
         pair_ttl: None,
         client_ip_header: None,
+        fake_gateway: None,
+        foreground_lease: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("env"), "{m}"),
@@ -1176,6 +1267,8 @@ fn too_much_traffic_during_sync_fails_the_connect() {
                     online: true,
                     last_seen: Some(1),
                     last_reason: None,
+                    foreground: false,
+                    foreground_until: None,
                 }),
             );
         }
@@ -1193,6 +1286,8 @@ fn too_much_traffic_during_sync_fails_the_connect() {
         pair_opens_per_minute: None,
         pair_ttl: None,
         client_ip_header: None,
+        fake_gateway: None,
+        foreground_lease: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("too much"), "{m}"),

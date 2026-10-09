@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use xshell_protocol::ring::entitlement::{
     entitlement_kid, sign_entitlement, verify_entitlement, GatewayKeys, Tier,
 };
+use xshell_protocol::ring::push::{
+    self, check_fresh, collapse_id, PushAgent, PushError, PushPayload, PushStatus,
+};
 use xshell_protocol::ring::relay::wire::{
     auth_message, decode_client, decode_relay, ByeReason, ClientFrame, ErrorCode, Presence,
     RelayFrame, WireError,
@@ -858,12 +861,30 @@ fn frames() -> Vec<(&'static str, String)> {
             token: "xet1.e30.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         },
         ClientFrame::Ping,
+        ClientFrame::State { foreground: true },
+        ClientFrame::State { foreground: false },
+        ClientFrame::Push {
+            id: 4,
+            blob: "xpb1.k1.AAAA".into(),
+            sealed_payload: payload.clone(),
+            collapse_id: collapse_id(&d.sign_key()),
+        },
     ];
     let presence = Presence {
         sign_key: d.sign_key(),
         online: false,
         last_seen: Some(T0 + 300),
         last_reason: Some("quit".into()),
+        foreground: false,
+        foreground_until: None,
+    };
+    let mobile_fg = Presence {
+        sign_key: dev(3).sign_key(),
+        online: true,
+        last_seen: Some(T0 + 250),
+        last_reason: None,
+        foreground: true,
+        foreground_until: Some(T0 * 1000 + 325_000),
     };
     let relay = vec![
         RelayFrame::Challenge {
@@ -881,8 +902,11 @@ fn frames() -> Vec<(&'static str, String)> {
                     online: true,
                     last_seen: Some(T0 + 200),
                     last_reason: None,
+                    foreground: false,
+                    foreground_until: None,
                 },
                 presence.clone(),
+                mobile_fg.clone(),
             ],
             entitlement: None,
             limited: false,
@@ -896,7 +920,16 @@ fn frames() -> Vec<(&'static str, String)> {
             limited: true,
             caps: vec![],
         },
+        RelayFrame::Welcome {
+            you: d.sign_key(),
+            roster_version: 2,
+            presence: vec![],
+            entitlement: None,
+            limited: false,
+            caps: vec!["foreground".into(), "push".into()],
+        },
         RelayFrame::Presence(presence),
+        RelayFrame::Presence(mobile_fg),
         RelayFrame::Env {
             from: d.sign_key(),
             payload,
@@ -935,6 +968,18 @@ fn frames() -> Vec<(&'static str, String)> {
             id: None,
             to: Some(a.sign_key()),
             detail: None,
+        },
+        RelayFrame::Error {
+            code: ErrorCode::PushFailed,
+            id: Some(4),
+            to: None,
+            detail: Some("foreground".into()),
+        },
+        RelayFrame::Error {
+            code: ErrorCode::PushFailed,
+            id: Some(5),
+            to: None,
+            detail: Some("device_gone".into()),
         },
         RelayFrame::Pong,
     ];
@@ -982,7 +1027,22 @@ fn int_bounds() -> Vec<(&'static str, String, String)> {
         ),
         (
             "relay",
-            Box::new(move |n| json!({"t":"presence","signKey":key,"online":false,"lastSeen":n})),
+            Box::new({
+                let key = key.clone();
+                move |n| json!({"t":"presence","signKey":key,"online":false,"lastSeen":n})
+            }),
+        ),
+        (
+            "relay",
+            Box::new(
+                move |n| json!({"t":"presence","signKey":key,"online":true,"foreground":true,"foregroundUntil":n}),
+            ),
+        ),
+        (
+            "client",
+            Box::new(
+                |n| json!({"t":"push","id":n,"blob":"xpb1.a.b","sealedPayload":"AAAA","collapseId":"c"}),
+            ),
         ),
     ];
     cases
@@ -1043,6 +1103,18 @@ fn lexemes() -> Vec<(String, &'static str)> {
             ),
             "invalid",
         ),
+        (r#"{"t":"state","foreground":true}"#.into(), "ok"),
+        (r#"{"t":"state","foreground":1}"#.into(), "invalid"),
+        (r#"{"t":"state"}"#.into(), "invalid"),
+        (
+            r#"{"t":"push","id":1,"blob":"xpb1.a.b","sealedPayload":"AAAA","collapseId":"c"}"#
+                .into(),
+            "ok",
+        ),
+        (
+            r#"{"t":"push","id":1,"blob":"xpb1.a.b","sealedPayload":"AAAA"}"#.into(),
+            "invalid",
+        ),
     ]
 }
 
@@ -1097,6 +1169,186 @@ fn entitlement_json() -> Value {
     })
 }
 
+// ---- Sealed pushes (PUSH.md) ---------------------------------------------------
+
+const SEAL_SECRET: [u8; 32] = [0x71; 32];
+
+/// Seals `plain` (already padded) from the Daemon (dev 2, or `from`) to `seal_key` with a
+/// fixed ephemeral key, exactly as `push::seal` does with a random one.
+fn seal_raw(from: usize, seal_key: &NoiseKey, ring: &RingId, e: &[u8; 32], plain: &[u8]) -> String {
+    let params: snow::params::NoiseParams = push::PUSH_PATTERN.parse().unwrap();
+    let pro = push::prologue(ring);
+    let mut hs = snow::Builder::new(params)
+        .local_private_key(&DEVS[from].noise_seed)
+        .unwrap()
+        .remote_public_key(seal_key.as_bytes())
+        .unwrap()
+        .prologue(&pro)
+        .unwrap()
+        .fixed_ephemeral_key_for_testing_only(e)
+        .build_initiator()
+        .unwrap();
+    let mut out = vec![0u8; 1 + 96 + plain.len()];
+    out[0] = 1;
+    let n = hs.write_message(plain, &mut out[1..]).unwrap();
+    out.truncate(1 + n);
+    b64::encode(&out)
+}
+
+fn ring0() -> RingId {
+    RingId::derive(&dev(0).sign_key())
+}
+
+fn seal_key() -> NoiseKey {
+    push::seal_key_of(&SEAL_SECRET).unwrap()
+}
+
+fn push_payloads() -> Vec<(&'static str, PushPayload)> {
+    let host = dev(2).sign_key();
+    let t = uuid::Uuid::parse_str("6f9619ff-8b86-d011-b42d-00c04fc964ff").unwrap();
+    let at = T0 * 1000 + 42_000;
+    vec![
+        (
+            "needs_you_512",
+            PushPayload {
+                host,
+                terminal: t,
+                status: PushStatus::NeedsYou,
+                agent: PushAgent::Claude,
+                project: "/home/me/app".into(),
+                title: Some("Fix the flaky test".into()),
+                at,
+                seq: 1_767_225_642_000,
+                needs_you: 1,
+            },
+        ),
+        (
+            "finished_long_project_1024",
+            PushPayload {
+                host,
+                terminal: t,
+                status: PushStatus::Finished,
+                agent: PushAgent::Codex,
+                project: format!("/srv/{}", "deep/".repeat(130)),
+                title: None,
+                at: at + 1,
+                seq: 1_767_225_642_001,
+                needs_you: 0,
+            },
+        ),
+        (
+            "non_ascii_title",
+            PushPayload {
+                host,
+                terminal: t,
+                status: PushStatus::NeedsYou,
+                agent: PushAgent::Claude,
+                project: "/Users/zoë/Projekte/straße".into(),
+                title: Some("Überprüfe 日本語 \"quotes\" 🚀".into()),
+                at: at + 2,
+                seq: 1_767_225_642_002,
+                needs_you: 3,
+            },
+        ),
+    ]
+}
+
+/// A plaintext built by hand: `len ‖ json ‖ padding`, padded to 512.
+fn raw_plain(len: u16, json: &[u8], pad: u8) -> Vec<u8> {
+    let mut v = len.to_be_bytes().to_vec();
+    v.extend_from_slice(json);
+    v.resize(512, pad);
+    v
+}
+
+fn push_error_name(e: &PushError) -> &'static str {
+    match e {
+        PushError::TooLarge => "too_large",
+        PushError::Encoding => "encoding",
+        PushError::Version => "version",
+        PushError::Crypto => "crypto",
+        PushError::Malformed(_) => "malformed",
+        PushError::Replayed => "replayed",
+        PushError::Stale => "stale",
+    }
+}
+
+fn push_json() -> Value {
+    let ring = ring0();
+    let sk = seal_key();
+    let ok: Vec<Value> = push_payloads()
+        .iter()
+        .enumerate()
+        .map(|(i, (name, p))| {
+            let e = [0x81 + i as u8; 32];
+            let plain = push::plaintext(p).unwrap();
+            json!({
+                "name": name,
+                "ephemeralSeedHex": hex(&e),
+                "plaintextHex": hex(&plain),
+                "sealedPayload": seal_raw(2, &sk, &ring, &e, &plain),
+                "sender": dev(2).noise_key(),
+                "payload": serde_json::from_slice::<Value>(&push::body(p).unwrap()).unwrap(),
+            })
+        })
+        .collect();
+    let (_, base) = push_payloads().remove(0);
+    let good_plain = push::plaintext(&base).unwrap();
+    let good = seal_raw(2, &sk, &ring, &[0x91; 32], &good_plain);
+    let json = push::body(&base).unwrap();
+    let mut flipped = b64::decode(&good).unwrap();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0x01;
+    let mut v2 = b64::decode(&good).unwrap();
+    v2[0] = 2;
+    let other_ring = RingId::derive(&dev(1).sign_key());
+    let dup = {
+        let s = String::from_utf8(json.clone()).unwrap();
+        s.replacen("{\"v\":1,", "{\"v\":1,\"v\":1,", 1)
+    };
+    let json_v2 = String::from_utf8(json.clone())
+        .unwrap()
+        .replacen("{\"v\":1,", "{\"v\":2,", 1);
+    let e = [0x92; 32];
+    let raw = |plain: &[u8]| seal_raw(2, &sk, &ring, &e, plain);
+    let reject = vec![
+        json!({"name": "wrong_seal_secret", "sealSecretHex": hex(&[0x72; 32]), "ringId": ring, "sealedPayload": good, "error": "crypto"}),
+        json!({"name": "mobile_session_key_as_seal_secret", "sealSecretHex": hex(&DEVS[3].noise_seed), "ringId": ring, "sealedPayload": good, "error": "crypto"}),
+        json!({"name": "other_ring", "sealSecretHex": hex(&SEAL_SECRET), "ringId": other_ring, "sealedPayload": good, "error": "crypto"}),
+        json!({"name": "flipped_tag_byte", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": b64::encode(&flipped), "error": "crypto"}),
+        json!({"name": "version_2", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": b64::encode(&v2), "error": "version"}),
+        json!({"name": "len_past_body", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": raw(&raw_plain(511, &json, 0)), "error": "malformed"}),
+        json!({"name": "nonzero_padding", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": raw(&raw_plain(json.len() as u16, &json, 0x20)), "error": "malformed"}),
+        json!({"name": "duplicate_key", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": raw(&raw_plain(dup.len() as u16, dup.as_bytes(), 0)), "error": "malformed"}),
+        json!({"name": "json_v2", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": raw(&raw_plain(json_v2.len() as u16, json_v2.as_bytes(), 0)), "error": "version"}),
+        json!({"name": "not_a_bucket", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": raw(&raw_plain(json.len() as u16, &json, 0)[..500]), "error": "malformed"}),
+        json!({"name": "too_long", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": "A".repeat(3073), "error": "too_large"}),
+        json!({"name": "padded_b64u", "sealSecretHex": hex(&SEAL_SECRET), "ringId": ring, "sealedPayload": format!("{good}="), "error": "encoding"}),
+    ];
+    // Opens, but the sender is no daemon of the Roster: the caller refuses it.
+    let stranger = seal_raw(4, &sk, &ring, &[0x93; 32], &good_plain);
+    let fresh = vec![
+        json!({"name": "fresh", "sealedPayload": good, "nowMs": base.at + 1000, "highestSeq": null, "result": "ok"}),
+        json!({"name": "replayed", "sealedPayload": good, "nowMs": base.at + 1000, "highestSeq": base.seq, "result": "replayed"}),
+        json!({"name": "stale_but_authentic", "sealedPayload": good, "nowMs": base.at + push::MAX_AGE_MS + 1, "highestSeq": null, "result": "stale"}),
+        json!({"name": "from_the_future", "sealedPayload": good, "nowMs": base.at - push::MAX_SKEW_MS - 1, "highestSeq": null, "result": "stale"}),
+    ];
+    json!({
+        "description": "Sealed pushes (PUSH.md): Noise_X_25519_ChaChaPoly_BLAKE2s from the daemon's noise key (keys.json) to sealKey, prologue \"xshell-push-v1\\n\" || ringId, plaintext len (u16 BE) || json || zeros padded to 512/1024/1536/2048, sealed = 0x01 || noise message, b64u. `ok`: seal plaintextHex with the fixed ephemeral to get sealedPayload; opening it gives `sender` and `payload`. `reject`: open must fail with `error`. `unknownSender` opens, but its sender is no daemon of the Roster. `freshness`: check_fresh after open at nowMs with the highest seq seen.",
+        "pattern": push::PUSH_PATTERN,
+        "ringId": ring,
+        "daemonNoiseSeedHex": hex(&DEVS[2].noise_seed),
+        "daemonSignKey": dev(2).sign_key(),
+        "sealSecretHex": hex(&SEAL_SECRET),
+        "sealKey": sk,
+        "collapseId": collapse_id(&dev(2).sign_key()),
+        "ok": ok,
+        "reject": reject,
+        "unknownSender": {"sealedPayload": stranger, "sender": dev(4).noise_key()},
+        "freshness": fresh,
+    })
+}
+
 fn build() -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     for (name, v) in [
@@ -1108,6 +1360,7 @@ fn build() -> BTreeMap<&'static str, String> {
         ("entitlement.json", entitlement_json()),
         ("ed25519.json", ed25519_json()),
         ("urls.json", urls_json()),
+        ("push.json", push_json()),
     ] {
         m.insert(name, serde_json::to_string_pretty(&v).unwrap() + "\n");
     }
@@ -1347,5 +1600,56 @@ fn vector_urls() {
             "{}",
             c["url"]
         );
+    }
+}
+
+#[test]
+fn vector_push() {
+    let v = read("push.json");
+    let ring = RingId::parse(v["ringId"].as_str().unwrap()).unwrap();
+    let secret = unhex32(v["sealSecretHex"].as_str().unwrap());
+    assert_eq!(push::seal_key_of(&secret).unwrap().to_b64(), v["sealKey"]);
+    let host = SignKey::parse(v["daemonSignKey"].as_str().unwrap()).unwrap();
+    assert_eq!(collapse_id(&host), v["collapseId"].as_str().unwrap());
+    let payloads = push_payloads();
+    for (c, (_, p)) in v["ok"].as_array().unwrap().iter().zip(&payloads) {
+        // Our encoder makes exactly the vector's plaintext; it opens to the payload.
+        assert_eq!(hex(&push::plaintext(p).unwrap()), c["plaintextHex"]);
+        let (who, got) = push::open(&secret, &ring, c["sealedPayload"].as_str().unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", c["name"]));
+        assert_eq!(who.to_b64(), c["sender"]);
+        assert_eq!(
+            serde_json::to_value(&got).unwrap()["seq"],
+            c["payload"]["seq"]
+        );
+        assert_eq!(&got.host, &host);
+        // What `seal` makes (random ephemeral) opens the same way.
+        let sealed = push::seal(&dev(2), &ring, &push::seal_key_of(&secret).unwrap(), p).unwrap();
+        assert_eq!(push::open(&secret, &ring, &sealed).unwrap().1, got);
+    }
+    for c in v["reject"].as_array().unwrap() {
+        let secret = unhex32(c["sealSecretHex"].as_str().unwrap());
+        let ring = RingId::parse(c["ringId"].as_str().unwrap()).unwrap();
+        let e = push::open(&secret, &ring, c["sealedPayload"].as_str().unwrap())
+            .expect_err(c["name"].as_str().unwrap());
+        assert_eq!(push_error_name(&e), c["error"], "{}", c["name"]);
+    }
+    let u = &v["unknownSender"];
+    let (who, _) = push::open(&secret, &ring, u["sealedPayload"].as_str().unwrap()).unwrap();
+    assert_eq!(who.to_b64(), u["sender"]);
+    let c = chain();
+    assert!(!c[1]
+        .roster()
+        .members
+        .iter()
+        .any(|m| m.role == Role::Daemon && m.noise_key == who));
+    for c in v["freshness"].as_array().unwrap() {
+        let (_, p) = push::open(&secret, &ring, c["sealedPayload"].as_str().unwrap()).unwrap();
+        let got = check_fresh(&p, c["nowMs"].as_u64().unwrap(), c["highestSeq"].as_u64());
+        let name = match &got {
+            Ok(()) => "ok",
+            Err(e) => push_error_name(e),
+        };
+        assert_eq!(name, c["result"], "{}", c["name"]);
     }
 }

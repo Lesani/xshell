@@ -360,7 +360,7 @@ pub struct PresenceView {
 impl PresenceView {
     fn of(p: &MemberPresence) -> Self {
         let (kind, reason, at) = match p {
-            MemberPresence::Online { since } => ("online", None, *since),
+            MemberPresence::Online { since, .. } => ("online", None, *since),
             MemberPresence::NeverConnected => ("never", None, None),
             MemberPresence::Closed { reason, at } => ("closed", Some(reason.clone()), *at),
             MemberPresence::Unreachable { at } => ("unreachable", None, *at),
@@ -1364,7 +1364,10 @@ impl DesktopRing {
             .map(|m| {
                 let presence = match &live {
                     _ if m.sign_key == me && v.connection == "connected" => {
-                        PresenceView::of(&MemberPresence::Online { since: None })
+                        PresenceView::of(&MemberPresence::Online {
+                            since: None,
+                            foreground_until: None,
+                        })
                     }
                     Some(list) => list
                         .iter()

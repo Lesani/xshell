@@ -8,6 +8,10 @@
 //! key in the target, [`QUOTA_SCENARIOS`] a Relay with a small daily quota, named in the
 //! target. The pairing scenarios open more slots from one machine than the default pairing
 //! rate limit allows, so a runner raises it, except for [`PAIR_RATE_SCENARIOS`].
+//! [`PUSH_SCENARIOS`] need a Relay that forwards pushes to the target's
+//! [`FakeGateway`] (run them one at a time: they script its replies),
+//! [`PUSH_UNAVAILABLE_SCENARIOS`] one without a gateway, and [`FOREGROUND_LEASE_SCENARIOS`]
+//! one with a short foreground lease, named in the target.
 //!
 //! [`TestRelay`]: super::test_relay::TestRelay
 
@@ -17,11 +21,13 @@ use super::super::pairing::PairSecret;
 use super::super::roster::{Member, Role, Roster, RosterError, SignedRoster};
 use super::super::url::RelayUrl;
 use super::super::{b64, DeviceKeys, RingError, RingId, SignError, SignKey, Signature, Signer};
-use super::client::{RingClient, RingClientConfig, RingEvents, RingTimeouts};
+use super::client::{PushRequest, RingClient, RingClientConfig, RingEvents, RingTimeouts};
+pub use super::fake_gateway::{FakeGateway, Reply};
 use super::transport::{self, Conn};
 use super::wire::{
     auth_message, close, decode_relay, ByeReason, ClientFrame, CloseReason, ErrorCode,
-    MemberPresence, RelayFrame, MAX_ENVELOPE_PAYLOAD, PING, PONG, QUOTA_REFUSALS_BEFORE_CLOSE,
+    MemberPresence, RelayFrame, CAP_FOREGROUND, CAP_PUSH, FOREGROUND_LEASE, MAX_ENVELOPE_PAYLOAD,
+    PING, PONG, QUOTA_REFUSALS_BEFORE_CLOSE,
 };
 use super::wire::{
     decode_pair_relay, PairClientFrame, PairRelayFrame, MAX_PAIR_MSGS, PAIR_MAX_SLOTS_PER_PREFIX,
@@ -62,6 +68,12 @@ pub struct RelayTarget {
     /// the header's name. The pairing scenarios then send client addresses of their own in
     /// it; without one they open from the runner's address.
     pub client_ip_header: Option<String>,
+    /// For a Relay that forwards pushes: the fake Push Gateway it forwards to.
+    /// [`PUSH_SCENARIOS`] need one.
+    pub fake_gateway: Option<Arc<FakeGateway>>,
+    /// For a Relay with a short foreground lease: [`FOREGROUND_LEASE_SCENARIOS`] need one of
+    /// at most 5 s. `None`: the protocol's 75 s.
+    pub foreground_lease: Option<Duration>,
 }
 
 impl RelayTarget {
@@ -876,7 +888,7 @@ pub fn presence_online(t: &RelayTarget) {
         .expect("daemon listed");
     assert!(matches!(
         d.presence,
-        MemberPresence::Online { since: Some(_) }
+        MemberPresence::Online { since: Some(_), .. }
     ));
 }
 
@@ -1156,7 +1168,8 @@ pub fn unknown_client_type_is_answered_and_tolerated(t: &RelayTarget) {
     let r = TestRing::new(&t.url);
     let (_a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
     let mut d = RawConn::login(t, &r.chain, &*r.daemon);
-    d.send(r#"{"t":"state","foreground":true}"#).expect("send");
+    d.send(r#"{"t":"future.thing","foreground":true}"#)
+        .expect("send");
     assert_eq!(d.error(WAIT).map(|e| e.0), Some(ErrorCode::UnknownType));
     d.env(&r.desktop.sign_key(), b"after unknown");
     assert!(rec_a
@@ -1442,6 +1455,389 @@ pub fn quota_refuses_then_closes(t: &RelayTarget) {
     )
     .expect("send bye");
     assert_eq!(d.close_code(WAIT), Some(close::NORMAL));
+}
+
+// ---- Foreground and push (sections 17 and 18) -------------------------------------------------
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn state(c: &mut RawConn, foreground: bool) {
+    c.send(&ClientFrame::State { foreground }.encode())
+        .expect("send state");
+}
+
+fn foreground(p: &MemberPresence) -> bool {
+    p.is_foreground(now_ms())
+}
+
+fn not_foreground_online(p: &MemberPresence) -> bool {
+    matches!(p, MemberPresence::Online { .. }) && !p.is_foreground(now_ms())
+}
+
+/// Presence events about `key` the recorder holds.
+fn presence_count(rec: &Recorder, key: &SignKey) -> usize {
+    rec.events()
+        .iter()
+        .filter(|e| matches!(e, Event::Presence { key: k, .. } if k == key))
+        .count()
+}
+
+/// A Mobile's `state` reaches the others' presence, with a lease deadline; a repeat changes
+/// nothing; `state false` clears it; a device connecting later reads it from `welcome`.
+pub fn state_foreground_reaches_presence(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    assert!(a.relay_caps().iter().any(|c| c == CAP_FOREGROUND));
+    let mut m = RawConn::login(t, &r.chain, &*r.mobile);
+    let mk = r.mobile.sign_key();
+    assert!(rec_a.wait_presence(&mk, |p| matches!(p, MemberPresence::Online { .. })));
+    let before = now_ms();
+    state(&mut m, true);
+    assert!(rec_a.wait_presence(&mk, foreground));
+    let lease = t.foreground_lease.unwrap_or(FOREGROUND_LEASE).as_millis() as u64;
+    match rec_a.presence_of(&mk) {
+        Some(MemberPresence::Online {
+            foreground_until: Some(u),
+            ..
+        }) => assert!(
+            u > before && u <= now_ms() + lease + 1000,
+            "foregroundUntil {u} outside the lease"
+        ),
+        other => panic!("expected a foreground lease, got {other:?}"),
+    }
+    let n = presence_count(&rec_a, &mk);
+    state(&mut m, true);
+    std::thread::sleep(QUIET);
+    assert_eq!(
+        presence_count(&rec_a, &mk),
+        n,
+        "a repeated state is broadcast"
+    );
+    state(&mut m, false);
+    assert!(rec_a.wait_presence(&mk, not_foreground_online));
+    state(&mut m, true);
+    assert!(rec_a.wait_presence(&mk, foreground));
+    let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+    let seen = d
+        .members()
+        .into_iter()
+        .find(|s| s.member.sign_key == mk)
+        .expect("mobile listed");
+    assert!(seen.presence.is_foreground(now_ms()), "{:?}", seen.presence);
+}
+
+/// Foreground ends with the socket: on `bye`, on a drop, and a new socket starts without it.
+pub fn state_foreground_clears_on_bye_and_drop(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (_a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let mk = r.mobile.sign_key();
+    let mut m = RawConn::login(t, &r.chain, &*r.mobile);
+    state(&mut m, true);
+    assert!(rec_a.wait_presence(&mk, foreground));
+    m.send(
+        &ClientFrame::Bye {
+            reason: ByeReason::quit(),
+        }
+        .encode(),
+    )
+    .expect("send bye");
+    assert!(rec_a.wait_presence(&mk, |p| matches!(p, MemberPresence::Closed { .. })));
+    assert!(!rec_a.presence_of(&mk).unwrap().is_foreground(0));
+    let mut m = RawConn::login(t, &r.chain, &*r.mobile);
+    assert!(rec_a.wait_presence(&mk, not_foreground_online));
+    state(&mut m, true);
+    assert!(rec_a.wait_presence(&mk, foreground));
+    drop(m);
+    assert!(rec_a.wait_presence(&mk, |p| matches!(p, MemberPresence::Unreachable { .. })));
+    let _m = RawConn::login(t, &r.chain, &*r.mobile);
+    std::thread::sleep(QUIET);
+    let p = rec_a.presence_of(&mk).expect("presence");
+    assert!(not_foreground_online(&p), "{p:?}");
+}
+
+/// Only a Mobile may send `state`: anyone else gets `bad_request` and stays connected.
+pub fn state_refused_from_non_mobile(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (_a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let mut d = RawConn::login(t, &r.chain, &*r.daemon);
+    state(&mut d, true);
+    assert_eq!(d.error(WAIT).map(|e| e.0), Some(ErrorCode::BadRequest));
+    d.env(&r.desktop.sign_key(), b"still here");
+    assert!(rec_a
+        .wait_for(
+            WAIT,
+            |e| matches!(e, Event::Envelope { payload, .. } if payload == b"still here")
+        )
+        .is_some());
+    let mut d2 = RawConn::login(t, &r.chain, &*r.desktop2);
+    state(&mut d2, true);
+    assert_eq!(d2.error(WAIT).map(|e| e.0), Some(ErrorCode::BadRequest));
+    std::thread::sleep(QUIET);
+    for k in [r.daemon.sign_key(), r.desktop2.sign_key()] {
+        assert!(!rec_a.presence_of(&k).is_some_and(|p| p.is_foreground(0)));
+    }
+}
+
+/// A lease runs out without frames or pings, even with the socket open: the flag clears and
+/// the change is broadcast. Pings renew it.
+pub fn state_foreground_lease_expires(t: &RelayTarget) {
+    let lease = t
+        .foreground_lease
+        .expect("a target with a short foreground lease");
+    assert!(lease <= Duration::from_secs(5));
+    let r = TestRing::new(&t.url);
+    let (_a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let mk = r.mobile.sign_key();
+    // Pinging: renewed past the first lease.
+    let mut m = RawConn::login(t, &r.chain, &*r.mobile);
+    state(&mut m, true);
+    assert!(rec_a.wait_presence(&mk, foreground));
+    let first = match rec_a.presence_of(&mk) {
+        Some(MemberPresence::Online {
+            foreground_until: Some(u),
+            ..
+        }) => u,
+        other => panic!("expected a lease, got {other:?}"),
+    };
+    let end = Instant::now() + lease * 2;
+    while Instant::now() < end {
+        m.send(PING).expect("ping");
+        let _ = m.recv(lease / 8);
+    }
+    let p = rec_a.presence_of(&mk).expect("presence");
+    match p {
+        MemberPresence::Online {
+            foreground_until: Some(u),
+            ..
+        } => assert!(u > first && p.is_foreground(now_ms()), "not renewed: {u}"),
+        other => panic!("a pinging Mobile lost foreground: {other:?}"),
+    }
+    // Silent (a half-open socket): cleared once the lease runs out, still online.
+    let silent = Instant::now();
+    assert!(rec_a
+        .wait_for(lease * 2 + WAIT, |e| matches!(
+            e,
+            Event::Presence { key, presence } if key == &mk && silent.elapsed() > lease / 2
+                && not_foreground_online(presence)
+        ))
+        .is_some());
+}
+
+fn fake_gateway(t: &RelayTarget) -> &Arc<FakeGateway> {
+    t.fake_gateway
+        .as_ref()
+        .expect("a target with a fake Push Gateway")
+}
+
+/// A unique, well-formed push request.
+pub fn push_request() -> PushRequest {
+    let mut n = [0u8; 16];
+    getrandom::getrandom(&mut n).expect("randomness");
+    PushRequest {
+        blob: format!("xpb1.test.{}", b64::encode(&n)),
+        sealed_payload: b64::encode(&[7u8; 609]),
+        collapse_id: format!("c-{}", &b64::encode(&n)[..8]),
+    }
+}
+
+/// The gateway's requests for `req`'s blob.
+fn forwarded(gw: &FakeGateway, req: &PushRequest) -> Vec<serde_json::Value> {
+    gw.requests()
+        .into_iter()
+        .filter(|v| v["blob"] == req.blob.as_str())
+        .collect()
+}
+
+fn push_frame(id: u64, req: &PushRequest) -> String {
+    ClientFrame::Push {
+        id,
+        blob: req.blob.clone(),
+        sealed_payload: req.sealed_payload.clone(),
+        collapse_id: req.collapse_id.clone(),
+    }
+    .encode()
+}
+
+fn push_failed(r: Result<(), RingError>) -> Option<String> {
+    match r {
+        Err(RingError::Relay {
+            code: ErrorCode::PushFailed,
+            detail,
+        }) => detail,
+        other => panic!("expected push_failed, got {other:?}"),
+    }
+}
+
+/// A Daemon's push reaches the gateway exactly once, as exactly `{blob, sealedPayload,
+/// collapseId}`, and is answered `ok`.
+pub fn push_forwards_exactly_once_verbatim(t: &RelayTarget) {
+    let gw = fake_gateway(t);
+    let r = TestRing::new(&t.url);
+    let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+    assert!(d.relay_caps().iter().any(|c| c == CAP_PUSH));
+    let req = push_request();
+    d.push(&req, WAIT).expect("push");
+    std::thread::sleep(QUIET);
+    let got = forwarded(gw, &req);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        got[0],
+        json!({
+            "blob": req.blob,
+            "sealedPayload": req.sealed_payload,
+            "collapseId": req.collapse_id,
+        })
+    );
+}
+
+/// While any Mobile of the Ring is in the foreground the Relay refuses a push with
+/// `foreground` and calls no gateway; once it leaves, pushes go through.
+pub fn push_refused_while_a_mobile_is_foreground(t: &RelayTarget) {
+    let gw = fake_gateway(t);
+    let r = TestRing::new(&t.url);
+    let (d, rec_d) = connect(t, &r.chain, signer(&r.daemon));
+    let mk = r.mobile.sign_key();
+    let mut m = RawConn::login(t, &r.chain, &*r.mobile);
+    state(&mut m, true);
+    assert!(rec_d.wait_presence(&mk, foreground));
+    let req = push_request();
+    assert_eq!(
+        push_failed(d.push(&req, WAIT)).as_deref(),
+        Some("foreground")
+    );
+    state(&mut m, false);
+    assert!(rec_d.wait_presence(&mk, not_foreground_online));
+    std::thread::sleep(QUIET);
+    assert!(forwarded(gw, &req).is_empty(), "forwarded while foreground");
+    d.push(&req, WAIT).expect("push after the foreground");
+    assert_eq!(forwarded(gw, &req).len(), 1);
+}
+
+/// Only a Daemon may push: a Desktop or a Mobile gets `push_failed` with detail `role`.
+pub fn push_refused_from_non_daemon(t: &RelayTarget) {
+    let gw = fake_gateway(t);
+    let r = TestRing::new(&t.url);
+    let req = push_request();
+    for who in [&r.desktop, &r.mobile] {
+        let mut c = RawConn::login(t, &r.chain, &**who);
+        c.send(&push_frame(5, &req)).expect("send push");
+        assert_eq!(
+            c.error(WAIT),
+            Some((ErrorCode::PushFailed, Some(5), Some("role".into())))
+        );
+    }
+    std::thread::sleep(QUIET);
+    assert!(forwarded(gw, &req).is_empty());
+}
+
+/// A gateway refusal comes back as its `code` when that is `^[a-z_]{1,32}$`, else as
+/// `gateway`.
+pub fn push_relays_gateway_refusal_detail(t: &RelayTarget) {
+    let gw = fake_gateway(t);
+    let r = TestRing::new(&t.url);
+    let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+    for (reply, detail) in [
+        (Reply::refusal(410, "device_gone"), "device_gone"),
+        (Reply::refusal(429, "quota_exceeded"), "quota_exceeded"),
+        (Reply::refusal(400, "Not-A-Code"), "gateway"),
+        (
+            Reply {
+                status: 500,
+                body: "oops".into(),
+            },
+            "gateway",
+        ),
+    ] {
+        gw.respond(reply);
+        let req = push_request();
+        assert_eq!(push_failed(d.push(&req, WAIT)).as_deref(), Some(detail));
+        assert_eq!(forwarded(gw, &req).len(), 1);
+    }
+}
+
+/// Malformed push fields are `bad_request` with the frame's `id`, and nothing is forwarded.
+pub fn push_bad_fields_refused(t: &RelayTarget) {
+    let gw = fake_gateway(t);
+    let r = TestRing::new(&t.url);
+    let mut d = RawConn::login(t, &r.chain, &*r.daemon);
+    let ok = push_request();
+    let cases = [
+        PushRequest {
+            blob: "xpb2.nope.AAAA".into(),
+            ..ok.clone()
+        },
+        PushRequest {
+            blob: format!("xpb1.{}", "a".repeat(4092)),
+            ..ok.clone()
+        },
+        PushRequest {
+            blob: "xpb1.a b".into(),
+            ..ok.clone()
+        },
+        PushRequest {
+            sealed_payload: "AA==".into(),
+            ..ok.clone()
+        },
+        PushRequest {
+            sealed_payload: "A".repeat(3073),
+            ..ok.clone()
+        },
+        PushRequest {
+            sealed_payload: String::new(),
+            ..ok.clone()
+        },
+        PushRequest {
+            collapse_id: String::new(),
+            ..ok.clone()
+        },
+        PushRequest {
+            collapse_id: "c".repeat(65),
+            ..ok.clone()
+        },
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        let id = 100 + i as u64;
+        d.send(&push_frame(id, c)).expect("send push");
+        assert_eq!(
+            d.error(WAIT).map(|e| (e.0, e.1)),
+            Some((ErrorCode::BadRequest, Some(id))),
+            "case {i}"
+        );
+    }
+    std::thread::sleep(QUIET);
+    // Every case keeps the blob or the collapse id of `ok`.
+    assert!(gw
+        .requests()
+        .iter()
+        .all(|v| v["blob"] != ok.blob.as_str() && v["collapseId"] != ok.collapse_id.as_str()));
+}
+
+/// A Relay without a gateway lists no `push` cap and refuses a push with `unavailable`; the
+/// client does not even send one.
+pub fn push_unavailable_without_gateway(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+    assert!(!d.relay_caps().iter().any(|c| c == CAP_PUSH));
+    assert!(d.relay_caps().iter().any(|c| c == CAP_FOREGROUND));
+    assert!(matches!(
+        d.push(&push_request(), WAIT),
+        Err(RingError::Relay {
+            code: ErrorCode::Unsupported,
+            ..
+        })
+    ));
+    let mut raw = RawConn::login(t, &r.chain, &*r.daemon);
+    raw.send(&push_frame(3, &push_request()))
+        .expect("send push");
+    assert_eq!(
+        raw.error(WAIT),
+        Some((ErrorCode::PushFailed, Some(3), Some("unavailable".into())))
+    );
 }
 
 // ---- The pairing pipe (section 16) ------------------------------------------------------------
@@ -1836,6 +2232,37 @@ pub const PAIR_RATE_SCENARIOS: &[(&str, Scenario)] =
 pub const QUOTA_SCENARIOS: &[(&str, Scenario)] =
     &[("quota_refuses_then_closes", quota_refuses_then_closes)];
 
+/// Scenarios for a Relay that forwards pushes to the target's fake gateway. Run them one at a
+/// time: they script the gateway's replies.
+pub const PUSH_SCENARIOS: &[(&str, Scenario)] = &[
+    (
+        "push_forwards_exactly_once_verbatim",
+        push_forwards_exactly_once_verbatim,
+    ),
+    (
+        "push_refused_while_a_mobile_is_foreground",
+        push_refused_while_a_mobile_is_foreground,
+    ),
+    ("push_refused_from_non_daemon", push_refused_from_non_daemon),
+    (
+        "push_relays_gateway_refusal_detail",
+        push_relays_gateway_refusal_detail,
+    ),
+    ("push_bad_fields_refused", push_bad_fields_refused),
+];
+
+/// Scenarios for a Relay without a Push Gateway.
+pub const PUSH_UNAVAILABLE_SCENARIOS: &[(&str, Scenario)] = &[(
+    "push_unavailable_without_gateway",
+    push_unavailable_without_gateway,
+)];
+
+/// Scenarios for a Relay with a short foreground lease; the target names it.
+pub const FOREGROUND_LEASE_SCENARIOS: &[(&str, Scenario)] = &[(
+    "state_foreground_lease_expires",
+    state_foreground_lease_expires,
+)];
+
 /// Scenarios for a Hosted Relay; the target must carry the gateway key.
 pub const HOSTED_SCENARIOS: &[(&str, Scenario)] = &[
     (
@@ -1935,4 +2362,16 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("pair_pipe_refuses_third", pair_pipe_refuses_third),
     ("pair_pipe_caps_messages", pair_pipe_caps_messages),
     ("pair_pipe_closes_peer", pair_pipe_closes_peer),
+    (
+        "state_foreground_reaches_presence",
+        state_foreground_reaches_presence,
+    ),
+    (
+        "state_foreground_clears_on_bye_and_drop",
+        state_foreground_clears_on_bye_and_drop,
+    ),
+    (
+        "state_refused_from_non_mobile",
+        state_refused_from_non_mobile,
+    ),
 ];

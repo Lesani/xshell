@@ -248,7 +248,7 @@ impl Store {
         self.dir.join("roster.json")
     }
 
-    fn ensure_dir(&self) -> io::Result<()> {
+    pub(crate) fn ensure_dir(&self) -> io::Result<()> {
         // Windows: created owned by this user with a user-only DACL, or made so (see
         // `xshell_core::private_fs`).
         #[cfg(windows)]
@@ -419,10 +419,32 @@ struct Joined {
     sessions: Sessions,
 }
 
+/// Told every newly trusted chain with its adoption epoch (the push registrations prune
+/// against it). The hook runs without the chain's lock, so calls can arrive out of order:
+/// the epoch, taken under the lock, orders them, and a lower one is stale.
+pub(crate) type HeadHook = Arc<dyn Fn(u64, &RosterChain) + Send + Sync>;
+
 /// The chain the store holds, shared with the Connector's callbacks.
 struct Persist {
     store: Store,
     chain: Mutex<Option<RosterChain>>,
+    on_head: std::sync::OnceLock<HeadHook>,
+    /// Bumped, with the chain's lock held, every time a chain is adopted.
+    epoch: AtomicU64,
+}
+
+impl Persist {
+    /// The epoch of a chain being adopted now; only with the chain's lock held.
+    fn adopt(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Tells the hook about `chain`, adopted at `epoch`; never with the chain's lock held.
+    fn head_changed(&self, epoch: u64, chain: &RosterChain) {
+        if let Some(h) = self.on_head.get() {
+            h(epoch, chain);
+        }
+    }
 }
 
 impl Persist {
@@ -452,7 +474,10 @@ impl Persist {
             }
         }
         sessions.sweep(trusted.head());
-        *cur = Some(trusted);
+        *cur = Some(trusted.clone());
+        let epoch = self.adopt();
+        drop(cur);
+        self.head_changed(epoch, &trusted);
     }
 }
 
@@ -545,6 +570,8 @@ impl Ring {
             persist: Arc::new(Persist {
                 store: Store { dir },
                 chain: Mutex::new(None),
+                on_head: std::sync::OnceLock::new(),
+                epoch: AtomicU64::new(0),
             }),
             keys: Mutex::new(None),
             life: Mutex::new(Life::default()),
@@ -561,6 +588,33 @@ impl Ring {
         &self.hub
     }
 
+    /// Calls `f` with every new trusted head (and the stored one at `resume`). Set once,
+    /// before `resume`.
+    pub fn set_on_head(&self, f: HeadHook) {
+        let _ = self.persist.on_head.set(f);
+    }
+
+    /// The chain this Host trusts, if it is in a Ring.
+    pub fn trusted_chain(&self) -> Option<RosterChain> {
+        self.persist
+            .chain
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What a push goes through: the Connector, this Host's keys and the trusted chain;
+    /// `None` while no Connector runs.
+    pub fn push_link(&self) -> Option<(Arc<Connector>, Arc<DeviceKeys>, RosterChain)> {
+        let connector = self.lock_life().joined.as_ref()?.connector.clone();
+        let keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        Some((connector, keys, self.trusted_chain()?))
+    }
+
     /// At start: rejoin the stored Ring, if this Host is a member of it.
     pub fn resume(&self) {
         let keys = match self.persist.store.load_keys() {
@@ -575,7 +629,12 @@ impl Ring {
         let Some(chain) = self.persist.store.load_chain() else {
             return;
         };
-        *self.persist.chain.lock().unwrap_or_else(|e| e.into_inner()) = Some(chain.clone());
+        let epoch = {
+            let mut cur = self.persist.chain.lock().unwrap_or_else(|e| e.into_inner());
+            *cur = Some(chain.clone());
+            self.persist.adopt()
+        };
+        self.persist.head_changed(epoch, &chain);
         if !is_daemon_member(&chain, &keys) {
             crate::log!("INFO", "ring: this Host is not in the stored Roster");
             return;
@@ -744,6 +803,7 @@ impl Ring {
             .is_some_and(|c| c.ring_id() == trusted.ring_id());
         let moved = cur.as_ref() != Some(&trusted);
         *cur = Some(trusted.clone());
+        let epoch = moved.then(|| self.persist.adopt());
         match life.joined.as_ref() {
             Some(j) if same_ring => {
                 if moved {
@@ -757,6 +817,9 @@ impl Ring {
             _ => self.install(&mut life, trusted.clone(), keys)?,
         }
         drop(cur);
+        if let Some(epoch) = epoch {
+            self.persist.head_changed(epoch, &trusted);
+        }
         if let Some(e) = saved.conflict {
             crate::log!("ERROR", "ring: refused a roster: {e}");
             return Err(format!("roster refused: {e}"));

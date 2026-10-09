@@ -34,12 +34,24 @@
       "json": "{\"t\":\"ping\"}"
     },
     {
+      "dir": "client",
+      "json": "{\"t\":\"state\",\"foreground\":true}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"state\",\"foreground\":false}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"push\",\"id\":4,\"blob\":\"xpb1.k1.AAAA\",\"sealedPayload\":\"bm9pc2UgbWVzc2FnZQ\",\"collapseId\":\"3iK24M_jXCTBEAtAJKytMw\"}"
+    },
+    {
       "dir": "relay",
       "json": "{\"t\":\"challenge\",\"v\":1,\"nonce\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI\",\"rosterVersion\":2,\"caps\":[]}"
     },
     {
       "dir": "relay",
-      "json": "{\"t\":\"welcome\",\"you\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"rosterVersion\":2,\"presence\":[{\"signKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"online\":true,\"lastSeen\":1767225800,\"lastReason\":null},{\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"online\":false,\"lastSeen\":1767225900,\"lastReason\":\"quit\"}],\"entitlement\":null,\"caps\":[]}"
+      "json": "{\"t\":\"welcome\",\"you\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"rosterVersion\":2,\"presence\":[{\"signKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"online\":true,\"lastSeen\":1767225800,\"lastReason\":null},{\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"online\":false,\"lastSeen\":1767225900,\"lastReason\":\"quit\"},{\"signKey\":\"25lf4lFp0UHKubu6krqgH58uHs599MsqwFGQ83_MH50\",\"online\":true,\"lastSeen\":1767225850,\"lastReason\":null,\"foreground\":true,\"foregroundUntil\":1767225925000}],\"entitlement\":null,\"caps\":[]}"
     },
     {
       "dir": "relay",
@@ -47,7 +59,15 @@
     },
     {
       "dir": "relay",
+      "json": "{\"t\":\"welcome\",\"you\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"rosterVersion\":2,\"presence\":[],\"entitlement\":null,\"caps\":[\"foreground\",\"push\"]}"
+    },
+    {
+      "dir": "relay",
       "json": "{\"t\":\"presence\",\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"online\":false,\"lastSeen\":1767225900,\"lastReason\":\"quit\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"presence\",\"signKey\":\"25lf4lFp0UHKubu6krqgH58uHs599MsqwFGQ83_MH50\",\"online\":true,\"lastSeen\":1767225850,\"lastReason\":null,\"foreground\":true,\"foregroundUntil\":1767225925000}"
     },
     {
       "dir": "relay",
@@ -84,6 +104,14 @@
     {
       "dir": "relay",
       "json": "{\"t\":\"error\",\"code\":\"entitlement_required\",\"to\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"error\",\"code\":\"push_failed\",\"id\":4,\"detail\":\"foreground\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"error\",\"code\":\"push_failed\",\"id\":5,\"detail\":\"device_gone\"}"
     },
     {
       "dir": "relay",
@@ -135,6 +163,16 @@
       "dir": "relay",
       "max": "{\"lastSeen\":9007199254740991,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}",
       "over": "{\"lastSeen\":9007199254740992,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"foreground\":true,\"foregroundUntil\":9007199254740991,\"online\":true,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}",
+      "over": "{\"foreground\":true,\"foregroundUntil\":9007199254740992,\"online\":true,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}"
+    },
+    {
+      "dir": "client",
+      "max": "{\"blob\":\"xpb1.a.b\",\"collapseId\":\"c\",\"id\":9007199254740991,\"sealedPayload\":\"AAAA\",\"t\":\"push\"}",
+      "over": "{\"blob\":\"xpb1.a.b\",\"collapseId\":\"c\",\"id\":9007199254740992,\"sealedPayload\":\"AAAA\",\"t\":\"push\"}"
     }
   ],
   "lexemes": [
@@ -251,6 +289,31 @@
     {
       "dir": "client",
       "json": "{\"t\":\"env\",\"to\":\"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"payload\":\"aGk\"}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"state\",\"foreground\":true}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"state\",\"foreground\":1}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"state\"}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"push\",\"id\":1,\"blob\":\"xpb1.a.b\",\"sealedPayload\":\"AAAA\",\"collapseId\":\"c\"}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"push\",\"id\":1,\"blob\":\"xpb1.a.b\",\"sealedPayload\":\"AAAA\"}",
       "result": "invalid"
     }
   ]

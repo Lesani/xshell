@@ -115,6 +115,9 @@ pub enum ErrorCode {
     PairExpired,
     /// Pairing pipe: more than [`MAX_PAIR_MSGS`] messages in one direction.
     TooMany,
+    /// A `push` was not forwarded, or the Push Gateway refused it; `detail` says why
+    /// (section 18).
+    PushFailed,
     /// A code this version does not know.
     Other(String),
 }
@@ -143,6 +146,7 @@ const ERROR_CODES: &[(ErrorCode, &str)] = &[
     (ErrorCode::PairBusy, "pair_busy"),
     (ErrorCode::PairExpired, "pair_expired"),
     (ErrorCode::TooMany, "too_many"),
+    (ErrorCode::PushFailed, "push_failed"),
 ];
 
 impl ErrorCode {
@@ -247,31 +251,65 @@ pub struct Presence {
     /// The last `bye` reason, or `dropped`; `null` while online or never seen.
     #[serde(default)]
     pub last_reason: Option<String>,
+    /// A Mobile in the foreground (section 17); omitted when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub foreground: bool,
+    /// While `foreground`: unix ms when the Relay's foreground lease runs out unless it
+    /// renews it (section 17).
+    #[serde(
+        default,
+        deserialize_with = "safe::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub foreground_until: Option<u64>,
 }
+
+/// Cap a Relay lists when it takes `state` frames and reports foreground Mobiles (section 17).
+pub const CAP_FOREGROUND: &str = "foreground";
+/// Cap a Relay lists when it forwards `push` frames to a Push Gateway (section 18).
+pub const CAP_PUSH: &str = "push";
+/// A Mobile counts as foreground only while its last frame or ping is younger than this.
+pub const FOREGROUND_LEASE: std::time::Duration = std::time::Duration::from_secs(75);
+/// A Relay renews a foreground lease at the latest this long before it runs out.
+pub const FOREGROUND_RENEW_BEFORE: std::time::Duration = std::time::Duration::from_secs(25);
+/// The Relay's deadline for the Push Gateway's answer.
+pub const PUSH_GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Pushes a Relay forwards at once per Ring; more are refused with `busy`.
+pub const PUSH_MAX_IN_FLIGHT: usize = 8;
 
 /// What a client makes of a [`Presence`] record. A Relay assertion, not a proof.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MemberPresence {
     Online {
         since: Option<u64>,
+        /// A Mobile the Relay reports in the foreground: unix ms its lease runs out. A
+        /// record that says foreground without a deadline never runs out (fail closed).
+        foreground_until: Option<u64>,
     },
     /// A Roster member the Relay has not seen yet.
     NeverConnected,
     /// It said goodbye: "xshell closed".
-    Closed {
-        reason: String,
-        at: Option<u64>,
-    },
+    Closed { reason: String, at: Option<u64> },
     /// The socket dropped without a goodbye: "unreachable".
-    Unreachable {
-        at: Option<u64>,
-    },
+    Unreachable { at: Option<u64> },
+}
+
+impl MemberPresence {
+    /// Online and in the foreground at `now_ms` (its lease not run out).
+    pub fn is_foreground(&self, now_ms: u64) -> bool {
+        matches!(self, MemberPresence::Online { foreground_until: Some(u), .. } if now_ms < *u)
+    }
 }
 
 impl From<&Presence> for MemberPresence {
     fn from(p: &Presence) -> Self {
         if p.online {
-            return MemberPresence::Online { since: p.last_seen };
+            return MemberPresence::Online {
+                since: p.last_seen,
+                foreground_until: p
+                    .foreground
+                    .then_some(p.foreground_until.unwrap_or(u64::MAX)),
+            };
         }
         match (&p.last_reason, p.last_seen) {
             (None, None) => MemberPresence::NeverConnected,
@@ -390,6 +428,18 @@ pub enum ClientFrame {
     },
     #[serde(rename = "ping")]
     Ping,
+    /// A Mobile entering or leaving the foreground (section 17).
+    #[serde(rename = "state")]
+    State { foreground: bool },
+    /// A Daemon asking for a push to be forwarded to the Push Gateway (section 18).
+    #[serde(rename = "push", rename_all = "camelCase")]
+    Push {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        blob: String,
+        sealed_payload: String,
+        collapse_id: String,
+    },
     /// A type this version does not know (decode only).
     #[serde(skip)]
     Unknown { t: String },
@@ -404,6 +454,8 @@ const CLIENT_TYPES: &[&str] = &[
     "roster.get",
     "entitlement.put",
     "ping",
+    "state",
+    "push",
 ];
 
 /// Relay → client.
@@ -736,8 +788,10 @@ mod tests {
             })
         );
         assert_eq!(
-            decode_client(r#"{"t":"state","foreground":true}"#),
-            Ok(ClientFrame::Unknown { t: "state".into() })
+            decode_client(r#"{"t":"later.thing","foreground":true}"#),
+            Ok(ClientFrame::Unknown {
+                t: "later.thing".into()
+            })
         );
     }
 
@@ -794,6 +848,13 @@ mod tests {
             },
             ClientFrame::RosterGet { id: 3, since: 1 },
             ClientFrame::Ping,
+            ClientFrame::State { foreground: true },
+            ClientFrame::Push {
+                id: 4,
+                blob: "xpb1.k.AAAA".into(),
+                sealed_payload: "AAAA".into(),
+                collapse_id: "c".into(),
+            },
         ];
         for f in frames {
             assert_eq!(decode_client(&f.encode()).unwrap(), f);
@@ -823,11 +884,27 @@ mod tests {
             online,
             last_seen: seen,
             last_reason: reason.map(str::to_string),
+            foreground: false,
+            foreground_until: None,
         };
         assert_eq!(
             MemberPresence::from(&p(true, Some(5), None)),
-            MemberPresence::Online { since: Some(5) }
+            MemberPresence::Online {
+                since: Some(5),
+                foreground_until: None
+            }
         );
+        let mut fg = p(true, Some(5), None);
+        fg.foreground = true;
+        fg.foreground_until = Some(1000);
+        let m = MemberPresence::from(&fg);
+        assert!(m.is_foreground(999) && !m.is_foreground(1000));
+        // Without a deadline: foreground for good (fail closed).
+        fg.foreground_until = None;
+        assert!(MemberPresence::from(&fg).is_foreground(u64::MAX - 1));
+        // Offline is never foreground.
+        fg.online = false;
+        assert!(!MemberPresence::from(&fg).is_foreground(0));
         assert_eq!(
             MemberPresence::from(&p(false, None, None)),
             MemberPresence::NeverConnected

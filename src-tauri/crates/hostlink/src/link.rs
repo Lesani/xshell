@@ -133,6 +133,8 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::TermEvent { .. } => "term.event",
         ClientMsg::RingIdentity => "ring.identity",
         ClientMsg::RingJoin { .. } => "ring.join",
+        ClientMsg::PushRegister { .. } => "push.register",
+        ClientMsg::PushUnregister => "push.unregister",
     }
 }
 

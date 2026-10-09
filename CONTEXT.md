@@ -120,6 +120,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 - A **Mobile** is woken when an **Agent Status** becomes needs you or finished, each switchable in settings; the **Daemon** decides and seals the payload, so the **Relay** learns only that some device should be woken
 - A **Daemon** streams raw **Terminal** output to a **Mobile** only while that **Terminal**'s **Terminal View** is on screen; the **Chat View** receives session updates, never screen redraws. That stream is at most 1 frame per second, rising to 10 per second for 3 seconds after the **Mobile** sends input
 - A **Relay** asks the **Push Gateway** to wake a **Mobile** only when no **Mobile** of its **Ring** is in the foreground; the **Push Gateway** never sees **Terminal** content
+- A **Daemon** seals each push to a seal key the **Mobile** registers over its session for that purpose alone, never its session key; a **Mobile** counts as in the foreground only while it tells the **Relay** so and its connection stays live, and the **Daemon** and the **Relay** both check it
 - "Desktop" as a **Roster** role means a computer **Desktop**; a **Mobile** has its own role, never the desktop role
 - Only **Desktops** may change the **Roster**; **Mobiles** and headless **Daemons** are members that cannot add or remove anyone
 - A **Remote Host** joins its **Desktop**'s **Ring** automatically when that **Desktop** installs its **Daemon** over SSH; other machines pair with `xshelld pair`

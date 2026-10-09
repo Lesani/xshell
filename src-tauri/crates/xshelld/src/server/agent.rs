@@ -49,6 +49,8 @@ pub(crate) fn on_event(
         Some(t) => t.on_agent_event(run, status).map(|changed| {
             if changed && !reg.frozen {
                 d.broadcast_terminals(&reg);
+                // The agent reported it itself: a push may go out (input never pushes).
+                d.push.notify(terminal, run, status);
             }
             Value::Null
         }),

@@ -273,6 +273,11 @@ Relay  -> {"t":"welcome","you":"<signKey>","rosterVersion":N,"presence":[…],"e
 
 - `rosterVersion` in the challenge is the Relay's stored head version for this Ring, or 0
   when it has none.
+- `caps` in `challenge` and `welcome` lists the Relay's optional features: `foreground`
+  (section 17) and `push` (section 18, only when a Push Gateway is configured). A device
+  sends `state` or `push` only when the cap is listed: an older Relay answers them with
+  `unknown_type` and no `id`, so a request to it would only time out. `auth.caps` is
+  reserved (send `[]`).
 - Before `auth` the client may only send `auth.chain`, `auth` and `ping`. Anything else gets
   `error{code:"bad_request"}` and close 4000.
 - If `auth` does not arrive within the **auth timeout** of the challenge (10 s by default; a
@@ -351,10 +356,13 @@ Relay has not seen can still connect by supplying that version itself.
 Per member the Relay stores and persists (a Durable Object can be evicted at any time):
 
 ```json
-{"signKey":"…","online":true,"lastSeen":1767225600,"lastReason":null}
+{"signKey":"…","online":true,"lastSeen":1767225600,"lastReason":null,"foreground":true,"foregroundUntil":1767225675000}
 ```
 
 - `lastSeen` is the time of the last connect or disconnect, `null` if never seen.
+- `foreground` and `foregroundUntil` (unix ms) describe a Mobile in the foreground
+  (section 17). Both are omitted when it is not; a device reads a missing `foreground` as
+  `false`.
 - `lastReason` is the last `bye` reason, the reserved value `"dropped"` when a socket closed
   without one, and `null` while online or never seen.
 - Every change is pushed to the other connected members as `{"t":"presence",…record}`.
@@ -515,10 +523,10 @@ default. Any other Relay applies one only when it is configured with one (the Wo
   and the JSON parse (section 6). Frames before `auth` do not count. The exact bytes
   `{"t":"ping"}` never count: on Cloudflare they are auto-answered and never reach the
   Durable Object (section 13). A ping written any other way (`{"t": "ping"}`) does count.
-  `bye` is never counted or refused.
+  `bye` is never counted or refused. `state` and `push` count like any other frame.
 - **Over the quota:** once the Ring's count for the day has reached the quota, a frame is not
   processed. The Relay answers `error{code:"quota"}`, with the frame's `id` (`roster.put`,
-  `roster.get`, `entitlement.put`) or `to` (`env`) when it decoded with one, and the socket
+  `roster.get`, `entitlement.put`, `push`) or `to` (`env`) when it decoded with one, and the socket
   stays open. After 32 refusals in a row on one socket (`wire::QUOTA_REFUSALS_BEFORE_CLOSE`;
   a processed frame starts the count again), the Relay closes it with 4029. Nothing is
   billed.
@@ -534,7 +542,7 @@ default. Any other Relay applies one only when it is configured with one (the Wo
 
 | Code | Close | Meaning |
 |---|---|---|
-| `bad_request` | 4000 if malformed or before auth | bad frame, bad envelope, or `auth`/`auth.chain` after auth |
+| `bad_request` | 4000 if malformed or before auth | bad frame, bad envelope, `auth`/`auth.chain` after auth, `state` from anyone but a Mobile, bad `push` fields (with `id`) |
 | `unsupported` | 4000 | binary frame |
 | `unknown_type` | no | unknown `t` after auth |
 | `auth_timeout` | 4008 | no `auth` within the auth timeout (10 s by default) |
@@ -554,6 +562,7 @@ default. Any other Relay applies one only when it is configured with one (the Wo
 | `pair_busy` | 4010 | pairing pipe: a third socket, or a slot already used (section 16) |
 | `pair_expired` | 4008 | pairing pipe: the slot's time is up |
 | `too_many` | 4000 | pairing pipe: more than eight `pair.msg` from one socket |
+| `push_failed` | no | a `push` not forwarded or refused by the gateway; `detail` says why (section 18) |
 
 A close with 1000 follows a `bye`. Devices treat unknown codes as errors and keep going.
 
@@ -652,16 +661,83 @@ The test Relay implements all of this (the rate limit only when configured with
 configured); `TestRelayOptions::lax_pairing` turns single use and the lifetime off, to prove
 that the endpoints enforce them themselves. The contract scenarios `pair_pipe_*`,
 `pair_prefix_cap_refuses_21st`, `pair_reservation_released_on_meeting` and
-`pair_refusal_burns_slot` pin it (section 19).
+`pair_refusal_burns_slot` pin it (section 20).
 
-## 17. Reserved for later versions
+## 17. Foreground
 
-- `{"t":"state","foreground":bool}`, sent by Mobiles, which would add `foreground` to their
-  presence;
-- `{"t":"push",…}`, for push forwarding;
-- caps `foreground`, `push`, `bin`. Binary frames stay reserved.
+A Mobile tells the Relay when its app comes to the foreground and when it leaves it, so that
+no push wakes a phone whose user is looking at the app (cap `foreground`):
 
-## 18. Worker checklist
+```text
+client -> {"t":"state","foreground":true|false}
+```
+
+- Only a member whose head role is `mobile` may send it. Anyone else gets
+  `error{code:"bad_request"}`, and the socket stays open.
+- It is a control frame (8 KiB cap) and counts toward the quota (section 14). It has no
+  answer. A frame that does not change the value is not broadcast.
+- **The lease.** A Mobile counts as foreground only while its socket's last frame or ping is
+  younger than **75 s** (`wire::FOREGROUND_LEASE`): on a Worker the later of the last
+  `webSocketMessage` and `getWebSocketAutoResponseTimestamp`. A suspended iPhone whose
+  socket is half open therefore stops counting within 75 s, `state false` or not.
+- **Presence.** The member's presence record (section 8) gains `"foreground":true` and
+  `"foregroundUntil"`, the unix ms at which the lease runs out counted from the latest
+  activity the Relay knew when it sent the record. Every change is broadcast like any
+  presence change, and `welcome.presence` carries it.
+- **Renewal.** The Relay renews a lease at the latest 25 s before it runs out
+  (`wire::FOREGROUND_RENEW_BEFORE`; a Worker sets an alarm): if the socket was active since,
+  it broadcasts the record with a later `foregroundUntil`; once the lease has run out, it
+  clears the flag and broadcasts that. Devices treat a Mobile as foreground only while
+  `now < foregroundUntil`, so a lost update cannot keep pushes off for longer than one lease.
+  A record with `foreground` but without `foregroundUntil` counts as foreground for good
+  (it fails closed).
+  `foregroundUntil` is on the Relay's clock: a device whose clock runs ahead ends the lease
+  early (the Relay's own check in section 18 still holds), one whose clock runs behind
+  holds pushes back a little longer.
+- The flag resets to false on `bye`, close, error, replacement (the new socket starts
+  without it), removal and the wake sweep (section 8).
+- A Mobile re-sends its state after every reconnect (`Connector::set_foreground`).
+
+## 18. Push
+
+A Daemon asks the Relay to forward a push to the Push Gateway (cap `push`, listed only when
+the Relay is configured with a gateway):
+
+```text
+client -> {"t":"push","id":n,"blob":"xpb1…","sealedPayload":"…","collapseId":"…"}
+Relay  -> {"t":"ok","id":n}
+       |  {"t":"error","id":n,"code":"push_failed","detail":D}
+```
+
+- `blob` is the Mobile's push blob from the gateway (opaque here); `sealedPayload` is sealed
+  to the Mobile (`PUSH.md`) and opaque to the Relay and the gateway;
+  `collapseId` lets a newer push of one Host replace the older notification.
+- **Checks, in this order:**
+  1. the sender's head role is `daemon`, else `push_failed` with detail `role`;
+  2. the fields: `blob` starts with `xpb1.`, is 8 to 4096 bytes of `[A-Za-z0-9_.-]`;
+     `sealedPayload` is canonical b64u of 1 to 3072 characters; `collapseId` is 1 to 64
+     bytes. Else `error{code:"bad_request",id}`. The frame then stays under 8 KiB;
+  3. no Mobile of the Ring is in the foreground with its lease running (section 17), else
+     `push_failed` with detail `foreground`, and the gateway is not called. This recheck
+     closes the race of a Mobile coming to the foreground while a push is on its way;
+  4. a gateway is configured, else `push_failed` with detail `unavailable`;
+  5. at most 8 pushes per Ring are being forwarded at once
+     (`wire::PUSH_MAX_IN_FLIGHT`), else `push_failed` with detail `busy`.
+- **Forwarding.** The Relay sends `POST {gateway}/v1/push` with exactly
+  `{"blob","sealedPayload","collapseId"}` and a 15 s deadline
+  (`wire::PUSH_GATEWAY_TIMEOUT`), and answers when the gateway does:
+  - 200: `ok`;
+  - a refusal `{"error":{"code",…}}`: `push_failed` with `detail` = that `code` when it
+    matches `^[a-z_]{1,32}$`, else `gateway`;
+  - a network failure or the deadline: `push_failed` with detail `unreachable`.
+- A push counts toward the quota (section 14) and is forwarded once: the Relay never retries.
+  The gateway charges an attempt before any external call, so a Daemon retries only
+  `reconcile_pending`, once.
+- The answer goes to the socket that sent the frame; if that socket is gone, it is dropped.
+
+Reserved: cap `bin`. Binary frames stay reserved.
+
+## 19. Worker checklist
 
 - One Durable Object per Ring (`idFromName(ringId)`), using WebSocket Hibernation.
 - Storage: `roster:<version>` (the token string), `head` (version number), `presence:<signKey>`
@@ -700,8 +776,16 @@ that the endpoints enforce them themselves. The contract scenarios `pair_pipe_*`
   slot caps (per prefix and per Relay), whose reservations the slot releases as soon as it
   is used up or burnt, expires or refuses its first open. The client address comes from
   `CF-Connecting-IP` only when `request.cf` is present, else from `CLIENT_IP_HEADER`.
+- Foreground (section 17): keep `foreground` per Mobile socket in its attachment (it ends
+  with the socket); compute the lease from the later of the last `webSocketMessage` and
+  `getWebSocketAutoResponseTimestamp`; an alarm renews or clears each lease at the latest
+  25 s before it runs out and broadcasts the change; `welcome.presence` carries it.
+- Push (section 18): `PUSH_GATEWAY_URL` configures the gateway and the `push` cap; check
+  role, fields, foreground (live, from the leases) and the gateway in that order; forward
+  with `fetch` and a 15 s `AbortSignal.timeout`; at most 8 in flight per Ring; answer on the
+  sending socket only if it is still open.
 
-## 19. Test vectors and the contract suite
+## 20. Test vectors and the contract suite
 
 `crates/protocol/testdata/ring/` holds deterministic vectors (fixed seeds and timestamps;
 Ed25519 is deterministic):
@@ -714,7 +798,8 @@ Ed25519 is deterministic):
 | `roster-reject.json` | `cases` (`{name, trusted[], candidate, error}`): stale, forged and tampered signatures, a malleated and a small-order-R signature, Mobile/Daemon/non-member signers, gap, `prev` mismatch, fork, wrong Ring id, genesis not self-derived or by a Mobile, no Desktop, duplicate keys, unusable member keys, integer lexemes, non-finite numbers, lone surrogates, invalid UTF-8, nesting depth, plain `ws://`, bad encodings; `accepted` (`{name, candidate}`): unusual but valid genesis tokens (floats and big numbers in unknown fields, depth 127, an escaped surrogate pair, a non-canonical member key) |
 | `auth.json` | an origin, Ring id, nonce, key, the signed message and signature; origins that must not verify; origin normalization pairs |
 | `urls.json` | `accept` (`{url, origin, endpoint}` for a fixed Ring id) and `reject` (`{url, why}`) Relay URLs |
-| `frames.json` | one of every v1 frame; `intBounds`: frames at 2^53−1 (accepted) and one past it (refused); `lexemes`: client frames and whether they decode (`ok`), are `malformed`, or have bad fields (`invalid`) |
+| `frames.json` | one of every v1 frame (`state`, `push`, a foreground presence record and `push_failed` included); `intBounds`: frames at 2^53−1 (accepted) and one past it (refused); `lexemes`: client frames and whether they decode (`ok`), are `malformed`, or have bad fields (`invalid`) |
+| `push.json` | sealed pushes (`PUSH.md`): fixed keys and ephemerals, plaintexts and sealed payloads that open to their payloads, payloads that must be refused, one from a sender outside the Roster, and the freshness rule (replayed, stale) |
 | `entitlement.json` | a gateway key, its kid, and tokens with the expected verification result (ok, wrong tier, expired, other Ring, unknown kid, bad signature, malformed) |
 
 To regenerate them, run
@@ -723,7 +808,8 @@ A normal test run fails when the files are stale.
 
 The contract scenarios in `ring::relay::contract` (feature `test-relay`) are public functions
 taking a `RelayTarget { url, tls, auth_timeout, gateway, quota_frames_per_day,
-pair_opens_per_minute, pair_ttl, client_ip_header }`. This repository runs them against the test
+pair_opens_per_minute, pair_ttl, client_ip_header, fake_gateway,
+foreground_lease }`. This repository runs them against the test
 Relay. `xshell-remote` runs the same functions against the Worker on workerd, which makes them
 the definition of a conforming Relay. Every scenario uses fresh random keys, so it needs no
 reset. `contract::SCENARIOS` lists the single-Relay scenarios.
@@ -743,7 +829,16 @@ daily quota (at most 1000 frames), which their target's `quota_frames_per_day` n
 the default per-prefix cap of 20. When the Relay trusts a client address header, the
 target's `client_ip_header` names it, and these scenarios send addresses of their own in it,
 each in fresh random prefixes; without one, they open from the runner's address, and each
-needs a Relay on which nothing else from that prefix is outstanding.
+needs a Relay on which nothing else from that prefix is outstanding. `SCENARIOS` also holds the foreground scenarios
+`state_foreground_reaches_presence`, `state_foreground_clears_on_bye_and_drop` and
+`state_refused_from_non_mobile`. `contract::FOREGROUND_LEASE_SCENARIOS`
+(`state_foreground_lease_expires`) need a Relay with a foreground lease of at most 5 s
+(`foreground_lease`). `contract::PUSH_SCENARIOS` need a Relay that forwards to the
+`FakeGateway` in the target's `fake_gateway` (`ring::relay::fake_gateway`, a plain HTTP fake
+that records every request body and answers from a script; the Worker under test is started
+with its URL as the gateway). Run them one at a time: they script the gateway's replies.
+`contract::PUSH_UNAVAILABLE_SCENARIOS` (`push_unavailable_without_gateway`) need a Relay
+without a gateway.
 
 **Contract runners raise the rate limit.** The pairing scenarios open many more slots from
 one machine than the default 10 opens a minute allows. A runner therefore configures every

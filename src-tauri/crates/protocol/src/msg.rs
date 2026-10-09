@@ -112,6 +112,27 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<JoinExpect>,
     },
+    /// A Mobile's push registration (over its session): the Push Gateway's opaque `blob`
+    /// (`xpb1.…`), the X25519 `sealKey` pushes are sealed to (b64u; never the Mobile's
+    /// session key), and which Agent Status changes push. Replaces the Mobile's previous
+    /// registration. Mobile only; gated on the `push` capability.
+    #[serde(rename = "push.register", rename_all = "camelCase")]
+    PushRegister {
+        blob: String,
+        seal_key: String,
+        triggers: PushTriggers,
+    },
+    /// Forget this Mobile's push registration. Mobile only; gated on `push`.
+    #[serde(rename = "push.unregister")]
+    PushUnregister,
+}
+
+/// Which Agent Status changes wake a Mobile. Both are required.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PushTriggers {
+    pub needs_you: bool,
+    pub finished: bool,
 }
 
 /// The refusal of a conditional `ring.join` whose expected membership no longer holds.
@@ -181,6 +202,8 @@ const CLIENT_TYPES: &[&str] = &[
     "term.event",
     "ring.identity",
     "ring.join",
+    "push.register",
+    "push.unregister",
 ];
 
 /// `term.open`'s spec: a launch spec plus the Desktop-chosen UUID, initial size and opaque
@@ -629,6 +652,36 @@ mod tests {
         assert!(matches!(
             decode_inbound(raw.to_string().as_bytes()),
             Err(DecodeError::Invalid { id: Some(6), .. })
+        ));
+    }
+
+    #[test]
+    fn push_messages_roundtrip() {
+        let reg = ClientMsg::PushRegister {
+            blob: "xpb1.k.AAAA".into(),
+            seal_key: "S".into(),
+            triggers: PushTriggers {
+                needs_you: true,
+                finished: false,
+            },
+        };
+        let b = body(encode_msg(&reg, Some(7)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":7,"t":"push.register","blob":"xpb1.k.AAAA","sealKey":"S","triggers":{"needsYou":true,"finished":false}}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap().msg, reg);
+        let b = body(encode_msg(&ClientMsg::PushUnregister, Some(8)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":8,"t":"push.unregister"}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap().msg, ClientMsg::PushUnregister);
+        // Both triggers are required.
+        let raw = json!({"t":"push.register","id":9,"blob":"b","sealKey":"k","triggers":{"needsYou":true}});
+        assert!(matches!(
+            decode_inbound(raw.to_string().as_bytes()),
+            Err(DecodeError::Invalid { id: Some(9), .. })
         ));
     }
 

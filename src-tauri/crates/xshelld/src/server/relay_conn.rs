@@ -87,6 +87,7 @@ fn bridge(d: Arc<Daemon>, inc: Incoming) -> io::Result<()> {
         }
     };
     let id = d.next_conn.fetch_add(1, Ordering::SeqCst);
+    let peer = inc.member.clone();
     crate::log!(
         "INFO",
         "conn {id}: relay session from {} ({:?})",
@@ -101,7 +102,7 @@ fn bridge(d: Arc<Daemon>, inc: Incoming) -> io::Result<()> {
         .name(format!("conn-{id}-r"))
         .spawn({
             let d = d.clone();
-            move || conn::handle(d, theirs, id, role)
+            move || conn::handle(d, theirs, id, role, Some(peer))
         })
         .and_then(|_| {
             std::thread::Builder::new()

@@ -8,7 +8,8 @@
 use super::super::chain::{RosterChain, MAX_CHAIN_LEN};
 use super::super::entitlement::{verify_entitlement, GatewayKeys};
 use super::super::pairing::valid_slot;
-use super::super::roster::{RosterError, SignedRoster};
+use super::super::push::{blob_well_formed, collapse_id_well_formed, sealed_well_formed};
+use super::super::roster::{Role, RosterError, SignedRoster};
 use super::super::url::RelayUrl;
 use super::super::{verify, RingId, SignKey, Signature};
 use super::contract::RelayTarget;
@@ -21,6 +22,10 @@ use super::wire::{
 use super::wire::{
     decode_pair_client, PairClientFrame, PairRelayFrame, MAX_PAIR_FRAME, MAX_PAIR_MSGS,
     PAIR_MAX_SLOTS, PAIR_MAX_SLOTS_PER_PREFIX, PAIR_SLOT_TTL, PAIR_TOMBSTONE,
+};
+use super::wire::{
+    CAP_FOREGROUND, CAP_PUSH, FOREGROUND_LEASE, FOREGROUND_RENEW_BEFORE, PUSH_GATEWAY_TIMEOUT,
+    PUSH_MAX_IN_FLIGHT,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -86,6 +91,13 @@ pub struct TestRelayOptions {
     /// reverse proxy (its last list entry), instead of the socket's peer address. An open
     /// without a usable value counts against one shared bucket (section 16).
     pub client_ip_header: Option<String>,
+    /// Forward `push` frames to this Push Gateway (`http://host:port`, plain HTTP only) and
+    /// list the `push` cap. `None`: no cap, and `push` is refused as `unavailable`.
+    pub push_gateway: Option<String>,
+    /// The deadline for the gateway's answer (default 15 s).
+    pub push_timeout: Duration,
+    /// How long a Mobile counts as foreground after its last frame or ping (default 75 s).
+    pub foreground_lease: Duration,
 }
 
 impl Default for TestRelayOptions {
@@ -106,6 +118,9 @@ impl Default for TestRelayOptions {
             pair_max_slots_per_prefix: PAIR_MAX_SLOTS_PER_PREFIX,
             pair_tombstone: PAIR_TOMBSTONE,
             client_ip_header: None,
+            push_gateway: None,
+            push_timeout: PUSH_GATEWAY_TIMEOUT,
+            foreground_lease: FOREGROUND_LEASE,
         }
     }
 }
@@ -162,6 +177,9 @@ struct Rec {
     last_reason: Option<String>,
     /// The generation of the socket this record describes.
     gen: u64,
+    /// A Mobile's `state`, and the lease the last broadcast announced (unix ms).
+    foreground: bool,
+    foreground_until: Option<u64>,
 }
 
 struct RingState {
@@ -175,6 +193,11 @@ struct RingState {
     gens: HashMap<SignKey, u64>,
     /// The quota counter: the UTC day (days since the epoch) and the frames counted on it.
     quota: (u64, u64),
+    /// When each key's current socket last sent a frame or a ping (the Worker reads
+    /// `getWebSocketAutoResponseTimestamp` for pings).
+    activity: HashMap<SignKey, Instant>,
+    /// Pushes being forwarded to the gateway now.
+    pushes_in_flight: usize,
 }
 
 impl RingState {
@@ -185,13 +208,73 @@ impl RingState {
                 online: r.online,
                 last_seen: r.last_seen,
                 last_reason: r.last_reason.clone(),
+                foreground: r.online && r.foreground,
+                foreground_until: if r.online && r.foreground {
+                    r.foreground_until
+                } else {
+                    None
+                },
             },
             None => Presence {
                 sign_key: *key,
                 online: false,
                 last_seen: None,
                 last_reason: None,
+                foreground: false,
+                foreground_until: None,
             },
+        }
+    }
+
+    /// Unix ms when `key`'s foreground lease runs out, counted from its socket's last frame
+    /// or ping; `None` once it has.
+    fn lease_until(&self, key: &SignKey, lease: Duration) -> Option<u64> {
+        let since = self.activity.get(key)?.elapsed();
+        let left = lease.checked_sub(since).filter(|d| !d.is_zero())?;
+        Some(now_ms() + left.as_millis() as u64)
+    }
+
+    /// Whether any Mobile is in the foreground now: its `state` says so and its lease runs.
+    fn any_foreground(&self, lease: Duration) -> bool {
+        self.presence
+            .iter()
+            .any(|(k, r)| r.online && r.foreground && self.lease_until(k, lease).is_some())
+    }
+
+    /// Renews or ends the foreground leases (the Worker's alarm): a lease close to running
+    /// out is extended to the socket's latest activity, and one that ran out clears the
+    /// flag. Either is broadcast like any presence change.
+    fn sweep_foreground(&mut self, lease: Duration) {
+        let renew = FOREGROUND_RENEW_BEFORE.min(lease / 3);
+        let now = now_ms();
+        let mut changed = Vec::new();
+        let keys: Vec<SignKey> = self.presence.keys().copied().collect();
+        for k in keys {
+            let until = self.lease_until(&k, lease);
+            let Some(r) = self.presence.get_mut(&k) else {
+                continue;
+            };
+            if !(r.online && r.foreground) {
+                continue;
+            }
+            match until {
+                None => {
+                    r.foreground = false;
+                    r.foreground_until = None;
+                    changed.push(k);
+                }
+                Some(u) => {
+                    let old = r.foreground_until.unwrap_or(0);
+                    if u > old && old.saturating_sub(now) < renew.as_millis() as u64 {
+                        r.foreground_until = Some(u);
+                        changed.push(k);
+                    }
+                }
+            }
+        }
+        for k in changed {
+            let p = RelayFrame::Presence(self.presence_of(&k)).encode();
+            self.broadcast(Some(&k), &p);
         }
     }
 
@@ -221,6 +304,8 @@ impl RingState {
         r.online = false;
         r.last_seen = Some(now());
         r.last_reason = Some(reason.to_string());
+        r.foreground = false;
+        r.foreground_until = None;
         let p = RelayFrame::Presence(self.presence_of(key)).encode();
         self.broadcast(Some(key), &p);
     }
@@ -278,6 +363,8 @@ struct Shared {
     recorded: Mutex<Vec<Vec<u8>>>,
     /// The pairing pipe's slots and the per-address open log.
     pair: Mutex<PairState>,
+    /// `push` frames received (any outcome).
+    push_frames: std::sync::atomic::AtomicUsize,
     opts: TestRelayOptions,
     origin: Mutex<String>,
     tls: Option<Arc<ServerConfig>>,
@@ -364,6 +451,87 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl Shared {
+    /// What `challenge.caps` and `welcome.caps` list.
+    fn caps(&self) -> Vec<String> {
+        let mut c = vec![CAP_FOREGROUND.to_string()];
+        if self.opts.push_gateway.is_some() {
+            c.push(CAP_PUSH.to_string());
+        }
+        c
+    }
+}
+
+/// `POST {gateway}/v1/push` with `body`, waiting at most `timeout`: `Ok` on 200, else the
+/// `detail` the Relay reports (section 18).
+fn forward_push(gateway: &str, body: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let unreachable = || "unreachable".to_string();
+    let rest = gateway.strip_prefix("http://").ok_or_else(unreachable)?;
+    let (host, base) = match rest.split_once('/') {
+        Some((h, p)) => (h, format!("/{}", p.trim_end_matches('/'))),
+        None => (rest, String::new()),
+    };
+    let addr: SocketAddr = std::net::ToSocketAddrs::to_socket_addrs(host)
+        .ok()
+        .and_then(|mut a| a.next())
+        .ok_or_else(unreachable)?;
+    let left = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    };
+    let mut tcp = TcpStream::connect_timeout(&addr, left()).map_err(|_| unreachable())?;
+    let _ = tcp.set_write_timeout(Some(left()));
+    write!(
+        tcp,
+        "POST {base}/v1/push HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .map_err(|_| unreachable())?;
+    let mut resp = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(unreachable());
+        }
+        let _ = tcp.set_read_timeout(Some(left()));
+        match tcp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(unreachable()),
+        }
+        if resp.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&resp);
+    let status: u16 = text
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(unreachable)?;
+    if status == 200 {
+        return Ok(());
+    }
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["code"].as_str().map(str::to_string))
+        .filter(|c| {
+            (1..=32).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        });
+    Err(code.unwrap_or_else(|| "gateway".into()))
+}
+
 pub struct TestRelay {
     shared: Arc<Shared>,
     addr: SocketAddr,
@@ -417,6 +585,7 @@ impl TestRelay {
             recording: AtomicBool::new(false),
             recorded: Mutex::new(Vec::new()),
             pair: Mutex::new(PairState::default()),
+            push_frames: std::sync::atomic::AtomicUsize::new(0),
             opts,
             origin: Mutex::new(origin),
             tls,
@@ -424,6 +593,23 @@ impl TestRelay {
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
+        let s = shared.clone();
+        thread::spawn(move || {
+            // The foreground lease sweep (a Worker's alarm).
+            let lease = s.opts.foreground_lease;
+            let tick = (lease / 50).clamp(Duration::from_millis(5), Duration::from_millis(500));
+            while !s.stop.load(Ordering::Acquire) {
+                thread::sleep(tick);
+                for r in s
+                    .rings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values_mut()
+                {
+                    r.sweep_foreground(lease);
+                }
+            }
+        });
         let s = shared.clone();
         thread::spawn(move || {
             while !s.stop.load(Ordering::Acquire) {
@@ -474,6 +660,9 @@ impl TestRelay {
             tls: None,
             auth_timeout: self.shared.opts.auth_timeout,
             gateway: None,
+            fake_gateway: None,
+            foreground_lease: (self.shared.opts.foreground_lease != FOREGROUND_LEASE)
+                .then_some(self.shared.opts.foreground_lease),
             quota_frames_per_day: self.shared.quota(),
             pair_opens_per_minute: self.shared.opts.pair_opens_per_minute,
             pair_ttl: (self.shared.opts.pair_ttl != PAIR_SLOT_TTL)
@@ -585,6 +774,11 @@ impl TestRelay {
 
     pub fn presence(&self, ring: &RingId, key: &SignKey) -> Option<Presence> {
         self.rings().get(ring).map(|r| r.presence_of(key))
+    }
+
+    /// How many `push` frames the Relay received, whatever became of them.
+    pub fn push_frames(&self) -> usize {
+        self.shared.push_frames.load(Ordering::Acquire)
     }
 
     /// Bytes the client sent into connections taken over by `Fault::EmptyTlsRecords`.
@@ -1130,7 +1324,7 @@ impl Conn {
             v: RELAY_PROTOCOL,
             nonce: nonce.clone(),
             roster_version: challenge_version,
-            caps: Vec::new(),
+            caps: self.shared.caps(),
         }
         .encode();
         if !self.write(&challenge) {
@@ -1266,6 +1460,14 @@ impl Conn {
     fn handle(&mut self, text: &str) {
         let pre = matches!(self.phase, Phase::Pre { .. });
         let decoded = decode_client(text);
+        if let Phase::Authed { key, gen, .. } = self.phase {
+            let ring = self.ring.clone();
+            if let Some(s) = self.rings().get_mut(&ring) {
+                if s.conns.get(&key).is_some_and(|c| c.gen == gen) {
+                    s.activity.insert(key, Instant::now());
+                }
+            }
+        }
         // The quota counts authenticated frames past the size cap and the parse, except the
         // exact ping (auto-answered on a Worker, so it never reaches the Relay's code) and
         // `bye` (always honoured).
@@ -1356,7 +1558,8 @@ impl Conn {
             Ok(
                 ClientFrame::RosterPut { id, .. }
                 | ClientFrame::RosterGet { id, .. }
-                | ClientFrame::EntitlementPut { id, .. },
+                | ClientFrame::EntitlementPut { id, .. }
+                | ClientFrame::Push { id, .. },
             ) => (Some(*id), None),
             _ => (None, None),
         };
@@ -1546,6 +1749,8 @@ impl Conn {
             pings: HashMap::new(),
             gens: HashMap::new(),
             quota: (0, 0),
+            activity: HashMap::new(),
+            pushes_in_flight: 0,
         });
         state.chain = chain;
         if existed {
@@ -1575,8 +1780,11 @@ impl Conn {
                 last_seen: Some(now()),
                 last_reason: None,
                 gen,
+                foreground: false,
+                foreground_until: None,
             },
         );
+        state.activity.insert(key, Instant::now());
         let me = RelayFrame::Presence(state.presence_of(&key)).encode();
         state.broadcast(Some(&key), &me);
         let limited = !self.shared.entitled(&ring, state);
@@ -1600,7 +1808,7 @@ impl Conn {
                 .collect(),
             entitlement,
             limited,
-            caps: Vec::new(),
+            caps: self.shared.caps(),
         }
         .encode();
         drop(rings);
@@ -1642,6 +1850,8 @@ impl Conn {
             ClientFrame::Env { .. }
                 | ClientFrame::RosterPut { .. }
                 | ClientFrame::EntitlementPut { .. }
+                | ClientFrame::State { .. }
+                | ClientFrame::Push { .. }
         ) && !self.still_current(&me, gen)
         {
             return;
@@ -1806,6 +2016,35 @@ impl Conn {
                 drop(rings);
                 self.write(&RelayFrame::Ok { id }.encode());
             }
+            ClientFrame::State { foreground } => {
+                let mut rings = self.rings();
+                let Some(s) = rings.get_mut(&ring) else {
+                    return;
+                };
+                let mobile = s.chain.head().member(&me).map(|m| m.role) == Some(Role::Mobile);
+                if !mobile || s.current(&me, gen).is_err() {
+                    drop(rings);
+                    self.error(ErrorCode::BadRequest, None, None, Some("state"));
+                    return;
+                }
+                let until = s.lease_until(&me, self.shared.opts.foreground_lease);
+                let Some(r) = s.presence.get_mut(&me) else {
+                    return;
+                };
+                if r.foreground == foreground {
+                    return;
+                }
+                r.foreground = foreground;
+                r.foreground_until = if foreground { until } else { None };
+                let p = RelayFrame::Presence(s.presence_of(&me)).encode();
+                s.broadcast(Some(&me), &p);
+            }
+            ClientFrame::Push {
+                id,
+                blob,
+                sealed_payload,
+                collapse_id,
+            } => self.push(me, gen, id, blob, sealed_payload, collapse_id),
             ClientFrame::Unknown { .. } => {
                 self.error(ErrorCode::UnknownType, None, None, None);
             }
@@ -1814,6 +2053,85 @@ impl Conn {
             }
             ClientFrame::Ping => {}
         }
+    }
+}
+
+impl Conn {
+    /// A `push` frame (section 18): checked in order (role, fields, foreground, a gateway),
+    /// then forwarded on a thread of its own, which answers on this socket.
+    fn push(
+        &mut self,
+        me: SignKey,
+        gen: u64,
+        id: u64,
+        blob: String,
+        sealed: String,
+        collapse: String,
+    ) {
+        self.shared.push_frames.fetch_add(1, Ordering::AcqRel);
+        let ring = self.ring.clone();
+        let failed = |detail: &str| (ErrorCode::PushFailed, Some(detail.to_string()));
+        let verdict: Result<(), (ErrorCode, Option<String>)> = {
+            let mut rings = self.rings();
+            match rings.get_mut(&ring) {
+                None => Err((ErrorCode::Internal, None)),
+                Some(s) if s.current(&me, gen).is_err() => Err((ErrorCode::Removed, None)),
+                Some(s) if s.chain.head().member(&me).map(|m| m.role) != Some(Role::Daemon) => {
+                    Err(failed("role"))
+                }
+                Some(_)
+                    if !blob_well_formed(&blob)
+                        || !sealed_well_formed(&sealed)
+                        || !collapse_id_well_formed(&collapse) =>
+                {
+                    Err((ErrorCode::BadRequest, None))
+                }
+                Some(s) if s.any_foreground(self.shared.opts.foreground_lease) => {
+                    Err(failed("foreground"))
+                }
+                Some(_) if self.shared.opts.push_gateway.is_none() => Err(failed("unavailable")),
+                Some(s) if s.pushes_in_flight >= PUSH_MAX_IN_FLIGHT => Err(failed("busy")),
+                Some(s) => {
+                    s.pushes_in_flight += 1;
+                    Ok(())
+                }
+            }
+        };
+        if let Err((code, detail)) = verdict {
+            self.error(code, Some(id), None, detail.as_deref());
+            return;
+        }
+        let body = serde_json::json!({
+            "blob": blob,
+            "sealedPayload": sealed,
+            "collapseId": collapse,
+        })
+        .to_string();
+        let gateway = self.shared.opts.push_gateway.clone().unwrap_or_default();
+        let timeout = self.shared.opts.push_timeout;
+        let (shared, tx) = (self.shared.clone(), self.tx.clone());
+        thread::spawn(move || {
+            let r = forward_push(&gateway, &body, timeout);
+            if let Some(s) = shared
+                .rings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&ring)
+            {
+                s.pushes_in_flight = s.pushes_in_flight.saturating_sub(1);
+            }
+            let answer = match r {
+                Ok(()) => RelayFrame::Ok { id },
+                Err(detail) => RelayFrame::Error {
+                    code: ErrorCode::PushFailed,
+                    id: Some(id),
+                    to: None,
+                    detail: Some(detail),
+                },
+            };
+            // A direct answer: it goes out even on a muted socket.
+            let _ = tx.send(Cmd::Inject(answer.encode()));
+        });
     }
 }
 

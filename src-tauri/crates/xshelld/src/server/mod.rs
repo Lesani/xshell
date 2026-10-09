@@ -5,7 +5,9 @@
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
 //! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status) is taken
 //! last, and nothing is locked while it is held. No lock is held across a blocking PTY or
-//! socket write: writers own their sockets, input threads own PTY writers.
+//! socket write: writers own their sockets, input threads own PTY writers. The push
+//! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
+//! frame is queued on the Relay connection (never blocking).
 
 mod agent;
 mod calls;
@@ -14,6 +16,7 @@ mod orphans;
 pub use orphans::Cleanup;
 mod outbox;
 pub mod parent;
+mod push;
 mod registry;
 mod relaunch;
 mod relay_conn;
@@ -85,6 +88,16 @@ pub struct Config {
     pub ring_backoff_unit: Duration,
     /// The Relay client's timeouts (tests shorten them).
     pub ring_timeouts: xshell_protocol::ring::relay::RingTimeouts,
+    /// Pushes to one Mobile go out at most once per window (leading and trailing).
+    pub push_window: Duration,
+    /// How long a push waits for the Relay's answer; past it the outcome is unknown and the
+    /// push is not retried.
+    pub push_timeout: Duration,
+    /// The delay before the one retry of a push the gateway answered `reconcile_pending`.
+    pub push_retry: Duration,
+    /// Test hooks for the push pipeline.
+    #[doc(hidden)]
+    pub push_hooks: PushHooks,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -121,6 +134,35 @@ pub enum TestPoint {
     /// A `term.open`'s started Terminal is not kept (it could not be saved, or its threads
     /// did not start); it is about to be ended (on the thread that waits for it, no lock held).
     RefusedOpen,
+}
+
+/// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushPoint {
+    /// About to write `push.json` (a registration, or a push's `seq`).
+    Save,
+    /// A reserved push is persisted and sealed, and about to be checked once more and
+    /// queued.
+    Submit,
+}
+
+/// Test hooks for the push pipeline.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct PushHooks {
+    /// Runs at each [`PushPoint`]; may block to order a race.
+    pub at: Option<Arc<dyn Fn(PushPoint) + Send + Sync>>,
+    /// While set, every write of `push.json` fails.
+    pub fail_saves: Option<Arc<AtomicBool>>,
+    /// Replaces the clock a push's `seq` is drawn from (unix ms).
+    pub clock: Option<fn() -> u64>,
+}
+
+impl std::fmt::Debug for PushHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushHooks")
+    }
 }
 
 /// `serve --gui-bound --parent-pid N`.
@@ -205,6 +247,10 @@ impl Config {
             abort: None,
             ring_backoff_unit: Duration::from_secs(1),
             ring_timeouts: Default::default(),
+            push_window: Duration::from_secs(10),
+            push_timeout: Duration::from_secs(20),
+            push_retry: Duration::from_secs(2),
+            push_hooks: PushHooks::default(),
             cleanup_override: None,
             test_hook: None,
         }
@@ -332,6 +378,19 @@ impl Server {
             cfg.ring_timeouts,
             cfg.write_stall_timeout,
         );
+        let push = Arc::new(push::Push::new(
+            paths.ring_dir.clone(),
+            push::PushConfig {
+                window: cfg.push_window,
+                timeout: cfg.push_timeout,
+                retry: cfg.push_retry,
+                hooks: cfg.push_hooks.clone(),
+            },
+        ));
+        {
+            let p = push.clone();
+            ring.set_on_head(Arc::new(move |epoch, c| p.on_head(epoch, c)));
+        }
         let d = Arc::new(Daemon {
             cfg,
             ctx: Arc::new(ctx),
@@ -348,9 +407,11 @@ impl Server {
             next_run: AtomicU64::new(registry::now_ms()),
             escalations: Default::default(),
             ring,
+            push,
         });
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
+        d.push.bind(Arc::downgrade(&d));
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);
@@ -491,7 +552,7 @@ impl ServerHandle {
         let d = self.d.clone();
         std::thread::Builder::new()
             .name(format!("conn-{id}-r"))
-            .spawn(move || conn::handle(d, server, id, role))?;
+            .spawn(move || conn::handle(d, server, id, role, None))?;
         Ok(client)
     }
 

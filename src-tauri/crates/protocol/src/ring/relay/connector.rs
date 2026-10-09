@@ -21,7 +21,7 @@
 
 use super::super::chain::RosterChain;
 use super::super::{RingError, SignKey, SignedRoster};
-use super::client::{MemberStatus, RingClient, RingClientConfig, RingEvents};
+use super::client::{MemberStatus, PushRequest, RingClient, RingClientConfig, RingEvents, Ticket};
 use super::wire::{close, ByeReason, CloseReason, ErrorCode, MemberPresence};
 use crate::backoff::Backoff;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -164,6 +164,8 @@ struct St {
     /// Limited state changed (entitlement); the worker re-reports `Connected`.
     refresh: bool,
     stop: Option<Stop>,
+    /// The foreground state a Mobile last set: sent again on every new connection.
+    foreground: Option<bool>,
 }
 
 struct Inner {
@@ -482,6 +484,10 @@ impl Inner {
                             break;
                         }
                         st.client = Some(c.clone());
+                        if let Some(f) = st.foreground {
+                            // Fire and forget, as every `state`.
+                            let _ = c.set_foreground(f);
+                        }
                         Ok(c)
                     }
                     Err(e) => {
@@ -714,6 +720,7 @@ impl Connector {
                 kick: false,
                 refresh: false,
                 stop: None,
+                foreground: None,
             }),
             cv: Condvar::new(),
             events,
@@ -786,6 +793,55 @@ impl Connector {
         let c = lock(&self.inner.st).client.clone();
         match c {
             Some(c) if !c.is_closed() => c.send(to, payload),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// What the current connection's Relay lists in `welcome.caps`; `None` while not
+    /// connected.
+    pub fn relay_caps(&self) -> Option<Vec<String>> {
+        let c = lock(&self.inner.st).client.clone()?;
+        (!c.is_closed()).then(|| c.relay_caps())
+    }
+
+    /// The current connection's generation: it changes with every new connection. `None`
+    /// while not connected.
+    pub fn connection(&self) -> Option<u64> {
+        let st = lock(&self.inner.st);
+        st.client
+            .as_ref()
+            .filter(|c| !c.is_closed())
+            .map(|_| st.gen)
+    }
+
+    /// A Mobile entering or leaving the foreground: sent now if connected, and again on
+    /// every connection from now on. Never blocks.
+    pub fn set_foreground(&self, foreground: bool) {
+        let c = {
+            let mut st = lock(&self.inner.st);
+            st.foreground = Some(foreground);
+            st.client.clone()
+        };
+        if let Some(c) = c.filter(|c| !c.is_closed()) {
+            let _ = c.set_foreground(foreground);
+        }
+    }
+
+    /// Asks the Relay to forward one push (see [`RingClient::push`]); `Err(Closed)` when not
+    /// connected. Nothing is queued for a later connection.
+    pub fn push(&self, req: &PushRequest, timeout: Duration) -> Result<(), RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.push(req, timeout),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// [`Connector::push`] in two steps (see [`RingClient::push_start`]): never blocks.
+    pub fn push_start(&self, req: &PushRequest) -> Result<Ticket, RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.push_start(req),
             _ => Err(RingError::Closed(CloseReason::Local)),
         }
     }

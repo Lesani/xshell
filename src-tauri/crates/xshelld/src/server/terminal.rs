@@ -421,7 +421,14 @@ impl Terminal {
         d.nudge_overflowed(dropped);
         if self.status.lock().unwrap().on_output(bytes) {
             super::agent::changed(d, self);
+            // Codex's OSC 9 notification: the agent itself says it needs you.
+            d.push.notify(self.id, self.run, AgentStatus::NeedsYou);
         }
+    }
+
+    /// The Agent Status of this run.
+    pub fn agent_status(&self) -> Option<AgentStatus> {
+        self.status.lock().unwrap().status()
     }
 
     /// A hook's report for process `run`.

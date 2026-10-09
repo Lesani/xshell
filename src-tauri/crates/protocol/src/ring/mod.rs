@@ -23,6 +23,7 @@ mod json;
 pub mod keys;
 pub mod noise;
 pub mod pairing;
+pub mod push;
 pub mod relay;
 pub mod ring_id;
 pub mod roster;
@@ -44,6 +45,8 @@ pub const AUTH_CONTEXT: &str = "xshell-relay-auth-v1\n";
 pub const PAIR_POP_CONTEXT: &str = pairing::POP_CONTEXT;
 /// Prefix of a session handshake's Noise prologue.
 pub const NOISE_CONTEXT: &str = noise::SESSION_PROLOGUE;
+/// Prefix of a sealed push's Noise prologue.
+pub const PUSH_CONTEXT: &str = push::PUSH_PROLOGUE;
 /// Every Roster token starts with this.
 pub const ROSTER_PREFIX: &str = "xro1.";
 /// Every Push Gateway entitlement token starts with this (see `push/core/entitlement.ts`).
