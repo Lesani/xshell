@@ -954,8 +954,9 @@ impl HostHandle {
             Kill,
             Refuse(HostError),
         }
-        let plan = {
+        let (plan, cfg) = {
             let mut st = self.sh.lock();
+            let cfg = st.cfg.clone();
             let plan = match Shared::usable_link(&st) {
                 Ok((l, _)) => Plan::Request(l),
                 Err(_) if st.status.status == StatusKind::Incompatible => Plan::Kill,
@@ -967,7 +968,7 @@ impl HostHandle {
                 st.status.phase = Some(Phase::Upgrading);
                 self.sh.publish(&mut st);
             }
-            plan
+            (plan, cfg)
         };
         match plan {
             Plan::Refuse(e) => once.call(Err(e)),
@@ -1004,7 +1005,12 @@ impl HostHandle {
                     once.call(Err(e));
                 }
             }
-            Plan::Kill if self.config().daemon_override().is_some() => {
+            // The configuration the plan was made under decides; a direct Host (a local
+            // socket) has no transport to run the script through either.
+            Plan::Kill
+                if cfg.daemon_override().is_some()
+                    || self.sh.mc.transports.direct(&cfg).is_some() =>
+            {
                 // A Daemon command means the user manages the binary, and such hosts often
                 // allow only `<cmd> connect` / `<cmd> --version` over ssh: send no script.
                 once.call(Err(HostError::new(
@@ -1015,7 +1021,6 @@ impl HostHandle {
             Plan::Kill => {
                 let sh = self.sh.clone();
                 let o = once.clone();
-                let cfg = self.config();
                 let cancel = self.cancel_token();
                 let spawned = std::thread::Builder::new()
                     .name("host-upgrade".into())

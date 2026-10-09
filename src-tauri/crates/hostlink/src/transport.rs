@@ -2,6 +2,7 @@
 //! function builds each command line, so tests substitute a transport and nothing else.
 
 use crate::config::HostConfig;
+use crate::dial::Dialer;
 use std::ffi::OsString;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,13 @@ pub trait Transport: Send + Sync {
 
 pub trait TransportFactory: Send + Sync {
     fn for_host(&self, cfg: &HostConfig) -> Box<dyn Transport>;
+
+    /// A direct stream to this Host's Daemon (a local socket), used instead of running
+    /// `connect` through `for_host`. Such a Host is never probed, installed or signalled by
+    /// script.
+    fn direct(&self, _cfg: &HostConfig) -> Option<Box<dyn Dialer>> {
+        None
+    }
 }
 
 /// `ssh -T -o BatchMode=yes … -- <target> <remote_cmd>`. The user's `~/.ssh/config` applies.

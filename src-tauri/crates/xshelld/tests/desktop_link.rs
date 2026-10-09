@@ -1,5 +1,7 @@
 //! The Desktop's host link (xshell-hostlink) against the real `xshelld`, through a local
-//! `sh -c` transport and the daemon-command override.
+//! `sh -c` transport and the daemon-command override, and directly over the Daemon's local
+//! socket. A test that holds for both runs twice: `<name>` (command) and
+//! `<name>_over_socket`.
 #![cfg(unix)]
 
 mod common;
@@ -14,9 +16,27 @@ use xshell_hostlink::status::{IncompatibleReason, Phase};
 use xshell_hostlink::StatusKind;
 use xshell_protocol::msg::ProtocolRange;
 
-#[test]
-fn connects_and_calls_get_home_dir() {
-    let fx = Fx::new();
+/// `#[test] $cmd` runs `$body(Via::Command)`, `#[test] $sock` runs `$body(Via::Socket)`.
+macro_rules! on_both {
+    ($cmd:ident, $sock:ident, $body:ident) => {
+        #[test]
+        fn $cmd() {
+            $body(Via::Command)
+        }
+        #[test]
+        fn $sock() {
+            $body(Via::Socket)
+        }
+    };
+}
+
+on_both!(
+    connects_and_calls_get_home_dir,
+    connects_and_calls_get_home_dir_over_socket,
+    connects_and_calls_get_home_dir_on
+);
+fn connects_and_calls_get_home_dir_on(via: Via) {
+    let fx = Fx::via(via);
     let s = fx.a.wait_usable();
     assert_eq!(s.status, StatusKind::Connected);
     assert_eq!(s.daemon_version.as_deref(), Some(VERSION));
@@ -28,9 +48,13 @@ fn connects_and_calls_get_home_dir() {
     assert_eq!(e.code, xshell_hostlink::HostErrorCode::Remote);
 }
 
-#[test]
-fn open_attach_input_roundtrip() {
-    let fx = Fx::new();
+on_both!(
+    open_attach_input_roundtrip,
+    open_attach_input_roundtrip_over_socket,
+    open_attach_input_roundtrip_on
+);
+fn open_attach_input_roundtrip_on(via: Via) {
+    let fx = Fx::via(via);
     fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
@@ -40,9 +64,13 @@ fn open_attach_input_roundtrip() {
     marker(&h, &sink, t, "abc");
 }
 
-#[test]
-fn terminals_follow_open_update_close() {
-    let fx = Fx::new();
+on_both!(
+    terminals_follow_open_update_close,
+    terminals_follow_open_update_close_over_socket,
+    terminals_follow_open_update_close_on
+);
+fn terminals_follow_open_update_close_on(via: Via) {
+    let fx = Fx::via(via);
     fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
@@ -79,9 +107,13 @@ fn terminals_follow_open_update_close() {
     assert_eq!(bytes, sink.len() as u64, "exit watermark = bytes delivered");
 }
 
-#[test]
-fn reconnect_reattaches_with_replay() {
-    let fx = Fx::new();
+on_both!(
+    reconnect_reattaches_with_replay,
+    reconnect_reattaches_with_replay_over_socket,
+    reconnect_reattaches_with_replay_on
+);
+fn reconnect_reattaches_with_replay_on(via: Via) {
+    let fx = Fx::via(via);
     fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
@@ -90,16 +122,15 @@ fn reconnect_reattaches_with_replay() {
     marker(&h, &sink, t, "before");
     let n = fx.a.rec.count();
     let from = sink.len();
-    let ssh = h.child_pid().expect("transport pid") as i32;
-    // Kill the transport's whole process group, as a dropped ssh would end.
-    unsafe { libc::kill(-ssh, libc::SIGKILL) };
+    // As a dropped ssh would end.
+    let cut = fx.sever();
     let (i, _) =
         fx.a.rec
             .wait_status_from(n, "reconnecting", |s| s.status == StatusKind::Reconnecting);
     let start = Instant::now();
     fx.a.rec.wait_status_from(i, "connected again", usable);
     assert!(start.elapsed() < Duration::from_secs(5));
-    assert_ne!(h.child_pid(), Some(ssh as u32));
+    assert!(fx.redialed_since(cut));
     // The replay (a reset, then the earlier output) arrived without a new attach from us.
     let after = sink.wait_from(from, "before");
     let reset = after.find("\x1bc").expect("replay starts with a reset");
@@ -107,25 +138,33 @@ fn reconnect_reattaches_with_replay() {
     marker(&h, &sink, t, "after");
 }
 
-#[test]
-fn disconnect_ends_nothing() {
-    let fx = Fx::new();
+on_both!(
+    disconnect_ends_nothing,
+    disconnect_ends_nothing_over_socket,
+    disconnect_ends_nothing_on
+);
+fn disconnect_ends_nothing_on(via: Via) {
+    let fx = Fx::via(via);
     fx.a.wait_usable();
     let t = Uuid::new_v4();
     let pid = open(&fx.a.host(), t, fx.project(), VecSink::new()).unwrap();
     fx.a.m.shutdown();
-    let b = Fx::desk(&fx.home, |_| {});
+    let b = fx.another_desk(|_| {});
     let list = b.rec.wait_list("first list", |_| true);
     let info = list.iter().find(|i| i.terminal == t).expect("still listed");
     assert_eq!(info.pid, Some(pid));
     assert!(pid_alive(pid as i32));
 }
 
-#[test]
-fn two_desktops_share_terminal() {
-    let fx = Fx::new();
+on_both!(
+    two_desktops_share_terminal,
+    two_desktops_share_terminal_over_socket,
+    two_desktops_share_terminal_on
+);
+fn two_desktops_share_terminal_on(via: Via) {
+    let fx = Fx::via(via);
     fx.a.wait_usable();
-    let b = Fx::desk(&fx.home, |_| {});
+    let b = fx.another_desk(|_| {});
     b.wait_usable();
     let t = Uuid::new_v4();
     let sa = VecSink::new();
@@ -139,9 +178,13 @@ fn two_desktops_share_terminal() {
     sb.wait_from(from, "shared");
 }
 
-#[test]
-fn status_exposes_daemon_capabilities() {
-    let fx = Fx::new();
+on_both!(
+    status_exposes_daemon_capabilities,
+    status_exposes_daemon_capabilities_over_socket,
+    status_exposes_daemon_capabilities_on
+);
+fn status_exposes_daemon_capabilities_on(via: Via) {
+    let fx = Fx::via(via);
     let s = fx.a.wait_usable();
     assert!(
         s.daemon_capabilities.iter().any(|c| c == "term.relaunch"),
@@ -150,12 +193,16 @@ fn status_exposes_daemon_capabilities() {
     );
 }
 
+on_both!(
+    relaunch_keeps_sink_no_exit,
+    relaunch_keeps_sink_no_exit_over_socket,
+    relaunch_keeps_sink_no_exit_on
+);
 /// A Relaunch keeps the Tab's sink: no exit, a reset, then the new process's output.
-#[test]
-fn relaunch_keeps_sink_no_exit() {
+fn relaunch_keeps_sink_no_exit_on(via: Via) {
     // Before the Daemon starts: it inherits the fake agents' PATH.
     shared_fake_agents();
-    let fx = Fx::new();
+    let fx = Fx::via(via);
     fx.a.wait_usable();
     let h = fx.a.host();
     let cwd = fx.home.project("app");
@@ -188,13 +235,17 @@ fn relaunch_keeps_sink_no_exit() {
     );
 }
 
+on_both!(
+    launch_prefix_wraps_agent_and_survives_relaunch,
+    launch_prefix_wraps_agent_and_survives_relaunch_over_socket,
+    launch_prefix_wraps_agent_and_survives_relaunch_on
+);
 /// A Host's launch prefix runs the agent under it, and a Relaunch (built by the Daemon from
 /// the stored spec) keeps it. Changing the prefix keeps the connection.
-#[test]
-fn launch_prefix_wraps_agent_and_survives_relaunch() {
+fn launch_prefix_wraps_agent_and_survives_relaunch_on(via: Via) {
     // Before the Daemon starts: it inherits the fake agents' PATH.
     shared_fake_agents();
-    let fx = Fx::new();
+    let fx = Fx::via(via);
     let first = fx.a.wait_usable();
     assert!(first
         .daemon_capabilities
@@ -258,12 +309,13 @@ fn hup_proof(fx: &Fx) -> xshell_core::launch::LaunchSpec {
 
 #[test]
 fn upgrade_restores_same_uuid_new_pid() {
+    // Command only: nothing starts a Daemon over a socket.
     let fx = Fx::new();
     fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
     let pid = open(&h, t, hup_proof(&fx), VecSink::new()).unwrap();
-    let old_daemon = fx.guard.pid().expect("daemon pid");
+    let old_daemon = fx.daemon_pid().expect("daemon pid");
     let n = fx.a.rec.count();
     upgrade(&h).unwrap();
     // Until the old Daemon is gone, the Host stays in phase `upgrading`, never connected.
@@ -282,7 +334,7 @@ fn upgrade_restores_same_uuid_new_pid() {
         "{during:#?}"
     );
     assert!(during.iter().any(|s| s.status == StatusKind::Reconnecting));
-    let new_daemon = fx.guard.pid().expect("new daemon pid");
+    let new_daemon = fx.daemon_pid().expect("new daemon pid");
     assert_ne!(new_daemon, old_daemon);
     let list = fx.a.rec.wait_list("restored", |l| {
         l.iter()
@@ -291,9 +343,13 @@ fn upgrade_restores_same_uuid_new_pid() {
     assert_eq!(list.len(), 1);
 }
 
-#[test]
-fn incompatible_when_ranges_disjoint() {
-    let fx = Fx::with(|c| c.ours = ProtocolRange { min: 2, max: 3 });
+on_both!(
+    incompatible_when_ranges_disjoint,
+    incompatible_when_ranges_disjoint_over_socket,
+    incompatible_when_ranges_disjoint_on
+);
+fn incompatible_when_ranges_disjoint_on(via: Via) {
+    let fx = Fx::with_via(via, |c| c.ours = ProtocolRange { min: 2, max: 3 });
     let s =
         fx.a.rec
             .wait_status("incompatible", |s| s.status == StatusKind::Incompatible);
@@ -316,9 +372,25 @@ fn shutdown_leaves_no_children() {
     assert!(wait_dead(pid), "transport {pid} survived");
 }
 
+/// `shutdown_leaves_no_children` over a socket: no child to kill, the socket is shut down.
 #[test]
-fn config_replacement_reattaches() {
-    let fx = Fx::new();
+fn shutdown_closes_the_socket() {
+    let fx = Fx::via(Via::Socket);
+    fx.a.wait_usable();
+    let conn = fx.mark();
+    let start = Instant::now();
+    fx.a.m.shutdown();
+    assert!(start.elapsed() < Duration::from_secs(3));
+    fx.assert_conn_gone(conn);
+}
+
+on_both!(
+    config_replacement_reattaches,
+    config_replacement_reattaches_over_socket,
+    config_replacement_reattaches_on
+);
+fn config_replacement_reattaches_on(via: Via) {
+    let fx = Fx::via(via);
     let first = fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
@@ -412,9 +484,13 @@ fn stall_delivery(fx: &Fx) -> (Uuid, std::sync::Arc<Gate>) {
     (t, gate)
 }
 
-#[test]
-fn input_never_waits_on_a_blocked_delivery() {
-    let fx = Fx::new();
+on_both!(
+    input_never_waits_on_a_blocked_delivery,
+    input_never_waits_on_a_blocked_delivery_over_socket,
+    input_never_waits_on_a_blocked_delivery_on
+);
+fn input_never_waits_on_a_blocked_delivery_on(via: Via) {
+    let fx = Fx::via(via);
     let (t, gate) = stall_delivery(&fx);
     let _release = Release(gate.clone());
     let h = fx.a.host();
@@ -432,12 +508,16 @@ fn input_never_waits_on_a_blocked_delivery() {
     }
 }
 
-#[test]
-fn shutdown_is_bounded_with_a_blocked_delivery() {
-    let fx = Fx::new();
+on_both!(
+    shutdown_is_bounded_with_a_blocked_delivery,
+    shutdown_is_bounded_with_a_blocked_delivery_over_socket,
+    shutdown_is_bounded_with_a_blocked_delivery_on
+);
+fn shutdown_is_bounded_with_a_blocked_delivery_on(via: Via) {
+    let fx = Fx::via(via);
     let (_t, gate) = stall_delivery(&fx);
-    let _release = Release(gate.clone());
-    let ssh = fx.a.host().child_pid().unwrap() as i32;
+    let release = Release(gate.clone());
+    let conn = fx.mark();
     let start = Instant::now();
     fx.a.m.shutdown();
     assert!(
@@ -445,15 +525,26 @@ fn shutdown_is_bounded_with_a_blocked_delivery() {
         "{:?}",
         start.elapsed()
     );
-    assert!(reaped(ssh), "transport {ssh} survived or was not reaped");
+    fx.assert_conn_gone(conn);
+    // Still stalled in the delivery: closing the socket alone does not end the reader.
+    if let (Some(tap), Mark::Dial(n)) = (&fx.tap, conn) {
+        assert!(!tap.reader_ended(n - 1, Duration::from_millis(100)));
+    }
+    // Released, the stalled reader sees the closed stream and ends.
+    drop(release);
+    fx.assert_reader_ended(conn);
 }
 
-#[test]
-fn shutdown_is_bounded_with_a_concurrent_configure() {
-    let fx = Fx::new();
+on_both!(
+    shutdown_is_bounded_with_a_concurrent_configure,
+    shutdown_is_bounded_with_a_concurrent_configure_over_socket,
+    shutdown_is_bounded_with_a_concurrent_configure_on
+);
+fn shutdown_is_bounded_with_a_concurrent_configure_on(via: Via) {
+    let fx = Fx::via(via);
     let (_t, gate) = stall_delivery(&fx);
     let release = Release(gate.clone());
-    let ssh = fx.a.host().child_pid().unwrap() as i32;
+    let conn = fx.mark();
     let handle = fx.a.host();
     // The configure replaces the Host: it stops it, then waits on the blocked state.
     std::thread::scope(|s| {
@@ -469,27 +560,13 @@ fn shutdown_is_bounded_with_a_concurrent_configure() {
             "{:?}",
             start.elapsed()
         );
-        assert!(reaped(ssh), "transport {ssh} survived or was not reaped");
+        fx.assert_conn_gone(conn);
         drop(release);
+        fx.assert_reader_ended(conn);
         cfg.join().unwrap().unwrap();
     });
     // The configure that finished after the shutdown started nothing.
     std::thread::sleep(Duration::from_millis(300));
     assert!(fx.a.m.snapshot().is_empty());
-    match handle.child_pid() {
-        Some(p) if p as i32 != ssh => assert!(wait_dead(p as i32), "a new transport {p} runs"),
-        _ => {}
-    }
-}
-
-/// Gone and reaped: `kill(0)` fails only once nobody holds the zombie.
-fn reaped(pid: i32) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    true
+    fx.assert_no_new_conn(conn, &handle);
 }

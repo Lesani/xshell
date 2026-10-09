@@ -699,4 +699,204 @@ pub(crate) mod tests {
         assert!(connected >= 3, "it did connect each time ({connected})");
         m.shutdown();
     }
+
+    /// A scripted Daemon on a local socket: every connection gets `greeting`, then either
+    /// stays open until the Desktop hangs up or is hung up on shortly.
+    #[cfg(unix)]
+    struct SocketPeer {
+        path: std::path::PathBuf,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    fn socket_peer(greeting: Vec<u8>, hang_up: bool) -> SocketPeer {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = accepts.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                n.fetch_add(1, Ordering::SeqCst);
+                let _ = s.write_all(&greeting);
+                std::thread::spawn(move || {
+                    if hang_up {
+                        std::thread::sleep(Duration::from_millis(50));
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        SocketPeer {
+            path,
+            accepts,
+            _dir: dir,
+        }
+    }
+
+    #[cfg(unix)]
+    fn greeting(min: u32, max: u32) -> Vec<u8> {
+        use crate::link::testpeer::{hello_frame, terminals_frame};
+        let mut b = hello_frame(min, max, "1.5.0");
+        b.extend(terminals_frame(vec![]));
+        b
+    }
+
+    /// Hosts whose target is `sock` are dialed directly; every transport command (of any
+    /// Host) is recorded and fails.
+    #[cfg(unix)]
+    struct DirectFactory {
+        path: std::path::PathBuf,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[cfg(unix)]
+    impl TransportFactory for DirectFactory {
+        fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+            struct T(Arc<Mutex<Vec<String>>>);
+            impl Transport for T {
+                fn command(&self, remote: &str) -> CommandSpec {
+                    self.0.lock().unwrap().push(remote.to_string());
+                    LocalShellTransport::default().command("exit 1")
+                }
+                fn describe(&self) -> String {
+                    "recording".into()
+                }
+            }
+            Box::new(T(self.sent.clone()))
+        }
+
+        fn direct(&self, cfg: &HostConfig) -> Option<Box<dyn crate::dial::Dialer>> {
+            (cfg.ssh_target == "sock").then(|| {
+                Box::new(crate::dial::UnixSocketDialer {
+                    path: self.path.clone(),
+                }) as Box<dyn crate::dial::Dialer>
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn direct_manager(peer: &SocketPeer, rec: Arc<Recorder>) -> (Manager, Arc<Mutex<Vec<String>>>) {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut mc = test_config(rec);
+        mc.transports = Arc::new(DirectFactory {
+            path: peer.path.clone(),
+            sent: sent.clone(),
+        });
+        (Manager::new(mc), sent)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_host_connects_without_probe_or_install() {
+        let peer = socket_peer(greeting(1, 1), false);
+        let rec = Recorder::new();
+        let (m, sent) = direct_manager(&peer, rec.clone());
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        rec.wait_status(|s| s.status == StatusKind::Connected);
+        let phases: Vec<_> = rec.statuses().iter().filter_map(|s| s.phase).collect();
+        assert!(
+            !phases.iter().any(|p| matches!(
+                p,
+                crate::status::Phase::Probing | crate::status::Phase::Installing
+            )),
+            "{phases:?}"
+        );
+        assert_eq!(m.host("h_aaaaaaaa").unwrap().child_pid(), None);
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "{:?}",
+            sent.lock().unwrap()
+        );
+        m.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_host_reconnects_after_peer_hangup() {
+        let peer = socket_peer(greeting(1, 1), true);
+        let rec = Recorder::new();
+        let (m, _) = direct_manager(&peer, rec.clone());
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let kinds: Vec<StatusKind> = rec.statuses().iter().map(|s| s.status).collect();
+            let first = kinds.iter().position(|k| *k == StatusKind::Connected);
+            let again = first.and_then(|i| {
+                let r = kinds[i..]
+                    .iter()
+                    .position(|k| *k == StatusKind::Reconnecting)?;
+                kinds[i + r..]
+                    .iter()
+                    .position(|k| *k == StatusKind::Connected)
+            });
+            if again.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{kinds:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(peer.accepts.load(Ordering::SeqCst) >= 2);
+        m.shutdown();
+    }
+
+    #[cfg(unix)]
+    fn upgrade_is_refused_without_script(m: &Manager, rec: &Recorder, sent: &Mutex<Vec<String>>) {
+        rec.wait_status(|s| s.status == StatusKind::Incompatible && s.next_retry_at.is_some());
+        let before = sent.lock().unwrap().len();
+        let (w, rx) = crate::link::testpeer::slot();
+        m.host("h_aaaaaaaa").unwrap().upgrade(w);
+        let r = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            r.unwrap_err().code,
+            crate::errors::HostErrorCode::Incompatible
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            before,
+            "{:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_host_upgrade_kill_sends_no_script() {
+        let peer = socket_peer(greeting(2, 3), false);
+        let rec = Recorder::new();
+        let (m, sent) = direct_manager(&peer, rec.clone());
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        upgrade_is_refused_without_script(&m, &rec, &sent);
+        assert!(sent.lock().unwrap().is_empty());
+        m.shutdown();
+    }
+
+    /// The direct mode follows the configuration: a Host retargeted from a command to a
+    /// socket is refused the kill script too.
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_direct_host_upgrade_kill_sends_no_script() {
+        let peer = socket_peer(greeting(2, 3), false);
+        let rec = Recorder::new();
+        let (m, sent) = direct_manager(&peer, rec.clone());
+        let mut h = test_host("h_aaaaaaaa", "x");
+        h.daemon_command = Some("xd".into());
+        m.configure(vec![h.clone()]).unwrap();
+        rec.wait_status(|s| s.next_retry_at.is_some());
+        assert!(
+            !sent.lock().unwrap().is_empty(),
+            "the command Host ran nothing"
+        );
+        h.ssh_target = "sock".into();
+        h.daemon_command = None;
+        m.configure(vec![h]).unwrap();
+        upgrade_is_refused_without_script(&m, &rec, &sent);
+        m.shutdown();
+    }
 }

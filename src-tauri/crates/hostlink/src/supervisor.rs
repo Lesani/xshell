@@ -2,12 +2,13 @@
 //! drops, back off, repeat. Every phase watches the run's cancel token.
 
 use crate::cancel::CancelToken;
+use crate::dial::{CommandDialer, Connection, DialError, Dialer};
 use crate::errors::HostError;
-use crate::errors::{classify_ssh_failure, HostErrorHint};
+use crate::errors::HostErrorHint;
 use crate::handle::Shared;
 use crate::install::{ensure_installed, kill_daemon_script, os_name};
-use crate::link::{Link, LinkError, LinkIo};
-use crate::process::{self, run_script, Proc};
+use crate::link::{Link, LinkError};
+use crate::process::run_script;
 use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind};
 use crate::transport::{connect_command, sh_wrap, Transport};
 use crate::version::{self, classify, Classified};
@@ -84,7 +85,7 @@ struct Connected {
     /// Attachments not re-attached yet (the send queue was full).
     left: usize,
     link: Arc<Link>,
-    proc: Proc,
+    conn: Box<dyn Connection>,
     gen: u64,
     at: Instant,
 }
@@ -110,9 +111,11 @@ enum Waited {
 struct Sup {
     sh: Arc<Shared>,
     cancel: CancelToken,
-    transport: Box<dyn Transport>,
+    /// Install and the upgrade kill script; also what `dialer` runs `connect` through,
+    /// unless the Host is reached directly.
+    transport: Arc<dyn Transport>,
+    dialer: Box<dyn Dialer>,
     managed: bool,
-    override_: Option<String>,
     backoff: Backoff,
     install_verified: bool,
     last_gen: u64,
@@ -120,14 +123,22 @@ struct Sup {
 
 pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let cfg = sh.lock().cfg.clone();
-    let transport = sh.mc.transports.for_host(&cfg);
-    let override_ = cfg.daemon_override().map(String::from);
+    let transport: Arc<dyn Transport> = sh.mc.transports.for_host(&cfg).into();
+    let direct = sh.mc.transports.direct(&cfg);
+    let override_ = cfg.daemon_override();
+    let managed = override_.is_none() && direct.is_none();
+    let dialer = direct.unwrap_or_else(|| {
+        Box::new(CommandDialer {
+            transport: transport.clone(),
+            remote_cmd: connect_command(override_, &sh.mc.desktop_version),
+        })
+    });
     let mut s = Sup {
         sh,
         cancel,
         transport,
-        managed: override_.is_none(),
-        override_,
+        dialer,
+        managed,
         backoff: Backoff::default(),
         install_verified: false,
         last_gen: 0,
@@ -270,7 +281,7 @@ impl Sup {
         let up_for = c.at.elapsed();
         drop(c.link);
         // ssh has usually exited with the stream; make sure, and reap it.
-        c.proc.child.kill_and_wait(Duration::from_secs(2));
+        c.conn.end();
         let mut st = self.sh.lock();
         let delay = if st.upgrading {
             Duration::ZERO
@@ -376,29 +387,23 @@ impl Sup {
             }
         }
         self.set_phase(None);
-        let cmd = self
-            .transport
-            .command(&connect_command(self.override_.as_deref(), &version));
-        let mut proc = match process::spawn(&cmd, &self.cancel) {
-            Ok(p) => p,
-            Err(_) if self.cancel.is_cancelled() => return Attempt::Cancelled,
-            Err(e) => {
+        let dialed = match self.dialer.dial(&self.cancel) {
+            Ok(d) => d,
+            Err(DialError::Cancelled) => return Attempt::Cancelled,
+            Err(DialError::Failed { message, hint }) => {
                 return Attempt::Failed(Failure {
-                    message: format!("cannot run {}: {e}", self.transport.describe()),
-                    hint: classify_ssh_failure("", Some(&e), None),
+                    message,
+                    hint,
                     incompatible: None,
                     reinstall: false,
                 })
             }
         };
-        let gen = self.sh.begin_link(Some(proc.pid()));
+        let conn = dialed.conn;
+        let gen = self.sh.begin_link(conn.pid());
         self.last_gen = gen;
-        let io = LinkIo {
-            read: Box::new(proc.stdout.take().expect("piped stdout")),
-            write: Box::new(proc.stdin.take().expect("piped stdin")),
-        };
         let established = Link::establish_with(
-            io,
+            dialed.io,
             mc.ours,
             &version,
             self.sh.events(gen),
@@ -408,7 +413,7 @@ impl Sup {
         let (link, hello, noise) = match established {
             Ok(x) => x,
             Err(_) if self.cancel.is_cancelled() => return Attempt::Cancelled,
-            Err(e) => return Attempt::Failed(self.link_failure(&proc, e)),
+            Err(e) => return Attempt::Failed(self.link_failure(&*conn, e)),
         };
         if let Some(n) = noise {
             eprintln!(
@@ -490,14 +495,14 @@ impl Sup {
         };
         Attempt::Connected(Connected {
             link,
-            proc,
+            conn,
             gen,
             at: Instant::now(),
             left,
         })
     }
 
-    fn link_failure(&self, proc: &Proc, e: LinkError) -> Failure {
+    fn link_failure(&self, conn: &dyn Connection, e: LinkError) -> Failure {
         match e {
             LinkError::Incompatible { hello, message } => {
                 let reason = match version::classify(
@@ -509,7 +514,7 @@ impl Sup {
                     Classified::Incompatible { reason, .. } => reason,
                     Classified::Compatible { .. } => version::IncompatibleReason::Older,
                 };
-                proc.child.kill_and_wait(Duration::from_secs(2));
+                conn.end();
                 Failure {
                     message,
                     hint: None,
@@ -518,18 +523,12 @@ impl Sup {
                 }
             }
             LinkError::Failed(m) => {
-                // Let ssh finish so its stderr and exit code are complete.
-                let status = proc.child.wait_timeout(Duration::from_secs(1));
-                proc.child.kill_and_wait(Duration::from_secs(2));
-                proc.wait_stderr(Duration::from_millis(500));
-                let stderr = proc.stderr_text();
-                let code = status.and_then(|s| s.code());
-                let reinstall = code == Some(127) || stderr.contains("No such file");
+                let d = conn.diagnose(m);
                 Failure {
-                    hint: classify_ssh_failure(&stderr, None, code),
-                    message: if stderr.is_empty() { m } else { stderr },
+                    message: d.message,
+                    hint: d.hint,
                     incompatible: None,
-                    reinstall,
+                    reinstall: d.reinstall,
                 }
             }
         }

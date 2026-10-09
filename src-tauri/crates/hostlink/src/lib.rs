@@ -4,6 +4,7 @@
 
 pub mod cancel;
 pub mod config;
+pub mod dial;
 pub mod errors;
 pub mod handle;
 pub mod install;
@@ -18,6 +19,9 @@ pub mod version;
 
 pub use cancel::CancelToken;
 pub use config::{HostConfig, HOST_ID_PATTERN};
+#[cfg(unix)]
+pub use dial::UnixSocketDialer;
+pub use dial::{Connection, DialError, Dialed, Dialer};
 pub use errors::{HostError, HostErrorCode, HostErrorHint};
 pub use handle::{HostHandle, TermSink};
 pub use install::{BinarySource, ChainSource, DirSource, FileSource};

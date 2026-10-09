@@ -4,8 +4,10 @@ import { getShellById } from "../shells";
 import { AGENT_IDS, type AgentId } from "../agents";
 import type { HostId, TerminalInfo } from "./types";
 
-// A Remote Host's Terminals are the source of truth (ADR-0001): the Desktop shows exactly one
-// Tab per listed Terminal. These pure functions turn a `terminals` list into Tab changes.
+// A Daemon's Terminals are the source of truth for its Host, Remote or Local (ADR-0001,
+// ADR-0005): the Desktop shows exactly one Tab per listed Terminal. These pure functions turn a
+// `terminals` list into Tab changes. `host` undefined is the Local Host; its in-process Tabs
+// (no `terminal`) are never touched.
 
 export const REMOTE_TAB_PREFIX = "remote-";
 export const remoteTabId = (uuid: string) => `${REMOTE_TAB_PREFIX}${uuid}`;
@@ -17,7 +19,7 @@ function basename(p: string): string {
   return p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
 }
 
-export function tabFromTerminal(host: HostId, info: TerminalInfo): Tab {
+export function tabFromTerminal(host: HostId | undefined, info: TerminalInfo): Tab {
   const { spec, meta } = info;
   const raw = spec.shellMode === "raw";
   const agent = (AGENT_IDS as string[]).includes(spec.agent ?? "") ? (spec.agent as AgentId) : undefined;
@@ -25,7 +27,6 @@ export function tabFromTerminal(host: HostId, info: TerminalInfo): Tab {
   const tab: Tab = {
     id: remoteTabId(info.terminal),
     type: "terminal",
-    host,
     terminal: info.terminal,
     title: str(meta.title) || (raw ? (shellName || "Shell") : "Session"),
     projectPath: spec.cwd,
@@ -33,6 +34,7 @@ export function tabFromTerminal(host: HostId, info: TerminalInfo): Tab {
     shellMode: raw ? "raw" : "claude",
     createdAt: num(meta.createdAt) ?? info.createdAtMs,
   };
+  if (host) tab.host = host;
   if (spec.sessionId) tab.sessionId = spec.sessionId;
   if (agent) tab.agent = agent;
   if (spec.shellId) tab.shellId = spec.shellId;
@@ -51,7 +53,7 @@ export interface ReconcileDelta {
 // `isDirty`: local, not-yet-echoed edits (amendment 17) — the list never overwrites them.
 export function reconcile(
   tabs: Tab[],
-  host: HostId,
+  host: HostId | undefined,
   list: TerminalInfo[],
   pending: ReadonlySet<string>,
   isDirty: (tabId: string, field: "title" | "sessionId") => boolean = () => false,
@@ -149,13 +151,13 @@ export function applyReconcile(s: ReconcileState, d: ReconcileDelta): ReconcileS
   return { tabs, groups, activeLeafByGroup, removed: d.remove };
 }
 
-// Amendment 22: at startup, cached remote tabs get their groupId back from the persisted
-// group layouts (leaf ids are the stable `remote-<uuid>`).
+// Amendment 22: at startup, cached Daemon Tabs (any Host) get their groupId back from the
+// persisted group layouts (leaf ids are the stable `remote-<uuid>`).
 export function restoreGroupIds(tabs: Tab[], groups: Group[]): Tab[] {
   const groupOf = new Map<string, string>();
   for (const g of groups) for (const id of collectLeafIds(g.layout)) groupOf.set(id, g.id);
   return tabs.map(t => {
-    if (!t.host) return t;
+    if (!t.terminal) return t;
     const gid = groupOf.get(t.id);
     return gid && t.groupId !== gid ? { ...t, groupId: gid } : t;
   });
@@ -178,7 +180,7 @@ export interface HostsReconcile {
 
 // Reconciles every Host's latest list against one evolving tab list, so the result can be
 // applied as a single transaction.
-export function reconcileHosts(tabs: Tab[], lists: [HostId, TerminalInfo[]][], o: ReconcileOptions): HostsReconcile {
+export function reconcileHosts(tabs: Tab[], lists: [HostId | undefined, TerminalInfo[]][], o: ReconcileOptions): HostsReconcile {
   const deltas: ReconcileDelta[] = [];
   const removed: string[] = [];
   const confirmed: string[] = [];
