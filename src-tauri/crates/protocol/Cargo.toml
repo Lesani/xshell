@@ -4,9 +4,64 @@ version = "0.0.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "The xshell wire protocol: framing, messages, version negotiation. No PTY, SQLite or Tauri."
+description = "The xshell wire protocol: framing, messages, version negotiation, the Ring and the Relay client. No PTY, SQLite or Tauri."
+
+[features]
+default = ["ring"]
+# The Ring: device keys, the Roster and its signature chain, the Relay wire types. Pure Rust,
+# no network code. (Named after the domain term; rustls's `ring` feature below is the crypto
+# library.)
+ring = [
+    "dep:ed25519-dalek",
+    "dep:x25519-dalek",
+    "dep:sha2",
+    "dep:base64",
+    "dep:getrandom",
+    "dep:zeroize",
+]
+# The blocking Relay client: WebSocket over TLS, one IO thread.
+relay-client = [
+    "ring",
+    "dep:tungstenite",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:libc",
+    "dep:windows-sys",
+]
+# An in-process test Relay and the Relay contract scenarios (test support only).
+test-relay = ["relay-client"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize", "fast"], optional = true }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"], optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+base64 = { version = "=0.22.1", optional = true }
+getrandom = { version = "=0.2.17", optional = true }
+zeroize = { version = "=1.8.2", optional = true }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
+rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "=1.0.9", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "=0.2.185", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Networking_WinSock"], optional = true }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+
+[[test]]
+name = "ring_roster"
+required-features = ["ring"]
+
+[[test]]
+name = "ring_vectors"
+required-features = ["ring"]
+
+[[test]]
+name = "ring_relay"
+required-features = ["test-relay"]

@@ -1,0 +1,140 @@
+{
+  "description": "One of every v1 frame, as this implementation encodes it. Field order is not significant. `intBounds`: each `max` frame decodes, each `over` frame (one past 2^53-1) is refused.",
+  "frames": [
+    {
+      "dir": "client",
+      "json": "{\"t\":\"auth.chain\",\"rosters\":[\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MSwicHJldiI6bnVsbCwicmVsYXlVcmwiOiJ3c3M6Ly9yZWxheS5leGFtcGxlLmNvbSIsInNpZ25lZEJ5IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyIsImlzc3VlZEF0IjoxNzY3MjI1NjAwLCJtZW1iZXJzIjpbeyJuYW1lIjoiZGVza3RvcCIsInJvbGUiOiJkZXNrdG9wIiwic2lnbktleSI6IjBFcXlNblFydEtzNkUyaTlSaFhrNXRBaVNyY2FBV3V2aFNDak1zbDNoemMiLCJub2lzZUtleSI6IkJTcFFkenJJMlJkejh0eVdZdUV2RGVfcEZlUVZ1S0hJNGdwYVBXcXl1RU0iLCJhZGRlZEF0IjoxNzY3MjI1NjAwfV19.7Hvl2MKxRQH1aole1lvfopNvlOX1FM9qAo4w8c72BJnQ4bugbgF96rvqOkrMog2c7-ED6Q-Aed8C6PVEgSzqDA\",\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MiwicHJldiI6Ild4cTk4YUtaYko4T3VtOVI4VkY0eVlOUEtLT1VudjVYb1FnVmNwTnBadmciLCJyZWxheVVybCI6IndzczovL3JlbGF5LmV4YW1wbGUuY29tIiwic2lnbmVkQnkiOiIwRXF5TW5RcnRLczZFMmk5UmhYazV0QWlTcmNhQVd1dmhTQ2pNc2wzaHpjIiwiaXNzdWVkQXQiOjE3NjcyMjU2NjAsIm1lbWJlcnMiOlt7Im5hbWUiOiJkZXNrdG9wIiwicm9sZSI6ImRlc2t0b3AiLCJzaWduS2V5IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyIsIm5vaXNlS2V5IjoiQlNwUWR6ckkyUmR6OHR5V1l1RXZEZV9wRmVRVnVLSEk0Z3BhUFdxeXVFTSIsImFkZGVkQXQiOjE3NjcyMjU2MDB9LHsibmFtZSI6ImRlc2t0b3AtMiIsInJvbGUiOiJkZXNrdG9wIiwic2lnbktleSI6ImlFdUlWX1Rxb1dFOFlWQk5zMDFMNnZOR1VYb09NZDQ4M2RUWnRDQWRuUXMiLCJub2lzZUtleSI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUEiLCJhZGRlZEF0IjoxNzY3MjI1NjYwfSx7Im5hbWUiOiJkYWVtb24iLCJyb2xlIjoiZGFlbW9uIiwic2lnbktleSI6IlNBZGFXWDV5R2hWdUxnZVozbHpBeFRKTnh1ZnE4YzNVWWxDR2pzVXlGZDAiLCJub2lzZUtleSI6Ildka2lWSE5GSHZfLWF6YmJ5dV9iOTdHSlhlWWdoRkNhZjF0WXZ3SFFaQmciLCJhZGRlZEF0IjoxNzY3MjI1NjYwfSx7Im5hbWUiOiJtb2JpbGUiLCJyb2xlIjoibW9iaWxlIiwic2lnbktleSI6IjI1bGY0bEZwMFVIS3VidTZrcnFnSDU4dUhzNTk5TXNxd0ZHUTgzX01INTAiLCJub2lzZUtleSI6IkV5eEVLLUFRLTlWLWNtQXpLS3AyNXhfTXdWQTZyaUdUSjlGTm5KbVQ5SEkiLCJhZGRlZEF0IjoxNzY3MjI1NjYwfV19.x7tQXyV9sJcvIJQoef4VyE1X3Dc_E_PWphO8Z25B83QD8C9F7z-JBsSBSA2zzxmWlFVpQJaSYFMfdMmvVXOPBg\"]}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"auth\",\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"sig\":\"KPdS-cB6vmXPJKOxx-sWqmeGl3DsLS3rRrVvu9LR3hRJQlrxfzevzSSzGV2Uq8b7FtH2A7UxQEcInAnlLt01DQ\",\"caps\":[]}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"env\",\"to\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"payload\":\"bm9pc2UgbWVzc2FnZQ\"}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"bye\",\"reason\":\"upgrade\"}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.put\",\"id\":1,\"roster\":\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MywicHJldiI6InZLUmNhbFVWLVJWaU1EOVZhWFp3cXYxaGRMTnUtMlB0cnA2MllYTzA1a28iLCJyZWxheVVybCI6IndzczovL3JlbGF5LnNlbGYtaG9zdGVkLmV4YW1wbGU6ODQ0My94c2hlbGwiLCJzaWduZWRCeSI6ImlFdUlWX1Rxb1dFOFlWQk5zMDFMNnZOR1VYb09NZDQ4M2RUWnRDQWRuUXMiLCJpc3N1ZWRBdCI6MTc2NzIyNTcyMCwibWVtYmVycyI6W3sibmFtZSI6ImRlc2t0b3AiLCJyb2xlIjoiZGVza3RvcCIsInNpZ25LZXkiOiIwRXF5TW5RcnRLczZFMmk5UmhYazV0QWlTcmNhQVd1dmhTQ2pNc2wzaHpjIiwibm9pc2VLZXkiOiJCU3BRZHpySTJSZHo4dHlXWXVFdkRlX3BGZVFWdUtISTRncGFQV3F5dUVNIiwiYWRkZWRBdCI6MTc2NzIyNTYwMH0seyJuYW1lIjoiZGVza3RvcC0yIiwicm9sZSI6ImRlc2t0b3AiLCJzaWduS2V5IjoiaUV1SVZfVHFvV0U4WVZCTnMwMUw2dk5HVVhvT01kNDgzZFRadENBZG5RcyIsIm5vaXNlS2V5IjoiRDZwb1R0S0laN2xfU21vdDdsMzR6cGRPZHJjQmpqOGlvY1RQSm5oWER5QSIsImFkZGVkQXQiOjE3NjcyMjU2NjB9LHsibmFtZSI6ImRhZW1vbiIsInJvbGUiOiJkYWVtb24iLCJzaWduS2V5IjoiU0FkYVdYNXlHaFZ1TGdlWjNsekF4VEpOeHVmcThjM1VZbENHanNVeUZkMCIsIm5vaXNlS2V5IjoiV2RraVZITkZIdl8tYXpiYnl1X2I5N0dKWGVZZ2hGQ2FmMXRZdndIUVpCZyIsImFkZGVkQXQiOjE3NjcyMjU2NjB9XX0.XY9HLPUi2pfrOq_dyurAj53_IBMw5WQQGpjjCKW4Sxa194M7kpDQ_k0XAi88VW5u39hJqpp7FtrWhEqZReqUBA\"}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":2,\"since\":1}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"entitlement.put\",\"id\":3,\"token\":\"xet1.e30.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"challenge\",\"v\":1,\"nonce\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI\",\"rosterVersion\":2,\"caps\":[]}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"welcome\",\"you\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"rosterVersion\":2,\"presence\":[{\"signKey\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"online\":true,\"lastSeen\":1767225800,\"lastReason\":null},{\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"online\":false,\"lastSeen\":1767225900,\"lastReason\":\"quit\"}],\"entitlement\":null,\"caps\":[]}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"welcome\",\"you\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"rosterVersion\":2,\"presence\":[],\"entitlement\":null,\"limited\":true,\"caps\":[]}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"presence\",\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"online\":false,\"lastSeen\":1767225900,\"lastReason\":\"quit\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"env\",\"from\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"payload\":\"bm9pc2UgbWVzc2FnZQ\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"ok\",\"id\":1}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"error\",\"code\":\"roster_invalid\",\"id\":1,\"detail\":\"signer_not_desktop\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"error\",\"code\":\"offline\",\"to\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"roster\",\"roster\":\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MywicHJldiI6InZLUmNhbFVWLVJWaU1EOVZhWFp3cXYxaGRMTnUtMlB0cnA2MllYTzA1a28iLCJyZWxheVVybCI6IndzczovL3JlbGF5LnNlbGYtaG9zdGVkLmV4YW1wbGU6ODQ0My94c2hlbGwiLCJzaWduZWRCeSI6ImlFdUlWX1Rxb1dFOFlWQk5zMDFMNnZOR1VYb09NZDQ4M2RUWnRDQWRuUXMiLCJpc3N1ZWRBdCI6MTc2NzIyNTcyMCwibWVtYmVycyI6W3sibmFtZSI6ImRlc2t0b3AiLCJyb2xlIjoiZGVza3RvcCIsInNpZ25LZXkiOiIwRXF5TW5RcnRLczZFMmk5UmhYazV0QWlTcmNhQVd1dmhTQ2pNc2wzaHpjIiwibm9pc2VLZXkiOiJCU3BRZHpySTJSZHo4dHlXWXVFdkRlX3BGZVFWdUtISTRncGFQV3F5dUVNIiwiYWRkZWRBdCI6MTc2NzIyNTYwMH0seyJuYW1lIjoiZGVza3RvcC0yIiwicm9sZSI6ImRlc2t0b3AiLCJzaWduS2V5IjoiaUV1SVZfVHFvV0U4WVZCTnMwMUw2dk5HVVhvT01kNDgzZFRadENBZG5RcyIsIm5vaXNlS2V5IjoiRDZwb1R0S0laN2xfU21vdDdsMzR6cGRPZHJjQmpqOGlvY1RQSm5oWER5QSIsImFkZGVkQXQiOjE3NjcyMjU2NjB9LHsibmFtZSI6ImRhZW1vbiIsInJvbGUiOiJkYWVtb24iLCJzaWduS2V5IjoiU0FkYVdYNXlHaFZ1TGdlWjNsekF4VEpOeHVmcThjM1VZbENHanNVeUZkMCIsIm5vaXNlS2V5IjoiV2RraVZITkZIdl8tYXpiYnl1X2I5N0dKWGVZZ2hGQ2FmMXRZdndIUVpCZyIsImFkZGVkQXQiOjE3NjcyMjU2NjB9XX0.XY9HLPUi2pfrOq_dyurAj53_IBMw5WQQGpjjCKW4Sxa194M7kpDQ_k0XAi88VW5u39hJqpp7FtrWhEqZReqUBA\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"roster.chain\",\"id\":2,\"rosters\":[\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MiwicHJldiI6Ild4cTk4YUtaYko4T3VtOVI4VkY0eVlOUEtLT1VudjVYb1FnVmNwTnBadmciLCJyZWxheVVybCI6IndzczovL3JlbGF5LmV4YW1wbGUuY29tIiwic2lnbmVkQnkiOiIwRXF5TW5RcnRLczZFMmk5UmhYazV0QWlTcmNhQVd1dmhTQ2pNc2wzaHpjIiwiaXNzdWVkQXQiOjE3NjcyMjU2NjAsIm1lbWJlcnMiOlt7Im5hbWUiOiJkZXNrdG9wIiwicm9sZSI6ImRlc2t0b3AiLCJzaWduS2V5IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyIsIm5vaXNlS2V5IjoiQlNwUWR6ckkyUmR6OHR5V1l1RXZEZV9wRmVRVnVLSEk0Z3BhUFdxeXVFTSIsImFkZGVkQXQiOjE3NjcyMjU2MDB9LHsibmFtZSI6ImRlc2t0b3AtMiIsInJvbGUiOiJkZXNrdG9wIiwic2lnbktleSI6ImlFdUlWX1Rxb1dFOFlWQk5zMDFMNnZOR1VYb09NZDQ4M2RUWnRDQWRuUXMiLCJub2lzZUtleSI6IkQ2cG9UdEtJWjdsX1Ntb3Q3bDM0enBkT2RyY0Jqajhpb2NUUEpuaFhEeUEiLCJhZGRlZEF0IjoxNzY3MjI1NjYwfSx7Im5hbWUiOiJkYWVtb24iLCJyb2xlIjoiZGFlbW9uIiwic2lnbktleSI6IlNBZGFXWDV5R2hWdUxnZVozbHpBeFRKTnh1ZnE4YzNVWWxDR2pzVXlGZDAiLCJub2lzZUtleSI6Ildka2lWSE5GSHZfLWF6YmJ5dV9iOTdHSlhlWWdoRkNhZjF0WXZ3SFFaQmciLCJhZGRlZEF0IjoxNzY3MjI1NjYwfSx7Im5hbWUiOiJtb2JpbGUiLCJyb2xlIjoibW9iaWxlIiwic2lnbktleSI6IjI1bGY0bEZwMFVIS3VidTZrcnFnSDU4dUhzNTk5TXNxd0ZHUTgzX01INTAiLCJub2lzZUtleSI6IkV5eEVLLUFRLTlWLWNtQXpLS3AyNXhfTXdWQTZyaUdUSjlGTm5KbVQ5SEkiLCJhZGRlZEF0IjoxNzY3MjI1NjYwfV19.x7tQXyV9sJcvIJQoef4VyE1X3Dc_E_PWphO8Z25B83QD8C9F7z-JBsSBSA2zzxmWlFVpQJaSYFMfdMmvVXOPBg\",\"xro1.eyJ2IjoxLCJyaW5nSWQiOiIwZExWaC1WZnhKT21RSl93bi1qbDFwNGhSTzBhWDlEUks2ejFlaTRQMC13IiwidmVyc2lvbiI6MywicHJldiI6InZLUmNhbFVWLVJWaU1EOVZhWFp3cXYxaGRMTnUtMlB0cnA2MllYTzA1a28iLCJyZWxheVVybCI6IndzczovL3JlbGF5LnNlbGYtaG9zdGVkLmV4YW1wbGU6ODQ0My94c2hlbGwiLCJzaWduZWRCeSI6ImlFdUlWX1Rxb1dFOFlWQk5zMDFMNnZOR1VYb09NZDQ4M2RUWnRDQWRuUXMiLCJpc3N1ZWRBdCI6MTc2NzIyNTcyMCwibWVtYmVycyI6W3sibmFtZSI6ImRlc2t0b3AiLCJyb2xlIjoiZGVza3RvcCIsInNpZ25LZXkiOiIwRXF5TW5RcnRLczZFMmk5UmhYazV0QWlTcmNhQVd1dmhTQ2pNc2wzaHpjIiwibm9pc2VLZXkiOiJCU3BRZHpySTJSZHo4dHlXWXVFdkRlX3BGZVFWdUtISTRncGFQV3F5dUVNIiwiYWRkZWRBdCI6MTc2NzIyNTYwMH0seyJuYW1lIjoiZGVza3RvcC0yIiwicm9sZSI6ImRlc2t0b3AiLCJzaWduS2V5IjoiaUV1SVZfVHFvV0U4WVZCTnMwMUw2dk5HVVhvT01kNDgzZFRadENBZG5RcyIsIm5vaXNlS2V5IjoiRDZwb1R0S0laN2xfU21vdDdsMzR6cGRPZHJjQmpqOGlvY1RQSm5oWER5QSIsImFkZGVkQXQiOjE3NjcyMjU2NjB9LHsibmFtZSI6ImRhZW1vbiIsInJvbGUiOiJkYWVtb24iLCJzaWduS2V5IjoiU0FkYVdYNXlHaFZ1TGdlWjNsekF4VEpOeHVmcThjM1VZbENHanNVeUZkMCIsIm5vaXNlS2V5IjoiV2RraVZITkZIdl8tYXpiYnl1X2I5N0dKWGVZZ2hGQ2FmMXRZdndIUVpCZyIsImFkZGVkQXQiOjE3NjcyMjU2NjB9XX0.XY9HLPUi2pfrOq_dyurAj53_IBMw5WQQGpjjCKW4Sxa194M7kpDQ_k0XAi88VW5u39hJqpp7FtrWhEqZReqUBA\"],\"more\":false}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"entitlement\",\"token\":null}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"entitlement\",\"token\":\"xet1.eyJ2IjoxLCJraWQiOiJvOGRoNVcxVjlGNCIsInJpbmdJZCI6IjBkTFZoLVZmeEpPbVFKX3duLWpsMXA0aFJPMGFYOURSSzZ6MWVpNFAwLXciLCJ0aWVyIjoiaG9zdGVkIiwicHVyY2hhc2VSZWYiOiJwdXJjaGFzZS0xIiwiaXNzdWVkQXQiOjE3NjcyMjU2MDAsImV4cGlyZXNBdCI6MTc2NzIyOTIwMH0.BRfjmxWIzMz8hTeLairZg-5TlrQgaGWHXSwAx6fOgib1hDPPMWjUQ4_W7VARbf1PDL5XgAU6rmneWZNnBSA6BA\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"error\",\"code\":\"entitlement_required\",\"to\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\"}"
+    },
+    {
+      "dir": "relay",
+      "json": "{\"t\":\"pong\"}"
+    }
+  ],
+  "intBounds": [
+    {
+      "dir": "client",
+      "max": "{\"id\":9007199254740991,\"since\":1,\"t\":\"roster.get\"}",
+      "over": "{\"id\":9007199254740992,\"since\":1,\"t\":\"roster.get\"}"
+    },
+    {
+      "dir": "client",
+      "max": "{\"id\":1,\"since\":9007199254740991,\"t\":\"roster.get\"}",
+      "over": "{\"id\":1,\"since\":9007199254740992,\"t\":\"roster.get\"}"
+    },
+    {
+      "dir": "client",
+      "max": "{\"id\":9007199254740991,\"roster\":\"xro1.a.b\",\"t\":\"roster.put\"}",
+      "over": "{\"id\":9007199254740992,\"roster\":\"xro1.a.b\",\"t\":\"roster.put\"}"
+    },
+    {
+      "dir": "client",
+      "max": "{\"id\":9007199254740991,\"t\":\"entitlement.put\",\"token\":\"xet1.a.b\"}",
+      "over": "{\"id\":9007199254740992,\"t\":\"entitlement.put\",\"token\":\"xet1.a.b\"}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"id\":9007199254740991,\"t\":\"ok\"}",
+      "over": "{\"id\":9007199254740992,\"t\":\"ok\"}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"code\":\"internal\",\"id\":9007199254740991,\"t\":\"error\"}",
+      "over": "{\"code\":\"internal\",\"id\":9007199254740992,\"t\":\"error\"}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"id\":9007199254740991,\"more\":false,\"rosters\":[],\"t\":\"roster.chain\"}",
+      "over": "{\"id\":9007199254740992,\"more\":false,\"rosters\":[],\"t\":\"roster.chain\"}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"nonce\":\"\",\"rosterVersion\":9007199254740991,\"t\":\"challenge\",\"v\":1}",
+      "over": "{\"nonce\":\"\",\"rosterVersion\":9007199254740992,\"t\":\"challenge\",\"v\":1}"
+    },
+    {
+      "dir": "relay",
+      "max": "{\"lastSeen\":9007199254740991,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}",
+      "over": "{\"lastSeen\":9007199254740992,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}"
+    }
+  ]
+}

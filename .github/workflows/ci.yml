@@ -41,6 +41,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Includes xshelld's unit and integration tests (in-process server, real binary).
       - run: cargo test --workspace --locked
+      # The Ring client, the test Relay and the contract scenarios are behind features.
+      - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-protocol --all-features --locked
+      - run: cargo build -p xshell-protocol --no-default-features --locked
       - name: Guard - xshell-core stays Tauri-free
         shell: bash # -eo pipefail: a failing cargo tree fails the step
         run: |
@@ -57,6 +61,13 @@ jobs:
           grep -q '^xshell-protocol ' <<<"$tree"
           if grep -E '^(tauri|wry|webkit2gtk|gtk|portable-pty|rusqlite|libsqlite3-sys) ' <<<"$tree"; then
             echo "::error::xshell-protocol depends on a PTY, SQLite or Tauri crate"
+            exit 1
+          fi
+          # The codec alone (no default features) carries no crypto and no network code.
+          bare=$(cargo tree -p xshell-protocol --no-default-features -e normal --prefix none --locked)
+          grep -q '^xshell-protocol ' <<<"$bare"
+          if grep -E '^(ed25519-dalek|x25519-dalek|curve25519-dalek|sha2|tungstenite|rustls|ring|webpki-roots) ' <<<"$bare"; then
+            echo "::error::xshell-protocol --no-default-features depends on a crypto or network crate"
             exit 1
           fi
       - name: Guard - home and temp dirs only come from HostCtx
@@ -98,6 +109,9 @@ jobs:
           workspaces: ./src-tauri -> target
       - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked
+      # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.
+      - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-protocol --all-features --locked
   xshelld-musl:
     # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
     # builds natively with musl-gcc on a runner of its own architecture. The release workflow

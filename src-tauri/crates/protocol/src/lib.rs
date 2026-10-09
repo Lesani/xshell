@@ -1,12 +1,15 @@
 //! The Desktop ↔ Daemon protocol: framing, messages, version negotiation and request
 //! correlation. Sans-IO apart from the blocking `read_frame`/`write_frame` helpers, so any
-//! runtime can drive it.
+//! runtime can drive it. With the `ring` feature (on by default) also the [`ring`] module: device
+//! keys, the Roster and the Relay protocol; `relay-client` adds the Relay client.
 
 pub mod correlate;
 pub mod frame;
 pub mod launch;
 pub mod msg;
 pub mod negotiate;
+#[cfg(feature = "ring")]
+pub mod ring;
 
 pub use launch::LaunchSpec;
 use msg::ProtocolRange;

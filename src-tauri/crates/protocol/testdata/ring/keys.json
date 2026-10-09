@@ -1,0 +1,60 @@
+{
+  "devices": [
+    {
+      "name": "desktop",
+      "noiseKey": "BSpQdzrI2Rdz8tyWYuEvDe_pFeQVuKHI4gpaPWqyuEM",
+      "noiseSeedHex": "1212121212121212121212121212121212121212121212121212121212121212",
+      "role": "desktop",
+      "signKey": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+      "signSeedHex": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "desktop-2",
+      "noiseKey": "D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA",
+      "noiseSeedHex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "role": "desktop",
+      "signKey": "iEuIV_TqoWE8YVBNs01L6vNGUXoOMd483dTZtCAdnQs",
+      "signSeedHex": "2121212121212121212121212121212121212121212121212121212121212121"
+    },
+    {
+      "name": "daemon",
+      "noiseKey": "WdkiVHNFHv_-azbbyu_b97GJXeYghFCaf1tYvwHQZBg",
+      "noiseSeedHex": "3232323232323232323232323232323232323232323232323232323232323232",
+      "role": "daemon",
+      "signKey": "SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0",
+      "signSeedHex": "3131313131313131313131313131313131313131313131313131313131313131"
+    },
+    {
+      "name": "mobile",
+      "noiseKey": "EyxEK-AQ-9V-cmAzKKp25x_MwVA6riGTJ9FNnJmT9HI",
+      "noiseSeedHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "role": "mobile",
+      "signKey": "25lf4lFp0UHKubu6krqgH58uHs599MsqwFGQ83_MH50",
+      "signSeedHex": "4141414141414141414141414141414141414141414141414141414141414141"
+    },
+    {
+      "name": "stranger",
+      "noiseKey": "9osFugP3GF4bqIh4aC-N0LFRWPYFCInJSB15wtfS-gc",
+      "noiseSeedHex": "5252525252525252525252525252525252525252525252525252525252525252",
+      "role": "desktop",
+      "signKey": "wFDFY3pE-oYp__PMzOIwDLNipj2Z2V_FQUUmb0MyRFo",
+      "signSeedHex": "5151515151515151515151515151515151515151515151515151515151515151"
+    }
+  ],
+  "noiseKeyRejects": [
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "4Ot6fDtBuK4WVuP68Z_EatoJjeucMrH9hmIFFl9JuAA",
+    "X5yVvKNQjCSx0LFVnIPvWwREXMRYHI6G2CJO3dCfEVc",
+    "7P_______________________________________38",
+    "7f_______________________________________38",
+    "7v_______________________________________38",
+    "zet6fDtBuK4WVuP68Z_EatoJjeucMrH9hmIFFl9JuIA",
+    "TJyVvKNQjCSx0LFVnIPvWwREXMRYHI6G2CJO3dCfEdc",
+    "7v_______________________________________38",
+    "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCYk"
+  ],
+  "noiseKeyRule": "canonical (u < 2^255-19, high bit clear) and not of small order",
+  "ringId": "0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+  "ringIdRule": "b64u(SHA-256(\"xshell-ring-v1\\n\" || signKey))"
+}
