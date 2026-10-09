@@ -39,20 +39,59 @@ What the protocol guarantees, and what it does not:
 - **base64url** (`b64u`): RFC 4648 §5 without padding. Decoders refuse padding (`=`), the
   standard alphabet (`+`, `/`), whitespace, a length ≡ 1 (mod 4), and non-zero trailing bits.
   Every byte string has exactly one accepted spelling, so keys compare as strings.
-- **JSON**: every frame and every Roster payload is one JSON object. Duplicate keys at any
-  depth are refused (JavaScript's `JSON.parse` keeps the last one and cannot detect them; a
-  Worker that cannot refuse them must at least never re-encode a Roster). Every integer, in
-  frames and in Roster payloads (ids, versions, timestamps, generations), is a non-negative
-  integer of at most 2^53−1; one past it is refused. Fields are camelCase. Unknown fields are ignored on receipt (and, in a Roster,
-  covered by its signature and kept).
-- **Keys**: `signKey` is an Ed25519 public key (32 bytes, b64u, 43 characters). It must be a
-  valid point and not of small order. `noiseKey` is an X25519 public key (32 bytes, b64u) in
+- **JSON**: every frame and every Roster payload is one JSON object in UTF-8. Fields are
+  camelCase. Unknown fields are ignored on receipt (and, in a Roster, covered by its
+  signature and kept). These are refused anywhere in the text, in ignored fields too:
+  - invalid UTF-8;
+  - a duplicate key at any depth;
+  - a `\u` escape that is a lone UTF-16 surrogate (an escaped pair such as `\ud83d\ude00`
+    is fine);
+  - a number outside the finite range of an IEEE 754 double, such as `1e999`;
+  - more than 127 levels of nested objects and arrays, the top-level object included.
+
+  JavaScript's `JSON.parse` keeps the last of two duplicate keys and reads `1e999` as
+  `Infinity`, so a Worker needs a parser of its own for frames and Roster payloads.
+- **Integers**: every integer field, in frames and in Roster payloads (ids, versions,
+  timestamps, generations), is written as a plain non-negative integer (digits only: no sign,
+  fraction or exponent) of at most 2^53−1. So `-0`, `-1`, `1.0` and `1e2` are refused, and
+  so is 2^53. The refusal is reported as follows (section 4.4 for Rosters, section 6 for
+  frames):
+
+| Integer field holds | In a Roster | In a frame |
+|---|---|---|
+| `0` to `9007199254740991` | accepted | accepted |
+| `9007199254740992` to `18446744073709551615` | `invalid` | bad fields (`bad_request`) |
+| a sign, fraction or exponent, or more than `18446744073709551615` | `malformed` | bad fields (`bad_request`) |
+
+  A Roster's `v` is read as a 32-bit unsigned integer: above 4294967295 it is `malformed`,
+  and any value other than 1 is `invalid`. A field the reader ignores may hold any finite
+  number. `testdata/ring/roster-reject.json` and the `lexemes` of `frames.json` pin these
+  rules.
+- **Keys**: `signKey` is an Ed25519 public key (32 bytes, b64u, 43 characters). It is
+  decoded as curve25519-dalek decompresses a point: the low 255 bits are y, read modulo p
+  (so a non-canonical y ≥ p is accepted and means y − p), and the top bit selects x. The
+  result must be a point on the curve and not of small order (8·A is not the identity).
+  Keys still compare as strings, so two encodings of one point are two keys. Every
+  non-canonical encoding decodes to a point with y below 19, whose private key nobody
+  knows, so no such key can sign. `noiseKey` is an X25519 public key (32 bytes, b64u) in
   canonical form (u < 2^255−19, high bit clear) and not of small order: the u-coordinates 0,
   1, the two order-8 points (`e0eb7a7c…b800` and `5f9c95bc…1157`) and p−1 are refused, and
-  their non-canonical forms, p and p+1, fail the canonical check. Signatures are Ed25519, 64 bytes, b64u (86 characters), verified strictly
-  (`verify_strict`: canonical `S`, no small-order `R` or key). WebCrypto's Ed25519 verify
-  accepts the same signatures for every signature this crate produces; a Worker should also
-  refuse small-order keys when it parses a Roster.
+  their non-canonical forms, p and p+1, fail the canonical check.
+- **Signatures** are Ed25519, 64 bytes, b64u (86 characters). Devices and Relays verify them
+  strictly, exactly as ed25519-dalek 2.2's `verify_strict` does:
+  1. `S` is canonical: S < L, the group order;
+  2. `R` decodes to a point (as a key does) that is not of small order;
+  3. the key is not of small order;
+  4. with k = SHA-512(R as sent ‖ the key as sent ‖ message) mod L, the canonical encoding
+     of sB − kA equals R as sent (the cofactorless equation; so a non-canonical R fails).
+
+  This is normative for Relays, not only for devices: a Relay that stored a malleated
+  (S + L) copy of a genuine token, or a token signed with a small-order R, would hold a
+  head that every device refuses. WebCrypto is not enough on its own. On workerd
+  2026-09-21, `crypto.subtle` imports any 32 bytes as an Ed25519 key, refuses S ≥ L, and
+  accepts both a small-order R and a small-order key. A Worker therefore decodes keys and R
+  itself and refuses small orders before it calls `verify`. `testdata/ring/ed25519.json`
+  pins key decoding and these signatures.
 - **Domain separation**: each signed message starts with its own context string:
 
 | Purpose | Context (ASCII, `\n` is LF) |
@@ -115,6 +154,10 @@ every version on its own:
   U+200B–U+200F, U+202A–U+202E, U+2060–U+2069, U+FEFF.
 - The signature verifies under `signedBy`.
 
+`signedBy`, `signKey` and `noiseKey` are typed fields, like the integers: a value that is not
+a usable key by section 2 (a small-order or off-curve `signKey`, a small-order or
+non-canonical `noiseKey`) makes the token `malformed`, not `invalid`.
+
 ### 4.3 Chain rules
 
 **Genesis (version 1):** `version == 1` and `prev == null`; `ringId == derive(signedBy)`;
@@ -143,8 +186,8 @@ A refused Roster is reported with one of these `detail` codes, in this order of 
 | Detail | Meaning |
 |---|---|
 | `too_large` | token over 64 KiB, chain over 4096 versions, or candidate over 16 MiB |
-| `malformed` | prefix, base64url, JSON, duplicate key, or a missing or mistyped field |
-| `invalid` | a structural rule of 4.2 (other than the signature) |
+| `malformed` | prefix, base64url, UTF-8, JSON (section 2), duplicate key, or a missing or mistyped field (an unusable key, or an integer written with a sign, fraction or exponent, included) |
+| `invalid` | a structural rule of 4.2 (other than the signature), or an integer above 2^53−1 that fits 64 bits |
 | `bad_signature` | the signature does not verify under `signedBy` |
 | `not_genesis` | a chain that does not start at version 1 with `prev: null` |
 | `ring_mismatch` | wrong `ringId` (not derived from the genesis signer, or changed) |
@@ -160,6 +203,8 @@ fragment, backslash, percent escape, empty or dot path segment. The host is a DN
 a dotted-quad IPv4 address in canonical form, or a bracketed IPv6 address without an embedded
 IPv4 part. A port, if given, is 1 to 65535 without leading zeros. These limits exist so that
 every accepted URL normalizes the same way in Rust and in a Worker's `new URL()`.
+`testdata/ring/urls.json` pins which URLs are accepted, their origins and their Ring
+endpoints.
 
 **Origin** (what a device signs): lowercase scheme and host, the default port (wss 443,
 ws 80) dropped, no path, IPv6 in brackets in canonical (RFC 5952) form:
@@ -177,16 +222,21 @@ expected origin when that happens.
 
 ## 6. Transport
 
-- A device dials `{relayUrl without trailing /}/v1/ring/{ringId}` as a WebSocket upgrade. The
-  Worker checks `ringId` against `^[A-Za-z0-9_-]{16,128}$` (else HTTP 404) and routes to
-  `idFromName(ringId)`.
+- A device dials `{relayUrl without trailing /}/v1/ring/{ringId}` as a WebSocket upgrade. A
+  `relayUrl` may carry a path, so the Relay serves every request path that **ends** in
+  `/v1/ring/{ringId}`, whatever comes before it; a Relay behind a path prefix need not know
+  the prefix. `ringId` is the last path segment and must match `^[A-Za-z0-9_-]{16,128}$`.
+  The Worker routes it to `idFromName(ringId)`.
+- HTTP answers: such a path without a WebSocket upgrade gets 426; `GET /healthz` gets 200;
+  every other request, a bad `ringId` included, gets 404.
 - **Text frames only.** A binary frame gets `error{code:"unsupported"}` and close 4000.
 - Each frame is one JSON object tagged by `"t"`.
 - An unknown `t` from the Relay is ignored by devices. An unknown `t` from an authenticated
   client gets `error{code:"unknown_type"}` and the socket stays open, so extensions stay
   additive.
 
-**Frame size caps** (raw text length, checked before or right after parsing):
+**Frame size caps** (the frame's length in UTF-8 bytes, checked before or right after
+parsing; every byte limit in this document counts UTF-8 bytes):
 
 | Frame (client to Relay) | Cap |
 |---|---|
@@ -196,11 +246,18 @@ expected origin when that happens.
 | every other frame | 8 KiB |
 | any Relay to client frame (`roster.chain` included) | 1 MiB |
 
-A frame over its cap gets `error{code:"too_large"}` and close 1009. An `env` whose decoded
+A frame over its cap gets `error{code:"too_large"}` and close 1009. A Worker may send 1009:
+workerd accepts `close(1009)` (checked on workerd 2026-09-21), and browsers forbid only
+*calling* `close()` with it, not receiving it. The runtime's own limit on an inbound message
+is far above every cap (32 MiB on workerd), so the Relay checks the caps itself; a message
+over the runtime's limit may end the socket without an `error` frame. An `env` whose decoded
 payload is over 65536 bytes but whose frame is within the cap gets `error{code:"too_large",
-to}` and the socket stays open. Malformed JSON (or no string `t`, or duplicate keys) gets
-`error{code:"bad_request"}` and close 4000. A known type with bad fields gets
-`error{code:"bad_request"}`; before authentication it also closes with 4000.
+to}` and the socket stays open. Malformed JSON (section 2: no single strict object, no string
+`t`, duplicate keys, a lone surrogate, a non-finite number, too deep) gets
+`error{code:"bad_request"}` and close 4000. A known type with bad fields (an integer field
+that breaks section 2 included) gets `error{code:"bad_request"}`; before authentication it
+also closes with 4000. `auth` or `auth.chain` after authentication gets
+`error{code:"bad_request"}`, and the socket stays open.
 
 ## 7. Handshake
 
@@ -215,7 +272,8 @@ Relay  -> {"t":"welcome","you":"<signKey>","rosterVersion":N,"presence":[…],"e
   when it has none.
 - Before `auth` the client may only send `auth.chain`, `auth` and `ping`. Anything else gets
   `error{code:"bad_request"}` and close 4000.
-- If `auth` does not arrive within 10 s of the challenge, the Relay sends
+- If `auth` does not arrive within the **auth timeout** of the challenge (10 s by default; a
+  Relay may configure another, and a contract target names it), the Relay sends
   `error{code:"auth_timeout"}` and closes with 4008.
 - The signed message is
   `ASCII("xshell-relay-auth-v1\n" + origin + "\n" + ringId + "\n" + nonce + "\n" + signKey)`,
@@ -308,6 +366,12 @@ the record is online. Terminal transitions are idempotent: once one has happened
 for that generation do nothing. A replaced socket's late `bye`, close or error therefore
 leaves the new socket online.
 
+**After a restart.** A Relay that restarts or is redeployed can lose its sockets without any
+close or error event. When it wakes, every presence record that says `online` but has no
+live authenticated socket of the record's generation becomes `dropped`, with `lastSeen` set
+to the time of the wake, and the change is pushed like any other. (The test Relay never
+restarts, so the contract suite does not cover this.)
+
 How a device reads a record (amendment A4, Host Status):
 
 | Record | Device shows |
@@ -363,7 +427,8 @@ Any member may upload; the chain rules decide. A token byte-identical to the hea
 is at most 64 KiB, under the Durable Object's 128 KiB value limit) and then:
 
 1. broadcasts `{"t":"roster","roster":"xro1…"}` to every connected member, the uploader
-   included;
+   included. The uploader may get the broadcast before or after its `ok`, and a client
+   handles both orders (the test Relay's `broadcast_before_ok` tests the other one);
 2. sends each member the new head no longer lists `error{code:"removed"}`, closes it with
    4004, and forgets its presence record.
 
@@ -388,15 +453,29 @@ Relay  -> {"t":"ok","id":9}  or  {"t":"error","id":9,"code":"entitlement_invalid
 Relay  -> {"t":"entitlement","token":"xet1…"}     (to every connected member)
 ```
 
-A Relay configured with the Push Gateway's public key verifies the token with
-`verifyEntitlement(token, ringId, now, keys)` (any tier; a refusal's `detail` is the
-gateway's code: `malformed`, `bad_signature`, `unknown_kid`, `ring_mismatch`, `expired`).
-A Relay without it stores the latest well-formed token: `xet1.`, a payload part that
-decodes to a JSON object, and a part that decodes to 64 bytes, 4 KiB at most. The stored
-token is returned in `welcome.entitlement`. `crates/protocol` implements the same check
-(`ring::entitlement::verify_entitlement`); `testdata/ring/entitlement.json` pins it.
+One switch: a Relay is **Hosted** if and only if it is configured with the Push Gateway's
+public keys (the Worker's `GATEWAY_PUBLIC_KEYS`, the test Relay's `hosted`). Then it:
 
-**Hosted Relay: limited sessions.** The Hosted Relay routes envelopes for a Ring only while
+- verifies each `entitlement.put` with `verifyEntitlement(token, ringId, now, keys)` (any
+  tier; a refusal's `detail` is the gateway's code: `malformed`, `bad_signature`,
+  `unknown_kid`, `ring_mismatch`, `expired`);
+- limits sessions without a valid Hosted token (below);
+- applies the daily quota (section 14);
+- returns the stored token in `welcome.entitlement` only while it still verifies (any
+  tier), else `null`.
+
+A Relay that is not Hosted verifies nothing: it stores the latest well-formed token (`xet1.`,
+a payload part that decodes to a strict JSON object by section 2, and a part that decodes to
+64 bytes, 4 KiB at most) and returns it in `welcome.entitlement` exactly as stored.
+`crates/protocol` implements the gateway's check (`ring::entitlement::verify_entitlement`);
+`testdata/ring/entitlement.json` pins it.
+
+The Worker verifies with the Push Gateway's own `verifyEntitlement`, which reads the payload
+with `JSON.parse`: it accepts duplicate keys and numbers like `1.0` that `crates/protocol`
+refuses. This divergence is accepted, because only the gateway signs these tokens and it never
+writes such payloads.
+
+**Hosted Relay: limited sessions.** A Hosted Relay routes envelopes for a Ring only while
 it stores a valid `tier: "hosted"` token (signature, kid, `ringId`, and `now < expiresAt`, no
 grace). Without one, an authenticated member still gets a session, so that a new Ring can
 install its first token:
@@ -423,15 +502,28 @@ authentication. The Relay answers exactly `{"t":"pong"}`. On Cloudflare that is
 pings never wake the Durable Object. A device that receives no complete frame for 75 s (two
 missed pongs plus slack) treats the connection as dead.
 
-## 14. Quotas (amendment A3, Hosted Relay)
+## 14. Quotas (amendment A3)
 
-- Per Ring per UTC day, at most 2,000,000 client frames processed by the Relay. Every client
-  frame the Durable Object handles counts. Auto-answered pings never reach it and do not
-  count.
+A Hosted Relay applies a daily quota of client frames per Ring, 2,000,000 per UTC day by
+default. Any other Relay applies one only when it is configured with one (the Worker's
+`QUOTA_FRAMES_PER_DAY`, the test Relay's `quota_frames_per_day`).
+
+- **What counts:** each client frame on an authenticated socket that passes the size cap
+  and the JSON parse (section 6). Frames before `auth` do not count. The exact bytes
+  `{"t":"ping"}` never count: on Cloudflare they are auto-answered and never reach the
+  Durable Object (section 13). A ping written any other way (`{"t": "ping"}`) does count.
+  `bye` is never counted or refused.
+- **Over the quota:** once the Ring's count for the day has reached the quota, a frame is not
+  processed. The Relay answers `error{code:"quota"}`, with the frame's `id` (`roster.put`,
+  `roster.get`, `entitlement.put`) or `to` (`env`) when it decoded with one, and the socket
+  stays open. After 32 refusals in a row on one socket (`wire::QUOTA_REFUSALS_BEFORE_CLOSE`;
+  a processed frame starts the count again), the Relay closes it with 4029. Nothing is
+  billed.
+- **Accuracy:** the counter may lose up to 64 counted frames each time the Relay is evicted
+  or restarted (a Worker writes it behind, every 64 frames and at each alarm).
+- `rate_limited` is reserved: no v1 Relay sends it.
 - The 64 KiB per-message limit is the envelope payload limit of section 10. Control frames
   have their own caps (section 6).
-- Over the daily quota the Relay answers `error{code:"quota"}`. A connection that keeps
-  sending is closed with 4029. Nothing is billed.
 
 ## 15. Errors and close codes
 
@@ -439,10 +531,10 @@ missed pongs plus slack) treats the connection as dead.
 
 | Code | Close | Meaning |
 |---|---|---|
-| `bad_request` | 4000 if malformed or before auth | bad frame, or bad envelope |
+| `bad_request` | 4000 if malformed or before auth | bad frame, bad envelope, or `auth`/`auth.chain` after auth |
 | `unsupported` | 4000 | binary frame |
 | `unknown_type` | no | unknown `t` after auth |
-| `auth_timeout` | 4008 | no `auth` within 10 s |
+| `auth_timeout` | 4008 | no `auth` within the auth timeout (10 s by default) |
 | `no_roster` | 4003 | no Roster stored and no candidate |
 | `not_member` | 4003 | key not in the resulting head |
 | `bad_signature` | 4001 | challenge answer does not verify |
@@ -451,8 +543,8 @@ missed pongs plus slack) treats the connection as dead.
 | `removed` | 4004 | a new head no longer lists this device |
 | `replaced` | 4009 | the same key connected again |
 | `offline`, `unknown_recipient`, `too_large` | no (`too_large` on a frame: 1009) | envelope refused |
-| `quota` | 4029 if it persists | Hosted daily quota |
-| `rate_limited` | no | slow down |
+| `quota` | 4029 after 32 in a row | daily quota (section 14) |
+| `rate_limited` | no | reserved; not sent in v1 |
 | `entitlement_required` | no | `env` in a limited session (section 12) |
 | `entitlement_invalid` | no | `entitlement.put` refused |
 | `internal` | optional | Relay failure |
@@ -471,8 +563,12 @@ A close with 1000 follows a `bye`. Devices treat unknown codes as errors and kee
 - One Durable Object per Ring (`idFromName(ringId)`), using WebSocket Hibernation.
 - Storage: `roster:<version>` (the token string), `head` (version number), `presence:<signKey>`
   (record plus the generation it describes), `gen:<signKey>` (the generation counter, never
-  deleted), `entitlement`, `stage/<candidateId>/<n>` (staged chunks, section 7), and the
-  quota counter per UTC day.
+  deleted), `entitlement`, `stage/<candidateId>/<n>` (staged chunks, section 7), the
+  quota counter per UTC day, and `ring` (the Ring id, written at the first request: a
+  Durable Object cannot reliably learn the name it was created from).
+- On wake, rebuild the socket index from `getWebSockets()` and the attachments, and mark
+  `dropped` every online presence record without a live socket of its generation
+  (section 8).
 - Attachment per socket: `{signKey, gen}` once authenticated; `{nonce, deadline,
   candidateId}` and the manifest `{frames, chunks, versions, bytes, stored}` before. Never
   the candidate itself.
@@ -480,16 +576,20 @@ A close with 1000 follows a `bye`. Devices treat unknown codes as errors and kee
   `entitlement.put`), check under the same storage transaction that the attachment's key is
   still in the head and its `gen` is still the key's current socket; otherwise answer
   `removed` (close 4004) or `replaced` (close 4009) and do nothing else.
-- `webSocketMessage`: apply the size cap, parse strictly, dispatch by `t`. Before auth,
-  allow only `auth.chain`, `auth`, and `ping` (which never arrives, being auto-answered).
+- `webSocketMessage`: apply the size cap, parse strictly (section 2; `JSON.parse` is not
+  enough), apply the quota (section 14), dispatch by `t`. Before auth, allow only
+  `auth.chain`, `auth`, and `ping` (which arrives only when not written exactly, the exact
+  bytes being auto-answered).
+- Verify every signature strictly (section 2): decode keys and `R` with y taken mod p,
+  refuse `S ≥ L` and small-order `R` and keys, and only then call WebCrypto.
 - `webSocketClose` / `webSocketError`: mark the socket `dropped` unless a `bye` was seen,
   guarded by its generation (section 8).
-- Use an alarm for the 10 s auth deadline and for sweeping stale `stage/` keys.
+- Use an alarm for the auth deadline and for sweeping stale `stage/` keys.
 - Devices budget their reads per turn at the socket, below TLS, so records without
   plaintext cannot starve them; a Relay should do the same where its runtime allows. Optionally also sweep half-open sockets with
   `getWebSocketAutoResponseTimestamp`.
-- Reuse the Push Gateway's `b64.ts` (`fromB64u` is strict) and the shape of `entitlement.ts`
-  for Roster tokens.
+- Reuse the Push Gateway's `b64.ts` (its `fromB64u` must be strict as section 2 says,
+  non-zero trailing bits included) and the shape of `entitlement.ts` for Roster tokens.
 - Log `bad_signature` together with the origin the Relay expected.
 
 ## 18. Test vectors and the contract suite
@@ -500,10 +600,12 @@ Ed25519 is deterministic):
 | File | Contents |
 |---|---|
 | `keys.json` | seeds (hex), the derived `signKey`/`noiseKey`, the Ring id, and `noiseKeyRejects` (small-order and non-canonical X25519 encodings that must be refused) |
+| `ed25519.json` | `signKeys` (`{key, ok}`: small-order points, every y ≥ p, an off-curve key) and `signatures` (`{key, message, sig, ok}`: valid, S + L, small-order R, small-order key), as `verify_strict` reads them |
 | `roster-chain.json` | v1 → v2 (adds a Desktop, a Daemon, a Mobile) → v3 (signed by the second Desktop, removes the Mobile, moves the Relay): tokens, decoded payloads, hashes |
-| `roster-reject.json` | `{name, trusted[], candidate, error}`: stale, forged and tampered signatures, Mobile/Daemon/non-member signers, gap, `prev` mismatch, fork, wrong Ring id, genesis not self-derived or by a Mobile, no Desktop, duplicate keys, unsafe integers, plain `ws://`, bad encodings |
+| `roster-reject.json` | `cases` (`{name, trusted[], candidate, error}`): stale, forged and tampered signatures, a malleated and a small-order-R signature, Mobile/Daemon/non-member signers, gap, `prev` mismatch, fork, wrong Ring id, genesis not self-derived or by a Mobile, no Desktop, duplicate keys, unusable member keys, integer lexemes, non-finite numbers, lone surrogates, invalid UTF-8, nesting depth, plain `ws://`, bad encodings; `accepted` (`{name, candidate}`): unusual but valid genesis tokens (floats and big numbers in unknown fields, depth 127, an escaped surrogate pair, a non-canonical member key) |
 | `auth.json` | an origin, Ring id, nonce, key, the signed message and signature; origins that must not verify; origin normalization pairs |
-| `frames.json` | one of every v1 frame; `intBounds`: frames at 2^53−1 (accepted) and one past it (refused) |
+| `urls.json` | `accept` (`{url, origin, endpoint}` for a fixed Ring id) and `reject` (`{url, why}`) Relay URLs |
+| `frames.json` | one of every v1 frame; `intBounds`: frames at 2^53−1 (accepted) and one past it (refused); `lexemes`: client frames and whether they decode (`ok`), are `malformed`, or have bad fields (`invalid`) |
 | `entitlement.json` | a gateway key, its kid, and tokens with the expected verification result (ok, wrong tier, expired, other Ring, unknown kid, bad signature, malformed) |
 
 To regenerate them, run
@@ -511,7 +613,7 @@ To regenerate them, run
 A normal test run fails when the files are stale.
 
 The contract scenarios in `ring::relay::contract` (feature `test-relay`) are public functions
-taking a `RelayTarget { url, tls, auth_timeout, gateway }`. This repository runs them against the test
+taking a `RelayTarget { url, tls, auth_timeout, gateway, quota_frames_per_day }`. This repository runs them against the test
 Relay. `xshell-remote` runs the same functions against the Worker on workerd, which makes them
 the definition of a conforming Relay. Every scenario uses fresh random keys, so it needs no
 reset. `contract::SCENARIOS` lists the single-Relay scenarios.
@@ -519,3 +621,5 @@ reset. `contract::SCENARIOS` lists the single-Relay scenarios.
 assumes a Relay without the gateway key. `contract::HOSTED_SCENARIOS` run against a Hosted
 Relay; their target's `gateway` holds the gateway signing key the Relay trusts, so they can
 mint tokens (`hosted_routing_ends_when_the_last_token_expires` is the routing cutoff test).
+`contract::QUOTA_SCENARIOS` (`quota_refuses_then_closes`) run against a Relay with a small
+daily quota (at most 1000 frames), which their target's `quota_frames_per_day` names.

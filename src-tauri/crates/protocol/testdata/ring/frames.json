@@ -1,5 +1,5 @@
 {
-  "description": "One of every v1 frame, as this implementation encodes it. Field order is not significant. `intBounds`: each `max` frame decodes, each `over` frame (one past 2^53-1) is refused.",
+  "description": "One of every v1 frame, as this implementation encodes it. Field order is not significant. `intBounds`: each `max` frame decodes, each `over` frame (one past 2^53-1) is refused. `lexemes`: client frames and their reading: `ok` decodes (an unknown `t` included), `malformed` is not one strict JSON object with a string `t` (bad_request, close 4000), `invalid` is a known type with bad fields (bad_request; close 4000 before auth).",
   "frames": [
     {
       "dir": "client",
@@ -135,6 +135,123 @@
       "dir": "relay",
       "max": "{\"lastSeen\":9007199254740991,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}",
       "over": "{\"lastSeen\":9007199254740992,\"online\":false,\"signKey\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"t\":\"presence\"}"
+    }
+  ],
+  "lexemes": [
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":0,\"since\":0}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":-0,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1.0,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1e2,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":-1,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":18446744073709551615,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":18446744073709551616,\"since\":0}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1,\"since\":0,\"x\":1.5}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1,\"since\":0,\"x\":18446744073709551616}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1,\"since\":0,\"x\":1e999}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"roster.get\",\"id\":1,\"since\":0,\"x\":-1e999}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"future.type\",\"x\":1.5e308}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"future.type\",\"x\":1e309}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":\"\\ud800\"}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":\"\\udc00\\ud800\"}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":\"\\ud83d\\ude00\"}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":{\"a\":1,\"a\":1}}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"t\":\"ping\"}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"ping\",\"x\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+      "result": "malformed"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"env\",\"to\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"payload\":\"aGk\"}",
+      "result": "ok"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"env\",\"to\":\"SAdaWX5yGhVuLgeZ3lzAxTJNxufq8c3UYlCGjsUyFd0\",\"payload\":1}",
+      "result": "invalid"
+    },
+    {
+      "dir": "client",
+      "json": "{\"t\":\"env\",\"to\":\"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"payload\":\"aGk\"}",
+      "result": "invalid"
     }
   ]
 }

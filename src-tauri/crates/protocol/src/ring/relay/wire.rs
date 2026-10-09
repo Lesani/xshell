@@ -30,6 +30,10 @@ pub const MAX_STAGE_CHUNKS: usize = 4096;
 pub const MAX_STAGE_BYTES: usize = MAX_CANDIDATE_BYTES + 64 * 1024;
 /// An entitlement token is at most this long.
 pub const MAX_ENTITLEMENT_TOKEN: usize = 4 * 1024;
+/// A Hosted Relay's default daily quota of client frames per Ring (section 14).
+pub const HOSTED_QUOTA_FRAMES_PER_DAY: u64 = 2_000_000;
+/// A socket is closed with 4029 after this many quota refusals in a row (section 14).
+pub const QUOTA_REFUSALS_BEFORE_CLOSE: usize = 32;
 /// The exact keepalive frames.
 pub const PING: &str = r#"{"t":"ping"}"#;
 pub const PONG: &str = r#"{"t":"pong"}"#;

@@ -4,7 +4,9 @@
 //! between scenarios is needed.
 //!
 //! [`entitlement_slot_round_trips`] assumes a Relay without the Push Gateway's key (it then
-//! stores any well-formed token).
+//! stores any well-formed token). [`HOSTED_SCENARIOS`] need a Hosted Relay and its gateway
+//! key in the target, [`QUOTA_SCENARIOS`] a Relay with a small daily quota, named in the
+//! target.
 //!
 //! [`TestRelay`]: super::test_relay::TestRelay
 
@@ -17,7 +19,7 @@ use super::client::{RingClient, RingClientConfig, RingEvents, RingTimeouts};
 use super::transport::{self, Conn};
 use super::wire::{
     auth_message, close, decode_relay, ByeReason, ClientFrame, CloseReason, ErrorCode,
-    MemberPresence, RelayFrame, MAX_ENVELOPE_PAYLOAD,
+    MemberPresence, RelayFrame, MAX_ENVELOPE_PAYLOAD, PING, PONG, QUOTA_REFUSALS_BEFORE_CLOSE,
 };
 use rustls::ClientConfig;
 use serde_json::json;
@@ -42,6 +44,9 @@ pub struct RelayTarget {
     /// For a Hosted Relay: a signer holding the Push Gateway key the Relay trusts, so the
     /// Hosted scenarios can mint entitlement tokens.
     pub gateway: Option<Arc<dyn Signer>>,
+    /// For a Relay with a daily frame quota (section 14): the quota per Ring. The
+    /// [`QUOTA_SCENARIOS`] need a small one (at most 1000).
+    pub quota_frames_per_day: Option<u64>,
 }
 
 impl RelayTarget {
@@ -1297,6 +1302,79 @@ pub fn hosted_routing_ends_when_the_last_token_expires(t: &RelayTarget) {
         .collect();
     assert!(late.is_empty());
 }
+
+/// A Relay with a daily quota of client frames per Ring (`t.quota_frames_per_day`, at most
+/// 1000): exact pings are not counted, and neither are the frames before `auth`; once the
+/// Ring's quota for the day is used up, every frame but `bye` is refused with `quota`
+/// (echoing the frame's `to` or `id`), the 32nd refusal in a row closes the socket with 4029,
+/// and another socket of the same Ring is refused too.
+pub fn quota_refuses_then_closes(t: &RelayTarget) {
+    let limit = t
+        .quota_frames_per_day
+        .expect("the target names its daily quota");
+    assert!(
+        (1..=1000).contains(&limit),
+        "the quota scenarios need a quota of at most 1000 frames"
+    );
+    let r = TestRing::new(&t.url);
+    let mut a = RawConn::login(t, &r.chain, &*r.desktop);
+    let head = r.chain.head().version();
+    for _ in 0..limit + 8 {
+        a.send(PING).expect("send ping");
+    }
+    for _ in 0..limit + 8 {
+        assert_eq!(
+            a.recv(WAIT),
+            Raw::Text(PONG.into()),
+            "exact pings are answered"
+        );
+    }
+    let get = |id: u64| ClientFrame::RosterGet { id, since: head }.encode();
+    for id in 0..limit {
+        a.send(&get(id)).expect("send roster.get");
+        match a.frame(WAIT) {
+            Some(RelayFrame::RosterChain { id: got, .. }) => assert_eq!(got, id),
+            other => panic!("frame {id} of {limit}: expected roster.chain, got {other:?}"),
+        }
+    }
+    // Over the quota: refused, with `to` or `id` echoed.
+    a.env(&r.daemon.sign_key(), b"over quota");
+    match a.frame(WAIT) {
+        Some(RelayFrame::Error { code, to, .. }) => {
+            assert_eq!(code, ErrorCode::Quota);
+            assert_eq!(to, Some(r.daemon.sign_key()));
+        }
+        other => panic!("expected a quota error, got {other:?}"),
+    }
+    for id in 1..QUOTA_REFUSALS_BEFORE_CLOSE as u64 {
+        a.send(&get(1000 + id)).expect("send roster.get");
+        match a.frame(WAIT) {
+            Some(RelayFrame::Error { code, id: got, .. }) => {
+                assert_eq!(code, ErrorCode::Quota);
+                assert_eq!(got, Some(1000 + id));
+            }
+            other => panic!("refusal {id}: expected a quota error, got {other:?}"),
+        }
+    }
+    assert_eq!(a.close_code(WAIT), Some(close::QUOTA));
+    // The quota is the Ring's: another member logs in (auth is not counted) but is refused,
+    // and its goodbye still works.
+    let mut d = RawConn::login(t, &r.chain, &*r.daemon);
+    d.send(&get(1)).expect("send roster.get");
+    assert_eq!(d.error(WAIT).map(|e| e.0), Some(ErrorCode::Quota));
+    d.send(
+        &ClientFrame::Bye {
+            reason: ByeReason::quit(),
+        }
+        .encode(),
+    )
+    .expect("send bye");
+    assert_eq!(d.close_code(WAIT), Some(close::NORMAL));
+}
+
+/// Scenarios for a Relay with a small daily quota; the target must name it.
+pub const QUOTA_SCENARIOS: &[(&str, Scenario)] =
+    &[("quota_refuses_then_closes", quota_refuses_then_closes)];
 
 /// Scenarios for a Hosted Relay; the target must carry the gateway key.
 pub const HOSTED_SCENARIOS: &[(&str, Scenario)] = &[

@@ -53,6 +53,8 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Networking_WinSock"], op
 
 [dev-dependencies]
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
+# Builds the Ed25519 edge-case vectors (small-order R, non-canonical encodings).
+curve25519-dalek = { version = "=4.1.3", default-features = false }
 
 [[test]]
 name = "ring_roster"

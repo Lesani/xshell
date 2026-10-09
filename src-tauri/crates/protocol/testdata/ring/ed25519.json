@@ -1,0 +1,275 @@
+{
+  "description": "Ed25519 as ed25519-dalek 2.2 verify_strict reads it. signKeys: a key decodes as a point with y taken mod p (a y >= p is accepted, as curve25519-dalek decompresses it) and is refused if it is not a point or is of small order. signatures: S must be canonical (< L), R must decode and not be of small order, the key must not be of small order, the encoded R must equal the canonical encoding of sB - kA, and k = SHA-512(R bytes || key bytes as given || message) mod L.",
+  "signKeys": [
+    {
+      "key": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+      "ok": true,
+      "why": "an ordinary key"
+    },
+    {
+      "key": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "7P_______________________________________38",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "xxdqcD1N2E-6PAt2DRBnDyogU_osOczGTsf9d5KsA3o",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "xxdqcD1N2E-6PAt2DRBnDyogU_osOczGTsf9d5KsA_o",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "JuiVj8KyJ7BFw_SJ8u-Y8NXfrAXTxjM5sTgCiG1T_AU",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "JuiVj8KyJ7BFw_SJ8u-Y8NXfrAXTxjM5sTgCiG1T_IU",
+      "ok": false,
+      "why": "small order"
+    },
+    {
+      "key": "7f_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, small order"
+    },
+    {
+      "key": "7f________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, small order"
+    },
+    {
+      "key": "7v_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, small order"
+    },
+    {
+      "key": "7v________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, small order"
+    },
+    {
+      "key": "7________________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "7_________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "8P_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8P________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8f_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8f________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8v_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8v________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8________________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "8_________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "9P_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "9P________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "9f_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "9f________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "9v_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "9v________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "9________________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "9_________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "-P_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-P________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-f_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-f________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-v_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-v________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "-________________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "-_________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "_P_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "_P________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "_f_______________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "_f________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "_v_______________________________________38",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "_v________________________________________8",
+      "ok": false,
+      "why": "non-canonical y, not a point"
+    },
+    {
+      "key": "_________________________________________38",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "__________________________________________8",
+      "ok": true,
+      "why": "non-canonical y, read mod p: accepted"
+    },
+    {
+      "key": "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "ok": false,
+      "why": "not a point"
+    }
+  ],
+  "signatures": [
+    {
+      "key": "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s",
+      "message": "xshell ed25519 vector",
+      "name": "valid",
+      "ok": true,
+      "sig": "xdKl-N2-3-6RVPg1sdr_zvh06N8ds6YHKAUi6nPlvx45fgfPUwUNZ9tl6ZA2UJqCMrmhv13HW_S9UuUGLma5Aw"
+    },
+    {
+      "key": "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s",
+      "message": "xshell ed25519 vector",
+      "name": "s_plus_l",
+      "ok": false,
+      "sig": "xdKl-N2-3-6RVPg1sdr_zvh06N8ds6YHKAUi6nPlvx4mUv0rbmgfv7EC4TMVSnmXMrmhv13HW_S9UuUGLma5Ew"
+    },
+    {
+      "key": "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s",
+      "message": "xshell ed25519 vector",
+      "name": "small_order_r",
+      "ok": false,
+      "sig": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD3-Jmmfl-vcBOGaUTl1eT9BleCkgWKxZ59EpgKTda-Aw"
+    },
+    {
+      "key": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "message": "xshell ed25519 vector",
+      "name": "small_order_key",
+      "ok": false,
+      "sig": "WGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  ]
+}

@@ -12,7 +12,8 @@ use xshell_protocol::ring::relay::test_relay::{
     Fault, TestRelay, TestRelayOptions, TestTls, TrickleProxy,
 };
 use xshell_protocol::ring::relay::wire::{
-    ByeReason, CloseReason, MemberPresence, Presence, RelayFrame,
+    ByeReason, CloseReason, ErrorCode, MemberPresence, Presence, RelayFrame,
+    HOSTED_QUOTA_FRAMES_PER_DAY,
 };
 use xshell_protocol::ring::relay::{RingClient, RingLimits, RingTimeouts};
 use xshell_protocol::ring::{RingError, Role, RosterError, Signer};
@@ -374,6 +375,7 @@ fn trickled_tls_records_do_not_stall_sends_or_keepalive() {
         tls: Some(tls),
         auth_timeout: Duration::from_secs(10),
         gateway: None,
+        quota_frames_per_day: None,
     };
     r.set_origin(&t.origin());
     let ring = TestRing::new(&t.url);
@@ -547,6 +549,113 @@ fn hosted_routing_ends_when_the_last_token_expires() {
 #[test]
 fn every_hosted_scenario_is_run_here() {
     assert_eq!(HOSTED_SCENARIOS.len(), 2);
+}
+
+// ---- Quotas ---------------------------------------------------------------------------------
+
+#[test]
+fn quota_refuses_then_closes() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        quota_frames_per_day: Some(40),
+        ..TestRelayOptions::default()
+    });
+    contract::quota_refuses_then_closes(&r.target());
+}
+
+#[test]
+fn every_quota_scenario_is_run_here() {
+    assert_eq!(QUOTA_SCENARIOS.len(), 1);
+}
+
+#[test]
+fn spaced_ping_counts_against_the_quota() {
+    // Only the exact bytes are auto-answered on a Worker; any other ping reaches the Relay.
+    let r = TestRelay::start_with(TestRelayOptions {
+        quota_frames_per_day: Some(1),
+        ..TestRelayOptions::default()
+    });
+    let t = r.target();
+    let get = r#"{"t":"roster.get","id":5,"since":0}"#;
+    // On a fresh Ring the request is processed …
+    let fresh = TestRing::new(&t.url);
+    let mut f = RawConn::login(&t, &fresh.chain, &*fresh.desktop);
+    f.send(get).unwrap();
+    assert!(matches!(
+        f.frame(WAIT),
+        Some(RelayFrame::RosterChain { id: 5, .. })
+    ));
+    // … but after a spaced ping, which counts, it is over the quota.
+    let ring = TestRing::new(&t.url);
+    let mut a = RawConn::login(&t, &ring.chain, &*ring.desktop);
+    a.send(r#"{"t": "ping"}"#).unwrap();
+    assert_eq!(a.recv(WAIT), contract::Raw::Text(r#"{"t":"pong"}"#.into()));
+    a.send(get).unwrap();
+    assert!(matches!(
+        a.frame(WAIT),
+        Some(RelayFrame::Error {
+            code: ErrorCode::Quota,
+            id: Some(5),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn hosted_relay_has_the_default_quota() {
+    let (_r, t) = hosted_relay();
+    assert_eq!(t.quota_frames_per_day, Some(HOSTED_QUOTA_FRAMES_PER_DAY));
+    assert_eq!(relay().target().quota_frames_per_day, None);
+}
+
+// ---- Routing --------------------------------------------------------------------------------
+
+#[test]
+fn relay_url_with_a_path_is_served_by_suffix() {
+    let r = relay();
+    let t = RelayTarget {
+        url: format!("{}/some/base", r.url()),
+        ..r.target()
+    };
+    let ring = TestRing::new(&t.url);
+    let (a, _) = connect(&t, &ring.chain, ring.desktop.clone());
+    assert!(!a.is_closed());
+    // Anything that is not `…/v1/ring/{ringId}` is not found.
+    for path in [
+        "/",
+        "/v1/ring/short",
+        "/v1/ring/",
+        "/v1/ringx/abcdefghijklmnopq",
+    ] {
+        assert_eq!(http_status(&r, path, true), "404", "{path} (upgrade)");
+        assert_eq!(http_status(&r, path, false), "404", "{path}");
+    }
+}
+
+/// The status a plain HTTP/1.1 GET of `path` gets, with or without a WebSocket upgrade.
+fn http_status(r: &TestRelay, path: &str, upgrade: bool) -> String {
+    use std::io::{Read, Write};
+    let mut tcp = std::net::TcpStream::connect(r.addr()).unwrap();
+    tcp.set_read_timeout(Some(WAIT)).unwrap();
+    let up = if upgrade {
+        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    } else {
+        ""
+    };
+    write!(tcp, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{up}\r\n").unwrap();
+    let mut head = [0u8; 12];
+    tcp.read_exact(&mut head).unwrap();
+    String::from_utf8_lossy(&head[9..]).into_owned()
+}
+
+#[test]
+fn plain_http_gets_healthz_426_and_404() {
+    let r = relay();
+    assert_eq!(http_status(&r, "/healthz", false), "200");
+    let ring = TestRing::new(&r.url());
+    let path = format!("/base/v1/ring/{}", ring.ring_id());
+    assert_eq!(http_status(&r, &path, false), "426");
+    assert_eq!(http_status(&r, "/nope", false), "404");
+    assert_eq!(http_status(&r, "/v1/ring/bad!id-0123456789", false), "404");
 }
 
 // ---- Staged candidates ----------------------------------------------------------------------
@@ -782,6 +891,7 @@ fn session_frames_before_welcome_fail_the_connect() {
         tls: None,
         auth_timeout: Duration::from_secs(10),
         gateway: None,
+        quota_frames_per_day: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("env"), "{m}"),
@@ -832,6 +942,7 @@ fn too_much_traffic_during_sync_fails_the_connect() {
         tls: None,
         auth_timeout: Duration::from_secs(10),
         gateway: None,
+        quota_frames_per_day: None,
     };
     match try_connect(&t, &ring.chain, ring.desktop.clone()) {
         Err(RingError::Protocol(m)) => assert!(m.contains("too much"), "{m}"),

@@ -1,0 +1,242 @@
+{
+  "accept": [
+    {
+      "endpoint": "wss://relay.example.com/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://relay.example.com",
+      "url": "wss://relay.example.com"
+    },
+    {
+      "endpoint": "wss://relay.example.com/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://relay.example.com",
+      "url": "WSS://Relay.Example.COM/"
+    },
+    {
+      "endpoint": "wss://relay.example.com/x/y/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://relay.example.com",
+      "url": "wss://relay.example.com:443/x/y/"
+    },
+    {
+      "endpoint": "wss://relay.example.com:8443/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://relay.example.com:8443",
+      "url": "wss://relay.example.com:8443"
+    },
+    {
+      "endpoint": "wss://relay.self-hosted.example:8443/xshell/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://relay.self-hosted.example:8443",
+      "url": "wss://relay.self-hosted.example:8443/xshell"
+    },
+    {
+      "endpoint": "wss://r.example.com/a-b/c_d~e!$&'()*+,;=:/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://r.example.com",
+      "url": "wss://r.example.com/a-b/c_d~e!$&'()*+,;=:"
+    },
+    {
+      "endpoint": "ws://127.0.0.1/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://127.0.0.1",
+      "url": "ws://127.0.0.1:80"
+    },
+    {
+      "endpoint": "ws://127.0.0.1:8787/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://127.0.0.1:8787",
+      "url": "ws://127.0.0.1:8787"
+    },
+    {
+      "endpoint": "ws://127.255.0.9/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://127.255.0.9",
+      "url": "ws://127.255.0.9"
+    },
+    {
+      "endpoint": "ws://localhost:1/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://localhost:1",
+      "url": "ws://localhost:1"
+    },
+    {
+      "endpoint": "ws://localhost/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://localhost",
+      "url": "ws://LOCALHOST"
+    },
+    {
+      "endpoint": "ws://[::1]:9000/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://[::1]:9000",
+      "url": "ws://[::1]:9000"
+    },
+    {
+      "endpoint": "ws://[::1]/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://[::1]",
+      "url": "ws://[0:0:0:0:0:0:0:1]"
+    },
+    {
+      "endpoint": "ws://[::1]/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "ws://[::1]",
+      "url": "ws://[0:0:0:0:0:0:0:1]:80"
+    },
+    {
+      "endpoint": "wss://[2001:db8::1]/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://[2001:db8::1]",
+      "url": "wss://[2001:DB8::1]"
+    },
+    {
+      "endpoint": "wss://[2001:db8::1:0:0:1]/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://[2001:db8::1:0:0:1]",
+      "url": "wss://[2001:db8:0:0:1:0:0:1]:443"
+    },
+    {
+      "endpoint": "wss://10.0.0.1/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://10.0.0.1",
+      "url": "wss://10.0.0.1"
+    },
+    {
+      "endpoint": "wss://xn--bcher-kva.example/v1/ring/0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w",
+      "origin": "wss://xn--bcher-kva.example",
+      "url": "wss://xn--bcher-kva.example"
+    }
+  ],
+  "description": "Relay URLs (RELAY.md section 5). Each `accept` URL parses, normalizes to `origin`, and its Ring endpoint for `ringId` is `endpoint`; each `reject` URL is refused (`why` is this implementation's reason, for humans).",
+  "reject": [
+    {
+      "url": "https://relay.example.com",
+      "why": "bad relay url: scheme is not wss or ws"
+    },
+    {
+      "url": "relay.example.com",
+      "why": "bad relay url: no scheme"
+    },
+    {
+      "url": "ws://relay.example.com",
+      "why": "bad relay url: ws:// is only allowed to a loopback host"
+    },
+    {
+      "url": "ws://10.0.0.1",
+      "why": "bad relay url: ws:// is only allowed to a loopback host"
+    },
+    {
+      "url": "wss://relay.example.com?x=1",
+      "why": "bad relay url: query or fragment"
+    },
+    {
+      "url": "wss://relay.example.com/#f",
+      "why": "bad relay url: query or fragment"
+    },
+    {
+      "url": "wss://user@relay.example.com",
+      "why": "bad relay url: backslash, percent escape or userinfo"
+    },
+    {
+      "url": "wss://relay.example.com/%2e%2e",
+      "why": "bad relay url: backslash, percent escape or userinfo"
+    },
+    {
+      "url": "wss://relay.example.com/a/../b",
+      "why": "bad relay url: dot segment in path"
+    },
+    {
+      "url": "wss://relay.example.com/./b",
+      "why": "bad relay url: dot segment in path"
+    },
+    {
+      "url": "wss://relay.example.com/a//b",
+      "why": "bad relay url: empty path segment"
+    },
+    {
+      "url": "wss://relay.example.com/a b",
+      "why": "bad relay url: not printable ASCII"
+    },
+    {
+      "url": "wss://relay.example.com/a\"b",
+      "why": "bad relay url: bad character in path"
+    },
+    {
+      "url": "wss://relay.example.com:0",
+      "why": "bad relay url: port with a leading zero"
+    },
+    {
+      "url": "wss://relay.example.com:0443",
+      "why": "bad relay url: port with a leading zero"
+    },
+    {
+      "url": "wss://relay.example.com:65536",
+      "why": "bad relay url: bad port"
+    },
+    {
+      "url": "wss://relay.example.com:",
+      "why": "bad relay url: bad port"
+    },
+    {
+      "url": "wss://relay.example.com:+443",
+      "why": "bad relay url: bad port"
+    },
+    {
+      "url": "wss://127.1",
+      "why": "bad relay url: bad IPv4 address"
+    },
+    {
+      "url": "wss://0x7f.0.0.1",
+      "why": "bad relay url: bad IPv4 address"
+    },
+    {
+      "url": "wss://1.2.3.04",
+      "why": "bad relay url: bad IPv4 address"
+    },
+    {
+      "url": "wss://1.2.3.256",
+      "why": "bad relay url: bad IPv4 address"
+    },
+    {
+      "url": "wss://-bad.example.com",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://bad-.example.com",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://bad..example.com",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://relay.example.com.",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://bad_host.example.com",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://réla y.example",
+      "why": "bad relay url: not printable ASCII"
+    },
+    {
+      "url": "wss://[::1",
+      "why": "bad relay url: unclosed IPv6 bracket"
+    },
+    {
+      "url": "wss://[::ffff:1.2.3.4]",
+      "why": "bad relay url: IPv6 address with an embedded IPv4 address"
+    },
+    {
+      "url": "wss://[::1]x",
+      "why": "bad relay url: junk after IPv6 host"
+    },
+    {
+      "url": "wss://[fe80::1%25eth0]",
+      "why": "bad relay url: backslash, percent escape or userinfo"
+    },
+    {
+      "url": "wss://",
+      "why": "bad relay url: bad host length"
+    },
+    {
+      "url": "wss://a\\b",
+      "why": "bad relay url: backslash, percent escape or userinfo"
+    },
+    {
+      "url": "wss://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+      "why": "bad relay url: bad host name"
+    },
+    {
+      "url": "wss://a.example/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "why": "bad relay url: longer than 512 bytes"
+    }
+  ],
+  "ringId": "0dLVh-VfxJOmQJ_wn-jl1p4hRO0aX9DRK6z1ei4P0-w"
+}

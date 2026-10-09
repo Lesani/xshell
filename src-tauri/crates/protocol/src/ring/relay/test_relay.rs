@@ -13,8 +13,9 @@ use super::super::{verify, RingId, SignKey, Signature};
 use super::contract::RelayTarget;
 use super::wire::{
     auth_message, check_payload, close, decode_client, entitlement_well_formed, new_nonce,
-    ClientFrame, ErrorCode, Presence, RelayFrame, WireError, DROPPED, MAX_CANDIDATE_BYTES,
-    MAX_FRAME, MAX_STAGE_BYTES, MAX_STAGE_CHUNK, MAX_STAGE_CHUNKS, PONG, RELAY_PROTOCOL,
+    ClientFrame, ErrorCode, Presence, RelayFrame, WireError, DROPPED, HOSTED_QUOTA_FRAMES_PER_DAY,
+    MAX_CANDIDATE_BYTES, MAX_FRAME, MAX_STAGE_BYTES, MAX_STAGE_CHUNK, MAX_STAGE_CHUNKS, PING, PONG,
+    QUOTA_REFUSALS_BEFORE_CLOSE, RELAY_PROTOCOL,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -56,6 +57,10 @@ pub struct TestRelayOptions {
     /// protocol's).
     pub max_stage_chunks: usize,
     pub max_stage_bytes: usize,
+    /// A daily quota of authenticated client frames per Ring (section 14 of the protocol).
+    /// `None`: the protocol's default, `HOSTED_QUOTA_FRAMES_PER_DAY` on a Hosted Relay and no
+    /// quota on any other.
+    pub quota_frames_per_day: Option<u64>,
 }
 
 impl Default for TestRelayOptions {
@@ -68,6 +73,7 @@ impl Default for TestRelayOptions {
             broadcast_before_ok: false,
             max_stage_chunks: MAX_STAGE_CHUNKS,
             max_stage_bytes: MAX_STAGE_BYTES,
+            quota_frames_per_day: None,
         }
     }
 }
@@ -124,6 +130,8 @@ struct RingState {
     /// The last generation handed out per key. Never reset, not even when a member is
     /// removed, so a re-added member's new socket cannot share an old socket's generation.
     gens: HashMap<SignKey, u64>,
+    /// The quota counter: the UTC day (days since the epoch) and the frames counted on it.
+    quota: (u64, u64),
 }
 
 impl RingState {
@@ -234,6 +242,15 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, (at, _)| at.elapsed() < ttl);
+    }
+
+    /// The quota in effect: the configured one, else the Hosted default, else none.
+    fn quota(&self) -> Option<u64> {
+        self.opts.quota_frames_per_day.or(self
+            .opts
+            .hosted
+            .as_ref()
+            .map(|_| HOSTED_QUOTA_FRAMES_PER_DAY))
     }
 
     /// Whether `ring` may route envelopes: always, unless this is a Hosted Relay without a
@@ -360,6 +377,7 @@ impl TestRelay {
             tls: None,
             auth_timeout: self.shared.opts.auth_timeout,
             gateway: None,
+            quota_frames_per_day: self.shared.quota(),
         }
     }
 
@@ -447,43 +465,108 @@ impl Drop for TestRelay {
 }
 
 /// The server side of a connection, with or without TLS.
-enum SConn {
+enum Io {
     Plain(TcpStream),
     Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
 }
 
+/// The server side of a connection, with or without TLS. `replay` holds bytes already read
+/// (the HTTP request head, read before the WebSocket handshake) and is read first.
+struct SConn {
+    io: Io,
+    replay: Vec<u8>,
+}
+
 impl SConn {
     fn tcp(&self) -> &TcpStream {
-        match self {
-            SConn::Plain(s) => s,
-            SConn::Tls(t) => t.get_ref(),
+        match &self.io {
+            Io::Plain(s) => s,
+            Io::Tls(t) => t.get_ref(),
         }
     }
 }
 
 impl Read for SConn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            SConn::Plain(s) => s.read(buf),
-            SConn::Tls(t) => t.read(buf),
+        if !self.replay.is_empty() {
+            let n = buf.len().min(self.replay.len());
+            buf[..n].copy_from_slice(&self.replay[..n]);
+            self.replay.drain(..n);
+            return Ok(n);
+        }
+        match &mut self.io {
+            Io::Plain(s) => s.read(buf),
+            Io::Tls(t) => t.read(buf),
         }
     }
 }
 
 impl Write for SConn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            SConn::Plain(s) => s.write(buf),
-            SConn::Tls(t) => t.write(buf),
+        match &mut self.io {
+            Io::Plain(s) => s.write(buf),
+            Io::Tls(t) => t.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            SConn::Plain(s) => s.flush(),
-            SConn::Tls(t) => t.flush(),
+        match &mut self.io {
+            Io::Plain(s) => s.flush(),
+            Io::Tls(t) => t.flush(),
         }
     }
+}
+
+/// What a request head asks for, before any WebSocket handshake (section 6).
+#[derive(Debug, PartialEq)]
+enum Route {
+    Health,
+    Ring,
+    UpgradeRequired,
+    NotFound,
+}
+
+fn route(head: &str) -> Route {
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or("").split(' ');
+    let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+    let path = target.split('?').next().unwrap_or("");
+    let upgrade = lines.any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("upgrade") && v.trim().eq_ignore_ascii_case("websocket")
+        })
+    });
+    if method == "GET" && path == "/healthz" {
+        Route::Health
+    } else if ring_of_path(path).is_none() {
+        Route::NotFound
+    } else if upgrade {
+        Route::Ring
+    } else {
+        Route::UpgradeRequired
+    }
+}
+
+/// Reads the request head (up to the blank line), or `None` if it does not come in time.
+fn read_head(stream: &mut SConn, deadline: Instant) -> Option<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        if Instant::now() >= deadline || head.len() > 64 * 1024 {
+            return None;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(head)
 }
 
 fn would_block(e: &tungstenite::Error) -> bool {
@@ -524,6 +607,8 @@ struct Conn {
     fragments_started: bool,
     /// Fault::EmptyTlsRecords: hand the connection to `empty_record_flood` after `run`.
     take_over: bool,
+    /// Quota refusals in a row on this socket (a Worker keeps it in the attachment).
+    quota_refusals: usize,
 }
 
 /// A staged candidate's manifest, kept in the attachment: what reconstruction must find.
@@ -561,6 +646,13 @@ fn chunk_tokens(tokens: &[String]) -> Vec<String> {
     out
 }
 
+/// The Ring a request path names: `…/v1/ring/{ringId}` as a path suffix, so a Relay URL may
+/// carry a path (section 6).
+fn ring_of_path(path: &str) -> Option<RingId> {
+    let (_, id) = path.rsplit_once("/v1/ring/")?;
+    RingId::parse(id).ok()
+}
+
 fn stage_prefix(ring: &RingId, candidate: &str) -> String {
     format!("stage/{ring}/{candidate}/")
 }
@@ -572,24 +664,52 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
     tcp.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ())?;
     let _ = tcp.set_nodelay(true);
-    let stream = match &shared.tls {
+    let io = match &shared.tls {
         Some(cfg) => {
             let c = ServerConnection::new(cfg.clone()).map_err(|_| ())?;
-            SConn::Tls(Box::new(StreamOwned::new(c, tcp)))
+            Io::Tls(Box::new(StreamOwned::new(c, tcp)))
         }
-        None => SConn::Plain(tcp),
+        None => Io::Plain(tcp),
     };
+    let mut stream = SConn {
+        io,
+        replay: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let head = read_head(&mut stream, deadline).ok_or(())?;
+    let status = match route(&String::from_utf8_lossy(&head)) {
+        Route::Ring => None,
+        Route::Health => Some("200 OK"),
+        Route::UpgradeRequired => Some("426 Upgrade Required"),
+        Route::NotFound => Some("404 Not Found"),
+    };
+    if let Some(status) = status {
+        let body = if status.starts_with("200") { "ok" } else { "" };
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.flush();
+        return Ok(());
+    }
+    stream.replay = head;
     let path = Arc::new(Mutex::new(String::new()));
     let p = path.clone();
     #[allow(clippy::result_large_err)] // the shape tungstenite's callback requires
     let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        *p.lock().unwrap_or_else(|e| e.into_inner()) = req.uri().path().to_string();
+        let path = req.uri().path();
+        if ring_of_path(path).is_none() {
+            let mut not_found = ErrorResponse::new(None);
+            *not_found.status_mut() = tungstenite::http::StatusCode::NOT_FOUND;
+            return Err(not_found);
+        }
+        *p.lock().unwrap_or_else(|e| e.into_inner()) = path.to_string();
         Ok(resp)
     };
     let config = WebSocketConfig::default()
         .max_message_size(Some(2 * MAX_FRAME))
         .max_frame_size(Some(2 * MAX_FRAME));
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut r = tungstenite::accept_hdr_with_config(stream, callback, Some(config));
     let ws = loop {
         match r {
@@ -601,10 +721,7 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
         }
     };
     let path = path.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let ring = path
-        .strip_prefix("/v1/ring/")
-        .and_then(|id| RingId::parse(id).ok())
-        .ok_or(())?;
+    let ring = ring_of_path(&path).ok_or(())?;
     let (tx, rx) = mpsc::channel();
     shared.stage_sweep();
     let mut conn = Conn {
@@ -625,6 +742,7 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
         next_fragment: Instant::now(),
         fragments_started: false,
         take_over: false,
+        quota_refusals: 0,
     };
     conn.run();
     conn.ended();
@@ -639,7 +757,7 @@ fn serve(shared: Arc<Shared>, tcp: TcpStream) -> Result<(), ()> {
 fn empty_record_flood(ws: WebSocket<SConn>, shared: &Shared) {
     use rustls::crypto::cipher::{OutboundChunks, OutboundPlainMessage};
     use rustls::{ConnectionTrafficSecrets, ContentType, ProtocolVersion, SupportedCipherSuite};
-    let SConn::Tls(tls) = ws.into_inner() else {
+    let Io::Tls(tls) = ws.into_inner().io else {
         return;
     };
     let StreamOwned { conn, sock } = *tls;
@@ -941,7 +1059,21 @@ impl Conn {
 
     fn handle(&mut self, text: &str) {
         let pre = matches!(self.phase, Phase::Pre { .. });
-        let frame = match decode_client(text) {
+        let decoded = decode_client(text);
+        // The quota counts authenticated frames past the size cap and the parse, except the
+        // exact ping (auto-answered on a Worker, so it never reaches the Relay's code) and
+        // `bye` (always honoured).
+        if matches!(self.phase, Phase::Authed { .. })
+            && text != PING
+            && !matches!(
+                decoded,
+                Ok(ClientFrame::Bye { .. }) | Err(WireError::TooLarge | WireError::Malformed(_))
+            )
+            && !self.quota_allows(&decoded)
+        {
+            return;
+        }
+        let frame = match decoded {
             Ok(f) => f,
             Err(WireError::TooLarge) => {
                 self.error(ErrorCode::TooLarge, None, None, None);
@@ -986,6 +1118,48 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// Counts one frame against the Ring's daily quota. Over it, refuses the frame (echoing
+    /// its `id` or `to`), and closes after `QUOTA_REFUSALS_BEFORE_CLOSE` refusals in a row.
+    fn quota_allows(&mut self, decoded: &Result<ClientFrame, WireError>) -> bool {
+        let Some(limit) = self.shared.quota() else {
+            return true;
+        };
+        let day = now() / 86_400;
+        let ring = self.ring.clone();
+        let allowed = match self.rings().get_mut(&ring) {
+            Some(s) => {
+                if s.quota.0 != day {
+                    s.quota = (day, 0);
+                }
+                let ok = s.quota.1 < limit;
+                if ok {
+                    s.quota.1 += 1;
+                }
+                ok
+            }
+            None => true,
+        };
+        if allowed {
+            self.quota_refusals = 0;
+            return true;
+        }
+        let (id, to) = match decoded {
+            Ok(ClientFrame::Env { to, .. }) => (None, Some(*to)),
+            Ok(
+                ClientFrame::RosterPut { id, .. }
+                | ClientFrame::RosterGet { id, .. }
+                | ClientFrame::EntitlementPut { id, .. },
+            ) => (Some(*id), None),
+            _ => (None, None),
+        };
+        self.error(ErrorCode::Quota, id, to, None);
+        self.quota_refusals += 1;
+        if self.quota_refusals >= QUOTA_REFUSALS_BEFORE_CLOSE {
+            self.close(close::QUOTA);
+        }
+        false
     }
 
     fn handle_pre(&mut self, frame: ClientFrame) {
@@ -1165,6 +1339,7 @@ impl Conn {
             entitlement: None,
             pings: HashMap::new(),
             gens: HashMap::new(),
+            quota: (0, 0),
         });
         state.chain = chain;
         if existed {
