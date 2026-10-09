@@ -3,7 +3,7 @@
 use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
-use super::{conn, Config, ConnId, ExitReason, TestPoint};
+use super::{conn, Config, ConnId, ExitReason, Role, TestPoint};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -241,9 +241,10 @@ impl Daemon {
                 Ok(sock) => {
                     let id = self.next_conn.fetch_add(1, Ordering::SeqCst);
                     let d = self.clone();
+                    // The socket carries Desktops only: local ones and `xshelld connect`.
                     let r = std::thread::Builder::new()
                         .name(format!("conn-{id}-r"))
-                        .spawn(move || conn::handle(d, sock, id));
+                        .spawn(move || conn::handle(d, sock, id, Role::Desktop));
                     if let Err(e) = r {
                         crate::log!("ERROR", "cannot start connection thread: {e}");
                     }

@@ -1,0 +1,662 @@
+#![cfg(unix)]
+//! Connection roles: what a Mobile may do (ADR-0004). Each refusal is checked against a
+//! Desktop connection to the same server doing the same thing. Mobile connections are served
+//! in process (`ServerHandle::connect_in_process`) until the Relay carries them.
+
+mod common;
+
+use common::*;
+use serde_json::{json, Value};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use uuid::Uuid;
+use xshell_core::claude::encode_project_name;
+use xshell_core::launch::LaunchSpec;
+use xshell_protocol::frame::Frame;
+use xshell_protocol::msg::{ClientMsg, Hello, ServerMsg};
+use xshelld::server::{ExitReason, Role, ServerHandle};
+
+const SID: &str = "11111111-2222-3333-4444-555555555555";
+const SKIP: &str = "--dangerously-skip-permissions";
+const FORBIDDEN: &str = "forbidden for mobile";
+
+struct Env {
+    desk: Client,
+    mob: Client,
+    srv: ServerHandle,
+    /// A Project the Host knows from Claude history for `SID`.
+    cwd: PathBuf,
+    fake: Fake,
+    _reaper: FakeReaper,
+    h: TestHome,
+}
+
+fn env() -> Env {
+    let h = TestHome::new();
+    let cwd = h.project("app");
+    claude_history(&h, &cwd, SID);
+    let fake = Fake::in_dir(&cwd);
+    let srv = start(&h, |_| {});
+    Env {
+        desk: Client::in_process(&srv, Role::Desktop),
+        mob: Client::in_process(&srv, Role::Mobile),
+        srv,
+        _reaper: FakeReaper(fake.pids_log.clone()),
+        fake,
+        cwd,
+        h,
+    }
+}
+
+impl Env {
+    fn claude(&self) -> LaunchSpec {
+        claude_spec(&self.cwd, Some(SID))
+    }
+
+    fn shell(&self) -> LaunchSpec {
+        sh_spec(&self.cwd)
+    }
+
+    /// A Terminal the Desktop opened.
+    fn desk_open(&mut self, spec: LaunchSpec) -> Uuid {
+        let t = Uuid::new_v4();
+        self.desk.open(t, spec);
+        t
+    }
+}
+
+#[track_caller]
+fn refused(r: Result<Value, String>) {
+    let e = r.expect_err("refused for a Mobile");
+    assert!(e.starts_with(FORBIDDEN), "{e}");
+}
+
+fn try_open(c: &mut Client, spec: LaunchSpec) -> Result<Value, String> {
+    c.request(&open_msg(Uuid::new_v4(), spec))
+}
+
+/// Every message about one Terminal, each with an id.
+fn per_terminal(t: Uuid) -> Vec<ClientMsg> {
+    vec![
+        ClientMsg::TermAttach { terminal: t },
+        ClientMsg::TermInput {
+            terminal: t,
+            data: "echo hi\n".into(),
+        },
+        ClientMsg::TermResize {
+            terminal: t,
+            cols: 100,
+            rows: 30,
+        },
+        ClientMsg::TermDetach { terminal: t },
+        ClientMsg::TermRelaunch {
+            terminal: t,
+            skip_permissions: true,
+        },
+        ClientMsg::TermClose { terminal: t },
+    ]
+}
+
+/// The Terminals a new connection is told about.
+fn listed(srv: &ServerHandle) -> Vec<Uuid> {
+    let s = srv.connect_in_process(Role::Desktop).unwrap();
+    let mut c = Client::from_io(s.try_clone().unwrap(), s);
+    let list = c.hello(range(1, 1)).1;
+    list.iter().map(|t| t.terminal).collect()
+}
+
+// ── Refusals ──────────────────────────────────────────────────────────────
+
+#[test]
+fn mobile_refuses_raw_shell_open_desktop_opens() {
+    let mut e = env();
+    let t = Uuid::new_v4();
+    refused(e.mob.request(&open_msg(t, e.shell())));
+    assert!(listed(&e.srv).is_empty());
+    e.desk.open(t, e.shell());
+    e.desk.attach(t);
+    e.desk.marker(t, "deskok");
+}
+
+#[test]
+fn mobile_refuses_open_variants() {
+    let mut e = env();
+    let other = e.h.project("other");
+    let ok = e.claude();
+    let variants = [
+        (
+            "shell_command",
+            LaunchSpec {
+                shell_command: Some("/bin/sh".into()),
+                ..ok.clone()
+            },
+        ),
+        (
+            "shell_id",
+            LaunchSpec {
+                shell_id: Some("bash".into()),
+                ..ok.clone()
+            },
+        ),
+        (
+            "launch_prefix",
+            LaunchSpec {
+                launch_prefix: Some(vec!["env".into()]),
+                ..ok.clone()
+            },
+        ),
+        (
+            "agent cursor",
+            LaunchSpec {
+                agent: Some("cursor".into()),
+                ..ok.clone()
+            },
+        ),
+        (
+            "agent none",
+            LaunchSpec {
+                agent: None,
+                ..ok.clone()
+            },
+        ),
+        ("unknown project", claude_spec(&other, Some(SID))),
+        (
+            "empty cwd",
+            LaunchSpec {
+                cwd: String::new(),
+                ..ok.clone()
+            },
+        ),
+        (
+            "option session id",
+            LaunchSpec {
+                session_id: Some("-cx".into()),
+                ..ok.clone()
+            },
+        ),
+        (
+            "shell_mode weird",
+            LaunchSpec {
+                shell_mode: Some("weird".into()),
+                ..ok.clone()
+            },
+        ),
+    ];
+    for (what, spec) in variants {
+        let e2 = try_open(&mut e.mob, spec.clone()).expect_err(what);
+        assert!(e2.starts_with(FORBIDDEN), "{what}: {e2}");
+        let r = try_open(&mut e.desk, spec);
+        assert!(r.as_ref().is_ok_and(|v| v["pid"].is_u64()), "{what}: {r:?}");
+    }
+    // No Mobile launch reached the agent.
+    assert_eq!(e.fake.wait_launches(7).len(), 7);
+}
+
+#[test]
+fn mobile_refuses_file_git_and_probe_calls() {
+    let mut e = env();
+    if !git_fixture(&e.cwd) {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    let cwd = e.cwd.to_string_lossy().into_owned();
+    let calls = [
+        ("read_text_file", json!({ "path": e.cwd.join("a.txt") })),
+        ("list_dir", json!({ "path": cwd })),
+        ("search_dir", json!({ "root": cwd, "query": "a" })),
+        ("get_git_status", json!({ "cwd": cwd })),
+        ("get_git_log", json!({ "cwd": cwd })),
+        (
+            "git_diff",
+            json!({ "cwd": cwd, "path": "a.txt", "mode": "unstaged" }),
+        ),
+        ("git_stage", json!({ "cwd": cwd, "paths": ["a.txt"] })),
+        ("git_unstage", json!({ "cwd": cwd, "paths": ["a.txt"] })),
+        ("list_git_branches", json!({ "cwd": cwd })),
+        ("git_checkout", json!({ "cwd": cwd, "branch": "other" })),
+        (
+            "git_discard",
+            json!({ "cwd": cwd, "path": "b.txt", "mode": "untracked" }),
+        ),
+        ("get_project_skills", json!({ "projectPath": cwd })),
+        ("get_project_memories", json!({ "projectPath": cwd })),
+        ("get_codex_context", json!({ "projectPath": cwd })),
+        ("get_cursor_context", json!({ "projectPath": cwd })),
+        ("get_opencode_context", json!({ "projectPath": cwd })),
+        ("get_antigravity_context", json!({ "projectPath": cwd })),
+        ("get_username", json!({})),
+        ("get_home_dir", json!({})),
+        ("detect_agent_binary", json!({ "binary": "agy" })),
+    ];
+    for (m, p) in calls {
+        let r = e.mob.call(m, p.clone());
+        assert_eq!(r, Err(format!("{FORBIDDEN}: call {m}")));
+        if m == "git_discard" {
+            assert!(
+                e.cwd.join("b.txt").exists(),
+                "a refused discard changed nothing"
+            );
+        }
+        let d = e.desk.call(m, p);
+        assert!(d.is_ok(), "{m}: {d:?}");
+    }
+    assert!(!e.cwd.join("b.txt").exists());
+}
+
+#[test]
+fn mobile_unknown_call_forbidden() {
+    let mut e = env();
+    assert_eq!(
+        e.mob.call("no_such_method", json!({})),
+        Err(format!("{FORBIDDEN}: call no_such_method"))
+    );
+    let d = e.desk.call("no_such_method", json!({})).unwrap_err();
+    assert!(d.contains("unknown method"), "{d}");
+}
+
+#[test]
+fn mobile_refuses_term_update_desktop_updates() {
+    let mut e = env();
+    let t = e.desk_open(e.claude());
+    let upd = ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: Some("-cx".into()),
+        meta: None,
+    };
+    refused(e.mob.request(&upd));
+    assert_eq!(e.desk.request(&upd), Ok(Value::Null));
+}
+
+#[test]
+fn mobile_refuses_daemon_upgrade_desktop_upgrades() {
+    let mut e = env();
+    refused(e.mob.request(&ClientMsg::DaemonUpgrade));
+    assert_eq!(e.srv.wait_timeout(Duration::from_millis(300)), None);
+    // Still serving: a refused upgrade froze nothing.
+    e.desk_open(e.shell());
+    assert_eq!(e.desk.request(&ClientMsg::DaemonUpgrade), Ok(Value::Null));
+    assert_eq!(e.srv.wait_timeout(T), Some(ExitReason::Upgrade));
+}
+
+#[test]
+fn mobile_refuses_ops_on_shell_terminal() {
+    let mut e = env();
+    // A raw shell, and an agent under a launch prefix that is really a shell.
+    let prefixed = LaunchSpec {
+        launch_prefix: Some(
+            ["bash", "-c", "exec sh -i", "--"]
+                .map(String::from)
+                .to_vec(),
+        ),
+        ..e.claude()
+    };
+    for spec in [e.shell(), prefixed] {
+        let t = e.desk_open(spec);
+        for m in per_terminal(t) {
+            refused(e.mob.request(&m));
+        }
+        assert!(listed(&e.srv).contains(&t), "not closed");
+        // The Desktop still has it, and no Mobile input reached it.
+        e.desk.attach(t);
+        e.desk.marker(t, "deskok");
+        let out = String::from_utf8_lossy(&e.desk.out[&t]).into_owned();
+        assert!(!out.contains("hi\r\n"), "{out}");
+    }
+    assert_eq!(e.srv.attached(), 2);
+}
+
+#[test]
+fn mobile_refuses_relaunch_of_shell_and_wrapped_agent() {
+    let mut e = env();
+    let relaunch = |t| ClientMsg::TermRelaunch {
+        terminal: t,
+        skip_permissions: true,
+    };
+    let shell = e.desk_open(e.shell());
+    refused(e.mob.request(&relaunch(shell)));
+    let wrapped = e.desk_open(LaunchSpec {
+        shell_command: Some("/bin/sh".into()),
+        shell_id: Some("bash".into()),
+        ..e.claude()
+    });
+    refused(e.mob.request(&relaunch(wrapped)));
+    let r = e.desk.request(&relaunch(wrapped)).unwrap();
+    assert_eq!(r["relaunched"], json!(true));
+
+    // An agent whose session id a Desktop changed into an option: reachable, not relaunchable.
+    let t = e.desk_open(e.claude());
+    let upd = ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: Some("-cx".into()),
+        meta: None,
+    };
+    assert_eq!(e.desk.request(&upd), Ok(Value::Null));
+    e.mob.attach(t);
+    refused(e.mob.request(&relaunch(t)));
+}
+
+#[test]
+fn mobile_input_without_id_to_shell_dropped() {
+    let mut e = env();
+    let t = e.desk_open(e.shell());
+    e.desk.attach(t);
+    e.mob.input(t, "echo mo\"\"bile\n");
+    // Ordered after the input on the Mobile's connection: by now it was handled.
+    e.mob
+        .call("get_all_recent_sessions", json!({ "limit": 1 }))
+        .unwrap();
+    e.desk.marker(t, "deskok");
+    let out = String::from_utf8_lossy(&e.desk.out[&t]).into_owned();
+    assert!(!out.contains("mobile"), "{out}");
+    // No reply and no error for it: the Mobile's connection carries on.
+    assert!(!e
+        .mob
+        .log
+        .iter()
+        .any(|m| matches!(m, Ev::Msg(ServerMsg::Error { .. }))));
+    assert!(!e.mob.is_eof());
+}
+
+// ── Allowed ───────────────────────────────────────────────────────────────
+
+#[test]
+fn mobile_opens_claude_in_known_project() {
+    let mut e = env();
+    let t = Uuid::new_v4();
+    let spec = LaunchSpec {
+        skip_permissions: Some(true),
+        ..e.claude()
+    };
+    assert!(e.mob.open(t, spec)["pid"].is_u64());
+    let argv = &e.fake.wait_launches(1)[0];
+    assert_eq!(argv, &[SKIP, "--resume", SID]);
+}
+
+#[test]
+fn mobile_opens_codex_in_known_project() {
+    let mut e = env();
+    let cx = e.h.project("cx");
+    codex_history(&e.h, &cx);
+    let fake = Fake::in_dir(&cx);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let spec = LaunchSpec {
+        agent: Some("codex".into()),
+        session_id: Some("r1".into()),
+        ..claude_spec(&cx, None)
+    };
+    e.mob.open(Uuid::new_v4(), spec);
+    assert_eq!(fake.wait_launches(1)[0], ["resume", "r1"]);
+}
+
+#[test]
+fn mobile_opens_claude_in_project_known_only_from_cursor() {
+    let mut e = env();
+    let cur = e.h.project("cur");
+    cursor_history(&e.h, &cur);
+    let fake = Fake::in_dir(&cur);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    e.mob.open(Uuid::new_v4(), claude_spec(&cur, None));
+    assert_eq!(fake.wait_launches(1).len(), 1);
+}
+
+#[test]
+fn mobile_attach_input_resize_detach_close_agent() {
+    let mut e = env();
+    let t = Uuid::new_v4();
+    e.mob.open(t, e.claude());
+    e.mob.attach(t);
+    e.mob.output_until(t, "args");
+    let input = ClientMsg::TermInput {
+        terminal: t,
+        data: "typed\r".into(),
+    };
+    assert_eq!(e.mob.request(&input), Ok(Value::Null));
+    e.mob.output_until(t, "typed");
+    e.mob.resize(t, 100, 30);
+    assert_eq!(
+        e.mob.request(&ClientMsg::TermDetach { terminal: t }),
+        Ok(Value::Null)
+    );
+    assert_eq!(e.srv.attached(), 0);
+    assert_eq!(
+        e.mob.request(&ClientMsg::TermClose { terminal: t }),
+        Ok(Value::Null)
+    );
+    e.mob.terminals_where(|l| l.is_empty());
+}
+
+#[test]
+fn mobile_attaches_to_desktop_opened_agent() {
+    let mut e = env();
+    let t = e.desk_open(e.claude());
+    e.mob.attach(t);
+    e.mob.output_until(t, "args");
+}
+
+#[test]
+fn mobile_relaunches_agent() {
+    let mut e = env();
+    let t = Uuid::new_v4();
+    e.mob.open(t, e.claude());
+    e.fake.wait_pids(1);
+    let r = e
+        .mob
+        .request(&ClientMsg::TermRelaunch {
+            terminal: t,
+            skip_permissions: true,
+        })
+        .unwrap();
+    assert_eq!(r["relaunched"], json!(true));
+    let l = e.fake.wait_launches(2);
+    assert_eq!(l[1], [SKIP, "--resume", SID]);
+}
+
+#[test]
+fn mobile_session_and_stats_calls_ok() {
+    let mut e = env();
+    let cwd = e.cwd.to_string_lossy().into_owned();
+    let enc = encode_project_name(&cwd);
+    let calls = [
+        ("list_claude_projects", json!({})),
+        ("get_sessions", json!({ "encodedName": enc })),
+        ("get_all_recent_sessions", json!({ "limit": 5 })),
+        (
+            "get_session_messages",
+            json!({ "encodedName": enc, "sessionId": SID, "limit": 5 }),
+        ),
+        ("list_project_session_ids", json!({ "cwd": cwd })),
+        (
+            "detect_session_branch",
+            json!({ "cwd": cwd, "currentSessionId": SID, "knownSessionIds": [SID] }),
+        ),
+        ("list_codex_projects", json!({})),
+        ("list_cursor_projects", json!({})),
+        ("list_opencode_projects", json!({})),
+        ("list_antigravity_projects", json!({})),
+        ("probe_statusline_setup", json!({})),
+        ("get_global_rate_limits", json!({})),
+        ("get_claude_cost_summary", json!({})),
+        ("get_codex_usage", json!({})),
+        (
+            "save_dropped_file",
+            json!({ "bytesBase64": "aGk=", "name": "x.png" }),
+        ),
+    ];
+    for (m, p) in calls {
+        let r = e.mob.call(m, p.clone());
+        assert!(r.is_ok(), "{m}: {r:?}");
+        assert!(e.desk.call(m, p).is_ok(), "{m}");
+    }
+    let projects = e.mob.call("list_claude_projects", json!({})).unwrap();
+    assert_eq!(projects[0]["path"], json!(cwd));
+    let ids = e
+        .mob
+        .call("list_project_session_ids", json!({ "cwd": cwd }));
+    assert_eq!(ids, Ok(json!([SID])));
+}
+
+#[test]
+fn mobile_save_dropped_file_ok() {
+    let mut e = env();
+    let p = e
+        .mob
+        .call(
+            "save_dropped_file",
+            json!({ "bytesBase64": "aGk=", "name": "shot.png" }),
+        )
+        .unwrap();
+    let p = PathBuf::from(p.as_str().unwrap());
+    assert!(
+        p.starts_with(e.h.paths().tmp.join("xshell-clipboard")),
+        "{p:?}"
+    );
+    assert_eq!(fs::read(&p).unwrap(), b"hi");
+    let evil = json!({ "bytesBase64": "aGk=", "name": "../../evil" });
+    refused(e.mob.call("save_dropped_file", evil.clone()));
+    // A Desktop's name is sanitised as before.
+    let d = e.desk.call("save_dropped_file", evil).unwrap();
+    assert!(Path::new(d.as_str().unwrap()).starts_with(e.h.paths().tmp.join("xshell-clipboard")));
+}
+
+#[test]
+fn mobile_session_reads_stay_in_session_storage() {
+    let mut e = env();
+    let projects = e.h.home().join(".claude/projects");
+    let outside = e.h.root().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let line = json!({ "type": "user", "message": { "role": "user", "content": "secret" } });
+    fs::write(outside.join("x.jsonl"), format!("{line}\n")).unwrap();
+    std::os::unix::fs::symlink(&outside, projects.join("escape")).unwrap();
+    let enc = encode_project_name(&e.cwd.to_string_lossy());
+
+    let abs = outside.to_string_lossy().into_owned();
+    let cases = [
+        (abs.as_str(), "x"),
+        ("../../../outside", "x"),
+        (enc.as_str(), "../../../../outside/x"),
+        ("escape", "x"),
+    ];
+    for (name, sid) in cases {
+        let p = json!({ "encodedName": name, "sessionId": sid, "limit": 5 });
+        refused(e.mob.call("get_session_messages", p.clone()));
+        // A Desktop reads it as it always did.
+        let d = e.desk.call("get_session_messages", p).unwrap();
+        assert_eq!(d[0]["text"], json!("secret"), "{name} {sid}");
+    }
+    for name in [abs.as_str(), "..", "escape"] {
+        let p = json!({ "encodedName": name });
+        refused(e.mob.call("get_sessions", p.clone()));
+        assert!(e.desk.call("get_sessions", p).is_ok());
+    }
+    let outside_cwd = json!({ "cwd": abs });
+    refused(e.mob.call("list_project_session_ids", outside_cwd.clone()));
+    assert!(e.desk.call("list_project_session_ids", outside_cwd).is_ok());
+}
+
+#[test]
+fn mobile_bulk_session_reads_refuse_symlinked_files() {
+    let mut e = env();
+    let outside = e.h.root().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let line =
+        json!({ "type": "user", "cwd": e.cwd, "message": { "role": "user", "content": "secret" } });
+    fs::write(outside.join("x.jsonl"), format!("{line}\n")).unwrap();
+    let cwd = e.cwd.to_string_lossy().into_owned();
+    let enc = encode_project_name(&cwd);
+    let link =
+        e.h.home()
+            .join(".claude/projects")
+            .join(&enc)
+            .join("leak.jsonl");
+    std::os::unix::fs::symlink(outside.join("x.jsonl"), &link).unwrap();
+
+    let calls = [
+        ("get_sessions", json!({ "encodedName": enc })),
+        ("get_all_recent_sessions", json!({ "limit": 50 })),
+        (
+            "detect_session_branch",
+            json!({ "cwd": cwd, "currentSessionId": SID, "knownSessionIds": [SID] }),
+        ),
+    ];
+    for (m, p) in &calls {
+        refused(e.mob.call(m, p.clone()));
+    }
+    // A Desktop reads the linked file as it always did.
+    let d = e.desk.call("get_sessions", calls[0].1.clone()).unwrap();
+    assert!(
+        d.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == json!("leak")),
+        "{d}"
+    );
+    assert!(e
+        .desk
+        .call("get_all_recent_sessions", calls[1].1.clone())
+        .is_ok());
+
+    fs::remove_file(&link).unwrap();
+    for (m, p) in calls {
+        assert!(e.mob.call(m, p).is_ok(), "{m}");
+    }
+}
+
+#[test]
+fn mobile_escaping_parent_with_missing_leaf_refused() {
+    let mut e = env();
+    let outside = e.h.root().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, e.h.home().join(".claude/projects/escape")).unwrap();
+    let p = json!({ "encodedName": "escape", "sessionId": "missing", "limit": 5 });
+    refused(e.mob.call("get_session_messages", p.clone()));
+    assert_eq!(e.desk.call("get_session_messages", p), Ok(json!([])));
+}
+
+// ── The role cannot change ────────────────────────────────────────────────
+
+#[test]
+fn mobile_second_hello_keeps_role() {
+    let mut e = env();
+    let r = e.mob.request(&ClientMsg::Hello(Hello {
+        protocol: range(1, 1),
+        version: "t".into(),
+        capabilities: vec![],
+    }));
+    assert_eq!(r, Err("already said hello".into()));
+    let shell = e.shell();
+    refused(try_open(&mut e.mob, shell));
+}
+
+#[test]
+fn mobile_hello_role_field_ignored() {
+    let e = env();
+    let s = e.srv.connect_in_process(Role::Mobile).unwrap();
+    let mut c = Client::from_io(s.try_clone().unwrap(), s);
+    let hello = json!({
+        "t": "hello",
+        "protocol": { "min": 1, "max": 1 },
+        "version": "t",
+        "role": "desktop",
+    });
+    c.send_frame(&Frame::Json(hello.to_string().into_bytes()));
+    c.terminals();
+    refused(try_open(&mut c, e.shell()));
+}
+
+#[test]
+fn roles_are_per_connection() {
+    let mut e = env();
+    let mut mob2 = Client::in_process(&e.srv, Role::Mobile);
+    // The socket carries Desktops.
+    let mut sock = Client::connect(&e.h.paths().socket);
+    sock.hello(range(1, 1));
+    let t = e.desk_open(e.shell());
+    for m in [&mut e.mob, &mut mob2] {
+        refused(m.request(&ClientMsg::TermAttach { terminal: t }));
+    }
+    sock.attach(t);
+    sock.marker(t, "sockok");
+    refused(try_open(&mut mob2, e.shell()));
+    e.desk.open(Uuid::new_v4(), e.shell());
+}

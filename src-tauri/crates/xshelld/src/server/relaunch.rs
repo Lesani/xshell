@@ -7,6 +7,7 @@
 use super::conn::reply;
 use super::outbox::Outbox;
 use super::registry::{Daemon, Registry};
+use super::role::{self, Role};
 use super::terminal::{self, SpawnError, Terminal};
 use super::TestPoint;
 use serde_json::json;
@@ -28,9 +29,10 @@ pub(crate) fn start(
     id: Option<u64>,
     terminal: Uuid,
     skip: bool,
+    role: Role,
 ) {
     let mut reg = d.reg.lock().unwrap();
-    let t = match reserve(d, &reg, terminal, skip) {
+    let t = match reserve(d, &reg, terminal, skip, role) {
         Ok(Reserved::Started(t)) => t,
         Ok(Reserved::Unchanged(pid)) => {
             drop(reg);
@@ -50,7 +52,7 @@ pub(crate) fn start(
     } else {
         std::thread::Builder::new()
             .name(format!("relaunch-{}", &terminal.simple().to_string()[..8]))
-            .spawn(move || run(&d2, &t2, skip, &ob2, id))
+            .spawn(move || run(&d2, &t2, skip, role, &ob2, id))
             .map(drop)
     };
     if let Err(e) = r {
@@ -66,24 +68,22 @@ enum Reserved {
     Unchanged(Option<u32>),
 }
 
-/// The checks that need no process change, in order: the Daemon, the Terminal's lifecycle,
-/// the spec, the no-op case, the list budget. Then the reservation.
+/// The checks that need no process change, in order: the Daemon, the Terminal and the role,
+/// the Terminal's lifecycle, the spec, the no-op case, the list budget. Then the reservation.
 fn reserve(
     d: &Arc<Daemon>,
     reg: &Registry,
     terminal: Uuid,
     skip: bool,
+    role: Role,
 ) -> Result<Reserved, String> {
     if reg.frozen {
         return Err("xshelld is upgrading or shutting down".into());
     }
-    let t = reg
-        .terminals
-        .get(&terminal)
-        .cloned()
-        .ok_or_else(|| format!("unknown terminal {terminal}"))?;
+    let t = role::listed(reg, role, &terminal)?.clone();
     t.check_relaunch()?;
     let current = t.spec();
+    role::check_relaunch(role, &current)?;
     let spec = relaunch_spec(&current, skip)?;
     if current.skip_permissions.unwrap_or(false) == skip {
         return Ok(Reserved::Unchanged(t.info().pid));
@@ -97,7 +97,14 @@ fn reserve(
 /// The worker: end the old process, then, under the registry lock, start the replacement
 /// from the record as it is now (a `term.update` in the meantime counts) and list it in the
 /// old one's place.
-fn run(d: &Arc<Daemon>, t: &Arc<Terminal>, skip: bool, ob: &Arc<Outbox>, id: Option<u64>) {
+fn run(
+    d: &Arc<Daemon>,
+    t: &Arc<Terminal>,
+    skip: bool,
+    role: Role,
+    ob: &Arc<Outbox>,
+    id: Option<u64>,
+) {
     let deadline = Instant::now() + d.cfg.kill_grace + EXIT_SLACK;
     t.signal_groups(d.cfg.kill_grace);
     d.test_point(t.id, TestPoint::Signalled);
@@ -121,7 +128,7 @@ fn run(d: &Arc<Daemon>, t: &Arc<Terminal>, skip: bool, ob: &Arc<Outbox>, id: Opt
         );
         return;
     }
-    match replacement(d, &reg, t, skip) {
+    match replacement(d, &reg, t, skip, role) {
         Ok(next) => {
             let dropped = t.hand_over(&next);
             let pid = next.info().pid;
@@ -151,17 +158,20 @@ fn run(d: &Arc<Daemon>, t: &Arc<Terminal>, skip: bool, ob: &Arc<Outbox>, id: Opt
 }
 
 /// Start the replacement. Its identity is persisted (as the old Terminal's leader) before
-/// any of its threads start, so a crash from then on leaves a record that ends it.
+/// any of its threads start, so a crash from then on leaves a record that ends it. The role
+/// is checked again on the spec it starts, which a `term.update` may have changed.
 fn replacement(
     d: &Arc<Daemon>,
     reg: &Registry,
     t: &Arc<Terminal>,
     skip: bool,
+    role: Role,
 ) -> Result<Arc<Terminal>, SpawnError> {
     if reg.frozen {
         return Err(String::from("xshelld is upgrading or shutting down").into());
     }
     let (spec, meta, created_at_ms, size) = t.relaunch_parts();
+    role::check_relaunch(role, &spec)?;
     let spec = relaunch_spec(&spec, skip)?;
     d.check_budget(reg, t.id, &spec, &meta)?;
     let spawned = |leader: &Leader| {

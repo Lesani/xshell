@@ -5557,6 +5557,7 @@ version = "1.5.0"
 dependencies = [
  "dirs",
  "libc",
+ "md5",
  "portable-pty",
  "serde",
  "serde_json",

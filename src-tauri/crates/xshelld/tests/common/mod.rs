@@ -22,7 +22,7 @@ use xshell_protocol::msg::{
     decode_server, encode_msg, ClientMsg, Hello, OpenSpec, ProtocolRange, ServerMsg, TerminalInfo,
 };
 use xshelld::paths::{resolve, Paths};
-use xshelld::server::{Config, Server, ServerHandle};
+use xshelld::server::{Config, Role, Server, ServerHandle};
 
 pub const T: Duration = Duration::from_secs(5);
 
@@ -367,6 +367,78 @@ pub fn make_jsonl(h: &TestHome, cwd: &Path, sid: &str) {
     fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
 }
 
+/// Claude history for `sid` in `cwd`, so the Daemon knows `cwd` as a Project.
+pub fn claude_history(h: &TestHome, cwd: &Path, sid: &str) {
+    let dir = h
+        .home()
+        .join(".claude/projects")
+        .join(encode_project_name(&cwd.to_string_lossy()));
+    fs::create_dir_all(&dir).unwrap();
+    let line = json!({ "type": "user", "cwd": cwd, "sessionId": sid });
+    fs::write(dir.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+}
+
+/// A Codex rollout in `cwd`, so the Daemon knows `cwd` as a Project.
+pub fn codex_history(h: &TestHome, cwd: &Path) {
+    let dir = h.home().join(".codex/sessions/2026/01/01");
+    fs::create_dir_all(&dir).unwrap();
+    let line = json!({ "type": "session_meta", "payload": { "id": "r1", "cwd": cwd } });
+    let name = format!(
+        "rollout-{}.jsonl",
+        encode_project_name(&cwd.to_string_lossy())
+    );
+    fs::write(dir.join(name), format!("{line}\n")).unwrap();
+}
+
+/// A Cursor chat in `cwd` (trusted workspace plus one chat with a conversation).
+pub fn cursor_history(h: &TestHome, cwd: &Path) {
+    let cwd = cwd.to_string_lossy();
+    let ws = h.home().join(".cursor/projects/p1");
+    fs::create_dir_all(&ws).unwrap();
+    fs::write(
+        ws.join(".workspace-trusted"),
+        json!({ "workspacePath": cwd }).to_string(),
+    )
+    .unwrap();
+    let digest = format!("{:x}", md5::compute(cwd.as_bytes()));
+    let chat = h.home().join(".cursor/chats").join(digest).join("chat-1");
+    fs::create_dir_all(&chat).unwrap();
+    fs::write(
+        chat.join("meta.json"),
+        json!({ "hasConversation": true, "title": "t" }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A git repository in `dir` with one commit (`a.txt`), one modified file (`a.txt`) and one
+/// untracked file (`b.txt`). `false` when git is not on PATH.
+pub fn git_fixture(dir: &Path) -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q", "-b", "main"]) {
+        return false;
+    }
+    fs::write(dir.join("a.txt"), "one\n").unwrap();
+    assert!(git(&["add", "a.txt"]) && git(&["commit", "-q", "-m", "first"]));
+    assert!(git(&["branch", "other"]));
+    fs::write(dir.join("a.txt"), "two\n").unwrap();
+    fs::write(dir.join("b.txt"), "new\n").unwrap();
+    true
+}
+
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_xshelld")
 }
@@ -504,6 +576,16 @@ impl Client {
         let r = s.try_clone().unwrap();
         let mut c = Client::from_io(r, s.try_clone().unwrap());
         c._keep = Some(s);
+        c
+    }
+
+    /// A connection served in the test process with `role` (see
+    /// `ServerHandle::connect_in_process`), after its hello.
+    pub fn in_process(srv: &ServerHandle, role: Role) -> Client {
+        let s = srv.connect_in_process(role).unwrap();
+        let mut c = Client::from_io(s.try_clone().unwrap(), s.try_clone().unwrap());
+        c._keep = Some(s);
+        c.hello(range(1, 1));
         c
     }
 

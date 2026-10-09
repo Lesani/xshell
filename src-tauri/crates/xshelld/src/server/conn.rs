@@ -1,11 +1,12 @@
-//! One Desktop connection: handshake, then a read loop that applies each message. Every
-//! handler is non-blocking (PTY writes go through input threads, calls get their own thread).
-//! Losing a connection detaches it everywhere and ends nothing.
+//! One connection: handshake, then a read loop that applies each message its [`Role`] allows.
+//! Every handler is non-blocking (PTY writes go through input threads, calls get their own
+//! thread). Losing a connection detaches it everywhere and ends nothing.
 
 use super::calls::spawn_call;
 use super::outbox::{writer_loop, Outbox};
 use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
+use super::role::{self, Role};
 use super::terminal::{self, Terminal};
 use super::{ConnId, ExitReason};
 use serde_json::{json, Value};
@@ -40,13 +41,15 @@ fn push_error(ob: &Outbox, code: &str, message: String) {
 struct Conn {
     d: Arc<Daemon>,
     id: ConnId,
+    /// Set by the transport; no message changes it.
+    role: Role,
     ob: Arc<Outbox>,
     /// Terminals this connection attached to or sized; all are released on disconnect.
     touched: HashSet<Uuid>,
     inflight: Arc<AtomicUsize>,
 }
 
-pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
+pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId, role: Role) {
     let (wsock, asock) = match (sock.try_clone(), sock.try_clone()) {
         (Ok(w), Ok(a)) => (w, a),
         _ => return,
@@ -113,6 +116,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
     let mut c = Conn {
         d: d.clone(),
         id,
+        role,
         ob: ob.clone(),
         touched: HashSet::new(),
         inflight: Arc::new(AtomicUsize::new(0)),
@@ -170,33 +174,29 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId) {
 }
 
 impl Conn {
-    /// Run `f` on the Terminal listed under `id` with the registry still locked. Attach,
-    /// detach and resize go through here: a Relaunch moves the attached connections and the
-    /// size arbiter to the replacement under the same lock, so none of them lands on the
-    /// Terminal it replaced.
+    /// Run `f` on the Terminal listed under `id`, if this connection's role may act on it,
+    /// with the registry still locked. Attach, detach and resize go through here: a Relaunch
+    /// moves the attached connections and the size arbiter to the replacement under the same
+    /// lock, so none of them lands on the Terminal it replaced.
     fn with_listed<R>(&self, id: &Uuid, f: impl FnOnce(&Arc<Terminal>) -> R) -> Result<R, String> {
         let reg = self.d.reg.lock().unwrap();
-        let t = reg
-            .terminals
-            .get(id)
-            .ok_or_else(|| format!("unknown terminal {id}"))?;
-        Ok(f(t))
+        role::listed(&reg, self.role, id).map(f)
     }
 
+    /// The Terminal listed under `id`, if this connection's role may act on it. The caller
+    /// keeps using this instance rather than looking the UUID up again.
     fn terminal(&self, id: &Uuid) -> Result<Arc<Terminal>, String> {
-        self.d
-            .reg
-            .lock()
-            .unwrap()
-            .terminals
-            .get(id)
-            .cloned()
-            .ok_or_else(|| format!("unknown terminal {id}"))
+        self.with_listed(id, Arc::clone)
     }
 
     fn on_msg(&mut self, m: Inbound) {
         let id = m.id;
         let d = self.d.clone();
+        // Before any lock or in-flight slot is taken; a refusal without `id` is dropped.
+        if let Err(e) = role::check(self.role, &d.ctx, &m.msg) {
+            reply(&self.ob, id, Err(e));
+            return;
+        }
         match m.msg {
             ClientMsg::Hello(_) => reply(&self.ob, id, Err("already said hello".into())),
             ClientMsg::Call { method, params } => {
@@ -292,9 +292,9 @@ impl Conn {
             }
             ClientMsg::TermClose { terminal } => {
                 let mut reg = d.reg.lock().unwrap();
-                let r = match reg.terminals.get(&terminal).cloned() {
-                    None => Err(format!("unknown terminal {terminal}")),
-                    Some(t) if t.is_exited() => {
+                let r = match role::listed(&reg, self.role, &terminal).cloned() {
+                    Err(e) => Err(e),
+                    Ok(t) if t.is_exited() => {
                         // Nothing left to signal; the pid may already be reused.
                         if !reg.frozen {
                             reg.terminals.remove(&terminal);
@@ -304,7 +304,7 @@ impl Conn {
                         }
                         Ok(Value::Null)
                     }
-                    Some(t) => {
+                    Ok(t) => {
                         t.kill(d.cfg.kill_grace);
                         Ok(Value::Null)
                     }
@@ -336,7 +336,7 @@ impl Conn {
             ClientMsg::TermRelaunch {
                 terminal,
                 skip_permissions,
-            } => relaunch::start(&d, &self.ob, id, terminal, skip_permissions),
+            } => relaunch::start(&d, &self.ob, id, terminal, skip_permissions, self.role),
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();

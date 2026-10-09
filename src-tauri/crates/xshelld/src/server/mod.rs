@@ -12,6 +12,8 @@ pub use orphans::Cleanup;
 mod outbox;
 mod registry;
 mod relaunch;
+mod role;
+pub use role::Role;
 mod size;
 mod terminal;
 
@@ -20,9 +22,9 @@ use registry::{Daemon, Registry};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -294,6 +296,19 @@ impl ServerHandle {
     pub fn attached(&self) -> usize {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.values().map(|t| t.attached()).sum()
+    }
+
+    /// Test hook: a connection served in this process with `role`, as a transport other than
+    /// the socket would hand it over. Returns the client's end.
+    #[doc(hidden)]
+    pub fn connect_in_process(&self, role: Role) -> io::Result<UnixStream> {
+        let (client, server) = UnixStream::pair()?;
+        let id = self.d.next_conn.fetch_add(1, Ordering::SeqCst);
+        let d = self.d.clone();
+        std::thread::Builder::new()
+            .name(format!("conn-{id}-r"))
+            .spawn(move || conn::handle(d, server, id, role))?;
+        Ok(client)
     }
 
     pub fn stopper(&self) -> Stopper {

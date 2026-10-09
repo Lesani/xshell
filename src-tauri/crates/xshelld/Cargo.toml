@@ -28,5 +28,6 @@ portable-pty = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+md5 = { workspace = true }
 tempfile = "3"
 xshell-hostlink = { path = "../hostlink" }
