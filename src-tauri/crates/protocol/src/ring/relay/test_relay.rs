@@ -224,6 +224,8 @@ struct Shared {
     raw_rx: std::sync::atomic::AtomicUsize,
     /// Set once Fault::EmptyTlsRecords starts writing.
     flooding: AtomicBool,
+    /// Answer every `roster.put` with `error{code:"internal"}` (see `refuse_roster_puts`).
+    refuse_puts: AtomicBool,
     opts: TestRelayOptions,
     origin: Mutex<String>,
     tls: Option<Arc<ServerConfig>>,
@@ -320,6 +322,7 @@ impl TestRelay {
             stop: AtomicBool::new(false),
             raw_rx: std::sync::atomic::AtomicUsize::new(0),
             flooding: AtomicBool::new(false),
+            refuse_puts: AtomicBool::new(false),
             opts,
             origin: Mutex::new(origin),
             tls,
@@ -393,6 +396,17 @@ impl TestRelay {
     /// Makes `key`'s socket misbehave.
     pub fn fault(&self, ring: &RingId, key: &SignKey, fault: Fault) -> bool {
         self.command(ring, key, Cmd::Fault(fault))
+    }
+
+    /// Closes `key`'s socket with `code` and no error frame, as a Relay that lost the
+    /// socket would; false when it has none.
+    pub fn kick(&self, ring: &RingId, key: &SignKey, code: u16) -> bool {
+        self.command(ring, key, Cmd::Close(code))
+    }
+
+    /// While on, every `roster.put` fails with `error{code:"internal"}` and stores nothing.
+    pub fn refuse_roster_puts(&self, on: bool) {
+        self.shared.refuse_puts.store(on, Ordering::Release);
     }
 
     fn command(&self, ring: &RingId, key: &SignKey, cmd: Cmd) -> bool {
@@ -1485,6 +1499,10 @@ impl Conn {
                 self.close(close::NORMAL);
             }
             ClientFrame::RosterPut { id, roster } => {
+                if self.shared.refuse_puts.load(Ordering::Acquire) {
+                    self.error(ErrorCode::Internal, Some(id), None, None);
+                    return;
+                }
                 let r = match SignedRoster::parse(&roster) {
                     Ok(r) => r,
                     Err(e) => {

@@ -4,7 +4,9 @@ import { hostInvoke } from "../hosts/hostInvoke";
 import { fmt } from "../hosts/strings";
 import type { HostConfig } from "../hosts/types";
 import { HostsSettings } from "./HostsSettings";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server } from "lucide-react";
+import { MobileSettings } from "./MobileSettings";
+import { fmt as ringFmt } from "../ring/strings";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server, Smartphone } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -68,12 +70,13 @@ interface SettingsViewProps {
   updateInfo: UpdateInfo;
 }
 
-type Category = "appearance" | "agents" | "hosts" | "terminal" | "behavior" | "about";
+type Category = "appearance" | "agents" | "hosts" | "mobile" | "terminal" | "behavior" | "about";
 
 const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "agents",     label: "Agents",     icon: Bot },
   { id: "hosts",      label: fmt("settings.nav.hosts"), icon: Server },
+  { id: "mobile",     label: ringFmt("settings.nav.mobile"), icon: Smartphone },
   { id: "terminal",   label: "Terminal",   icon: TerminalIcon },
   { id: "behavior",   label: "Behavior",   icon: SettingsIcon },
   { id: "about",      label: "About",      icon: Info },
@@ -255,6 +258,7 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
           )}
 
           {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} />}
+          {active === "mobile" && <MobileSettings />}
 
           {active === "agents" && (
             <>

@@ -5931,6 +5931,7 @@ dependencies = [
  "uuid",
  "xshell-core",
  "xshell-protocol",
+ "zeroize",
 ]
 
 [[package]]
@@ -5971,6 +5972,7 @@ dependencies = [
  "xshell-core",
  "xshell-hostlink",
  "xshell-protocol",
+ "zeroize",
 ]
 
 [[package]]

@@ -27,9 +27,9 @@ pub mod url;
 
 pub use chain::{verify_genesis, verify_successor, Accepted, RosterChain};
 pub use error::RingError;
-pub use keys::{verify, DeviceKeys, NoiseKey, SignError, SignKey, Signature, Signer};
+pub use keys::{verify, DeviceKeys, NoiseKey, SecretSeed, SignError, SignKey, Signature, Signer};
 pub use ring_id::RingId;
-pub use roster::{Member, Role, Roster, RosterDraft, RosterError, SignedRoster};
+pub use roster::{member_name, Member, Role, Roster, RosterDraft, RosterError, SignedRoster};
 
 /// Prefix of the bytes hashed into a [`RingId`].
 pub const RING_ID_CONTEXT: &str = "xshell-ring-v1\n";

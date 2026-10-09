@@ -15,6 +15,7 @@ mod outbox;
 pub mod parent;
 mod registry;
 mod relaunch;
+mod ring;
 mod role;
 pub use role::Role;
 mod size;
@@ -74,6 +75,10 @@ pub struct Config {
     /// Stops the server from another thread, also while it is still starting: a trigger
     /// during restore abandons the start (Terminals ended, state file kept).
     pub abort: Option<Arc<StopLatch>>,
+    /// The Relay connection's backoff unit (1 s; tests shorten it).
+    pub ring_backoff_unit: Duration,
+    /// The Relay client's timeouts (tests shorten them).
+    pub ring_timeouts: xshell_protocol::ring::relay::RingTimeouts,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -191,6 +196,8 @@ impl Config {
             event_exe: std::env::current_exe().ok(),
             gui_bound: None,
             abort: None,
+            ring_backoff_unit: Duration::from_secs(1),
+            ring_timeouts: Default::default(),
             cleanup_override: None,
             test_hook: None,
         }
@@ -205,6 +212,19 @@ pub enum ExitReason {
     Upgrade,
     /// SIGTERM/SIGINT/SIGHUP or [`ServerHandle::shutdown`]: Terminals ended, state file kept.
     Shutdown,
+}
+
+impl ExitReason {
+    /// The goodbye this exit says to the Relay.
+    pub fn bye_reason(self) -> xshell_protocol::ring::relay::ByeReason {
+        use xshell_protocol::ring::relay::ByeReason;
+        match self {
+            ExitReason::Idle => ByeReason::idle(),
+            ExitReason::Upgrade => ByeReason::upgrade(),
+            // GUI quit, SIGTERM, the parent's death.
+            ExitReason::Shutdown => ByeReason::quit(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -300,6 +320,11 @@ impl Server {
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
         xshell_core::files::cleanup_old_dropped_files(&ctx);
         let hooks = agent::hooks(&cfg);
+        let ring = ring::Ring::new(
+            paths.ring_dir.clone(),
+            cfg.ring_backoff_unit,
+            cfg.ring_timeouts,
+        );
         let d = Arc::new(Daemon {
             cfg,
             ctx: Arc::new(ctx),
@@ -315,12 +340,16 @@ impl Server {
             // process never matches a restored Terminal's run.
             next_run: AtomicU64::new(registry::now_ms()),
             escalations: Default::default(),
+            ring,
         });
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);
             return Err(StartError::Aborted);
         }
+        // A member of a Ring connects to its Relay; the Relay socket is not a connection for
+        // idle tracking.
+        d.ring.resume();
         let da = d.clone();
         let ds = d.clone();
         let threads = std::thread::Builder::new()

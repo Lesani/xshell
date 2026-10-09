@@ -214,6 +214,8 @@ struct TauriObserver(AppHandle);
 
 impl Observer for TauriObserver {
     fn status(&self, s: &HostStatus) {
+        // Records the Local Host's connection for the Ring; the work runs elsewhere.
+        crate::ring::observe(&crate::ring::LOCAL_SYNC, s);
         let _ = self.0.emit("hosts:status", s);
     }
     fn terminals(&self, host: &str, list: &[TerminalInfo]) {

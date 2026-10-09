@@ -408,6 +408,9 @@ impl Conn {
             ClientMsg::DaemonUpgrade if d.cfg.gui_bound.is_some() => {
                 reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
             }
+            ClientMsg::RingIdentity => reply(&self.ob, id, d.ring.identity()),
+            // Never blocks: leaving another Ring says goodbye on a thread of its own.
+            ClientMsg::RingJoin { rosters } => reply(&self.ob, id, d.ring.join(&rosters)),
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();

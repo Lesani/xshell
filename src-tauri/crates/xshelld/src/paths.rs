@@ -22,6 +22,8 @@ pub struct Paths {
     pub mode: PathBuf,
     /// `home/.xshell/log/xshelld.log`.
     pub log: PathBuf,
+    /// `home/.xshell/daemon/ring`: this Host's Ring keys and Roster chain (0700).
+    pub ring_dir: PathBuf,
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
     /// `$XDG_RUNTIME_DIR/xshell/tmp`, else `home/.xshell/tmp`.
     pub tmp: PathBuf,
@@ -63,6 +65,7 @@ pub fn resolve(
             .join("claude-hooks.json"),
         mode: home.join(".xshell").join("daemon").join("mode"),
         log: home.join(".xshell").join("log").join("xshelld.log"),
+        ring_dir: home.join(".xshell").join("daemon").join("ring"),
         tmp,
     }
 }
@@ -193,6 +196,7 @@ mod tests {
             PathBuf::from("/h/.xshell/daemon/claude-hooks.json")
         );
         assert_eq!(p.log, PathBuf::from("/h/.xshell/log/xshelld.log"));
+        assert_eq!(p.ring_dir, PathBuf::from("/h/.xshell/daemon/ring"));
         assert_eq!(p.tmp, PathBuf::from("/h/.xshell/tmp"));
         // A relative XDG_RUNTIME_DIR is invalid per the spec and ignored.
         assert_eq!(resolve(Path::new("/h"), Some(Path::new("r")), None), p);

@@ -236,6 +236,52 @@ pub trait Signer: Send + Sync {
     fn sign(&self, msg: &[u8]) -> Result<[u8; 64], SignError>;
 }
 
+/// A 32-byte private seed in storage form (b64u in JSON), wiped when dropped. It decodes
+/// straight into zeroizing storage, also when deserialization fails later on, and encodes
+/// through a wiped string.
+pub struct SecretSeed(pub Zeroizing<[u8; 32]>);
+
+impl SecretSeed {
+    pub fn new(bytes: &[u8; 32]) -> Self {
+        SecretSeed(Zeroizing::new(*bytes))
+    }
+}
+
+impl fmt::Debug for SecretSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretSeed(..)")
+    }
+}
+
+impl Serialize for SecretSeed {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let text = Zeroizing::new(b64::encode(&self.0[..]));
+        s.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretSeed {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SecretSeed;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a b64u 32-byte seed")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SecretSeed, E> {
+                let mut out = Zeroizing::new([0u8; 32]);
+                b64::decode_into(v, &mut out).map_err(|_| E::custom("bad seed"))?;
+                Ok(SecretSeed(out))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<SecretSeed, E> {
+                let v = Zeroizing::new(v);
+                self.visit_str(&v)
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
 /// A device's two private keys, held in memory and zeroed on drop.
 pub struct DeviceKeys {
     sign: ed25519_dalek::SigningKey,
@@ -301,6 +347,16 @@ impl Signer for DeviceKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_seed_round_trips_and_refuses_junk() {
+        let seed = SecretSeed::new(&[7; 32]);
+        let json = serde_json::to_string(&seed).unwrap();
+        let back: SecretSeed = serde_json::from_str(&json).unwrap();
+        assert_eq!(*back.0, [7; 32]);
+        assert!(serde_json::from_str::<SecretSeed>("\"short\"").is_err());
+        assert_eq!(format!("{seed:?}"), "SecretSeed(..)");
+    }
 
     #[test]
     fn keys_round_trip_and_sign() {

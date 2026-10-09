@@ -35,6 +35,8 @@ pub(crate) struct Daemon {
     pub next_run: AtomicU64,
     /// Hung-up process groups whose SIGKILL is still due, Terminal listed or not.
     pub escalations: Arc<orphans::Escalations>,
+    /// This Host's Ring membership and Relay connection.
+    pub ring: super::ring::Ring,
 }
 
 #[derive(Default)]
@@ -318,6 +320,19 @@ impl Daemon {
         if self.exiting.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The goodbye runs alongside ending the Terminals and is over before the lock is
+        // released, so an upgraded successor connects only after it.
+        let me = self.clone();
+        let bye = std::thread::Builder::new()
+            .name("ring-bye".into())
+            .spawn(move || me.ring.stop(reason.bye_reason()));
+        let bye = match bye {
+            Ok(h) => Some(h),
+            Err(_) => {
+                self.ring.stop(reason.bye_reason());
+                None
+            }
+        };
         let terms: Vec<Arc<Terminal>> = {
             let mut reg = self.reg.lock().unwrap();
             reg.frozen = true;
@@ -355,6 +370,9 @@ impl Daemon {
         }
         let _ = fs::remove_file(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
+        if let Some(h) = bye {
+            let _ = h.join();
+        }
         // Released last: a successor may start as soon as this is gone.
         // Unlocked explicitly: a child forked meanwhile may still share the file.
         if let Some(l) = self.lock_file.lock().unwrap().take() {

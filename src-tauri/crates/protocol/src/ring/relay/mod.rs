@@ -5,6 +5,8 @@ pub mod wire;
 #[cfg(feature = "relay-client")]
 mod client;
 #[cfg(feature = "relay-client")]
+pub mod connector;
+#[cfg(feature = "relay-client")]
 mod io;
 #[cfg(feature = "relay-client")]
 pub mod transport;
@@ -18,4 +20,6 @@ pub mod test_relay;
 pub use client::{
     MemberStatus, RingClient, RingClientConfig, RingEvents, RingLimits, RingTimeouts,
 };
+#[cfg(feature = "relay-client")]
+pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState};
 pub use wire::{ByeReason, CloseReason, ErrorCode, MemberPresence, Presence};

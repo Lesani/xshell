@@ -97,6 +97,9 @@ pub trait RingEvents: Send + Sync {
     fn presence(&self, key: SignKey, presence: MemberPresence);
     /// A new verified head.
     fn roster(&self, roster: &SignedRoster);
+    /// The whole verified chain that `roster` just made the head of, called right after
+    /// it: what a device persists, so a restart resumes from everything it verified.
+    fn chain(&self, _chain: &RosterChain) {}
     /// The Relay sent a Roster version that failed verification; the trusted head stands.
     fn roster_rejected(&self, error: RosterError);
     /// An `error` the Relay sent that answers no request (`offline`, `unknown_recipient`, …).
@@ -450,6 +453,7 @@ impl RingClient {
         }
         if chain.head().version() > cfg.chain.head().version() {
             events.roster(chain.head());
+            events.chain(&chain);
         }
 
         let presence = presence
@@ -631,6 +635,12 @@ impl RingClient {
     /// Says goodbye with `reason` and waits (at most the `bye` timeout) for the Relay to
     /// close, so it reports this device "xshell closed" rather than unreachable.
     pub fn bye(self, reason: ByeReason) -> Result<(), RingError> {
+        self.goodbye(reason)
+    }
+
+    /// [`RingClient::bye`] for a shared client: the connection ends either way, and a second
+    /// goodbye is refused.
+    pub fn goodbye(&self, reason: ByeReason) -> Result<(), RingError> {
         let rx = self.outbox.bye(reason)?;
         // The IO thread enforces the deadline; the margin covers scheduling.
         match rx.recv_timeout(self.timeouts.bye + Duration::from_millis(500)) {
@@ -686,13 +696,16 @@ impl ClientHandler {
                     if known {
                         return Acceptance::Known;
                     }
-                    st.chain.accept(&p).map(|_| st.chain.head().clone())
+                    st.chain
+                        .accept(&p)
+                        .map(|_| (st.chain.head().clone(), st.chain.clone()))
                 }
             }
         };
         match result {
-            Ok(head) => {
+            Ok((head, chain)) => {
                 self.events.roster(&head);
+                self.events.chain(&chain);
                 Acceptance::New
             }
             Err(RosterError::Gap) => Acceptance::Gap,

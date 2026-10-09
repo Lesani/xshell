@@ -207,6 +207,9 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
         // Agent hooks report from the Host itself, over the local socket, never from a phone.
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
+        // Ring membership is the Desktop's to manage.
+        ClientMsg::RingIdentity => Err(forbidden("ring.identity")),
+        ClientMsg::RingJoin { .. } => Err(forbidden("ring.join")),
     }
 }
 
@@ -695,7 +698,13 @@ mod tests {
             session_id: None,
             meta: None,
         };
-        for m in [&upd, &ClientMsg::DaemonUpgrade] {
+        let join = ClientMsg::RingJoin { rosters: vec![] };
+        for m in [
+            &upd,
+            &ClientMsg::DaemonUpgrade,
+            &ClientMsg::RingIdentity,
+            &join,
+        ] {
             assert!(check(Role::Mobile, &ctx, m)
                 .unwrap_err()
                 .starts_with(FORBIDDEN));
@@ -722,6 +731,11 @@ mod tests {
             hooks: None,
             next_run: AtomicU64::new(1),
             escalations: Default::default(),
+            ring: crate::server::ring::Ring::new(
+                dir.join("ring"),
+                std::time::Duration::from_secs(1),
+                Default::default(),
+            ),
         })
     }
 

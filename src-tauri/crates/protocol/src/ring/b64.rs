@@ -67,9 +67,54 @@ pub fn decode_array<const N: usize>(s: &str) -> Result<[u8; N], B64Error> {
     })
 }
 
+/// Decodes `s` straight into `out`, which must be exactly its decoded length; no other copy
+/// of the bytes is made (for secrets kept in zeroizing storage). On error `out` is zeroed.
+pub fn decode_into<const N: usize>(s: &str, out: &mut [u8; N]) -> Result<(), B64Error> {
+    if decoded_len(s.len()) != Some(N) {
+        return Err(B64Error::Length {
+            expected: N,
+            got: decoded_len(s.len()).unwrap_or(0),
+        });
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(B64Error::Invalid);
+    }
+    match URL_SAFE_NO_PAD.decode_slice(s, &mut out[..]) {
+        Ok(n) if n == N => Ok(()),
+        _ => {
+            out.fill(0);
+            Err(B64Error::Invalid)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_into_matches_decode_array() {
+        let bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29));
+        let s = encode(&bytes);
+        let mut out = [0u8; 32];
+        decode_into(&s, &mut out).unwrap();
+        assert_eq!(out, bytes);
+        assert!(decode_into(&s[..42], &mut out).is_err());
+        let mut bad = s.clone();
+        bad.replace_range(0..1, "+");
+        assert!(decode_into(&bad, &mut out).is_err());
+        // Non-canonical trailing bits are refused, as by decode.
+        let last = s.chars().last().unwrap();
+        let mut tweaked = s[..42].to_string();
+        tweaked.push(if last == 'B' { 'C' } else { 'B' });
+        assert_eq!(
+            decode_into(&tweaked, &mut out).is_ok(),
+            decode(&tweaked).is_ok()
+        );
+    }
 
     #[test]
     fn round_trips() {

@@ -13,6 +13,7 @@ pub mod link;
 pub mod local;
 pub mod manager;
 pub mod process;
+pub mod ring;
 pub mod ssh_config;
 pub mod status;
 pub mod supervisor;

@@ -94,6 +94,16 @@ pub enum ClientMsg {
         run: u64,
         status: AgentStatus,
     },
+    /// This Host's Ring identity: its public keys and name, and its membership if it has
+    /// one. Creates the keys on first use; the private keys never leave the Host. Desktop
+    /// only; gated on the `ring` capability.
+    #[serde(rename = "ring.identity")]
+    RingIdentity,
+    /// Join (or follow) a Ring: the whole Roster chain from version 1, as tokens. The chain
+    /// must verify and its head must list this Host as a `daemon`; a chain of the same Ring
+    /// must extend the stored one. Desktop only; gated on the `ring` capability.
+    #[serde(rename = "ring.join")]
+    RingJoin { rosters: Vec<String> },
 }
 
 /// What an agent Terminal is doing, as its agent's hooks report it.
@@ -147,6 +157,8 @@ const CLIENT_TYPES: &[&str] = &[
     "term.relaunch",
     "daemon.upgrade",
     "term.event",
+    "ring.identity",
+    "ring.join",
 ];
 
 /// `term.open`'s spec: a launch spec plus the Desktop-chosen UUID, initial size and opaque
@@ -546,6 +558,30 @@ mod tests {
         let inb = decode_inbound(&b).unwrap();
         assert_eq!(inb.id, Some(3));
         assert_eq!(inb.msg, ClientMsg::DaemonUpgrade);
+    }
+
+    #[test]
+    fn ring_messages_roundtrip() {
+        let b = body(encode_msg(&ClientMsg::RingIdentity, Some(4)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":4,"t":"ring.identity"}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap().msg, ClientMsg::RingIdentity);
+        let join = ClientMsg::RingJoin {
+            rosters: vec!["xro1.a.b".into()],
+        };
+        let b = body(encode_msg(&join, Some(5)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":5,"t":"ring.join","rosters":["xro1.a.b"]}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap().msg, join);
+        let raw = json!({"t":"ring.join","id":6});
+        assert!(matches!(
+            decode_inbound(raw.to_string().as_bytes()),
+            Err(DecodeError::Invalid { id: Some(6), .. })
+        ));
     }
 
     #[test]

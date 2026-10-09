@@ -38,6 +38,8 @@ pub trait TermSink: Send + Sync {
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The hello capability of Daemons that serve `term.relaunch`.
 const RELAUNCH_CAPABILITY: &str = "term.relaunch";
+/// The hello capability of Daemons that serve `ring.identity` and `ring.join`.
+pub const RING_CAPABILITY: &str = "ring";
 /// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
 ///
 /// [`LaunchSpec`]: xshell_core::launch::LaunchSpec
@@ -944,6 +946,53 @@ impl HostHandle {
         }
     }
 
+    /// A request sent only when the Daemon of the current link advertises `capability`;
+    /// refused with `refusal` without sending anything otherwise.
+    fn gated(&self, msg: ClientMsg, capability: &str, refusal: &str, w: Waiter) {
+        let once = Once::new(w);
+        let sent = {
+            // The capability and the link are checked and used under one lock: `adopt`
+            // replaces both together.
+            let st = self.sh.lock();
+            Shared::usable_link(&st).and_then(|(l, _)| {
+                if !st
+                    .status
+                    .daemon_capabilities
+                    .iter()
+                    .any(|c| c == capability)
+                {
+                    return Err(HostError::invalid(refusal));
+                }
+                let o = once.clone();
+                l.request(msg, self.sh.mc.term_timeout, Box::new(move |r| o.call(r)))
+            })
+        };
+        if let Err(e) = sent {
+            once.call(Err(e));
+        }
+    }
+
+    /// `ring.identity`: the Host's Ring keys, name and membership. Refused without sending
+    /// anything when the Daemon does not advertise the `ring` capability.
+    pub fn ring_identity(&self, w: Waiter) {
+        self.gated(
+            ClientMsg::RingIdentity,
+            RING_CAPABILITY,
+            "this Host's xshelld cannot join a ring; upgrade it first",
+            w,
+        );
+    }
+
+    /// `ring.join` with the whole Roster chain. Refused like [`HostHandle::ring_identity`].
+    pub fn ring_join(&self, rosters: Vec<String>, w: Waiter) {
+        self.gated(
+            ClientMsg::RingJoin { rosters },
+            RING_CAPABILITY,
+            "this Host's xshelld cannot join a ring; upgrade it first",
+            w,
+        );
+    }
+
     /// Connected: `daemon.upgrade`, then the supervisor waits for the old Daemon to close
     /// the link before reconnecting. Incompatible: SIGTERM the Daemon through its pidfile,
     /// then reconnect.
@@ -1785,6 +1834,45 @@ pub(crate) mod tests {
         h.term_relaunch(t, true, w);
         let e = rx.recv_timeout(T5).unwrap().unwrap_err();
         assert_eq!(e.code, HostErrorCode::Invalid);
+        assert_nothing_sent(&h, &mut peer, t);
+    }
+
+    #[test]
+    fn ring_join_sent_with_capability() {
+        let sh = shared();
+        let mut peer = connect_capable(&sh, vec![], &["term", "ring"]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.ring_join(vec!["xro1.a.b".into()], w);
+        let m = peer.expect("ring.join");
+        assert_eq!(m["rosters"], json!(["xro1.a.b"]));
+        peer.reply(m["id"].as_u64().unwrap(), Ok(json!({"version": 1})));
+        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"version": 1})));
+        let (w, rx) = res_slot();
+        h.ring_identity(w);
+        let m = peer.expect("ring.identity");
+        peer.reply(m["id"].as_u64().unwrap(), Ok(json!({"name": "x"})));
+        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"name": "x"})));
+    }
+
+    #[test]
+    fn ring_join_refused_without_capability() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = res_slot();
+        h.ring_join(vec![], w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
+        let (w, rx) = res_slot();
+        h.ring_identity(w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
         assert_nothing_sent(&h, &mut peer, t);
     }
 

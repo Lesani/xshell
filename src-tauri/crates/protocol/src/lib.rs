@@ -3,6 +3,7 @@
 //! runtime can drive it. With the `ring` feature (on by default) also the [`ring`] module: device
 //! keys, the Roster and the Relay protocol; `relay-client` adds the Relay client.
 
+pub mod backoff;
 pub mod correlate;
 pub mod frame;
 pub mod launch;
@@ -28,6 +29,7 @@ pub const CAPABILITIES: &[&str] = &[
     "term.relaunch",
     "launch.prefix",
     "agent.status",
+    "ring",
 ];
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -55,6 +57,11 @@ mod tests {
     #[test]
     fn capabilities_include_agent_status() {
         assert!(CAPABILITIES.contains(&"agent.status"));
+    }
+
+    #[test]
+    fn capabilities_include_ring() {
+        assert!(CAPABILITIES.contains(&"ring"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod agent_events;
 mod hosts;
 mod local_migration;
 mod local_pty;
+mod ring;
 
 use local_pty::LocalPtys;
 use std::fs;
@@ -338,6 +339,9 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "local_migration_journal_clear",
     "local_migration_guard",
     "local_migration_sync_settings",
+    "ring_status",
+    "ring_enable",
+    "ring_set_relay_url",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -577,6 +581,7 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager as _;
             app.manage(hosts::Hosts::new(app.handle()));
+            ring::setup(app.handle());
             #[cfg(unix)]
             setup_agent_status(app);
             // The main window is built here, after the state its page calls into, rather than
@@ -662,17 +667,32 @@ pub fn run() {
             local_migration::local_migration_journal_write,
             local_migration::local_migration_journal_clear,
             local_migration::local_migration_guard,
-            local_migration::local_migration_sync_settings
+            local_migration::local_migration_sync_settings,
+            ring::ring_status,
+            ring::ring_enable,
+            ring::ring_set_relay_url
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, ev| {
             if let tauri::RunEvent::Exit = ev {
                 use tauri::Manager as _;
+                // Say goodbye to the Relay while the local Daemon ends (at most 2.5 s).
+                let a = app.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let bye = std::thread::Builder::new()
+                    .name("ring-quit".into())
+                    .spawn(move || {
+                        ring::quit(&a);
+                        let _ = tx.send(());
+                    });
                 // End the local Daemon this app started; kill every ssh (Remote Daemons and
                 // their Terminals keep running).
                 if let Some(h) = app.try_state::<hosts::Hosts>() {
                     h.quit();
+                }
+                if bye.is_ok() {
+                    let _ = rx.recv_timeout(std::time::Duration::from_millis(2500));
                 }
                 #[cfg(unix)]
                 if let Some(s) = app.try_state::<AgentEventSocket>() {
@@ -729,7 +749,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 67);
+        assert_eq!(registered.len(), 70);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

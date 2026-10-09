@@ -192,6 +192,35 @@ fn check_name(name: &str) -> Result<(), RosterError> {
     Ok(())
 }
 
+/// A device name every Roster accepts, made from `raw` (a hostname, say): the characters
+/// [`check_name`] refuses are dropped, surrounding whitespace is trimmed, and the rest is cut
+/// to 64 bytes at a character boundary. `fallback` when nothing is left.
+pub fn member_name(raw: &str, fallback: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
+    let mut out = String::new();
+    for c in clean.trim().chars() {
+        if out.len() + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    let out = out.trim_end().to_string();
+    if out.is_empty() {
+        let mut f = String::new();
+        for c in fallback.chars() {
+            if f.len() + c.len_utf8() > MAX_NAME_BYTES {
+                break;
+            }
+            f.push(c);
+        }
+        return f;
+    }
+    out
+}
+
 fn check_int(what: &str, n: u64) -> Result<(), RosterError> {
     if n > MAX_SAFE_INT {
         return Err(invalid(format!("{what} above 2^53-1")));
@@ -409,5 +438,26 @@ impl SignedRoster {
     /// `b64u(SHA-256(ASCII(token)))`: the next version's `prev`.
     pub fn hash(&self) -> String {
         b64::encode(&Sha256::digest(self.token.as_bytes()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_name_is_always_valid() {
+        assert_eq!(member_name("laptop", "x"), "laptop");
+        assert_eq!(member_name("  dev box\n", "x"), "dev box");
+        assert_eq!(member_name("a\u{200B}b\u{202E}c\u{7}", "x"), "abc");
+        assert_eq!(member_name("", "this computer"), "this computer");
+        assert_eq!(member_name("\u{FEFF}\t", "this computer"), "this computer");
+        let long = "é".repeat(40);
+        let n = member_name(&long, "x");
+        assert_eq!(n.len(), 64);
+        assert!(n.chars().all(|c| c == 'é'));
+        for raw in ["laptop", &long, "\u{2060}x", " ", "a\u{0}b"] {
+            assert_eq!(check_name(&member_name(raw, "fallback")), Ok(()), "{raw:?}");
+        }
     }
 }

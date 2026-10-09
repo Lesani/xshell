@@ -67,3 +67,7 @@ required-features = ["ring"]
 [[test]]
 name = "ring_relay"
 required-features = ["test-relay"]
+
+[[test]]
+name = "ring_connector"
+required-features = ["test-relay"]
