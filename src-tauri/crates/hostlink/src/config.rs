@@ -1,7 +1,8 @@
 //! A configured Remote Host, as the frontend stores it in `settings.json` and pushes it in.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use xshell_core::launch::LaunchSpec;
 
 /// The one definition of a Host id. Generated ids are `h_` plus 8 characters of `[a-z0-9]`.
 /// The frontend's `parseProjectKey` uses the same pattern; a Vitest reads this line.
@@ -18,7 +19,14 @@ pub struct HostConfig {
     /// Runs an existing Daemon instead of the managed install: `<daemonCommand> connect`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_command: Option<String>,
+    /// Per agent id (`claude`, `codex`, ...): a command the agent is launched under on this
+    /// Host, e.g. a proxy wrapper. Shell words; the agent and its arguments follow them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launch_prefixes: BTreeMap<String, String>,
 }
+
+/// The agent ids a launch prefix can be set for (the frontend's `AgentId`).
+pub const PREFIX_AGENTS: &[&str] = &["claude", "codex", "cursor", "opencode", "antigravity"];
 
 impl HostConfig {
     /// The override, trimmed; blank counts as none.
@@ -27,6 +35,18 @@ impl HostConfig {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+    }
+
+    /// The launch prefix for the agent `spec` starts, as argv words. `None` for raw shells and
+    /// agents without one (blank counts as none). The agent id defaults to `claude`, as in
+    /// [`xshell_core::launch::agent_binary`].
+    pub fn launch_prefix(&self, spec: &LaunchSpec) -> Option<Vec<String>> {
+        if spec.shell_mode.as_deref() == Some("raw") {
+            return None;
+        }
+        let agent = spec.agent.as_deref().unwrap_or("claude");
+        let words = shlex::split(self.launch_prefixes.get(agent)?)?;
+        (!words.is_empty()).then_some(words)
     }
 
     /// Whether a change from `old` needs a new connection (the name and color do not).
@@ -84,6 +104,26 @@ pub fn validate_one(h: &HostConfig) -> Result<(), String> {
             ));
         }
     }
+    for (agent, prefix) in &h.launch_prefixes {
+        if !PREFIX_AGENTS.contains(&agent.as_str()) {
+            return Err(format!(
+                "host {}: launch prefix for unknown agent {agent:?}",
+                h.id
+            ));
+        }
+        if prefix.contains('\n') || prefix.contains('\r') {
+            return Err(format!(
+                "host {}: the {agent} launch prefix has a line break",
+                h.id
+            ));
+        }
+        if shlex::split(prefix).is_none() {
+            return Err(format!(
+                "host {}: the {agent} launch prefix has an unclosed quote",
+                h.id
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -106,6 +146,7 @@ pub(crate) fn test_host(id: &str, target: &str) -> HostConfig {
         ssh_target: target.into(),
         color: None,
         daemon_command: None,
+        launch_prefixes: BTreeMap::new(),
     }
 }
 
@@ -146,6 +187,52 @@ mod tests {
     }
 
     #[test]
+    fn launch_prefix_validation() {
+        let mut h = test_host("h_ab12cd34", "dev");
+        h.launch_prefixes
+            .insert("claude".into(), "vamoto-headroom-exec".into());
+        h.launch_prefixes
+            .insert("codex".into(), "'my wrapper' --flag".into());
+        assert!(validate_one(&h).is_ok());
+        for (agent, bad) in [("claude", "a\nb"), ("claude", "'unclosed"), ("pi", "wrap")] {
+            let mut b = h.clone();
+            b.launch_prefixes.insert(agent.into(), bad.into());
+            assert!(validate_one(&b).is_err(), "{agent} {bad:?}");
+        }
+    }
+
+    #[test]
+    fn launch_prefix_per_agent() {
+        let mut h = test_host("h_ab12cd34", "dev");
+        h.launch_prefixes
+            .insert("claude".into(), "vamoto-headroom-exec".into());
+        h.launch_prefixes
+            .insert("codex".into(), "'my wrapper' --flag".into());
+        h.launch_prefixes.insert("cursor".into(), "  ".into());
+        let spec = |agent: Option<&str>, mode: Option<&str>| LaunchSpec {
+            agent: agent.map(Into::into),
+            shell_mode: mode.map(Into::into),
+            ..Default::default()
+        };
+        let words = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            h.launch_prefix(&spec(None, None)),
+            words(&["vamoto-headroom-exec"])
+        );
+        assert_eq!(
+            h.launch_prefix(&spec(Some("claude"), Some("claude"))),
+            words(&["vamoto-headroom-exec"])
+        );
+        assert_eq!(
+            h.launch_prefix(&spec(Some("codex"), None)),
+            words(&["my wrapper", "--flag"])
+        );
+        assert_eq!(h.launch_prefix(&spec(Some("cursor"), None)), None);
+        assert_eq!(h.launch_prefix(&spec(Some("opencode"), None)), None);
+        assert_eq!(h.launch_prefix(&spec(None, Some("raw"))), None);
+    }
+
+    #[test]
     fn json_shape() {
         let h: HostConfig =
             serde_json::from_str(r#"{"id":"h_ab12cd34","name":"Dev","sshTarget":"dev"}"#).unwrap();
@@ -153,6 +240,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&h).unwrap(),
             r#"{"id":"h_ab12cd34","name":"Dev","sshTarget":"dev"}"#
+        );
+        let h: HostConfig = serde_json::from_str(
+            r#"{"id":"h_ab12cd34","name":"Dev","sshTarget":"dev","launchPrefixes":{"claude":"w"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            h.launch_prefixes.get("claude").map(String::as_str),
+            Some("w")
         );
     }
 
@@ -168,5 +263,9 @@ mod tests {
         let mut c = a.clone();
         c.daemon_command = Some("~/xd".into());
         assert!(c.connection_differs(&a));
+        // A launch prefix applies to the next launch; the connection stays.
+        let mut d = a.clone();
+        d.launch_prefixes.insert("claude".into(), "w".into());
+        assert!(!d.connection_differs(&a));
     }
 }

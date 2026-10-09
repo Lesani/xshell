@@ -188,6 +188,68 @@ fn relaunch_keeps_sink_no_exit() {
     );
 }
 
+/// A Host's launch prefix runs the agent under it, and a Relaunch (built by the Daemon from
+/// the stored spec) keeps it. Changing the prefix keeps the connection.
+#[test]
+fn launch_prefix_wraps_agent_and_survives_relaunch() {
+    // Before the Daemon starts: it inherits the fake agents' PATH.
+    shared_fake_agents();
+    let fx = Fx::new();
+    let first = fx.a.wait_usable();
+    assert!(first
+        .daemon_capabilities
+        .iter()
+        .any(|c| c == "launch.prefix"));
+    let cwd = fx.home.project("app");
+    let fake = Fake::in_dir(&cwd);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let log = cwd.join("prefix.log");
+    let wrap = fx.home.script(
+        "wrap",
+        &format!(
+            "printf '%s|' \"$@\" >> '{}'; echo >> '{}'; shift; exec \"$@\"",
+            log.display(),
+            log.display()
+        ),
+    );
+    let mut cfg = host_config(Some(override_cmd()));
+    cfg.launch_prefixes
+        .insert("claude".into(), format!("'{}' --tag", wrap.display()));
+    fx.a.m.configure(vec![cfg]).unwrap();
+
+    let sid = "11111111-2222-3333-4444-555555555555";
+    make_jsonl(&fx.home, &cwd, sid);
+    let t = Uuid::new_v4();
+    let sink = VecSink::new();
+    let old = open(&fx.a.host(), t, claude_spec(&cwd, Some(sid)), sink.clone()).unwrap();
+    sink.wait_from(0, &format!("pid {old} "));
+    let new = relaunch(&fx.a.host(), t, true).unwrap().expect("pid");
+    sink.wait_from(0, &format!("pid {new} "));
+    assert_eq!(
+        fake.wait_launches(2),
+        vec![
+            vec!["--resume".to_string(), sid.into()],
+            vec![
+                "--dangerously-skip-permissions".into(),
+                "--resume".into(),
+                sid.into()
+            ],
+        ]
+    );
+    let lines = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        lines,
+        format!(
+            "--tag|claude|--resume|{sid}|\n--tag|claude|--dangerously-skip-permissions|--resume|{sid}|\n"
+        )
+    );
+    // The prefix change was applied without a reconnect.
+    assert_eq!(
+        fx.a.host().status().config_generation,
+        first.config_generation
+    );
+}
+
 /// A Terminal that ignores SIGHUP delays the old Daemon's exit by its kill grace (2 s).
 fn hup_proof(fx: &Fx) -> xshell_core::launch::LaunchSpec {
     let s = fx.home.script("hupproof", "trap '' HUP\nexec sleep 1000");

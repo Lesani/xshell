@@ -272,6 +272,7 @@ pub fn host_config(daemon_command: Option<String>) -> HostConfig {
         ssh_target: "local".into(),
         color: None,
         daemon_command,
+        launch_prefixes: Default::default(),
     }
 }
 

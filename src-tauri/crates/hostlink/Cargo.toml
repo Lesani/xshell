@@ -12,6 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 semver = { workspace = true }
+# Splits a Host's launch prefixes into argv words with POSIX shell quoting.
+shlex = "1.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -20,6 +20,11 @@ pub struct LaunchSpec {
     /// Start the agent with its "skip permission prompts" flag (see [`permission_flag`]).
     /// `None` is off; agents without such a flag and raw shells ignore it.
     pub skip_permissions: Option<bool>,
+    /// A command the agent runs under, as argv words: `[prefix..., agent, agent args...]`
+    /// (e.g. a proxy wrapper that sets up the environment and then execs the agent). Raw
+    /// shells ignore it. Remote Terminals get it from the Host's configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_prefix: Option<Vec<String>>,
 }
 
 /// The process a [`LaunchSpec`] resolves to, as plain data. `env` holds only the variables
@@ -223,6 +228,18 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
     let effective_shell = gitbash_resolved
         .as_deref()
         .or(spec.shell_command.as_deref());
+    // The agent invocation: the launch prefix's words, if any, then the agent. `exec` is what
+    // the shell runs, `exec_args` everything after it.
+    let prefix: &[String] = spec.launch_prefix.as_deref().unwrap_or_default();
+    let (exec, exec_args): (&str, Vec<String>) = match prefix.split_first() {
+        Some((head, rest)) => {
+            let mut v = rest.to_vec();
+            v.push(agent_bin.to_string());
+            v.extend(agent_args.iter().cloned());
+            (head.as_str(), v)
+        }
+        None => (agent_bin, agent_args),
+    };
     let (program, args): (String, Vec<String>) = if mode == "raw" {
         // Raw shell: spawn the chosen shell directly (no claude wrapping).
         let shell = effective_shell.unwrap_or(if cfg!(windows) {
@@ -239,9 +256,14 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
                 // & 'claude' 'arg1' 'arg2' — single-quoted to avoid PS expansion surprises.
                 // Prefer the .cmd shim over the bare name so AllSigned policies don't block
                 // the unsigned .ps1 shim (see resolve_cmd_shim / issue #41).
-                let exec = resolve_cmd_shim(agent_bin).unwrap_or_else(|| agent_bin.to_string());
+                // A prefix is run as given: it is the user's own command, not an npm shim.
+                let exec = if prefix.is_empty() {
+                    resolve_cmd_shim(agent_bin).unwrap_or_else(|| agent_bin.to_string())
+                } else {
+                    exec.to_string()
+                };
                 let mut s = format!("& '{}'", exec.replace('\'', "''"));
-                for a in &agent_args {
+                for a in &exec_args {
                     s.push(' ');
                     s.push('\'');
                     s.push_str(&a.replace('\'', "''"));
@@ -253,8 +275,8 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
                 )
             }
             "cmd" => {
-                let mut args = vec!["/K".to_string(), agent_bin.to_string()];
-                args.extend(agent_args.iter().cloned());
+                let mut args = vec!["/K".to_string(), exec.to_string()];
+                args.extend(exec_args.iter().cloned());
                 (shell.to_string(), args)
             }
             "gitbash" | "bash" | "zsh" | "fish" => {
@@ -262,8 +284,12 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
                 fn q(s: &str) -> String {
                     format!("'{}'", s.replace('\'', "'\\''"))
                 }
-                let mut s = String::from(agent_bin);
-                for a in &agent_args {
+                let mut s = if prefix.is_empty() {
+                    String::from(agent_bin)
+                } else {
+                    q(exec)
+                };
+                for a in &exec_args {
                     s.push(' ');
                     s.push_str(&q(a));
                 }
@@ -277,11 +303,11 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
             }
             _ => {
                 // Unknown shell_id — fall back to the pre-existing OS-default behavior.
-                os_default(agent_bin, &agent_args)
+                os_default(exec, &exec_args)
             }
         }
     } else {
-        os_default(agent_bin, &agent_args)
+        os_default(exec, &exec_args)
     };
     let mut env: Vec<(String, String)> = Vec::new();
     // Tag the terminal so Claude Code's OTEL telemetry attributes sessions to this app
@@ -326,13 +352,13 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
 
 // No host shell chosen: on Windows run the agent through `cmd.exe /C`, elsewhere spawn it
 // directly.
-fn os_default(agent_bin: &str, agent_args: &[String]) -> (String, Vec<String>) {
+fn os_default(exec: &str, exec_args: &[String]) -> (String, Vec<String>) {
     if cfg!(windows) {
-        let mut args = vec!["/C".to_string(), agent_bin.to_string()];
-        args.extend(agent_args.iter().cloned());
+        let mut args = vec!["/C".to_string(), exec.to_string()];
+        args.extend(exec_args.iter().cloned());
         ("cmd.exe".to_string(), args)
     } else {
-        (agent_bin.to_string(), agent_args.to_vec())
+        (exec.to_string(), exec_args.to_vec())
     }
 }
 
@@ -684,6 +710,7 @@ mod tests {
                 fullscreen_rendering: Some(false),
                 force_sync_output: Some(true),
                 skip_permissions: Some(true),
+                launch_prefix: None,
             }
         );
         // Optional fields may be missing.
@@ -863,6 +890,125 @@ mod tests {
                 "sid"
             ])
         );
+    }
+
+    fn prefixed(s: LaunchSpec) -> LaunchSpec {
+        LaunchSpec {
+            launch_prefix: Some(strings(&["/opt/proxy exec", "--quiet"])),
+            ..s
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_prefix_runs_agent_under_it() {
+        let fx = Fixture::new();
+        let plan = plan_command(
+            &fx.ctx(),
+            &skipping(prefixed(LaunchSpec {
+                agent: Some("codex".into()),
+                session_id: Some("id1".into()),
+                ..spec("/w")
+            })),
+        )
+        .unwrap();
+        assert_eq!(plan.program, "/opt/proxy exec");
+        assert_eq!(
+            plan.args,
+            strings(&[
+                "--quiet",
+                "codex",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "id1"
+            ])
+        );
+        // The prefix is transparent to the agent's environment.
+        assert_eq!(plan.env, plan_env(&[]));
+        assert_builder(&plan);
+
+        // An empty prefix is no prefix.
+        let bare = plan_command(
+            &fx.ctx(),
+            &LaunchSpec {
+                launch_prefix: Some(vec![]),
+                ..spec("/w")
+            },
+        )
+        .unwrap();
+        assert_eq!(bare.program, "claude");
+        assert!(bare.args.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_prefix_in_wrappers_and_raw() {
+        let fx = Fixture::new();
+        let wrapped = |shell_id: &str, shell: &str| {
+            plan_command(
+                &fx.ctx(),
+                &prefixed(LaunchSpec {
+                    session_id: Some("sid".into()),
+                    shell_id: Some(shell_id.into()),
+                    shell_command: Some(shell.into()),
+                    ..spec("/w")
+                }),
+            )
+            .unwrap()
+            .args
+        };
+        assert_eq!(
+            wrapped("bash", "bash"),
+            strings(&[
+                "-i",
+                "-c",
+                "'/opt/proxy exec' '--quiet' 'claude' '--session-id' 'sid'; exec bash -i"
+            ])
+        );
+        assert_eq!(
+            wrapped("pwsh", "pwsh"),
+            strings(&[
+                "-NoLogo",
+                "-NoExit",
+                "-Command",
+                "& '/opt/proxy exec' '--quiet' 'claude' '--session-id' 'sid'"
+            ])
+        );
+        assert_eq!(
+            wrapped("cmd", "cmd.exe"),
+            strings(&[
+                "/K",
+                "/opt/proxy exec",
+                "--quiet",
+                "claude",
+                "--session-id",
+                "sid"
+            ])
+        );
+
+        // A raw shell runs no agent, so there is nothing to prefix.
+        let raw = plan_command(
+            &fx.ctx(),
+            &prefixed(LaunchSpec {
+                shell_mode: Some("raw".into()),
+                shell_command: Some("zsh".into()),
+                ..spec("/w")
+            }),
+        )
+        .unwrap();
+        assert_eq!(raw.program, "zsh");
+        assert!(raw.args.is_empty());
+    }
+
+    #[test]
+    fn launch_prefix_serde() {
+        let s: LaunchSpec =
+            serde_json::from_value(serde_json::json!({"cwd": "/w", "launchPrefix": ["p", "-x"]}))
+                .unwrap();
+        assert_eq!(s.launch_prefix, Some(strings(&["p", "-x"])));
+        // Absent stays absent on the wire, so older Daemons read the spec unchanged.
+        let v = serde_json::to_value(LaunchSpec::default()).unwrap();
+        assert!(v.get("launchPrefix").is_none());
     }
 
     #[test]

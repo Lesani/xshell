@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hintText, toHostConfig, validateHostForm } from "./hostForm";
+import { hintText, shellWordsOk, toHostConfig, validateHostForm } from "./hostForm";
 import { HOST_ID_RE } from "./projectKey";
 
 const ok = { name: "Dev", sshTarget: "user@host", daemonCommand: "" };
@@ -26,6 +26,19 @@ describe("host form", () => {
     expect(c).toEqual({ id: c.id, name: "Dev", sshTarget: "dev" });
     expect(HOST_ID_RE.test(c.id)).toBe(true);
     expect(toHostConfig({ ...ok, color: "#3498DB", daemonCommand: "~/xd" }, "h_ab12cd34")).toEqual({ id: "h_ab12cd34", name: "Dev", sshTarget: "user@host", color: "#3498DB", daemonCommand: "~/xd" });
+  });
+
+  it("validates launch prefixes like shlex::split", () => {
+    for (const good of ["vamoto-headroom-exec", "'my wrapper' --flag", "a\\ b", 'env "X=a b"', "''", ""]) expect(shellWordsOk(good), good).toBe(true);
+    for (const bad of ["'open", '"open', "trailing\\", "\"a'"]) expect(shellWordsOk(bad), bad).toBe(false);
+    expect(validateHostForm({ ...ok, launchPrefixes: { claude: "wrap", codex: "'x" } })).toEqual({ "launchPrefix.codex": "Enter the command on one line and close every quote, or leave it blank." });
+    expect(validateHostForm({ ...ok, launchPrefixes: { claude: "a\nb" } })["launchPrefix.claude"]).toBeDefined();
+  });
+
+  it("keeps only non-blank launch prefixes, trimmed", () => {
+    const c = toHostConfig({ ...ok, launchPrefixes: { claude: " wrap ", codex: "  ", cursor: "" } }, "h_ab12cd34");
+    expect(c.launchPrefixes).toEqual({ claude: "wrap" });
+    expect(toHostConfig({ ...ok, launchPrefixes: { codex: " " } }, "h_ab12cd34")).not.toHaveProperty("launchPrefixes");
   });
 
   it("hints name the configured target", () => {

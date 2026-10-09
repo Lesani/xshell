@@ -199,6 +199,8 @@ fn spawn_terminal(
         fullscreen_rendering,
         force_sync_output,
         skip_permissions,
+        // Launch prefixes are per Remote Host; local Terminals run the agent directly.
+        launch_prefix: None,
     };
     let sink = Arc::new(ChannelSink {
         data: on_data,

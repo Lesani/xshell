@@ -9,6 +9,9 @@ export interface HostConfig {
   sshTarget: string;
   color?: string;
   daemonCommand?: string;
+  // Per agent id: a command the agent starts under on this host (shell words; the agent and
+  // its arguments are appended). Mirrors `HostConfig::launch_prefixes` in hostlink.
+  launchPrefixes?: Partial<Record<string, string>>;
 }
 
 export type HostStatusKind = "reconnecting" | "connected" | "upgrade-pending" | "offline" | "incompatible";
