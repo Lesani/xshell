@@ -1318,7 +1318,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let (a, b) = (mobile(10), mobile(20));
         let c = chain(&[a, b], 1);
-        let p = Push::new(t.path().to_path_buf(), cfg());
+        let p = Push::new(t.path().join("ring"), cfg());
         p.on_head(1, &c);
         {
             let mut st = lock(&p.inner);
@@ -1329,13 +1329,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(t.path().join("push.json"))
+            let mode = std::fs::metadata(t.path().join("ring").join("push.json"))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let again = Push::new(t.path().to_path_buf(), cfg());
+        let again = Push::new(t.path().join("ring"), cfg());
         assert_eq!(lock(&again.inner).file, lock(&p.inner).file);
         assert_eq!(lock(&again.inner).next_gen, 3);
         // `b` leaves the Roster; `a`'s Noise key changes: both entries go.
@@ -1355,7 +1355,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let a = mobile(10);
         let c = chain(&[a], 1);
-        let p = Push::new(t.path().to_path_buf(), cfg());
+        let p = Push::new(t.path().join("ring"), cfg());
         p.on_head(1, &c);
         lock(&p.inner).file.mobiles.insert(a.0, reg(a.1, 1));
         p.inner.save().unwrap();
@@ -1365,7 +1365,7 @@ mod tests {
         // A late callback of the old Ring never switches back.
         p.on_head(1, &c);
         assert_eq!(lock(&p.inner).file.ring_id.as_ref(), Some(other.ring_id()));
-        let again = Push::new(t.path().to_path_buf(), cfg());
+        let again = Push::new(t.path().join("ring"), cfg());
         let st = lock(&again.inner);
         assert!(st.file.mobiles.is_empty());
         assert_eq!(st.file.ring_id.as_ref(), Some(other.ring_id()));
@@ -1377,7 +1377,7 @@ mod tests {
         let mk = DeviceKeys::from_seeds(&[10; 32], &[11; 32]);
         let m = Member::new("m", Role::Mobile, mk.sign_key(), mk.noise_key(), 2);
         let c = chain(&[(m.sign_key, m.noise_key)], 1);
-        let p = Push::new(t.path().to_path_buf(), cfg());
+        let p = Push::new(t.path().join("ring"), cfg());
         let sk = mobile(200).1.to_b64();
         let tr = PushTriggers {
             needs_you: true,
@@ -1401,10 +1401,14 @@ mod tests {
     #[test]
     fn unreadable_store_is_moved_aside() {
         let t = tempfile::tempdir().unwrap();
-        write_private(&t.path().join("push.json"), b"{nope").unwrap();
-        let p = Push::new(t.path().to_path_buf(), cfg());
+        let dir = t.path().join("ring");
+        super::super::ring::Store::new(dir.clone())
+            .ensure_dir()
+            .unwrap();
+        write_private(&dir.join("push.json"), b"{nope").unwrap();
+        let p = Push::new(t.path().join("ring"), cfg());
         assert!(lock(&p.inner).file.mobiles.is_empty());
-        let names: Vec<String> = std::fs::read_dir(t.path())
+        let names: Vec<String> = std::fs::read_dir(t.path().join("ring"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();

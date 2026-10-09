@@ -818,7 +818,8 @@ struct Gate {
     armed: std::sync::atomic::AtomicBool,
     hit: std::sync::Mutex<bool>,
     open: std::sync::Mutex<bool>,
-    cv: std::sync::Condvar,
+    hit_cv: std::sync::Condvar,
+    open_cv: std::sync::Condvar,
 }
 
 impl Gate {
@@ -830,14 +831,15 @@ impl Gate {
                     return;
                 }
                 *g.hit.lock().unwrap() = true;
-                g.cv.notify_all();
+                g.hit_cv.notify_all();
                 let mut open = g.open.lock().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !*open && Instant::now() < deadline {
-                    open =
-                        g.cv.wait_timeout(open, Duration::from_millis(50))
-                            .unwrap()
-                            .0;
+                    open = g
+                        .open_cv
+                        .wait_timeout(open, Duration::from_millis(50))
+                        .unwrap()
+                        .0;
                 }
             })),
             ..PushHooks::default()
@@ -856,7 +858,7 @@ impl Gate {
         while !*hit {
             assert!(Instant::now() < deadline, "the push never reached the gate");
             hit = self
-                .cv
+                .hit_cv
                 .wait_timeout(hit, Duration::from_millis(50))
                 .unwrap()
                 .0;
@@ -865,7 +867,7 @@ impl Gate {
 
     fn release(&self) {
         *self.open.lock().unwrap() = true;
-        self.cv.notify_all();
+        self.open_cv.notify_all();
     }
 }
 

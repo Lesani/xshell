@@ -522,8 +522,13 @@ fn endless_fragments_end_as_dead_within_the_deadline() {
             |e| matches!(e, Event::Envelope { payload, .. } if payload == b"while fragmented")
         )
         .is_some());
+    // Two more pings (200 ms apart) before the 1.5 s dead deadline, polled so that a
+    // loaded runner's scheduling does not count against it.
     let before = r.pings(&ring.ring_id(), &ring.desktop.sign_key());
-    std::thread::sleep(Duration::from_millis(700));
+    let by = Instant::now() + Duration::from_millis(1200);
+    while r.pings(&ring.ring_id(), &ring.desktop.sign_key()) < before + 2 && Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(r.pings(&ring.ring_id(), &ring.desktop.sign_key()) >= before + 2);
     // No complete frame arrives, so the connection is declared dead on time.
     assert_eq!(
