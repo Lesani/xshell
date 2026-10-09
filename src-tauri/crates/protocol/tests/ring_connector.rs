@@ -200,11 +200,11 @@ fn dropping_without_stop_reports_unreachable() {
     let (c, rec) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
     assert!(rec.connected());
     c.abandon();
-    let p = r.presence(&ring.ring_id(), &key).unwrap();
-    assert_eq!(
-        MemberPresence::from(&p),
-        MemberPresence::Unreachable { at: p.last_seen }
-    );
+    // No goodbye: the Relay notices the dropped socket on its own, shortly after.
+    wait_until("unreachable", || {
+        r.presence(&ring.ring_id(), &key)
+            .is_some_and(|p| matches!(MemberPresence::from(&p), MemberPresence::Unreachable { .. }))
+    });
 }
 
 #[test]

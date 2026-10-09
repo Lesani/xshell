@@ -1650,6 +1650,11 @@ impl TrickleProxy {
                 let Ok(server) = TcpStream::connect(upstream) else {
                     continue;
                 };
+                // Each trickled piece goes out at once. With Nagle, a small write waits for
+                // the ACK of the one before, and macOS delays loopback ACKs: the trickle
+                // then crawled far past the test's connect timeout.
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
                 let (Ok(c2), Ok(s2)) = (client.try_clone(), server.try_clone()) else {
                     continue;
                 };
