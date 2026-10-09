@@ -1676,19 +1676,30 @@ impl Drop for TrickleProxy {
     }
 }
 
+/// Forwards `from` to `to`, `chunk` bytes per `every`. The pace is kept against a schedule,
+/// not by sleeping `every` after each piece: a sleep can last several times longer than asked
+/// (macOS runners under load stretch a 15 ms sleep to 65 ms), and per-piece sleeps would add
+/// that up. Behind schedule, pieces go out back to back until it is caught up.
 fn pipe(mut from: TcpStream, mut to: TcpStream, chunk: usize, every: Duration) {
     let mut buf = vec![0u8; 16 * 1024];
+    let mut due = Instant::now();
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        // An idle gap does not bank credit for a burst later.
+        due = due.max(Instant::now());
         for piece in buf[..n].chunks(chunk) {
             if to.write_all(piece).is_err() {
                 return;
             }
             if !every.is_zero() {
-                thread::sleep(every);
+                due += every;
+                let now = Instant::now();
+                if due > now {
+                    thread::sleep(due - now);
+                }
             }
         }
     }
