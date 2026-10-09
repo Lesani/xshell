@@ -3327,6 +3327,23 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(AppState { terminals: Mutex::new(HashMap::new()) })
+        .setup(|app| {
+            // The main window is built here rather than from tauri.conf.json (`create: false`):
+            // the config cannot enable clipboard access. Without it WebKitGTK rejects
+            // `navigator.clipboard` reads, so Ctrl+V and right-click paste did nothing on Linux.
+            // On Windows it grants clipboard reads without a permission prompt; macOS ignores it.
+            let main = app
+                .config()
+                .app
+                .windows
+                .first()
+                .ok_or("tauri.conf.json defines no window")?
+                .clone();
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &main)?
+                .enable_clipboard_access()
+                .build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![list_claude_projects, get_sessions, get_all_recent_sessions, get_session_messages, read_image_base64, save_dropped_file, read_text_file, reveal_in_explorer, list_dir, search_dir, open_url, get_username, get_home_dir, get_project_skills, get_project_memories, get_git_status, get_git_log, git_diff, git_stage, git_unstage, git_discard, list_git_branches, git_checkout, list_project_session_ids, detect_session_branch, probe_statusline_setup, get_global_rate_limits, detect_agent_binary, list_codex_projects, list_cursor_projects, list_opencode_projects, list_antigravity_projects, get_codex_context, get_cursor_context, get_opencode_context, get_antigravity_context, get_claude_cost_summary, get_codex_usage, spawn_terminal, write_terminal, resize_terminal, close_terminal])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
