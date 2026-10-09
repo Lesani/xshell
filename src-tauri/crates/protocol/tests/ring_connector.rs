@@ -76,6 +76,13 @@ impl ConnectorEvents for Rec {
     }
 }
 
+/// A Relay behind a `TrickleProxy`: the trickle alone takes about half a second up to the
+/// challenge, so the 500 ms auth deadline of `relay()` would race it; this one keeps the
+/// default 10 s.
+fn slow_relay() -> TestRelay {
+    TestRelay::start()
+}
+
 fn relay() -> TestRelay {
     TestRelay::start_with(TestRelayOptions {
         auth_timeout: Duration::from_millis(500),
@@ -399,7 +406,7 @@ fn chain_is_reported_whole_after_catch_up() {
 
 #[test]
 fn stop_during_authentication_then_reconnect() {
-    let r = relay();
+    let r = slow_relay();
     // Every byte from the Relay arrives slowly, so the connect is still authenticating when
     // stop comes.
     let proxy = TrickleProxy::start(r.addr(), 8, Duration::from_millis(15));
@@ -453,7 +460,7 @@ fn stop_during_authentication_then_reconnect() {
 
 #[test]
 fn stop_while_the_move_is_acknowledged_says_goodbye_on_the_old_relay() {
-    let (a, b) = (relay(), relay());
+    let (a, b) = (slow_relay(), relay());
     // The old Relay answers slowly, so the stop arrives while the publication is in flight.
     let proxy = TrickleProxy::start(a.addr(), 8, Duration::from_millis(15));
     let old = format!("ws://127.0.0.1:{}", proxy.addr().port());
