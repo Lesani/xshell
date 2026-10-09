@@ -253,6 +253,12 @@ impl Server {
             Err(fs::TryLockError::WouldBlock) => return Err(StartError::AlreadyRunning),
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
+        let mut starting = Starting {
+            paths: &paths,
+            lock: Some(lock),
+            pid: false,
+            socket: false,
+        };
         // Holding the lock, record how this Daemon runs: `connect` starts none while xshell
         // owns it, and a Persistent `serve` hands it back.
         let mode = if cfg.gui_bound.is_some() {
@@ -274,12 +280,14 @@ impl Server {
             .truncate(true)
             .mode(0o600)
             .open(&paths.pid)?;
+        starting.pid = true;
         writeln!(pidf, "{}", std::process::id())?;
         match fs::remove_file(&paths.socket) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
         let listener = UnixListener::bind(&paths.socket)?;
+        starting.socket = true;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
@@ -293,7 +301,7 @@ impl Server {
             stopping: AtomicBool::new(false),
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
-            lock_file: Mutex::new(Some(lock)),
+            lock_file: Mutex::new(starting.lock.take()),
             next_conn: AtomicU64::new(1),
             hooks,
             // Runs are told apart across restarts too: a hook of the previous Daemon's
@@ -307,13 +315,19 @@ impl Server {
             return Err(StartError::Aborted);
         }
         let da = d.clone();
-        std::thread::Builder::new()
-            .name("accept".into())
-            .spawn(move || da.accept_loop(listener))?;
         let ds = d.clone();
-        std::thread::Builder::new()
-            .name("supervisor".into())
-            .spawn(move || ds.supervise())?;
+        let threads = std::thread::Builder::new()
+            .name("accept".into())
+            .spawn(move || da.accept_loop(listener))
+            .and_then(|_| {
+                std::thread::Builder::new()
+                    .name("supervisor".into())
+                    .spawn(move || ds.supervise())
+            });
+        if let Err(e) = threads {
+            d.exit(ExitReason::Shutdown);
+            return Err(e.into());
+        }
         crate::log!(
             "INFO",
             "xshelld {} serving {} (pid {})",
@@ -321,10 +335,36 @@ impl Server {
             paths.socket.display(),
             std::process::id()
         );
+        drop(starting);
         Ok(ServerHandle {
             socket: paths.socket,
             d,
         })
+    }
+}
+
+/// A start in progress: if it fails, the pidfile and socket it created are removed and the
+/// lock is released, explicitly (a child forked meanwhile may still share the lock's file).
+struct Starting<'a> {
+    paths: &'a Paths,
+    /// Taken by the Daemon once it exists; from then on its `exit` cleans up.
+    lock: Option<fs::File>,
+    pid: bool,
+    socket: bool,
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        let Some(lock) = self.lock.take() else {
+            return;
+        };
+        if self.socket {
+            let _ = fs::remove_file(&self.paths.socket);
+        }
+        if self.pid {
+            let _ = fs::remove_file(&self.paths.pid);
+        }
+        let _ = lock.unlock();
     }
 }
 

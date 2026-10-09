@@ -349,7 +349,10 @@ impl Daemon {
         let _ = fs::remove_file(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
         // Released last: a successor may start as soon as this is gone.
-        self.lock_file.lock().unwrap().take();
+        // Unlocked explicitly: a child forked meanwhile may still share the file.
+        if let Some(l) = self.lock_file.lock().unwrap().take() {
+            let _ = l.unlock();
+        }
         *self.exit.lock().unwrap() = Some(reason);
         self.exit_cv.notify_all();
     }

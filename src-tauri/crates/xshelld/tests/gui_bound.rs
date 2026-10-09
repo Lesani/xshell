@@ -525,6 +525,7 @@ fn persistent_start_fails_without_mode_marker() {
         Ok(_) => panic!("it served"),
     }
     assert!(!h.paths().socket.exists());
+    assert!(!h.paths().pid.exists());
     // The lock is released: a later start with a writable marker works.
     fs::remove_dir_all(h.paths().mode).unwrap();
     let srv = xshelld::server::Server::start(config(&h)).expect("starts");
