@@ -62,9 +62,12 @@ impl InstallError {
     }
 }
 
-/// Versions go into shell scripts, so only a safe alphabet is accepted.
+/// Versions go into shell scripts and paths, so only a safe alphabet is accepted, and never
+/// `.` or `..`.
 pub fn valid_version(v: &str) -> bool {
     !v.is_empty()
+        && v != "."
+        && v != ".."
         && v.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
 }
@@ -383,6 +386,104 @@ pub fn ensure_installed(
     }
 }
 
+/// `home/.xshell/server/<version>/xshelld`: where a Daemon that outlives the app runs from,
+/// the same place managed install puts it on a Remote Host.
+pub fn local_server_bin(home: &std::path::Path, version: &str) -> PathBuf {
+    home.join(".xshell")
+        .join("server")
+        .join(version)
+        .join("xshelld")
+}
+
+/// Copy the app's `xshelld` (`src`) to [`local_server_bin`] unless an identical private copy
+/// is already there. A Persistent Daemon must not run from inside the app: an AppImage's
+/// mount ends with the app, and agent hooks call the Daemon's own path.
+///
+/// Every directory on the way is created 0700 and must be a real directory owned by this
+/// user. The copy goes to a new, uniquely named file in the same directory and is renamed
+/// over the old one, so a running Daemon keeps its binary and concurrent installs never see
+/// a partial file.
+#[cfg(unix)]
+pub fn install_local(
+    src: &std::path::Path,
+    home: &std::path::Path,
+    version: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    if !valid_version(version) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid version string {version:?}"),
+        ));
+    }
+    let dest = local_server_bin(home, version);
+    let uid = unsafe { libc::getuid() };
+    let mut dir = home.to_path_buf();
+    for part in [".xshell", "server", version] {
+        dir.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let m = std::fs::symlink_metadata(&dir)?;
+        if !m.file_type().is_dir() {
+            return Err(Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        if m.uid() != uid {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
+            ));
+        }
+        if m.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let bytes = std::fs::read(src)?;
+    if let Ok(m) = std::fs::symlink_metadata(&dest) {
+        let same = m.file_type().is_file()
+            && m.uid() == uid
+            && m.mode() & 0o777 == 0o700
+            && m.len() == bytes.len() as u64
+            && std::fs::read(&dest).is_ok_and(|b| b == bytes);
+        if same {
+            return Ok(dest);
+        }
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".xshelld.{}.{}.{nanos}.tmp",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let r = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        // The umask may have narrowed it.
+        f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &dest)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.map(|_| dest)
+}
+
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod testutil {
@@ -507,6 +608,155 @@ mod tests {
         assert!(!valid_version("1.5.0;rm"));
         assert!(!valid_version(""));
         assert!(!valid_version("1 2"));
+        assert!(!valid_version("."));
+        assert!(!valid_version(".."));
+        assert!(!valid_version("1/2"));
+        assert!(valid_version("..1"));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn tmp_leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_copies_and_skips_identical() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("sidecar");
+        std::fs::write(&src, b"binary-1").unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let p = install_local(&src, &home, "1.5.0").unwrap();
+        assert_eq!(p, home.join(".xshell/server/1.5.0/xshelld"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"binary-1");
+        assert_eq!(mode_of(&p), 0o700);
+        for d in [".xshell", ".xshell/server", ".xshell/server/1.5.0"] {
+            assert_eq!(mode_of(&home.join(d)), 0o700, "{d}");
+        }
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        // Identical: left alone.
+        install_local(&src, &home, "1.5.0").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+        assert!(tmp_leftovers(p.parent().unwrap()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_replaces_changed_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("sidecar");
+        let home = t.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(&src, b"old").unwrap();
+        let p = install_local(&src, &home, "1.5.0").unwrap();
+        // A process keeps the old file open, as a running Daemon keeps its binary.
+        let held = std::fs::File::open(&p).unwrap();
+        let ino = held.metadata().unwrap().ino();
+        // A dev build with the same version but other bytes replaces it, by rename.
+        std::fs::write(&src, b"new build").unwrap();
+        install_local(&src, &home, "1.5.0").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new build");
+        assert_ne!(std::fs::metadata(&p).unwrap().ino(), ino);
+        let mut old = String::new();
+        use std::io::Read;
+        (&held).read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old", "the running binary was overwritten in place");
+        assert!(tmp_leftovers(p.parent().unwrap()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_repairs_wrong_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("sidecar");
+        std::fs::write(&src, b"same").unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let p = install_local(&src, &home, "1.5.0").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(p.parent().unwrap(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        install_local(&src, &home, "1.5.0").unwrap();
+        assert_eq!(mode_of(&p), 0o700);
+        assert_eq!(mode_of(p.parent().unwrap()), 0o700);
+        assert_eq!(std::fs::read(&p).unwrap(), b"same");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_refuses_symlinked_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("sidecar");
+        std::fs::write(&src, b"x").unwrap();
+        let home = t.path().join("home");
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(home.join(".xshell")).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".xshell/server")).unwrap();
+        let e = install_local(&src, &home, "1.5.0").unwrap_err();
+        assert!(e.to_string().contains("not a directory"), "{e}");
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_rejects_bad_version() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("sidecar");
+        std::fs::write(&src, b"x").unwrap();
+        for v in ["", ".", "..", "1/2", "1;rm"] {
+            let e = install_local(&src, t.path(), v).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{v:?}");
+        }
+        assert!(!t.path().join(".xshell").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_concurrent() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let srcs: Vec<_> = (0..8)
+            .map(|i| {
+                let p = t.path().join(format!("sidecar{i}"));
+                std::fs::write(&p, format!("build-{i}").repeat(4096)).unwrap();
+                p
+            })
+            .collect();
+        let handles: Vec<_> = srcs
+            .iter()
+            .cloned()
+            .map(|s| {
+                let home = home.clone();
+                std::thread::spawn(move || install_local(&s, &home, "1.5.0").unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let p = local_server_bin(&home, "1.5.0");
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            (0..8).any(|i| got == format!("build-{i}").repeat(4096)),
+            "a mixed or partial file"
+        );
+        assert_eq!(mode_of(&p), 0o700);
+        assert!(tmp_leftovers(p.parent().unwrap()).is_empty());
     }
 
     #[test]

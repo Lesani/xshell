@@ -1,7 +1,8 @@
 //! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`,
-//! `xshelld serve --gui-bound --parent-pid PID`, `xshelld --version`, and `xshelld event …`,
-//! the agent hook client. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
-//! environment variable. Hand-parsed: four commands, five flags.
+//! `xshelld serve [--gui-bound --parent-pid PID] [--interactive-env]`, `xshelld --version`,
+//! and `xshelld event …`, the agent hook client. `--home`, `--socket` and
+//! `--idle-timeout-ms` fall back to an environment variable. Hand-parsed: four commands, six
+//! flags.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -30,6 +31,10 @@ pub struct Opts {
     pub gui_bound: bool,
     /// `--parent-pid`: the app's pid. Required with `--gui-bound`, refused otherwise.
     pub parent_pid: Option<u32>,
+    /// `serve --interactive-env`: take the PATH of an interactive login shell, as a GUI-bound
+    /// Daemon does. The app passes it when it starts a Persistent Daemon (ADR-0005), so its
+    /// agents find what they found in the GUI-bound one.
+    pub interactive_env: bool,
 }
 
 pub const USAGE: &str = "\
@@ -50,6 +55,8 @@ serve options:
   --gui-bound        run for the xshell app on this machine: no idle exit, and the
                      Daemon and its Terminals end when the app does
   --parent-pid PID   the app's process id (required with --gui-bound)
+  --interactive-env  take PATH from an interactive login shell (rc files too);
+                     implied by --gui-bound
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
@@ -118,6 +125,7 @@ pub fn parse(
             "--socket" => opts.socket = Some(value()?.into()),
             "--idle-timeout-ms" => opts.idle_timeout = Some(parse_ms(&value()?, &flag)?),
             "--gui-bound" if inline.is_none() => opts.gui_bound = true,
+            "--interactive-env" if inline.is_none() => opts.interactive_env = true,
             "--parent-pid" => {
                 let v = value()?;
                 let pid = v
@@ -132,6 +140,9 @@ pub fn parse(
     }
     if cmd == "connect" && (opts.gui_bound || opts.parent_pid.is_some()) {
         return Err("--gui-bound and --parent-pid are options of serve only".into());
+    }
+    if cmd == "connect" && opts.interactive_env {
+        return Err("--interactive-env is an option of serve only".into());
     }
     if opts.gui_bound != opts.parent_pid.is_some() {
         return Err("--gui-bound and --parent-pid go together".into());
@@ -232,6 +243,38 @@ mod tests {
         assert!(run(&["serve", "--gui-bound", "--parent-pid", "1"], &[]).is_err());
         assert!(run(&["serve", "--gui-bound=yes", "--parent-pid", "9"], &[]).is_err());
         assert!(USAGE.contains("--gui-bound") && USAGE.contains("--parent-pid"));
+    }
+
+    #[test]
+    fn parses_interactive_env() {
+        assert_eq!(
+            run(&["serve", "--interactive-env"], &[]),
+            Ok(Command::Serve(Opts {
+                interactive_env: true,
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            run(
+                &[
+                    "serve",
+                    "--gui-bound",
+                    "--interactive-env",
+                    "--parent-pid",
+                    "9"
+                ],
+                &[]
+            ),
+            Ok(Command::Serve(Opts {
+                gui_bound: true,
+                parent_pid: Some(9),
+                interactive_env: true,
+                ..Default::default()
+            }))
+        );
+        assert!(run(&["connect", "--interactive-env"], &[]).is_err());
+        assert!(run(&["serve", "--interactive-env=1"], &[]).is_err());
+        assert!(USAGE.contains("--interactive-env"));
     }
 
     #[test]

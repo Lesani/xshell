@@ -1005,12 +1005,23 @@ impl HostHandle {
                     once.call(Err(e));
                 }
             }
-            // The configuration the plan was made under decides; a direct Host (a local
-            // socket) has no transport to run the script through either.
-            Plan::Kill
-                if cfg.daemon_override().is_some()
-                    || self.sh.mc.transports.direct(&cfg).is_some() =>
-            {
+            // The configuration the plan was made under decides. A direct Host (a local
+            // socket) has no transport to run the script through; its dialer may stop the
+            // Daemon itself (the Local Host's Persistent Daemon), otherwise it is refused.
+            Plan::Kill if cfg.daemon_override().is_none() => {
+                match self.sh.mc.transports.direct(&cfg) {
+                    Some(d) if d.upgradable() => self.stop_direct(d, once),
+                    Some(_) => {
+                        self.end_upgrade();
+                        once.call(Err(HostError::new(
+                            crate::errors::HostErrorCode::Incompatible,
+                            "this Daemon cannot be upgraded from here: restart it in a compatible version",
+                        )));
+                    }
+                    None => self.kill_over_transport(cfg, once),
+                }
+            }
+            Plan::Kill => {
                 // A Daemon command means the user manages the binary, and such hosts often
                 // allow only `<cmd> connect` / `<cmd> --version` over ssh: send no script.
                 once.call(Err(HostError::new(
@@ -1018,23 +1029,71 @@ impl HostHandle {
                     "this host runs xshelld through a Daemon command: replace that binary with a compatible xshelld and restart its Daemon on the host",
                 )));
             }
-            Plan::Kill => {
-                let sh = self.sh.clone();
-                let o = once.clone();
-                let cancel = self.cancel_token();
-                let spawned = std::thread::Builder::new()
-                    .name("host-upgrade".into())
-                    .spawn(move || {
-                        let t = sh.mc.transports.for_host(&cfg);
-                        let r = crate::supervisor::kill_daemon(&*t, &cancel);
-                        sh.kick.store(true, Ordering::SeqCst);
-                        o.call(r.map(|_| Value::Null));
-                    });
-                if spawned.is_err() {
-                    once.call(Err(HostError::offline("cannot start the upgrade")));
-                }
-            }
         }
+    }
+
+    /// The SIGTERM pidfile script over the Host's transport, then reconnect.
+    fn kill_over_transport(&self, cfg: HostConfig, once: Arc<Once<Reply>>) {
+        let sh = self.sh.clone();
+        let o = once.clone();
+        let cancel = self.cancel_token();
+        let spawned = std::thread::Builder::new()
+            .name("host-upgrade".into())
+            .spawn(move || {
+                let t = sh.mc.transports.for_host(&cfg);
+                let r = crate::supervisor::kill_daemon(&*t, &cancel);
+                sh.kick.store(true, Ordering::SeqCst);
+                o.call(r.map(|_| Value::Null));
+            });
+        if spawned.is_err() {
+            once.call(Err(HostError::offline("cannot start the upgrade")));
+        }
+    }
+
+    /// A direct Host's own stop of its incompatible Daemon, then reconnect.
+    fn stop_direct(&self, d: Box<dyn crate::dial::Dialer>, once: Arc<Once<Reply>>) {
+        let sh = self.sh.clone();
+        let o = once.clone();
+        let cancel = self.cancel_token();
+        let spawned = std::thread::Builder::new()
+            .name("host-upgrade".into())
+            .spawn(move || {
+                let r = match d.stop_incompatible(&cancel) {
+                    Some(Ok(())) => Ok(Value::Null),
+                    Some(Err(e)) => Err(e),
+                    None => Err(HostError::new(
+                        crate::errors::HostErrorCode::Incompatible,
+                        "this Daemon cannot be upgraded from here",
+                    )),
+                };
+                if r.is_err() {
+                    let mut st = sh.lock();
+                    st.upgrading = false;
+                    st.upgrade_expect = false;
+                    st.status.phase = None;
+                    sh.publish(&mut st);
+                }
+                sh.kick.store(true, Ordering::SeqCst);
+                o.call(r);
+            });
+        if spawned.is_err() {
+            self.end_upgrade();
+            once.call(Err(HostError::offline("cannot start the upgrade")));
+        }
+    }
+
+    /// An upgrade that did not start: back to the plain status.
+    fn end_upgrade(&self) {
+        let mut st = self.sh.lock();
+        st.upgrading = false;
+        st.upgrade_expect = false;
+        st.status.phase = None;
+        self.sh.publish(&mut st);
+    }
+
+    /// The generation of the newest link: it grows with each connection attempt.
+    pub fn link_generation(&self) -> u64 {
+        self.sh.lock().gen
     }
 
     /// Retry now instead of waiting out the backoff. Never waits on `State`.

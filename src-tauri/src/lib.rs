@@ -348,6 +348,7 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_upgrade",
     "host_test",
     "local_host_info",
+    "local_daemon_set_persistent",
 ];
 // The PTY commands; a remote host serves terminals through its own protocol.
 #[cfg(test)]
@@ -639,6 +640,7 @@ pub fn run() {
             hosts::commands::host_upgrade,
             hosts::commands::host_test,
             hosts::commands::local_host_info,
+            hosts::commands::local_daemon_set_persistent,
             hosts::commands::list_ssh_hosts
         ])
         .build(tauri::generate_context!())
@@ -706,7 +708,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 59);
+        assert_eq!(registered.len(), 60);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

@@ -930,6 +930,143 @@ pub(crate) mod tests {
         m.shutdown();
     }
 
+    /// A direct dialer whose upgradable flag the test flips.
+    #[cfg(unix)]
+    struct FlagDialer {
+        path: std::path::PathBuf,
+        on: Arc<std::sync::atomic::AtomicBool>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl crate::dial::Dialer for FlagDialer {
+        fn dial(&self, c: &crate::CancelToken) -> Result<crate::Dialed, crate::DialError> {
+            crate::dial::UnixSocketDialer {
+                path: self.path.clone(),
+            }
+            .dial(c)
+        }
+        fn describe(&self) -> String {
+            "flag".into()
+        }
+        fn upgradable(&self) -> bool {
+            self.on.load(Ordering::SeqCst)
+        }
+        fn stop_incompatible(
+            &self,
+            _: &crate::CancelToken,
+        ) -> Option<Result<(), crate::HostError>> {
+            self.upgradable().then(|| {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    struct FlagFactory(
+        std::path::PathBuf,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    #[cfg(unix)]
+    impl TransportFactory for FlagFactory {
+        fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+            Box::new(LocalShellTransport::default())
+        }
+        fn direct(&self, _: &HostConfig) -> Option<Box<dyn crate::dial::Dialer>> {
+            Some(Box::new(FlagDialer {
+                path: self.0.clone(),
+                on: self.1.clone(),
+                stops: self.2.clone(),
+            }))
+        }
+    }
+
+    /// An older direct Daemon is upgrade pending exactly while its dialer says it may be
+    /// upgraded, read anew on every connection of the same supervisor.
+    #[cfg(unix)]
+    #[test]
+    fn direct_upgradable_reports_pending() {
+        use crate::link::testpeer::{hello_frame, terminals_frame};
+        let mut older = hello_frame(1, 1, "1.4.0");
+        older.extend(terminals_frame(vec![]));
+        let peer = socket_peer(older, true);
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rec = Recorder::new();
+        let mut mc = test_config(rec.clone());
+        mc.transports = Arc::new(FlagFactory(
+            peer.path.clone(),
+            on.clone(),
+            Default::default(),
+        ));
+        mc.stable_after = Duration::ZERO;
+        let m = Manager::new(mc);
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        let count = || rec.statuses().len();
+        rec.wait_status(|s| s.status == StatusKind::Connected);
+        assert!(!rec
+            .statuses()
+            .iter()
+            .any(|s| s.status == StatusKind::UpgradePending));
+        on.store(true, Ordering::SeqCst);
+        let from = count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !rec.statuses()[from..]
+            .iter()
+            .any(|s| s.status == StatusKind::UpgradePending)
+        {
+            assert!(Instant::now() < deadline, "never upgrade pending");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        on.store(false, Ordering::SeqCst);
+        // Settle: the next connections are plain again.
+        std::thread::sleep(Duration::from_millis(200));
+        let from = count();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !rec.statuses()[from..]
+            .iter()
+            .any(|s| s.status == StatusKind::Connected)
+        {
+            assert!(Instant::now() < deadline, "still upgrade pending");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!rec.statuses()[from..]
+            .iter()
+            .any(|s| s.status == StatusKind::UpgradePending));
+        m.shutdown();
+    }
+
+    /// "Upgrade now" on an incompatible direct Host asks its dialer to stop the Daemon when
+    /// the dialer may upgrade it, and is refused otherwise, never running a script.
+    #[cfg(unix)]
+    #[test]
+    fn direct_upgradable_incompatible_upgrade_stops_through_dialer() {
+        let peer = socket_peer(greeting(2, 3), false);
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = Recorder::new();
+        let mut mc = test_config(rec.clone());
+        mc.transports = Arc::new(FlagFactory(peer.path.clone(), on.clone(), stops.clone()));
+        let m = Manager::new(mc);
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        rec.wait_status(|s| s.status == StatusKind::Incompatible);
+        let up = || {
+            let (w, rx) = crate::link::testpeer::slot();
+            m.host("h_aaaaaaaa").unwrap().upgrade(w);
+            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        };
+        let e = up().unwrap_err();
+        assert_eq!(e.code, crate::errors::HostErrorCode::Incompatible);
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        assert_eq!(m.host("h_aaaaaaaa").unwrap().status().phase, None);
+        on.store(true, Ordering::SeqCst);
+        up().unwrap();
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        m.shutdown();
+    }
+
     #[cfg(unix)]
     fn local_host() -> HostConfig {
         test_host(crate::LOCAL_HOST_ID, "sock")

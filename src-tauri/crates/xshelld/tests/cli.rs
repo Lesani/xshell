@@ -283,3 +283,37 @@ fn persistent_serve_reenables_autostart() {
     p.client.hello(range(1, 1));
     assert!(p.finish().success());
 }
+
+/// After the app hands its Terminals to a Persistent Daemon (`serve --interactive-env`),
+/// `connect` starts a Daemon again when that one is gone.
+#[test]
+fn connect_autostarts_after_persistent_handover() {
+    let h = TestHome::new();
+    let mut parent = GuiParent::start(&h, &[]);
+    Client::connect(&h.paths().socket).hello(range(1, 1));
+    let daemon = parent.daemon_pid();
+    unsafe { libc::kill(daemon, libc::SIGTERM) };
+    assert!(wait_dead(daemon, T));
+    parent.kill();
+
+    let mut serve = ServeProc {
+        child: bin_cmd(&h)
+            .args(["serve", "--interactive-env"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    };
+    Client::connect(&h.paths().socket).hello(range(1, 1));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "persistent"
+    );
+    unsafe { libc::kill(serve.pid(), libc::SIGKILL) };
+    assert!(serve.wait_exit(T).is_some());
+
+    let _guard = DaemonGuard::new(&h);
+    let mut p = ConnectProc::start(&h);
+    p.client.hello(range(1, 1));
+    assert!(p.finish().success());
+}

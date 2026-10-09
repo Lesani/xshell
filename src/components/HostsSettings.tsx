@@ -4,6 +4,8 @@ import { Plus, RefreshCw, ArrowUpCircle, Pencil, Trash2, X, ChevronRight, PlugZa
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
 import { ColorPicker } from "./ColorPicker";
 import { HostBadge } from "./HostBadge";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { LocalDaemonSettings } from "./LocalDaemonSettings";
 import { fmt } from "../hosts/strings";
 import { hintText, toHostConfig, validateHostForm, type HostFormErrors, type HostFormValues } from "../hosts/hostForm";
 import { isUsableStatus } from "../hosts/registry";
@@ -57,26 +59,6 @@ function StatusChip({ status, now }: { status: HostStatus | undefined; now: numb
       <span className="host-chip-dot" />
       {statusLabel(status)}{phase ? ` · ${phase}` : ""}{retry ? ` · ${retry}` : ""}
     </span>
-  );
-}
-
-function ConfirmDialog({ title, body, confirm, onConfirm, onCancel }: { title: string; body: string; confirm: string; onConfirm: () => void; onCancel: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onCancel(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onCancel]);
-  return (
-    <div className="settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
-      <div className="settings-panel host-confirm-panel">
-        <div className="settings-header"><span>{title}</span><button className="settings-close" onClick={onCancel} aria-label={fmt("hosts.form.cancel")}><X size={14} /></button></div>
-        <div className="settings-body"><p className="host-confirm-body">{body}</p></div>
-        <div className="settings-footer">
-          <button className="btn btn-ghost" onClick={onCancel}>{fmt("hosts.form.cancel")}</button>
-          <button className="btn btn-primary" onClick={onConfirm}>{confirm}</button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -262,6 +244,8 @@ export function HostsSettings({ onSave, onRemove }: Props) {
   };
 
   return (
+    <>
+    <LocalDaemonSettings />
     <div className="settings-section">
       <div className="settings-section-head host-section-head">
         <div>
@@ -286,5 +270,6 @@ export function HostsSettings({ onSave, onRemove }: Props) {
           onConfirm={() => { const id = removing.id; setRemoving(null); onRemove(id); }} onCancel={() => setRemoving(null)} />
       )}
     </div>
+    </>
   );
 }

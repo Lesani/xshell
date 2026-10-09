@@ -7,10 +7,20 @@ import type { HostId } from "./types";
 
 export const LOCAL_HOST: HostId = "local";
 
-// What `local_host_info` reports: whether new Local Tabs run through the Daemon.
+// What `local_host_info` reports: whether new Local Tabs run through the Daemon, and the
+// "Keep terminals running after quit" setting (a Persistent Daemon, Linux and macOS only).
 export interface LocalHostInfo {
   mode: "daemon" | "in-process";
   reason: string | null;
+  persistent?: LocalPersistentInfo;
+}
+
+export interface LocalPersistentInfo {
+  supported: boolean;
+  enabled: boolean;
+  // How the connected Daemon runs; null while not connected.
+  running: "gui-bound" | "persistent" | null;
+  log: string | null;
 }
 
 // The Host whose Daemon serves this Tab's Terminal (wire id), or null for an in-process Tab.

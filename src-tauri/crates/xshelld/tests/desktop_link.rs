@@ -731,7 +731,9 @@ fn remote_desktop_sees_xshell_not_running_hint() {
 #[test]
 fn local_socket_path_agrees_with_xshelld_paths() {
     use std::path::Path;
-    use xshell_hostlink::local::{local_log_path, local_socket_path};
+    use xshell_hostlink::local::{
+        local_log_path, local_mode_path, local_pid_path, local_socket_path,
+    };
     let home = Path::new("/home/u");
     for xdg in [
         None,
@@ -741,5 +743,385 @@ fn local_socket_path_agrees_with_xshelld_paths() {
         let p = xshelld::paths::resolve(home, xdg, None);
         assert_eq!(local_socket_path(home, xdg), p.socket, "{xdg:?}");
         assert_eq!(local_log_path(home), p.log);
+        assert_eq!(local_mode_path(home), p.mode);
+        assert_eq!(local_pid_path(&p.socket), p.pid);
+    }
+}
+
+// ── The Persistent Daemon setting on the Local Host (#25) ──────────────────
+
+const SWITCH: Duration = Duration::from_secs(30);
+
+fn mode(home: &common::TestHome) -> String {
+    std::fs::read_to_string(home.paths().mode)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// The pid in the pidfile (never through a `DaemonGuard`: dropping one ends the Daemon).
+fn daemon_pid(home: &common::TestHome) -> i32 {
+    std::fs::read_to_string(home.paths().pid)
+        .expect("a pidfile")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// Wait for a list that has `t` running under a pid other than `old`; returns its pid.
+fn restored(rec: &Recorder, from: usize, t: Uuid, old: u32) -> u32 {
+    let l = rec.wait_list_from(from, "restored", |l| {
+        l.iter()
+            .any(|i| i.terminal == t && i.pid.is_some_and(|p| p != old))
+    });
+    l.iter().find(|i| i.terminal == t).unwrap().pid.unwrap()
+}
+
+/// AC1: with the setting on, quitting leaves the Terminals running in a Daemon started from
+/// the installed copy, and the next start reattaches to them.
+#[test]
+fn local_persistent_quit_leaves_terminals_and_next_start_reattaches() {
+    let home = common::TestHome::new();
+    let _guard = common::DaemonGuard::new(&home);
+    let a = LocalDesk::persistent(&home);
+    a.wait_usable();
+    assert_eq!(mode(&home), "persistent");
+    assert_eq!(a.daemon.gui_pid(), None);
+    let daemon = daemon_pid(&home);
+    let installed = home
+        .home()
+        .join(".xshell/server")
+        .join(VERSION)
+        .join("xshelld");
+    assert!(installed.is_file());
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{daemon}/exe")).unwrap(),
+        installed
+    );
+    let t = Uuid::new_v4();
+    let sink = VecSink::new();
+    let pid = open(
+        &a.host(),
+        t,
+        common::sh_spec(&home.project("p")),
+        sink.clone(),
+    )
+    .unwrap();
+    marker(&a.host(), &sink, t, "beforequit");
+    a.quit();
+    drop(a);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(pid_alive(daemon), "the Persistent Daemon ended at quit");
+    assert!(pid_alive(pid as i32), "its Terminal ended at quit");
+
+    let b = LocalDesk::persistent(&home);
+    b.wait_usable();
+    let l = b
+        .rec
+        .wait_list("with the terminal", |l| l.iter().any(|i| i.terminal == t));
+    assert_eq!(l[0].pid, Some(pid), "the Terminal was restarted");
+    let sink = VecSink::new();
+    attach(&b.host(), t, sink.clone());
+    marker(&b.host(), &sink, t, "afterrestart");
+    assert_eq!(daemon_pid(&home), daemon);
+}
+
+/// Switching on: the GUI-bound Daemon hands its Terminals to a Persistent one, which then
+/// survives the quit.
+#[test]
+fn local_switch_on_keeps_terminals() {
+    let home = common::TestHome::new();
+    let _guard = common::DaemonGuard::new(&home);
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    let gui = a.daemon.gui_pid().expect("a GUI-bound child") as i32;
+    let t = Uuid::new_v4();
+    let pid = open(
+        &a.host(),
+        t,
+        common::sh_spec(&home.project("p")),
+        VecSink::new(),
+    )
+    .unwrap();
+    let lists = a.rec.list_count();
+    a.daemon.switch(&a.host(), true, 1, SWITCH).unwrap();
+    assert!(a.daemon.persistent());
+    assert_eq!(mode(&home), "persistent");
+    assert!(wait_dead(gui), "the GUI-bound Daemon still runs");
+    assert_eq!(a.daemon.gui_pid(), None);
+    let now = restored(&a.rec, lists, t, pid);
+    let daemon = daemon_pid(&home);
+    // Already on: nothing restarts.
+    let lists = a.rec.list_count();
+    a.daemon.switch(&a.host(), true, 1, SWITCH).unwrap();
+    assert_eq!(daemon_pid(&home), daemon);
+    assert_eq!(
+        a.host()
+            .snapshot()
+            .terminals
+            .unwrap()
+            .iter()
+            .find(|i| i.terminal == t)
+            .unwrap()
+            .pid,
+        Some(now)
+    );
+    assert!(a.rec.list_count() >= lists);
+    a.quit();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(pid_alive(daemon));
+    assert!(pid_alive(now as i32));
+}
+
+/// AC2: switching off hands the Terminals to a GUI-bound child, and the next quit ends them.
+#[test]
+fn local_switch_off_then_quit_ends_terminals() {
+    let home = common::TestHome::new();
+    let _guard = common::DaemonGuard::new(&home);
+    let a = LocalDesk::persistent(&home);
+    a.wait_usable();
+    let old = daemon_pid(&home);
+    let t = Uuid::new_v4();
+    let pid = open(
+        &a.host(),
+        t,
+        common::sh_spec(&home.project("p")),
+        VecSink::new(),
+    )
+    .unwrap();
+    let lists = a.rec.list_count();
+    a.daemon.switch(&a.host(), false, 1, SWITCH).unwrap();
+    assert!(!a.daemon.persistent());
+    assert_eq!(mode(&home), "gui-bound");
+    assert!(wait_dead(old), "the Persistent Daemon still runs");
+    let gui = a.daemon.gui_pid().expect("a GUI-bound child");
+    assert_eq!(daemon_pid(&home), gui as i32);
+    let now = restored(&a.rec, lists, t, pid);
+    a.quit();
+    assert!(wait_dead(gui as i32));
+    assert!(wait_dead(now as i32), "the Terminal outlived the quit");
+}
+
+/// Another xshell's GUI-bound Daemon is never ended to switch on.
+#[test]
+fn local_switch_refuses_foreign_gui_bound() {
+    let home = common::TestHome::new();
+    let other = common::GuiParent::start(&home, &[]);
+    common::connect_socket(&home.paths().socket);
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    assert_eq!(a.daemon.gui_pid(), None);
+    assert_eq!(
+        a.daemon.switch(&a.host(), true, 1, SWITCH),
+        Err(xshell_hostlink::SwitchError::OtherApp)
+    );
+    assert!(!a.daemon.persistent());
+    assert!(pid_alive(other.daemon_pid()));
+    assert_eq!(mode(&home), "gui-bound");
+}
+
+/// A Persistent Daemon older than this Desktop is upgrade pending while the setting is on,
+/// and "Upgrade now" restarts it from this Desktop's installed copy.
+#[test]
+fn local_persistent_older_daemon_is_upgrade_pending() {
+    let home = common::TestHome::new();
+    let _guard = common::DaemonGuard::new(&home);
+    let _serve = common::ServeProc::start(&home, &[("XSHELLD_IDLE_TIMEOUT_MS", "60000")]);
+    common::connect_socket(&home.paths().socket);
+    let old = daemon_pid(&home);
+    let a = LocalDesk::with(
+        &home,
+        LocalOpts {
+            persistent: true,
+            version: "99.0.0".into(),
+            ..Default::default()
+        },
+    );
+    let s = a
+        .rec
+        .wait_status("pending", |s| s.status == StatusKind::UpgradePending);
+    assert_eq!(s.daemon_version.as_deref(), Some(VERSION));
+    let from = a.rec.count();
+    upgrade(&a.host()).unwrap();
+    a.rec
+        .wait_status_from(from, "reconnected", |s| usable(s) && s.phase.is_none());
+    assert!(wait_dead(old));
+    assert_ne!(daemon_pid(&home), old);
+    assert!(home.home().join(".xshell/server/99.0.0/xshelld").is_file());
+    assert_eq!(mode(&home), "persistent");
+}
+
+/// Not a test by itself: with `XSHELL_TEST_FAKE_OLD_DAEMON=<socket>` it serves a Daemon
+/// that only speaks protocol 0, as `local_persistent_incompatible_daemon_upgrades` runs it
+/// in a child process.
+#[test]
+fn fake_old_daemon_process() {
+    use std::io::{Read, Write};
+    let Some(sock) = std::env::var_os("XSHELL_TEST_FAKE_OLD_DAEMON") else {
+        return;
+    };
+    let sock = std::path::PathBuf::from(sock);
+    let dir = sock.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let _ = std::fs::remove_file(&sock);
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::fs::write(dir.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
+    let hello = xshell_protocol::msg::encode_msg(
+        &xshell_protocol::msg::ServerMsg::Hello(xshell_protocol::msg::Hello {
+            protocol: ProtocolRange { min: 0, max: 0 },
+            version: "0.9.0".into(),
+            capabilities: vec![],
+        }),
+        None,
+    )
+    .unwrap();
+    for s in l.incoming() {
+        let Ok(mut s) = s else { break };
+        let _ = s.write_all(&hello);
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while matches!(s.read(&mut b), Ok(n) if n > 0) {}
+        });
+    }
+}
+
+/// An incompatible (older protocol) Persistent Daemon: "Upgrade now" stops it after checking
+/// that its pidfile and its socket agree, and a compatible one starts from the installed copy.
+#[test]
+fn local_persistent_incompatible_daemon_upgrades() {
+    let home = common::TestHome::new();
+    let _guard = common::DaemonGuard::new(&home);
+    let socket = home.paths().socket;
+    let mut fake = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fake_old_daemon_process", "--test-threads", "1"])
+        .env("XSHELL_TEST_FAKE_OLD_DAEMON", &socket)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    common::connect_socket(&socket);
+    std::fs::create_dir_all(home.paths().mode.parent().unwrap()).unwrap();
+    std::fs::write(home.paths().mode, "persistent\n").unwrap();
+    let a = LocalDesk::persistent(&home);
+    let s = a
+        .rec
+        .wait_status("incompatible", |s| s.status == StatusKind::Incompatible);
+    assert_eq!(s.incompatible_reason, Some(IncompatibleReason::DaemonOlder));
+    let from = a.rec.count();
+    upgrade(&a.host()).unwrap();
+    let s = a.rec.wait_status_from(from, "upgraded", usable).1;
+    assert_eq!(s.daemon_version.as_deref(), Some(VERSION));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fake.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the old Daemon still runs");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(daemon_pid(&home), fake.id() as i32);
+    assert_eq!(mode(&home), "persistent");
+}
+
+/// After a switch, failed or not, the setting matches what runs: Persistent, or GUI-bound in
+/// a child of ours. The Terminals survive either way. It must hold for a second on end, so a
+/// Daemon that is still exiting does not count.
+fn assert_consistent(a: &LocalDesk, home: &common::TestHome, t: Uuid) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut since: Option<Instant> = None;
+    loop {
+        let up = usable(&a.host().status());
+        let m = mode(home);
+        let ok = up
+            && if a.daemon.persistent() {
+                m == "persistent"
+            } else {
+                m == "gui-bound" && a.daemon.gui_pid().is_some()
+            };
+        let listed = a
+            .host()
+            .snapshot()
+            .terminals
+            .is_some_and(|l| l.iter().any(|i| i.terminal == t && i.pid.is_some()));
+        if ok && listed {
+            let t0 = *since.get_or_insert_with(Instant::now);
+            if t0.elapsed() >= Duration::from_secs(1) {
+                return;
+            }
+        } else {
+            since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setting persistent={} but mode {m:?}, usable {up}, terminal listed {listed}",
+            a.daemon.persistent()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A switch whose successor does not come up in time (here: no time at all) is undone or
+/// kept so that the setting still describes what runs.
+#[test]
+fn local_switch_failure_after_successor_spawn_keeps_setting_consistent() {
+    for to_persistent in [true, false] {
+        let home = common::TestHome::new();
+        let _guard = common::DaemonGuard::new(&home);
+        let a = if to_persistent {
+            LocalDesk::new(&home)
+        } else {
+            LocalDesk::persistent(&home)
+        };
+        a.wait_usable();
+        let t = Uuid::new_v4();
+        open(
+            &a.host(),
+            t,
+            common::sh_spec(&home.project("p")),
+            VecSink::new(),
+        );
+        let r = a
+            .daemon
+            .switch(&a.host(), to_persistent, 1, Duration::from_millis(1));
+        assert!(r.is_err(), "{to_persistent}: {r:?}");
+        assert_consistent(&a, &home, t);
+        // And a switch with time to finish still works from there.
+        a.daemon
+            .switch(&a.host(), to_persistent, 1, SWITCH)
+            .unwrap();
+        assert_eq!(a.daemon.persistent(), to_persistent);
+        assert_consistent(&a, &home, t);
+    }
+}
+
+/// More Terminals than the user confirmed: refused before anything restarts, in both
+/// directions, and the setting stays as it was.
+#[test]
+fn local_switch_refuses_unconfirmed_terminals() {
+    for from_persistent in [false, true] {
+        let home = common::TestHome::new();
+        let _guard = common::DaemonGuard::new(&home);
+        let a = if from_persistent {
+            LocalDesk::persistent(&home)
+        } else {
+            LocalDesk::new(&home)
+        };
+        a.wait_usable();
+        let t = Uuid::new_v4();
+        let pid = open(
+            &a.host(),
+            t,
+            common::sh_spec(&home.project("p")),
+            VecSink::new(),
+        )
+        .unwrap();
+        a.rec
+            .wait_list("with the terminal", |l| l.iter().any(|i| i.terminal == t));
+        let daemon = daemon_pid(&home);
+        assert_eq!(
+            a.daemon.switch(&a.host(), !from_persistent, 0, SWITCH),
+            Err(xshell_hostlink::SwitchError::ConfirmAgain(1))
+        );
+        assert_eq!(a.daemon.persistent(), from_persistent);
+        assert_eq!(daemon_pid(&home), daemon);
+        assert!(pid_alive(daemon) && pid_alive(pid as i32));
     }
 }

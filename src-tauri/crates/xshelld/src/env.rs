@@ -2,8 +2,9 @@
 //! thread that reads the environment exists. `CommandBuilder::new` copies the process
 //! environment, so what is set here reaches every Terminal.
 //!
-//! The login shell's PATH is merged in. A GUI-bound Daemon (ADR-0005) takes the PATH of an
-//! interactive login shell instead, so entries set only in rc files (nvm, asdf, pyenv in
+//! The login shell's PATH is merged in. A GUI-bound Daemon (ADR-0005), and a Persistent one
+//! the app starts (`serve --interactive-env`), takes the PATH of an interactive login shell
+//! instead, so entries set only in rc files (nvm, asdf, pyenv in
 //! `.bashrc`/`.zshrc`) apply as they did when the app ran agents inside the user's shell;
 //! it falls back to the login-only PATH.
 
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 const MARKER: &str = "__XSHELL_PATH__";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `interactive`: also source the rc files (GUI-bound). `cancelled` aborts a slow shell.
+/// `interactive`: also source the rc files (GUI-bound or `--interactive-env`). `cancelled` aborts a slow shell.
 pub fn prepare(interactive: bool, cancelled: &dyn Fn() -> bool) {
     if std::env::var_os("XSHELLD_LOGIN_ENV").as_deref() != Some("0".as_ref()) {
         let mut found = None;

@@ -76,7 +76,9 @@ pub fn main_entry() -> i32 {
         crate::log!("ERROR", "cannot start: {e}");
         return 1;
     }
-    env::prepare(gui_bound.is_some(), &|| stop.is_set());
+    env::prepare(gui_bound.is_some() || opts.interactive_env, &|| {
+        stop.is_set()
+    });
     if stop.is_set() {
         crate::log!("INFO", "stopped while starting; exiting");
         return 0;

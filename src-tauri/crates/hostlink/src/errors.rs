@@ -125,6 +125,19 @@ pub fn classify_ssh_failure(
     None
 }
 
+/// Why a switch of the Local Host's Daemon mode (`LocalDaemon::switch`) did not end in the
+/// mode asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchError {
+    /// Another xshell's GUI-bound Daemon runs the Terminals; it is never ended from here.
+    OtherApp,
+    /// The Daemon of the target mode did not become usable in time.
+    Timeout,
+    /// More Terminals run than the user confirmed would restart (the count now running).
+    ConfirmAgain(usize),
+    Failed(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

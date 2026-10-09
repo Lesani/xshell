@@ -115,6 +115,7 @@ struct Sup {
     /// unless the Host is reached directly.
     transport: Arc<dyn Transport>,
     dialer: Box<dyn Dialer>,
+    /// Installed over the transport (no Daemon command, not direct).
     managed: bool,
     backoff: Backoff,
     install_verified: bool,
@@ -149,6 +150,12 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
 impl Sup {
     fn unit(&self) -> Duration {
         self.sh.mc.backoff_unit
+    }
+
+    /// Whether this Desktop upgrades the Daemon: a managed one, or one its direct dialer
+    /// says it may (the Local Host's Persistent Daemon). Read live: that can change.
+    fn upgradable(&self) -> bool {
+        self.managed || self.dialer.upgradable()
     }
 
     fn set_phase(&self, p: Option<Phase>) {
@@ -201,6 +208,8 @@ impl Sup {
                         // Not on a Daemon-command host: it may allow no other ssh command.
                         if self.managed {
                             let _ = kill_daemon(&*self.transport, &self.cancel);
+                        } else if self.dialer.upgradable() {
+                            let _ = self.dialer.stop_incompatible(&self.cancel);
                         }
                         c.link.close();
                         self.ended(c, "the Daemon did not exit for the upgrade".into())
@@ -422,8 +431,8 @@ impl Sup {
                 n.trim()
             );
         }
-        let (negotiated, upgrade_pending) = match classify(&version, mc.ours, &hello, self.managed)
-        {
+        let upgradable = self.upgradable();
+        let (negotiated, upgrade_pending) = match classify(&version, mc.ours, &hello, upgradable) {
             Classified::Compatible {
                 negotiated,
                 upgrade_pending,
@@ -450,9 +459,8 @@ impl Sup {
                 reinstall: false,
             });
         }
-        let managed = self.managed;
         let adopted = self.sh.adopt(gen, &link, |st| {
-            let mismatch = managed && st.upgrade_expect && hello.version != version;
+            let mismatch = upgradable && st.upgrade_expect && hello.version != version;
             st.status.set_kind(if upgrade_pending || mismatch {
                 StatusKind::UpgradePending
             } else {
@@ -509,7 +517,7 @@ impl Sup {
                     &self.sh.mc.desktop_version,
                     self.sh.mc.ours,
                     &hello,
-                    self.managed,
+                    self.upgradable(),
                 ) {
                     Classified::Incompatible { reason, .. } => reason,
                     Classified::Compatible { .. } => version::IncompatibleReason::Older,

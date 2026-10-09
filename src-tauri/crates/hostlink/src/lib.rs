@@ -24,12 +24,12 @@ pub use config::{HostConfig, HOST_ID_PATTERN, LOCAL_HOST_ID};
 #[cfg(unix)]
 pub use dial::UnixSocketDialer;
 pub use dial::{Connection, DialError, Dialed, Dialer};
-pub use errors::{HostError, HostErrorCode, HostErrorHint};
+pub use errors::{HostError, HostErrorCode, HostErrorHint, SwitchError};
 pub use handle::{HostHandle, TermSink};
 pub use install::{BinarySource, ChainSource, DirSource, FileSource};
 pub use link::Waiter;
 #[cfg(unix)]
-pub use local::{GuiBoundDaemon, GuiBoundDialer};
+pub use local::{LocalDaemon, LocalDaemonConfig, LocalDialer};
 pub use manager::{Manager, ManagerConfig, Observer};
 pub use status::{HostSnapshot, HostStatus, HostTestResult, Phase, StatusKind};
 pub use transport::{LocalShellTransport, SshTransport, Transport, TransportFactory};

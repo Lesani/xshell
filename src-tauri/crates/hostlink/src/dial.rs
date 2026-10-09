@@ -57,6 +57,22 @@ impl DialError {
 pub trait Dialer: Send + Sync {
     fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError>;
     fn describe(&self) -> String;
+
+    /// Whether the Desktop upgrades the Daemon this reaches (ADR-0003), although it is not
+    /// installed over a transport: an older one is reported as upgrade pending. Read at each
+    /// check, so it may change while the Host runs.
+    fn upgradable(&self) -> bool {
+        false
+    }
+
+    /// Stop the incompatible Daemon this reaches, so the next dial starts this Desktop's
+    /// version ("Upgrade now"). `None`: this dialer cannot, and the upgrade is refused.
+    fn stop_incompatible(
+        &self,
+        _cancel: &CancelToken,
+    ) -> Option<Result<(), crate::errors::HostError>> {
+        None
+    }
 }
 
 /// What carries a link: the transport child, or a socket. Dropping it ends it too.

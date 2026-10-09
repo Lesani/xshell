@@ -531,3 +531,190 @@ fn persistent_start_fails_without_mode_marker() {
     let srv = xshelld::server::Server::start(config(&h)).expect("starts");
     drop(srv);
 }
+
+// ── Hand-over to and from a Persistent Daemon (#25) ───────────────────────
+
+const SID: &str = "11111111-2222-3333-4444-555555555555";
+
+/// `serve --interactive-env` as a child of this test, as the app starts it.
+fn persistent_serve(h: &TestHome, env: &[(&str, &str)]) -> ServeProc {
+    let mut c = bin_cmd(h);
+    c.args(["serve", "--interactive-env"])
+        .env("XSHELLD_IDLE_TIMEOUT_MS", "60000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    ServeProc {
+        child: c.spawn().unwrap(),
+    }
+}
+
+/// Switching on: the app ends its GUI-bound Daemon in order and starts a Persistent one,
+/// which restores the same Terminals with their agents resumed.
+#[test]
+fn handover_gui_bound_to_persistent_restores_terminals() {
+    let h = TestHome::new();
+    let fake = soft_agent(&h);
+    let _reap = FakeReaper(fake.pids_log.clone());
+    let path = fake.path_env();
+    let cwd = h.project("p");
+    let parent = GuiParent::start(&h, &[("PATH", path.as_str())]);
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    let id = Uuid::new_v4();
+    c.open(id, claude_spec(&cwd, Some(SID)));
+    let first = *fake.wait_pids(1).last().unwrap();
+    make_jsonl(&h, &cwd, SID);
+    drop(c);
+    let daemon = parent.daemon_pid();
+    unsafe { libc::kill(daemon, libc::SIGTERM) };
+    assert!(wait_dead(daemon, Duration::from_secs(10)));
+    assert!(!alive(first));
+
+    let _serve = persistent_serve(&h, &[("PATH", path.as_str())]);
+    let mut c = Client::connect(&h.paths().socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert_eq!(
+        list.iter().map(|t| t.terminal).collect::<Vec<_>>(),
+        vec![id]
+    );
+    assert_eq!(fake.wait_launches(2)[1], vec!["--resume", SID]);
+    let pids = fake.wait_pids(2);
+    assert_ne!(pids[1], first);
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "persistent"
+    );
+    // The app quitting (its old process ending) no longer matters.
+    drop(parent);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(alive(pids[1]));
+}
+
+/// Switching off: `daemon.upgrade` makes the Persistent Daemon persist and exit, and the
+/// app's GUI-bound Daemon restores the same Terminals.
+#[test]
+fn handover_persistent_to_gui_bound_via_upgrade() {
+    let h = TestHome::new();
+    let fake = soft_agent(&h);
+    let _reap = FakeReaper(fake.pids_log.clone());
+    let path = fake.path_env();
+    let cwd = h.project("p");
+    let mut serve = persistent_serve(&h, &[("PATH", path.as_str())]);
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    let id = Uuid::new_v4();
+    c.open(id, claude_spec(&cwd, Some(SID)));
+    let first = *fake.wait_pids(1).last().unwrap();
+    make_jsonl(&h, &cwd, SID);
+    c.request(&ClientMsg::DaemonUpgrade).unwrap();
+    assert!(serve.wait_exit(T).is_some());
+    assert!(!alive(first));
+
+    let parent = GuiParent::start(&h, &[("PATH", path.as_str())]);
+    let mut c = Client::connect(&h.paths().socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert_eq!(
+        list.iter().map(|t| t.terminal).collect::<Vec<_>>(),
+        vec![id]
+    );
+    assert_eq!(fake.wait_launches(2)[1], vec!["--resume", SID]);
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
+    // From now on the Terminals end with the app.
+    let daemon = parent.daemon_pid();
+    let second = fake.wait_pids(2)[1];
+    drop(c);
+    drop(parent);
+    assert!(wait_dead(daemon, Duration::from_secs(10)));
+    assert!(wait_dead(second, Duration::from_secs(2)));
+}
+
+/// A Persistent Daemon has no parent watch: the process that started it (the app) dying,
+/// even by SIGKILL while it starts, leaves it and its Terminals running.
+#[test]
+fn persistent_survives_parent_death() {
+    let h = TestHome::new();
+    let pid_file = h.root().join("persistent.pid");
+    let base = bin_cmd(&h);
+    let mut c = std::process::Command::new("/bin/sh");
+    for (k, v) in base.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    let mut parent = c
+        .env("XSHELLD_IDLE_TIMEOUT_MS", "60000")
+        .arg("-c")
+        .arg(
+            r#""$0" serve --interactive-env </dev/null >/dev/null 2>&1 &
+echo $! > "$1"
+exec sleep 600"#,
+        )
+        .arg(bin())
+        .arg(&pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + T;
+    let daemon: i32 = loop {
+        if let Some(p) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no Daemon started");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _reap = PidReaper(vec![daemon]);
+    let mut cl = Client::connect(&h.paths().socket);
+    cl.hello(range(1, 1));
+    let id = Uuid::new_v4();
+    cl.open(id, sh_spec(&h.project("p")));
+    let _ = parent.kill();
+    let _ = parent.wait();
+    drop(cl);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(alive(daemon), "the Persistent Daemon ended with its parent");
+    let mut cl = Client::connect(&h.paths().socket);
+    let (_, list) = cl.hello(range(1, 1));
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].terminal, id);
+    assert!(list[0].pid.is_some_and(|p| alive(p as i32)));
+}
+
+/// PATH entries set only in interactive rc files reach agents of a Persistent Daemon the
+/// app starts (`--interactive-env`), as they do in a GUI-bound one.
+#[test]
+fn interactive_env_reaches_agents_when_persistent() {
+    let h = TestHome::new();
+    let fake = soft_agent(&h);
+    let _reap = FakeReaper(fake.pids_log.clone());
+    let shell = h.script(
+        "rc-shell",
+        &format!(
+            "case \" $* \" in *\" -i \"*) PATH=\"{}:$PATH\";; esac\n\
+             for last; do :; done\nexec /bin/sh -c \"$last\"",
+            fake.bin.display()
+        ),
+    );
+    let _serve = persistent_serve(
+        &h,
+        &[
+            ("XSHELLD_LOGIN_ENV", "1"),
+            ("SHELL", shell.to_str().unwrap()),
+        ],
+    );
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    c.open(Uuid::new_v4(), claude_spec(&h.project("p"), None));
+    assert_eq!(fake.wait_pids(1).len(), 1, "the agent was not found");
+}

@@ -681,13 +681,12 @@ pub fn pid_alive(pid: i32) -> bool {
     alive(pid)
 }
 
-// ── The Local Host in a GUI-bound Daemon ──────────────────────────────────
+// ── The Local Host in a GUI-bound or Persistent Daemon ────────────────────
 
-/// The app's Local Host: the user's Daemon socket, starting the workspace's `xshelld` as a
-/// GUI-bound child of this test process when nothing listens there.
+/// The app's Local Host: the user's Daemon socket, starting the workspace's `xshelld` (as a
+/// GUI-bound child of this test process, or detached when persistent) when nothing listens.
 pub struct LocalFactory {
-    pub socket: PathBuf,
-    pub daemon: Arc<xshell_hostlink::GuiBoundDaemon>,
+    pub daemon: Arc<xshell_hostlink::LocalDaemon>,
 }
 
 impl TransportFactory for LocalFactory {
@@ -697,8 +696,7 @@ impl TransportFactory for LocalFactory {
 
     fn direct(&self, cfg: &HostConfig) -> Option<Box<dyn Dialer>> {
         (cfg.id == xshell_hostlink::LOCAL_HOST_ID).then(|| {
-            Box::new(xshell_hostlink::GuiBoundDialer {
-                socket: self.socket.clone(),
+            Box::new(xshell_hostlink::LocalDialer {
                 daemon: self.daemon.clone(),
             }) as Box<dyn Dialer>
         })
@@ -706,34 +704,74 @@ impl TransportFactory for LocalFactory {
 }
 
 /// A Desktop in local Daemon mode, as `src-tauri` sets it up. Dropping it quits like the
-/// app does.
+/// app does; a Persistent Daemon outlives it (guard it with a [`DaemonGuard`]).
 pub struct LocalDesk {
     pub m: Manager,
     pub rec: Arc<Recorder>,
-    pub daemon: Arc<xshell_hostlink::GuiBoundDaemon>,
+    pub daemon: Arc<xshell_hostlink::LocalDaemon>,
+}
+
+pub struct LocalOpts {
+    pub persistent: bool,
+    pub version: String,
+    pub env: Vec<(String, String)>,
+    pub tweak: Box<dyn FnOnce(&mut ManagerConfig)>,
+}
+
+impl Default for LocalOpts {
+    fn default() -> Self {
+        Self {
+            persistent: false,
+            version: VERSION.into(),
+            env: vec![],
+            tweak: Box::new(|_| {}),
+        }
+    }
 }
 
 impl LocalDesk {
     pub fn new(h: &TestHome) -> LocalDesk {
-        let env: Vec<(OsString, OsString)> = vec![
+        Self::with(h, LocalOpts::default())
+    }
+
+    /// With the Persistent Daemon setting on.
+    pub fn persistent(h: &TestHome) -> LocalDesk {
+        Self::with(
+            h,
+            LocalOpts {
+                persistent: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with(h: &TestHome, o: LocalOpts) -> LocalDesk {
+        let mut env: Vec<(OsString, OsString)> = vec![
             ("HOME".into(), h.home().into()),
             ("XDG_RUNTIME_DIR".into(), h.run().into()),
             ("XSHELLD_LOGIN_ENV".into(), "0".into()),
         ];
-        let daemon = Arc::new(
-            xshell_hostlink::GuiBoundDaemon::new(bin().into(), env, h.paths().log).unwrap(),
-        );
+        env.extend(o.env.into_iter().map(|(k, v)| (k.into(), v.into())));
         let socket = xshell_hostlink::local::local_socket_path(&h.home(), Some(&h.run()));
+        let daemon = Arc::new(
+            xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+                bin: bin().into(),
+                env,
+                home: h.home(),
+                socket,
+                version: o.version.clone(),
+            })
+            .unwrap(),
+        );
+        daemon.set_persistent(o.persistent);
         let rec = Recorder::new();
         let factory = Arc::new(LocalFactory {
-            socket,
             daemon: daemon.clone(),
         });
-        let m = Manager::new(manager_config(
-            factory,
-            Arc::new(FileSource(bin().into())),
-            rec.clone(),
-        ));
+        let mut cfg = manager_config(factory, Arc::new(FileSource(bin().into())), rec.clone());
+        cfg.desktop_version = o.version;
+        (o.tweak)(&mut cfg);
+        let m = Manager::new(cfg);
         m.set_local(HostConfig {
             id: xshell_hostlink::LOCAL_HOST_ID.into(),
             name: "local".into(),
@@ -755,7 +793,8 @@ impl LocalDesk {
         self.rec.wait_status("connected", usable)
     }
 
-    /// Quit as the app does: SIGTERM our Daemon, stop the links, wait for it, then kill.
+    /// Quit as the app does: SIGTERM a GUI-bound Daemon of ours, stop the links, wait for
+    /// it, then kill. A Persistent Daemon keeps running.
     pub fn quit(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         self.daemon.hang_up();
