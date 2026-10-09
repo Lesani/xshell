@@ -604,6 +604,9 @@ pub struct Client {
     next_id: u64,
     /// Keep only a short tail of output and leave it out of `log` (for floods).
     pub quiet: bool,
+    /// How long `expect_msg` (and so `request`) waits: [`T`] unless a test that only checks
+    /// state, not latency, allows more on a loaded machine.
+    pub timeout: Duration,
     _keep: Option<UnixStream>,
 }
 
@@ -619,9 +622,15 @@ impl Client {
     /// A connection served in the test process with `role` (see
     /// `ServerHandle::connect_in_process`), after its hello.
     pub fn in_process(srv: &ServerHandle, role: Role) -> Client {
+        Self::in_process_within(srv, role, T)
+    }
+
+    /// [`Client::in_process`], waiting up to `timeout` for each message.
+    pub fn in_process_within(srv: &ServerHandle, role: Role, timeout: Duration) -> Client {
         let s = srv.connect_in_process(role).unwrap();
         let mut c = Client::from_io(s.try_clone().unwrap(), s.try_clone().unwrap());
         c._keep = Some(s);
+        c.timeout = timeout;
         c.hello(range(1, 1));
         c
     }
@@ -654,6 +663,7 @@ impl Client {
             eof: false,
             next_id: 1000,
             quiet: false,
+            timeout: T,
             _keep: None,
         }
     }
@@ -741,8 +751,9 @@ impl Client {
     }
 
     pub fn expect_msg(&mut self, what: &str, pred: impl Fn(&ServerMsg) -> bool) -> ServerMsg {
-        self.try_msg(T, pred)
-            .unwrap_or_else(|| panic!("no {what} within {T:?}; log: {:?}", self.summary()))
+        let t = self.timeout;
+        self.try_msg(t, pred)
+            .unwrap_or_else(|| panic!("no {what} within {t:?}; log: {:?}", self.summary()))
     }
 
     /// A compact view of the log for failure messages.

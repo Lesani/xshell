@@ -68,13 +68,13 @@ impl Remote {
 
     /// Its Daemon's identity, asked directly.
     fn key(&self) -> SignKey {
-        let mut c = Client::in_process(self.srv.as_ref().unwrap(), ConnRole::Desktop);
+        let mut c = direct(self.srv.as_ref().unwrap());
         let v = c.request(&ClientMsg::RingIdentity).unwrap();
         LocalIdentity::from_json(&v).unwrap().sign_key
     }
 
     fn ring_id(&self) -> Option<String> {
-        let mut c = Client::in_process(self.srv.as_ref().unwrap(), ConnRole::Desktop);
+        let mut c = direct(self.srv.as_ref().unwrap());
         let v = c.request(&ClientMsg::RingIdentity).unwrap();
         v["ring"]["ringId"].as_str().map(String::from)
     }
@@ -90,6 +90,14 @@ impl Drop for Remote {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// A Desktop connection straight to a Remote Host's Daemon, for checking its state. It
+/// waits as long as the rest of the test: on a loaded machine (the whole workspace's tests
+/// at once, every Daemon fsyncing its keys and Roster) an answer can take more than the
+/// harness's usual 5 s, and these checks are about state, not latency.
+fn direct(srv: &ServerHandle) -> Client {
+    Client::in_process_within(srv, ConnRole::Desktop, WAIT)
 }
 
 /// The app's Observer, minus the events: only the Ring hooks.
@@ -333,7 +341,7 @@ fn host_in_another_ring_is_left_alone_until_claimed() {
     // Another Desktop's Ring holds the Host.
     let key = a.key();
     let noise = {
-        let mut c = Client::in_process(a.srv.as_ref().unwrap(), ConnRole::Desktop);
+        let mut c = direct(a.srv.as_ref().unwrap());
         let v = c.request(&ClientMsg::RingIdentity).unwrap();
         LocalIdentity::from_json(&v).unwrap().noise_key
     };
@@ -345,7 +353,7 @@ fn host_in_another_ring_is_left_alone_until_claimed() {
         })
         .unwrap();
     let foreign = RosterChain::from_chain(vec![g, v2]).unwrap();
-    let mut c = Client::in_process(a.srv.as_ref().unwrap(), ConnRole::Desktop);
+    let mut c = direct(a.srv.as_ref().unwrap());
     c.request(&ClientMsg::RingJoin {
         rosters: foreign
             .versions()
