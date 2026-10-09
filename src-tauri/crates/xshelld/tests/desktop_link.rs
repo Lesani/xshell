@@ -572,3 +572,174 @@ fn shutdown_is_bounded_with_a_concurrent_configure_on(via: Via) {
     assert!(fx.a.m.snapshot().is_empty());
     fx.assert_no_new_conn(conn, &handle);
 }
+
+// ── The Local Host in a GUI-bound Daemon (ADR-0005) ───────────────────────
+
+/// AC1: a new local Terminal is a Daemon Terminal; another Desktop, over the socket and
+/// over `xshelld connect`, sees it and gets its output.
+#[test]
+fn local_dialer_spawns_gui_bound_and_second_desktop_attaches() {
+    let home = common::TestHome::new();
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    let child = a.daemon.pid().expect("the Desktop started a Daemon");
+    assert_eq!(
+        std::fs::read_to_string(home.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
+    let h = a.host();
+    let t = Uuid::new_v4();
+    let sink = VecSink::new();
+    open(&h, t, common::sh_spec(&home.project("p")), sink.clone());
+
+    let b = socket_desk(&home.paths().socket, Default::default(), |_| {});
+    b.wait_usable();
+    b.rec
+        .wait_list("with A's terminal", |l| l.iter().any(|i| i.terminal == t));
+    let sink_b = VecSink::new();
+    attach(&b.host(), t, sink_b.clone());
+
+    let c = Fx::desk(&home, |_| {});
+    c.wait_usable();
+    c.rec
+        .wait_list("with A's terminal", |l| l.iter().any(|i| i.terminal == t));
+    let sink_c = VecSink::new();
+    attach(&c.host(), t, sink_c.clone());
+
+    let from_b = sink_b.len();
+    let from_c = sink_c.len();
+    marker(&h, &sink, t, "fromdesktopa");
+    sink_b.wait_from(from_b, "fromdesktopa");
+    sink_c.wait_from(from_c, "fromdesktopa");
+    // B's input reaches the same Terminal.
+    marker(&b.host(), &sink_b, t, "fromdesktopb");
+    assert_eq!(a.daemon.pid(), Some(child), "one Daemon only");
+    c.m.shutdown();
+    b.m.shutdown();
+}
+
+/// A Daemon already running for this user is used, never started again and never signalled.
+#[test]
+fn local_dialer_uses_running_daemon_without_spawning() {
+    let home = common::TestHome::new();
+    let mut serve = common::ServeProc::start(&home, &[("XSHELLD_IDLE_TIMEOUT_MS", "60000")]);
+    common::connect_socket(&home.paths().socket);
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    assert_eq!(a.daemon.pid(), None);
+    let t = Uuid::new_v4();
+    let pid = open(
+        &a.host(),
+        t,
+        common::sh_spec(&home.project("p")),
+        VecSink::new(),
+    )
+    .expect("pid") as i32;
+    a.quit();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        serve.wait_exit(Duration::ZERO).is_none(),
+        "the Daemon was ended"
+    );
+    assert!(common::alive(pid), "its Terminal was ended");
+}
+
+/// When the Daemon ends under it, the Desktop starts a new one, which restores the Terminals.
+#[test]
+fn local_dialer_respawns_after_daemon_death_and_restores() {
+    let home = common::TestHome::new();
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    let first = a.daemon.pid().unwrap();
+    let t = Uuid::new_v4();
+    let pid = open(
+        &a.host(),
+        t,
+        common::sh_spec(&home.project("p")),
+        VecSink::new(),
+    )
+    .unwrap();
+    let lists = a.rec.list_count();
+    // As a remote Desktop's upgrade kill script would.
+    unsafe { libc::kill(first as i32, libc::SIGTERM) };
+    let l = a.rec.wait_list_from(lists, "restored", |l| {
+        l.iter()
+            .any(|i| i.terminal == t && i.pid.is_some_and(|p| p != pid))
+    });
+    assert_eq!(l.len(), 1);
+    let second = a.daemon.pid().expect("a new Daemon");
+    assert_ne!(second, first);
+}
+
+/// AC2, quitting: every local Terminal ends with the Daemon the Desktop started.
+#[test]
+fn gui_bound_terminate_ends_terminals() {
+    let home = common::TestHome::new();
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    let daemon = a.daemon.pid().unwrap() as i32;
+    let mut pids = vec![];
+    for _ in 0..2 {
+        let t = Uuid::new_v4();
+        pids.push(
+            open(
+                &a.host(),
+                t,
+                common::sh_spec(&home.project("p")),
+                VecSink::new(),
+            )
+            .unwrap() as i32,
+        );
+    }
+    let t0 = Instant::now();
+    a.quit();
+    assert!(t0.elapsed() < Duration::from_secs(10));
+    assert!(wait_dead(daemon));
+    for p in pids {
+        assert!(wait_dead(p), "terminal {p} survived the quit");
+    }
+    assert!(!home.paths().socket.exists());
+}
+
+/// AC3: a remote Desktop reaching a machine whose xshell is closed is told so, and nothing
+/// is started there.
+#[test]
+fn remote_desktop_sees_xshell_not_running_hint() {
+    let home = common::TestHome::new();
+    let a = LocalDesk::new(&home);
+    a.wait_usable();
+    a.quit();
+    let remote = Fx::desk(&home, |_| {});
+    let s = remote.rec.wait_status("failed", |s| s.error_hint.is_some());
+    assert_eq!(
+        s.error_hint,
+        Some(xshell_hostlink::HostErrorHint::XshellNotRunning),
+        "{s:#?}"
+    );
+    assert!(
+        s.last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("xshell is not running"),
+        "{s:#?}"
+    );
+    remote.m.shutdown();
+    assert!(!home.paths().socket.exists());
+    assert!(!home.paths().pid.exists());
+}
+
+#[test]
+fn local_socket_path_agrees_with_xshelld_paths() {
+    use std::path::Path;
+    use xshell_hostlink::local::{local_log_path, local_socket_path};
+    let home = Path::new("/home/u");
+    for xdg in [
+        None,
+        Some(Path::new("/run/user/1000")),
+        Some(Path::new("rel")),
+    ] {
+        let p = xshelld::paths::resolve(home, xdg, None);
+        assert_eq!(local_socket_path(home, xdg), p.socket, "{xdg:?}");
+        assert_eq!(local_log_path(home), p.log);
+    }
+}

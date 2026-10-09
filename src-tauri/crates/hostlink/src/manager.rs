@@ -73,6 +73,9 @@ const STOP_DEADLINE: Duration = Duration::from_secs(3);
 pub struct Manager {
     mc: Arc<ManagerConfig>,
     hosts: Mutex<Vec<Arc<HostHandle>>>,
+    /// The Local Host when its Terminals run in a Daemon ([`Manager::set_local`]). Outside
+    /// `configure`: the frontend's Host list never names it.
+    local: Mutex<Option<Arc<HostHandle>>>,
     configure_lock: Mutex<()>,
     config_gen: AtomicU64,
     shut: AtomicBool,
@@ -96,6 +99,7 @@ impl Manager {
         Self {
             mc: Arc::new(cfg),
             hosts: Mutex::new(Vec::new()),
+            local: Mutex::new(None),
             configure_lock: Mutex::new(()),
             config_gen: AtomicU64::new(0),
             shut: AtomicBool::new(false),
@@ -174,7 +178,27 @@ impl Manager {
         Ok(())
     }
 
+    /// Run the Local Host's Terminals in a Daemon, reached through `cfg` (its id is
+    /// [`crate::LOCAL_HOST_ID`]; the transport factory's `direct` dialer reaches it). Once; a
+    /// second call is ignored, as is any after `shutdown`.
+    pub fn set_local(&self, cfg: HostConfig) {
+        let mut local = self.local.lock().unwrap();
+        if local.is_some() || self.shut.load(Ordering::SeqCst) {
+            return;
+        }
+        let h = Arc::new(HostHandle::new(cfg, self.mc.clone(), self.next_gen()));
+        h.start();
+        *local = Some(h);
+    }
+
+    fn local(&self) -> Option<Arc<HostHandle>> {
+        self.local.lock().unwrap().clone()
+    }
+
     pub fn host(&self, id: &str) -> Option<Arc<HostHandle>> {
+        if let Some(l) = self.local().filter(|l| l.id() == id) {
+            return Some(l);
+        }
         self.hosts
             .lock()
             .unwrap()
@@ -183,14 +207,19 @@ impl Manager {
             .cloned()
     }
 
+    /// The Local Host first, then the configured Hosts in their order.
     pub fn snapshot(&self) -> Vec<HostSnapshot> {
-        let hosts = self.hosts.lock().unwrap().clone();
-        hosts.iter().map(|h| h.snapshot()).collect()
+        self.all().iter().map(|h| h.snapshot()).collect()
+    }
+
+    fn all(&self) -> Vec<Arc<HostHandle>> {
+        let mut all: Vec<_> = self.local().into_iter().collect();
+        all.extend(self.hosts.lock().unwrap().iter().cloned());
+        all
     }
 
     pub fn kick_all(&self) {
-        let hosts = self.hosts.lock().unwrap().clone();
-        for h in hosts {
+        for h in self.all() {
             h.kick();
         }
     }
@@ -263,7 +292,8 @@ impl Manager {
         let deadline = Instant::now() + STOP_DEADLINE;
         self.shut.store(true, Ordering::SeqCst);
         self.cancel.cancel();
-        let hosts: Vec<Arc<HostHandle>> = std::mem::take(&mut *self.hosts.lock().unwrap());
+        let mut hosts: Vec<Arc<HostHandle>> = std::mem::take(&mut *self.hosts.lock().unwrap());
+        hosts.extend(self.local.lock().unwrap().take());
         let mut joins = Vec::new();
         for h in &hosts {
             h.retire();
@@ -898,5 +928,67 @@ pub(crate) mod tests {
         m.configure(vec![h]).unwrap();
         upgrade_is_refused_without_script(&m, &rec, &sent);
         m.shutdown();
+    }
+
+    #[cfg(unix)]
+    fn local_host() -> HostConfig {
+        test_host(crate::LOCAL_HOST_ID, "sock")
+    }
+
+    /// The Local Host is outside the configured list: `configure` neither lists nor stops it.
+    #[cfg(unix)]
+    #[test]
+    fn local_host_survives_configure() {
+        let peer = socket_peer(greeting(1, 1), false);
+        let rec = Recorder::new();
+        let (m, _) = direct_manager(&peer, rec.clone());
+        m.set_local(local_host());
+        rec.wait_status(|s| s.host == "local" && s.status == StatusKind::Connected);
+        let local = m.host("local").unwrap();
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        m.configure(vec![]).unwrap();
+        assert!(Arc::ptr_eq(&local, &m.host("local").unwrap()));
+        assert_eq!(local.status().status, StatusKind::Connected);
+        // The frontend can never configure it.
+        assert!(m.configure(vec![local_host()]).is_err());
+        // Set once.
+        m.set_local(test_host(crate::LOCAL_HOST_ID, "elsewhere"));
+        assert_eq!(m.host("local").unwrap().config().ssh_target, "sock");
+        m.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_host_in_snapshot_and_lookup() {
+        let peer = socket_peer(greeting(1, 1), false);
+        let rec = Recorder::new();
+        let (m, _) = direct_manager(&peer, rec.clone());
+        assert!(m.host("local").is_none());
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        m.set_local(local_host());
+        let order: Vec<String> = m.snapshot().iter().map(|s| s.status.host.clone()).collect();
+        assert_eq!(order, ["local", "h_aaaaaaaa"]);
+        assert_eq!(m.host("local").unwrap().id(), "local");
+        assert!(m.host("h_aaaaaaaa").is_some());
+        m.kick_all();
+        m.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_local() {
+        let peer = socket_peer(greeting(1, 1), false);
+        let rec = Recorder::new();
+        let (m, _) = direct_manager(&peer, rec.clone());
+        m.set_local(local_host());
+        rec.wait_status(|s| s.host == "local" && s.status == StatusKind::Connected);
+        let t0 = Instant::now();
+        m.shutdown();
+        assert!(t0.elapsed() < STOP_DEADLINE + Duration::from_millis(500));
+        assert!(m.host("local").is_none());
+        assert!(m.snapshot().is_empty());
+        // Nothing starts it again.
+        m.set_local(local_host());
+        assert!(m.host("local").is_none());
     }
 }

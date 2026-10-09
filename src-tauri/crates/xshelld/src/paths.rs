@@ -17,6 +17,9 @@ pub struct Paths {
     /// `home/.xshell/daemon/claude-hooks.json`: the Claude Code settings naming the agent
     /// hooks, passed to each Claude Terminal with `--settings`.
     pub claude_hooks: PathBuf,
+    /// `home/.xshell/daemon/mode`: how the last Daemon that held the lock was started
+    /// ([`Mode`]). `connect` never starts a Daemon while it says `gui-bound`.
+    pub mode: PathBuf,
     /// `home/.xshell/log/xshelld.log`.
     pub log: PathBuf,
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
@@ -58,9 +61,60 @@ pub fn resolve(
             .join(".xshell")
             .join("daemon")
             .join("claude-hooks.json"),
+        mode: home.join(".xshell").join("daemon").join("mode"),
         log: home.join(".xshell").join("log").join("xshelld.log"),
         tmp,
     }
+}
+
+/// How the Daemon on this machine is run: by the xshell app (GUI-bound, ADR-0005) or on its
+/// own (Persistent). Recorded in [`Paths::mode`] by each `serve` that takes the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    GuiBound,
+    Persistent,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::GuiBound => "gui-bound",
+            Mode::Persistent => "persistent",
+        }
+    }
+}
+
+/// The recorded mode; `None` when there is no marker or it is unreadable.
+pub fn read_mode(path: &Path) -> Option<Mode> {
+    match fs::read_to_string(path).ok()?.trim() {
+        "gui-bound" => Some(Mode::GuiBound),
+        "persistent" => Some(Mode::Persistent),
+        _ => None,
+    }
+}
+
+/// Record `mode` atomically (a 0600 temp file renamed over the marker).
+pub fn write_mode(path: &Path, mode: Mode) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        writeln!(f, "{}", mode.as_str())?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }
 
 /// Create `dir` (and parents) as 0700. An existing dir must be owned by us; a mode broader
@@ -142,6 +196,28 @@ mod tests {
         assert_eq!(p.tmp, PathBuf::from("/h/.xshell/tmp"));
         // A relative XDG_RUNTIME_DIR is invalid per the spec and ignored.
         assert_eq!(resolve(Path::new("/h"), Some(Path::new("r")), None), p);
+    }
+
+    #[test]
+    fn mode_path() {
+        let p = resolve(Path::new("/h"), Some(Path::new("/r")), None);
+        assert_eq!(p.mode, PathBuf::from("/h/.xshell/daemon/mode"));
+        assert_eq!(p.mode.parent(), p.state.parent());
+        let t = tempfile::tempdir().unwrap();
+        let m = t.path().join("mode");
+        assert_eq!(read_mode(&m), None);
+        write_mode(&m, Mode::GuiBound).unwrap();
+        assert_eq!(read_mode(&m), Some(Mode::GuiBound));
+        assert_eq!(fs::metadata(&m).unwrap().mode() & 0o777, 0o600);
+        write_mode(&m, Mode::Persistent).unwrap();
+        assert_eq!(read_mode(&m), Some(Mode::Persistent));
+        fs::write(&m, "bogus\n").unwrap();
+        assert_eq!(read_mode(&m), None);
+        assert_eq!(
+            fs::read_dir(t.path()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
     }
 
     #[test]

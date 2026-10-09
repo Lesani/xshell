@@ -1,32 +1,48 @@
-//! `xshelld connect`: bridge stdio to the Daemon's socket, starting `serve` if none runs.
+//! `xshelld connect`: bridge stdio to the Daemon's socket, starting `serve` if none runs,
+//! unless the machine's Daemon is GUI-bound (xshell runs it there, ADR-0005): then a missing
+//! Daemon means xshell is closed, and `connect` exits with [`NOT_RUNNING_EXIT`] instead.
 //! Holds no state and writes nothing to stdout but bridged bytes; diagnostics go to stderr,
 //! which the Desktop shows as the ssh error text.
 
 use crate::cli::Opts;
-use crate::paths::{check_socket_path_len, ensure_private_dir, Paths};
-use std::fs;
+use crate::paths::{check_socket_path_len, read_mode, Mode, Paths};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use xshell_protocol::{NOT_RUNNING_EXIT, NOT_RUNNING_MESSAGE};
 
 const SPAWN_WAIT: Duration = Duration::from_secs(10);
-const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn run_connect(opts: &Opts, paths: &Paths) -> i32 {
     match connect_or_spawn(paths, opts) {
         Ok(sock) => bridge(sock),
-        Err(e) => {
+        Err(Refused::NotRunning) => {
+            eprintln!("xshelld: {NOT_RUNNING_MESSAGE}");
+            NOT_RUNNING_EXIT
+        }
+        Err(Refused::Io(e)) => {
             eprintln!("xshelld: {e}");
             1
         }
     }
 }
 
-fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
+enum Refused {
+    /// No Daemon runs, and only xshell may start one here.
+    NotRunning,
+    Io(io::Error),
+}
+
+impl From<io::Error> for Refused {
+    fn from(e: io::Error) -> Self {
+        Refused::Io(e)
+    }
+}
+
+fn connect_or_spawn(paths: &Paths, opts: &Opts) -> Result<UnixStream, Refused> {
     check_socket_path_len(&paths.socket)?;
     match UnixStream::connect(&paths.socket) {
         Ok(s) => return Ok(s),
@@ -35,7 +51,10 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
                 e.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) => {}
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
+    }
+    if read_mode(&paths.mode) == Some(Mode::GuiBound) {
+        return Err(Refused::NotRunning);
     }
     let mut child = Reaped(Some(spawn_detached_serve(paths, opts)?));
     let deadline = Instant::now() + SPAWN_WAIT;
@@ -55,7 +74,8 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
                     return Err(io::Error::other(format!(
                         "xshelld serve exited with {st}; see {}",
                         paths.log.display()
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -66,7 +86,8 @@ fn connect_or_spawn(paths: &Paths, opts: &Opts) -> io::Result<UnixStream> {
                     "xshelld serve did not start listening within {SPAWN_WAIT:?}; see {}",
                     paths.log.display()
                 ),
-            ));
+            )
+            .into());
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_millis(200));
@@ -103,19 +124,7 @@ impl Drop for Reaped {
 }
 
 fn spawn_detached_serve(paths: &Paths, opts: &Opts) -> io::Result<Child> {
-    if let Some(dir) = paths.log.parent() {
-        ensure_private_dir(dir)?;
-    }
-    if fs::metadata(&paths.log).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
-        let mut old = paths.log.clone().into_os_string();
-        old.push(".1");
-        let _ = fs::rename(&paths.log, old);
-    }
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&paths.log)?;
+    let log = crate::log::open_log(&paths.log)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("serve");
     if let Some(h) = &opts.home {

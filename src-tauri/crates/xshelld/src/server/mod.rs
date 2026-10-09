@@ -12,6 +12,7 @@ mod conn;
 mod orphans;
 pub use orphans::Cleanup;
 mod outbox;
+pub mod parent;
 mod registry;
 mod relaunch;
 mod role;
@@ -19,7 +20,7 @@ pub use role::Role;
 mod size;
 mod terminal;
 
-use crate::paths::{check_socket_path_len, ensure_private_dir, Paths};
+use crate::paths::{check_socket_path_len, ensure_private_dir, write_mode, Mode, Paths};
 use registry::{Daemon, Registry};
 use std::fs;
 use std::io::{self, Write};
@@ -27,7 +28,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::terminal::state::Leader;
@@ -64,6 +65,12 @@ pub struct Config {
     /// The agent hook client agents run (`<exe> event …`): this executable by default.
     /// `None` launches agents without hooks, so they report no Agent Status.
     pub event_exe: Option<PathBuf>,
+    /// Run for the xshell app on this machine (ADR-0005): no idle exit, no `daemon.upgrade`,
+    /// and the mode marker says `gui-bound`. `None`: a Persistent Daemon.
+    pub gui_bound: Option<GuiBound>,
+    /// Stops the server from another thread, also while it is still starting: a trigger
+    /// during restore abandons the start (Terminals ended, state file kept).
+    pub abort: Option<Arc<StopLatch>>,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -94,6 +101,56 @@ pub enum TestPoint {
     /// A process's exit was handled: published, held for a Relaunch, or dropped because its
     /// Terminal was never listed.
     ExitHandled { pid: Option<u32> },
+    /// Restore is about to relaunch this persisted Terminal (registry locked: the Daemon does
+    /// not serve yet, so a hook may block to stall the start).
+    Restore,
+}
+
+/// `serve --gui-bound --parent-pid N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiBound {
+    pub parent_pid: u32,
+}
+
+/// Stops a `serve` from any thread (signals, the parent watch): before the server is up the
+/// trigger is remembered, so a start in progress gives up; afterwards it is a
+/// [`Stopper::shutdown`].
+#[derive(Default)]
+pub struct StopLatch(Mutex<(bool, Option<Weak<Daemon>>)>);
+
+impl StopLatch {
+    pub fn trigger(&self) {
+        let d = {
+            let mut g = self.0.lock().unwrap();
+            g.0 = true;
+            g.1.as_ref().and_then(Weak::upgrade)
+        };
+        if let Some(d) = d {
+            d.exit(ExitReason::Shutdown);
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.lock().unwrap().0
+    }
+
+    /// From now on a trigger shuts `h` down; at once when one came already.
+    fn arm(&self, h: &ServerHandle) {
+        let set = {
+            let mut g = self.0.lock().unwrap();
+            g.1 = Some(Arc::downgrade(&h.d));
+            g.0
+        };
+        if set {
+            h.d.exit(ExitReason::Shutdown);
+        }
+    }
+}
+
+impl std::fmt::Debug for StopLatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StopLatch({})", self.is_set())
+    }
 }
 
 /// A test hook: called with the Terminal and the point reached.
@@ -125,6 +182,8 @@ impl Config {
             max_terminal_bytes: 256 * 1024,
             max_list_bytes: 16 * 1024 * 1024,
             event_exe: std::env::current_exe().ok(),
+            gui_bound: None,
+            abort: None,
             cleanup_override: None,
             test_hook: None,
         }
@@ -145,6 +204,9 @@ pub enum ExitReason {
 pub enum StartError {
     /// Another `serve` holds the lock.
     AlreadyRunning,
+    /// [`Config::abort`] fired while starting: the restored Terminals were ended and the
+    /// state file kept.
+    Aborted,
     Io(io::Error),
 }
 
@@ -152,6 +214,7 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartError::AlreadyRunning => write!(f, "another xshelld serve is running"),
+            StartError::Aborted => write!(f, "stopped while starting"),
             StartError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -190,6 +253,20 @@ impl Server {
             Err(fs::TryLockError::WouldBlock) => return Err(StartError::AlreadyRunning),
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
+        // Holding the lock, record how this Daemon runs: `connect` starts none while xshell
+        // owns it, and a Persistent `serve` hands it back.
+        let mode = if cfg.gui_bound.is_some() {
+            Mode::GuiBound
+        } else {
+            Mode::Persistent
+        };
+        // Without it, `connect` would start or refuse Daemons against how this one runs.
+        write_mode(&paths.mode, mode).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot write {}: {e}", paths.mode.display()),
+            )
+        })?;
         // Holding the lock makes the socket ours: a leftover one is stale.
         let mut pidf = fs::OpenOptions::new()
             .write(true)
@@ -222,8 +299,13 @@ impl Server {
             // Runs are told apart across restarts too: a hook of the previous Daemon's
             // process never matches a restored Terminal's run.
             next_run: AtomicU64::new(registry::now_ms()),
+            escalations: Default::default(),
         });
-        d.restore();
+        if !d.restore() {
+            crate::log!("INFO", "stopped while restoring Terminals; exiting");
+            d.exit(ExitReason::Shutdown);
+            return Err(StartError::Aborted);
+        }
         let da = d.clone();
         std::thread::Builder::new()
             .name("accept".into())
@@ -335,9 +417,9 @@ impl Drop for ServerHandle {
     }
 }
 
-/// `serve` as a process: shut down orderly on SIGTERM, SIGINT or SIGHUP. The caller must
-/// have blocked those signals (see [`block_exit_signals`]) before starting any thread.
-pub fn run_serve(cfg: Config) -> i32 {
+/// `serve` as a process: shut down orderly when `stop` fires (see [`watch_exit_signals`]).
+pub fn run_serve(mut cfg: Config, stop: Arc<StopLatch>) -> i32 {
+    cfg.abort = Some(stop.clone());
     let h = match Server::start(cfg) {
         Ok(h) => h,
         Err(StartError::AlreadyRunning) => {
@@ -345,22 +427,29 @@ pub fn run_serve(cfg: Config) -> i32 {
             hold_loser_for_tests();
             return 3;
         }
+        Err(StartError::Aborted) => return 0,
         Err(e) => {
             crate::log!("ERROR", "cannot start: {e}");
             return 1;
         }
     };
-    let stopper = h.stopper();
-    let _ = std::thread::Builder::new()
+    stop.arm(&h);
+    let reason = h.wait();
+    crate::log!("INFO", "exiting: {reason:?}");
+    0
+}
+
+/// Fire `stop` on SIGTERM, SIGINT or SIGHUP, from a thread of its own. The caller must have
+/// blocked those signals (see [`block_exit_signals`]) before starting any thread.
+pub fn watch_exit_signals(stop: Arc<StopLatch>) -> io::Result<()> {
+    std::thread::Builder::new()
         .name("signals".into())
         .spawn(move || loop {
             let sig = wait_exit_signal();
             crate::log!("INFO", "signal {sig}: shutting down");
-            stopper.shutdown();
-        });
-    let reason = h.wait();
-    crate::log!("INFO", "exiting: {reason:?}");
-    0
+            stop.trigger();
+        })?;
+    Ok(())
 }
 
 /// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits

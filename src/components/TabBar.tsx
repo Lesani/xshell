@@ -12,6 +12,7 @@ import { registry } from "../hosts/registry";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import { agentStatusAria, agentStatusOf, agentStatusTooltip } from "../tabs/agentStatus";
+import { daemonHost } from "../hosts/localHost";
 import { useLocalAgentStatuses } from "../tabs/localAgentStatus";
 import { AgentStatusBadge } from "./AgentStatusBadge";
 import { collectLeafIds } from "../layout";
@@ -378,12 +379,13 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const baseTooltip = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
             const hostTooltip = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
             const permsTooltip = tab.skipPermissions ? `${hostTooltip} · ${fmt("tab.skipPerms.tabTooltip")}` : hostTooltip;
+            const liveHost = daemonHost(tab);
             const agentStatus = agentStatusOf(tab, {
-              live: tab.host ? hostsSnap.live[tab.host] : undefined,
-              status: tab.host ? hostsSnap.status[tab.host] : undefined,
+              live: liveHost ? hostsSnap.live[liveHost] : undefined,
+              status: liveHost ? hostsSnap.status[liveHost] : undefined,
               local: localAgentStatuses,
             });
-            const statusHost = tab.host ? hostNameOf(tab.host) : "";
+            const statusHost = tab.host ? hostNameOf(tab.host) : liveHost ? fmt("picker.group.local") : "";
             const tooltipText = agentStatus ? `${permsTooltip}\n${agentStatusTooltip(agentStatus, statusHost)}` : permsTooltip;
             return (
               <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${tab.skipPermissions ? "tab-skip-perms" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>

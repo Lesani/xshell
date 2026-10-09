@@ -12,6 +12,63 @@ use xshell_core::terminal::state::{Leader, ProcIdentity};
 const KILL_WAIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
+/// SIGKILL each process group in `groups` that still exists at `at`, waiting until then
+/// while any does: an orderly exit never leaves a hangup-ignoring member of a Terminal's
+/// group running once the Daemon, and with it every kill timer, is gone.
+pub(crate) fn escalate_groups(groups: &[i32], at: Instant) {
+    let exists = |g: i32| unsafe { libc::killpg(g, 0) } == 0;
+    loop {
+        let left: Vec<i32> = groups.iter().copied().filter(|&g| exists(g)).collect();
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= at {
+            for g in left {
+                unsafe { libc::killpg(g, libc::SIGKILL) };
+            }
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Hung-up process groups whose SIGKILL is due at a given time, until their kill timer has
+/// run. A Terminal closed by a Desktop leaves the list at once, but its timer may still be
+/// pending when the Daemon exits; [`Escalations::drain`] fires those first.
+#[derive(Default)]
+pub(crate) struct Escalations {
+    pending: std::sync::Mutex<std::collections::HashMap<u64, (Vec<i32>, Instant)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Escalations {
+    /// `groups` get their SIGKILL at `at`; returns the entry for [`Escalations::done`].
+    pub fn add(&self, groups: Vec<i32>, at: Instant) -> u64 {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending.lock().unwrap().insert(id, (groups, at));
+        id
+    }
+
+    pub fn done(&self, id: u64) {
+        self.pending.lock().unwrap().remove(&id);
+    }
+
+    /// Escalate every pending entry now, each when it is due but no later than `deadline`.
+    pub fn drain(&self, deadline: Instant) {
+        let mut all: Vec<(Vec<i32>, Instant)> = self
+            .pending
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, v)| v)
+            .collect();
+        all.sort_by_key(|(_, at)| *at);
+        for (groups, at) in all {
+            escalate_groups(&groups, at.min(deadline));
+        }
+    }
+}
+
 /// The outcome of ending a Terminal's leftovers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cleanup {

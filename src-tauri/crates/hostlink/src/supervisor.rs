@@ -390,7 +390,7 @@ impl Sup {
         let dialed = match self.dialer.dial(&self.cancel) {
             Ok(d) => d,
             Err(DialError::Cancelled) => return Attempt::Cancelled,
-            Err(DialError::Failed { message, hint }) => {
+            Err(DialError::Failed { message, hint, .. }) => {
                 return Attempt::Failed(Failure {
                     message,
                     hint,

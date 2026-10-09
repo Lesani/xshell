@@ -1,7 +1,8 @@
 import type { Tab } from "../types";
 import type { HostId, TerminalInfo } from "./types";
+import { daemonHost } from "./localHost";
 
-// Pushes a remote Tab's late-bound metadata (linked session id, title) to its Terminal with
+// Pushes a Daemon Tab's (Remote, or Local on the wire Host "local") late-bound metadata (linked session id, title) to its Terminal with
 // `host_term_update`, so every Desktop and the Daemon's restore see it (amendment 17).
 //
 // Only explicit local edits are sent: title-sync linking, a /rename picked up by the title
@@ -61,10 +62,11 @@ export class MetaSync {
   takeUpdates(tabs: Tab[]): MetaUpdate[] {
     const out: MetaUpdate[] = [];
     for (const tab of tabs) {
-      if (!tab.host || !tab.terminal) continue;
+      const host = daemonHost(tab);
+      if (!host || !tab.terminal) continue;
       const fields = this.entries.get(tab.id);
       if (!fields) continue;
-      const u: MetaUpdate = { tabId: tab.id, host: tab.host, terminal: tab.terminal, fields: [], values: {} };
+      const u: MetaUpdate = { tabId: tab.id, host, terminal: tab.terminal, fields: [], values: {} };
       for (const f of ["sessionId", "title"] as const) {
         const e = fields[f];
         if (!e || e.state !== "dirty") continue;
@@ -99,7 +101,7 @@ export class MetaSync {
   observe(host: HostId, list: TerminalInfo[], tabs: Tab[]) {
     const byUuid = new Map(list.map(i => [i.terminal, i]));
     for (const tab of tabs) {
-      if (tab.host !== host || !tab.terminal) continue;
+      if (!tab.terminal || daemonHost(tab) !== host) continue;
       const fields = this.entries.get(tab.id);
       if (!fields) continue;
       const info = byUuid.get(tab.terminal);
@@ -130,7 +132,7 @@ export function localEdits(prev: Tab[], next: Tab[]): { tabId: string; field: Me
   const before = new Map(prev.map(t => [t.id, t]));
   const out: { tabId: string; field: MetaField; value: string }[] = [];
   for (const t of next) {
-    if (!t.host || !t.terminal) continue;
+    if (!t.terminal) continue;
     const p = before.get(t.id);
     if (!p) continue;
     if (t.sessionId && t.sessionId !== p.sessionId) out.push({ tabId: t.id, field: "sessionId", value: t.sessionId });

@@ -721,6 +721,7 @@ mod tests {
             next_conn: AtomicU64::new(1),
             hooks: None,
             next_run: AtomicU64::new(1),
+            escalations: Default::default(),
         })
     }
 

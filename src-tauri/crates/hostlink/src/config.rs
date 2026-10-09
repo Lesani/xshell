@@ -8,6 +8,11 @@ use xshell_core::launch::LaunchSpec;
 /// The frontend's `parseProjectKey` uses the same pattern; a Vitest reads this line.
 pub const HOST_ID_PATTERN: &str = "^h_[a-z0-9]{8}$";
 
+/// The Local Host's id on the wire (`hosts:status`, `hosts:terminals`, `host_term_*`) when
+/// its Terminals run in a Daemon ([`crate::Manager::set_local`]). Never a configured Host:
+/// it does not match [`HOST_ID_PATTERN`], so `validate` refuses it.
+pub const LOCAL_HOST_ID: &str = "local";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostConfig {

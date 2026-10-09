@@ -1,6 +1,7 @@
-//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`, `xshelld --version`,
-//! and `xshelld event …`, the agent hook client. Each flag falls back to an environment
-//! variable. Hand-parsed: four commands, three flags.
+//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`,
+//! `xshelld serve --gui-bound --parent-pid PID`, `xshelld --version`, and `xshelld event …`,
+//! the agent hook client. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
+//! environment variable. Hand-parsed: four commands, five flags.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -25,13 +26,18 @@ pub struct Opts {
     pub socket: Option<PathBuf>,
     /// `--idle-timeout-ms` / `XSHELLD_IDLE_TIMEOUT_MS`. Test-only, hidden from `--help`.
     pub idle_timeout: Option<Duration>,
+    /// `serve --gui-bound`: run for the xshell app on this machine (ADR-0005) and end with it.
+    pub gui_bound: bool,
+    /// `--parent-pid`: the app's pid. Required with `--gui-bound`, refused otherwise.
+    pub parent_pid: Option<u32>,
 }
 
 pub const USAGE: &str = "\
 usage: xshelld <command> [options]
 
 commands:
-  connect     bridge stdin/stdout to the Daemon, starting it if needed
+  connect     bridge stdin/stdout to the Daemon, starting it if needed (never
+              when xshell on this machine runs it: then exit 4)
   serve       run the Daemon in the foreground
   event       report an agent's status (run by agent hooks inside Terminals)
   --version   print name, version and protocol range as one line of JSON
@@ -39,6 +45,11 @@ commands:
 options:
   --home DIR      home directory to serve (env XSHELLD_HOME)
   --socket PATH   Daemon socket (env XSHELLD_SOCKET)
+
+serve options:
+  --gui-bound        run for the xshell app on this machine: no idle exit, and the
+                     Daemon and its Terminals end when the app does
+  --parent-pid PID   the app's process id (required with --gui-bound)
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
@@ -106,8 +117,24 @@ pub fn parse(
             "--home" => opts.home = Some(value()?.into()),
             "--socket" => opts.socket = Some(value()?.into()),
             "--idle-timeout-ms" => opts.idle_timeout = Some(parse_ms(&value()?, &flag)?),
+            "--gui-bound" if inline.is_none() => opts.gui_bound = true,
+            "--parent-pid" => {
+                let v = value()?;
+                let pid = v
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|&p| p > 1)
+                    .ok_or_else(|| format!("--parent-pid: expected a process id, got {v:?}"))?;
+                opts.parent_pid = Some(pid);
+            }
             _ => return Err(format!("unknown option: {s}")),
         }
+    }
+    if cmd == "connect" && (opts.gui_bound || opts.parent_pid.is_some()) {
+        return Err("--gui-bound and --parent-pid are options of serve only".into());
+    }
+    if opts.gui_bound != opts.parent_pid.is_some() {
+        return Err("--gui-bound and --parent-pid go together".into());
     }
     if opts.home.is_none() {
         opts.home = env("XSHELLD_HOME").map(PathBuf::from);
@@ -153,6 +180,7 @@ mod tests {
                 home: Some("/env/home".into()),
                 socket: Some("/env/sock".into()),
                 idle_timeout: Some(Duration::from_millis(250)),
+                ..Default::default()
             }))
         );
         assert_eq!(
@@ -171,6 +199,7 @@ mod tests {
                 home: Some("/h".into()),
                 socket: Some("/s".into()),
                 idle_timeout: Some(Duration::from_millis(5)),
+                ..Default::default()
             }))
         );
         assert!(run(&["serve", "--bogus"], &[]).is_err());
@@ -179,6 +208,43 @@ mod tests {
         assert!(run(&["frobnicate"], &[]).is_err());
         assert_eq!(run(&["--version"], &[]), Ok(Command::Version));
         assert_eq!(run(&[], &[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn parses_gui_bound_flags() {
+        assert_eq!(
+            run(&["serve", "--gui-bound", "--parent-pid", "4242"], &[]),
+            Ok(Command::Serve(Opts {
+                gui_bound: true,
+                parent_pid: Some(4242),
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            run(&["serve", "--parent-pid=7", "--gui-bound"], &[]),
+            Ok(Command::Serve(Opts {
+                gui_bound: true,
+                parent_pid: Some(7),
+                ..Default::default()
+            }))
+        );
+        assert!(run(&["serve", "--gui-bound", "--parent-pid", "x"], &[]).is_err());
+        assert!(run(&["serve", "--gui-bound", "--parent-pid", "1"], &[]).is_err());
+        assert!(run(&["serve", "--gui-bound=yes", "--parent-pid", "9"], &[]).is_err());
+        assert!(USAGE.contains("--gui-bound") && USAGE.contains("--parent-pid"));
+    }
+
+    #[test]
+    fn parent_pid_requires_gui_bound() {
+        assert!(run(&["serve", "--parent-pid", "4242"], &[]).is_err());
+        assert!(run(&["serve", "--gui-bound"], &[]).is_err());
+    }
+
+    #[test]
+    fn connect_rejects_gui_bound() {
+        assert!(run(&["connect", "--gui-bound", "--parent-pid", "4242"], &[]).is_err());
+        assert!(run(&["connect", "--parent-pid", "4242"], &[]).is_err());
+        assert!(run(&["connect", "--gui-bound"], &[]).is_err());
     }
 
     #[test]

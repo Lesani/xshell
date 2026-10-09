@@ -347,6 +347,7 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_term_relaunch",
     "host_upgrade",
     "host_test",
+    "local_host_info",
 ];
 // The PTY commands; a remote host serves terminals through its own protocol.
 #[cfg(test)]
@@ -637,6 +638,7 @@ pub fn run() {
             hosts::commands::host_term_relaunch,
             hosts::commands::host_upgrade,
             hosts::commands::host_test,
+            hosts::commands::local_host_info,
             hosts::commands::list_ssh_hosts
         ])
         .build(tauri::generate_context!())
@@ -644,9 +646,10 @@ pub fn run() {
         .run(|app, ev| {
             if let tauri::RunEvent::Exit = ev {
                 use tauri::Manager as _;
-                // Kill every ssh; the Daemons and their Terminals keep running.
+                // End the local Daemon this app started; kill every ssh (Remote Daemons and
+                // their Terminals keep running).
                 if let Some(h) = app.try_state::<hosts::Hosts>() {
-                    h.manager.shutdown();
+                    h.quit();
                 }
                 #[cfg(unix)]
                 if let Some(s) = app.try_state::<AgentEventSocket>() {
@@ -703,7 +706,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 58);
+        assert_eq!(registered.len(), 59);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

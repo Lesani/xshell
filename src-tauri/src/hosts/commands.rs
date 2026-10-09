@@ -50,6 +50,12 @@ pub async fn hosts_configure(
         .map_err(|e| e.to_string())?
 }
 
+/// How local Tabs run: `daemon` (Daemon Terminals on host `local`) or `in-process`.
+#[tauri::command]
+pub fn local_host_info(state: State<'_, Hosts>) -> super::local::LocalHostInfo {
+    state.local_mode.info()
+}
+
 #[tauri::command]
 pub fn hosts_status(state: State<'_, Hosts>) -> Vec<HostSnapshot> {
     state.manager.snapshot()

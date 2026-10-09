@@ -247,3 +247,71 @@ describe("host epochs", () => {
     r._dispose();
   });
 });
+
+describe("the Local Host (local Daemon mode)", () => {
+  const L = "local";
+  const lstatus = (s: HostStatus["status"]) => status(s, { host: L });
+
+  it("starts the listeners with no Remote Hosts and applies \"local\" events; never probes agents", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : undefined));
+    const r = new HostRegistry();
+    await r.init([]);
+    expect(r.isConfigured(L)).toBe(false);
+    await r.setLocal(true);
+    expect(r.isConfigured(L)).toBe(true);
+    expect(r.getSnapshot().configs).toEqual([]);
+    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_status"]);
+    expect(invoke.mock.calls[0][1]).toEqual({ hosts: [] });
+    handlers["hosts:status"]({ payload: lstatus("connected") });
+    handlers["hosts:terminals"]({ payload: { host: L, list: [] } });
+    expect(r.isUsable(L)).toBe(true);
+    expect(r.getSnapshot().live[L]).toEqual([]);
+    await flush();
+    expect(invoke.mock.calls.filter(c => c[0] === "host_call")).toEqual([]);
+    await expect(r.waitUsable(L)).resolves.toBeUndefined();
+    r._dispose();
+  });
+
+  it("configure keeps the Local Host, configure([]) included", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined));
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    await r.setLocal(true);
+    handlers["hosts:status"]({ payload: lstatus("connected") });
+    handlers["hosts:terminals"]({ payload: { host: L, list: [] } });
+    await r.configure([]);
+    expect(r.isConfigured(L)).toBe(true);
+    expect(r.isUsable(L)).toBe(true);
+    expect(r.getSnapshot().live[L]).toEqual([]);
+    const configures = invoke.mock.calls.filter(c => c[0] === "hosts_configure");
+    expect(configures[configures.length - 1][1]).toEqual({ hosts: [] });
+    r._dispose();
+  });
+
+  it("joining a running registry reads the Local Host's status from a fresh snapshot", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [{ status: lstatus("connected"), terminals: [] }, { status: status("offline"), terminals: null }] : undefined));
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    // Ignored before setLocal: not configured yet.
+    expect(r.getStatus(L)).toBeUndefined();
+    handlers["hosts:status"]({ payload: status("connected") });
+    await r.setLocal(true);
+    expect(r.isUsable(L)).toBe(true);
+    expect(r.getSnapshot().live[L]).toEqual([]);
+    // The fresh snapshot only fills in the Local Host.
+    expect(r.getStatus(H)?.status).toBe("connected");
+    r._dispose();
+  });
+
+  it("without setLocal, \"local\" events are ignored (in-process mode)", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : undefined));
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    handlers["hosts:status"]({ payload: lstatus("connected") });
+    handlers["hosts:terminals"]({ payload: { host: L, list: [] } });
+    expect(r.getStatus(L)).toBeUndefined();
+    expect(L in r.getSnapshot().live).toBe(false);
+    await expect(r.waitUsable(L)).rejects.toMatchObject({ code: "unknown-host" });
+    r._dispose();
+  });
+});

@@ -23,7 +23,32 @@ pub enum DialError {
     Failed {
         message: String,
         hint: Option<HostErrorHint>,
+        /// The OS error behind a local socket failure, so a dialer can tell a missing
+        /// Daemon (`NotFound`, `ConnectionRefused`) from any other failure.
+        kind: Option<std::io::ErrorKind>,
     },
+}
+
+impl DialError {
+    /// A failure with no OS error kind attached.
+    pub fn failed(message: impl Into<String>, hint: Option<HostErrorHint>) -> Self {
+        DialError::Failed {
+            message: message.into(),
+            hint,
+            kind: None,
+        }
+    }
+
+    /// Whether this is a local socket nobody listens on: missing, or refusing connections.
+    pub fn no_listener(&self) -> bool {
+        matches!(
+            self,
+            DialError::Failed {
+                kind: Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused),
+                ..
+            }
+        )
+    }
 }
 
 /// Opens one connection per attempt. `dial` returns promptly once `cancel` fires, and is
@@ -64,10 +89,10 @@ impl Dialer for CommandDialer {
             Ok(p) => p,
             Err(_) if cancel.is_cancelled() => return Err(DialError::Cancelled),
             Err(e) => {
-                return Err(DialError::Failed {
-                    message: format!("cannot run {}: {e}", self.transport.describe()),
-                    hint: classify_ssh_failure("", Some(&e), None),
-                })
+                return Err(DialError::failed(
+                    format!("cannot run {}: {e}", self.transport.describe()),
+                    classify_ssh_failure("", Some(&e), None),
+                ))
             }
         };
         let io = LinkIo {
@@ -110,6 +135,8 @@ impl Connection for Proc {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use unix::{connect_nb, Pending};
 #[cfg(unix)]
 pub use unix::{connect_unix, UnixSocketDialer, CONNECT_TIMEOUT};
 
@@ -149,6 +176,7 @@ mod unix {
         DialError::Failed {
             message: format!("cannot connect to {}: {e}", path.display()),
             hint: None,
+            kind: Some(e.kind()),
         }
     }
 
@@ -179,13 +207,13 @@ mod unix {
         }
     }
 
-    pub(super) enum Pending {
+    pub(crate) enum Pending {
         Done(UnixStream),
         InProgress(OwnedFd),
     }
 
     /// One non-blocking `connect`. The stream is blocking again once connected.
-    pub(super) fn connect_nb(path: &Path) -> io::Result<Pending> {
+    pub(crate) fn connect_nb(path: &Path) -> io::Result<Pending> {
         let bytes = path.as_os_str().as_bytes();
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
@@ -444,9 +472,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.sock");
         match (UnixSocketDialer { path: path.clone() }).dial(&CancelToken::new()) {
-            Err(DialError::Failed { message, hint }) => {
+            Err(DialError::Failed {
+                message,
+                hint,
+                kind,
+            }) => {
                 assert!(message.contains(&path.display().to_string()), "{message}");
                 assert_eq!(hint, None);
+                assert_eq!(kind, Some(std::io::ErrorKind::NotFound));
             }
             Err(e) => panic!("{e:?}"),
             Ok(_) => panic!("connected to nothing"),

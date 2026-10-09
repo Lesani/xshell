@@ -1119,3 +1119,96 @@ pub fn ok_pid(v: &Value) -> i32 {
 pub fn get_home(c: &mut Client) -> Value {
     c.call("get_home_dir", json!({})).unwrap()
 }
+
+// ── GUI-bound Daemons ─────────────────────────────────────────────────────
+
+/// A stand-in for the xshell app: `sh` starts `xshelld serve --gui-bound --parent-pid $$`
+/// in the background, then becomes `sleep`, so the parent stays the same process. Dropping it
+/// SIGKILLs the parent (the Daemon follows) and waits for the Daemon.
+pub struct GuiParent {
+    pub child: Child,
+    daemon_pid_file: PathBuf,
+}
+
+impl GuiParent {
+    pub fn start(h: &TestHome, env: &[(&str, &str)]) -> GuiParent {
+        let daemon_pid_file = h.root().join(format!("gui-daemon.{}.pid", Uuid::new_v4()));
+        let base = bin_cmd(h);
+        let mut c = Command::new("/bin/sh");
+        for (k, v) in base.get_envs() {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        c.arg("-c")
+            .arg(
+                r#""$0" serve --gui-bound --parent-pid $$ </dev/null >/dev/null 2>&1 &
+echo $! > "$1"
+exec sleep 600"#,
+            )
+            .arg(bin())
+            .arg(&daemon_pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        GuiParent {
+            child: c.spawn().unwrap(),
+            daemon_pid_file,
+        }
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.child.id() as i32
+    }
+
+    /// The Daemon's pid, as the parent saw it start.
+    pub fn daemon_pid(&self) -> i32 {
+        let deadline = Instant::now() + T;
+        loop {
+            if let Some(p) = fs::read_to_string(&self.daemon_pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return p;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the parent did not start xshelld"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// SIGKILL the parent (the app crashing) and reap it.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for GuiParent {
+    fn drop(&mut self) {
+        let daemon = fs::read_to_string(&self.daemon_pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+        self.kill();
+        if let Some(p) = daemon {
+            if !wait_dead(p, Duration::from_secs(10)) {
+                unsafe { libc::kill(p, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// Count the lines of the Daemon log containing `needle`.
+pub fn log_lines(h: &TestHome, needle: &str) -> usize {
+    fs::read_to_string(h.paths().log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains(needle))
+        .count()
+}

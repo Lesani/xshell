@@ -100,3 +100,11 @@ describe("agent status text", () => {
     expect(wrapLines("x".repeat(70))).toBe("x".repeat(70));
   });
 });
+
+describe("agentStatusOf: local Daemon Tabs", () => {
+  const ld: Tab = { id: "remote-u1", type: "terminal", title: "T", terminal: "u1", agent: "claude", projectPath: "/p" };
+  it("read the live list, not the in-process store", () => {
+    expect(agentStatusOf(ld, ctx({ live: [info("working")], status: status("connected"), local: new Map([[ld.id, "finished"]]) }))).toEqual({ status: "working", stale: false });
+    expect(agentStatusOf(ld, ctx({ live: undefined, local: new Map([[ld.id, "finished"]]) }))).toBeNull();
+  });
+});

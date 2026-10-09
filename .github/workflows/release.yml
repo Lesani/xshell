@@ -14,10 +14,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux and macOS bundle the xshelld sidecar (tauri.daemon.conf.json): local
+          # Terminals run in a GUI-bound Daemon (ADR-0005). Windows does not yet (#24).
           - platform: macos-latest
-            args: '--target universal-apple-darwin'
+            args: '--target universal-apple-darwin --config src-tauri/tauri.daemon.conf.json'
           - platform: ubuntu-22.04
-            args: ''
+            args: '--config src-tauri/tauri.daemon.conf.json'
           - platform: windows-latest
             args: ''
 
@@ -57,6 +59,28 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      # The sidecar the app starts as its GUI-bound Daemon. Its own profile keeps
+      # `panic = "unwind"` (see Cargo.toml). Tauri finds it as binaries/xshelld-<triple> and
+      # installs it as `xshelld` next to the app's executable.
+      - name: Build the xshelld sidecar
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          mkdir -p binaries
+          if [ "${{ matrix.platform }}" = macos-latest ]; then
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              cargo build -p xshelld --profile release-daemon --locked --target "$t"
+            done
+            lipo -create -output binaries/xshelld-universal-apple-darwin \
+              target/aarch64-apple-darwin/release-daemon/xshelld \
+              target/x86_64-apple-darwin/release-daemon/xshelld
+          else
+            cargo build -p xshelld --profile release-daemon --locked
+            triple="$(rustc -vV | sed -n 's/^host: //p')"
+            cp target/release-daemon/xshelld "binaries/xshelld-$triple"
+          fi
 
       - name: Build and publish (Tauri)
         uses: tauri-apps/tauri-action@v0

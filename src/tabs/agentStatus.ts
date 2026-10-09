@@ -1,6 +1,7 @@
 import type { Tab } from "../types";
 import { fmt, type StringKey } from "../hosts/strings";
 import { isUsableStatus } from "../hosts/registry";
+import { daemonHost } from "../hosts/localHost";
 import type { AgentStatus, HostStatus, TerminalInfo } from "../hosts/types";
 
 // A Tab's Agent Status and how the tab bar words it. Pure: TabBar renders the result, tests
@@ -20,10 +21,11 @@ export function asAgentStatus(v: unknown): AgentStatus | null {
 }
 
 export interface AgentStatusContext {
-  // Remote Tabs: the Host's last known `terminals` list and its status. Ignored for Local Tabs.
+  // Daemon Tabs (Remote, and Local ones on "local"; see `daemonHost`): the Host's last known
+  // `terminals` list and its status. Ignored for in-process Tabs.
   live: TerminalInfo[] | null | undefined;
   status: HostStatus | undefined;
-  // Local Tabs: the statuses by Tab id.
+  // In-process Local Tabs: the statuses by Tab id.
   local: ReadonlyMap<string, AgentStatus>;
 }
 
@@ -36,7 +38,7 @@ export interface TabAgentStatus {
 export function agentStatusOf(tab: Tab, c: AgentStatusContext): TabAgentStatus | null {
   if ((tab.shellMode || "claude") === "raw") return null;
   if (!HOOK_AGENTS.includes(tab.agent || "claude")) return null;
-  if (!tab.host) {
+  if (!daemonHost(tab)) {
     const s = asAgentStatus(c.local.get(tab.id));
     return s ? { status: s, stale: false } : null;
   }

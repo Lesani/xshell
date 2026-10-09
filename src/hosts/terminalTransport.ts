@@ -2,11 +2,13 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import type { Tab } from "../types";
 import { getShellById } from "../shells";
 import { registry } from "./registry";
+import { daemonHost } from "./localHost";
 import { backoffDelay, sleep } from "./backoff";
 import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type RemoteExit, type TerminalMeta } from "./types";
 
-// The one place TerminalTab talks to a PTY. Local tabs use today's spawn/write/resize/close
-// commands unchanged; remote tabs use host_term_* and a lifecycle controller that makes the
+// The one place TerminalTab talks to a PTY. In-process Local tabs use today's
+// spawn/write/resize/close commands unchanged; Daemon Tabs (Remote, and Local ones under the
+// wire id "local", see `daemonHost`) use host_term_* and a lifecycle controller that makes the
 // asynchronous start cancellable and idempotent (amendment 16).
 
 export interface TerminalSinks {
@@ -354,8 +356,9 @@ export interface MountedTerminal {
 }
 
 export function mountTerminal(tab: Tab, sinks: TerminalSinks): MountedTerminal {
-  if (tab.host && tab.terminal) {
-    const host = tab.host, uuid = tab.terminal;
+  const dh = daemonHost(tab);
+  if (dh && tab.terminal) {
+    const host = dh, uuid = tab.terminal;
     const gen = remoteTerminals.mount(host, uuid, sinks);
     return {
       start: (o, signal) => remoteTerminals.start(host, uuid, gen, o, signal),
@@ -388,11 +391,12 @@ export function mountTerminal(tab: Tab, sinks: TerminalSinks): MountedTerminal {
 // unmount), so the close survives whatever happens to the component; the later unmount sees
 // the intent and does not detach. Local tabs keep closing their PTY on unmount, as before.
 export function markClosing(tabs: Tab[]) {
-  for (const t of tabs) if (t.host && t.terminal) remoteTerminals.close(t.host, t.terminal);
+  for (const t of tabs) { const h = daemonHost(t); if (h && t.terminal) remoteTerminals.close(h, t.terminal); }
 }
 
 export function writeTerminal(tab: Tab, data: string) {
-  if (tab.host && tab.terminal) invoke("host_term_input", { host: tab.host, terminal: tab.terminal, data }).catch(() => {});
+  const h = daemonHost(tab);
+  if (h) invoke("host_term_input", { host: h, terminal: tab.terminal, data }).catch(() => {});
   else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
 }
 
@@ -401,14 +405,16 @@ export function writeTerminal(tab: Tab, data: string) {
 // Tab's current session (linked or switched after the start); a remote one the Daemon's.
 // Resolves once the new process runs.
 export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> {
-  if (tab.host && tab.terminal) {
-    await invoke("host_term_relaunch", { host: tab.host, terminal: tab.terminal, skipPermissions: value });
+  const h = daemonHost(tab);
+  if (h) {
+    await invoke("host_term_relaunch", { host: h, terminal: tab.terminal, skipPermissions: value });
   } else {
     await invoke("relaunch_terminal", { id: tab.id, skipPermissions: value, sessionId: tab.sessionId || null, agent: tab.agent || null });
   }
 }
 
 export function resizeTerminal(tab: Tab, cols: number, rows: number) {
-  if (tab.host && tab.terminal) invoke("host_term_resize", { host: tab.host, terminal: tab.terminal, cols, rows }).catch(() => {});
+  const h = daemonHost(tab);
+  if (h) invoke("host_term_resize", { host: h, terminal: tab.terminal, cols, rows }).catch(() => {});
   else invoke("resize_terminal", { id: tab.id, cols, rows }).catch(() => {});
 }

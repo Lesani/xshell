@@ -44,6 +44,19 @@ describe("metaSync", () => {
     expect(m.takeUpdates([{ ...local, title: "B" }])).toEqual([]);
   });
 
+  it("local Daemon Tabs send their updates to the wire Host \"local\"", () => {
+    const m = new MetaSync();
+    const before = tabFromTerminal(undefined, info("u", null, "New Chat"));
+    expect(before.host).toBeUndefined();
+    const after: Tab = { ...before, sessionId: "s1" };
+    for (const e of localEdits([before], [after])) m.markDirty(e.tabId, e.field, e.value);
+    const [u] = m.takeUpdates([after]);
+    expect(u).toMatchObject({ host: "local", terminal: "u", sessionId: "s1" });
+    m.settled(u, true);
+    m.observe("local", [info("u", "s1", "New Chat")], [after]);
+    expect(m.isDirty(after.id, "sessionId")).toBe(false);
+  });
+
   it("echo clears the entry; failure retries once then drops", () => {
     const m = new MetaSync();
     const t = tabFromTerminal(H, info("u", "s1", "Old"));

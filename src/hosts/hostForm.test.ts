@@ -44,6 +44,7 @@ describe("host form", () => {
   it("hints name the configured target", () => {
     expect(hintText("host-key", "dev")).toBe("Run `ssh dev` once in a terminal to accept the key.");
     expect(hintText("permission-denied", "u@h")).toBe("Set up SSH key access; verify `ssh -o BatchMode=yes u@h` works.");
+    expect(hintText("xshell-not-running", "dev")).toBe("xshell is closed on dev. Open it there; terminals are reachable only while it's open.");
     expect(hintText(null, "dev")).toBeNull();
   });
 });

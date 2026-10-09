@@ -81,3 +81,13 @@ describe("agents: bypassFlag", () => {
     expect(AGENT_IDS.filter(a => AGENTS[a].bypassFlag)).toEqual(["claude", "codex"]);
   });
 });
+
+describe("skipPermsState: local Daemon Tabs read the \"local\" list", () => {
+  const ld: Tab = { id: "remote-u1", type: "terminal", title: "T", terminal: "u1", sessionId: "stale", agent: "claude", projectPath: "/p" };
+  it("reads the flag and session from the live entry, not the Tab", () => {
+    expect(skipPermsOn({ ...ld, skipPermissions: true }, [info()])).toBe(false);
+    expect(skipPermsOn(ld, [info({ skipPermissions: true })])).toBe(true);
+    expect(skipPermsState(ld, ctx({ live: [info({ skipPermissions: true })], status: status("connected"), hostName: "This computer" }))).toEqual({ kind: "available", on: true });
+    expect(skipPermsState(ld, ctx({ live: [info()], status: status("reconnecting"), hostName: "This computer" }))).toEqual(disabled(fmt("tab.skipPerms.disabled.hostUnavailable", { host: "This computer" })));
+  });
+});

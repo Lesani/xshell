@@ -9,6 +9,8 @@ dist-ssr/
 # Tauri / Rust
 src-tauri/target/
 src-tauri/gen/schemas/
+# The xshelld sidecar the release build bundles (release.yml).
+src-tauri/binaries/
 
 # IDE
 .vscode/*

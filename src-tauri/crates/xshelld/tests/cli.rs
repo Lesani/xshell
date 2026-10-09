@@ -210,3 +210,76 @@ fn connect_reaps_a_losing_serve() {
     let _ = connect.kill();
     let _ = connect.wait();
 }
+
+/// After a GUI-bound Daemon ran here, `connect` starts none: a missing Daemon means xshell
+/// is closed on this machine.
+#[test]
+fn connect_never_starts_gui_bound_daemon() {
+    let h = TestHome::new();
+    let mut parent = GuiParent::start(&h, &[]);
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    drop(c);
+    let daemon = parent.daemon_pid();
+    parent.kill();
+    assert!(wait_dead(daemon, Duration::from_secs(3)));
+    let serving = log_lines(&h, "serving");
+
+    let out = bin_cmd(&h)
+        .arg("connect")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(xshell_protocol::NOT_RUNNING_EXIT));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("xshell is not running"), "{err}");
+    assert!(!err.contains("No such file") && !err.contains("Connection refused"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!h.paths().socket.exists());
+    assert!(!h.paths().pid.exists());
+    assert_eq!(log_lines(&h, "serving"), serving, "a Daemon was started");
+}
+
+#[test]
+fn connect_bridges_to_running_gui_bound_daemon() {
+    let h = TestHome::new();
+    let _parent = GuiParent::start(&h, &[]);
+    let mut c = Client::connect(&h.paths().socket);
+    c.hello(range(1, 1));
+    let t = Uuid::new_v4();
+    c.open(t, sh_spec(&h.project("p")));
+    let mut p = ConnectProc::start(&h);
+    let (_, list) = p.client.hello(range(1, 1));
+    assert_eq!(list.iter().map(|i| i.terminal).collect::<Vec<_>>(), vec![t]);
+    assert!(p.finish().success());
+}
+
+/// A Persistent `serve` takes the machine back from xshell: afterwards `connect` starts a
+/// Daemon again when none runs.
+#[test]
+fn persistent_serve_reenables_autostart() {
+    let h = TestHome::new();
+    let mut parent = GuiParent::start(&h, &[]);
+    Client::connect(&h.paths().socket).hello(range(1, 1));
+    let daemon = parent.daemon_pid();
+    parent.kill();
+    assert!(wait_dead(daemon, Duration::from_secs(3)));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
+
+    let mut serve = ServeProc::start(&h, &[]);
+    Client::connect(&h.paths().socket).hello(range(1, 1));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "persistent"
+    );
+    unsafe { libc::kill(serve.pid(), libc::SIGTERM) };
+    assert!(serve.wait_exit(T).is_some());
+
+    let _guard = DaemonGuard::new(&h);
+    let mut p = ConnectProc::start(&h);
+    p.client.hello(range(1, 1));
+    assert!(p.finish().success());
+}

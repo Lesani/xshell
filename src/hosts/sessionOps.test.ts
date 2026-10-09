@@ -121,3 +121,58 @@ describe("skip permissions is never part of a remote open", () => {
     }
   });
 });
+
+describe("local Daemon mode (ADR-0005): new Local Tabs are Daemon Terminals", () => {
+  const UUID = "11111111-2222-3333-4444-555555555555";
+  // The Local Host is never refused, whatever its status: the Tab waits while it starts.
+  const lctx = (over: Partial<OpenContext> = {}) => ctx({ localDaemon: true, usable: false, isConfigured: () => false, ...over });
+
+  it("open session: remote-<uuid> id, no host, pending on \"local\", agent spec without a wrapper", () => {
+    const plan = planOpenSession(session(), project, [], lctx());
+    if (plan.kind !== "create") throw new Error("expected create");
+    expect(plan.tab).toEqual({ id: `remote-${UUID}`, terminal: UUID, type: "terminal", title: "Fix bug", sessionId: "s1", agent: "claude", projectPath: "/home/u/proj", projectName: "proj", lastActiveAt: NOW, createdAt: NOW });
+    expect(plan.tab.host).toBeUndefined();
+    expect(plan.pending).toEqual({ uuid: UUID, open: {
+      host: "local", state: "opening",
+      spec: { agent: "claude", sessionId: "s1", cwd: "/home/u/proj", shellMode: "claude", shellId: null, shellCommand: null, fullscreenRendering: true, forceSyncOutput: true },
+      meta: { title: "Fix bug", projectName: "proj", createdAt: NOW },
+    } });
+  });
+
+  it("new chat: claude gets its session id, other agents none; no wrapper", () => {
+    const c = planNewChat(project, "claude", lctx());
+    if (c.kind !== "create") throw new Error("expected create");
+    expect(c.tab).toMatchObject({ id: `remote-${UUID}`, terminal: UUID, sessionId: UUID, agent: "claude", title: "New Chat" });
+    expect(c.tab.host).toBeUndefined();
+    expect(c.pending?.open).toMatchObject({ host: "local", spec: { agent: "claude", sessionId: UUID, shellId: null, shellCommand: null, cwd: "/home/u/proj" } });
+    const x = planNewChat(project, "codex", lctx());
+    if (x.kind !== "create") throw new Error("expected create");
+    expect(x.tab.sessionId).toBeUndefined();
+    expect(x.pending?.open.spec).toMatchObject({ agent: "codex", sessionId: null, shellId: null, shellCommand: null });
+  });
+
+  it("raw shell keeps its preset command; no project → home directory", () => {
+    const s = planNewShell(null, "bash", "Bash", lctx());
+    if (s.kind !== "create") throw new Error("expected create");
+    expect(s.tab).toMatchObject({ id: `remote-${UUID}`, terminal: UUID, shellMode: "raw", shellId: "bash", projectPath: "", projectName: "~", title: "Bash" });
+    expect(s.tab.host).toBeUndefined();
+    expect(s.pending?.open).toMatchObject({ host: "local", spec: { agent: null, sessionId: null, cwd: "", shellMode: "raw", shellId: "bash", shellCommand: "bash" } });
+    const p = planNewShell(project, "bash", "Bash", lctx());
+    expect(p.kind === "create" && p.pending?.open.spec.cwd).toBe("/home/u/proj");
+  });
+
+  it("Remote plans are unchanged in local Daemon mode", () => {
+    expect(planOpenSession(session({ host: H }), remoteProject, [], ctx({ localDaemon: true }))).toEqual(planOpenSession(session({ host: H }), remoteProject, [], ctx()));
+    expect(planNewChat(remoteProject, "claude", ctx({ localDaemon: true, usable: false })).kind).toBe("refuse");
+  });
+
+  it("localDaemon false: exactly the in-process plans", () => {
+    for (const c of [ctx(), ctx({ localDaemon: false })]) {
+      expect(planOpenSession(session(), project, [], c)).toEqual({ kind: "create", tab: { id: `terminal-s1-${NOW.toString(36)}`, type: "terminal", title: "Fix bug", sessionId: "s1", agent: "claude", projectPath: "/home/u/proj", projectName: "proj", lastActiveAt: NOW } });
+      expect(planNewShell(null, "bash", "Bash", c)).toEqual({ kind: "create", tab: { id: `terminal-shell-${NOW}`, type: "terminal", title: "Bash", projectPath: "", projectName: "~", shellMode: "raw", shellId: "bash", lastActiveAt: NOW } });
+      const nc = planNewChat(project, "codex", c);
+      expect(nc.kind === "create" && nc.tab.id).toBe(`terminal-new-${NOW}`);
+      expect(nc.kind === "create" && nc.pending).toBeUndefined();
+    }
+  });
+});

@@ -16,3 +16,37 @@ macro_rules! log {
         $crate::log::write($level, format_args!($($arg)*))
     };
 }
+
+/// Rotated once it is this big: the old log becomes `xshelld.log.1`.
+const LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Open the Daemon log for appending (0600, its directory private), rotating it first when
+/// it has grown past 5 MiB. `serve`'s stdout and stderr go here.
+pub fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        crate::paths::ensure_private_dir(dir)?;
+    }
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > LOG_ROTATE_BYTES) {
+        let mut old = path.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(path, old);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Point this process's stdout and stderr at the Daemon log (see [`open_log`]).
+pub fn redirect_to_log(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let f = open_log(path)?;
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::dup2(f.as_raw_fd(), fd) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}

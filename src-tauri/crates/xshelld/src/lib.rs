@@ -46,7 +46,6 @@ pub fn main_entry() -> i32 {
     if serve {
         // Before any thread exists, so only the sigwait thread ever receives them.
         server::block_exit_signals();
-        env::prepare();
     }
     let Some(home) = opts.home.clone().or_else(dirs::home_dir) else {
         eprintln!("xshelld: cannot determine the home directory; pass --home");
@@ -54,16 +53,76 @@ pub fn main_entry() -> i32 {
     };
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let paths = paths::resolve(&home, xdg.as_deref(), opts.socket.as_deref());
-    if serve {
-        let mut cfg = server::Config::new(home, paths);
-        if let Some(t) = opts.idle_timeout {
-            cfg.idle_timeout = t;
-        }
-        cfg.test_hook = crash_after_replacement_hook();
-        server::run_serve(cfg)
-    } else {
-        connect::run_connect(&opts, &paths)
+    if !serve {
+        return connect::run_connect(&opts, &paths);
     }
+    let gui_bound = opts
+        .parent_pid
+        .map(|parent_pid| server::GuiBound { parent_pid });
+    let stop = std::sync::Arc::new(server::StopLatch::default());
+    if let Some(g) = gui_bound {
+        // Nobody reads our output: it goes to the log, as for a `serve` `connect` starts.
+        if let Err(e) = log::redirect_to_log(&paths.log) {
+            crate::log!("WARN", "cannot log to {}: {e}", paths.log.display());
+        }
+        // Armed first: the parent may die while the login shell or the restore is slow.
+        let s = stop.clone();
+        if let Err(e) = server::parent::watch(g.parent_pid, move || s.trigger()) {
+            crate::log!("ERROR", "cannot start: {e}");
+            return 1;
+        }
+    }
+    if let Err(e) = server::watch_exit_signals(stop.clone()) {
+        crate::log!("ERROR", "cannot start: {e}");
+        return 1;
+    }
+    env::prepare(gui_bound.is_some(), &|| stop.is_set());
+    if stop.is_set() {
+        crate::log!("INFO", "stopped while starting; exiting");
+        return 0;
+    }
+    let mut cfg = server::Config::new(home, paths);
+    if let Some(t) = opts.idle_timeout {
+        cfg.idle_timeout = t;
+    }
+    cfg.gui_bound = gui_bound;
+    cfg.test_hook = test_hook();
+    server::run_serve(cfg, stop)
+}
+
+/// The test hooks the environment asks for (see [`crash_after_replacement_hook`] and
+/// [`restore_delay_hook`]).
+fn test_hook() -> Option<server::TestHook> {
+    let hooks: Vec<server::TestHook> = [crash_after_replacement_hook(), restore_delay_hook()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if hooks.is_empty() {
+        return None;
+    }
+    Some(server::TestHook(std::sync::Arc::new(move |id, point| {
+        // Every hook runs, whatever an earlier one returned.
+        let mut any = false;
+        for h in &hooks {
+            any |= (h.0)(id, point);
+        }
+        any
+    })))
+}
+
+/// Test hook: with `XSHELLD_TEST_RESTORE_DELAY_MS=<ms>`, restore waits that long before
+/// each persisted Terminal, so a test can end the parent while a start is in progress.
+fn restore_delay_hook() -> Option<server::TestHook> {
+    let ms: u64 = std::env::var("XSHELLD_TEST_RESTORE_DELAY_MS")
+        .ok()?
+        .parse()
+        .ok()?;
+    Some(server::TestHook(std::sync::Arc::new(move |_, point| {
+        if point == server::TestPoint::Restore {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        false
+    })))
 }
 
 /// Test hook: with `XSHELLD_TEST_CRASH_AFTER_REPLACEMENT=<file>`, `serve` aborts (a crash: no

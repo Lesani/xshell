@@ -2,6 +2,7 @@ import type { Tab } from "../types";
 import { AGENTS } from "../agents";
 import { fmt } from "../hosts/strings";
 import { isUsableStatus } from "../hosts/registry";
+import { daemonHost } from "../hosts/localHost";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
 
 // Whether a Tab offers "skip permissions" and in what state. Pure: TerminalTab renders the
@@ -16,7 +17,8 @@ export type SkipPermsState =
   | { kind: "available"; on: boolean };
 
 export interface SkipPermsContext {
-  // Remote Tabs: the Host's live `terminals` list and status. Ignored for Local Tabs.
+  // Daemon Tabs (Remote, and Local ones on "local"): the Host's live `terminals` list and
+  // status. Ignored for in-process Tabs.
   live: TerminalInfo[] | null | undefined;
   status: HostStatus | undefined;
   hostName: string;
@@ -29,7 +31,7 @@ export interface SkipPermsContext {
 // Whether the flag is on. A remote Tab reads it from the Daemon's spec (ADR-0001), never
 // from its own copy.
 export function skipPermsOn(tab: Tab, live: TerminalInfo[] | null | undefined): boolean {
-  if (!tab.host) return !!tab.skipPermissions;
+  if (!daemonHost(tab)) return !!tab.skipPermissions;
   return !!live?.find(i => i.terminal === tab.terminal)?.spec.skipPermissions;
 }
 
@@ -38,7 +40,7 @@ export function skipPermsState(tab: Tab, c: SkipPermsContext): SkipPermsState {
   if (!AGENTS[tab.agent || "claude"].bypassFlag) return { kind: "hidden" };
   let sessionId = tab.sessionId;
   let ended = c.localEnded;
-  if (tab.host) {
+  if (daemonHost(tab)) {
     if (!isUsableStatus(c.status)) return { kind: "disabled", reason: fmt("tab.skipPerms.disabled.hostUnavailable", { host: c.hostName }) };
     // A Daemon that cannot restart Terminals never gets the request.
     if (!c.status?.daemonCapabilities?.includes(RELAUNCH_CAPABILITY)) return { kind: "hidden" };

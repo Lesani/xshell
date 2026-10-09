@@ -69,6 +69,8 @@ pub enum HostErrorHint {
     UnsupportedPlatform,
     BinaryUnavailable,
     DaemonCommandFailed,
+    /// The Host's Daemon is run by xshell there, and xshell is closed (ADR-0005).
+    XshellNotRunning,
 }
 
 /// Map an ssh failure to a hint. `stderr` is ssh's (and the remote command's) stderr.
@@ -82,6 +84,10 @@ pub fn classify_ssh_failure(
     }
     let s = stderr;
     let has = |needle: &str| s.contains(needle);
+    if exit == Some(xshell_protocol::NOT_RUNNING_EXIT) && has(xshell_protocol::NOT_RUNNING_MESSAGE)
+    {
+        return Some(HostErrorHint::XshellNotRunning);
+    }
     if has("Host key verification failed")
         || has("REMOTE HOST IDENTIFICATION HAS CHANGED")
         || has("host key is known for")
@@ -155,6 +161,21 @@ mod tests {
         let nf = io::Error::from(io::ErrorKind::NotFound);
         assert_eq!(classify_ssh_failure("", Some(&nf), None), Some(SshMissing));
         assert_eq!(classify_ssh_failure("weird", None, Some(1)), None);
+    }
+
+    #[test]
+    fn classify_xshell_not_running() {
+        let text = format!("xshelld: {}\n", xshell_protocol::NOT_RUNNING_MESSAGE);
+        assert_eq!(
+            classify_ssh_failure(&text, None, Some(4)),
+            Some(XshellNotRunning)
+        );
+        // Only with the exit code that goes with it.
+        assert_eq!(classify_ssh_failure(&text, None, Some(1)), None);
+        assert_eq!(
+            serde_json::to_string(&XshellNotRunning).unwrap(),
+            r#""xshell-not-running""#
+        );
     }
 
     #[test]

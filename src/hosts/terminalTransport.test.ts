@@ -439,3 +439,35 @@ describe("skip permissions", () => {
     await expect(relaunchTerminal({ ...tab, host: H, terminal: "u9" }, true)).rejects.toEqual({ code: "invalid", message: "nope" });
   });
 });
+
+describe("local Daemon Tabs (terminal set, no host) route host_term_* with \"local\"", () => {
+  const local: Tab = { id: "remote-l1", type: "terminal", title: "L", terminal: "l1" };
+
+  it("open, input, resize, relaunch and close go to the wire Host \"local\"", async () => {
+    invoke.mockResolvedValue({ pid: 3 });
+    pendingOpens.set("l1", { host: "local", spec: { cwd: "/p", shellId: null, shellCommand: null }, meta: {}, state: "opening" });
+    const t = mountTerminal(local, sinks().s);
+    await t.start(opts);
+    writeTerminal(local, "x");
+    resizeTerminal(local, 10, 5);
+    await relaunchTerminal(local, true);
+    markClosing([local]);
+    await flush();
+    t.end();
+    expect(invoke.mock.calls.map(c => [c[0], c[1].host])).toEqual([
+      ["host_term_open", "local"], ["host_term_input", "local"], ["host_term_resize", "local"],
+      ["host_term_relaunch", "local"], ["host_term_close", "local"],
+    ]);
+    expect(calls("spawn_terminal")).toEqual([]);
+  });
+
+  it("an unmount without close intent detaches from \"local\"", async () => {
+    invoke.mockResolvedValue({ exitCode: null });
+    const tab: Tab = { id: "remote-l2", type: "terminal", title: "L", terminal: "l2" };
+    const t = mountTerminal(tab, sinks().s);
+    await t.start(opts);
+    t.end();
+    expect(calls("host_term_attach")[0][1]).toMatchObject({ host: "local", terminal: "l2" });
+    expect(calls("host_term_detach")).toEqual([["host_term_detach", { host: "local", terminal: "l2" }]]);
+  });
+});

@@ -33,6 +33,8 @@ pub(crate) struct Daemon {
     pub hooks: Option<xshell_core::agent_status::AgentHooks>,
     /// The next Terminal process's run number (see `Terminal::run`).
     pub next_run: AtomicU64,
+    /// Hung-up process groups whose SIGKILL is still due, Terminal listed or not.
+    pub escalations: Arc<orphans::Escalations>,
 }
 
 #[derive(Default)]
@@ -175,9 +177,16 @@ impl Daemon {
         }
     }
 
+    /// Whether [`Config::abort`] fired.
+    fn aborted(&self) -> bool {
+        self.cfg.abort.as_ref().is_some_and(|a| a.is_set())
+    }
+
     /// Relaunch every persisted Terminal under its UUID, ending leftovers of the previous
-    /// run first. A Terminal that fails to start is dropped.
-    pub fn restore(self: &Arc<Self>) {
+    /// run first. A Terminal that fails to start is dropped. `false`: [`Config::abort`]
+    /// fired, so restore stopped early and saved nothing (the state file keeps every
+    /// Terminal for the next start).
+    pub fn restore(self: &Arc<Self>) -> bool {
         let loaded = match state::load(&self.cfg.paths.state) {
             Ok(l) => l,
             Err(e) => {
@@ -195,6 +204,12 @@ impl Daemon {
         let mut reg = self.reg.lock().unwrap();
         let had = loaded.terminals.len();
         for p in loaded.terminals {
+            self.test_point(p.terminal, TestPoint::Restore);
+            if self.aborted() {
+                // Under the lock: no exit of a Terminal restored so far saves a shorter list.
+                reg.frozen = true;
+                return false;
+            }
             // No budget check here: budgets bound new mutations, and a record saved under an
             // earlier limit is never dropped for its size.
             if let Some(leader) = &p.leader {
@@ -230,10 +245,15 @@ impl Daemon {
                 Err(e) => crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal),
             }
         }
+        if self.aborted() {
+            reg.frozen = true;
+            return false;
+        }
         if had > 0 || self.cfg.paths.state.exists() {
             self.persist(&reg);
         }
         self.touch_idle(&mut reg);
+        true
     }
 
     pub fn accept_loop(self: Arc<Self>, listener: UnixListener) {
@@ -262,6 +282,10 @@ impl Daemon {
     }
 
     pub fn supervise(self: Arc<Self>) {
+        // A GUI-bound Daemon lives exactly as long as the app.
+        if self.cfg.gui_bound.is_some() {
+            return;
+        }
         let tick = (self.cfg.idle_timeout / 4).min(Duration::from_secs(1));
         loop {
             std::thread::sleep(tick);
@@ -292,15 +316,20 @@ impl Daemon {
             reg.frozen = true;
             reg.terminals.values().cloned().collect()
         };
+        let hung_up = Instant::now();
         for t in &terms {
             t.kill(self.cfg.kill_grace);
         }
-        let deadline = Instant::now() + self.cfg.kill_grace * 2 + Duration::from_secs(2);
+        let deadline = hung_up + self.cfg.kill_grace * 2 + Duration::from_secs(2);
         for t in &terms {
             if !t.wait_exited(deadline) {
                 crate::log!("WARN", "terminal {} did not end in time", t.id);
             }
         }
+        // A Terminal's exit is its leader's; a process of its group that ignores the hangup
+        // must still get its SIGKILL before this process, and the kill timers, are gone.
+        // That includes Terminals closed earlier, which left the list already.
+        self.escalations.drain(deadline);
 
         self.stopping.store(true, Ordering::SeqCst);
         // Wake the accept loop.

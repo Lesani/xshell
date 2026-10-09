@@ -310,7 +310,7 @@ export interface Tab {
   lastActiveAt?: number; // ms epoch — bumped whenever the tab becomes the focused leaf; drives "recent" sort in the tab search dialog
   createdAt?: number; // ms epoch at tab creation (stable, unlike lastActiveAt) — lets the title-sync link an unlinked agent tab to a session that appeared after it opened
   host?: HostId;     // Remote Host the Terminal runs on; absent = Local Host
-  terminal?: string; // remote Terminal UUID (the tab id is `remote-<uuid>`)
+  terminal?: string; // Daemon Terminal UUID (the tab id is `remote-<uuid>`); set on a Local Tab too when it runs in the local Daemon
   skipPermissions?: boolean; // the agent runs without permission prompts; remote tabs mirror the Daemon's spec
 }
 

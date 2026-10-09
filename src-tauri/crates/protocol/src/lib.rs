@@ -27,6 +27,14 @@ pub const CAPABILITIES: &[&str] = &[
     "agent.status",
 ];
 
+/// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
+/// is GUI-bound, ADR-0005) and xshell is closed: nothing was started.
+pub const NOT_RUNNING_EXIT: i32 = 4;
+/// What `connect` prints after `xshelld: ` with [`NOT_RUNNING_EXIT`]. It avoids the phrases
+/// ssh failures are recognized by ("No such file", "Connection refused").
+pub const NOT_RUNNING_MESSAGE: &str =
+    "xshell is not running here; terminals are reachable only while xshell is open";
+
 #[cfg(test)]
 mod tests {
     use super::*;

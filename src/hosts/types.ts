@@ -1,7 +1,10 @@
 // TS mirror of the Desktop ↔ Remote Host contract (Rust serde camelCase; enum values
 // kebab-case). The Rust side lives in src-tauri/crates/hostlink and src-tauri/src/hosts.
 
-export type HostId = string; // ^h_[a-z0-9]{8}$ ; "local" is reserved and never sent
+// ^h_[a-z0-9]{8}$ for Remote Hosts. "local" (`LOCAL_HOST`) names the Local Host on the wire
+// only (its Terminals through the Daemon this Desktop runs); it is never configured and never a
+// Tab's or Project's `host`.
+export type HostId = string;
 
 export interface HostConfig {
   id: HostId;
@@ -24,7 +27,9 @@ export type HostErrorHint =
   | "ssh-missing"
   | "unsupported-platform"
   | "binary-unavailable"
-  | "daemon-command-failed";
+  | "daemon-command-failed"
+  // The Host's xshell is closed, and its terminals run only while it is open.
+  | "xshell-not-running";
 
 export interface HostStatus {
   host: HostId;

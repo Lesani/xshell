@@ -102,6 +102,8 @@ pub(crate) struct Terminal {
     pub run: u64,
     /// The Agent Status of this run. Locked last, never across another lock.
     status: Mutex<Tracker>,
+    /// The Daemon's pending SIGKILLs, which [`Terminal::kill`] adds to.
+    escalations: Arc<super::orphans::Escalations>,
 }
 
 /// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
@@ -234,6 +236,7 @@ pub(crate) fn spawn_with(
         kept_leader: None,
         run,
         status: Mutex::new(tracker),
+        escalations: d.escalations.clone(),
     });
     let tag = short(&id);
 
@@ -680,6 +683,9 @@ impl Terminal {
                 unsafe { libc::killpg(g, libc::SIGHUP) };
             }
         }
+        // Recorded until the timer ran, so an exit in between still sends the SIGKILL.
+        let esc = self.escalations.clone();
+        let entry = esc.add(groups.clone(), Instant::now() + grace);
         let r = std::thread::Builder::new()
             .name(format!("pty-kill-{}", short(&self.id)))
             .spawn(move || {
@@ -689,6 +695,7 @@ impl Terminal {
                         unsafe { libc::killpg(g, libc::SIGKILL) };
                     }
                 }
+                esc.done(entry);
             });
         if let Err(e) = r {
             crate::log!("ERROR", "cannot start kill timer for {}: {e}", self.id);
@@ -834,6 +841,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         kept_leader: p.leader,
         run: d.next_run.fetch_add(1, Ordering::SeqCst),
         status: Mutex::new(status),
+        escalations: d.escalations.clone(),
     };
     Arc::new(t)
 }

@@ -9,6 +9,8 @@ import { registry, HostUnknownError } from "../hosts/registry";
 import { useHostLive, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import { HostBadge } from "./HostBadge";
+import { daemonHost, isLocalHost } from "../hosts/localHost";
+import { terminalHostState, terminalHostStateText, terminalOpenFailedText } from "../hosts/terminalState";
 import { load } from "@tauri-apps/plugin-store";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -227,11 +229,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const startOptsRef = useRef<StartOptions | null>(null);
   const isActiveRef = useRef(isActive);
   useEffect(() => { isActiveRef.current = isActive; }, [isActive]);
-  // Remote Tabs: Host Status drives the overlays; the live list carries the exit code.
-  const hostStatus = useHostStatus(tab.host);
-  const hostLive = useHostLive(tab.host);
+  // Daemon Tabs (Remote, and Local on "local"): Host Status drives the overlays; the live
+  // list carries the exit code.
+  const liveHost = daemonHost(tab);
+  const localDaemonTab = isLocalHost(liveHost);
+  const hostStatus = useHostStatus(liveHost ?? undefined);
+  const hostLive = useHostLive(liveHost ?? undefined);
   const hostsSnap = useHostsSnapshot();
-  const hostName = tab.host ? (hostsSnap.configs.find(c => c.id === tab.host)?.name || tab.host) : "";
+  const hostName = tab.host ? (hostsSnap.configs.find(c => c.id === tab.host)?.name || tab.host) : localDaemonTab ? fmt("picker.group.local") : "";
   const [inputPaused, setInputPaused] = useState(false);
   const inputPausedTimerRef = useRef<number | null>(null);
   const flashInputPaused = useCallback(() => {
@@ -512,7 +517,8 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         setEnded(true);
       },
     });
-    const remoteHost = tabRef.current.host;
+    // The Host whose Daemon runs this Tab's Terminal ("local" for a Local Daemon Tab).
+    const remoteHost = daemonHost(tabRef.current);
     let inputDisposable: { dispose(): void } | null = null;
     let resizeDisposable: { dispose(): void } | null = null;
     let resizeTimer: number | undefined;
@@ -634,7 +640,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         setIsInitializing(false);
         if (remoteHost) {
           const message = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
-          term.write(`\x1b[31m${fmt("terminal.remote.openFailed", { host: registry.hostName(remoteHost), error: message })}\x1b[0m\r\n`);
+          term.write(`\x1b[31m${terminalOpenFailedText(isLocalHost(remoteHost), registry.hostName(remoteHost), message)}\x1b[0m\r\n`);
           return;
         }
         term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
@@ -830,7 +836,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     setSkipBusy(true);
     try {
       await relaunchTerminal(tab, value);
-      if (!tab.host) onSkipPermissionsChange(tab.id, value);
+      if (!tab.terminal) onSkipPermissionsChange(tab.id, value);
     } catch (err) {
       const error = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
       showSkipError(fmt("tab.skipPerms.failed", { error }));
@@ -1101,16 +1107,9 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // numbers for this session AND the user hasn't opted out via the Agents tab toggle.
   // Without authoritative stats the cost would always be $0 and the bar empty — falls back
   // to the plain path in that case (or whenever the user has explicitly disabled the strip).
-  // Remote Host state for the overlay/banner: null when local or usable.
-  const remoteState: null | "waiting" | "reconnecting" | "offline" | "incompatible" = (() => {
-    if (!tab.host) return null;
-    const st = hostStatus?.status;
-    if (st === "connected" || st === "upgrade-pending") return null;
-    if (st === "incompatible") return "incompatible";
-    if (st === "offline") return "offline";
-    return hostLive == null || !startedRef.current ? "waiting" : "reconnecting";
-  })();
-  const remoteStateText = remoteState ? fmt(`terminal.remote.${remoteState}` as const, { host: hostName }) : null;
+  // Daemon Host state for the overlay/banner: null for in-process Tabs or when usable.
+  const remoteState = liveHost ? terminalHostState(hostStatus, hostLive, startedRef.current) : null;
+  const remoteStateText = terminalHostStateText(remoteState, localDaemonTab, hostName, hostStatus?.lastError);
   const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
   const agentLabel = AGENTS[tab.agent || "claude"].label;
   const skipState = skipPermsState(tab, { live: hostLive, status: hostStatus, hostName, localEnded: ended, busy: skipBusy });
@@ -1230,7 +1229,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
           {!isInitializing && remoteStateText && (
             <div className="terminal-remote-banner"><AlertTriangle size={12} /><span>{remoteStateText}</span></div>
           )}
-          {inputPaused && remoteState && (
+          {inputPaused && remoteState && !localDaemonTab && (
             <div className="terminal-remote-hint">{fmt("terminal.remote.inputPaused")}</div>
           )}
         </div>

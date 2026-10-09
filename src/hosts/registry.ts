@@ -2,12 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_IDS, AGENTS, type AgentId } from "../agents";
 import { hostInvoke } from "./hostInvoke";
+import { LOCAL_HOST } from "./localHost";
 import type { HostConfig, HostId, HostSnapshot, HostStatus, HostTerminalsEvent, TerminalInfo } from "./types";
 
 // The Desktop's view of its Remote Hosts: configs, Host Status, the live `terminals` list per
 // Host and the agent CLIs detected on each. An external store read with useSyncExternalStore.
 //
 // With no Hosts configured the registry stays dormant: no event listeners, no Tauri calls.
+// The Local Host joins (`setLocal`) when its Terminals run in a Daemon: it gets status and
+// `terminals` lists under the wire id "local" but is never in `configs`.
 
 export interface RegistrySnapshot {
   configs: HostConfig[];
@@ -50,6 +53,7 @@ export class HostRegistry {
   private reattachListeners = new Set<(host: HostId) => void>();
   private agentsProbed = new Set<HostId>();
   private teardown: (() => void) | null = null;
+  private local = false;
 
   // ── store ──
   subscribe = (l: () => void) => { this.listeners.add(l); return () => { this.listeners.delete(l); }; };
@@ -70,6 +74,26 @@ export class HostRegistry {
     this.initPromise = this.start();
     return this.initPromise;
   }
+
+  // Local Daemon mode: track the "local" Host too, starting the listeners even with no Remote
+  // Hosts. Call after `init`. When the registry already runs, its "local" events were ignored
+  // until now, so a fresh `hosts_status` fills them in.
+  setLocal(enabled: boolean): Promise<void> {
+    this.local = enabled;
+    if (!enabled) return this.initPromise ?? Promise.resolve();
+    if (!this.initPromise) {
+      this.initPromise = this.start();
+      return this.initPromise;
+    }
+    return this.initPromise.then(async () => {
+      const seqBefore = { status: { ...this.statusSeq }, live: { ...this.liveSeq } };
+      let snaps: HostSnapshot[] = [];
+      try { snaps = await invoke<HostSnapshot[]>("hosts_status"); } catch (_) {}
+      this.applySnapshot(snaps.filter(x => x.status.host === LOCAL_HOST), seqBefore);
+    });
+  }
+
+  get localEnabled(): boolean { return this.local; }
 
   private async start() {
     // 1. listen to both events, 2. hosts_configure, 3. hosts_status for anything emitted
@@ -130,7 +154,8 @@ export class HostRegistry {
     if (nowUsable && !isUsableStatus(prev)) {
       for (const l of this.usableListeners) l(h);
     }
-    if (nowUsable && !this.agentsProbed.has(h)) { this.agentsProbed.add(h); this.probeAgents(h); }
+    // The Local Host's agents are the Desktop's own probe (Settings), not the Daemon's.
+    if (nowUsable && h !== LOCAL_HOST && !this.agentsProbed.has(h)) { this.agentsProbed.add(h); this.probeAgents(h); }
     // Amendment 20: a replaced connection (configGeneration changed) → mounted Tabs re-attach.
     if (replaced) {
       for (const l of this.reattachListeners) l(h);
@@ -188,7 +213,7 @@ export class HostRegistry {
     await invoke("hosts_configure", { hosts: list });
   }
 
-  isConfigured(id: HostId): boolean { return this.snap.configs.some(c => c.id === id); }
+  isConfigured(id: HostId): boolean { return id === LOCAL_HOST ? this.local : this.snap.configs.some(c => c.id === id); }
   config(id: HostId): HostConfig | undefined { return this.snap.configs.find(c => c.id === id); }
   hostName(id: HostId | undefined): string { return (id && this.config(id)?.name) || id || ""; }
   getStatus(id: HostId): HostStatus | undefined { return this.snap.status[id]; }

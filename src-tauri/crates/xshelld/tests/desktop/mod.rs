@@ -433,10 +433,7 @@ struct TapDialer {
 impl Dialer for TapDialer {
     fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError> {
         let s = connect_unix(&self.path, cancel, CONNECT_TIMEOUT)?;
-        let failed = |e: std::io::Error| DialError::Failed {
-            message: e.to_string(),
-            hint: None,
-        };
+        let failed = |e: std::io::Error| DialError::failed(e.to_string(), None);
         self.tap
             .streams
             .lock()
@@ -647,7 +644,7 @@ impl Fx {
     }
 }
 
-fn socket_desk(
+pub fn socket_desk(
     socket: &std::path::Path,
     tap: Arc<Tap>,
     tweak: impl FnOnce(&mut ManagerConfig),
@@ -682,4 +679,93 @@ pub fn wait_dead(pid: i32) -> bool {
 
 pub fn pid_alive(pid: i32) -> bool {
     alive(pid)
+}
+
+// ── The Local Host in a GUI-bound Daemon ──────────────────────────────────
+
+/// The app's Local Host: the user's Daemon socket, starting the workspace's `xshelld` as a
+/// GUI-bound child of this test process when nothing listens there.
+pub struct LocalFactory {
+    pub socket: PathBuf,
+    pub daemon: Arc<xshell_hostlink::GuiBoundDaemon>,
+}
+
+impl TransportFactory for LocalFactory {
+    fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+        Box::new(LocalShellTransport::default())
+    }
+
+    fn direct(&self, cfg: &HostConfig) -> Option<Box<dyn Dialer>> {
+        (cfg.id == xshell_hostlink::LOCAL_HOST_ID).then(|| {
+            Box::new(xshell_hostlink::GuiBoundDialer {
+                socket: self.socket.clone(),
+                daemon: self.daemon.clone(),
+            }) as Box<dyn Dialer>
+        })
+    }
+}
+
+/// A Desktop in local Daemon mode, as `src-tauri` sets it up. Dropping it quits like the
+/// app does.
+pub struct LocalDesk {
+    pub m: Manager,
+    pub rec: Arc<Recorder>,
+    pub daemon: Arc<xshell_hostlink::GuiBoundDaemon>,
+}
+
+impl LocalDesk {
+    pub fn new(h: &TestHome) -> LocalDesk {
+        let env: Vec<(OsString, OsString)> = vec![
+            ("HOME".into(), h.home().into()),
+            ("XDG_RUNTIME_DIR".into(), h.run().into()),
+            ("XSHELLD_LOGIN_ENV".into(), "0".into()),
+        ];
+        let daemon = Arc::new(
+            xshell_hostlink::GuiBoundDaemon::new(bin().into(), env, h.paths().log).unwrap(),
+        );
+        let socket = xshell_hostlink::local::local_socket_path(&h.home(), Some(&h.run()));
+        let rec = Recorder::new();
+        let factory = Arc::new(LocalFactory {
+            socket,
+            daemon: daemon.clone(),
+        });
+        let m = Manager::new(manager_config(
+            factory,
+            Arc::new(FileSource(bin().into())),
+            rec.clone(),
+        ));
+        m.set_local(HostConfig {
+            id: xshell_hostlink::LOCAL_HOST_ID.into(),
+            name: "local".into(),
+            ssh_target: String::new(),
+            color: None,
+            daemon_command: None,
+            launch_prefixes: Default::default(),
+        });
+        LocalDesk { m, rec, daemon }
+    }
+
+    pub fn host(&self) -> Arc<HostHandle> {
+        self.m
+            .host(xshell_hostlink::LOCAL_HOST_ID)
+            .expect("local host")
+    }
+
+    pub fn wait_usable(&self) -> HostStatus {
+        self.rec.wait_status("connected", usable)
+    }
+
+    /// Quit as the app does: SIGTERM our Daemon, stop the links, wait for it, then kill.
+    pub fn quit(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        self.daemon.hang_up();
+        self.m.shutdown();
+        self.daemon.reap(deadline);
+    }
+}
+
+impl Drop for LocalDesk {
+    fn drop(&mut self) {
+        self.quit();
+    }
 }

@@ -26,10 +26,12 @@ import { asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey,
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
 import { cache } from "./hosts/cache";
-import { applyFocusRemovals, applyGroupRemovals, applyTabDeltas, reconcileHosts, restoreGroupIds, tabFromTerminal } from "./hosts/reconcile";
+import { applyFocusRemovals, applyGroupRemovals, applyTabDeltas, reconcileHosts } from "./hosts/reconcile";
 import { localEdits, metaSync } from "./hosts/metaSync";
 import { planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
+import { daemonHost, type LocalHostInfo } from "./hosts/localHost";
+import { isRemoteDataHost, listsForReconcile, needsCache, persistableTabs, restorableTabs, restoreGroups, withHostData } from "./hosts/appTabs";
 import { mergeRecent } from "./hosts/aggregate";
 import { statusLabel, useHostsSnapshot } from "./hosts/useHosts";
 import type { HostConfig, HostId, TerminalInfo } from "./hosts/types";
@@ -117,19 +119,23 @@ export default function App() {
   const showNotice = useCallback((text: string) => setNotice({ id: Date.now(), text }), []);
   const dismissNotice = useCallback(() => setNotice(null), []);
   const configuredHostsRef = useRef<HostConfig[]>([]);
+  // New Local Tabs run in the Daemon this Desktop started (`local_host_info`, ADR-0005).
+  const localDaemonRef = useRef(false);
   // A Remote Host's projects and recent sessions, stamped with `host` at this boundary. Served
   // from the cache while the Host is offline.
   const fetchHostData = useCallback(async (host: HostId) => {
+    // The Local Host's data stays on the in-process path, also in local Daemon mode.
+    if (!isRemoteDataHost(host)) return;
     const [projects, sessions] = await Promise.all([
       hostInvoke<ProjectInfo[]>(host, "list_claude_projects").catch(() => null),
       hostInvoke<SessionInfo[]>(host, "get_all_recent_sessions", { limit: 100 }).catch(() => null),
     ]);
     if (!registry.isConfigured(host)) return;
-    if (projects) setProjectsByHost(prev => ({ ...prev, [host]: projects.map(p => ({ ...p, host })) }));
-    if (sessions) setRecentByHost(prev => ({ ...prev, [host]: sessions.map(x => ({ ...x, host })) }));
+    setProjectsByHost(prev => withHostData(prev, host, projects));
+    setRecentByHost(prev => withHostData(prev, host, sessions));
   }, []);
   // Refetch a Host's data whenever it becomes usable.
-  useEffect(() => registry.onUsable(host => { fetchHostData(host); }), [fetchHostData]);
+  useEffect(() => registry.onUsable(host => { if (isRemoteDataHost(host)) fetchHostData(host); }), [fetchHostData]);
   const [projectSessions, setProjectSessions] = useState<SessionInfo[]>([]);
   // Remote project page served from the offline cache (stays true until a live fetch).
   const [projectSessionsStale, setProjectSessionsStale] = useState(false);
@@ -282,12 +288,15 @@ export default function App() {
           store.get<HostConfig[]>("hosts"),
         ]);
         // Remote Hosts: start the registry (a no-op with none configured) and load the
-        // offline cache so their last known Terminals show as Tabs right away.
+        // offline cache so their last known Terminals show as Tabs right away. In local
+        // Daemon mode the Local Host joins the registry and its cached Tabs restore too.
         const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
-        if (hostConfigs.length > 0) {
-          await cache.load();
-          registry.init(hostConfigs).catch(() => {});
-        }
+        const localInfo = await invoke<LocalHostInfo>("local_host_info").catch(() => null);
+        const localDaemon = localInfo?.mode === "daemon";
+        localDaemonRef.current = localDaemon;
+        if (needsCache(hostConfigs.length, localDaemon)) await cache.load();
+        if (hostConfigs.length > 0) registry.init(hostConfigs).catch(() => {});
+        if (localDaemon) registry.setLocal(true).catch(() => {});
         configuredHostsRef.current = hostConfigs;
         // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
         // from the flat `project_paths` list by wrapping each path in a project item.
@@ -326,26 +335,13 @@ export default function App() {
         if (typeof rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(rowMetricsCodex);
         if (typeof rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(rlSidebarCodex);
         if (typeof rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(rowMetricsOpencode);
-        // Restore only tabs that have a real sessionId (not abandoned "New Chat" tabs). Remote
-        // Tabs are not in open_tabs: they come from the cached `terminals` list per Host.
-        const cachedRemote: Tab[] = hostConfigs.flatMap(h => (cache.terminals(h.id) ?? []).slice().sort((a, b) => a.createdAtMs - b.createdAtMs).map(info => tabFromTerminal(h.id, info)));
-        if (savedTabs?.length || cachedRemote.length) {
-          const restorable = [...(savedTabs ?? []).filter(t => t.sessionId && t.projectPath && !t.host), ...cachedRemote];
+        // Restore only in-process tabs that have a real sessionId (not abandoned "New Chat"
+        // tabs). Daemon Tabs are not in open_tabs: they come from the cached `terminals` list
+        // per Host ("local" too, in local Daemon mode only).
+        {
+          const restorable = restorableTabs({ saved: savedTabs, hosts: hostConfigs.map(h => h.id), localDaemon, cached: h => cache.terminals(h) });
           if (restorable.length) {
-            // First, filter groups: keep only those whose leaves are all restorable.
-            const restoredIds = new Set(restorable.map(t => t.id));
-            const keptGroups: Group[] = [];
-            if (savedGroups?.length) {
-              for (const g of savedGroups) {
-                const leaves = collectLeafIds(g.layout);
-                if (leaves.length >= 2 && leaves.every(id => restoredIds.has(id))) keptGroups.push(g);
-              }
-            }
-            const validGroupIds = new Set(keptGroups.map(g => g.id));
-            // Then, scrub any orphaned groupId off a tab — a leftover from an earlier bug
-            // where tabs kept a groupId pointing at a group that no longer exists.
-            // Cached remote tabs get their groupId back from the kept layouts (amendment 22).
-            const scrubbed = restoreGroupIds(restorable, keptGroups).map(t => (t.groupId && !validGroupIds.has(t.groupId)) ? { ...t, groupId: undefined } : t);
+            const { tabs: scrubbed, groups: keptGroups } = restoreGroups(restorable, savedGroups);
             setTabs(scrubbed);
             setGroups(keptGroups);
             let maxN = 0;
@@ -413,8 +409,8 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        // Remote Tabs are mirrored from their Daemon, never persisted here.
-        await store.set("open_tabs", tabs.some(t => t.host) ? tabs.filter(t => !t.host) : tabs);
+        // Daemon Tabs are mirrored from their Daemon, never persisted here.
+        await store.set("open_tabs", persistableTabs(tabs));
       } catch (_) {}
     })();
   }, [tabs, tabsRestored]);
@@ -826,6 +822,7 @@ export default function App() {
     status: (h) => registry.getStatus(h),
     hostName: (h) => registry.hostName(h),
     statusLabel,
+    localDaemon: localDaemonRef.current,
   }), [fullscreenRendering, forceSyncOutput]);
 
   // Applies a plan: refusal → notice; create → add the tab (and register a remote open).
@@ -1085,7 +1082,7 @@ export default function App() {
   }), [showNotice]);
   useEffect(() => {
     if (!tabsRestored) return;
-    const fresh: [HostId, TerminalInfo[]][] = [];
+    const fresh: [HostId, TerminalInfo[]][] = []; // by wire id ("local" included)
     for (const [host, list] of Object.entries(hostsSnap.live)) {
       if (!list || appliedLiveRef.current[host] === list) continue;
       appliedLiveRef.current[host] = list;
@@ -1095,7 +1092,7 @@ export default function App() {
     }
     if (fresh.length === 0) return;
     // Every Host's delta in one transaction (tabs, groups and focus together).
-    const r = reconcileHosts(tabsRef.current, fresh, {
+    const r = reconcileHosts(tabsRef.current, listsForReconcile(fresh), {
       pending: pendingUuids(),
       isDirty: (id, f) => metaSync.isDirty(id, f),
       isClosing: (uuid) => remoteTerminals.isClosing(uuid),
@@ -1124,7 +1121,7 @@ export default function App() {
   const [metaTick, setMetaTick] = useState(0);
   useEffect(() => {
     if (!tabsRestored) return;
-    const ready = tabs.filter(t => t.host && t.terminal && registry.isUsable(t.host));
+    const ready = tabs.filter(t => { const h = daemonHost(t); return !!h && registry.isUsable(h); });
     if (ready.length === 0) return;
     for (const u of metaSync.takeUpdates(ready)) {
       const args: Record<string, unknown> = { host: u.host, terminal: u.terminal };

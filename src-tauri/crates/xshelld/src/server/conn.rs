@@ -24,6 +24,10 @@ use xshell_protocol::msg::{
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::{CAPABILITIES, PROTOCOL};
 
+/// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
+pub(crate) const UPGRADE_REFUSED: &str =
+    "xshell on this machine runs these terminals; update xshell there instead";
+
 pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     if let Some(id) = id {
         ob.push_control(Arc::from(encode_res(id, r)));
@@ -345,6 +349,11 @@ impl Conn {
                 run,
                 status,
             } => agent::on_event(&d, &self.ob, id, terminal, run, status),
+            // xshell on this machine brings its own Daemon; one replaced from elsewhere
+            // would only be started again in the old version.
+            ClientMsg::DaemonUpgrade if d.cfg.gui_bound.is_some() => {
+                reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
+            }
             ClientMsg::DaemonUpgrade => {
                 {
                     let mut reg = d.reg.lock().unwrap();
