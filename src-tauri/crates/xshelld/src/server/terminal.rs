@@ -659,7 +659,9 @@ impl Terminal {
         self.hang_up(grace, false);
     }
 
-    fn hang_up(self: &Arc<Self>, grace: Duration, closing: bool) {
+    /// The process groups ending the Terminal signals: the session leader's and the
+    /// foreground job's.
+    fn groups(&self) -> Vec<i32> {
         let mut groups: Vec<i32> = self.pid.map(|p| p as i32).into_iter().collect();
         let fg = self
             .io
@@ -673,6 +675,30 @@ impl Terminal {
                 groups.push(g);
             }
         }
+        groups
+    }
+
+    /// [`Terminal::kill`], then wait until the process has exited and every group it
+    /// signalled is gone, or until `deadline`. Answers whether they are gone.
+    pub fn end_and_wait(self: &Arc<Self>, grace: Duration, deadline: Instant) -> bool {
+        let groups = self.groups();
+        self.kill(grace);
+        if !self.wait_exited(deadline) {
+            return false;
+        }
+        loop {
+            if groups.iter().all(|&g| unsafe { libc::killpg(g, 0) } != 0) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn hang_up(self: &Arc<Self>, grace: Duration, closing: bool) {
+        let groups = self.groups();
         {
             let mut l = self.life.lock().unwrap();
             if l.exited.is_some() {

@@ -1,6 +1,7 @@
 #[cfg(unix)]
 mod agent_events;
 mod hosts;
+mod local_migration;
 mod local_pty;
 
 use local_pty::LocalPtys;
@@ -321,7 +322,8 @@ async fn relaunch_terminal(
 // thread; core itself is fully synchronous.
 
 // Commands that only make sense on the machine running the window, so a remote host never
-// serves them: project icons are local files, and the other two open local apps. The tests
+// serves them: project icons are local files, two open local apps, and the local migration
+// commands guard this machine's settings file. The tests
 // below check that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
@@ -329,6 +331,13 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "reveal_in_explorer",
     "read_image_base64",
     "list_ssh_hosts",
+    "local_migration_lock",
+    "local_migration_unlock",
+    "local_migration_journal_read",
+    "local_migration_journal_write",
+    "local_migration_journal_clear",
+    "local_migration_guard",
+    "local_migration_sync_settings",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -552,9 +561,14 @@ pub fn run() {
     xshell_core::files::cleanup_old_dropped_files(&ctx());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(
+            tauri_plugin_store::Builder::new()
+                .default_serialize_fn(local_migration::serialize_settings)
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .manage(local_migration::MigrationLock::default())
         .manage(AppState {
             ptys: Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
                 xshell_core::plan_command_with(&ctx(), spec, hooks)
@@ -641,7 +655,14 @@ pub fn run() {
             hosts::commands::host_test,
             hosts::commands::local_host_info,
             hosts::commands::local_daemon_set_persistent,
-            hosts::commands::list_ssh_hosts
+            hosts::commands::list_ssh_hosts,
+            local_migration::local_migration_lock,
+            local_migration::local_migration_unlock,
+            local_migration::local_migration_journal_read,
+            local_migration::local_migration_journal_write,
+            local_migration::local_migration_journal_clear,
+            local_migration::local_migration_guard,
+            local_migration::local_migration_sync_settings
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -708,7 +729,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 60);
+        assert_eq!(registered.len(), 67);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

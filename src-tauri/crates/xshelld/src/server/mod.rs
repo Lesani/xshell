@@ -44,6 +44,9 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// SIGHUP → SIGKILL delay when ending a Terminal.
     pub kill_grace: Duration,
+    /// How long a refused `term.open` (its Terminal could not be saved) waits for the
+    /// Terminal's processes to be gone. `None`: `kill_grace` plus one second.
+    pub refused_open_wait: Option<Duration>,
     /// A connection whose socket accepts no bytes for this long is dropped.
     pub write_stall_timeout: Duration,
     /// The first message must arrive within this.
@@ -104,6 +107,9 @@ pub enum TestPoint {
     /// Restore is about to relaunch this persisted Terminal (registry locked: the Daemon does
     /// not serve yet, so a hook may block to stall the start).
     Restore,
+    /// A `term.open`'s started Terminal is not kept (it could not be saved, or its threads
+    /// did not start); it is about to be ended (on the thread that waits for it, no lock held).
+    RefusedOpen,
 }
 
 /// `serve --gui-bound --parent-pid N`.
@@ -171,6 +177,7 @@ impl Config {
             paths,
             idle_timeout: Duration::from_secs(3600),
             kill_grace: Duration::from_secs(2),
+            refused_open_wait: None,
             write_stall_timeout: Duration::from_secs(60),
             hello_timeout: Duration::from_secs(30),
             replay_capacity: xshell_core::terminal::replay::DEFAULT_REPLAY_CAPACITY,

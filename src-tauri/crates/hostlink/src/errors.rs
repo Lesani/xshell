@@ -15,6 +15,9 @@ pub enum HostErrorCode {
     Remote,
     Busy,
     Invalid,
+    /// A `term.open` the Daemon failed after starting its Terminal, without confirming the
+    /// Terminal is gone ([`xshell_protocol::OPEN_INDETERMINATE`]): it may still run.
+    Indeterminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +44,15 @@ impl HostError {
     }
     pub fn remote(m: impl Into<String>) -> Self {
         Self::new(HostErrorCode::Remote, m)
+    }
+    /// The Daemon's error text as an error: [`HostErrorCode::Indeterminate`] when it says
+    /// the outcome is open, otherwise [`HostErrorCode::Remote`].
+    pub fn from_daemon(m: String) -> Self {
+        if m.starts_with(xshell_protocol::OPEN_INDETERMINATE) {
+            Self::new(HostErrorCode::Indeterminate, m)
+        } else {
+            Self::remote(m)
+        }
     }
     pub fn timeout(m: impl Into<String>) -> Self {
         Self::new(HostErrorCode::Timeout, m)

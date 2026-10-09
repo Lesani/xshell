@@ -46,6 +46,20 @@ describe("restorableTabs", () => {
     expect(cached.local).toHaveLength(2);
   });
 
+  it("#4/G: migrated Terminals merge with the cached Local ones in the Daemon's order, the live entry winning", () => {
+    const migrated = [info("l2", 5, { sessionId: "fresh" }), info("m0", 3), info("m9", 9)];
+    const tabs = restorableTabs({ saved: [], hosts: [H], localDaemon: true, cached: get, migrated });
+    expect(tabs.map(t => t.id)).toEqual(["remote-r1", "remote-l1", "remote-m0", "remote-l2", "remote-m9"]);
+    expect(tabs[3].sessionId).toBe("fresh");
+  });
+
+  it("#4: in in-process mode `migrated` is ignored and `saved` restores exactly as before", () => {
+    const a = restorableTabs({ saved: [inproc], hosts: [H], localDaemon: false, cached: get, migrated: [info("m1", 1)] });
+    const b = restorableTabs({ saved: [inproc], hosts: [H], localDaemon: false, cached: get });
+    expect(a).toEqual(b);
+    expect(a.map(t => t.id)).toEqual(["terminal-s1-a", "remote-r1"]);
+  });
+
   it("needs the cache with Remote Hosts or in local Daemon mode (M6)", () => {
     expect(needsCache(0, false)).toBe(false);
     expect(needsCache(1, false)).toBe(true);

@@ -36,6 +36,10 @@ import { mergeRecent } from "./hosts/aggregate";
 import { statusLabel, useHostsSnapshot } from "./hosts/useHosts";
 import type { HostConfig, HostId, TerminalInfo } from "./hosts/types";
 import { AppNotice } from "./components/AppNotice";
+import { NO_MIGRATION, groupsToPersist, migrateLocalTabsOnce, migrationNotice, openTabsToPersist, renderedGroups, type MigrationOutcome } from "./hosts/localMigration";
+import { localMigrationDeps } from "./hosts/localMigrationDeps";
+import { applyFenced, singleFlight } from "./hosts/startup";
+import { fmt } from "./hosts/strings";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders. A Local
@@ -87,6 +91,79 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
   return <div className="drop-zone-preview" style={box} />;
 }
 
+// ── Startup (once per window) ─────────────────────────────────────
+// Reads the settings, starts the Host registry and, in local Daemon mode, moves saved
+// in-process Tabs into the Daemon (issue #4), then computes the Tabs to restore. App applies
+// the result (H: the whole startup is single-flight and its state application fenced).
+async function loadStartup() {
+  const store = await load("settings.json", { defaults: {}, autoSave: true });
+  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts] = await Promise.all([
+    store.get<string[]>("project_paths"),
+    store.get<Record<string, ProjectSettings>>("project_icons"),
+    store.get<Tab[]>("open_tabs"),
+    store.get<Group[]>("open_groups"),
+    store.get<boolean>("git_lazy_polling"),
+    store.get<string>("terminal_bg_color"),
+    store.get<boolean>("always_on_top"),
+    store.get<string>("default_shell"),
+    store.get<boolean>("context_tree_enabled"),
+    store.get<number>("default_terminal_font_size"),
+    store.get<boolean>("git_changes_tree"),
+    store.get<boolean>("file_explorer_on_start"),
+    store.get<SidebarItem[]>("sidebar_layout"),
+    store.get<boolean>("rate_limit_in_sidebar"),
+    store.get<boolean>("session_row_metrics"),
+    store.get<ThemeMode>("theme"),
+    store.get<boolean>("fullscreen_rendering_enabled"),
+    store.get<boolean>("terminal_header_stats"),
+    store.get<boolean>("project_stats_chart"),
+    store.get<'cost' | 'tokens'>("project_stats_view"),
+    store.get<boolean>("force_sync_output_enabled"),
+    store.get<boolean>("eager_init_tabs"),
+    store.get<boolean>("webgl_rendering_enabled"),
+    store.get<number>("terminal_font_weight"),
+    store.get<string>("default_agent"),
+    store.get<boolean>("session_row_metrics_codex"),
+    store.get<boolean>("rate_limit_in_sidebar_codex"),
+    store.get<boolean>("session_row_metrics_opencode"),
+    store.get<HostConfig[]>("hosts"),
+  ]);
+  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts };
+  // Remote Hosts: start the registry (a no-op with none configured) and load the offline
+  // cache so their last known Terminals show as Tabs right away. In local Daemon mode the
+  // Local Host joins the registry and its cached Tabs restore too.
+  const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
+  const localInfo = await invoke<LocalHostInfo>("local_host_info").catch(() => null);
+  const localDaemon = localInfo?.mode === "daemon";
+  if (needsCache(hostConfigs.length, localDaemon)) await cache.load();
+  if (hostConfigs.length > 0) registry.init(hostConfigs).catch(() => {});
+  if (localDaemon) registry.setLocal(true).catch(() => {});
+  // Local Daemon mode: saved in-process Tabs move into the Daemon before anything mounts.
+  // Restore and persistence wait for it.
+  const migration = localDaemon
+    ? await migrateLocalTabsOnce(
+        { openTabs: savedTabs, openGroups: savedGroups, zoom: null },
+        { fullscreenRendering: fsRender ?? true, forceSyncOutput: syncOut ?? true },
+        localMigrationDeps,
+      ).catch(() => ({ ...NO_MIGRATION, writesLayout: false }))
+    : NO_MIGRATION;
+  // Restore only in-process tabs that have a real sessionId (not abandoned "New Chat"
+  // tabs): in local Daemon mode only those the migration left in-process. Daemon Tabs are not
+  // in open_tabs: they come from the cached `terminals` list per Host ("local" too, in local
+  // Daemon mode only, merged with the Terminals the migration just confirmed). Held-back
+  // Tabs keep their leaves in the saved layouts; only the shown ones are pruned.
+  const durableGroups = migration.groups ?? savedGroups ?? [];
+  const restorable = restorableTabs({ saved: localDaemon ? migration.inProcess : savedTabs, hosts: hostConfigs.map(h => h.id), localDaemon, cached: h => cache.terminals(h), migrated: migration.migrated });
+  const restored = restoreGroups(restorable, renderedGroups(durableGroups, migration.heldBack));
+  // The local Projects and sessions, fetched once with the rest of the startup.
+  const data = Promise.all([
+    hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => [] as ProjectInfo[]),
+    hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
+  ]);
+  return { v, hostConfigs, localDaemon, migration, durableGroups, restored, data };
+}
+const startupOnce = singleFlight(loadStartup);
+
 export default function App() {
   // Projects per Host ("local" plus each Remote Host id); remote items carry `host`.
   const [projectsByHost, setProjectsByHost] = useState<Record<string, ProjectInfo[]>>({ local: [] });
@@ -121,6 +198,10 @@ export default function App() {
   const configuredHostsRef = useRef<HostConfig[]>([]);
   // New Local Tabs run in the Daemon this Desktop started (`local_host_info`, ADR-0005).
   const localDaemonRef = useRef(false);
+  // Local Daemon mode: what moving the saved in-process Tabs into the Daemon left (issue #4).
+  const migrationRef = useRef<MigrationOutcome>(NO_MIGRATION);
+  // The saved `open_groups` as restored, held-back leaves included (F).
+  const durableGroupsRef = useRef<Group[]>([]);
   // A Remote Host's projects and recent sessions, stamped with `host` at this boundary. Served
   // from the cache while the Host is offline.
   const fetchHostData = useCallback(async (host: HostId) => {
@@ -252,118 +333,83 @@ export default function App() {
 
   // ── Initial load ──────────────────────────────────────────────────
   const [tabsRestored, setTabsRestored] = useState(false);
-  useEffect(() => {
-    (async () => {
-      try {
-        const store = await load("settings.json", { defaults: {}, autoSave: true });
-        const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts] = await Promise.all([
-          store.get<string[]>("project_paths"),
-          store.get<Record<string, ProjectSettings>>("project_icons"),
-          store.get<Tab[]>("open_tabs"),
-          store.get<Group[]>("open_groups"),
-          store.get<boolean>("git_lazy_polling"),
-          store.get<string>("terminal_bg_color"),
-          store.get<boolean>("always_on_top"),
-          store.get<string>("default_shell"),
-          store.get<boolean>("context_tree_enabled"),
-          store.get<number>("default_terminal_font_size"),
-          store.get<boolean>("git_changes_tree"),
-          store.get<boolean>("file_explorer_on_start"),
-          store.get<SidebarItem[]>("sidebar_layout"),
-          store.get<boolean>("rate_limit_in_sidebar"),
-          store.get<boolean>("session_row_metrics"),
-          store.get<ThemeMode>("theme"),
-          store.get<boolean>("fullscreen_rendering_enabled"),
-          store.get<boolean>("terminal_header_stats"),
-          store.get<boolean>("project_stats_chart"),
-          store.get<'cost' | 'tokens'>("project_stats_view"),
-          store.get<boolean>("force_sync_output_enabled"),
-          store.get<boolean>("eager_init_tabs"),
-          store.get<boolean>("webgl_rendering_enabled"),
-          store.get<number>("terminal_font_weight"),
-          store.get<string>("default_agent"),
-          store.get<boolean>("session_row_metrics_codex"),
-          store.get<boolean>("rate_limit_in_sidebar_codex"),
-          store.get<boolean>("session_row_metrics_opencode"),
-          store.get<HostConfig[]>("hosts"),
-        ]);
-        // Remote Hosts: start the registry (a no-op with none configured) and load the
-        // offline cache so their last known Terminals show as Tabs right away. In local
-        // Daemon mode the Local Host joins the registry and its cached Tabs restore too.
-        const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
-        const localInfo = await invoke<LocalHostInfo>("local_host_info").catch(() => null);
-        const localDaemon = localInfo?.mode === "daemon";
-        localDaemonRef.current = localDaemon;
-        if (needsCache(hostConfigs.length, localDaemon)) await cache.load();
-        if (hostConfigs.length > 0) registry.init(hostConfigs).catch(() => {});
-        if (localDaemon) registry.setLocal(true).catch(() => {});
-        configuredHostsRef.current = hostConfigs;
-        // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
-        // from the flat `project_paths` list by wrapping each path in a project item.
-        let layout: SidebarItem[] = [];
-        if (Array.isArray(storedLayout) && storedLayout.length > 0) {
-          layout = storedLayout;
-        } else if (paths && paths.length > 0) {
-          layout = paths.map(p => ({ kind: "project" as const, path: asProjectKey(p) }));
+  useEffect(() => applyFenced(startupOnce().catch(() => null), async (r, alive) => {
+    if (r) {
+      const { v, hostConfigs, localDaemon, migration, durableGroups, restored } = r;
+      localDaemonRef.current = localDaemon;
+      configuredHostsRef.current = hostConfigs;
+      migrationRef.current = migration;
+      durableGroupsRef.current = durableGroups;
+      const notice = migrationNotice(migration.failed);
+      if (notice) showNotice(notice);
+      // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
+      // from the flat `project_paths` list by wrapping each path in a project item.
+      let layout: SidebarItem[] = [];
+      if (Array.isArray(v.storedLayout) && v.storedLayout.length > 0) {
+        layout = v.storedLayout;
+      } else if (v.paths && v.paths.length > 0) {
+        layout = v.paths.map(p => ({ kind: "project" as const, path: asProjectKey(p) }));
+      }
+      setSidebarLayout(layout);
+      // Derive the flat paths list from the layout so downstream code stays happy.
+      const derivedPaths = flattenSidebarPaths(layout);
+      if (derivedPaths.length) setSavedPaths(derivedPaths);
+      else if (v.paths) setSavedPaths(v.paths.map(asProjectKey));
+      if (v.icons) setProjectIcons(v.icons);
+      if (typeof v.gitLazy === "boolean") setGitLazyPolling(v.gitLazy);
+      if (typeof v.bgColor === "string") setTerminalBgColor(v.bgColor);
+      if (typeof v.aot === "boolean") setAlwaysOnTop(v.aot);
+      if (typeof v.shell === "string") setDefaultShell(v.shell);
+      if (typeof v.ctxEnabled === "boolean") setContextTreeEnabled(v.ctxEnabled);
+      if (typeof v.defFont === "number" && v.defFont >= 8 && v.defFont <= 32) setDefaultTerminalFontSize(v.defFont);
+      if (typeof v.rlSidebar === "boolean") setShowRateLimitInSidebar(v.rlSidebar);
+      if (typeof v.rowMetrics === "boolean") setShowSessionRowMetrics(v.rowMetrics);
+      if (typeof v.gitTree === "boolean") setGitChangesTree(v.gitTree);
+      if (typeof v.fileExpOnStart === "boolean") setFileExplorerOnStart(v.fileExpOnStart);
+      if (typeof v.fsRender === "boolean") setFullscreenRendering(v.fsRender);
+      if (typeof v.syncOut === "boolean") setForceSyncOutput(v.syncOut);
+      if (typeof v.eagerInit === "boolean") setEagerInitTabs(v.eagerInit);
+      if (typeof v.webgl === "boolean") setWebglRendering(v.webgl);
+      if (typeof v.fontWeight === "number" && v.fontWeight >= 100 && v.fontWeight <= 700) setTerminalFontWeight(v.fontWeight);
+      if (typeof v.termHeaderStats === "boolean") setShowTerminalHeaderStats(v.termHeaderStats);
+      if (typeof v.projectStatsChart === "boolean") setShowProjectStatsChart(v.projectStatsChart);
+      if (v.storedTheme === "light" || v.storedTheme === "dark") setTheme(v.storedTheme);
+      if (v.statsView === "cost" || v.statsView === "tokens") setProjectStatsView(v.statsView);
+      if (v.defAgent === "ask" || (typeof v.defAgent === "string" && (AGENT_IDS as string[]).includes(v.defAgent))) setDefaultAgent(v.defAgent as "ask" | AgentId);
+      if (typeof v.rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(v.rowMetricsCodex);
+      if (typeof v.rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(v.rlSidebarCodex);
+      if (typeof v.rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(v.rowMetricsOpencode);
+      if (restored.tabs.length) {
+        setTabs(restored.tabs);
+        setGroups(restored.groups);
+        let maxN = 0;
+        for (const g of restored.groups) {
+          const m = /^Group\s+(\d+)$/.exec(g.name);
+          if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
         }
-        setSidebarLayout(layout);
-        // Derive the flat paths list from the layout so downstream code stays happy.
-        const derivedPaths = flattenSidebarPaths(layout);
-        if (derivedPaths.length) setSavedPaths(derivedPaths);
-        else if (paths) setSavedPaths(paths.map(asProjectKey));
-        if (icons) setProjectIcons(icons);
-        if (typeof gitLazy === "boolean") setGitLazyPolling(gitLazy);
-        if (typeof bgColor === "string") setTerminalBgColor(bgColor);
-        if (typeof aot === "boolean") setAlwaysOnTop(aot);
-        if (typeof shell === "string") setDefaultShell(shell);
-        if (typeof ctxEnabled === "boolean") setContextTreeEnabled(ctxEnabled);
-        if (typeof defFont === "number" && defFont >= 8 && defFont <= 32) setDefaultTerminalFontSize(defFont);
-        if (typeof rlSidebar === "boolean") setShowRateLimitInSidebar(rlSidebar);
-        if (typeof rowMetrics === "boolean") setShowSessionRowMetrics(rowMetrics);
-        if (typeof gitTree === "boolean") setGitChangesTree(gitTree);
-        if (typeof fileExpOnStart === "boolean") setFileExplorerOnStart(fileExpOnStart);
-        if (typeof fsRender === "boolean") setFullscreenRendering(fsRender);
-        if (typeof syncOut === "boolean") setForceSyncOutput(syncOut);
-        if (typeof eagerInit === "boolean") setEagerInitTabs(eagerInit);
-        if (typeof webgl === "boolean") setWebglRendering(webgl);
-        if (typeof fontWeight === "number" && fontWeight >= 100 && fontWeight <= 700) setTerminalFontWeight(fontWeight);
-        if (typeof termHeaderStats === "boolean") setShowTerminalHeaderStats(termHeaderStats);
-        if (typeof projectStatsChart === "boolean") setShowProjectStatsChart(projectStatsChart);
-        if (storedTheme === "light" || storedTheme === "dark") setTheme(storedTheme);
-        if (statsView === "cost" || statsView === "tokens") setProjectStatsView(statsView);
-        if (defAgent === "ask" || (typeof defAgent === "string" && (AGENT_IDS as string[]).includes(defAgent))) setDefaultAgent(defAgent as "ask" | AgentId);
-        if (typeof rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(rowMetricsCodex);
-        if (typeof rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(rlSidebarCodex);
-        if (typeof rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(rowMetricsOpencode);
-        // Restore only in-process tabs that have a real sessionId (not abandoned "New Chat"
-        // tabs). Daemon Tabs are not in open_tabs: they come from the cached `terminals` list
-        // per Host ("local" too, in local Daemon mode only).
-        {
-          const restorable = restorableTabs({ saved: savedTabs, hosts: hostConfigs.map(h => h.id), localDaemon, cached: h => cache.terminals(h) });
-          if (restorable.length) {
-            const { tabs: scrubbed, groups: keptGroups } = restoreGroups(restorable, savedGroups);
-            setTabs(scrubbed);
-            setGroups(keptGroups);
-            let maxN = 0;
-            for (const g of keptGroups) {
-              const m = /^Group\s+(\d+)$/.exec(g.name);
-              if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
-            }
-            groupCounterRef.current = maxN + 1;
-          }
-        }
-      } catch (_) {}
-      setTabsRestored(true);
-      for (const h of configuredHostsRef.current) fetchHostData(h.id);
-      const [projects, sessions] = await Promise.all([
-        hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => [] as ProjectInfo[]),
-        hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
-      ]);
-      setAllProjects(projects);
-      setRecentSessions(sessions);
-      setInitialLoading(false);
-    })();
-  }, []);
+        groupCounterRef.current = maxN + 1;
+      }
+      // The journal is retired only once restore applied it against the live list. Until
+      // that succeeds nothing is persisted; if it fails, persistence stays off for this run
+      // (the journal's base is applied again at the next start).
+      const ok = await migration.settle().then(() => true, () => false);
+      if (!alive()) return;
+      if (!ok) {
+        migrationRef.current = { ...migration, ownsOpenTabs: false, writesLayout: false };
+        showNotice(fmt("notice.localMigration.unsaved"));
+      }
+    } else {
+      // The startup failed: nothing saved is rewritten from this window's empty state.
+      migrationRef.current = { ...NO_MIGRATION, writesLayout: false };
+    }
+    setTabsRestored(true);
+    for (const h of configuredHostsRef.current) fetchHostData(h.id);
+    const [projects, sessions] = r ? await r.data : [[], []];
+    if (!alive()) return;
+    setAllProjects(projects);
+    setRecentSessions(sessions);
+    setInitialLoading(false);
+  }), []);
 
   // ── Load the last skipped-update version from the store ───────────
   useEffect(() => {
@@ -409,8 +455,12 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        // Daemon Tabs are mirrored from their Daemon, never persisted here.
-        await store.set("open_tabs", persistableTabs(tabs));
+        // Daemon Tabs are mirrored from their Daemon, never persisted here. In local Daemon
+        // mode only the instance holding the migration lock writes `open_tabs` (its
+        // in-process Tabs and the held-back ones); in-process mode writes as always.
+        const persistable = persistableTabs(tabs);
+        const next = localDaemonRef.current ? openTabsToPersist(persistable, migrationRef.current) : persistable;
+        if (next) await store.set("open_tabs", next);
       } catch (_) {}
     })();
   }, [tabs, tabsRestored]);
@@ -964,7 +1014,9 @@ export default function App() {
     (async () => {
       try {
         const store = await load("settings.json", { defaults: {}, autoSave: true });
-        await store.set("open_groups", groups);
+        // Without the migration lock nothing is written; held-back leaves stay saved (F).
+        const next = groupsToPersist(groups, tabsRef.current, durableGroupsRef.current, migrationRef.current);
+        if (next) await store.set("open_groups", next);
       } catch (_) {}
     })();
   }, [groups, tabsRestored]);

@@ -465,6 +465,145 @@ fn open_missing_cwd_rejected() {
     assert!(!h.paths().state.exists() || h.state_ids().is_empty());
 }
 
+/// A directory where the state file's temp file goes: every save fails, also as root.
+fn block_state_saves(h: &TestHome) -> std::path::PathBuf {
+    let tmp = h.paths().state.with_file_name("terminals.json.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    tmp
+}
+
+/// A raw Terminal that ignores SIGHUP, then writes its pid to the returned file.
+fn stubborn(h: &TestHome) -> (xshell_core::LaunchSpec, std::path::PathBuf) {
+    let pidf = h.root().join("stubborn.pid");
+    let prog = h.script(
+        "stubborn",
+        &format!("trap '' HUP; echo $$ > {}; exec sleep 100", pidf.display()),
+    );
+    (raw_spec(&h.project("p"), &prog), pidf)
+}
+
+/// Holds the end of a refused open until the stubborn process has set its trap.
+fn pid_written(f: &std::path::Path) -> xshelld::server::TestHook {
+    let f = f.to_path_buf();
+    xshelld::server::TestHook(std::sync::Arc::new(move |_, p| {
+        if p == xshelld::server::TestPoint::RefusedOpen {
+            read_pid(&f);
+        }
+        false
+    }))
+}
+
+fn read_pid(f: &std::path::Path) -> i32 {
+    let t0 = Instant::now();
+    loop {
+        if let Some(p) = std::fs::read_to_string(f)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            return p;
+        }
+        assert!(t0.elapsed() < T, "no pid file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn refused_open_waits_until_the_process_is_gone() {
+    let h = TestHome::new();
+    let (spec, pidf) = stubborn(&h);
+    let srv = start(&h, |c| {
+        c.kill_grace = Duration::from_millis(500);
+        c.test_hook = Some(pid_written(&pidf));
+    });
+    let mut a = client(&srv);
+    block_state_saves(&h);
+    let t0 = Instant::now();
+    let err = a.request(&open_msg(Uuid::new_v4(), spec)).unwrap_err();
+    let pid = read_pid(&pidf);
+    let _reap = PidReaper(vec![pid]);
+    assert!(err.starts_with("cannot save"), "{err}");
+    // SIGHUP is ignored: the refusal comes only after the SIGKILL ended it.
+    assert!(t0.elapsed() >= Duration::from_millis(500));
+    assert!(!alive(pid));
+}
+
+#[test]
+fn refused_open_is_indeterminate_when_the_end_is_not_confirmed() {
+    let h = TestHome::new();
+    let (spec, pidf) = stubborn(&h);
+    let srv = start(&h, |c| {
+        c.kill_grace = Duration::from_secs(5);
+        c.refused_open_wait = Some(Duration::from_millis(300));
+        c.test_hook = Some(pid_written(&pidf));
+    });
+    let mut a = client(&srv);
+    block_state_saves(&h);
+    let t = Uuid::new_v4();
+    let err = a.request(&open_msg(t, spec)).unwrap_err();
+    let pid = read_pid(&pidf);
+    let _reap = PidReaper(vec![pid]);
+    assert!(
+        err.starts_with(xshell_protocol::OPEN_INDETERMINATE),
+        "{err}"
+    );
+    assert!(alive(pid));
+    // Still never listed, and the SIGKILL still follows.
+    let mut b = Client::connect(&srv.socket);
+    assert!(b.hello(range(1, 1)).1.is_empty());
+    assert!(wait_dead(pid, Duration::from_secs(10)));
+}
+
+/// The process started but its input thread did not: the refusal waits for its end.
+#[test]
+fn open_with_failed_threads_waits_until_the_process_is_gone() {
+    let h = TestHome::new();
+    let (spec, pidf) = stubborn(&h);
+    let f = pidf.clone();
+    let srv = start(&h, move |c| {
+        c.kill_grace = Duration::from_millis(500);
+        c.test_hook = Some(xshelld::server::TestHook(std::sync::Arc::new(
+            move |_, p| {
+                // Fail the input thread once the process has set its trap.
+                p == xshelld::server::TestPoint::StartInput && {
+                    read_pid(&f);
+                    true
+                }
+            },
+        )));
+    });
+    let mut a = client(&srv);
+    let t0 = Instant::now();
+    let err = a.request(&open_msg(Uuid::new_v4(), spec)).unwrap_err();
+    let pid = read_pid(&pidf);
+    let _reap = PidReaper(vec![pid]);
+    assert!(err.starts_with("failed to start terminal threads"), "{err}");
+    assert!(t0.elapsed() >= Duration::from_millis(500));
+    assert!(!alive(pid));
+    let mut b = Client::connect(&srv.socket);
+    assert!(b.hello(range(1, 1)).1.is_empty());
+}
+
+#[test]
+fn open_refused_when_state_cannot_be_saved() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut a = client(&srv);
+    let tmp = block_state_saves(&h);
+    let t = Uuid::new_v4();
+    let err = a
+        .request(&open_msg(t, sh_spec(&h.project("p"))))
+        .unwrap_err();
+    assert!(err.contains("cannot save"), "{err}");
+    let mut b = Client::connect(&srv.socket);
+    assert!(b.hello(range(1, 1)).1.is_empty());
+    assert!(!h.state_ids().contains(&t));
+    // Once the state can be written again, the same UUID opens.
+    std::fs::remove_dir(&tmp).unwrap();
+    a.open(t, sh_spec(&h.project("p")));
+    assert_eq!(h.state_ids(), vec![t]);
+    a.request(&ClientMsg::TermClose { terminal: t }).unwrap();
+}
+
 fn yes_terminal(h: &TestHome, b: &mut Client) -> Uuid {
     let t = Uuid::new_v4();
     let prog = h.script("yes", "exec yes xshell");

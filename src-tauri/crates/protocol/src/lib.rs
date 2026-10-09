@@ -33,6 +33,11 @@ pub const CAPABILITIES: &[&str] = &[
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
 /// is GUI-bound, ADR-0005) and xshell is closed: nothing was started.
 pub const NOT_RUNNING_EXIT: i32 = 4;
+
+/// Prefix of a `term.open` error after which the Terminal may still be running: the Daemon
+/// could not save it, ended it, and could not confirm in time that its processes are gone.
+/// Every other `term.open` error is a refusal (no Terminal exists).
+pub const OPEN_INDETERMINATE: &str = "open-indeterminate:";
 /// What `connect` prints after `xshelld: ` with [`NOT_RUNNING_EXIT`]. It avoids the phrases
 /// ssh failures are recognized by ("No such file", "Connection refused").
 pub const NOT_RUNNING_MESSAGE: &str =

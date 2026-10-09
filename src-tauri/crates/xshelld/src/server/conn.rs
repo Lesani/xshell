@@ -9,20 +9,21 @@ use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
 use super::role::{self, Role};
 use super::terminal::{self, Terminal};
-use super::{ConnId, ExitReason};
+use super::{ConnId, ExitReason, TestPoint};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{
     decode_inbound, encode_res, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
 };
 use xshell_protocol::negotiate::negotiate;
-use xshell_protocol::{CAPABILITIES, PROTOCOL};
+use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE, PROTOCOL};
 
 /// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
 pub(crate) const UPGRADE_REFUSED: &str =
@@ -178,6 +179,45 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: UnixStream, id: ConnId, role: Role) {
     }
 }
 
+/// Refuse a `term.open` whose Terminal started but is not kept: it is ended, and the
+/// refusal is sent once its processes are gone. If that cannot be confirmed in time (or not
+/// waited for at all), the error says the outcome is open ([`OPEN_INDETERMINATE`]).
+fn refuse_after_end(
+    d: &Arc<Daemon>,
+    ob: &Arc<Outbox>,
+    id: Option<u64>,
+    t: Arc<Terminal>,
+    e: String,
+) {
+    let wait = d
+        .cfg
+        .refused_open_wait
+        .unwrap_or(d.cfg.kill_grace + Duration::from_secs(1));
+    let (grace, ob2, d2, t2) = (d.cfg.kill_grace, ob.clone(), d.clone(), t.clone());
+    let r = std::thread::Builder::new()
+        .name("refused-open".into())
+        .spawn(move || {
+            d2.test_point(t2.id, TestPoint::RefusedOpen);
+            let gone = t2.end_and_wait(grace, Instant::now() + wait);
+            let msg = if gone {
+                e
+            } else {
+                format!("{OPEN_INDETERMINATE} {e}")
+            };
+            reply(&ob2, id, Err(msg));
+        });
+    if r.is_err() {
+        t.kill(d.cfg.kill_grace);
+        reply(
+            ob,
+            id,
+            Err(format!(
+                "{OPEN_INDETERMINATE} cannot wait for the terminal to end"
+            )),
+        );
+    }
+}
+
 impl Conn {
     /// Run `f` on the Terminal listed under `id`, if this connection's role may act on it,
     /// with the registry still locked. Attach, detach and resize go through here: a Relaunch
@@ -210,34 +250,48 @@ impl Conn {
             ClientMsg::TermOpen { spec } => {
                 let mut reg = d.reg.lock().unwrap();
                 let r = if reg.frozen {
-                    Err("xshelld is upgrading or shutting down".to_string())
+                    Err(("xshelld is upgrading or shutting down".to_string(), None))
                 } else if reg.terminals.contains_key(&spec.terminal) {
-                    Err(format!("terminal {} already exists", spec.terminal))
+                    Err((format!("terminal {} already exists", spec.terminal), None))
                 } else if let Err(e) = d.check_budget(&reg, spec.terminal, &spec.launch, &spec.meta)
                 {
-                    Err(e)
+                    Err((e, None))
                 } else {
-                    terminal::spawn(
+                    terminal::spawn_with(
                         &d,
                         spec.terminal,
                         spec.launch,
                         spec.meta,
-                        spec.cols,
-                        spec.rows,
+                        (spec.cols, spec.rows),
                         now_ms(),
+                        |_| {},
                     )
+                    .map_err(|e| (e.message, e.started))
                 };
                 match r {
                     Ok(t) => {
                         let pid = t.info().pid;
-                        reg.terminals.insert(t.id, t);
-                        d.persist(&reg);
+                        reg.terminals.insert(t.id, t.clone());
+                        // The open succeeds only once the Terminal is in the state file, so
+                        // a client that got OK can rely on it surviving a Daemon restart.
+                        // Otherwise it is ended unlisted (its exit is then not published).
+                        if let Err(e) = d.try_persist(&reg) {
+                            reg.terminals.remove(&t.id);
+                            drop(reg);
+                            refuse_after_end(&d, &self.ob, id, t, e);
+                            return;
+                        }
                         d.touch_idle(&mut reg);
                         d.broadcast_terminals(&reg);
                         drop(reg);
                         reply(&self.ob, id, Ok(json!({ "pid": pid })));
                     }
-                    Err(e) => {
+                    // The process started but its threads did not: it is being ended.
+                    Err((e, Some(t))) => {
+                        drop(reg);
+                        refuse_after_end(&d, &self.ob, id, t, e);
+                    }
+                    Err((e, None)) => {
                         drop(reg);
                         reply(&self.ob, id, Err(e));
                     }

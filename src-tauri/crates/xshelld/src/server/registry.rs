@@ -140,17 +140,24 @@ impl Daemon {
     }
 
     pub fn persist(&self, reg: &Registry) {
+        let _ = self.try_persist(reg);
+    }
+
+    /// [`Daemon::persist`], reporting a failed write (already logged). Frozen: nothing is
+    /// written, and that is not a failure.
+    pub fn try_persist(&self, reg: &Registry) -> Result<(), String> {
         if reg.frozen {
-            return;
+            return Ok(());
         }
         let list: Vec<_> = reg.terminals.values().map(|t| t.persisted()).collect();
-        if let Err(e) = state::save_atomic(&self.cfg.paths.state, &list) {
+        state::save_atomic(&self.cfg.paths.state, &list).map_err(|e| {
             crate::log!(
                 "ERROR",
                 "cannot save {}: {e}",
                 self.cfg.paths.state.display()
             );
-        }
+            format!("cannot save the terminal list: {e}")
+        })
     }
 
     pub fn touch_idle(&self, reg: &mut Registry) {

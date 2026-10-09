@@ -328,7 +328,7 @@ impl Link {
         };
         // A late reply to a timed-out request finds nothing and is dropped.
         if let Some(req) = req {
-            (req.waiter)(r.map_err(HostError::remote));
+            (req.waiter)(r.map_err(HostError::from_daemon));
         }
     }
 

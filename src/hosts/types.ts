@@ -86,7 +86,8 @@ export interface HostSnapshot {
   terminals: TerminalInfo[] | null; // null = never connected this run
 }
 
-export type HostErrorCode = "unknown-host" | "offline" | "incompatible" | "timeout" | "remote" | "busy" | "invalid";
+// "indeterminate": an open failed after its Terminal started, which may still run.
+export type HostErrorCode = "unknown-host" | "offline" | "incompatible" | "timeout" | "remote" | "busy" | "invalid" | "indeterminate";
 
 export interface HostError {
   code: HostErrorCode;
