@@ -65,7 +65,7 @@ More agents are on the way — the registry is built to grow.
 - 🧩 **Context tree** for skills, agents, plugins, MCP servers, hooks, slash commands, and CLAUDE.md.
 - 📊 **Cost, context, and rate-limit tracking** per session and across your account.
 - 🪶 **Inline git panel** with diff counts and staging.
-- **Remote hosts** over SSH, with shared terminals that keep running when you disconnect or quit xshell.
+- 🌐 **Remote hosts** over SSH, with shared terminals that keep running when you disconnect or quit xshell.
 
 Built with Tauri 2 and Rust. Native on Windows, macOS, and Linux.
 
