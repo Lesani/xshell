@@ -1264,7 +1264,13 @@ mod tests {
             connected(v) && v.moving.is_none()
         });
         assert_eq!(one.head_version(&rid), Some(2));
-        assert_eq!(two.head_version(&rid), Some(2));
+        // "Connected" can still be the old link's state for a moment: wait for the new
+        // Relay to hold the chain.
+        let deadline = Instant::now() + WAIT;
+        while two.head_version(&rid) != Some(2) {
+            assert!(Instant::now() < deadline, "the new relay has version 2");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let (s, _) = Store::new(t.path().join("ring")).load().unwrap();
         assert_eq!(s.unwrap().pending_move, None);
         ring.quit();
@@ -1515,17 +1521,35 @@ mod tests {
         let (a, _) = open(cfg(t.path(), &one.url()));
         let rid = a.enable(None, false).unwrap().ring_id.unwrap();
         let me = a.view().members[0].sign_key;
-        wait_view(&a, "a connected", connected);
-        wait_view(&b, "b sees the Ring and defers", |v| {
-            v.ring_id.as_ref() == Some(&rid) && v.connection == "other-window"
+        // Either window may win the connection (B re-reads the state and may take the lock
+        // first): the owner is the one connected, the other one defers.
+        let deadline = Instant::now() + WAIT;
+        let (owner, other) = loop {
+            let (va, vb) = (a.view(), b.view());
+            if connected(&va)
+                && vb.ring_id.as_ref() == Some(&rid)
+                && vb.connection == "other-window"
+            {
+                break (&a, &b);
+            }
+            if connected(&vb) && va.connection == "other-window" {
+                break (&b, &a);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one owns, one defers: {va:?} {vb:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        other.set_relay_url(&two.url()).unwrap();
+        wait_view(owner, "the owner adopted the move", |v| {
+            v.version == Some(2)
         });
-        b.set_relay_url(&two.url()).unwrap();
-        wait_view(&a, "a adopted the move", |v| v.version == Some(2));
         let deadline = Instant::now() + WAIT;
         while one.head_version(&rid) != Some(2) || !online(&two, &rid, &me) {
             assert!(
                 Instant::now() < deadline,
-                "a published on the old relay and moved"
+                "the owner published on the old relay and moved"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

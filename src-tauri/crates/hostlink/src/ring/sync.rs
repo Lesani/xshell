@@ -1059,12 +1059,27 @@ mod tests {
         }
     }
 
+    /// The latest join, once it carries version `n`. A join of a newer version may still be
+    /// on its way when an older one already arrived, so wait for it rather than sampling.
     fn joined_with(d: &FakeDaemon, n: usize) -> RosterChain {
-        wait("a join", || !d.joins().is_empty());
-        let (t, _) = d.joins().last().unwrap().clone();
-        let c = RosterChain::from_tokens(&t).unwrap();
-        assert_eq!(c.head().version() as usize, n);
-        c
+        let head = |d: &FakeDaemon| {
+            d.joins()
+                .last()
+                .map(|(t, _)| RosterChain::from_tokens(t).unwrap())
+        };
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let c = head(d);
+            if let Some(c) = c.filter(|c| c.head().version() as usize == n) {
+                return c;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no join of version {n}; the latest: {:?}",
+                head(d).map(|c| c.head().version())
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn status(host: &str, kind: StatusKind, caps: &[&str], link_gen: u64) -> HostStatus {

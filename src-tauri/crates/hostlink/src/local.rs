@@ -255,7 +255,18 @@ impl LocalDaemon {
                 Ok(())
             });
         }
-        cmd.spawn()
+        // The copy was just written: a fork elsewhere in this process may still hold its
+        // write descriptor until that child execs (ETXTBSY). Retry briefly.
+        let mut tries = 0;
+        loop {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                r => return r,
+            }
+        }
     }
 
     /// If our child has exited: reap it and return its exit code (`None`: by a signal).
@@ -985,6 +996,19 @@ mod tests {
             .collect()
     }
 
+    /// The starts logged once at least `n` are in: the fake logs from its own process, which
+    /// may run after the dial that spawned it returned (a loaded machine).
+    fn wait_starts(dir: &Path, n: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = starts(dir);
+            if s.len() >= n || Instant::now() >= deadline {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn daemon_with(dir: &Path, bin: PathBuf) -> Arc<LocalDaemon> {
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -1071,12 +1095,17 @@ mod tests {
         assert!(starts(dir.path()).is_empty());
         drop(ok);
         drop(l);
+        // A child another test forks meanwhile may hold the listener until it execs: wait
+        // until the socket file is really stale.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(dir.path().join("s.sock")).is_ok() {
+            assert!(Instant::now() < deadline, "the listener stays open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // A stale socket file refuses: a Daemon is started, with the GUI-bound flags.
-        assert!(matches!(
-            d.dial(&cancel_after(500)),
-            Err(DialError::Cancelled)
-        ));
-        let s = starts(dir.path());
+        let r = d.dial(&cancel_after(500)).map(|_| ());
+        assert!(matches!(r, Err(DialError::Cancelled)), "{r:?}");
+        let s = wait_starts(dir.path(), 1);
         assert_eq!(
             s,
             vec![format!(
@@ -1105,7 +1134,7 @@ mod tests {
             Err(DialError::Cancelled)
         ));
         assert_eq!(
-            starts(dir.path()),
+            wait_starts(dir.path(), 1),
             vec!["serve --interactive-env".to_string()]
         );
         // It runs from the installed copy, in a session of its own.
