@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use xshell_core::protocol::msg::{ProtocolRange, TerminalInfo};
+use xshell_protocol::msg::{ProtocolRange, TerminalInfo};
 
 /// Receives every status change and every `terminals` list. Called under a Host's lock, in
 /// order; must not call back into the manager.
@@ -51,7 +51,7 @@ impl ManagerConfig {
     ) -> Self {
         Self {
             desktop_version: desktop_version.into(),
-            ours: xshell_core::protocol::PROTOCOL,
+            ours: xshell_protocol::PROTOCOL,
             transports,
             binaries,
             observer,

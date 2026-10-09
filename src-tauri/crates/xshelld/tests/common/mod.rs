@@ -1,5 +1,5 @@
 //! Shared harness for the xshelld integration tests: temp homes, in-process servers, the
-//! binary, and a protocol client built only from xshell-core's codec.
+//! binary, and a protocol client built only from xshell-protocol's codec.
 #![allow(dead_code)]
 
 use serde_json::{json, Map, Value};
@@ -17,8 +17,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
-use xshell_core::protocol::frame::{read_frame, write_frame, Frame, FrameDecoder, MAX_FRAME_LEN};
-use xshell_core::protocol::msg::{
+use xshell_protocol::frame::{read_frame, write_frame, Frame, FrameDecoder, MAX_FRAME_LEN};
+use xshell_protocol::msg::{
     decode_server, encode_msg, ClientMsg, Hello, OpenSpec, ProtocolRange, ServerMsg, TerminalInfo,
 };
 use xshelld::paths::{resolve, Paths};

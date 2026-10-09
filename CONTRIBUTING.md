@@ -70,7 +70,8 @@ xshell/
 │   ├── src/lib.rs             # Tauri commands and thin wrappers over core
 │   ├── src/main.rs            # Entry point
 │   ├── src/hosts/             # Desktop host commands, events, and binary downloads
-│   ├── crates/core/           # xshell-core: Tauri-free host logic and protocol
+│   ├── crates/protocol/       # xshell-protocol: frame codec and messages, no PTY/SQLite/Tauri
+│   ├── crates/core/           # xshell-core: Tauri-free host logic
 │   │   ├── src/dispatch.rs    # Method table for every host command
 │   │   ├── src/launch.rs      # Terminal launch spec → command plan
 │   │   └── tests/             # Integration tests and text fixtures
@@ -115,6 +116,7 @@ npm test                                  # Vitest (frontend unit tests)
 cd src-tauri
 cargo test --workspace --locked            # All Rust crates
 cargo test -p xshell-core --locked         # Core only
+cargo test -p xshell-protocol --locked     # Wire protocol only
 cargo test -p xshelld -p xshell-hostlink --locked # Daemon and hostlink
 ```
 
@@ -142,7 +144,7 @@ Use `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-da
 
 The Desktop checks `xshelld-<triple>` beside its executable first. Debug builds then check `src-tauri/target/<triple>/release-daemon/xshelld` and, for the matching local platform, `src-tauri/target/release-daemon/xshelld`. These paths assume the default Cargo layout; lookup uses the executable's parent directory. Missing local binaries fall back to GitHub release downloads.
 
-CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, a check that `xshell-core` has no Tauri dependency, a check that core never reads the home or temp directory outside `HostCtx`, `cargo clippy` and `cargo test` for `xshell-core` on Windows and macOS, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
+CI runs these checks on every push and pull request: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, a check that `xshell-core` has no Tauri dependency, a check that `xshell-protocol` has no PTY, SQLite or Tauri dependency, a check that core never reads the home or temp directory outside `HostCtx`, `cargo clippy` and `cargo test` for `xshell-core` on Windows and macOS, `tsc` (via `npm run build`), and `vitest`. You can run the same commands locally.
 
 Automated tests do not replace a manual pass: please also test your changes against a **packaged build**, not just `tauri dev`. Packaging often reveals issues that don't show up in dev mode.
 

@@ -8,6 +8,7 @@ description = "The Desktop's client side of Remote Hosts: transport, link, insta
 
 [dependencies]
 xshell-core = { path = "../core" }
+xshell-protocol = { path = "../protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

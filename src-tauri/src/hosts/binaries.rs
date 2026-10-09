@@ -436,11 +436,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_during_stalled_download() {
-        use xshell_core::protocol::msg::TerminalInfo;
         use xshell_hostlink::transport::{CommandSpec, LocalShellTransport, Transport};
         use xshell_hostlink::{
             HostConfig, HostStatus, Manager, ManagerConfig, Observer, Phase, TransportFactory,
         };
+        use xshell_protocol::msg::TerminalInfo;
 
         struct NotInstalled;
         impl Transport for NotInstalled {

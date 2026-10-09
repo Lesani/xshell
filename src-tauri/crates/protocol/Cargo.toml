@@ -1,0 +1,12 @@
+[package]
+name = "xshell-protocol"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The xshell wire protocol: framing, messages, version negotiation. No PTY, SQLite or Tauri."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

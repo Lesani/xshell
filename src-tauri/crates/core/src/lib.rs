@@ -14,7 +14,6 @@ pub mod launch;
 pub mod memories;
 pub mod opencode;
 pub mod paths;
-pub mod protocol;
 pub mod sessions;
 pub mod skills;
 pub mod stats;

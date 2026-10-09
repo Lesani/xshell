@@ -3,7 +3,7 @@
 use crate::errors::HostErrorHint;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
-use xshell_core::protocol::msg::TerminalInfo;
+use xshell_protocol::msg::TerminalInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

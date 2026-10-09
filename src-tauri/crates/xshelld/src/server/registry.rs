@@ -13,9 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::launch::LaunchSpec;
-use xshell_core::protocol::msg::{encode_msg, ServerMsg, TerminalInfo};
 use xshell_core::terminal::state;
 use xshell_core::HostCtx;
+use xshell_protocol::msg::{encode_msg, ServerMsg, TerminalInfo};
 
 pub(crate) struct Daemon {
     pub cfg: Config,

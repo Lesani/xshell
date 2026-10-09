@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core", "crates/xshelld", "crates/hostlink"]
+members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -38,6 +38,7 @@ serde_json = { workspace = true }
 portable-pty = { workspace = true }
 uuid = { workspace = true }
 xshell-core = { path = "crates/core" }
+xshell-protocol = { path = "crates/protocol" }
 xshell-hostlink = { path = "crates/hostlink" }
 dirs = { workspace = true }
 # All already in the tree via tauri-plugin-updater: no new crates.

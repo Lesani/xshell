@@ -1,8 +1,8 @@
 //! What a Daemon's `hello` means for this Desktop (ADR-0003): usable, usable with an upgrade
 //! pending, or unusable until one side is upgraded.
 
-use xshell_core::protocol::msg::{Hello, ProtocolRange};
-use xshell_core::protocol::negotiate::negotiate;
+use xshell_protocol::msg::{Hello, ProtocolRange};
+use xshell_protocol::negotiate::negotiate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncompatibleReason {

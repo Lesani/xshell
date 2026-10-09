@@ -4,9 +4,11 @@
 
 pub mod correlate;
 pub mod frame;
+pub mod launch;
 pub mod msg;
 pub mod negotiate;
 
+pub use launch::LaunchSpec;
 use msg::ProtocolRange;
 
 pub const PROTOCOL_MIN: u32 = 1;

@@ -7,13 +7,13 @@ mod common;
 use common::*;
 use std::time::Duration;
 use uuid::Uuid;
-use xshell_core::protocol::msg::ClientMsg;
+use xshell_protocol::msg::ClientMsg;
 
 fn serve(h: &TestHome, f: &Fake) -> ServeProc {
     ServeProc::start(h, &[("PATH", &f.path_env())])
 }
 
-fn client(h: &TestHome) -> (Client, Vec<xshell_core::protocol::msg::TerminalInfo>) {
+fn client(h: &TestHome) -> (Client, Vec<xshell_protocol::msg::TerminalInfo>) {
     let mut c = Client::connect(&h.paths().socket);
     let (_, list) = c.hello(range(1, 1));
     (c, list)

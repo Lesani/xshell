@@ -10,9 +10,9 @@ use desktop::*;
 use serde_json::json;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::msg::ProtocolRange;
 use xshell_hostlink::status::{IncompatibleReason, Phase};
 use xshell_hostlink::StatusKind;
+use xshell_protocol::msg::ProtocolRange;
 
 #[test]
 fn connects_and_calls_get_home_dir() {
@@ -389,7 +389,7 @@ fn stall_delivery(fx: &Fx) -> (Uuid, std::sync::Arc<Gate>) {
     let gate = std::sync::Arc::new(Gate::default());
     let (tx, rx) = std::sync::mpsc::channel();
     h.term_open(
-        xshell_core::protocol::msg::OpenSpec {
+        xshell_protocol::msg::OpenSpec {
             terminal: t,
             launch: fx.project(),
             cols: 80,

@@ -13,14 +13,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::correlate::Correlator;
-use xshell_core::protocol::frame::{Frame, FrameDecoder};
-use xshell_core::protocol::msg::{
+use xshell_protocol::correlate::Correlator;
+use xshell_protocol::frame::{Frame, FrameDecoder};
+use xshell_protocol::msg::{
     decode_server, encode_msg, ClientMsg, DecodeError, Hello, ProtocolRange, ServerMsg,
     TerminalInfo,
 };
-use xshell_core::protocol::negotiate::negotiate;
-use xshell_core::protocol::CAPABILITIES;
+use xshell_protocol::negotiate::negotiate;
+use xshell_protocol::CAPABILITIES;
 
 pub type Waiter = Box<dyn FnOnce(Result<Value, HostError>) + Send>;
 
@@ -556,8 +556,8 @@ pub(crate) mod testpeer {
     //! A scripted Daemon over in-memory pipes.
     use super::*;
     use std::io::{BufReader, PipeReader, PipeWriter};
-    use xshell_core::protocol::frame::{encode_output, read_frame, MAX_FRAME_LEN};
-    use xshell_core::protocol::msg::encode_res;
+    use xshell_protocol::frame::{encode_output, read_frame, MAX_FRAME_LEN};
+    use xshell_protocol::msg::encode_res;
 
     pub struct Peer {
         pub r: BufReader<PipeReader>,
@@ -966,7 +966,7 @@ mod tests {
 
     fn encode_raw_json(j: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
-        xshell_core::protocol::frame::encode_json(j, &mut v).unwrap();
+        xshell_protocol::frame::encode_json(j, &mut v).unwrap();
         v
     }
 

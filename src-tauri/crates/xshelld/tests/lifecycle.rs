@@ -8,8 +8,8 @@ use serde_json::json;
 use std::fs;
 use std::time::Duration;
 use uuid::Uuid;
-use xshell_core::protocol::msg::ClientMsg;
 use xshell_core::terminal::state::{save_atomic, PersistedTerminal};
+use xshell_protocol::msg::ClientMsg;
 use xshelld::server::{ExitReason, Server, StartError};
 
 #[test]
@@ -180,7 +180,7 @@ fn shutdown_keeps_state() {
     assert!(a
         .try_msg(Duration::ZERO, |m| matches!(
             m,
-            xshell_core::protocol::msg::ServerMsg::TermExit { .. }
+            xshell_protocol::msg::ServerMsg::TermExit { .. }
         ))
         .is_none());
 }

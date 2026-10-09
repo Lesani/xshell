@@ -1,7 +1,7 @@
 //! Kind-0 JSON messages. Every message is an object with a string `"t"` (its type); fields are
 //! camelCase and unknown fields are ignored, so protocol changes stay additive.
 
-use super::frame::{encode_json, FrameError};
+use crate::frame::{encode_json, FrameError};
 use crate::launch::LaunchSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -290,7 +290,7 @@ pub fn encode_res(id: u64, result: Result<Value, String>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+    use crate::frame::{read_frame, Frame, MAX_FRAME_LEN};
     use serde_json::json;
 
     fn body(frame: Vec<u8>) -> Vec<u8> {

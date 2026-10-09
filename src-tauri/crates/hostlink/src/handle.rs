@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::msg::{ClientMsg, OpenSpec, TerminalInfo};
+use xshell_protocol::msg::{ClientMsg, OpenSpec, TerminalInfo};
 
 /// Where one Tab's output goes.
 pub trait TermSink: Send + Sync {
@@ -1049,7 +1049,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::sync::mpsc;
     use xshell_core::launch::LaunchSpec;
-    use xshell_core::protocol::msg::{Hello, ProtocolRange, ServerMsg};
+    use xshell_protocol::msg::{Hello, ProtocolRange, ServerMsg};
 
     #[derive(Default)]
     pub struct VecSink {

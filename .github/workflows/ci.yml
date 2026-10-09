@@ -50,6 +50,15 @@ jobs:
             echo "::error::xshell-core depends on a Tauri/webview crate"
             exit 1
           fi
+      - name: Guard - xshell-protocol stays light (no PTY, SQLite or Tauri)
+        shell: bash
+        run: |
+          tree=$(cargo tree -p xshell-protocol -e normal --prefix none --locked)
+          grep -q '^xshell-protocol ' <<<"$tree"
+          if grep -E '^(tauri|wry|webkit2gtk|gtk|portable-pty|rusqlite|libsqlite3-sys) ' <<<"$tree"; then
+            echo "::error::xshell-protocol depends on a PTY, SQLite or Tauri crate"
+            exit 1
+          fi
       - name: Guard - home and temp dirs only come from HostCtx
         shell: bash
         run: |
@@ -87,8 +96,8 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-      - run: cargo clippy -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
-      - run: cargo test -p xshell-core -p xshelld -p xshell-hostlink --locked
+      - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
+      - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked
   xshelld-musl:
     # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
     # builds natively with musl-gcc on a runner of its own architecture. The release workflow

@@ -15,12 +15,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use uuid::Uuid;
-use xshell_core::protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
-use xshell_core::protocol::msg::{
+use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+use xshell_protocol::msg::{
     decode_inbound, encode_res, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
 };
-use xshell_core::protocol::negotiate::negotiate;
-use xshell_core::protocol::{CAPABILITIES, PROTOCOL};
+use xshell_protocol::negotiate::negotiate;
+use xshell_protocol::{CAPABILITIES, PROTOCOL};
 
 pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     if let Some(id) = id {

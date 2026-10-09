@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 use xshell_core::launch::LaunchSpec;
-use xshell_core::protocol::msg::{ClientMsg, ServerMsg, TerminalInfo};
 use xshell_core::terminal::replay::RESET;
+use xshell_protocol::msg::{ClientMsg, ServerMsg, TerminalInfo};
 use xshelld::server::{Config, Server, ServerHandle, StartError, TestHook, TestPoint};
 
 const SID: &str = "11111111-2222-3333-4444-555555555555";

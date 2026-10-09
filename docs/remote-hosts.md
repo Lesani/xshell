@@ -10,11 +10,12 @@ Agents running on another machine look and behave like local ones: the same side
 
 ```
 src-tauri/                      Cargo workspace root (target/ stays here)
-├── Cargo.toml                  [workspace] members = [".", "crates/core", "crates/xshelld"]
+├── Cargo.toml                  [workspace] members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink"]
 ├── src/                        Desktop (Tauri): commands, Local Host, Host connections
 └── crates/
+    ├── protocol/ (xshell-protocol)  wire protocol: frame codec, messages, negotiation; no PTY/SQLite/Tauri
     ├── core/   (xshell-core)   Tauri-free: every Host-side feature, terminal command building,
-    │                           protocol types + codec, RPC dispatch table
+    │                           RPC dispatch table
     └── xshelld/                the Daemon binary: socket server, Terminal registry, `connect` bridge
 ```
 
@@ -83,7 +84,8 @@ Messages (protocol 1):
 
 ## Testing
 
-- `cargo test` in core: session/project parsing against fixture home trees, protocol codec round-trips and malformed-frame handling, replay-buffer trimming, launch-spec persistence and restore arguments.
+- `cargo test` in xshell-protocol: codec round-trips, malformed-frame handling, message decoding and version negotiation.
+- `cargo test` in core: session/project parsing against fixture home trees, replay-buffer trimming, launch-spec persistence and restore arguments.
 - `cargo test` in xshelld: integration tests that run `serve` in-process on a temp socket and drive it through the client codec — open/attach/replay, two connections on one Terminal, size-follows-last-input, close ends it everywhere, disconnect ends nothing, restart restores with resume flags (a fake `claude` script records its argv).
 - Desktop Rust: host connection tests using the substitutable transport against a real `xshelld` built in the workspace; install path tested against a temp "remote home".
 - CI end-to-end: start `sshd` on the runner with a generated key and connect to `localhost` through the real `ssh` path, including auto-install from the workspace-built binary.

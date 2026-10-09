@@ -10,8 +10,8 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::frame::{encode_json, Frame};
-use xshell_core::protocol::msg::{ClientMsg, ServerMsg};
+use xshell_protocol::frame::{encode_json, Frame};
+use xshell_protocol::msg::{ClientMsg, ServerMsg};
 
 #[test]
 fn hello_negotiates_and_sends_terminals() {
@@ -32,7 +32,7 @@ fn hello_no_overlap_rejected() {
     let srv = start(&h, |_| {});
     let mut c = Client::connect(&srv.socket);
     c.send(
-        &ClientMsg::Hello(xshell_core::protocol::msg::Hello {
+        &ClientMsg::Hello(xshell_protocol::msg::Hello {
             protocol: range(2, 3),
             version: "future".into(),
             capabilities: vec![],

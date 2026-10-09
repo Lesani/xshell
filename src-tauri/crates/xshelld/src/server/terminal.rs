@@ -17,9 +17,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
-use xshell_core::protocol::msg::{encode_res, ServerMsg, TerminalInfo};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
+use xshell_protocol::msg::{encode_res, ServerMsg, TerminalInfo};
 
 const READ_BUF: usize = 16 * 1024;
 const INPUT_BACKLOG: usize = 1024;

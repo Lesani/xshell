@@ -5509,6 +5509,7 @@ dependencies = [
  "uuid",
  "xshell-core",
  "xshell-hostlink",
+ "xshell-protocol",
 ]
 
 [[package]]
@@ -5523,6 +5524,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "xshell-protocol",
 ]
 
 [[package]]
@@ -5537,6 +5539,16 @@ dependencies = [
  "tempfile",
  "uuid",
  "xshell-core",
+ "xshell-protocol",
+]
+
+[[package]]
+name = "xshell-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -5552,6 +5564,7 @@ dependencies = [
  "uuid",
  "xshell-core",
  "xshell-hostlink",
+ "xshell-protocol",
 ]
 
 [[package]]

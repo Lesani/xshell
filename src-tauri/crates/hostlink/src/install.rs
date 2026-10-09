@@ -9,8 +9,8 @@ use crate::transport::{sh_wrap, Transport};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
-use xshell_core::protocol::msg::ProtocolRange;
-use xshell_core::protocol::negotiate::negotiate;
+use xshell_protocol::msg::ProtocolRange;
+use xshell_protocol::negotiate::negotiate;
 
 pub const MARKER: &str = "@@XSHELL@@";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);

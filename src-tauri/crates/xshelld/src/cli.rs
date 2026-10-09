@@ -44,8 +44,8 @@ pub fn version_json() -> String {
     format!(
         r#"{{"name":"xshelld","version":{},"protocol":{{"min":{},"max":{}}},"os":{},"arch":{}}}"#,
         serde_json::Value::from(env!("CARGO_PKG_VERSION")),
-        xshell_core::protocol::PROTOCOL_MIN,
-        xshell_core::protocol::PROTOCOL_MAX,
+        xshell_protocol::PROTOCOL_MIN,
+        xshell_protocol::PROTOCOL_MAX,
         serde_json::Value::from(uname_os()),
         serde_json::Value::from(std::env::consts::ARCH),
     )

@@ -1,4 +1,4 @@
-use super::msg::ProtocolRange;
+use crate::msg::ProtocolRange;
 use std::fmt;
 
 /// The two sides share no protocol version.

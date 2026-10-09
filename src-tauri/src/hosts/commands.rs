@@ -10,10 +10,10 @@ use tauri::ipc::{Channel, Response};
 use tauri::State;
 use tokio::sync::oneshot;
 use uuid::Uuid;
-use xshell_core::protocol::msg::OpenSpec;
 use xshell_core::LaunchSpec;
 use xshell_hostlink::config::validate_one;
 use xshell_hostlink::{HostConfig, HostError, HostHandle, HostSnapshot, HostTestResult};
+use xshell_protocol::msg::OpenSpec;
 
 fn handle(state: &Hosts, host: &str) -> Result<Arc<HostHandle>, HostError> {
     state

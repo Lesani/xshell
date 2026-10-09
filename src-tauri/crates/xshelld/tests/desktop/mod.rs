@@ -9,12 +9,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::launch::LaunchSpec;
-use xshell_core::protocol::msg::{OpenSpec, TerminalInfo};
 use xshell_hostlink::transport::sh_quote;
 use xshell_hostlink::{
     BinarySource, FileSource, HostConfig, HostError, HostHandle, HostStatus, LocalShellTransport,
     Manager, ManagerConfig, Observer, StatusKind, TermSink, Transport, TransportFactory,
 };
+use xshell_protocol::msg::{OpenSpec, TerminalInfo};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ID: &str = "h_test0001";

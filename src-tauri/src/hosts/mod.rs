@@ -9,11 +9,11 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager as _};
-use xshell_core::protocol::msg::TerminalInfo;
 use xshell_hostlink::{
     HostConfig, HostStatus, Manager, ManagerConfig, Observer, SshTransport, TermSink, Transport,
     TransportFactory,
 };
+use xshell_protocol::msg::TerminalInfo;
 
 pub struct Hosts {
     pub manager: Arc<Manager>,

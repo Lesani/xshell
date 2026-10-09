@@ -8,9 +8,9 @@ use common::*;
 use serde_json::{json, Map};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::frame::Frame;
-use xshell_core::protocol::msg::{ClientMsg, ServerMsg};
 use xshell_core::terminal::OVERFLOW_NOTICE;
+use xshell_protocol::frame::Frame;
+use xshell_protocol::msg::{ClientMsg, ServerMsg};
 
 fn client(srv: &xshelld::server::ServerHandle) -> Client {
     let mut c = Client::connect(&srv.socket);
@@ -560,7 +560,7 @@ fn control_flood_disconnects_peer() {
     });
     let mut a = RawClient::connect(&srv.socket);
     a.hello();
-    let req = xshell_core::protocol::msg::encode_msg(
+    let req = xshell_protocol::msg::encode_msg(
         &ClientMsg::Call {
             method: "get_home_dir".into(),
             params: json!({}),
@@ -615,7 +615,7 @@ fn terminal_list_budget_enforced() {
         let mut meta = Map::new();
         meta.insert("title".into(), json!("x".repeat(title_len)));
         let r = a.request(&ClientMsg::TermOpen {
-            spec: xshell_core::protocol::msg::OpenSpec {
+            spec: xshell_protocol::msg::OpenSpec {
                 terminal: t,
                 launch: sh_spec(&h.project("p")),
                 cols: 80,

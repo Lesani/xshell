@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use uuid::Uuid;
-use xshell_core::protocol::msg::ClientMsg;
+use xshell_protocol::msg::ClientMsg;
 
 #[test]
 fn version_is_machine_readable() {

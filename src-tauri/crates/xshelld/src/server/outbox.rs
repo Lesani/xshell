@@ -13,8 +13,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::protocol::frame::KIND_OUTPUT;
 use xshell_core::terminal::OVERFLOW_NOTICE;
+use xshell_protocol::frame::KIND_OUTPUT;
 
 const WRITE_BUF: usize = 256 * 1024;
 /// Adjacent output chunks for one Terminal are merged into frames of at most this size.
@@ -293,7 +293,7 @@ pub(crate) fn writer_loop(ob: Arc<Outbox>, sock: UnixStream, stall: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xshell_core::protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+    use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 
     fn bytes(b: &[u8]) -> Arc<[u8]> {
         Arc::from(b)
