@@ -752,7 +752,11 @@ fn connector_put_entitlement_lifts_limit() {
     assert_eq!(c.entitlement(), None);
 
     let t = token(&gw, &ring.ring_id(), Tier::Hosted, now() + 3600);
-    c.put_entitlement(&t).expect("put");
+    // In two steps: queued at once, answered through the ticket.
+    c.put_entitlement_start(&t)
+        .expect("queued")
+        .wait(WAIT)
+        .expect("put");
     assert!(connected_as(&rec, false));
     assert!(rec
         .wait(WAIT, |e| matches!(e, Ev::Entitlement(Some(x)) if *x == t))
@@ -828,6 +832,10 @@ fn connector_put_entitlement_not_connected() {
         .is_some());
     let t = fake_entitlement(&ring.ring_id());
     assert!(matches!(c.put_entitlement(&t), Err(RingError::Closed(_))));
+    assert!(matches!(
+        c.put_entitlement_start(&t),
+        Err(RingError::Closed(_))
+    ));
     assert_eq!(c.entitlement(), None);
     c.stop(ByeReason::quit());
 

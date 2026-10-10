@@ -978,6 +978,18 @@ impl Connector {
         }
     }
 
+    /// [`Connector::put_entitlement`] in two steps: queues the `entitlement.put` on the
+    /// current connection without blocking (so a caller can do it under its own locks, right
+    /// after its last check) and returns the ticket its answer comes through. `Err(Closed)`
+    /// when not connected.
+    pub fn put_entitlement_start(&self, token: &str) -> Result<Ticket, RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.put_entitlement_start(token),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
     /// Whether the current connection is up and this Ring's envelopes are routed (not a
     /// limited session).
     pub fn routing(&self) -> bool {

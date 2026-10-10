@@ -800,15 +800,6 @@ impl RingClient {
         })
     }
 
-    fn request(
-        &self,
-        accept: Option<String>,
-        timeout: Duration,
-        frame: impl FnOnce(u64) -> ClientFrame,
-    ) -> Result<(), RingError> {
-        self.request_start(accept, frame)?.wait(timeout)
-    }
-
     /// Uploads the next Roster version and waits for the Relay to accept it. It must extend
     /// this client's trusted head.
     pub fn publish_roster(&self, next: &SignedRoster) -> Result<(), RingError> {
@@ -833,14 +824,20 @@ impl RingClient {
 
     /// Stores a Push Gateway entitlement token in the Ring's slot on the Relay.
     pub fn put_entitlement(&self, token: &str) -> Result<(), RingError> {
+        self.put_entitlement_start(token)?
+            .wait(self.timeouts.request)
+    }
+
+    /// [`RingClient::put_entitlement`] in two steps: queues the frame without blocking (so a
+    /// caller can do it under its own locks, right after its last check) and returns the
+    /// ticket its answer comes through.
+    pub fn put_entitlement_start(&self, token: &str) -> Result<Ticket, RingError> {
         if !entitlement_well_formed(token) {
             return Err(RingError::Invalid("not an entitlement token".into()));
         }
-        self.request(None, self.timeouts.request, |id| {
-            ClientFrame::EntitlementPut {
-                id,
-                token: token.to_string(),
-            }
+        self.request_start(None, |id| ClientFrame::EntitlementPut {
+            id,
+            token: token.to_string(),
         })
     }
 
