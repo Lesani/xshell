@@ -13,16 +13,20 @@ mod common;
 
 use common::*;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 use xshell_core::agent_status::{posix_quote, AgentStatus};
+use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
-use xshell_protocol::msg::{ClientMsg, TerminalInfo};
-use xshelld::server::ServerHandle;
+use xshell_protocol::msg::{ClientMsg, LastLine, Speaker, TerminalInfo};
+use xshelld::server::{Role, ServerHandle, TestHook, TestPoint};
 
 use AgentStatus::*;
 
@@ -587,4 +591,480 @@ fn hookless_daemon_launches_agents_as_before() {
         .unwrap_or_default()
         .contains("XSHELL_TERMINAL_ID"));
     assert!(!h.paths().claude_hooks.exists());
+}
+
+// ── Status time and last line ─────────────────────────────────────────────────
+
+const SID_B: &str = "bbbbbbbb-2222-3333-4444-555555555555";
+
+/// Where a held read says it is held, and what releases it.
+type Hold = (Sender<()>, Receiver<()>);
+
+/// Counts the last-line worker's reads per Terminal, and can hold one read until released.
+#[derive(Clone, Default)]
+struct Reads {
+    counts: Arc<(Mutex<HashMap<Uuid, usize>>, Condvar)>,
+    /// Hold the next read: tell the first sender, then wait on the receiver.
+    hold: Arc<Mutex<Option<Hold>>>,
+}
+
+impl Reads {
+    fn hook(&self) -> TestHook {
+        let me = self.clone();
+        TestHook(Arc::new(move |id, p| {
+            if p == TestPoint::LastLineRead {
+                if let Some((held, release)) = me.hold.lock().unwrap().take() {
+                    held.send(()).unwrap();
+                    let _ = release.recv_timeout(T);
+                }
+                let (m, cv) = &*me.counts;
+                *m.lock().unwrap().entry(id).or_default() += 1;
+                cv.notify_all();
+            }
+            false
+        }))
+    }
+
+    fn count(&self, t: Uuid) -> usize {
+        self.counts.0.lock().unwrap().get(&t).copied().unwrap_or(0)
+    }
+
+    /// Wait until `t` has been read `n` times in all.
+    fn wait(&self, t: Uuid, n: usize) {
+        let (m, cv) = &*self.counts;
+        let deadline = Instant::now() + T;
+        let mut g = m.lock().unwrap();
+        while g.get(&t).copied().unwrap_or(0) < n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "{t} not read {n} times within {T:?}");
+            g = cv.wait_timeout(g, left).unwrap().0;
+        }
+    }
+
+    /// Wait until both reads (now and the retry) of a request made after `before` reads
+    /// are done: the first one's result is stored by then.
+    fn settle(&self, t: Uuid, before: usize) {
+        self.wait(t, before + 2);
+    }
+}
+
+/// [`env`] with a short last-line retry and the read counter installed.
+fn env_reads() -> (Env, Reads) {
+    let reads = Reads::default();
+    let hook = reads.hook();
+    let e = env_with(|c| {
+        c.last_line_retry = Duration::from_millis(100);
+        c.test_hook = Some(hook);
+    });
+    (e, reads)
+}
+
+/// [`env`] with the Daemon's configuration changed by `tweak`.
+fn env_with(tweak: impl FnOnce(&mut xshelld::server::Config)) -> Env {
+    hook_fake_agents();
+    let user_config = user_agent_config();
+    let h = TestHome::new();
+    let cwd = h.project("app");
+    let fake = Fake {
+        bin: PathBuf::new(),
+        argv_log: cwd.join("argv.log"),
+        pids_log: cwd.join("pids.log"),
+    };
+    let srv = start(&h, tweak);
+    let mut c = Client::connect(&srv.socket);
+    c.hello(range(1, 1));
+    Env {
+        _reaper: FakeReaper(fake.pids_log.clone()),
+        h,
+        srv,
+        c,
+        cwd,
+        fake,
+        user_config,
+        sent: Default::default(),
+    }
+}
+
+fn user_msg(text: &str) -> Value {
+    serde_json::json!({"type": "user", "message": {"role": "user", "content": text}})
+}
+
+fn agent_msg(text: &str) -> Value {
+    serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                       "content": [{"type": "text", "text": text}]}})
+}
+
+fn append(p: &Path, v: &Value) {
+    use std::io::Write;
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+        .unwrap();
+    writeln!(f, "{v}").unwrap();
+}
+
+fn line(from: Speaker, text: &str) -> Option<LastLine> {
+    Some(LastLine {
+        from,
+        text: text.into(),
+    })
+}
+
+impl Env {
+    /// The session file of Claude session `sid` in this Env's Project.
+    fn claude_file(&self, sid: &str) -> PathBuf {
+        self.h
+            .home()
+            .join(".claude/projects")
+            .join(encode_project_name(&self.cwd.to_string_lossy()))
+            .join(format!("{sid}.jsonl"))
+    }
+
+    /// `t` as a new connection is told.
+    fn info(&self, t: Uuid) -> TerminalInfo {
+        let mut c = Client::connect(&self.srv.socket);
+        let list = c.hello(range(1, 1)).1;
+        list.into_iter().find(|i| i.terminal == t).expect("listed")
+    }
+
+    /// Wait until `c` is told `t` has `last`.
+    fn wait_line(c: &mut Client, t: Uuid, last: &Option<LastLine>) -> TerminalInfo {
+        let list = c.terminals_where(|l| l.iter().any(|i| i.terminal == t && i.last_line == *last));
+        list.into_iter().find(|i| i.terminal == t).unwrap()
+    }
+
+    fn link(&mut self, t: Uuid, sid: &str) {
+        self.c
+            .request(&ClientMsg::TermUpdate {
+                terminal: t,
+                session_id: Some(sid.into()),
+                meta: None,
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn status_at_ms_changes_with_status_only() {
+    let mut e = env();
+    let t = e.open("claude", Some(SID));
+    let i = e.info(t);
+    assert_eq!((i.agent_status, i.status_at_ms), (None, None));
+    let before = xshelld_now_ms();
+    e.claude_hook("UserPromptSubmit");
+    let working = e.wait(t, Some(Working)).status_at_ms.expect("stamped");
+    assert!(working >= before, "{working} < {before}");
+    // The same status again: the stamp stays.
+    e.claude_hook("UserPromptSubmit");
+    e.claude_hook("PostToolUse");
+    assert_eq!(e.info(t).status_at_ms, Some(working));
+    e.claude_hook("Stop");
+    let finished = e.wait(t, Some(Finished)).status_at_ms.unwrap();
+    assert!(finished > working);
+    // A Relaunch's run has no status, and so no stamp, until it reports; then it stamps
+    // after the replaced run.
+    make_jsonl(&e.h, &e.cwd, SID);
+    let n = e.fake.pids().len();
+    e.c.request(&ClientMsg::TermRelaunch {
+        terminal: t,
+        skip_permissions: true,
+    })
+    .unwrap();
+    e.fake.wait_pids(n + 1);
+    let i = e.wait(t, None);
+    assert_eq!(i.status_at_ms, None);
+    e.claude_hook("UserPromptSubmit");
+    let again = e.wait(t, Some(Working)).status_at_ms.unwrap();
+    assert!(again > finished);
+}
+
+fn xshelld_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn claude_last_line_follows_session_file() {
+    let mut e = env();
+    let f = e.claude_file(SID);
+    append(&f, &user_msg("fix the bug"));
+    append(&f, &agent_msg("Fixed\nthe   bug."));
+    let t = e.open("claude", Some(SID));
+    let mut other = Client::connect(&e.srv.socket);
+    other.hello(range(1, 1));
+    // Read on open already.
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "Fixed the bug."));
+    append(&f, &user_msg("now the tests"));
+    e.claude_hook("UserPromptSubmit");
+    let want = line(Speaker::User, "now the tests");
+    Env::wait_line(&mut e.c, t, &want);
+    Env::wait_line(&mut other, t, &want);
+    append(
+        &f,
+        &serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                            "content": [{"type": "tool_use", "name": "Bash"}]}}),
+    );
+    append(&f, &agent_msg("Tests pass."));
+    e.claude_hook("Stop");
+    let i = Env::wait_line(&mut other, t, &line(Speaker::Agent, "Tests pass."));
+    assert_eq!(i.agent_status, Some(Finished));
+}
+
+#[test]
+fn transcript_written_after_the_hook_is_read_on_retry() {
+    let (mut e, reads) = env_reads();
+    let f = e.claude_file(SID);
+    append(&f, &agent_msg("one"));
+    let t = e.open("claude", Some(SID));
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "one"));
+    // Both reads of the open are done; the Stop hook fires before the transcript has the
+    // turn's text, which only the retry sees.
+    reads.settle(t, 0);
+    let before = reads.count(t);
+    let (held_tx, held_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    *reads.hold.lock().unwrap() = Some((held_tx, release_rx));
+    e.claude_hook("Stop");
+    held_rx.recv_timeout(T).expect("the first read");
+    append(&f, &agent_msg("two"));
+    release_tx.send(()).unwrap();
+    // Only the retry, read after "two" was written, can see it.
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "two"));
+    assert!(reads.count(t) >= before + 2);
+}
+
+#[test]
+fn repeated_report_refreshes_last_line_after_the_retry() {
+    let (mut e, reads) = env_reads();
+    let f = e.claude_file(SID);
+    append(&f, &agent_msg("one"));
+    let t = e.open("claude", Some(SID));
+    reads.settle(t, 0);
+    e.claude_hook("Stop");
+    let i = e.wait(t, Some(Finished));
+    assert_eq!(i.last_line, line(Speaker::Agent, "one"));
+    let stamp = i.status_at_ms;
+    assert!(stamp.is_some());
+    // The Stop's read and its retry are over: only a new request reads again.
+    reads.settle(t, 2);
+    // Another turn finished: the status repeats, the line is new.
+    append(&f, &user_msg("again"));
+    append(&f, &agent_msg("two"));
+    e.claude_hook("Stop");
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "two"));
+    assert_eq!(i.agent_status, Some(Finished));
+    assert_eq!(i.status_at_ms, stamp, "a repeated status keeps its stamp");
+}
+
+#[test]
+fn last_line_appears_after_term_update_links_session() {
+    let mut e = env();
+    let t = e.open("claude", None);
+    append(&e.claude_file(SID_B), &agent_msg("linked"));
+    assert_eq!(e.info(t).last_line, None);
+    e.link(t, SID_B);
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "linked"));
+}
+
+#[test]
+fn codex_last_line_with_linked_session() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    let sid = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+    let rollout =
+        e.h.home()
+            .join(".codex/sessions/2026/10/10")
+            .join(format!("rollout-2026-10-10T10-00-00-{sid}.jsonl"));
+    let ev = |kind: &str, text: &str| serde_json::json!({"type": "event_msg", "payload": {"type": kind, "message": text}});
+    append(
+        &rollout,
+        &serde_json::json!({"type": "session_meta", "payload": {"id": sid}}),
+    );
+    append(&rollout, &ev("user_message", "build it"));
+    // Unlinked (Codex starts without a session id): no line.
+    assert_eq!(e.info(t).last_line, None);
+    e.link(t, sid);
+    Env::wait_line(&mut e.c, t, &line(Speaker::User, "build it"));
+    append(&rollout, &ev("agent_message", "Built."));
+    e.codex_notify_with(r#"{"type":"agent-turn-complete"}"#);
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "Built."));
+    assert_eq!(i.agent_status, Some(Finished));
+}
+
+#[test]
+fn last_line_stays_inside_session_storage() {
+    use std::os::unix::fs::symlink;
+    let (mut e, reads) = env_reads();
+    let t = e.open("claude", None);
+    reads.settle(t, 0);
+    let projects = e.h.home().join(".claude/projects");
+    let enc = encode_project_name(&e.cwd.to_string_lossy());
+    // `../escape` would name ~/.claude/projects/escape.jsonl.
+    append(&projects.join("escape.jsonl"), &agent_msg("escaped"));
+    append(&e.claude_file("inproject"), &agent_msg("control"));
+    let outside = e.h.root().join("outside.jsonl");
+    append(&outside, &agent_msg("secret"));
+    symlink(&outside, projects.join(&enc).join("linked.jsonl")).unwrap();
+    for sid in ["../escape", "linked"] {
+        let before = reads.count(t);
+        e.link(t, sid);
+        reads.settle(t, before);
+        assert_eq!(e.info(t).last_line, None, "{sid}");
+    }
+    // A symlinked Project directory pointing outside storage.
+    let elsewhere = e.h.root().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    append(&elsewhere.join("viadir.jsonl"), &agent_msg("secret"));
+    let real = projects.join(format!("{enc}.real"));
+    fs::rename(projects.join(&enc), &real).unwrap();
+    symlink(&elsewhere, projects.join(&enc)).unwrap();
+    let before = reads.count(t);
+    e.link(t, "viadir");
+    reads.settle(t, before);
+    assert_eq!(e.info(t).last_line, None);
+    // The control: a plain file in the Project directory is read.
+    fs::remove_file(projects.join(&enc)).unwrap();
+    fs::rename(&real, projects.join(&enc)).unwrap();
+    e.link(t, "inproject");
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "control"));
+}
+
+#[test]
+fn last_line_read_for_a_replaced_session_is_dropped() {
+    let (mut e, reads) = env_reads();
+    append(&e.claude_file(SID), &agent_msg("line A"));
+    append(&e.claude_file(SID_B), &agent_msg("line B"));
+    // The open's read of session A is held until the Terminal is relinked to B.
+    let (held_tx, held_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    *reads.hold.lock().unwrap() = Some((held_tx, release_rx));
+    let t = e.open("claude", Some(SID));
+    held_rx.recv_timeout(T).expect("the read of session A");
+    e.link(t, SID_B);
+    release_tx.send(()).unwrap();
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + T;
+    loop {
+        assert!(Instant::now() < deadline, "no line B: {seen:?}");
+        let list = e.c.terminals();
+        let i = list.iter().find(|i| i.terminal == t).unwrap();
+        seen.push(i.last_line.clone());
+        if i.last_line == line(Speaker::Agent, "line B") {
+            break;
+        }
+    }
+    assert!(
+        !seen.contains(&line(Speaker::Agent, "line A")),
+        "session A's line was published: {seen:?}"
+    );
+    reads.settle(t, 1);
+    assert_eq!(e.info(t).last_line, line(Speaker::Agent, "line B"));
+}
+
+#[test]
+fn mobile_connection_sees_status_at_and_last_line() {
+    let mut e = env();
+    append(&e.claude_file(SID), &agent_msg("for the phone"));
+    let mut m = Client::in_process(&e.srv, Role::Mobile);
+    let t = e.open("claude", Some(SID));
+    e.claude_hook("Stop");
+    let i = Env::wait_status(&mut m, t, Some(Finished));
+    assert!(i.status_at_ms.is_some());
+    Env::wait_line(&mut m, t, &line(Speaker::Agent, "for the phone"));
+}
+
+#[test]
+fn restore_recomputes_last_line() {
+    let mut e = env();
+    append(&e.claude_file(SID), &agent_msg("before restart"));
+    let t = e.open("claude", Some(SID));
+    e.claude_hook("Stop");
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "before restart"));
+    let n = e.fake.pids().len();
+    e.srv.stopper().shutdown();
+    assert!(e.srv.wait_timeout(T).is_some());
+    let state = fs::read_to_string(e.h.paths().state).unwrap();
+    assert!(!state.contains("lastLine") && !state.contains("statusAtMs"));
+    e.srv = start(&e.h, |_| {});
+    e.fake.wait_pids(n + 1);
+    let want = line(Speaker::Agent, "before restart");
+    let deadline = Instant::now() + T;
+    let i = loop {
+        let i = e.info(t);
+        if i.last_line == want {
+            break i;
+        }
+        assert!(Instant::now() < deadline, "no line after the restart");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // The status is not persisted.
+    assert_eq!((i.agent_status, i.status_at_ms), (None, None));
+}
+
+/// A list filled to its budget, then every entry given the widest last line: the frame
+/// still fits the list budget and the connection queue, and no connection is dropped.
+#[test]
+fn full_list_with_widest_last_lines_fits_the_queue() {
+    use xshell_protocol::msg::{encode_msg, OpenSpec, ServerMsg, LAST_LINE_MAX_CHARS};
+    const LIST: usize = 12_000;
+    let mut e = env_with(|c| {
+        c.max_list_bytes = LIST;
+        c.conn_total_cap = LIST;
+    });
+    // Four UTF-8 bytes per character, the most JSON spends on one.
+    let widest = "\u{1D11E}".repeat(LAST_LINE_MAX_CHARS + 10);
+    let want = line(Speaker::Agent, &"\u{1D11E}".repeat(LAST_LINE_MAX_CHARS));
+    let mut opened = Vec::new();
+    // Big entries first, then smaller ones into what is left.
+    for title in [1000usize, 100, 0] {
+        loop {
+            let sid = format!("{:08x}-0000-4000-8000-000000000000", opened.len());
+            append(&e.claude_file(&sid), &agent_msg(&widest));
+            let t = Uuid::new_v4();
+            let mut meta = serde_json::Map::new();
+            meta.insert("title".into(), Value::String("x".repeat(title)));
+            let r = e.c.request(&ClientMsg::TermOpen {
+                spec: OpenSpec {
+                    terminal: t,
+                    launch: spec(&e.cwd, "claude", Some(&sid)),
+                    cols: 80,
+                    rows: 24,
+                    meta,
+                },
+            });
+            match r {
+                Ok(_) => {
+                    opened.push(t);
+                    e.fake.wait_pids(opened.len());
+                }
+                Err(err) => {
+                    assert!(err.contains("terminal list too large"), "{err}");
+                    break;
+                }
+            }
+        }
+    }
+    assert!(opened.len() >= 4, "{}", opened.len());
+    let full = |l: &[TerminalInfo]| {
+        opened
+            .iter()
+            .all(|t| l.iter().any(|i| i.terminal == *t && i.last_line == want))
+    };
+    let list = e.c.terminals_where(full);
+    let frame = encode_msg(&ServerMsg::Terminals { list }, None).unwrap();
+    assert!(frame.len() <= LIST, "{} > {LIST}", frame.len());
+    // Neither the connection that saw every list nor a new one was dropped.
+    e.c.request(&ClientMsg::TermResize {
+        terminal: opened[0],
+        cols: 81,
+        rows: 24,
+    })
+    .unwrap();
+    let mut c = Client::connect(&e.srv.socket);
+    let (_, list) = c.hello(range(1, 1));
+    assert!(full(&list));
 }

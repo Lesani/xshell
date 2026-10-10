@@ -62,6 +62,14 @@ pub struct SessionInfo {
     pub agent: String,
 }
 
+/// A session id safe to pass on: it becomes an agent argument (`codex resume <id>`) and a
+/// file name (`<id>.jsonl`), so it may not look like an option or a path.
+pub fn valid_session_id(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 pub fn get_sessions(ctx: &HostCtx, encoded_name: String) -> Vec<SessionInfo> {
     let mut sessions: Vec<SessionInfo> = vec![];
 
@@ -276,6 +284,21 @@ mod tests {
     use super::*;
     use crate::testutil::Fixture;
     use serde_json::json;
+
+    #[test]
+    fn session_id_charset() {
+        for ok in [
+            "a",
+            "0",
+            "11111111-2222-3333-4444-555555555555",
+            "ses_ABC-1",
+        ] {
+            assert!(valid_session_id(ok), "{ok}");
+        }
+        for bad in ["", "-cx", "_a", "a b", "a/b", "../a", "a.b", "a\0", "é"] {
+            assert!(!valid_session_id(bad), "{bad:?}");
+        }
+    }
 
     fn claude_session(fx: &Fixture, cwd: &str, sid: &str, ts: &str) {
         fx.write_jsonl(

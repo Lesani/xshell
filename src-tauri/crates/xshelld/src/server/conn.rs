@@ -289,6 +289,7 @@ impl Conn {
                         d.touch_idle(&mut reg);
                         d.broadcast_terminals(&reg);
                         drop(reg);
+                        d.last_lines.request(t.id);
                         reply(&self.ob, id, Ok(json!({ "pid": pid })));
                     }
                     // The process started but its threads did not: it is being ended.
@@ -387,8 +388,14 @@ impl Conn {
                     None => Err(format!("unknown terminal {terminal}")),
                     Some(t) => {
                         let (spec, meta) = t.updated(session_id, meta);
+                        let relinked = spec.session_id != t.spec().session_id;
                         d.check_budget(&reg, terminal, &spec, &meta).map(|_| {
                             t.set_record(spec, meta);
+                            if relinked {
+                                // The line was the previous session's; the new one's is read.
+                                t.set_last_line(None);
+                                d.last_lines.request(terminal);
+                            }
                             d.persist(&reg);
                             d.broadcast_terminals(&reg);
                             Value::Null

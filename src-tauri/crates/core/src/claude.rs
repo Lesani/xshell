@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
+use xshell_protocol::msg::{LastLine, Speaker};
 
 // Mirror Claude Code's encoding of a project path into the directory name under
 // `~/.claude/projects/`. Every non-alphanumeric character collapses to `-` — including
@@ -569,42 +570,17 @@ pub fn get_session_messages(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if msg_type != "user" && msg_type != "assistant" {
-            continue;
-        }
-        let msg = match json.get("message") {
-            Some(m) => m,
-            None => continue,
-        };
-        let role = msg
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("")
-            .to_string();
-        let content = msg.get("content");
-        let text = if let Some(s) = content.and_then(|c| c.as_str()) {
-            s.chars().take(200).collect()
-        } else if let Some(arr) = content.and_then(|c| c.as_array()) {
-            arr.iter()
-                .filter_map(|item| {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        item.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.chars().take(200).collect::<String>())
-                    } else {
-                        None
-                    }
-                })
-                .next()
-                .unwrap_or_default()
-        } else {
+        let Some((role, text)) = message_text(&json) else {
             continue;
         };
+        let text: String = text.chars().take(200).collect();
         if text.is_empty() {
             continue;
         }
-        messages.push(MessagePreview { role, text });
+        messages.push(MessagePreview {
+            role: role.to_string(),
+            text,
+        });
     }
     // Return the last N messages
     let start = if messages.len() > limit {
@@ -613,6 +589,62 @@ pub fn get_session_messages(
         0
     };
     messages[start..].to_vec()
+}
+
+/// The role and text of a session entry that is a user or assistant message: its string
+/// content, or the first `text` part of its content array. `None` for every other entry
+/// (summaries, tool uses, tool results). The text may be empty.
+fn message_text(json: &serde_json::Value) -> Option<(&str, &str)> {
+    let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if msg_type != "user" && msg_type != "assistant" {
+        return None;
+    }
+    let msg = json.get("message")?;
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+    let content = msg.get("content")?;
+    let text = if let Some(s) = content.as_str() {
+        s
+    } else {
+        content
+            .as_array()?
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    item.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap_or_default()
+    };
+    Some((role, text))
+}
+
+/// The newest user or assistant text message in the tail of a Claude session file.
+/// Meta entries (caveats Claude Code injects as user messages) do not count.
+pub fn last_line_in(path: &Path) -> Option<LastLine> {
+    last_line_in_window(path, crate::last_line::TAIL_WINDOW)
+}
+
+pub(crate) fn last_line_in_window(path: &Path, window: u64) -> Option<LastLine> {
+    last_line_from(&mut crate::last_line::open_no_follow(path)?, window)
+}
+
+/// [`last_line_in`] for a file already opened (and checked).
+pub(crate) fn last_line_from(f: &mut std::fs::File, window: u64) -> Option<LastLine> {
+    crate::last_line::newest_in_tail(f, window, |json| {
+        if json.get("isMeta").and_then(|v| v.as_bool()) == Some(true) {
+            return None;
+        }
+        let (role, text) = message_text(json)?;
+        let from = match role {
+            "user" => Speaker::User,
+            "assistant" => Speaker::Agent,
+            _ => return None,
+        };
+        Some((from, text.to_string()))
+    })
 }
 
 // ── Branch detection ──────────────────────────────────────────────────

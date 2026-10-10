@@ -3,8 +3,9 @@
 //!
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
-//! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status) is taken
-//! last, and nothing is locked while it is held. No lock is held across a blocking PTY or
+//! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status),
+//! `Terminal.last_line` and the last-line worker's queue are taken last, and nothing is
+//! locked while one is held. No lock is held across a blocking PTY or
 //! socket write: writers own their sockets, input threads own PTY writers. The push
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
@@ -12,6 +13,7 @@
 mod agent;
 mod calls;
 mod conn;
+mod last_line;
 mod orphans;
 pub use orphans::Cleanup;
 mod outbox;
@@ -27,6 +29,7 @@ mod signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
 mod terminal;
+pub use terminal::OPTIONAL_FIELDS_BYTES;
 pub mod transport;
 
 use crate::paths::{check_endpoint, ensure_private_dir, private_file, write_mode, Mode, Paths};
@@ -98,6 +101,9 @@ pub struct Config {
     /// Test hooks for the push pipeline.
     #[doc(hidden)]
     pub push_hooks: PushHooks,
+    /// A Terminal's last line is read when asked for and once more after this long, for a
+    /// session file written after the hook that asked.
+    pub last_line_retry: Duration,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -134,6 +140,9 @@ pub enum TestPoint {
     /// A `term.open`'s started Terminal is not kept (it could not be saved, or its threads
     /// did not start); it is about to be ended (on the thread that waits for it, no lock held).
     RefusedOpen,
+    /// The last-line worker read this Terminal's session file and is about to store and
+    /// publish the result (no lock held).
+    LastLineRead,
 }
 
 /// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
@@ -251,6 +260,7 @@ impl Config {
             push_timeout: Duration::from_secs(20),
             push_retry: Duration::from_secs(2),
             push_hooks: PushHooks::default(),
+            last_line_retry: Duration::from_secs(1),
             cleanup_override: None,
             test_hook: None,
         }
@@ -391,6 +401,7 @@ impl Server {
             let p = push.clone();
             ring.set_on_head(Arc::new(move |epoch, c| p.on_head(epoch, c)));
         }
+        let last_lines = last_line::LastLines::new(cfg.last_line_retry);
         let d = Arc::new(Daemon {
             cfg,
             ctx: Arc::new(ctx),
@@ -408,10 +419,12 @@ impl Server {
             escalations: Default::default(),
             ring,
             push,
+            last_lines,
         });
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
         d.push.bind(Arc::downgrade(&d));
+        d.last_lines.bind(Arc::downgrade(&d));
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);

@@ -3,7 +3,7 @@
 
 use super::outbox::Outbox;
 use super::registry::Registry;
-use super::registry::{frame, Daemon};
+use super::registry::{frame, now_ms, Daemon};
 use super::size::SizeArbiter;
 use super::{ConnId, TestPoint};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
@@ -20,7 +20,7 @@ use xshell_core::agent_status::{AgentStatus, TerminalHooks, Tracker};
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
-use xshell_protocol::msg::{encode_res, ServerMsg, TerminalInfo};
+use xshell_protocol::msg::{encode_res, LastLine, ServerMsg, TerminalInfo};
 
 const READ_BUF: usize = 16 * 1024;
 const INPUT_BACKLOG: usize = 1024;
@@ -100,8 +100,12 @@ pub(crate) struct Terminal {
     /// This process's run: unique per Daemon start and process, so a hook of a process a
     /// Relaunch or restart replaced never reports for its successor.
     pub run: u64,
-    /// The Agent Status of this run. Locked last, never across another lock.
-    status: Mutex<Tracker>,
+    /// The Agent Status of this run and when it changed. Locked last, never across another
+    /// lock.
+    status: Mutex<StatusCell>,
+    /// The newest text message of the agent's session, as the last-line worker last read
+    /// it. Locked last, never across another lock.
+    last_line: Mutex<Option<LastLine>>,
     /// The Daemon's pending SIGKILLs, which [`Terminal::kill`] adds to.
     escalations: Arc<super::orphans::Escalations>,
     /// Windows: the kill-on-close Job Object the process runs in, with everything it
@@ -110,14 +114,74 @@ pub(crate) struct Terminal {
     job: Option<Arc<xshell_core::job::Job>>,
 }
 
+/// A run's Agent Status and the time of its last change.
+pub(crate) struct StatusCell {
+    tracker: Tracker,
+    /// When the status last changed (Unix ms); `None` before the first change.
+    at_ms: Option<u64>,
+    /// Every stamp is above this: the last stamp of the run this one replaced.
+    floor: u64,
+}
+
+impl StatusCell {
+    pub(crate) fn new(tracker: Tracker, floor: u64) -> Self {
+        Self {
+            tracker,
+            at_ms: None,
+            floor,
+        }
+    }
+
+    /// Pass on a [`Tracker`] method's result; a change is stamped with `now`, or just after
+    /// the previous stamp when the clock has not moved past it (equal or set back), so the
+    /// stamps of one Terminal strictly increase.
+    pub(crate) fn stamp(&mut self, changed: bool, now: u64) -> bool {
+        if changed {
+            self.at_ms = Some(now.max(self.last_stamp() + 1));
+        }
+        changed
+    }
+
+    /// Continue after `floor` (the replaced run's last stamp): a stamp made before, with a
+    /// clock below it, moves to just after it.
+    pub(crate) fn raise_floor(&mut self, floor: u64) {
+        self.floor = self.floor.max(floor);
+        if self.at_ms.is_some_and(|at| at <= floor) {
+            self.at_ms = Some(floor + 1);
+        }
+    }
+
+    /// The latest stamp this Terminal has had, the replaced run's included.
+    pub(crate) fn last_stamp(&self) -> u64 {
+        self.at_ms.unwrap_or(0).max(self.floor)
+    }
+
+    /// The status and its stamp, as listed.
+    pub(crate) fn listed(&self) -> (Option<AgentStatus>, Option<u64>) {
+        let status = self.tracker.status();
+        (status, status.and(self.at_ms))
+    }
+}
+
 /// Fixed per-entry cost in a `terminals` list on top of the spec and metadata (UUID, pid,
 /// exit code, timestamps, keys).
 const ENTRY_OVERHEAD: usize = 256;
 
+/// Reserved per entry for the fields the Daemon fills in after admission, at their largest
+/// serialized: `agentStatus`, `statusAtMs` and a `lastLine` of [`LAST_LINE_MAX_CHARS`]
+/// four-byte characters (control characters never reach it; `"` and `\` escape to two bytes).
+/// Counted in every entry's budget, so filling them never grows a list past its limit.
+///
+/// [`LAST_LINE_MAX_CHARS`]: xshell_protocol::msg::LAST_LINE_MAX_CHARS
+pub const OPTIONAL_FIELDS_BYTES: usize = 1024;
+
 /// The size a Terminal with this spec and metadata adds to a serialized `terminals` list.
 pub(crate) fn entry_bytes(spec: &LaunchSpec, meta: &Map<String, Value>) -> usize {
     let len = |v: serde_json::Result<Vec<u8>>| v.map_or(usize::MAX / 4, |b| b.len());
-    len(serde_json::to_vec(spec)) + len(serde_json::to_vec(meta)) + ENTRY_OVERHEAD
+    len(serde_json::to_vec(spec))
+        + len(serde_json::to_vec(meta))
+        + ENTRY_OVERHEAD
+        + OPTIONAL_FIELDS_BYTES
 }
 
 fn short(id: &Uuid) -> String {
@@ -287,7 +351,8 @@ pub(crate) fn spawn_with(
         persist_pending: AtomicBool::new(false),
         kept_leader: None,
         run,
-        status: Mutex::new(tracker),
+        status: Mutex::new(StatusCell::new(tracker, 0)),
+        last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
         #[cfg(windows)]
         job: Some(job),
@@ -419,7 +484,12 @@ impl Terminal {
             }
         }
         d.nudge_overflowed(dropped);
-        if self.status.lock().unwrap().on_output(bytes) {
+        let changed = {
+            let mut c = self.status.lock().unwrap();
+            let changed = c.tracker.on_output(bytes);
+            c.stamp(changed, now_ms())
+        };
+        if changed {
             super::agent::changed(d, self);
             // Codex's OSC 9 notification: the agent itself says it needs you.
             d.push.notify(self.id, self.run, AgentStatus::NeedsYou);
@@ -428,24 +498,30 @@ impl Terminal {
 
     /// The Agent Status of this run.
     pub fn agent_status(&self) -> Option<AgentStatus> {
-        self.status.lock().unwrap().status()
+        self.status.lock().unwrap().tracker.status()
     }
 
     /// A hook's report for process `run`.
     pub fn on_agent_event(&self, run: u64, status: AgentStatus) -> Result<bool, String> {
-        let mut tracker = self.status.lock().unwrap();
-        if tracker.agent().is_none() {
+        let mut c = self.status.lock().unwrap();
+        if c.tracker.agent().is_none() {
             return Err("not an agent terminal".into());
         }
         if run != self.run {
             return Err("stale run".into());
         }
-        tracker.on_event(status)
+        let changed = c.tracker.on_event(status)?;
+        Ok(c.stamp(changed, now_ms()))
     }
 
     /// Input about to be written: it may answer a prompt or interrupt a turn.
     pub fn note_input(&self, d: &Daemon, data: &[u8]) {
-        if self.status.lock().unwrap().on_input(data) {
+        let changed = {
+            let mut c = self.status.lock().unwrap();
+            let changed = c.tracker.on_input(data);
+            c.stamp(changed, now_ms())
+        };
+        if changed {
             super::agent::changed(d, self);
         }
     }
@@ -478,7 +554,11 @@ impl Terminal {
     /// shutting down or this Terminal is not the one listed under its UUID.
     fn finish_exit(self: &Arc<Self>, d: &Arc<Daemon>, reg: &mut Registry, code: i32) {
         // Published by the `terminals` list below.
-        self.status.lock().unwrap().on_exit();
+        {
+            let mut c = self.status.lock().unwrap();
+            let changed = c.tracker.on_exit();
+            c.stamp(changed, now_ms());
+        }
         {
             let mut o = self.out.lock().unwrap();
             o.exit_code = Some(code);
@@ -578,6 +658,12 @@ impl Terminal {
                 std::mem::replace(&mut io.arb, SizeArbiter::new(cols, rows)),
             )
         };
+        // The replacement resumes the same session, and its stamps continue after this run's,
+        // also one it made already (its reader runs before the hand-over).
+        let floor = self.status.lock().unwrap().last_stamp();
+        next.status.lock().unwrap().raise_floor(floor);
+        let line = self.last_line.lock().unwrap().clone();
+        *next.last_line.lock().unwrap() = line;
         let mut dropped = Vec::new();
         let mut io = next.io.lock().unwrap();
         io.arb = arb;
@@ -893,6 +979,16 @@ impl Terminal {
         r.meta = meta;
     }
 
+    /// Store the last line the worker read; `true` when it changed.
+    pub fn set_last_line(&self, line: Option<LastLine>) -> bool {
+        let mut l = self.last_line.lock().unwrap();
+        if *l == line {
+            return false;
+        }
+        *l = line;
+        true
+    }
+
     /// Connections attached to the output.
     pub fn attached(&self) -> usize {
         self.out.lock().unwrap().subs.len()
@@ -912,6 +1008,7 @@ impl Terminal {
     pub fn info(&self) -> TerminalInfo {
         let r = self.record.lock().unwrap();
         let exit_code = self.out.lock().unwrap().exit_code;
+        let (agent_status, status_at_ms) = self.status.lock().unwrap().listed();
         TerminalInfo {
             terminal: self.id,
             spec: r.spec.clone(),
@@ -919,7 +1016,9 @@ impl Terminal {
             created_at_ms: r.created_at_ms,
             pid: self.pid,
             exit_code,
-            agent_status: self.status.lock().unwrap().status(),
+            agent_status,
+            status_at_ms,
+            last_line: self.last_line.lock().unwrap().clone(),
         }
     }
 
@@ -972,8 +1071,9 @@ pub(crate) const UNRESOLVED_EXIT: i32 = -1;
 /// A restored Terminal without a process: listed as exited (`UNRESOLVED_EXIT`), its record
 /// and previous leader kept in the state file until `term.close` removes it.
 pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal> {
-    let mut status = Tracker::new(&p.spec);
-    status.on_exit();
+    let mut status = StatusCell::new(Tracker::new(&p.spec), 0);
+    let ended = status.tracker.on_exit();
+    status.stamp(ended, now_ms());
     let t = Terminal {
         id: p.terminal,
         record: Mutex::new(Record {
@@ -1007,6 +1107,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         kept_leader: p.leader,
         run: d.next_run.fetch_add(1, Ordering::SeqCst),
         status: Mutex::new(status),
+        last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
         #[cfg(windows)]
         job: None,
@@ -1223,5 +1324,156 @@ mod win {
             assert_eq!(q.feed(b"\x1b[2J"), (b"\x1b[2J".to_vec(), false));
             assert_eq!(q.feed(b"\x1b[6n"), (b"\x1b[6n".to_vec(), false));
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn cell(floor: u64) -> StatusCell {
+        StatusCell::new(
+            Tracker::new(&LaunchSpec {
+                agent: Some("claude".into()),
+                ..Default::default()
+            }),
+            floor,
+        )
+    }
+
+    fn event(c: &mut StatusCell, s: AgentStatus, now: u64) -> bool {
+        let changed = c.tracker.on_event(s).unwrap();
+        c.stamp(changed, now)
+    }
+
+    #[test]
+    fn optional_fields_fit_their_reserve() {
+        use xshell_protocol::msg::{Speaker, LAST_LINE_MAX_CHARS};
+        let bare = TerminalInfo {
+            terminal: Uuid::new_v4(),
+            spec: LaunchSpec::default(),
+            meta: Map::new(),
+            created_at_ms: u64::MAX,
+            pid: Some(u32::MAX),
+            exit_code: Some(i32::MIN),
+            agent_status: None,
+            status_at_ms: None,
+            last_line: None,
+        };
+        let size = |i: &TerminalInfo| serde_json::to_vec(i).unwrap().len();
+        // The widest character in JSON: four UTF-8 bytes, or two for an escaped `"`.
+        for widest in ["\u{1D11E}", "\"", "\\"] {
+            let text =
+                xshell_core::last_line::normalize(&widest.repeat(LAST_LINE_MAX_CHARS * 2)).unwrap();
+            let full = TerminalInfo {
+                agent_status: Some(AgentStatus::NeedsYou),
+                status_at_ms: Some(u64::MAX),
+                last_line: Some(LastLine {
+                    from: Speaker::Agent,
+                    text,
+                }),
+                ..bare.clone()
+            };
+            let extra = size(&full) - size(&bare);
+            assert!(extra <= OPTIONAL_FIELDS_BYTES, "{widest:?}: {extra}");
+        }
+        // The fixed fields of the bare entry fit the per-entry overhead.
+        let fixed = size(&bare)
+            - serde_json::to_vec(&bare.spec).unwrap().len()
+            - serde_json::to_vec(&bare.meta).unwrap().len();
+        assert!(fixed <= ENTRY_OVERHEAD, "{fixed}");
+    }
+
+    #[test]
+    fn status_stamps_strictly_increase() {
+        let mut c = cell(0);
+        assert_eq!(c.listed(), (None, None));
+        assert!(event(&mut c, AgentStatus::Working, 1000));
+        assert_eq!(c.listed(), (Some(AgentStatus::Working), Some(1000)));
+        // The same status again: no change, no new stamp.
+        assert!(!event(&mut c, AgentStatus::Working, 2000));
+        assert_eq!(c.listed().1, Some(1000));
+        // The clock did not move: just after the previous stamp.
+        assert!(event(&mut c, AgentStatus::Finished, 1000));
+        assert_eq!(c.listed(), (Some(AgentStatus::Finished), Some(1001)));
+        // The clock went back.
+        assert!(event(&mut c, AgentStatus::Working, 10));
+        assert_eq!(c.listed().1, Some(1002));
+        // And forward again.
+        assert!(event(&mut c, AgentStatus::NeedsYou, 5000));
+        assert_eq!(c.listed().1, Some(5000));
+        assert_eq!(c.last_stamp(), 5000);
+    }
+
+    #[test]
+    fn hand_over_moves_an_early_replacement_stamp_after_the_previous_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = super::super::role::tests::daemon(dir.path());
+        let persisted = || PersistedTerminal {
+            terminal: Uuid::new_v4(),
+            spec: LaunchSpec {
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+            meta: Map::new(),
+            cols: 80,
+            rows: 24,
+            created_at_ms: 0,
+            leader: None,
+        };
+        let prev = unresolved(&d, persisted());
+        let next = unresolved(&d, persisted());
+        // The previous run stamped at 5000; the replacement's reader stamped an OSC 9 at
+        // 100 (a clock set back), before the hand-over.
+        prev.status.lock().unwrap().at_ms = Some(5000);
+        {
+            let mut c = next.status.lock().unwrap();
+            c.at_ms = None;
+            c.tracker = Tracker::new(&next.spec());
+            let changed = c.tracker.on_output(b"\x1b]9;Approval requested\x07");
+            assert!(c.stamp(changed, 100));
+            assert_eq!(c.listed().1, Some(100));
+        }
+        prev.hand_over(&next);
+        assert_eq!(
+            next.info().status_at_ms,
+            Some(5001),
+            "listed after the previous run's stamp"
+        );
+        // Later stamps continue from there, the clock still behind.
+        let mut c = next.status.lock().unwrap();
+        let changed = c.tracker.on_event(AgentStatus::Working).unwrap();
+        assert!(c.stamp(changed, 200));
+        assert_eq!(c.listed().1, Some(5002));
+        drop(c);
+        // A replacement stamped after the floor keeps its stamp.
+        let mut c = cell(0);
+        assert!(event(&mut c, AgentStatus::Working, 9000));
+        c.raise_floor(5000);
+        assert_eq!(c.listed().1, Some(9000));
+    }
+
+    #[test]
+    fn replacement_run_stamps_after_the_previous_run() {
+        // A Relaunch's run starts unstamped, above the replaced run's last stamp.
+        let mut c = cell(5000);
+        assert_eq!(c.listed(), (None, None));
+        assert_eq!(c.last_stamp(), 5000);
+        assert!(event(&mut c, AgentStatus::Working, 4000));
+        assert_eq!(c.listed().1, Some(5001));
+        let mut c = cell(5000);
+        assert!(event(&mut c, AgentStatus::Working, 9000));
+        assert_eq!(c.listed().1, Some(9000));
+        // Non-agent Terminals have no status and so no stamp.
+        let mut shell = StatusCell::new(
+            Tracker::new(&LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..Default::default()
+            }),
+            0,
+        );
+        let ended = shell.tracker.on_exit();
+        assert!(!shell.stamp(ended, 1));
+        assert_eq!(shell.listed(), (None, None));
     }
 }

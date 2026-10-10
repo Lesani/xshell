@@ -29,6 +29,8 @@ pub const CAPABILITIES: &[&str] = &[
     "term.relaunch",
     "launch.prefix",
     "agent.status",
+    // `TerminalInfo.lastLine`: the newest text message of an agent Terminal's session.
+    "agent.last-line",
     "ring",
     // `ring.join` takes `expect` (a conditional join).
     "ring.cjoin",
@@ -61,6 +63,11 @@ mod tests {
     #[test]
     fn capabilities_include_agent_status() {
         assert!(CAPABILITIES.contains(&"agent.status"));
+    }
+
+    #[test]
+    fn capabilities_include_agent_last_line() {
+        assert!(CAPABILITIES.contains(&"agent.last-line"));
     }
 
     #[test]

@@ -186,6 +186,32 @@ fn lenient_agent_status<'de, D: serde::Deserializer<'de>>(
     Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// Who wrote a [`LastLine`].
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub enum Speaker {
+    User,
+    Agent,
+}
+
+/// The newest user or agent text message of an agent Terminal's session: one line,
+/// whitespace collapsed, at most [`LAST_LINE_MAX_CHARS`] characters.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LastLine {
+    pub from: Speaker,
+    pub text: String,
+}
+
+/// The most characters (Unicode scalar values) a [`LastLine`]'s text carries.
+pub const LAST_LINE_MAX_CHARS: usize = 200;
+
+/// `TerminalInfo.last_line`: a value this side cannot read (an unknown speaker, a missing
+/// text, not an object) reads as absent, so it never fails the whole `terminals` list.
+fn lenient_last_line<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<LastLine>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 /// Every `t` a Desktop may send in protocol 1.
 const CLIENT_TYPES: &[&str] = &[
     "hello",
@@ -239,6 +265,21 @@ pub struct TerminalInfo {
         deserialize_with = "lenient_agent_status"
     )]
     pub agent_status: Option<AgentStatus>,
+    /// When the Agent Status last changed, in Unix milliseconds of the Daemon's clock.
+    /// Strictly increasing per Terminal, across Relaunches and Daemon restarts while the
+    /// Daemon remembers the previous value. Absent while `agent_status` is, and from Daemons
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_at_ms: Option<u64>,
+    /// The newest text message of the agent's session (capability `agent.last-line`).
+    /// Absent for Terminals that are not a direct Claude or Codex agent, without a linked
+    /// session, before the session has a text message, and from older Daemons.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_last_line"
+    )]
+    pub last_line: Option<LastLine>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -700,6 +741,8 @@ mod tests {
                 pid: Some(9),
                 exit_code: None,
                 agent_status: None,
+                status_at_ms: None,
+                last_line: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -719,6 +762,8 @@ mod tests {
                 pid: Some(9),
                 exit_code: None,
                 agent_status: None,
+                status_at_ms: None,
+                last_line: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -743,6 +788,8 @@ mod tests {
             pid: Some(9),
             exit_code: None,
             agent_status: status,
+            status_at_ms: None,
+            last_line: None,
         }
     }
 
@@ -851,6 +898,93 @@ mod tests {
         assert!(
             matches!(&e, DecodeError::Invalid { id: Some(9), t, .. } if t == "term.event"),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn terminals_status_at_and_last_line_golden() {
+        let id = Uuid::new_v4();
+        let info = TerminalInfo {
+            status_at_ms: Some(1_700_000_000_123),
+            last_line: Some(LastLine {
+                from: Speaker::Agent,
+                text: "Refactor done.".into(),
+            }),
+            terminal: id,
+            ..info_with(Some(AgentStatus::Finished))
+        };
+        let list = ServerMsg::Terminals { list: vec![info] };
+        let b = body(encode_msg(&list, None).unwrap());
+        let s = String::from_utf8(b.clone()).unwrap();
+        assert!(
+            s.ends_with(
+                r#""agentStatus":"finished","statusAtMs":1700000000123,"lastLine":{"from":"agent","text":"Refactor done."}}]}"#
+            ),
+            "{s}"
+        );
+        assert_eq!(decode_server(&b).unwrap(), list);
+        assert_eq!(serde_json::to_value(Speaker::User).unwrap(), json!("user"));
+    }
+
+    #[test]
+    fn new_fields_omitted_when_none() {
+        let b = body(
+            encode_msg(
+                &ServerMsg::Terminals {
+                    list: vec![info_with(Some(AgentStatus::Working))],
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let s = String::from_utf8_lossy(&b);
+        assert!(!s.contains("statusAtMs"), "{s}");
+        assert!(!s.contains("lastLine"), "{s}");
+    }
+
+    #[test]
+    fn terminal_info_from_older_daemon_decodes() {
+        let id = Uuid::new_v4();
+        let raw = json!({"t":"terminals","list":[{"terminal":id,"spec":{"cwd":"/w"},"meta":{},
+            "createdAtMs":1,"pid":2,"exitCode":null,"agentStatus":"working"}]});
+        let ServerMsg::Terminals { list } = decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(list[0].agent_status, Some(AgentStatus::Working));
+        assert_eq!(list[0].status_at_ms, None);
+        assert_eq!(list[0].last_line, None);
+    }
+
+    #[test]
+    fn bad_last_line_decodes_as_none() {
+        let id = Uuid::new_v4();
+        let entry = |last: Value| {
+            json!({"terminal":id,"spec":{"cwd":"/w"},"meta":{},"createdAtMs":1,"pid":2,
+                   "exitCode":null,"statusAtMs":5,"lastLine":last})
+        };
+        let raw = json!({"t":"terminals","list":[
+            entry(json!({"from":"robot","text":"x"})),
+            entry(json!(7)),
+            entry(json!({"from":"user"})),
+            entry(json!(null)),
+            entry(json!({"from":"user","text":"hi"})),
+        ]});
+        let ServerMsg::Terminals { list } = decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(list.len(), 5);
+        for t in &list[..4] {
+            assert_eq!(t.last_line, None);
+            assert_eq!(t.status_at_ms, Some(5));
+        }
+        assert_eq!(
+            list[4].last_line,
+            Some(LastLine {
+                from: Speaker::User,
+                text: "hi".into()
+            })
         );
     }
 }

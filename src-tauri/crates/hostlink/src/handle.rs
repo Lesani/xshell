@@ -1239,6 +1239,8 @@ pub(crate) mod tests {
             pid: Some(2),
             exit_code: None,
             agent_status: None,
+            status_at_ms: None,
+            last_line: None,
         }
     }
 

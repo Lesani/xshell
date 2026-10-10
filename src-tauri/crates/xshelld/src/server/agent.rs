@@ -46,14 +46,21 @@ pub(crate) fn on_event(
     let reg = d.reg.lock().unwrap();
     let r = match reg.terminals.get(&terminal) {
         None => Err(format!("unknown terminal {terminal}")),
-        Some(t) => t.on_agent_event(run, status).map(|changed| {
-            if changed && !reg.frozen {
-                d.broadcast_terminals(&reg);
-                // The agent reported it itself: a push may go out (input never pushes).
-                d.push.notify(terminal, run, status);
-            }
-            Value::Null
-        }),
+        Some(t) => t
+            .on_agent_event(run, status)
+            .inspect(|_| {
+                // Accepted: the agent's session has a new message, also when the status
+                // repeats (another turn finished).
+                d.last_lines.request(terminal);
+            })
+            .map(|changed| {
+                if changed && !reg.frozen {
+                    d.broadcast_terminals(&reg);
+                    // The agent reported it itself: a push may go out (input never pushes).
+                    d.push.notify(terminal, run, status);
+                }
+                Value::Null
+            }),
     };
     drop(reg);
     reply(ob, id, r);
@@ -69,5 +76,9 @@ pub(crate) fn changed(d: &Daemon, t: &Terminal) {
         .is_some_and(|c| std::ptr::eq(Arc::as_ptr(c), t));
     if listed && !reg.frozen {
         d.broadcast_terminals(&reg);
+    }
+    drop(reg);
+    if listed {
+        d.last_lines.request(t.id);
     }
 }

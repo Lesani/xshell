@@ -39,6 +39,8 @@ pub(crate) struct Daemon {
     pub ring: super::ring::Ring,
     /// Push notifications to the Ring's Mobiles.
     pub push: Arc<super::push::Push>,
+    /// Reads agent Terminals' last lines.
+    pub last_lines: super::last_line::LastLines,
 }
 
 #[derive(Default)]
@@ -260,6 +262,9 @@ impl Daemon {
             reg.frozen = true;
             return false;
         }
+        for t in reg.terminals.values() {
+            self.last_lines.request(t.id);
+        }
         if had > 0 || self.cfg.paths.state.exists() {
             self.persist(&reg);
         }
@@ -324,6 +329,7 @@ impl Daemon {
             return;
         }
         self.push.stop();
+        self.last_lines.stop();
         // The goodbye runs alongside ending the Terminals and is over before the lock is
         // released, so an upgraded successor connects only after it.
         let me = self.clone();

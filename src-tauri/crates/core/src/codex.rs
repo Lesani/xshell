@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use xshell_protocol::msg::{LastLine, Speaker};
 
 // ── Codex session parsing ─────────────────────────────────────────────
 // Codex rollouts (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) parse into the same
@@ -37,6 +39,50 @@ pub fn codex_rollout_files(ctx: &HostCtx) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+/// The rollout of Codex session `sid`: the file under `~/.codex/sessions` whose name ends
+/// in `-{sid}.jsonl`. The newest by path (the date directories sort by date) when several do.
+pub fn rollout_for(ctx: &HostCtx, sid: &str) -> Option<PathBuf> {
+    if sid.is_empty() {
+        return None;
+    }
+    let suffix = format!("-{sid}.jsonl");
+    codex_rollout_files(ctx)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .max()
+}
+
+/// The newest user or agent message in the tail of a Codex rollout: the `message` of an
+/// `event_msg` of type `user_message` or `agent_message`.
+pub fn last_line_in(path: &Path) -> Option<LastLine> {
+    last_line_in_window(path, crate::last_line::TAIL_WINDOW)
+}
+
+pub(crate) fn last_line_in_window(path: &Path, window: u64) -> Option<LastLine> {
+    last_line_from(&mut crate::last_line::open_no_follow(path)?, window)
+}
+
+/// [`last_line_in`] for a file already opened (and checked).
+pub(crate) fn last_line_from(f: &mut std::fs::File, window: u64) -> Option<LastLine> {
+    crate::last_line::newest_in_tail(f, window, |json| {
+        if json.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+            return None;
+        }
+        let payload = json.get("payload")?;
+        let from = match payload.get("type").and_then(|v| v.as_str()) {
+            Some("user_message") => Speaker::User,
+            Some("agent_message") => Speaker::Agent,
+            _ => return None,
+        };
+        let text = payload.get("message").and_then(|v| v.as_str())?;
+        Some((from, text.to_string()))
+    })
 }
 
 // User-assigned session names (Codex's rename feature) don't live in the rollout files —

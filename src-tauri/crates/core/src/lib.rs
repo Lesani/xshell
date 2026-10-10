@@ -13,6 +13,7 @@ pub mod files;
 pub mod git;
 #[cfg(windows)]
 pub mod job;
+pub mod last_line;
 pub mod launch;
 pub mod memories;
 pub mod opencode;

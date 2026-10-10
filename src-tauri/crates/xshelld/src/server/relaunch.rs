@@ -136,6 +136,7 @@ fn run(
             d.persist(&reg);
             d.broadcast_terminals(&reg);
             drop(reg);
+            d.last_lines.request(t.id);
             d.nudge_overflowed(dropped);
             reply(ob, id, Ok(json!({ "pid": pid, "relaunched": true })));
         }

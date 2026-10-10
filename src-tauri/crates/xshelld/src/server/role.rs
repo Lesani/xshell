@@ -19,6 +19,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
+use xshell_core::paths::stays_inside;
+use xshell_core::sessions::valid_session_id;
 use xshell_core::sessions::CodexProjectInfo;
 use xshell_core::{antigravity, claude, codex, cursor, opencode, HostCtx};
 use xshell_protocol::msg::ClientMsg;
@@ -84,25 +86,6 @@ pub(crate) const MOBILE_REFUSED_CALLS: &[&str] = &[
     "detect_agent_binary",
 ];
 
-/// A spec that runs an agent directly: not a raw shell, no shell wrapped around the agent
-/// (a wrapping shell stays open after the agent exits) and no launch prefix (client-supplied
-/// argv run before the agent).
-pub(crate) fn is_agent_spec(s: &LaunchSpec) -> bool {
-    let unset = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
-    matches!(s.shell_mode.as_deref(), None | Some("claude"))
-        && unset(&s.shell_command)
-        && unset(&s.shell_id)
-        && s.launch_prefix.is_none()
-}
-
-/// A session id a Mobile may resume: it becomes an agent argument (`codex resume <id>`) and a
-/// file name (`<id>.jsonl`), so it may not look like an option or a path.
-pub(crate) fn valid_session_id(s: &str) -> bool {
-    let mut cs = s.chars();
-    cs.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
 /// Whether `cwd` is a Project the Host knows from any agent's session history. Paths compare
 /// after resolving symlinks, falling back to the exact string.
 pub(crate) fn known_project(ctx: &HostCtx, cwd: &str) -> bool {
@@ -131,7 +114,7 @@ pub(crate) fn known_project(ctx: &HostCtx, cwd: &str) -> bool {
 /// A Mobile's `term.open`: Claude or Codex, run directly, in a known Project, on a session id
 /// that is safe to pass on. `skipPermissions` is allowed (ADR-0004).
 pub(crate) fn check_open(ctx: &HostCtx, spec: &LaunchSpec) -> Result<(), String> {
-    if !is_agent_spec(spec) {
+    if !spec.is_direct_agent() {
         return Err(forbidden("term.open of a shell or a wrapped agent"));
     }
     if !matches!(spec.agent.as_deref(), Some("claude" | "codex")) {
@@ -161,7 +144,7 @@ pub(crate) fn check_relaunch(role: Role, spec: &LaunchSpec) -> Result<(), String
     if role == Role::Desktop {
         return Ok(());
     }
-    if !is_agent_spec(spec) {
+    if !spec.is_direct_agent() {
         return Err(forbidden("relaunch of a shell or a wrapped agent"));
     }
     check_session_id(spec)
@@ -179,7 +162,7 @@ pub(crate) fn listed<'a>(
         .terminals
         .get(id)
         .ok_or_else(|| format!("unknown terminal {id}"))?;
-    if role == Role::Mobile && !is_agent_spec(&t.spec()) {
+    if role == Role::Mobile && !t.spec().is_direct_agent() {
         return Err(forbidden("a shell or a wrapped agent Terminal"));
     }
     Ok(t)
@@ -312,29 +295,6 @@ fn in_claude_projects(
     }
 }
 
-/// Whether `path`, below `root`, resolves inside `root`: the path itself or, where it does
-/// not exist, its nearest existing ancestor. Only "not found" counts as absent; any other
-/// error, a dangling symlink included, refuses.
-fn stays_inside(root: &Path, path: &Path) -> bool {
-    let absent = |p: &Path| {
-        p.symlink_metadata()
-            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
-    };
-    let real_root = match fs::canonicalize(root) {
-        Ok(r) => r,
-        // No storage at all: nothing below it to read.
-        Err(_) => return absent(root),
-    };
-    let mut p = path;
-    while absent(p) {
-        match p.parent() {
-            Some(up) if up.starts_with(root) => p = up,
-            _ => return false,
-        }
-    }
-    fs::canonicalize(p).is_ok_and(|r| r.starts_with(&real_root))
-}
-
 /// Core reads every `*.jsonl` entry of a Claude Project directory, following symlinks:
 /// none of them may be one. A missing directory has none.
 fn plain_sessions(method: &str, dir: Option<&Path>) -> Result<(), String> {
@@ -379,7 +339,7 @@ fn every_project_plain(ctx: &HostCtx, method: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::registry::Daemon;
     use super::super::terminal;
     use super::super::Config;
@@ -461,46 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_spec_rules() {
-        assert!(is_agent_spec(&agent("/p")));
-        assert!(is_agent_spec(&LaunchSpec {
-            shell_mode: None,
-            shell_command: Some(String::new()),
-            shell_id: Some(String::new()),
-            ..agent("/p")
-        }));
-        assert!(!is_agent_spec(&raw_shell("/p")));
-        for s in [
-            LaunchSpec {
-                shell_mode: Some("raw".into()),
-                ..agent("/p")
-            },
-            LaunchSpec {
-                shell_mode: Some("weird".into()),
-                ..agent("/p")
-            },
-            LaunchSpec {
-                shell_command: Some("bash".into()),
-                ..agent("/p")
-            },
-            LaunchSpec {
-                shell_id: Some("bash".into()),
-                ..agent("/p")
-            },
-            LaunchSpec {
-                launch_prefix: Some(vec!["env".into()]),
-                ..agent("/p")
-            },
-            LaunchSpec {
-                launch_prefix: Some(vec![]),
-                ..agent("/p")
-            },
-        ] {
-            assert!(!is_agent_spec(&s), "{s:?}");
-        }
-    }
-
-    #[test]
     fn open_rules_reject_prefix_shell_id_agent() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
@@ -564,21 +484,6 @@ mod tests {
         ] {
             let e = check_open(&ctx, &s).unwrap_err();
             assert!(e.starts_with(FORBIDDEN), "{s:?}: {e}");
-        }
-    }
-
-    #[test]
-    fn session_id_charset() {
-        for ok in [
-            "a",
-            "0",
-            "11111111-2222-3333-4444-555555555555",
-            "ses_ABC-1",
-        ] {
-            assert!(valid_session_id(ok), "{ok}");
-        }
-        for bad in ["", "-cx", "_a", "a b", "a/b", "../a", "a.b", "a\0", "é"] {
-            assert!(!valid_session_id(bad), "{bad:?}");
         }
     }
 
@@ -735,7 +640,7 @@ mod tests {
         }
     }
 
-    fn daemon(dir: &Path) -> Arc<Daemon> {
+    pub(crate) fn daemon(dir: &Path) -> Arc<Daemon> {
         let paths = crate::paths::resolve(dir, None, None);
         Arc::new(Daemon {
             cfg: Config::new(dir.into(), paths),
@@ -765,6 +670,7 @@ mod tests {
                     hooks: Default::default(),
                 },
             )),
+            last_lines: crate::server::last_line::LastLines::new(std::time::Duration::from_secs(1)),
         })
     }
 

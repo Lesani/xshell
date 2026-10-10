@@ -79,6 +79,17 @@ export interface TerminalInfo {
   // Absent for shells, hookless agents, before the first report, and from Daemons without
   // the `agent.status` capability. A newer Daemon may send values this side does not know.
   agentStatus?: AgentStatus | null;
+  // Unix ms (the Daemon's clock) of the last Agent Status change. Absent with agentStatus
+  // and from older Daemons.
+  statusAtMs?: number | null;
+  // The newest text message of the agent's session (capability `agent.last-line`).
+  lastLine?: LastLine | null;
+}
+
+// Who wrote a Terminal's last line (Rust `Speaker`) and the line itself, whitespace collapsed.
+export interface LastLine {
+  from: "user" | "agent";
+  text: string;
 }
 
 export interface HostSnapshot {

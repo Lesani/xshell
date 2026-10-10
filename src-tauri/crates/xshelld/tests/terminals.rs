@@ -745,8 +745,10 @@ fn control_flood_disconnects_peer() {
 fn terminal_list_budget_enforced() {
     let h = TestHome::new();
     let srv = start(&h, |c| {
-        c.max_terminal_bytes = 2000;
-        c.max_list_bytes = 3000;
+        // Every entry also reserves room for the fields the Daemon fills in later.
+        let r = xshelld::server::OPTIONAL_FIELDS_BYTES;
+        c.max_terminal_bytes = 2000 + r;
+        c.max_list_bytes = 3000 + 2 * r;
     });
     let mut a = client(&srv);
     let open_with = |a: &mut Client, title_len: usize| {
