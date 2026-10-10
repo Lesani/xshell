@@ -527,40 +527,58 @@ fn mobile_detach_drops_held_output() {
 /// A Mobile whose queue overflows while a Desktop watches gets a fresh tail of the replay;
 /// nobody's PTY is nudged. The agent records every SIGWINCH in a file, which dropped output
 /// cannot hide.
+///
+/// The overflow does not depend on the machine's speed: the Mobile's output is held for a
+/// minute, so the whole 1 MiB flood queues against its 256 KiB cap; its input then makes the
+/// held output due. The flood is printed by shell builtins in 64 KiB bursts, so the Desktop,
+/// which drains as it goes, never comes near the cap (its overflow would nudge).
+/// (`until read`: a SIGWINCH, such as the Desktop's attach nudge, interrupts `read`.)
 #[test]
 fn mobile_overflow_with_desktop_attached_does_not_nudge() {
     let mut e = env_with(
-        "trap 'echo WINCH >> winch.log' WINCH\necho ready\nread x\ni=0\n\
-         while [ $i -lt 250 ]; do head -c 4000 /dev/zero | tr '\\0' b; echo; \
-         i=$((i+1)); sleep 0.002; done\necho DONE\n",
-        |c| c.conn_output_cap = 256 * 1024,
+        "trap 'echo WINCH >> winch.log' WINCH\necho ready\n\
+         s=b; while [ ${#s} -lt 4000 ]; do s=$s$s; done\nuntil read x; do :; done\ni=0\n\
+         while [ $i -lt 256 ]; do printf '%s\\n' \"$s\"; i=$((i+1)); \
+         if [ $((i % 16)) -eq 0 ]; then sleep 0.01; fi; done\necho DONE\n",
+        |c| {
+            c.conn_output_cap = 256 * 1024;
+            c.mobile_frame_idle = Duration::from_secs(60);
+            c.mobile_replay_cap = 64 * 1024;
+        },
     );
     e.desk_watching(100, 30);
     let mut m = e.mobile();
     attach_at(&mut m, e.t);
-    m.drain_for(ms(200));
+    m.output_until(e.t, "ready");
     // From here on (the Desktop's own attach nudge is over), no SIGWINCH at all.
     let winch = e.cwd.join("winch.log");
     let _ = fs::remove_file(&winch);
     e.desk.quiet = true;
     e.desk.input(e.t, "\n");
-    // 750 process spawns: slow on macOS runners, so wait longer than `T`.
     let slow = Duration::from_secs(30);
     assert!(
         e.desk.try_output_until(e.t, b"DONE", slow).is_some(),
         "no DONE at the Desktop"
     );
+    let flooded = m.log.len();
+    // Nothing reached the Mobile during the flood: its output is held.
+    m.drain_for(ms(200));
     assert!(
-        m.try_output_until(e.t, b"DONE", slow).is_some(),
-        "no DONE at the Mobile"
+        !m.log[flooded..].iter().any(|x| matches!(x, Ev::Out(..))),
+        "the Mobile's output was not held"
     );
-    // The recovery replaced what was queued by a reset and the tail.
-    let resets = m
-        .log
-        .iter()
-        .filter(|x| matches!(x, Ev::Out(t, d) if *t == e.t && d.starts_with(b"\x1bc")))
-        .count();
-    assert!(resets >= 2, "no recovery replay");
+    m.skip_output(e.t);
+    // Typing makes it due: the recovery's reset and tail, ending with the last line.
+    m.input(e.t, "");
+    let got = m
+        .try_output_until(e.t, b"DONE", slow)
+        .expect("no DONE at the Mobile");
+    assert!(got.starts_with(b"\x1bc"), "no recovery replay");
+    assert!(
+        got.len() < 256 * 1024,
+        "{} bytes: nothing was dropped",
+        got.len()
+    );
     // A nudge's SIGWINCH lands while the agent prints or right after.
     e.desk.drain_for(ms(1500));
     assert!(
