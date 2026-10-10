@@ -62,6 +62,7 @@ scenario!(
     auth_chain_signed_by_mobile_is_refused,
     client_syncs_newer_roster_on_welcome,
     entitlement_slot_round_trips,
+    entitlement_slot_keeps_the_latest_put,
     auth_timeout_closes,
     replaced_socket_close_keeps_new_online,
     stale_bye_after_replacement_is_ignored,
@@ -122,7 +123,7 @@ fn state_foreground_lease_expires() {
 #[test]
 fn every_scenario_is_listed_and_run_here() {
     // The macros above and the lists must not drift apart.
-    assert_eq!(SCENARIOS.len(), 39);
+    assert_eq!(SCENARIOS.len(), 40);
     assert_eq!(PUSH_SCENARIOS.len(), 5);
     assert_eq!(PUSH_UNAVAILABLE_SCENARIOS.len(), 1);
     assert_eq!(FOREGROUND_LEASE_SCENARIOS.len(), 1);
@@ -637,21 +638,78 @@ fn hosted_relay() -> (TestRelay, RelayTarget) {
     (r, t)
 }
 
-#[test]
-fn hosted_first_token_enables_routing() {
-    let (_r, t) = hosted_relay();
-    contract::hosted_first_token_enables_routing(&t);
+macro_rules! hosted_scenario {
+    ($($name:ident),* $(,)?) => {$(
+        #[test]
+        fn $name() {
+            let (_r, t) = hosted_relay();
+            contract::$name(&t);
+        }
+    )*};
 }
 
+hosted_scenario!(
+    hosted_first_token_enables_routing,
+    hosted_routing_ends_when_the_last_token_expires,
+    hosted_slot_keeps_hosted_over_push,
+    hosted_slot_keeps_the_later_expiry,
+    hosted_slot_replaces_an_expired_token,
+    hosted_slot_keeps_the_better_of_simultaneous_puts,
+);
+
+/// Section 12: the decision time is read once, under the Ring's lock. A put token that
+/// verified on arrival but has expired by then is refused, and the slot stays as it was.
 #[test]
-fn hosted_routing_ends_when_the_last_token_expires() {
-    let (_r, t) = hosted_relay();
-    contract::hosted_routing_ends_when_the_last_token_expires(&t);
+fn hosted_put_expiring_before_the_decision_is_refused() {
+    let pause = Duration::from_millis(1200);
+    let gw = keys();
+    let r = TestRelay::start_with(TestRelayOptions {
+        hosted: Some(GatewayKeys::new(&[gw.sign_key()])),
+        entitlement_put_pause: pause,
+        ..TestRelayOptions::default()
+    });
+    let mut t = r.target();
+    t.gateway = Some(gw);
+    let ring = TestRing::new(&t.url);
+    let (a, rec_a) = connect(&t, &ring.chain, ring.desktop.clone());
+    let push = contract::gateway_token(
+        &t,
+        &ring.ring_id(),
+        xshell_protocol::ring::entitlement::Tier::Push,
+        "p",
+        contract::now() + 3600,
+    );
+    a.put_entitlement(&push).expect("put push");
+    // Start right after a second boundary, so the token verifies on arrival (in this second)
+    // and has expired when the Relay decides (in the next).
+    while contract::now_ms() % 1000 > 100 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let late = contract::hosted_token(&t, &ring.ring_id(), contract::now() + 1);
+    let started = Instant::now();
+    let got = a.put_entitlement(&late);
+    assert!(
+        started.elapsed() >= pause,
+        "verified on arrival, so refused only after the pause"
+    );
+    match got {
+        Err(RingError::Relay { code, detail }) => {
+            assert_eq!(code, ErrorCode::EntitlementInvalid);
+            assert_eq!(detail.as_deref(), Some("expired"));
+        }
+        other => panic!("expected expired, got {other:?}"),
+    }
+    assert!(rec_a
+        .wait_for(QUIET, |e| e == &Event::Entitlement(Some(late.clone())))
+        .is_none());
+    let (m, _) = connect(&t, &ring.chain, ring.mobile.clone());
+    assert_eq!(m.entitlement().as_deref(), Some(push.as_str()));
+    assert!(m.limited());
 }
 
 #[test]
 fn every_hosted_scenario_is_run_here() {
-    assert_eq!(HOSTED_SCENARIOS.len(), 2);
+    assert_eq!(HOSTED_SCENARIOS.len(), 6);
 }
 
 // ---- Quotas ---------------------------------------------------------------------------------

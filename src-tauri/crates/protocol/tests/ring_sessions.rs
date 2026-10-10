@@ -480,3 +480,72 @@ fn answer_delayed_across_a_key_replacement_never_becomes_a_session() {
     );
     assert!(mobile.sessions.peers().is_empty());
 }
+
+/// The adapter passes the Connector's entitlement reports on to `next`: the slot from
+/// `welcome` after `Connected`, then every broadcast.
+#[test]
+fn session_events_forward_entitlement_to_next() {
+    use xshell_protocol::ring::entitlement::{sign_entitlement, GatewayKeys, Tier};
+    use xshell_protocol::ring::relay::{ConnectorEvents, LinkState};
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<Option<String>>>);
+    impl ConnectorEvents for Seen {
+        fn entitlement(&self, token: Option<&str>) {
+            self.0.lock().unwrap().push(token.map(str::to_string));
+        }
+    }
+
+    let gw = contract::keys();
+    let r = TestRelay::start_with(TestRelayOptions {
+        auth_timeout: Duration::from_millis(500),
+        hosted: Some(GatewayKeys::new(&[gw.sign_key()])),
+        ..TestRelayOptions::default()
+    });
+    let ring = TestRing::new(&r.url());
+    let tok = |exp: u64| {
+        sign_entitlement(
+            &*gw,
+            &ring.ring_id(),
+            Tier::Hosted,
+            "p",
+            contract::now(),
+            exp,
+        )
+        .unwrap()
+    };
+    let (desktop, _) = contract::connect(&r.target(), &ring.chain, ring.desktop.clone());
+    let first = tok(contract::now() + 3600);
+    desktop.put_entitlement(&first).expect("put");
+
+    let seen = Arc::new(Seen::default());
+    let mut client = contract::config(&r.target(), &ring.chain, ring.mobile.clone());
+    client.timeouts.request = Duration::from_secs(2);
+    let sessions = Sessions::new(cfg(&ring.mobile), None);
+    let connector = Arc::new(
+        Connector::start(
+            ConnectorConfig::new(client),
+            Arc::new(SessionEvents {
+                sessions: sessions.clone(),
+                next: Some(seen.clone()),
+            }),
+        )
+        .unwrap(),
+    );
+    sessions.attach(&connector);
+    let has = |t: &str| {
+        seen.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_deref() == Some(t))
+    };
+    wait_until("the welcome slot", || has(&first));
+    assert_eq!(connector.state(), LinkState::Connected { limited: false });
+
+    let second = tok(contract::now() + 7200);
+    desktop.put_entitlement(&second).expect("put");
+    wait_until("the broadcast", || has(&second));
+    assert_eq!(connector.entitlement().as_deref(), Some(second.as_str()));
+    connector.abandon();
+}

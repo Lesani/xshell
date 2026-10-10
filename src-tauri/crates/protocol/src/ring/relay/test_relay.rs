@@ -6,7 +6,9 @@
 //! a time.
 
 use super::super::chain::{RosterChain, MAX_CHAIN_LEN};
-use super::super::entitlement::{verify_entitlement, GatewayKeys};
+use super::super::entitlement::{
+    better_entitlement, verify_entitlement, EntitlementError, GatewayKeys,
+};
 use super::super::pairing::valid_slot;
 use super::super::push::{blob_well_formed, collapse_id_well_formed, sealed_well_formed};
 use super::super::roster::{Role, RosterError, SignedRoster};
@@ -60,7 +62,8 @@ pub struct TestRelayOptions {
     /// Serve `wss://` with this certificate.
     pub tls: Option<TestTls>,
     /// Act as the Hosted Relay: route only for Rings holding a valid Hosted entitlement
-    /// signed by one of these gateway keys; others get limited sessions.
+    /// signed by one of these gateway keys; others get limited sessions. Its entitlement
+    /// slot keeps a still-valid token over a put that is not better (section 12).
     pub hosted: Option<GatewayKeys>,
     /// Deliver the `roster` broadcast to the uploader before its `ok` (default: after).
     pub broadcast_before_ok: bool,
@@ -98,6 +101,9 @@ pub struct TestRelayOptions {
     pub push_timeout: Duration,
     /// How long a Mobile counts as foreground after its last frame or ping (default 75 s).
     pub foreground_lease: Duration,
+    /// Test hook: a pause between verifying an `entitlement.put` and deciding on it under
+    /// the Ring's lock, to place an expiry between the two (default none).
+    pub entitlement_put_pause: Duration,
 }
 
 impl Default for TestRelayOptions {
@@ -121,6 +127,7 @@ impl Default for TestRelayOptions {
             push_gateway: None,
             push_timeout: PUSH_GATEWAY_TIMEOUT,
             foreground_lease: FOREGROUND_LEASE,
+            entitlement_put_pause: Duration::ZERO,
         }
     }
 }
@@ -439,12 +446,17 @@ impl Shared {
     /// Whether `ring` may route envelopes: always, unless this is a Hosted Relay without a
     /// valid Hosted entitlement for it.
     fn entitled(&self, ring: &RingId, s: &RingState) -> bool {
+        self.entitled_at(ring, s, now())
+    }
+
+    /// [`Self::entitled`] at `at` (Unix seconds).
+    fn entitled_at(&self, ring: &RingId, s: &RingState, at: u64) -> bool {
         match &self.opts.hosted {
             None => true,
             Some(keys) => s
                 .entitlement
                 .as_deref()
-                .is_some_and(|t| verify_entitlement(t, ring, now(), keys, true).is_ok()),
+                .is_some_and(|t| verify_entitlement(t, ring, at, keys, true).is_ok()),
         }
     }
 }
@@ -2017,17 +2029,21 @@ impl Conn {
             }
             ClientFrame::EntitlementPut { id, token } => {
                 // A Hosted Relay verifies with the gateway's keys; any other checks the shape.
-                let refused = match &self.shared.opts.hosted {
-                    Some(keys) => verify_entitlement(&token, &ring, now(), keys, false)
-                        .err()
-                        .map(|e| Some(e.as_code())),
-                    None => (!entitlement_well_formed(&token)).then_some(None),
+                let (refused, claims) = match &self.shared.opts.hosted {
+                    Some(keys) => match verify_entitlement(&token, &ring, now(), keys, false) {
+                        Ok(c) => (None, Some(c)),
+                        Err(e) => (Some(Some(e.as_code())), None),
+                    },
+                    None => ((!entitlement_well_formed(&token)).then_some(None), None),
                 };
                 if let Some(detail) = refused {
                     self.error(ErrorCode::EntitlementInvalid, Some(id), None, detail);
                     return;
                 }
                 let shared = self.shared.clone();
+                if !shared.opts.entitlement_put_pause.is_zero() {
+                    std::thread::sleep(shared.opts.entitlement_put_pause);
+                }
                 let mut rings = self.rings();
                 let Some(s) = rings.get_mut(&ring) else {
                     return;
@@ -2035,9 +2051,36 @@ impl Conn {
                 if s.current(&me, gen).is_err() {
                     return;
                 }
+                // Section 12: one decision time, under the Ring's lock, for the put token's
+                // expiry, the stored token's validity and the limit. A Hosted Relay keeps a
+                // still-valid stored token unless the new one is better, so that of two puts
+                // arriving together the better one stays, whatever the order. The put is
+                // acknowledged either way; a kept slot broadcasts nothing.
+                let at = now();
+                if let (Some(keys), Some(new)) = (&shared.opts.hosted, &claims) {
+                    if at >= new.expires_at {
+                        drop(rings);
+                        self.error(
+                            ErrorCode::EntitlementInvalid,
+                            Some(id),
+                            None,
+                            Some(EntitlementError::Expired.as_code()),
+                        );
+                        return;
+                    }
+                    let kept = s.entitlement.as_deref().is_some_and(|stored| {
+                        verify_entitlement(stored, &ring, at, keys, false)
+                            .is_ok_and(|old| !better_entitlement(new, &old))
+                    });
+                    if kept {
+                        drop(rings);
+                        self.write(&RelayFrame::Ok { id }.encode());
+                        return;
+                    }
+                }
                 s.entitlement = Some(token.clone());
                 // Every socket of the Ring routes (or not) by the stored token from now on.
-                let limited = !shared.entitled(&ring, s);
+                let limited = !shared.entitled_at(&ring, s, at);
                 s.broadcast(
                     None,
                     &RelayFrame::Entitlement {

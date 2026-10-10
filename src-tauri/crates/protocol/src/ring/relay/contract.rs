@@ -3,8 +3,8 @@
 //! Each scenario panics on failure and uses fresh random keys, hence a fresh Ring: no reset
 //! between scenarios is needed.
 //!
-//! [`entitlement_slot_round_trips`] assumes a Relay without the Push Gateway's key (it then
-//! stores any well-formed token). [`HOSTED_SCENARIOS`] need a Hosted Relay and its gateway
+//! [`entitlement_slot_round_trips`] and [`entitlement_slot_keeps_the_latest_put`] assume a
+//! Relay without the Push Gateway's key (it then stores the latest well-formed token). [`HOSTED_SCENARIOS`] need a Hosted Relay and its gateway
 //! key in the target, [`QUOTA_SCENARIOS`] a Relay with a small daily quota, named in the
 //! target. The pairing scenarios open more slots from one machine than the default pairing
 //! rate limit allows, so a runner raises it, except for [`PAIR_RATE_SCENARIOS`].
@@ -1178,6 +1178,34 @@ pub fn entitlement_slot_round_trips(t: &RelayTarget) {
     );
 }
 
+/// A Relay that is not Hosted verifies nothing and keeps the latest well-formed put, even a
+/// "worse" one (section 12: only a Hosted Relay keeps the better token).
+pub fn entitlement_slot_keeps_the_latest_put(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let token = |tier: &str, expires_at: u64| {
+        let claims = json!({
+            "v": 1, "kid": "test", "ringId": r.ring_id().as_str(), "tier": tier,
+            "purchaseRef": "test", "issuedAt": now(), "expiresAt": expires_at,
+        });
+        format!(
+            "xet1.{}.{}",
+            b64::encode(claims.to_string().as_bytes()),
+            b64::encode(&[1u8; 64])
+        )
+    };
+    let hosted = token("hosted", now() + 7200);
+    let push = token("push", now() + 3600);
+    for tok in [&hosted, &push] {
+        a.put_entitlement(tok).expect("put");
+        assert!(rec_a
+            .wait_for(WAIT, |e| e == &Event::Entitlement(Some(tok.clone())))
+            .is_some());
+    }
+    let (m, _) = connect(t, &r.chain, signer(&r.mobile));
+    assert_eq!(m.entitlement().as_deref(), Some(push.as_str()));
+}
+
 pub fn auth_timeout_closes(t: &RelayTarget) {
     let r = TestRing::new(&t.url);
     let mut c = RawConn::open(t, &r.ring_id()).expect("open");
@@ -1461,6 +1489,172 @@ pub fn hosted_routing_ends_when_the_last_token_expires(t: &RelayTarget) {
         .filter(|(_, p)| p == b"too late")
         .collect();
     assert!(late.is_empty());
+}
+
+/// An entitlement for `ring` signed by the target's gateway.
+pub fn gateway_token(
+    t: &RelayTarget,
+    ring: &RingId,
+    tier: Tier,
+    purchase_ref: &str,
+    expires_at: u64,
+) -> String {
+    sign_entitlement(&**gateway(t), ring, tier, purchase_ref, now(), expires_at)
+        .expect("sign entitlement")
+}
+
+/// The token a new connection of `r`'s Mobile finds in the slot (`welcome.entitlement`).
+fn slot(t: &RelayTarget, r: &TestRing) -> Option<String> {
+    let (m, _) = connect(t, &r.chain, signer(&r.mobile));
+    m.entitlement()
+}
+
+/// On a fresh Ring: one device puts `first`, another then puts `second`; both are
+/// acknowledged. `second_stays`: whether the Relay must store `second` (and broadcast it)
+/// or keep `first` (and broadcast nothing). Checks the slot a new connection then finds.
+fn put_in_order(t: &RelayTarget, first: &str, second: &str, second_stays: bool, r: &TestRing) {
+    let (a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+    a.put_entitlement(first).expect("first put");
+    assert!(rec_a
+        .wait_for(WAIT, |e| e == &Event::Entitlement(Some(first.to_string())))
+        .is_some());
+    d.put_entitlement(second)
+        .expect("a valid put is acknowledged, kept or not");
+    let seen = |w| {
+        rec_a
+            .wait_for(w, |e| e == &Event::Entitlement(Some(second.to_string())))
+            .is_some()
+    };
+    let expected = if second_stays {
+        assert!(seen(WAIT), "the better token is broadcast");
+        second
+    } else {
+        assert!(!seen(QUIET), "a kept slot broadcasts nothing");
+        first
+    };
+    assert_eq!(slot(t, r).as_deref(), Some(expected));
+    assert_eq!(a.entitlement().as_deref(), Some(expected));
+}
+
+/// Hosted (section 12): a Hosted token stays over a Push one, whichever is put first, even
+/// one that expires later; the Ring keeps routing.
+pub fn hosted_slot_keeps_hosted_over_push(t: &RelayTarget) {
+    // Hosted first: the Push token is acknowledged and dropped.
+    let r = TestRing::new(&t.url);
+    let hosted = hosted_token(t, &r.ring_id(), now() + 3600);
+    let push = gateway_token(t, &r.ring_id(), Tier::Push, "p", now() + 7200);
+    put_in_order(t, &hosted, &push, false, &r);
+    let (m, _) = connect(t, &r.chain, signer(&r.mobile));
+    assert!(!m.limited(), "the kept Hosted token still routes");
+    // Push first: the Hosted token replaces it.
+    let r = TestRing::new(&t.url);
+    let hosted = hosted_token(t, &r.ring_id(), now() + 3600);
+    let push = gateway_token(t, &r.ring_id(), Tier::Push, "p", now() + 7200);
+    put_in_order(t, &push, &hosted, true, &r);
+}
+
+/// Hosted (section 12): within a tier, the token that expires later stays, whichever is put
+/// first; one with the same expiry is not better, so the stored one stays.
+pub fn hosted_slot_keeps_the_later_expiry(t: &RelayTarget) {
+    for tier in [Tier::Hosted, Tier::Push] {
+        let r = TestRing::new(&t.url);
+        let late = gateway_token(t, &r.ring_id(), tier, "late", now() + 7200);
+        let early = gateway_token(t, &r.ring_id(), tier, "early", now() + 3600);
+        put_in_order(t, &late, &early, false, &r);
+        let r = TestRing::new(&t.url);
+        let late = gateway_token(t, &r.ring_id(), tier, "late", now() + 7200);
+        let early = gateway_token(t, &r.ring_id(), tier, "early", now() + 3600);
+        put_in_order(t, &early, &late, true, &r);
+    }
+    let r = TestRing::new(&t.url);
+    let expires = now() + 3600;
+    let one = gateway_token(t, &r.ring_id(), Tier::Hosted, "one", expires);
+    let other = gateway_token(t, &r.ring_id(), Tier::Hosted, "other", expires);
+    put_in_order(t, &one, &other, false, &r);
+}
+
+/// Hosted (section 12): a stored token that expired no longer counts, so any valid token
+/// replaces it, a Push token after a Hosted one included.
+pub fn hosted_slot_replaces_an_expired_token(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let expires = now() + 2;
+    let hosted = hosted_token(t, &r.ring_id(), expires);
+    a.put_entitlement(&hosted).expect("put");
+    assert!(rec_a
+        .wait_for(WAIT, |e| e == &Event::Entitlement(Some(hosted.clone())))
+        .is_some());
+    assert!(!a.limited());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while now() < expires && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let push = gateway_token(t, &r.ring_id(), Tier::Push, "p", now() + 3600);
+    a.put_entitlement(&push).expect("put after expiry");
+    assert!(rec_a
+        .wait_for(WAIT, |e| e == &Event::Entitlement(Some(push.clone())))
+        .is_some());
+    assert!(a.limited(), "a Push token does not lift the limit");
+    let (m, _) = connect(t, &r.chain, signer(&r.mobile));
+    assert_eq!(m.entitlement().as_deref(), Some(push.as_str()));
+    assert!(m.limited());
+}
+
+/// Hosted (section 12): two devices put at the same moment; whichever arrives first, the
+/// better token is stored, and both puts are acknowledged. Each pair is raced several times
+/// with the sides swapped, so both arrival orders occur.
+pub fn hosted_slot_keeps_the_better_of_simultaneous_puts(t: &RelayTarget) {
+    type Pair = fn(&RelayTarget, &RingId) -> (String, String);
+    let pairs: [(&str, Pair); 2] = [
+        ("hosted over push", |t, ring| {
+            (
+                hosted_token(t, ring, now() + 3600),
+                gateway_token(t, ring, Tier::Push, "p", now() + 7200),
+            )
+        }),
+        ("later over earlier", |t, ring| {
+            (
+                gateway_token(t, ring, Tier::Hosted, "late", now() + 7200),
+                gateway_token(t, ring, Tier::Hosted, "early", now() + 3600),
+            )
+        }),
+    ];
+    for (what, pair) in pairs {
+        for round in 0..6 {
+            let r = TestRing::new(&t.url);
+            let (better, worse) = pair(t, &r.ring_id());
+            let (a, _) = connect(t, &r.chain, signer(&r.desktop));
+            let (d, _) = connect(t, &r.chain, signer(&r.daemon));
+            let (x, y) = if round % 2 == 0 {
+                (&better, &worse)
+            } else {
+                (&worse, &better)
+            };
+            let go = std::sync::Barrier::new(2);
+            let (ra, rd) = std::thread::scope(|s| {
+                let ha = s.spawn(|| {
+                    go.wait();
+                    a.put_entitlement(x)
+                });
+                let hd = s.spawn(|| {
+                    go.wait();
+                    d.put_entitlement(y)
+                });
+                (
+                    ha.join().expect("put thread"),
+                    hd.join().expect("put thread"),
+                )
+            });
+            ra.expect("both puts are acknowledged");
+            rd.expect("both puts are acknowledged");
+            assert_eq!(
+                slot(t, &r).as_deref(),
+                Some(better.as_str()),
+                "{what}, round {round}"
+            );
+        }
+    }
 }
 
 /// A Relay with a daily quota of client frames per Ring (`t.quota_frames_per_day`, at most
@@ -2348,6 +2542,22 @@ pub const HOSTED_SCENARIOS: &[(&str, Scenario)] = &[
         "hosted_routing_ends_when_the_last_token_expires",
         hosted_routing_ends_when_the_last_token_expires,
     ),
+    (
+        "hosted_slot_keeps_hosted_over_push",
+        hosted_slot_keeps_hosted_over_push,
+    ),
+    (
+        "hosted_slot_keeps_the_later_expiry",
+        hosted_slot_keeps_the_later_expiry,
+    ),
+    (
+        "hosted_slot_replaces_an_expired_token",
+        hosted_slot_replaces_an_expired_token,
+    ),
+    (
+        "hosted_slot_keeps_the_better_of_simultaneous_puts",
+        hosted_slot_keeps_the_better_of_simultaneous_puts,
+    ),
 ];
 
 /// A scenario against one Relay.
@@ -2423,6 +2633,10 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
         client_syncs_newer_roster_on_welcome,
     ),
     ("entitlement_slot_round_trips", entitlement_slot_round_trips),
+    (
+        "entitlement_slot_keeps_the_latest_put",
+        entitlement_slot_keeps_the_latest_put,
+    ),
     ("auth_timeout_closes", auth_timeout_closes),
     (
         "replaced_socket_close_keeps_new_online",

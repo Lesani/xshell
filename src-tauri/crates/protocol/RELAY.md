@@ -475,6 +475,20 @@ public keys (the Worker's `GATEWAY_PUBLIC_KEYS`, the test Relay's `hosted`). The
 - returns the stored token in `welcome.entitlement` only while it still verifies (any
   tier), else `null`.
 
+**Hosted Relay: the better token stays.** A Hosted Relay replaces a stored token that
+still verifies (signature, kid, `ringId`, `now < expiresAt`, any tier) only with a better
+one. A token is better when its tier is higher (`hosted` over `push`), or when its tier is
+the same and its `expiresAt` is later; the same tier and the same `expiresAt` is not better.
+A put token that verifies but is not better is acknowledged with `ok` and dropped: the slot
+keeps the stored token, and nothing is broadcast. A stored token that no longer verifies
+(expired, say) is replaced by any token that verifies. The Relay compares and replaces in one
+atomic step per Ring, so of two puts that arrive together the better token is stored,
+whatever their order. That step reads the clock once, and this one decision time is the `now`
+for both tokens: the stored token's validity, and the put token's expiry, checked again there
+even when its signature was verified before the step. A put token that has expired by the
+decision time is refused (`entitlement_invalid`, detail `expired`) and the slot does not
+change. `ring::entitlement::better_entitlement` implements the comparison.
+
 A Relay that is not Hosted verifies nothing: it stores the latest well-formed token (`xet1.`,
 a payload part that decodes to a strict JSON object by section 2, and a part that decodes to
 64 bytes, 4 KiB at most) and returns it in `welcome.entitlement` exactly as stored.
@@ -502,6 +516,12 @@ install its first token:
 - Validity is checked at each `env`, so the first `env` after the last token's `expiresAt`
   is refused, on existing sockets and new ones alike. A device learns of the limit from
   `welcome.limited`, an `entitlement` frame's `limited`, or the `entitlement_required` error.
+
+**Devices.** A device never puts a token for another Ring, and puts one only when the
+token it last saw from the Relay (in `welcome.entitlement` or an `entitlement` frame) is
+absent or expired, or the new token is better by the rule above. On a Relay that is not
+Hosted the latest put wins, so this rule is what keeps such a slot from going back to a
+worse token.
 
 `limited` is omitted when false, so a self-hosted Relay's frames do not change.
 

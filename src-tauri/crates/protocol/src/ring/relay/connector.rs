@@ -135,8 +135,18 @@ pub trait ConnectorEvents: Send + Sync {
     /// Noise session authenticates it).
     fn envelope(&self, _from: SignKey, _payload: Vec<u8>) {}
     /// An `error` the Relay sent that answers no request (`offline`, `unknown_recipient`,
-    /// `entitlement_required`, …), `to` naming the envelope's addressee.
+    /// `entitlement_required`, …), `to` naming the envelope's addressee. Every `quota`
+    /// refusal comes here too, also one that answers a request (an
+    /// [`Connector::put_entitlement`], say): its caller gets the error as its result first,
+    /// so one place can show the Ring's quota notice.
     fn error(&self, _code: &ErrorCode, _to: Option<SignKey>) {}
+    /// The Relay's entitlement slot as this connection sees it: called after every
+    /// `Connected` report (with the token from `welcome`, or the latest broadcast) and on
+    /// every `entitlement` broadcast. Calls from the Connector's thread and the client's may
+    /// cross, and the same token may come again: the live slot is [`Connector::entitlement`].
+    /// A broadcast arrives on the client's IO thread, so this must not wait on the Relay
+    /// (no [`Connector::put_entitlement`] from here).
+    fn entitlement(&self, _token: Option<&str>) {}
 }
 
 struct Stop {
@@ -303,8 +313,14 @@ impl RingEvents for Attempt {
         }
     }
 
-    fn entitlement(&self, _token: Option<&str>) {
+    fn entitlement(&self, token: Option<&str>) {
         self.refresh();
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.is_current(self.gen) {
+            inner.events.entitlement(token);
+        }
     }
 
     fn closed(&self, why: CloseReason) {
@@ -351,6 +367,16 @@ impl Inner {
     fn set_link(&self, link: LinkState) {
         lock(&self.st).link = link.clone();
         self.events.state(&link);
+    }
+
+    /// Reports `Connected` for `c`, then the slot it holds (only for the current attempt).
+    fn connected(&self, c: &RingClient, gen: u64) {
+        self.set_link(LinkState::Connected {
+            limited: c.limited(),
+        });
+        if self.is_current(gen) {
+            self.events.entitlement(c.entitlement().as_deref());
+        }
     }
 
     fn set_move(&self, m: MoveState) {
@@ -538,9 +564,7 @@ impl Inner {
             if let Some(job) = moving {
                 // Stay on the old Relay, reachable for the devices there, until it
                 // acknowledged the move.
-                self.set_link(LinkState::Connected {
-                    limited: c.limited(),
-                });
+                self.connected(&c, gen);
                 let mut tries = Backoff::default();
                 loop {
                     let r = self.publish_since(&c, job.from, Some(job.target));
@@ -594,18 +618,14 @@ impl Inner {
             if c.chain().head().version() < lock(&self.st).chain.head().version() {
                 let _ = self.sync(&c, &dialed);
             }
-            self.set_link(LinkState::Connected {
-                limited: c.limited(),
-            });
+            self.connected(&c, gen);
             loop {
                 match self.wait(None, true) {
                     Woke::Stop => {
                         self.finish(Some(c));
                         break 'attempt;
                     }
-                    Woke::Refresh => self.set_link(LinkState::Connected {
-                        limited: c.limited(),
-                    }),
+                    Woke::Refresh => self.connected(&c, gen),
                     Woke::Kick | Woke::Timeout => {}
                     Woke::Dirty => {
                         if !self.sync(&c, &dialed) {
@@ -934,6 +954,26 @@ impl Connector {
         let c = lock(&self.inner.st).client.clone();
         match c {
             Some(c) if !c.is_closed() => c.push_start(req),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// The token in the Relay's entitlement slot as the current connection last saw it (from
+    /// `welcome` or a broadcast); `None` while not connected or when the slot is empty.
+    pub fn entitlement(&self) -> Option<String> {
+        let c = lock(&self.inner.st).client.clone()?;
+        (!c.is_closed()).then(|| c.entitlement()).flatten()
+    }
+
+    /// Puts a Push Gateway entitlement token in the Ring's slot on the Relay and waits for
+    /// its answer (see [`RingClient::put_entitlement`]). A Hosted Relay acknowledges a valid
+    /// token that is not better than the one it holds without storing it (protocol section
+    /// 12): the slot then stays as [`Connector::entitlement`] reports it. `Err(Closed)` when
+    /// not connected; nothing is queued for a later connection.
+    pub fn put_entitlement(&self, token: &str) -> Result<(), RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.put_entitlement(token),
             _ => Err(RingError::Closed(CloseReason::Local)),
         }
     }

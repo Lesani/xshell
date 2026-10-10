@@ -102,7 +102,9 @@ pub trait RingEvents: Send + Sync {
     fn chain(&self, _chain: &RosterChain) {}
     /// The Relay sent a Roster version that failed verification; the trusted head stands.
     fn roster_rejected(&self, error: RosterError);
-    /// An `error` the Relay sent that answers no request (`offline`, `unknown_recipient`, …).
+    /// An `error` the Relay sent that answers no request (`offline`, `unknown_recipient`, …),
+    /// and every `quota` refusal, also one that answers a request (whose caller gets it
+    /// first, as its result).
     fn error(&self, _code: ErrorCode, _to: Option<SignKey>, _detail: Option<String>) {}
     fn entitlement(&self, _token: Option<&str>) {}
     /// Exactly once, last.
@@ -1053,7 +1055,19 @@ impl Handler for ClientHandler {
                 let waiter = id.and_then(|id| lock(&self.state).waiting.remove(&id));
                 match waiter {
                     Some(p) => {
-                        let _ = p.waiter.send(Err(RingError::Relay { code, detail }));
+                        // A quota refusal concerns the whole Ring, not just this request: it
+                        // reaches the events too, after the waiter has its answer.
+                        let quota = (code == ErrorCode::Quota).then(|| detail.clone());
+                        if quota.is_some() {
+                            lock(&self.state).last_error = Some(code.clone());
+                        }
+                        let _ = p.waiter.send(Err(RingError::Relay {
+                            code: code.clone(),
+                            detail,
+                        }));
+                        if let Some(detail) = quota {
+                            self.events.error(code, to, detail);
+                        }
                     }
                     None => {
                         let mut st = lock(&self.state);

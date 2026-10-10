@@ -852,4 +852,9 @@ impl ConnectorEvents for SessionEvents {
             n.error(code, to);
         }
     }
+    fn entitlement(&self, token: Option<&str>) {
+        if let Some(n) = &self.next {
+            n.entitlement(token);
+        }
+    }
 }

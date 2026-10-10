@@ -11,7 +11,8 @@ use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use xshell_protocol::ring::entitlement::{
-    entitlement_kid, sign_entitlement, verify_entitlement, GatewayKeys, Tier,
+    decode_entitlement, entitlement_kid, sign_entitlement, verify_entitlement, EntitlementError,
+    GatewayKeys, Tier,
 };
 use xshell_protocol::ring::push::{
     self, check_fresh, collapse_id, PushAgent, PushError, PushPayload, PushStatus,
@@ -1517,6 +1518,21 @@ fn vector_entitlements() {
             Err(e) => e.as_code(),
         };
         assert_eq!(code, c["result"].as_str().unwrap(), "{}", c["name"]);
+    }
+}
+
+/// `decode_entitlement` reads every vector token that is not malformed, whatever its
+/// verification result, and refuses the malformed ones.
+#[test]
+fn vector_entitlements_decode() {
+    let v = read("entitlement.json");
+    for c in v["cases"].as_array().unwrap() {
+        let got = decode_entitlement(c["token"].as_str().unwrap());
+        if c["result"] == "malformed" {
+            assert_eq!(got, Err(EntitlementError::Malformed), "{}", c["name"]);
+        } else {
+            assert_eq!(got.map(|c| c.v), Ok(1), "{}", c["name"]);
+        }
     }
 }
 

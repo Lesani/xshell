@@ -3,19 +3,24 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use xshell_protocol::ring::relay::contract::{config, connect, TestRing, WAIT};
+use xshell_protocol::ring::entitlement::{sign_entitlement, GatewayKeys, Tier};
+use xshell_protocol::ring::relay::contract::{
+    config, connect, fake_entitlement, keys, now, TestRing, QUIET, WAIT,
+};
 use xshell_protocol::ring::relay::test_relay::{Fault, TestRelay, TestRelayOptions, TrickleProxy};
-use xshell_protocol::ring::relay::wire::{ByeReason, MemberPresence};
+use xshell_protocol::ring::relay::wire::{ByeReason, ErrorCode, MemberPresence};
 use xshell_protocol::ring::relay::{
     Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState, RingTimeouts,
 };
-use xshell_protocol::ring::{RingError, RosterChain, SignKey, Signer};
+use xshell_protocol::ring::{DeviceKeys, RingError, RingId, RosterChain, SignKey, Signer};
 
 #[derive(Clone, Debug)]
 enum Ev {
     State(LinkState),
     Chain(u64),
     Moved(MoveState),
+    Entitlement(Option<String>),
+    Error(ErrorCode, Option<SignKey>),
 }
 
 #[derive(Default)]
@@ -72,6 +77,17 @@ impl ConnectorEvents for Rec {
     }
     fn moved(&self, m: &MoveState) {
         self.ev.lock().unwrap().push(Ev::Moved(m.clone()));
+        self.cv.notify_all();
+    }
+    fn entitlement(&self, token: Option<&str>) {
+        self.ev
+            .lock()
+            .unwrap()
+            .push(Ev::Entitlement(token.map(str::to_string)));
+        self.cv.notify_all();
+    }
+    fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
+        self.ev.lock().unwrap().push(Ev::Error(code.clone(), to));
         self.cv.notify_all();
     }
 }
@@ -681,5 +697,203 @@ fn publish_until_accepts_exactly_a_version_the_relay_moved_past() {
     assert!(matches!(e, RingError::Roster(_)), "{e:?}");
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     other.stop(ByeReason::quit());
+    c.stop(ByeReason::quit());
+}
+
+// ---- Entitlement (xshell-remote#14) ---------------------------------------------------------
+
+/// A Hosted test Relay and the gateway key it trusts.
+fn hosted_relay() -> (TestRelay, Arc<DeviceKeys>) {
+    let gw = keys();
+    let r = TestRelay::start_with(TestRelayOptions {
+        auth_timeout: Duration::from_millis(500),
+        hosted: Some(GatewayKeys::new(&[gw.sign_key()])),
+        ..TestRelayOptions::default()
+    });
+    (r, gw)
+}
+
+fn token(gw: &DeviceKeys, ring: &RingId, tier: Tier, expires_at: u64) -> String {
+    sign_entitlement(gw, ring, tier, "purchase", now(), expires_at).unwrap()
+}
+
+fn connected_as(rec: &Rec, limited: bool) -> bool {
+    rec.wait(
+        WAIT,
+        |e| matches!(e, Ev::State(LinkState::Connected { limited: l }) if *l == limited),
+    )
+    .is_some()
+}
+
+/// The events after the first `Connected` report.
+fn after_connected(rec: &Rec) -> Vec<Ev> {
+    rec.all()
+        .into_iter()
+        .skip_while(|e| !matches!(e, Ev::State(LinkState::Connected { .. })))
+        .skip(1)
+        .collect()
+}
+
+#[test]
+fn connector_put_entitlement_lifts_limit() {
+    let (r, gw) = hosted_relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(connected_as(&rec, true));
+    // The welcome's empty slot follows the `Connected` report.
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::Entitlement(None)))
+        .is_some());
+    assert!(matches!(
+        after_connected(&rec).first(),
+        Some(Ev::Entitlement(None))
+    ));
+    assert!(!c.routing());
+    assert_eq!(c.entitlement(), None);
+
+    let t = token(&gw, &ring.ring_id(), Tier::Hosted, now() + 3600);
+    c.put_entitlement(&t).expect("put");
+    assert!(connected_as(&rec, false));
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::Entitlement(Some(x)) if *x == t))
+        .is_some());
+    wait_until("routing", || c.routing());
+    assert_eq!(c.entitlement().as_deref(), Some(t.as_str()));
+    // A token the Hosted Relay refuses comes back as its error.
+    let foreign = token(&keys(), &ring.ring_id(), Tier::Hosted, now() + 3600);
+    assert!(matches!(
+        c.put_entitlement(&foreign),
+        Err(RingError::Relay {
+            code: ErrorCode::EntitlementInvalid,
+            ..
+        })
+    ));
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn connector_reports_entitlement_to_other_member() {
+    let (r, gw) = hosted_relay();
+    let ring = TestRing::new(&r.url());
+    let (a, rec_a) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    let (b, rec_b) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
+    assert!(connected_as(&rec_a, true) && connected_as(&rec_b, true));
+    let t = token(&gw, &ring.ring_id(), Tier::Hosted, now() + 3600);
+    a.put_entitlement(&t).expect("put");
+    // The other member learns the token from the broadcast, without putting anything.
+    assert!(rec_b
+        .wait(WAIT, |e| matches!(e, Ev::Entitlement(Some(x)) if *x == t))
+        .is_some());
+    assert!(connected_as(&rec_b, false));
+    assert_eq!(b.entitlement().as_deref(), Some(t.as_str()));
+    wait_until("b routing", || b.routing());
+    // A member connecting later gets it from `welcome`, right after `Connected`.
+    let (m, rec_m) = start(cfg(&r, &ring.chain, ring.mobile.clone()));
+    assert!(connected_as(&rec_m, false));
+    assert!(rec_m
+        .wait(WAIT, |e| matches!(e, Ev::Entitlement(Some(x)) if *x == t))
+        .is_some());
+    assert!(matches!(
+        after_connected(&rec_m).first(),
+        Some(Ev::Entitlement(Some(x))) if *x == t
+    ));
+    assert_eq!(m.entitlement().as_deref(), Some(t.as_str()));
+    // A worse token is acknowledged but the slot keeps the better one (section 12).
+    let push = token(&gw, &ring.ring_id(), Tier::Push, now() + 7200);
+    b.put_entitlement(&push).expect("acknowledged");
+    std::thread::sleep(QUIET);
+    assert_eq!(a.entitlement().as_deref(), Some(t.as_str()));
+    assert!(a.routing());
+    for c in [a, b, m] {
+        c.stop(ByeReason::quit());
+    }
+}
+
+#[test]
+fn connector_put_entitlement_not_connected() {
+    // Never connected.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://127.0.0.1:{}", dead.local_addr().unwrap().port());
+    drop(dead);
+    let ring = TestRing::new(&url);
+    let mut cc = ConnectorConfig::new(xshell_protocol::ring::relay::RingClientConfig::new(
+        ring.chain.clone(),
+        ring.desktop.clone(),
+    ));
+    cc.client.timeouts = timeouts();
+    cc.backoff_unit = Duration::from_millis(50);
+    let (c, rec) = start(cc);
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::State(LinkState::Waiting { .. })))
+        .is_some());
+    let t = fake_entitlement(&ring.ring_id());
+    assert!(matches!(c.put_entitlement(&t), Err(RingError::Closed(_))));
+    assert_eq!(c.entitlement(), None);
+    c.stop(ByeReason::quit());
+
+    // Dropped and waiting out a long backoff: refused, and nothing is put on the next
+    // connection.
+    let (r, gw) = hosted_relay();
+    let ring = TestRing::new(&r.url());
+    let mut cc = cfg(&r, &ring.chain, ring.desktop.clone());
+    cc.backoff_unit = Duration::from_secs(30);
+    let (c, rec) = start(cc);
+    assert!(connected_as(&rec, true));
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.desktop.sign_key(), 1011));
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::State(LinkState::Waiting { .. })))
+        .is_some());
+    let t = token(&gw, &ring.ring_id(), Tier::Hosted, now() + 3600);
+    assert!(matches!(c.put_entitlement(&t), Err(RingError::Closed(_))));
+    assert_eq!(c.entitlement(), None);
+    rec.clear();
+    c.kick();
+    assert!(connected_as(&rec, true));
+    std::thread::sleep(QUIET);
+    assert!(!c.routing());
+    assert_eq!(c.entitlement(), None);
+    let (probe, _) = connect(&r.target(), &ring.chain, ring.mobile.clone());
+    assert_eq!(probe.entitlement(), None);
+    assert!(probe.limited());
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn connector_quota_refusal_of_a_request_reaches_error() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        auth_timeout: Duration::from_millis(500),
+        quota_frames_per_day: Some(6),
+        ..TestRelayOptions::default()
+    });
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    let t = fake_entitlement(&ring.ring_id());
+    let mut refused = None;
+    for _ in 0..20 {
+        match c.put_entitlement(&t) {
+            Ok(()) => {}
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    // The request gets its answer …
+    assert!(
+        matches!(
+            refused,
+            Some(RingError::Relay {
+                code: ErrorCode::Quota,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    // … and the shared path hears of it too.
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
+        .is_some());
     c.stop(ByeReason::quit());
 }

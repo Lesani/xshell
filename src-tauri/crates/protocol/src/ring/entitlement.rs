@@ -105,16 +105,10 @@ fn signed_bytes(payload_part: &str) -> Vec<u8> {
     v
 }
 
-/// Verifies `token` for `ring` at `now` (Unix seconds), in the gateway's order of checks.
-/// `hosted` additionally requires the Hosted tier.
-pub fn verify_entitlement(
-    token: &str,
-    ring: &RingId,
-    now: u64,
-    keys: &GatewayKeys,
-    hosted: bool,
-) -> Result<EntitlementClaims, EntitlementError> {
-    use EntitlementError::*;
+/// A token split into its parts: the claims, the payload part as sent (what is signed) and
+/// the signature.
+fn parse(token: &str) -> Result<(EntitlementClaims, &str, Signature), EntitlementError> {
+    use EntitlementError::Malformed;
     if token.len() > super::relay::wire::MAX_ENTITLEMENT_TOKEN {
         return Err(Malformed);
     }
@@ -128,6 +122,42 @@ pub fn verify_entitlement(
         return Err(Malformed);
     }
     let sig = Signature::parse(sig_part).map_err(|_| Malformed)?;
+    Ok((claims, payload_part, sig))
+}
+
+/// Reads a token's claims as strictly as [`verify_entitlement`] does, but without checking
+/// the signature, the kid, the Ring or the time: the only refusal is
+/// [`EntitlementError::Malformed`]. For a device that shows or compares tokens it may not
+/// hold the gateway key for; nothing it returns is authenticated.
+pub fn decode_entitlement(token: &str) -> Result<EntitlementClaims, EntitlementError> {
+    parse(token).map(|(claims, _, _)| claims)
+}
+
+/// Whether `a` is a better entitlement than `b` (amendment A2, protocol section 12): a
+/// higher tier (`Hosted` over `Push`), or the same tier and a later `expires_at`. Equal tier
+/// and expiry is not better. Compares claims only: the caller decides which tokens count
+/// (verified, unexpired, for its Ring).
+pub fn better_entitlement(a: &EntitlementClaims, b: &EntitlementClaims) -> bool {
+    fn rank(t: Tier) -> u8 {
+        match t {
+            Tier::Push => 0,
+            Tier::Hosted => 1,
+        }
+    }
+    (rank(a.tier), a.expires_at) > (rank(b.tier), b.expires_at)
+}
+
+/// Verifies `token` for `ring` at `now` (Unix seconds), in the gateway's order of checks.
+/// `hosted` additionally requires the Hosted tier.
+pub fn verify_entitlement(
+    token: &str,
+    ring: &RingId,
+    now: u64,
+    keys: &GatewayKeys,
+    hosted: bool,
+) -> Result<EntitlementClaims, EntitlementError> {
+    use EntitlementError::*;
+    let (claims, payload_part, sig) = parse(token)?;
     let key = keys.get(&claims.kid).ok_or(UnknownKid)?;
     if !verify(key, &signed_bytes(payload_part), &sig) {
         return Err(BadSignature);
@@ -222,6 +252,120 @@ mod tests {
         ] {
             assert_eq!(
                 verify_entitlement(bad, &ring, 150, &keys, true),
+                Err(EntitlementError::Malformed),
+                "{bad}"
+            );
+        }
+    }
+
+    fn claims(tier: Tier, expires_at: u64) -> EntitlementClaims {
+        EntitlementClaims {
+            v: 1,
+            kid: "k".into(),
+            ring_id: "r".into(),
+            tier,
+            purchase_ref: "p".into(),
+            issued_at: 1,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn better_entitlement_hosted_beats_push() {
+        let (hosted, push) = (claims(Tier::Hosted, 100), claims(Tier::Push, 900));
+        assert!(better_entitlement(&hosted, &push));
+        assert!(!better_entitlement(&push, &hosted));
+    }
+
+    #[test]
+    fn better_entitlement_later_expiry_wins_within_a_tier() {
+        for tier in [Tier::Push, Tier::Hosted] {
+            let (early, late) = (claims(tier, 100), claims(tier, 200));
+            assert!(better_entitlement(&late, &early));
+            assert!(!better_entitlement(&early, &late));
+        }
+    }
+
+    #[test]
+    fn better_entitlement_equal_is_not_better() {
+        let a = claims(Tier::Hosted, 100);
+        let mut b = a.clone();
+        b.purchase_ref = "other".into();
+        b.issued_at = 50;
+        assert!(!better_entitlement(&a, &a));
+        assert!(!better_entitlement(&a, &b));
+        assert!(!better_entitlement(&b, &a));
+    }
+
+    #[test]
+    fn decode_entitlement_reads_without_the_key() {
+        let gw = DeviceKeys::from_seeds(&[0x61; 32], &[0x62; 32]);
+        let ring = RingId::derive(&DeviceKeys::from_seeds(&[1; 32], &[2; 32]).sign_key());
+        let t = sign_entitlement(&gw, &ring, Tier::Push, "p1", 100, 200).unwrap();
+        let c = decode_entitlement(&t).unwrap();
+        assert_eq!(
+            c,
+            EntitlementClaims {
+                v: 1,
+                kid: entitlement_kid(&gw.sign_key()),
+                ring_id: ring.as_str().into(),
+                tier: Tier::Push,
+                purchase_ref: "p1".into(),
+                issued_at: 100,
+                expires_at: 200,
+            }
+        );
+        // Unverified: a forged signature and an unknown signer still decode.
+        let (head, _) = t.rsplit_once('.').unwrap();
+        let forged = format!("{head}.{}", b64::encode(&[0u8; 64]));
+        assert_eq!(decode_entitlement(&forged), Ok(c));
+    }
+
+    #[test]
+    fn decode_entitlement_refuses_malformed() {
+        let gw = DeviceKeys::from_seeds(&[0x61; 32], &[0x62; 32]);
+        let ring = RingId::derive(&DeviceKeys::from_seeds(&[1; 32], &[2; 32]).sign_key());
+        let t = sign_entitlement(&gw, &ring, Tier::Hosted, "p1", 100, 200).unwrap();
+        let payload = |v: serde_json::Value| {
+            format!(
+                "xet1.{}.{}",
+                b64::encode(v.to_string().as_bytes()),
+                b64::encode(&[1u8; 64])
+            )
+        };
+        let base = serde_json::json!({
+            "v": 1, "kid": "k", "ringId": "r", "tier": "hosted",
+            "purchaseRef": "p", "issuedAt": 1, "expiresAt": 2,
+        });
+        assert!(decode_entitlement(&payload(base.clone())).is_ok());
+        let mut v2 = base.clone();
+        v2["v"] = 2.into();
+        let mut tier = base.clone();
+        tier["tier"] = "gold".into();
+        let mut big = base.clone();
+        big["expiresAt"] = (MAX_SAFE_INT + 1).into();
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("kid");
+        let long = format!(
+            "xet1.{}.AA",
+            "A".repeat(super::super::relay::wire::MAX_ENTITLEMENT_TOKEN)
+        );
+        for bad in [
+            String::new(),
+            "xet1.".into(),
+            "xet1.a".into(),
+            "xet2.e30.AA".into(),
+            format!("{t}="),
+            t.replace("xet1.", "xet1.."),
+            payload(v2),
+            payload(tier),
+            payload(big),
+            payload(missing),
+            format!("{}.AA", t.rsplit_once('.').unwrap().0),
+            long,
+        ] {
+            assert_eq!(
+                decode_entitlement(&bad),
                 Err(EntitlementError::Malformed),
                 "{bad}"
             );
