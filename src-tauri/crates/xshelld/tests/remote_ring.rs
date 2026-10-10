@@ -383,7 +383,11 @@ fn host_in_another_ring_is_left_alone_until_claimed() {
     wait("claimed and online", || online(&app.ring, &key));
     let ours = app.ring.view().ring_id.unwrap();
     assert_eq!(a.ring_id().as_deref(), Some(ours.as_str()));
-    assert!(app.worker.host_states().is_empty());
+    // The member can be online on the Relay before the worker has the join's answer, which
+    // is what clears the Host's `other-ring` state (#39): wait for that, not for a moment.
+    wait("the other-ring state cleared", || {
+        app.worker.host_states().is_empty()
+    });
 }
 
 /// A Host added with a managed install (probe, upload, `xshelld connect`) joins too.

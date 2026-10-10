@@ -61,22 +61,28 @@ fn hook_fake_agents() {
     });
 }
 
-/// The user's own agent configuration, which nothing here may touch.
-fn user_agent_config() -> Vec<(PathBuf, Option<SystemTime>)> {
-    let home = dirs::home_dir().unwrap_or_default();
-    [
-        ".claude/settings.json",
-        ".claude/settings.local.json",
-        ".claude.json",
-        ".codex/config.toml",
-    ]
-    .iter()
-    .map(|r| {
-        let p = home.join(r);
-        let m = fs::metadata(&p).and_then(|m| m.modified()).ok();
-        (p, m)
-    })
-    .collect()
+/// The user's own agent configuration, which nothing here may touch: in the home the Daemon
+/// serves and in this process's home (what its Terminals inherit). Both are the test's own
+/// ([`TestHome`], [`isolate_home`]), never the developer's: a Claude Code session running
+/// on the same machine rewrites the real `~/.claude.json` at any time (#39).
+fn user_agent_config(served: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+    let process = isolate_home();
+    [served, process]
+        .iter()
+        .flat_map(|home| {
+            [
+                ".claude/settings.json",
+                ".claude/settings.local.json",
+                ".claude.json",
+                ".codex/config.toml",
+            ]
+            .map(|r| home.join(r))
+        })
+        .map(|p| {
+            let m = fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (p, m)
+        })
+        .collect()
 }
 
 struct Env {
@@ -92,35 +98,14 @@ struct Env {
 }
 
 fn env() -> Env {
-    hook_fake_agents();
-    let user_config = user_agent_config();
-    let h = TestHome::new();
-    let cwd = h.project("app");
-    let fake = Fake {
-        bin: PathBuf::new(),
-        argv_log: cwd.join("argv.log"),
-        pids_log: cwd.join("pids.log"),
-    };
-    let srv = start(&h, |_| {});
-    let mut c = Client::connect(&srv.socket);
-    c.hello(range(1, 1));
-    Env {
-        _reaper: FakeReaper(fake.pids_log.clone()),
-        h,
-        srv,
-        c,
-        cwd,
-        fake,
-        user_config,
-        sent: Default::default(),
-    }
+    env_with(|_| {})
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             assert_eq!(
-                user_agent_config(),
+                user_agent_config(&self.h.home()),
                 self.user_config,
                 "the user's agent configuration changed"
             );
@@ -662,8 +647,8 @@ fn env_reads() -> (Env, Reads) {
 /// [`env`] with the Daemon's configuration changed by `tweak`.
 fn env_with(tweak: impl FnOnce(&mut xshelld::server::Config)) -> Env {
     hook_fake_agents();
-    let user_config = user_agent_config();
     let h = TestHome::new();
+    let user_config = user_agent_config(&h.home());
     let cwd = h.project("app");
     let fake = Fake {
         bin: PathBuf::new(),

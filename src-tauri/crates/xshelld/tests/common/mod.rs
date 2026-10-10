@@ -47,9 +47,29 @@ impl Default for TestHome {
     }
 }
 
+/// Points this test process's `HOME` at an empty directory of its own, once per test binary,
+/// so nothing a test starts (an in-process Daemon's Terminals and agents inherit this
+/// process's environment) reads or writes the developer's real home: `~/.claude.json`,
+/// `~/.claude/`, `~/.codex/`, shell rc files. Every Daemon a test starts serves its own
+/// [`TestHome`]; this covers what falls back to the process's home. [`TestHome::new`] calls it.
+pub fn isolate_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("xd-home")
+            .tempdir_in("/tmp")
+            .expect("tempdir")
+            .keep();
+        let dir = dir.canonicalize().unwrap();
+        std::env::set_var("HOME", &dir);
+        dir
+    })
+}
+
 impl TestHome {
     /// Under /tmp so socket paths stay well inside `sun_path`.
     pub fn new() -> Self {
+        isolate_home();
         let dir = tempfile::Builder::new()
             .prefix("xd")
             .tempdir_in("/tmp")
