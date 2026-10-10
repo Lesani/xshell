@@ -137,10 +137,10 @@ fn unknown_method_is_rejected() {
 }
 
 #[test]
-fn methods_list_has_no_duplicates_and_35_entries() {
+fn methods_list_has_no_duplicates_and_36_entries() {
     let set: HashSet<&str> = METHODS.iter().copied().collect();
-    assert_eq!(METHODS.len(), 35);
-    assert_eq!(set.len(), 35);
+    assert_eq!(METHODS.len(), 36);
+    assert_eq!(set.len(), 36);
 }
 
 #[test]
@@ -294,6 +294,61 @@ fn cwd_and_branch_detection_params_equal_direct_calls() {
         .unwrap()
     );
     assert_eq!(got["new_session_id"], json!("child"));
+}
+
+#[test]
+fn get_project_sessions_routes() {
+    let fx = Fixture::new();
+    claude_project(&fx);
+    let ctx = fx.ctx();
+    let got = call(&ctx, "get_project_sessions", json!({"cwd": CWD})).unwrap();
+    assert_eq!(
+        got,
+        to_value(sessions::project_sessions(&ctx, CWD, None, None)).unwrap()
+    );
+    let page: xshell_protocol::msg::PastSessionsPage = serde_json::from_value(got).unwrap();
+    assert_eq!(page.sessions.len(), 2);
+    assert_eq!(page.next, None);
+    // `limit` and `before` (camelCase) page through it.
+    let first = call(
+        &ctx,
+        "get_project_sessions",
+        json!({"cwd": CWD, "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(first["sessions"].as_array().unwrap().len(), 1);
+    let next = first["next"].clone();
+    assert!(next["modifiedMs"].is_u64(), "{next}");
+    let second = call(
+        &ctx,
+        "get_project_sessions",
+        json!({"cwd": CWD, "limit": 1, "before": next}),
+    )
+    .unwrap();
+    assert_eq!(second["sessions"].as_array().unwrap().len(), 1);
+    assert_ne!(second["sessions"][0]["id"], first["sessions"][0]["id"]);
+    assert_eq!(second["next"], Value::Null);
+}
+
+#[test]
+fn get_project_sessions_missing_cwd_errs() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx();
+    for p in [json!({}), Value::Null, json!({"limit": 5})] {
+        let e = call(&ctx, "get_project_sessions", p).unwrap_err();
+        assert!(
+            e.starts_with("invalid args for command `get_project_sessions`"),
+            "{e}"
+        );
+    }
+    // A malformed cursor is refused too.
+    let e = call(
+        &ctx,
+        "get_project_sessions",
+        json!({"cwd": CWD, "before": {"id": "x"}}),
+    )
+    .unwrap_err();
+    assert!(e.starts_with("invalid args"), "{e}");
 }
 
 #[test]

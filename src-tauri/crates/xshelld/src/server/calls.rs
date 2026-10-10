@@ -4,6 +4,7 @@
 use super::conn::reply;
 use super::outbox::Outbox;
 use super::registry::Daemon;
+use super::role::{self, Role};
 use serde_json::Value;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,7 @@ pub(crate) fn spawn_call(
     d: &Arc<Daemon>,
     ob: &Arc<Outbox>,
     inflight: &Arc<AtomicUsize>,
+    role: Role,
     id: Option<u64>,
     method: String,
     params: Value,
@@ -32,7 +34,9 @@ pub(crate) fn spawn_call(
         .name(format!("call-{name}"))
         .spawn(move || {
             // Needs `panic = "unwind"`: xshelld release builds use the release-daemon profile.
+            // The role's history checks run here, off the connection's reader.
             let res = catch_unwind(AssertUnwindSafe(|| {
+                role::authorize_call(role, &ctx, &method, &params)?;
                 xshell_core::dispatch(&ctx, &method, params)
             }))
             .unwrap_or_else(|_| Err(format!("internal error in {method}")));

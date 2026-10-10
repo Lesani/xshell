@@ -268,6 +268,65 @@ pub struct SessionPage {
     pub before: Option<u64>,
 }
 
+// ── Past sessions (`call get_project_sessions`, capability `project.sessions`) ──
+
+/// The most sessions one `get_project_sessions` page holds; `limit` is clamped to
+/// `1..=PAST_SESSIONS_PAGE_MAX` (default [`PAST_SESSIONS_PAGE_DEFAULT`]).
+pub const PAST_SESSIONS_PAGE_MAX: u32 = 200;
+pub const PAST_SESSIONS_PAGE_DEFAULT: u32 = 50;
+/// A [`PastSession`]'s `title` is at most this many characters.
+pub const PAST_SESSION_TITLE_MAX_CHARS: usize = 200;
+/// A [`PastSession`]'s `gitBranch` is at most this many characters.
+pub const PAST_SESSION_BRANCH_MAX_CHARS: usize = 100;
+
+/// Where the next `get_project_sessions` page starts: the last session of the page before.
+/// Pages are ordered by `modifiedMs` (newest first), then `agent`, then `id`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PastSessionsCursor {
+    pub modified_ms: u64,
+    pub agent: String,
+    pub id: String,
+}
+
+/// One past Claude Code or Codex session of a Project, as a Mobile lists it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PastSession {
+    pub id: String,
+    /// `claude` or `codex`.
+    pub agent: String,
+    /// The session's name or first prompt, whitespace collapsed; empty when it has none.
+    pub title: String,
+    /// When the session's file last changed (Unix ms): the order and the time shown.
+    pub modified_ms: u64,
+    /// The prompts the user typed. A lower bound for a very large session, whose middle is
+    /// not read.
+    pub message_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+/// The answer to `get_project_sessions`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PastSessionsPage {
+    pub sessions: Vec<PastSession>,
+    /// The `before` of the next page; `null` on the last page.
+    pub next: Option<PastSessionsCursor>,
+}
+
+impl PastSession {
+    /// This session as the `before` of the page after it.
+    pub fn cursor(&self) -> PastSessionsCursor {
+        PastSessionsCursor {
+            modified_ms: self.modified_ms,
+            agent: self.agent.clone(),
+            id: self.id.clone(),
+        }
+    }
+}
+
 /// Which Agent Status changes wake a Mobile. Both are required.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -1468,5 +1527,33 @@ mod tests {
         for t in ["session.subscribe", "session.page", "session.unsubscribe"] {
             assert!(CLIENT_TYPES.contains(&t), "{t}");
         }
+    }
+
+    #[test]
+    fn past_session_serde_shape() {
+        let raw = json!({
+            "sessions": [
+                {"id": "11111111-2222", "agent": "claude", "title": "fix the bug",
+                 "modifiedMs": 1_767_398_400_000u64, "messageCount": 3, "gitBranch": "main"},
+                {"id": "0199aaaa", "agent": "codex", "title": "",
+                 "modifiedMs": 1_767_398_300_000u64, "messageCount": 0}
+            ],
+            "next": {"modifiedMs": 1_767_398_300_000u64, "agent": "codex", "id": "0199aaaa"}
+        });
+        let page: PastSessionsPage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(page.sessions.len(), 2);
+        assert_eq!(page.sessions[0].git_branch.as_deref(), Some("main"));
+        assert_eq!(page.sessions[1].git_branch, None);
+        assert_eq!(page.next, Some(page.sessions[1].cursor()));
+        // Round trip: the same JSON, `gitBranch` left out when absent.
+        assert_eq!(serde_json::to_value(&page).unwrap(), raw);
+        // The last page.
+        let last: PastSessionsPage =
+            serde_json::from_value(json!({"sessions": [], "next": null})).unwrap();
+        assert_eq!(last.next, None);
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            json!({"sessions": [], "next": null})
+        );
     }
 }

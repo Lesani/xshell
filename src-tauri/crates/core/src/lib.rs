@@ -18,6 +18,7 @@ pub mod last_line;
 pub mod launch;
 pub mod memories;
 pub mod opencode;
+pub mod past;
 pub mod paths;
 pub mod pipe;
 pub mod private_fs;

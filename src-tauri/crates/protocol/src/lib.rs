@@ -43,6 +43,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::TERM_MOBILE,
     #[cfg(unix)]
     cap::TERM_FIRST_MESSAGE,
+    cap::PROJECT_SESSIONS,
 ];
 
 /// The names in [`CAPABILITIES`], so peers gate on a constant instead of a string literal.
@@ -82,6 +83,9 @@ pub mod cap {
     /// text as a command line.
     #[cfg(unix)]
     pub const TERM_FIRST_MESSAGE: &str = "term.first-message";
+    /// `call get_project_sessions`: one Project's Claude Code and Codex sessions, newest
+    /// first, paged (`msg::PastSessionsPage`).
+    pub const PROJECT_SESSIONS: &str = "project.sessions";
 }
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -147,6 +151,12 @@ mod tests {
     #[test]
     fn capabilities_exclude_term_first_message_on_windows() {
         assert!(!CAPABILITIES.contains(&"term.first-message"));
+    }
+
+    #[test]
+    fn capabilities_include_project_sessions() {
+        assert!(CAPABILITIES.contains(&"project.sessions"));
+        assert_eq!(cap::PROJECT_SESSIONS, "project.sessions");
     }
 
     #[test]

@@ -38,6 +38,7 @@ export const HOST_METHODS = [
   "get_antigravity_context",
   "get_claude_cost_summary",
   "get_codex_usage",
+  "get_project_sessions",
 ] as const;
 
 export type HostMethod = typeof HOST_METHODS[number];

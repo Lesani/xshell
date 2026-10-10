@@ -276,7 +276,7 @@ impl Conn {
         match m.msg {
             ClientMsg::Hello(_) => reply(&self.ob, id, Err("already said hello".into())),
             ClientMsg::Call { method, params } => {
-                spawn_call(&d, &self.ob, &self.inflight, id, method, params)
+                spawn_call(&d, &self.ob, &self.inflight, self.role, id, method, params)
             }
             ClientMsg::TermOpen { spec } => {
                 // A first message is checked for every role, after the role's own checks and

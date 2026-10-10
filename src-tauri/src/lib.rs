@@ -517,6 +517,17 @@ async fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String>
     xshell_core::agents::detect_agent_binary(binary)
 }
 
+/// One Project's past Claude Code and Codex sessions, newest first and paged; served to a
+/// Mobile by the Daemon (`project.sessions`). On its own thread: it reads session files.
+#[tauri::command]
+async fn get_project_sessions(
+    cwd: String,
+    limit: Option<u32>,
+    before: Option<xshell_protocol::msg::PastSessionsCursor>,
+) -> xshell_protocol::msg::PastSessionsPage {
+    xshell_core::sessions::project_sessions(&ctx(), &cwd, limit, before.as_ref())
+}
+
 #[tauri::command]
 fn list_codex_projects() -> Vec<CodexProjectInfo> {
     xshell_core::codex::list_codex_projects(&ctx())
@@ -645,6 +656,7 @@ pub fn run() {
             get_antigravity_context,
             get_claude_cost_summary,
             get_codex_usage,
+            get_project_sessions,
             spawn_terminal,
             write_terminal,
             resize_terminal,
@@ -761,7 +773,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 76);
+        assert_eq!(registered.len(), 77);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

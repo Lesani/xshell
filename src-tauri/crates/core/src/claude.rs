@@ -178,49 +178,10 @@ pub fn parse_session(
                 }
             }
             Some("human") | Some("user") => {
-                // Both real user prompts AND tool-result responses arrive as `type: "user"`.
-                // Tool results are NOT something the user typed — Claude requested a tool,
-                // the runtime sent back the result as a `user`-role turn with content like
-                // `[{ "type": "tool_result", ... }]`. Counting those as messages overstates
-                // the actual conversation length by 2-3×.
-                let content_node = json
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .or_else(|| json.get("content"));
-                let mut is_real_prompt = false;
-                let mut prompt_text: Option<String> = None;
-                if let Some(content) = content_node {
-                    if let Some(s) = content.as_str() {
-                        is_real_prompt = !s.is_empty();
-                        prompt_text = Some(s.chars().take(120).collect());
-                    } else if let Some(arr) = content.as_array() {
-                        // Real prompt = at least one text/image part AND no tool_result parts.
-                        let has_tool_result = arr.iter().any(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        });
-                        let has_text_or_image = arr.iter().any(|item| {
-                            let ty = item.get("type").and_then(|t| t.as_str());
-                            ty == Some("text")
-                                || ty == Some("image")
-                                || ty.is_none() && item.get("text").is_some()
-                        });
-                        is_real_prompt = !has_tool_result && has_text_or_image;
-                        if is_real_prompt {
-                            for item in arr {
-                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    prompt_text = Some(text.chars().take(120).collect());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if is_real_prompt {
+                if let Some(t) = user_prompt(&json) {
                     message_count += 1;
                     if first_human_message.is_empty() {
-                        if let Some(t) = prompt_text {
-                            first_human_message = t;
-                        }
+                        first_human_message = t;
                     }
                 }
             }
@@ -451,6 +412,39 @@ pub fn parse_session(
         );
     }
     Some(info)
+}
+
+/// The start (at most 120 characters, possibly empty) of the prompt a `user` line carries, if
+/// it is one the user typed. Both real user prompts AND tool-result responses arrive as
+/// `type: "user"`. Tool results are NOT something the user typed — Claude requested a tool,
+/// the runtime sent back the result as a `user`-role turn with content like
+/// `[{ "type": "tool_result", ... }]`. Counting those as messages overstates the actual
+/// conversation length by 2-3×.
+pub(crate) fn user_prompt(json: &serde_json::Value) -> Option<String> {
+    let content = json
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| json.get("content"))?;
+    if let Some(s) = content.as_str() {
+        return (!s.is_empty()).then(|| s.chars().take(120).collect());
+    }
+    let arr = content.as_array()?;
+    // Real prompt = at least one text/image part AND no tool_result parts.
+    let has_tool_result = arr
+        .iter()
+        .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+    let has_text_or_image = arr.iter().any(|item| {
+        let ty = item.get("type").and_then(|t| t.as_str());
+        ty == Some("text") || ty == Some("image") || ty.is_none() && item.get("text").is_some()
+    });
+    if has_tool_result || !has_text_or_image {
+        return None;
+    }
+    let text = arr
+        .iter()
+        .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+        .unwrap_or_default();
+    Some(text.chars().take(120).collect())
 }
 
 pub fn list_claude_projects(ctx: &HostCtx) -> Vec<ProjectInfo> {

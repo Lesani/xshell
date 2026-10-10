@@ -15,7 +15,7 @@ function coreMethods(src: string): string[] {
 describe("hostMethods", () => {
   it("TS list equals core METHODS", () => {
     const rust = coreMethods(dispatchSrc);
-    expect(rust.length).toBe(35);
+    expect(rust.length).toBe(36);
     expect(new Set(HOST_METHODS)).toEqual(new Set(rust));
     expect(HOST_METHODS.length).toBe(rust.length);
   });

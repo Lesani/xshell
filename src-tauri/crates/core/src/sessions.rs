@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 
+pub use crate::past::project_sessions;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectInfo {
     pub name: String,

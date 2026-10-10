@@ -49,6 +49,7 @@ pub const METHODS: &[&str] = &[
     "get_antigravity_context",
     "get_claude_cost_summary",
     "get_codex_usage",
+    "get_project_sessions",
 ];
 
 // Parameter shapes. Keys are camelCase like Tauri's argument mapping; missing `Option`
@@ -142,6 +143,14 @@ struct SessionBranch {
     cwd: String,
     current_session_id: String,
     known_session_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSessions {
+    cwd: String,
+    limit: Option<u32>,
+    before: Option<xshell_protocol::msg::PastSessionsCursor>,
 }
 
 #[derive(Deserialize)]
@@ -277,6 +286,15 @@ pub fn dispatch(ctx: &HostCtx, method: &str, params: Value) -> Result<Value, Str
         }
         "get_claude_cost_summary" => out(stats::get_claude_cost_summary(ctx)),
         "get_codex_usage" => out(codex::get_codex_usage(ctx)),
+        "get_project_sessions" => {
+            let a: ProjectSessions = p.parse()?;
+            out(sessions::project_sessions(
+                ctx,
+                &a.cwd,
+                a.limit,
+                a.before.as_ref(),
+            ))
+        }
         _ => Err(format!("unknown method `{method}`")),
     }
 }

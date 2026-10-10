@@ -61,6 +61,7 @@ pub(crate) const MOBILE_CALLS: &[&str] = &[
     "get_claude_cost_summary",
     "get_codex_usage",
     "save_dropped_file",
+    "get_project_sessions",
 ];
 
 /// Every core method a Mobile may not call: files, git, files read at a client-chosen path
@@ -90,7 +91,8 @@ pub(crate) const MOBILE_REFUSED_CALLS: &[&str] = &[
 ];
 
 /// Whether `cwd` is a Project the Host knows from any agent's session history. Paths compare
-/// after resolving symlinks, falling back to the exact string.
+/// after resolving symlinks, falling back to the exact string. Codex rollouts are read through
+/// core's cache of their first lines (and symlinked ones skipped), so a repeat costs `stat`s.
 pub(crate) fn known_project(ctx: &HostCtx, cwd: &str) -> bool {
     if cwd.is_empty() {
         return false;
@@ -106,7 +108,12 @@ pub(crate) fn known_project(ctx: &HostCtx, cwd: &str) -> bool {
                 .map(|p| p.path)
                 .collect()
         },
-        &|| paths(codex::list_codex_projects(ctx)),
+        &|| {
+            codex::rollouts(ctx)
+                .into_iter()
+                .map(|r| r.meta.cwd)
+                .collect()
+        },
         &|| paths(cursor::list_cursor_projects(ctx)),
         &|| paths(opencode::list_opencode_projects(ctx)),
         &|| paths(antigravity::list_antigravity_projects(ctx)),
@@ -258,6 +265,12 @@ fn check_call(ctx: &HostCtx, method: &str, params: &Value) -> Result<(), String>
                 _ => Ok(()),
             }
         }
+        // Only the cheap part here, on the connection's reader: the Project is checked on the
+        // call's own thread, in [`authorize_call`].
+        "get_project_sessions" => match arg("cwd")? {
+            "" => Err(forbidden(format!("call {method} outside a known Project"))),
+            _ => Ok(()),
+        },
         // Always written to the Daemon's drop directory; the name only ends the file name.
         "save_dropped_file" => match arg("name")? {
             "" => Ok(()),
@@ -266,6 +279,31 @@ fn check_call(ctx: &HostCtx, method: &str, params: &Value) -> Result<(), String>
         },
         _ => Err(refuse()),
     }
+}
+
+/// The part of a `call`'s check that reads session history, run on the call's own thread before
+/// dispatch so that a slow history never holds up the connection's other requests. [`check`]
+/// has already passed the call.
+pub(crate) fn authorize_call(
+    role: Role,
+    ctx: &HostCtx,
+    method: &str,
+    params: &Value,
+) -> Result<(), String> {
+    if role == Role::Desktop || method != "get_project_sessions" {
+        return Ok(());
+    }
+    let cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !known_project(ctx, cwd) {
+        return Err(forbidden(format!("call {method} outside a known Project")));
+    }
+    // Core reads the Claude Project directory's regular files only; as for the other session
+    // reads, a symlinked JSONL there refuses.
+    let dir = in_claude_projects(ctx, method, &[&encode_project_name(cwd)])?;
+    plain_sessions(method, dir.as_deref())
 }
 
 /// One plain path component: no separator, no `.` or `..`, not absolute, no NUL.
@@ -443,7 +481,10 @@ pub(crate) mod tests {
         for m in MOBILE_CALLS {
             let r = check_call(&ctx, m, &p);
             // The cwd methods need a known Project; everything else passes.
-            if matches!(*m, "list_project_session_ids" | "detect_session_branch") {
+            if matches!(
+                *m,
+                "list_project_session_ids" | "detect_session_branch" | "get_project_sessions"
+            ) {
                 assert!(r.unwrap_err().contains("known Project"), "{m}");
             } else {
                 assert_eq!(r, Ok(()), "{m}");
@@ -632,6 +673,66 @@ pub(crate) mod tests {
         assert_eq!(drop(""), Ok(()));
         for n in ["../x", "/etc/x", "a\\b", "..", "."] {
             assert!(drop(n).is_err(), "{n}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_sessions_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (cwd, codex_cwd) = (root.join("proj"), root.join("codex-only"));
+        let (_h, ctx) = history(&cwd, &codex_cwd);
+        let m = "get_project_sessions";
+        let p = |c: &Path| json!({ "cwd": c });
+        let both = |c: &Path| {
+            check(Role::Mobile, &ctx, &call(m, p(c)))
+                .and_then(|_| authorize_call(Role::Mobile, &ctx, m, &p(c)))
+        };
+        // Known from Claude history, and from Codex history only.
+        assert_eq!(both(&cwd), Ok(()));
+        assert_eq!(both(&codex_cwd), Ok(()));
+        // Outside a known Project: the cheap check passes, the worker's refuses.
+        let outside = root.join("outside");
+        assert_eq!(check(Role::Mobile, &ctx, &call(m, p(&outside))), Ok(()));
+        let e = authorize_call(Role::Mobile, &ctx, m, &p(&outside)).unwrap_err();
+        assert!(
+            e.starts_with(FORBIDDEN) && e.contains("known Project"),
+            "{e}"
+        );
+        // No cwd, or an empty one: refused on the reader already.
+        for bad in [json!({}), json!({ "cwd": "" }), json!({ "cwd": 5 })] {
+            let e = check(Role::Mobile, &ctx, &call(m, bad)).unwrap_err();
+            assert!(e.starts_with(FORBIDDEN), "{e}");
+        }
+        // A symlinked JSONL in the Claude Project directory refuses.
+        let enc = encode_project_name(&cwd.to_string_lossy());
+        let link = ctx
+            .home()
+            .unwrap()
+            .join(".claude/projects")
+            .join(&enc)
+            .join("l.jsonl");
+        fs::write(root.join("secret.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.jsonl"), &link).unwrap();
+        assert!(authorize_call(Role::Mobile, &ctx, m, &p(&cwd))
+            .unwrap_err()
+            .starts_with(FORBIDDEN));
+        // A Desktop, and every other call, have nothing to check on the worker.
+        assert_eq!(authorize_call(Role::Desktop, &ctx, m, &p(&outside)), Ok(()));
+        assert_eq!(
+            authorize_call(Role::Mobile, &ctx, "list_project_session_ids", &p(&outside)),
+            Ok(())
+        );
+        fs::remove_file(&link).unwrap();
+        assert_eq!(both(&cwd), Ok(()));
+    }
+
+    #[cfg(unix)]
+    fn call(method: &str, params: Value) -> ClientMsg {
+        ClientMsg::Call {
+            method: method.into(),
+            params,
         }
     }
 

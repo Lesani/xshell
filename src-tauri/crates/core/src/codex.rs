@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use xshell_protocol::msg::{LastLine, Speaker};
 
@@ -74,6 +75,124 @@ pub fn rollout_for_within(ctx: &HostCtx, sid: &str, max_entries: usize) -> Optio
         .max()
 }
 
+/// What a rollout's first line (`session_meta`) says about its session. `id` may be empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RolloutMeta {
+    pub id: String,
+    pub cwd: String,
+}
+
+/// A rollout file under `~/.codex/sessions`, from [`rollouts`].
+#[derive(Clone, Debug)]
+pub struct Rollout {
+    pub path: PathBuf,
+    pub modified: SystemTime,
+    pub meta: RolloutMeta,
+}
+
+/// The most of a rollout's first line read for its [`RolloutMeta`].
+const META_LINE_MAX: u64 = 1 << 20;
+/// The most rollouts whose [`RolloutMeta`] is cached; past that an entry is evicted.
+const META_CACHE_MAX: usize = 50_000;
+
+type MetaCache = HashMap<PathBuf, (SystemTime, u64, Option<RolloutMeta>)>;
+
+/// [`RolloutMeta`] by rollout path, valid while the file's mtime and length are unchanged.
+fn meta_cache() -> &'static Mutex<MetaCache> {
+    static CACHE: OnceLock<Mutex<MetaCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Insert into a bounded cache, evicting an arbitrary other entry when it is full.
+pub(crate) fn bounded_insert<V>(
+    cache: &mut HashMap<PathBuf, V>,
+    max: usize,
+    key: PathBuf,
+    value: V,
+) {
+    if cache.len() >= max && !cache.contains_key(&key) {
+        if let Some(k) = cache.keys().next().cloned() {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(key, value);
+}
+
+/// Every rollout under `~/.codex/sessions` that is a regular file (symlinks, and symlinked
+/// directories, are skipped) and whose first line names a cwd. The first
+/// lines are cached by path, mtime and length: a repeat call costs one `stat` per rollout.
+pub fn rollouts(ctx: &HostCtx) -> Vec<Rollout> {
+    let Some(home) = ctx.home.clone() else {
+        return vec![];
+    };
+    let mut found = vec![];
+    let mut stack = vec![home.join(".codex").join("sessions")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let p = entry.path();
+            if ft.is_dir() {
+                stack.push(p);
+            } else if ft.is_file() && p.extension().is_some_and(|ext| ext == "jsonl") {
+                // Not followed: `entry.metadata` describes the entry itself.
+                let Some((modified, len)) = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| Some((m.modified().ok()?, m.len())))
+                else {
+                    continue;
+                };
+                if let Some(meta) = rollout_meta(&p, modified, len) {
+                    found.push(Rollout {
+                        path: p,
+                        modified,
+                        meta,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The [`RolloutMeta`] of the rollout at `path`, which had `modified` and `len` when listed.
+fn rollout_meta(path: &Path, modified: SystemTime, len: u64) -> Option<RolloutMeta> {
+    if let Ok(cache) = meta_cache().lock() {
+        if let Some((m, l, meta)) = cache.get(path) {
+            if *m == modified && *l == len {
+                return meta.clone();
+            }
+        }
+    }
+    let meta = read_rollout_meta(path);
+    if let Ok(mut cache) = meta_cache().lock() {
+        bounded_insert(
+            &mut cache,
+            META_CACHE_MAX,
+            path.to_path_buf(),
+            (modified, len, meta.clone()),
+        );
+    }
+    meta
+}
+
+fn read_rollout_meta(path: &Path) -> Option<RolloutMeta> {
+    use std::io::Read;
+    let f = crate::last_line::open_no_follow(path)?;
+    let mut first = Vec::new();
+    BufReader::new(f.take(META_LINE_MAX))
+        .read_until(b'\n', &mut first)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&first).ok()?;
+    let payload = json.get("payload")?;
+    let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let cwd = s("cwd").filter(|c| !c.is_empty())?;
+    Some(RolloutMeta {
+        id: s("id").unwrap_or_default(),
+        cwd,
+    })
+}
+
 /// The newest user or agent message in the tail of a Codex rollout: the `message` of an
 /// `event_msg` of type `user_message` or `agent_message`.
 pub fn last_line_in(path: &Path) -> Option<LastLine> {
@@ -120,18 +239,98 @@ pub fn codex_session_names(ctx: &HostCtx) -> HashMap<String, String> {
         return names;
     };
     for line in content.lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            if let (Some(id), Some(name)) = (
-                json.get("id").and_then(|v| v.as_str()),
-                json.get("thread_name").and_then(|v| v.as_str()),
-            ) {
-                if !name.trim().is_empty() {
-                    names.insert(id.to_string(), name.to_string());
-                }
-            }
+        if let Some((id, name)) = index_name(line.as_bytes()) {
+            names.insert(id, name);
         }
     }
     names
+}
+
+/// The session id and non-blank name of one `session_index.jsonl` line.
+fn index_name(line: &[u8]) -> Option<(String, String)> {
+    let json: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let id = json.get("id")?.as_str()?;
+    let name = json.get("thread_name")?.as_str()?;
+    (!name.trim().is_empty()).then(|| (id.to_string(), name.to_string()))
+}
+
+/// The most of `session_index.jsonl` read for [`session_names_for`]: its end, since renames
+/// are appended and the last one wins.
+pub(crate) const INDEX_TAIL_BYTES: u64 = 4 << 20;
+/// The most names kept from that window.
+const INDEX_NAMES_MAX: usize = 50_000;
+
+type IndexCache = Option<(PathBuf, SystemTime, u64, Arc<HashMap<String, String>>)>;
+
+fn index_cache() -> &'static Mutex<IndexCache> {
+    static CACHE: OnceLock<Mutex<IndexCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The Codex names (renames) of the sessions `ids`, for a listing that must stay bounded:
+/// `~/.codex/session_index.jsonl` is opened only as a regular file (never through a symlink,
+/// never a FIFO), only its last [`INDEX_TAIL_BYTES`] are read, and what it holds is cached by
+/// mtime and length, so a rename that lands only in the index shows on the next call. Any
+/// failure reads as no renames.
+pub fn session_names_for(ctx: &HostCtx, ids: &[&str]) -> HashMap<String, String> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let Some(all) = ctx
+        .home
+        .as_ref()
+        .and_then(|h| index_names(&h.join(".codex").join("session_index.jsonl")))
+    else {
+        return HashMap::new();
+    };
+    ids.iter()
+        .filter_map(|id| Some((id.to_string(), all.get(*id)?.clone())))
+        .collect()
+}
+
+fn index_names(path: &Path) -> Option<Arc<HashMap<String, String>>> {
+    let mut f = crate::last_line::open_no_follow(path)?;
+    let m = f.metadata().ok()?;
+    let (modified, len) = (m.modified().ok()?, m.len());
+    if let Ok(cache) = index_cache().lock() {
+        if let Some((p, t, l, names)) = cache.as_ref() {
+            if p == path && *t == modified && *l == len {
+                return Some(names.clone());
+            }
+        }
+    }
+    let tail = read_tail(&mut f, len, INDEX_TAIL_BYTES).ok()?;
+    let mut names = HashMap::new();
+    for line in tail.split(|b| *b == b'\n') {
+        if let Some((id, name)) = index_name(line) {
+            if names.len() < INDEX_NAMES_MAX || names.contains_key(&id) {
+                names.insert(id, name);
+            }
+        }
+    }
+    let names = Arc::new(names);
+    if let Ok(mut cache) = index_cache().lock() {
+        *cache = Some((path.to_path_buf(), modified, len, names.clone()));
+    }
+    Some(names)
+}
+
+/// The whole lines in the last `max` bytes of a file `len` bytes long.
+pub(crate) fn read_tail(f: &mut fs::File, len: u64, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = len.saturating_sub(max);
+    let mut buf = Vec::new();
+    f.seek(SeekFrom::Start(start))?;
+    f.take(max).read_to_end(&mut buf)?;
+    if start > 0 {
+        // Started inside a line, or just after one: drop up to the first newline.
+        let cut = buf
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        buf.drain(..cut);
+    }
+    Ok(buf)
 }
 
 pub fn parse_codex_session(
@@ -801,6 +1000,40 @@ mod tests {
             ]
         );
         assert!(list_codex_projects(&Fixture::new().ctx()).is_empty());
+    }
+
+    #[test]
+    fn rollouts_cache_first_lines_by_mtime_and_length() {
+        let f = Fixture::new();
+        let p = f.write(
+            "home/.codex/sessions/2026/01/01/r1.jsonl",
+            meta_line("id-1", "/a") + "\n",
+        );
+        f.write("home/.codex/sessions/2026/01/01/bad.jsonl", "{}\n");
+        f.set_mtime(&p, at(1_000));
+        let ctx = f.ctx();
+        let metas = |ctx: &HostCtx| -> Vec<(String, String)> {
+            rollouts(ctx)
+                .into_iter()
+                .map(|r| (r.meta.id, r.meta.cwd))
+                .collect()
+        };
+        assert_eq!(metas(&ctx), vec![("id-1".into(), "/a".into())]);
+        // Same length and mtime: the cached first line is used, the file is not read.
+        fs::write(&p, meta_line("id-1", "/b") + "\n").unwrap();
+        f.set_mtime(&p, at(1_000));
+        assert_eq!(metas(&ctx), vec![("id-1".into(), "/a".into())]);
+        // A new mtime reads it again.
+        f.set_mtime(&p, at(2_000));
+        assert_eq!(metas(&ctx), vec![("id-1".into(), "/b".into())]);
+        // A first line longer than the cap is not read past it.
+        let long = serde_json::json!({"type": "session_meta",
+            "payload": {"id": "id-2", "cwd": "/c", "pad": "x".repeat(META_LINE_MAX as usize)}});
+        f.write("home/.codex/sessions/2026/01/02/r2.jsonl", long.to_string());
+        assert_eq!(metas(&ctx).len(), 1);
+        let mut none = f.ctx();
+        none.home = None;
+        assert!(rollouts(&none).is_empty());
     }
 
     #[test]

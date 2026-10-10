@@ -37,6 +37,7 @@ Messages (protocol 1):
 | Direction | Type | Purpose |
 |---|---|---|
 | D→H | `call { id, method, params }` | Any Host-side command by its Tauri name and the same JSON params the frontend sends today (camelCase). One dispatch table in core serves both. |
+| M/D→H | `call get_project_sessions { cwd, limit?, before? }` | One Project's past Claude Code and Codex sessions (capability `project.sessions`): `{ sessions: [{ id, agent, title, modifiedMs, messageCount, gitBranch? }], next }`, newest first by file mtime, `limit` default 50 and at most 200; `next` (`{ modifiedMs, agent, id }`, `null` on the last page) is the next call's `before`. A Mobile gets `forbidden for mobile: …` outside a known Project. Types: `xshell_protocol::msg::PastSessionsPage`. |
 | D→H | `term.open { id, spec }` | Start a Terminal from a launch spec (agent, session id, cwd, shell mode/id/command, flags, initial size, display metadata). The Desktop picks the Terminal UUID. Optional `firstMessage` (capability `term.first-message`, Unix Hosts only): see "First messages" below. |
 | D→H | `term.attach { id, terminal }` | Subscribe; Daemon replies `{ exitCode, cols, rows }` (`cols`/`rows`: the size applied to the PTY now), then sends the replay buffer as kind-1 frames, then live output. |
 | D→H | `term.detach`, `term.input`, `term.resize`, `term.close`, `term.update { meta }` | `term.update` records late-bound metadata (e.g. a session id linked after start) so restore resumes the right session. |

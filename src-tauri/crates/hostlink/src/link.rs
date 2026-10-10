@@ -1048,9 +1048,12 @@ mod tests {
             inner: io.write,
         });
         peer.greet();
+        // Padded so that the queue (three inputs) also has room for our hello, which grows
+        // with CAPABILITIES.
+        let data = |n: u8| format!("{n:03}{}", "-".repeat(1024));
         let input = |n: u8| ClientMsg::TermInput {
             terminal: Uuid::nil(),
-            data: format!("{n:03}"),
+            data: data(n),
         };
         let frame_len = encode_msg(&input(0), None).unwrap().len();
         let limits = LinkLimits {
@@ -1076,7 +1079,7 @@ mod tests {
             cv.notify_all();
         }
         for n in 0..3 {
-            assert_eq!(peer.expect("term.input")["data"], format!("{n:03}"));
+            assert_eq!(peer.expect("term.input")["data"], data(n));
         }
         link.request(ClientMsg::DaemonUpgrade, T5, w1).unwrap();
         link.request(ClientMsg::DaemonUpgrade, T5, w2).unwrap();

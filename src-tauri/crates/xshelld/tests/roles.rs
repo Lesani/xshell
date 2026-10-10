@@ -14,7 +14,7 @@ use uuid::Uuid;
 use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::frame::Frame;
-use xshell_protocol::msg::{ClientMsg, Hello, OpenSpec, ServerMsg};
+use xshell_protocol::msg::{ClientMsg, Hello, OpenSpec, PastSessionsPage, ServerMsg};
 use xshelld::server::{ExitReason, Role, ServerHandle};
 
 const SID: &str = "11111111-2222-3333-4444-555555555555";
@@ -641,6 +641,84 @@ fn mobile_escaping_parent_with_missing_leaf_refused() {
     let p = json!({ "encodedName": "escape", "sessionId": "missing", "limit": 5 });
     refused(e.mob.call("get_session_messages", p.clone()));
     assert_eq!(e.desk.call("get_session_messages", p), Ok(json!([])));
+}
+
+#[test]
+fn mobile_lists_project_sessions() {
+    let mut e = env();
+    codex_history(&e.h, &e.cwd);
+    let cwd = e.cwd.to_string_lossy().into_owned();
+    let got = e
+        .mob
+        .call("get_project_sessions", json!({ "cwd": cwd }))
+        .unwrap();
+    let page: PastSessionsPage = serde_json::from_value(got.clone()).unwrap();
+    let mut listed: Vec<_> = page
+        .sessions
+        .iter()
+        .map(|s| (s.agent.as_str(), s.id.as_str()))
+        .collect();
+    listed.sort();
+    assert_eq!(listed, [("claude", SID), ("codex", "r1")]);
+    assert_eq!(page.next, None);
+    // Paged: one at a time, the cursor carried back as is.
+    let first = e
+        .mob
+        .call("get_project_sessions", json!({ "cwd": cwd, "limit": 1 }))
+        .unwrap();
+    let rest = e
+        .mob
+        .call(
+            "get_project_sessions",
+            json!({ "cwd": cwd, "limit": 1, "before": first["next"] }),
+        )
+        .unwrap();
+    assert_eq!(
+        [first["sessions"][0].clone(), rest["sessions"][0].clone()].to_vec(),
+        got["sessions"].as_array().unwrap().clone()
+    );
+    assert_eq!(rest["next"], Value::Null);
+    // Outside a known Project: refused for a Mobile, an empty page for a Desktop.
+    let outside = json!({ "cwd": e.h.root().join("outside") });
+    refused(e.mob.call("get_project_sessions", outside.clone()));
+    refused(e.mob.call("get_project_sessions", json!({})));
+    let d = e.desk.call("get_project_sessions", outside).unwrap();
+    assert_eq!(d, json!({ "sessions": [], "next": null }));
+}
+
+#[test]
+fn mobile_project_sessions_check_does_not_hold_up_the_connection() {
+    let mut e = env();
+    // A FIFO among the Claude Projects: reading the history to find the Project blocks on it
+    // until a writer comes.
+    let held = e.h.home().join(".claude/projects/held");
+    fs::create_dir_all(&held).unwrap();
+    let fifo = held.join("f.jsonl");
+    let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+    let id = e.mob.request_id();
+    let msg = ClientMsg::Call {
+        method: "get_project_sessions".into(),
+        params: json!({ "cwd": e.cwd }),
+    };
+    e.mob.send(&msg, Some(id));
+    // An unrelated Terminal request on the same connection is answered meanwhile.
+    let r = e.mob.request(&ClientMsg::TermResize {
+        terminal: Uuid::new_v4(),
+        cols: 80,
+        rows: 24,
+    });
+    assert!(r.unwrap_err().starts_with("unknown terminal"));
+    let answered = |m: &ServerMsg| matches!(m, ServerMsg::Res(r) if r.id == id);
+    assert!(e
+        .mob
+        .try_msg(Duration::from_millis(300), answered)
+        .is_none());
+    // Release the read: the call then answers.
+    drop(fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+    let page = e.mob.wait_res(id).unwrap();
+    assert_eq!(page["sessions"][0]["id"], json!(SID));
 }
 
 // ── Visibility ────────────────────────────────────────────────────────────
