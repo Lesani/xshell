@@ -544,8 +544,16 @@ fn mobile_overflow_with_desktop_attached_does_not_nudge() {
     let _ = fs::remove_file(&winch);
     e.desk.quiet = true;
     e.desk.input(e.t, "\n");
-    e.desk.output_until(e.t, "DONE");
-    m.output_until(e.t, "DONE");
+    // 750 process spawns: slow on macOS runners, so wait longer than `T`.
+    let slow = Duration::from_secs(30);
+    assert!(
+        e.desk.try_output_until(e.t, b"DONE", slow).is_some(),
+        "no DONE at the Desktop"
+    );
+    assert!(
+        m.try_output_until(e.t, b"DONE", slow).is_some(),
+        "no DONE at the Mobile"
+    );
     // The recovery replaced what was queued by a reset and the tail.
     let resets = m
         .log
