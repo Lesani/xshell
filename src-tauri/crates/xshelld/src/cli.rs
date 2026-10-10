@@ -1,7 +1,7 @@
 //! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`,
 //! `xshelld serve [--gui-bound --parent-pid PID] [--interactive-env]`, `xshelld --version`,
 //! `xshelld event …`, the agent hook client, and (Windows) `xshelld job-exec`, the launcher
-//! of each Terminal. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
+//! of each Terminal, and `xshelld console-mode`, the reply gate's helper. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
 //! environment variable. Hand-parsed: five commands, seven flags.
 
 use std::ffi::OsString;
@@ -23,6 +23,11 @@ pub enum Command {
         job: String,
         program: OsString,
         args: Vec<OsString>,
+    },
+    /// `console-mode <pid>`: print the input mode of the console `pid` runs on (Windows; the
+    /// Daemon's reply gate, see `console_mode`).
+    ConsoleMode {
+        pid: u32,
     },
     Version,
     Help,
@@ -131,6 +136,7 @@ pub fn parse(
         "--help" | "-h" | "help" => return Ok(Command::Help),
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
+        "console-mode" => return parse_console_mode(args),
         "serve" | "connect" | "pair" => {}
         other => return Err(format!("unknown command: {other}")),
     }
@@ -209,6 +215,20 @@ pub fn parse(
         "pair" => Command::Pair(opts),
         _ => Command::Connect(opts),
     })
+}
+
+/// `console-mode <pid>`.
+fn parse_console_mode(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let usage = || "usage: xshelld console-mode <pid>".to_string();
+    let pid = args
+        .next()
+        .and_then(|p| p.to_str().and_then(|s| s.parse::<u32>().ok()))
+        .filter(|&p| p > 0)
+        .ok_or_else(usage)?;
+    if args.next().is_some() {
+        return Err(usage());
+    }
+    Ok(Command::ConsoleMode { pid })
 }
 
 /// `job-exec <job> -- <program> [args…]`.
@@ -385,6 +405,23 @@ mod tests {
         )
         .is_err());
         assert!(USAGE.contains("--job"));
+    }
+
+    #[test]
+    fn parses_console_mode() {
+        assert_eq!(
+            run(&["console-mode", "4242"], &[]),
+            Ok(Command::ConsoleMode { pid: 4242 })
+        );
+        for bad in [
+            &["console-mode"][..],
+            &["console-mode", "0"],
+            &["console-mode", "-1"],
+            &["console-mode", "x"],
+            &["console-mode", "12", "13"],
+        ] {
+            assert!(run(bad, &[]).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -181,6 +181,8 @@ pub enum ClientMsg {
     /// again before every write of the paste and before Enter, and held through that write,
     /// so the answer comes once the reply is typed: `null` when paste and Enter were written; a refusal above when nothing was;
     /// [`SUBMIT_UNCONFIRMED`] when the paste may have been written but Enter was not.
+    /// A Windows Host also reads the agent console's input mode before the paste and again
+    /// before Enter: [`SUBMIT_NO_VT_INPUT`] when the agent does not take terminal input.
     /// Gated on the `term.submit` capability.
     ///
     /// `files` (capability `term.submit-files`; an older Daemon ignores the field) are paths
@@ -241,6 +243,12 @@ pub const SUBMIT_NO_NONBLOCK: &str = "terminal input does not take replies";
 /// bracketed paste could not be completed in time: the agent may still be reading a paste.
 /// Nothing was typed; the Terminal View still works.
 pub const SUBMIT_STUCK: &str = "terminal input is stuck";
+/// The refusal of a `term.submit` (Windows Hosts) when the agent's console does not take
+/// terminal (VT) input, or its input mode cannot be read: the agent reads key events, and a
+/// paste would reach it as keystrokes (each newline a key of its own). Nothing was typed;
+/// the Terminal View still works.
+pub const SUBMIT_NO_VT_INPUT: &str =
+    "agent cannot safely take pasted replies; use the terminal view instead";
 /// The answer of a `term.submit` whose outcome is unknown: the paste may have reached the
 /// agent but Enter was not typed (the agent stopped accepting the reply in between, or the
 /// Terminal ended). The text may be waiting in the agent's composer.

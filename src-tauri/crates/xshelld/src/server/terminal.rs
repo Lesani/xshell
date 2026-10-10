@@ -24,8 +24,8 @@ use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
 use xshell_protocol::msg::{
     encode_res, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED, SUBMIT_NEEDS_YOU,
-    SUBMIT_NOT_CHAT, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_STUCK, SUBMIT_UNCONFIRMED,
-    SUBMIT_UNSUPPORTED,
+    SUBMIT_NOT_CHAT, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_NO_VT_INPUT, SUBMIT_STUCK,
+    SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
 };
 
 const READ_BUF: usize = 16 * 1024;
@@ -164,6 +164,17 @@ pub(crate) type WriteNow<'a> = dyn FnMut() -> std::io::Result<usize> + 'a;
 type SubmitGate =
     Box<dyn FnMut(SubmitStep, &mut WriteNow<'_>) -> Result<std::io::Result<usize>, String> + Send>;
 type SubmitDone = Box<dyn FnOnce(Result<(), String>) + Send>;
+/// Reads the agent console's input mode before a reply's writes ([`SubmitStep::Paste`] for
+/// the paste, [`SubmitStep::Enter`] for Enter), with nothing held: `Ok` with how long the
+/// reading took when it allows them, the refusal otherwise. A reading allows writes only
+/// while it is fresh (see [`MODE_STALE`]).
+pub(crate) type SubmitVet = Box<dyn FnMut(SubmitStep) -> Result<Duration, String> + Send>;
+/// The gate's refusal of a write whose reading of the input mode is stale (older than
+/// `Config::mode_fresh`, or spent by a write the PTY did not take): the mode is read again
+/// before the write is tried again. Never an outcome.
+pub(crate) const MODE_STALE: &str = "input mode reading is stale";
+/// How many stale refusals in a row a reply takes before it stops.
+const MODE_STALE_MAX: usize = 8;
 /// Whether a reply's `n`-th file (from 1) shows attached in the agent's composer: `Ok(false)`
 /// not yet, an `Err` when the reply must stop (the agent needs you, the Terminal ended).
 pub(crate) type SubmitAttach = Box<dyn FnMut(usize) -> Result<bool, String> + Send>;
@@ -203,6 +214,9 @@ pub(crate) struct Submit {
     pub enter_after: Duration,
     pub stall: Duration,
     pub gate: SubmitGate,
+    /// Windows: reads the input mode before the paste, again before Enter, and again
+    /// whenever a reading went stale. `None`: no reading (Unix).
+    pub vet: Option<SubmitVet>,
     done: Option<SubmitDone>,
     stuck: Option<Box<dyn FnOnce() + Send>>,
     /// Some of the paste was written.
@@ -226,6 +240,7 @@ impl Submit {
             enter_after,
             stall: SUBMIT_STALL,
             gate,
+            vet: None,
             done: Some(done),
             stuck: None,
             pasted: false,
@@ -443,6 +458,9 @@ pub(crate) trait PtyIn: Write {
     /// Write what the PTY takes now, without blocking: `WouldBlock` when it takes nothing,
     /// `Unsupported` when it cannot write without blocking (a reply is then never written).
     fn write_now(&mut self, data: &[u8]) -> std::io::Result<usize>;
+
+    /// Test hook: log a line to the backpressure probe's trace, if it has one.
+    fn trace(&mut self, _line: &dyn Fn() -> String) {}
 }
 
 /// A Terminal's PTY writer. Unix: with its own descriptor of the PTY master for writes that
@@ -455,6 +473,9 @@ struct PtyWriter {
     fd: Option<std::os::fd::OwnedFd>,
     #[cfg(windows)]
     pipe: Option<std::os::windows::io::OwnedHandle>,
+    /// Test hook: the backpressure probe's trace (`ProbeSeams::trace`).
+    #[cfg(any(test, debug_assertions))]
+    trace: Option<std::path::PathBuf>,
 }
 
 impl Write for PtyWriter {
@@ -471,15 +492,55 @@ impl PtyIn for PtyWriter {
         #[cfg(unix)]
         if let Some(fd) = &self.fd {
             use std::os::fd::AsRawFd;
-            return nonblocking_write(fd.as_raw_fd(), data);
+            let r = nonblocking_write(fd.as_raw_fd(), data);
+            #[cfg(any(test, debug_assertions))]
+            self.trace(&|| format!("nowait len={} {} avail=-", data.len(), shown(&r)));
+            return r;
         }
         #[cfg(windows)]
         if let Some(pipe) = &self.pipe {
-            return win::nowait_write(pipe, data);
+            let r = win::nowait_write(pipe, data);
+            #[cfg(any(test, debug_assertions))]
+            if self.trace.is_some() {
+                let avail = win::pipe_backlog(pipe).unwrap_or_else(|| "?".into());
+                self.trace(&|| format!("nowait len={} {} avail={avail}", data.len(), shown(&r)));
+            }
+            return r;
         }
         // Never a blocking write in its place: it could block holding the agent's state.
         let _ = data;
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn trace(&mut self, line: &dyn Fn() -> String) {
+        probe_trace(self.trace.as_deref(), line);
+    }
+}
+
+/// A write's result as the probe's trace shows it.
+#[cfg(any(test, debug_assertions))]
+fn shown(r: &std::io::Result<usize>) -> String {
+    match r {
+        Ok(n) => format!("ok={n}"),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => "wouldblock".into(),
+        Err(e) => format!("err={e}"),
+    }
+}
+
+/// Test hook: append `line` (with the time since the Unix epoch, in ms) to the backpressure
+/// probe's trace `path`, if there is one.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn probe_trace(path: Option<&Path>, line: &dyn Fn() -> String) {
+    let Some(p) = path else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
+        let _ = writeln!(f, "{} {}", now_ms(), line());
     }
 }
 
@@ -597,17 +658,43 @@ fn wait_attached(s: &mut Submit, n: usize, sleep: &dyn Fn(Duration)) -> bool {
 /// checked and held, and never blocks: when the PTY takes nothing the thread waits holding
 /// nothing and checks again. A paste stopped part way is completed ([`close_paste`]). An
 /// error stops the input thread.
+///
+/// With a vet (Windows), the agent console's input mode is read before every write of the
+/// paste (each piece, each retry, and again after the gate's [`MODE_STALE`]), and once more
+/// after the pause, before Enter (and before every retry of Enter): a reading allows one
+/// write at most. A reading that refuses before anything was written is the outcome; one
+/// that refuses later stops the reply: the paste is completed and Enter withheld.
 pub(crate) fn write_item(
     w: &mut dyn PtyIn,
     item: Input,
     sleep: &dyn Fn(Duration),
 ) -> std::io::Result<()> {
     let mut s = match item {
-        Input::Bytes(data) => return w.write_all(&data).and_then(|_| w.flush()),
+        Input::Bytes(data) => {
+            w.trace(&|| format!("block start {}", data.len()));
+            let r = w.write_all(&data).and_then(|_| w.flush());
+            w.trace(&|| match &r {
+                Ok(()) => "block done".into(),
+                Err(e) => format!("block err={e}"),
+            });
+            return r;
+        }
         Input::Submit(s) => s,
     };
-    let (mut off, mut waited) = (0, Duration::ZERO);
+    let (mut off, mut waited, mut stale) = (0, Duration::ZERO, 0);
     while off < s.paste.len() {
+        // A reading allows one write: every piece, and every retry of one, follows a
+        // reading of its own (always allowed without a vet).
+        match vet(&mut s, SubmitStep::Paste) {
+            // A reading taken to retry counts towards the stall.
+            Ok(took) if waited > Duration::ZERO => waited += took,
+            Ok(_) => {}
+            Err(e) if off == 0 => {
+                s.stop(e);
+                return Ok(());
+            }
+            Err(_) => return close_paste(s, w, off, sleep),
+        }
         let piece = s.paste[off..s.piece_end(off)].to_vec();
         let step = if s.file_starts_at(off) {
             SubmitStep::PasteFile
@@ -618,7 +705,7 @@ pub(crate) fn write_item(
             Step::Wrote(n) => {
                 off += n;
                 s.pasted = true;
-                waited = Duration::ZERO;
+                (waited, stale) = (Duration::ZERO, 0);
                 if let Some(k) = s.waits.iter().position(|&w| w == off) {
                     if !wait_attached(&mut s, k + 1, sleep) {
                         // At the end of a paste: nothing to complete, nothing more typed.
@@ -632,6 +719,11 @@ pub(crate) fn write_item(
                 waited += SUBMIT_WAIT;
                 continue;
             }
+            Step::Refused(e) if e == MODE_STALE && stale < MODE_STALE_MAX => {
+                stale += 1;
+                continue;
+            }
+            Step::Refused(e) if e == MODE_STALE && off == 0 => s.stop(SUBMIT_NO_VT_INPUT.into()),
             Step::Refused(e) if off == 0 => s.stop(e),
             Step::Full if off == 0 => s.stop("input backlog full".into()),
             Step::Refused(_) | Step::Full => return close_paste(s, w, off, sleep),
@@ -639,14 +731,25 @@ pub(crate) fn write_item(
         return Ok(());
     }
     sleep(s.enter_after);
-    let mut waited = Duration::ZERO;
+    // Enter is one write: every try of it (the first, after a pause, after a stale
+    // reading) follows a reading of its own, taken after the whole paste was written.
+    let (mut waited, mut stale) = (Duration::ZERO, 0);
     loop {
+        match vet(&mut s, SubmitStep::Enter) {
+            Ok(took) if waited > Duration::ZERO => waited += took,
+            Ok(_) => {}
+            Err(_) => {
+                s.finish(Err(SUBMIT_UNCONFIRMED.into()));
+                return Ok(());
+            }
+        }
         match gated(&mut s, SubmitStep::Enter, w, b"\r")? {
             Step::Wrote(_) => break,
             Step::Full if waited < s.stall => {
                 sleep(SUBMIT_WAIT);
                 waited += SUBMIT_WAIT;
             }
+            Step::Refused(e) if e == MODE_STALE && stale < MODE_STALE_MAX => stale += 1,
             Step::Refused(_) | Step::Full => {
                 s.finish(Err(SUBMIT_UNCONFIRMED.into()));
                 return Ok(());
@@ -655,6 +758,85 @@ pub(crate) fn write_item(
     }
     s.finish(Ok(()));
     Ok(())
+}
+
+/// The reply's reading of the input mode before a write of `step`: [`Submit::vet`], or
+/// none (always allowed).
+fn vet(s: &mut Submit, step: SubmitStep) -> Result<Duration, String> {
+    match s.vet.as_mut() {
+        Some(v) => v(step),
+        None => Ok(Duration::ZERO),
+    }
+}
+
+/// `m` locked; when `note` and it was held by another thread, `waited` is set.
+fn lock_noting_wait<'a, T>(
+    m: &'a Mutex<T>,
+    note: bool,
+    waited: &mut bool,
+) -> std::sync::MutexGuard<'a, T> {
+    if note {
+        match m.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::WouldBlock) => *waited = true,
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("poisoned lock: {e}"),
+        }
+    }
+    m.lock().unwrap()
+}
+
+/// Test hook: the backpressure probe's pause of a Terminal's output reader, before its next
+/// read (`ProbeSeams::drain_pause`): while the file exists, for at most 30 s (then the file
+/// is removed). Nothing is held.
+#[cfg(any(test, debug_assertions))]
+fn drain_pause(d: &Daemon) {
+    let seams = &d.cfg.submit_probe.seams;
+    let Some(p) = seams.drain_pause.as_deref() else {
+        return;
+    };
+    if !p.exists() {
+        return;
+    }
+    probe_trace(seams.trace.as_deref(), &|| "drain paused".into());
+    let until = Instant::now() + Duration::from_secs(30);
+    while p.exists() {
+        if Instant::now() >= until {
+            let _ = std::fs::remove_file(p);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    probe_trace(seams.trace.as_deref(), &|| "drain resumed".into());
+}
+
+/// What a reply's last reading of the input mode allows: one write of its paste or its
+/// Enter, while the reading is fresh. Shared by the reply's vet, which sets it, and its gate,
+/// which checks it with the agent's readiness held. Locked last, never across another lock.
+#[derive(Default)]
+struct ReplyMode(Mutex<Option<(bool, Instant)>>);
+
+impl ReplyMode {
+    /// A reading allows one write of the paste, or Enter (`enter`). It is as old as `from`:
+    /// a time no later than the mode was sampled (the helper's start).
+    fn allow(&self, enter: bool, from: Instant) {
+        *self.0.lock().unwrap() = Some((enter, from));
+    }
+
+    /// The reading allows nothing more.
+    fn spend(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    /// Whether a write of `step` is allowed: by a reading for it no older than `fresh`.
+    /// [`SubmitStep::Close`] never needs one.
+    fn allows(&self, step: SubmitStep, fresh: Duration) -> bool {
+        let enter = match step {
+            SubmitStep::Close => return true,
+            SubmitStep::Enter => true,
+            SubmitStep::Paste | SubmitStep::PasteFile => false,
+        };
+        matches!(*self.0.lock().unwrap(), Some((e, at)) if e == enter && at.elapsed() <= fresh)
+    }
 }
 
 pub(crate) struct Terminal {
@@ -705,6 +887,11 @@ pub(crate) struct Terminal {
     reply_writes: bool,
     /// A reply's stopped paste could not be completed: replies are refused from now on.
     reply_stuck: AtomicBool,
+    /// The last reading of the agent console's input mode, by a reply: whether it showed VT
+    /// input (`false` also when there was none), and when. A refusal refuses the next
+    /// replies at once while it is recent (`Config::mode_refusal_ttl`). Locked last, never
+    /// across another lock.
+    input_mode: Mutex<Option<(bool, Instant)>>,
     /// Windows: the kill-on-close Job Object the process runs in, with everything it
     /// starts. Closing it (the Terminal and its escalation dropped) ends them all.
     #[cfg(windows)]
@@ -990,6 +1177,8 @@ pub(crate) fn spawn_with(
             }),
         #[cfg(windows)]
         pipe,
+        #[cfg(any(test, debug_assertions))]
+        trace: d.cfg.submit_probe.seams.trace.clone(),
     };
     #[cfg(unix)]
     let reply_writes = writer.fd.is_some();
@@ -1043,6 +1232,7 @@ pub(crate) fn spawn_with(
         escalations: d.escalations.clone(),
         reply_writes,
         reply_stuck: AtomicBool::new(false),
+        input_mode: Mutex::new(None),
         #[cfg(windows)]
         job: Some(job),
     });
@@ -1139,6 +1329,8 @@ impl Terminal {
         #[cfg(windows)]
         let mut startup = win::StartupQuery::default();
         loop {
+            #[cfg(any(test, debug_assertions))]
+            drain_pause(d);
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 #[cfg(windows)]
@@ -1169,6 +1361,31 @@ impl Terminal {
         }
         self.life.lock().unwrap().reader_done = true;
         self.life_cv.notify_all();
+    }
+
+    /// The reply gate's reading of the agent console's input mode: the console's mode, and
+    /// how many processes it had attached (`None` when unknown).
+    fn read_input_mode(&self, d: &Daemon) -> Result<(u32, Option<u32>), String> {
+        match &d.cfg.input_mode {
+            super::InputModeGate::Off => Err("no input mode gate".into()),
+            #[cfg(windows)]
+            super::InputModeGate::Helper { exe, timeout } => {
+                let leader = self.pid.ok_or("the terminal has no process")?;
+                let job = self.job.as_ref().ok_or("the terminal has no job")?;
+                #[cfg(any(test, debug_assertions))]
+                let sim = d.cfg.submit_probe.seams.mode_sim.as_deref();
+                #[cfg(not(any(test, debug_assertions)))]
+                let sim = None;
+                crate::console_mode::read(exe, leader, job, *timeout, sim)
+                    .map(|r| (r.mode, Some(r.procs)))
+            }
+            #[cfg(not(windows))]
+            super::InputModeGate::Helper { .. } => {
+                Err("a console input mode is Windows only".into())
+            }
+            #[cfg(any(test, debug_assertions))]
+            super::InputModeGate::Fake(f) => (f.0)(self.pid).map(|m| (m, None)),
+        }
     }
 
     fn on_output(&self, d: &Arc<Daemon>, bytes: &[u8]) {
@@ -1206,6 +1423,7 @@ impl Terminal {
         };
         s.model.feed(bytes);
         self.screen_rev.fetch_add(1, Ordering::SeqCst);
+        d.test_point(self.id, TestPoint::ScreenFed);
         let mut p = self.prompt.lock().unwrap();
         if p.watching().is_some() {
             p.observe(s.read().0.map(|f| f.fingerprint));
@@ -1420,12 +1638,18 @@ impl Terminal {
     ///
     /// For a file's paste ([`SubmitStep::PasteFile`]), `images` gets the count of images
     /// attached in the composer as the check saw it, right before the write.
+    ///
+    /// With `mode` (Windows), a write of the paste or of Enter also needs a fresh reading of
+    /// the agent console's input mode that allows it ([`ReplyMode::allows`]): without one,
+    /// or when any of the locks had to be waited for, it is refused with [`MODE_STALE`], and
+    /// the mode is read again. Every write spends the reading.
     fn write_if_ready(
         &self,
         d: &Daemon,
         step: SubmitStep,
         write: &mut WriteNow<'_>,
         images: &AtomicUsize,
+        mode: Option<&ReplyMode>,
     ) -> Result<std::io::Result<usize>, String> {
         // Completing a stopped paste is written whatever the readiness: its end marker is
         // what keeps the next key out of the paste.
@@ -1433,11 +1657,25 @@ impl Terminal {
         if check {
             self.reply_life()?;
         }
-        let g = self.screen.lock().unwrap();
-        let mut p = self.prompt.lock().unwrap();
-        let mut c = self.status.lock().unwrap();
+        // With a reading of the input mode, a wait for any of the locks makes it stale: the
+        // agent ran meanwhile.
+        let mut waited = false;
+        let gated_write = check && mode.is_some();
+        let g = lock_noting_wait(&self.screen, gated_write, &mut waited);
+        let mut p = lock_noting_wait(&self.prompt, gated_write, &mut waited);
+        let mut c = lock_noting_wait(&self.status, gated_write, &mut waited);
         if check {
             Self::reply_ready(&g, &p, &c)?;
+            if waited || mode.is_some_and(|m| !m.allows(step, d.cfg.mode_fresh)) {
+                if let Some(m) = mode {
+                    m.spend();
+                }
+                #[cfg(any(test, debug_assertions))]
+                probe_trace(d.cfg.submit_probe.seams.trace.as_deref(), &|| {
+                    format!("stale {step:?}")
+                });
+                return Err(MODE_STALE.into());
+            }
             d.test_point(self.id, TestPoint::SubmitChecked);
         }
         if step == SubmitStep::PasteFile {
@@ -1448,6 +1686,10 @@ impl Terminal {
             images.store(n, Ordering::SeqCst);
         }
         let r = write();
+        // One reading, one write: the next is read for again.
+        if let Some(m) = mode {
+            m.spend();
+        }
         let mut changed = None;
         if step == SubmitStep::Enter && matches!(r, Ok(n) if n > 0) {
             let ch = c.tracker.on_input(b"\r");
@@ -1503,12 +1745,21 @@ impl Terminal {
             return Err(SUBMIT_STUCK.into());
         }
         let id = self.id;
+        let gated_mode = !matches!(d.cfg.input_mode, super::InputModeGate::Off);
         // The images in the composer right before the current file's paste (delivery, not
         // admission: input queued ahead of this reply may change the composer).
         let images = Arc::new(AtomicUsize::new(0));
-        let (weak, dg, base) = (Arc::downgrade(self), d.clone(), images.clone());
+        let mode = Arc::new(ReplyMode::default());
+        let (weak, dg, base, gm) = (
+            Arc::downgrade(self),
+            d.clone(),
+            images.clone(),
+            gated_mode.then(|| mode.clone()),
+        );
         // A probe's refusal once this many bytes of the paste were written.
         let (stop_after, mut sent) = (d.cfg.submit_probe.stop_after, 0usize);
+        #[cfg(any(test, debug_assertions))]
+        let mut paused = false;
         let gate: SubmitGate = Box::new(move |step, write| {
             dg.test_point(
                 id,
@@ -1518,17 +1769,95 @@ impl Terminal {
                     SubmitStep::Close => TestPoint::SubmitClose,
                 },
             );
+            // The backpressure probe: the output stops draining here, before this write.
+            #[cfg(any(test, debug_assertions))]
+            {
+                let seams = &dg.cfg.submit_probe.seams;
+                let paste = matches!(step, SubmitStep::Paste | SubmitStep::PasteFile);
+                if let (Some(wait), Some(file), false, true) = (
+                    seams.pause_on_paste,
+                    seams.drain_pause.as_deref(),
+                    paused,
+                    paste && sent >= seams.pause_after,
+                ) {
+                    paused = true;
+                    probe_trace(seams.trace.as_deref(), &|| format!("pause at {sent}"));
+                    if let Some(ack) = seams.pause_ack.as_deref() {
+                        let by = Instant::now() + Duration::from_secs(20);
+                        while !ack.exists() && Instant::now() < by {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    let _ = std::fs::write(file, b"");
+                    probe_trace(seams.trace.as_deref(), &|| "paused".into());
+                    std::thread::sleep(wait);
+                }
+            }
             if step != SubmitStep::Close && stop_after.is_some_and(|k| sent >= k) {
                 return Err(SUBMIT_NOT_READY.into());
             }
             let r = weak
                 .upgrade()
                 .ok_or_else(|| "terminal has exited".to_string())?
-                .write_if_ready(&dg, step, write, &base);
+                .write_if_ready(&dg, step, write, &base, gm.as_deref());
             if let Ok(Ok(n)) = &r {
                 sent += n;
             }
             r
+        });
+        // Windows: the agent console's input mode, read before the paste and before Enter,
+        // holding nothing (it starts a helper).
+        let vet: Option<SubmitVet> = gated_mode.then(|| {
+            let (weak, dv) = (Arc::downgrade(self), d.clone());
+            Box::new(move |step: SubmitStep| -> Result<Duration, String> {
+                let t0 = Instant::now();
+                mode.spend();
+                dv.test_point(id, TestPoint::SubmitMode);
+                let t = weak
+                    .upgrade()
+                    .ok_or_else(|| "terminal has exited".to_string())?;
+                t.reply_life()?;
+                // The reading is as old as this: the helper samples the mode after it starts,
+                // and may take any time to answer.
+                let sampled_from = Instant::now();
+                let reading = t.read_input_mode(&dv);
+                let vt = matches!(reading, Ok((m, _)) if m & crate::console_mode::VT_INPUT != 0);
+                *t.input_mode.lock().unwrap() = Some((vt, Instant::now()));
+                #[cfg(any(test, debug_assertions))]
+                probe_trace(dv.cfg.submit_probe.seams.trace.as_deref(), &|| {
+                    let ms = t0.elapsed().as_millis();
+                    let leader = t.pid.map_or("-".into(), |p| p.to_string());
+                    match &reading {
+                        Ok((m, procs)) => format!(
+                            "mode step={step:?} leader={leader} raw=0x{m:08x} vt={} procs={} ms={ms}",
+                            u8::from(vt),
+                            procs.map_or("-".into(), |p| p.to_string())
+                        ),
+                        Err(e) => format!("mode step={step:?} leader={leader} error={e} ms={ms}"),
+                    }
+                });
+                match &reading {
+                    Ok(_) if vt => {}
+                    Ok((m, _)) => {
+                        crate::log!(
+                            "INFO",
+                            "terminal {id}: the agent's console does not take VT input (mode 0x{m:08x}); reply refused"
+                        );
+                        return Err(SUBMIT_NO_VT_INPUT.into());
+                    }
+                    Err(e) => {
+                        crate::log!(
+                            "WARN",
+                            "terminal {id}: cannot read the agent console's input mode: {e}; reply refused"
+                        );
+                        return Err(SUBMIT_NO_VT_INPUT.into());
+                    }
+                }
+                mode.allow(step == SubmitStep::Enter, sampled_from);
+                drop(t);
+                dv.test_point(id, TestPoint::SubmitModeRead);
+                Ok(t0.elapsed())
+            }) as SubmitVet
         });
         let dd = d.clone();
         let done = Box::new(move |r: Result<(), String>| {
@@ -1540,6 +1869,13 @@ impl Terminal {
         {
             let c = self.status.lock().unwrap();
             Self::reply_ready(&g, &p, &c)?;
+        }
+        // A recent reading refused a reply: this one is refused too, without reading again.
+        if gated_mode {
+            let last = *self.input_mode.lock().unwrap();
+            if matches!(last, Some((false, at)) if at.elapsed() <= d.cfg.mode_refusal_ttl) {
+                return Err(SUBMIT_NO_VT_INPUT.into());
+            }
         }
         // Each file must add one image to the composer's count before its paste.
         let (weak, da) = (Arc::downgrade(self), d.clone());
@@ -1568,6 +1904,7 @@ impl Terminal {
         item.stall = d.cfg.submit_stall;
         item.attach_timeout = d.cfg.submit_attach_timeout;
         item.markers_alone = d.cfg.submit_markers_alone;
+        item.vet = vet;
         if let Some(n) = d.cfg.submit_probe.max_piece {
             item.max_piece = n;
         }
@@ -2441,6 +2778,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         escalations: d.escalations.clone(),
         reply_writes: false,
         reply_stuck: AtomicBool::new(false),
+        input_mode: Mutex::new(None),
         #[cfg(windows)]
         job: None,
     };
@@ -2530,6 +2868,34 @@ mod win {
                 Ok(n as usize)
             }
         }
+    }
+
+    /// Test hook: what the input pipe `h` (its write end) holds unread, and how much it
+    /// takes before it is full (`NtQueryInformationFile`, `FilePipeLocalInformation`).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn pipe_backlog(h: &OwnedHandle) -> Option<String> {
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FilePipeLocalInformation, NtQueryInformationFile, FILE_PIPE_LOCAL_INFORMATION,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let mut io: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut info = FILE_PIPE_LOCAL_INFORMATION::default();
+        // SAFETY: `h` is a pipe handle this Terminal owns; `info` is valid for its size.
+        let st = unsafe {
+            NtQueryInformationFile(
+                h.as_raw_handle(),
+                &mut io,
+                (&mut info as *mut FILE_PIPE_LOCAL_INFORMATION).cast(),
+                std::mem::size_of::<FILE_PIPE_LOCAL_INFORMATION>() as u32,
+                FilePipeLocalInformation,
+            )
+        };
+        (st >= 0).then(|| {
+            format!(
+                "{} free={} quota={}",
+                info.ReadDataAvailable, info.WriteQuotaAvailable, info.OutboundQuota
+            )
+        })
     }
 
     /// How long a Terminal's output may go on after its process exited and its console was
@@ -3731,6 +4097,328 @@ mod status_tests {
         assert_eq!(w.input.len(), 10);
     }
 
+    /// `item` with a vet that logs `vet <step>` to `ops` and answers from `answers` (one per
+    /// call, then `Ok`).
+    fn vetted(
+        item: Input,
+        ops: &Arc<Mutex<Vec<String>>>,
+        mut answers: Vec<Result<Duration, String>>,
+    ) -> Input {
+        let Input::Submit(mut s) = item else {
+            unreachable!()
+        };
+        let o = ops.clone();
+        answers.reverse();
+        s.vet = Some(Box::new(move |step| {
+            o.lock().unwrap().push(format!("vet {step:?}"));
+            answers.pop().unwrap_or(Ok(Duration::ZERO))
+        }));
+        Input::Submit(s)
+    }
+
+    #[test]
+    fn write_item_vets_before_the_first_piece() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(submit(&ops, &out, vec![]), &ops, vec![]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(ops.lock().unwrap()[..2], ["vet Paste", "gate Paste"]);
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+    }
+
+    #[test]
+    fn a_failed_first_vet_types_nothing() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(&ops, &out, vec![]),
+            &ops,
+            vec![Err(SUBMIT_NO_VT_INPUT.into())],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(*ops.lock().unwrap(), ["vet Paste"]);
+        assert!(w.input.is_empty());
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NO_VT_INPUT.to_string())]);
+    }
+
+    /// The mode is read again after the pause, right before Enter: after the last byte of
+    /// the paste.
+    #[test]
+    fn write_item_vets_again_after_the_enter_pause() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(submit(&ops, &out, vec![]), &ops, vec![]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(
+            *ops.lock().unwrap(),
+            [
+                "vet Paste",
+                "gate Paste",
+                "write \"\\u{1b}[200~fix it\\nplease\\u{1b}[201~\"",
+                "sleep 50ms",
+                "vet Enter",
+                "gate Enter",
+                "write \"\\r\"",
+            ]
+        );
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+    }
+
+    #[test]
+    fn a_failed_enter_vet_sends_no_enter() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(&ops, &out, vec![]),
+            &ops,
+            vec![Ok(Duration::ZERO), Err(SUBMIT_NO_VT_INPUT.into())],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(w.input, bracketed("fix it\nplease"));
+        assert_eq!(ops.lock().unwrap().last().unwrap(), "vet Enter");
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
+    /// Without a vet the bytes and their order are as they always were (Unix).
+    #[test]
+    fn no_vet_keeps_the_bytes_and_order() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        write_item(&mut w, submit(&ops, &out, vec![]), &sleeper(&ops)).unwrap();
+        assert!(!ops.lock().unwrap().iter().any(|o| o.starts_with("vet")));
+        let mut want = bracketed("fix it\nplease");
+        want.push(b'\r');
+        assert_eq!(w.input, want);
+    }
+
+    /// A1: a PTY that took nothing spends the reading; the mode is read again before the
+    /// next try, and a reading that refuses then stops the reply there: the paste's frame is
+    /// completed, no more of the text, no Enter.
+    #[test]
+    fn a_retry_reads_the_mode_again() {
+        let text = "z".repeat(SUBMIT_CHUNK * 2);
+        // Taken whole after two fulls: each try after a full follows a reading.
+        let mut w = Recorder {
+            full: 2,
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(submit_of(&text, &ops, &out, vec![]), &ops, vec![]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            if op == "full" {
+                assert_eq!(ops[i + 1], "sleep 10ms", "{ops:?}");
+                assert_eq!(ops[i + 2], "vet Paste", "{ops:?}");
+            }
+        }
+        // One reading per try: each piece, each retry.
+        let tries = ops.iter().filter(|o| *o == "gate Paste").count();
+        assert_eq!(ops.iter().filter(|o| *o == "vet Paste").count(), tries);
+        assert_eq!(tries, 3 + 2, "{ops:?}");
+        // The first piece is written, the second takes nothing; the reading before its retry
+        // refuses: the frame is closed and nothing else follows.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let o2 = ops.clone();
+        let item = vetted(
+            submit_of(&text, &ops, &out, vec![]),
+            &ops,
+            vec![Ok(Duration::ZERO), Err(SUBMIT_NO_VT_INPUT.into())],
+        );
+        let Input::Submit(mut s) = item else {
+            unreachable!()
+        };
+        let mut inner = std::mem::replace(&mut s.gate, Box::new(|_, _| Ok(Ok(0))));
+        let mut n = 0;
+        s.gate = Box::new(move |step, write| {
+            n += 1;
+            if n == 2 {
+                o2.lock().unwrap().push("full".into());
+                return Ok(Err(std::io::ErrorKind::WouldBlock.into()));
+            }
+            inner(step, write)
+        });
+        write_item(&mut w, Input::Submit(s), &sleeper(&ops)).unwrap();
+        let mut want = PASTE_START.to_vec();
+        want.extend(std::iter::repeat_n(b'z', SUBMIT_CHUNK - PASTE_START.len()));
+        want.extend_from_slice(PASTE_END);
+        assert_eq!(w.input, want);
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        let ops = ops.lock().unwrap();
+        assert_eq!(
+            ops.iter().filter(|o| o.starts_with("vet")).count(),
+            2,
+            "{ops:?}"
+        );
+        assert!(!ops.iter().any(|o| o.contains("\\r")), "{ops:?}");
+    }
+
+    /// A1: a reading allows one write. Every piece of a long paste follows a reading of its
+    /// own, and one that refuses between two pieces that were both taken stops the reply
+    /// there: the frame is closed, nothing more of the text, no Enter.
+    #[test]
+    fn every_piece_reads_the_mode_again() {
+        let text = "q".repeat(SUBMIT_CHUNK * 3);
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(submit_of(&text, &ops, &out, vec![]), &ops, vec![]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            if op.starts_with("gate") {
+                assert!(ops[i - 1].starts_with("vet"), "{i}: {ops:?}");
+            }
+        }
+        assert!(ops.iter().filter(|o| *o == "vet Paste").count() >= 4);
+        // The mode flips after the first piece was written: the second is never written.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit_of(&text, &ops, &out, vec![]),
+            &ops,
+            vec![Ok(Duration::ZERO), Err(SUBMIT_NO_VT_INPUT.into())],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        let mut want = PASTE_START.to_vec();
+        want.extend(std::iter::repeat_n(b'q', SUBMIT_CHUNK - PASTE_START.len()));
+        want.extend_from_slice(PASTE_END);
+        assert_eq!(w.input, want);
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
+    /// A1: a stale refusal (the gate found the reading too old) reads the mode again and
+    /// tries the same write; a reading that then refuses stops before that write.
+    #[test]
+    fn a_stale_reading_is_read_again() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(
+                &ops,
+                &out,
+                vec![Err(MODE_STALE.into()), Ok(()), Err(MODE_STALE.into())],
+            ),
+            &ops,
+            vec![],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        assert_eq!(
+            ops.lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.starts_with("vet") || o.starts_with("gate"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "vet Paste",
+                "gate Paste",
+                "vet Paste",
+                "gate Paste",
+                "vet Enter",
+                "gate Enter",
+                "vet Enter",
+                "gate Enter",
+            ]
+        );
+        // Stale, and the new reading refuses: nothing written, the refusal.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(&ops, &out, vec![Err(MODE_STALE.into())]),
+            &ops,
+            vec![Ok(Duration::ZERO), Err(SUBMIT_NO_VT_INPUT.into())],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert!(w.input.is_empty());
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NO_VT_INPUT.to_string())]);
+        // Stale at Enter, and the new reading refuses: no Enter.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(&ops, &out, vec![Ok(()), Err(MODE_STALE.into())]),
+            &ops,
+            vec![
+                Ok(Duration::ZERO),
+                Ok(Duration::ZERO),
+                Err(SUBMIT_NO_VT_INPUT.into()),
+            ],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(w.input, bracketed("fix it\nplease"));
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        // Always stale: given up after a few readings, nothing written.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = vetted(
+            submit(&ops, &out, vec![Err(MODE_STALE.into()); 10]),
+            &ops,
+            vec![],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert!(w.input.is_empty());
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NO_VT_INPUT.to_string())]);
+        let vets = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.starts_with("vet"))
+            .count();
+        assert_eq!(vets, MODE_STALE_MAX + 1);
+    }
+
+    /// A1: a retry of Enter after the PTY took nothing follows a reading of its own.
+    #[test]
+    fn an_enter_retry_reads_the_mode_again() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let o2 = ops.clone();
+        let Input::Submit(mut s) = vetted(submit(&ops, &out, vec![]), &ops, vec![]) else {
+            unreachable!()
+        };
+        let mut inner = std::mem::replace(&mut s.gate, Box::new(|_, _| Ok(Ok(0))));
+        let mut fulls = 1;
+        s.gate = Box::new(move |step, write| {
+            if step == SubmitStep::Enter && fulls > 0 {
+                fulls -= 1;
+                o2.lock().unwrap().push("full".into());
+                return Ok(Err(std::io::ErrorKind::WouldBlock.into()));
+            }
+            inner(step, write)
+        });
+        write_item(&mut w, Input::Submit(s), &sleeper(&ops)).unwrap();
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        let at = ops.iter().position(|o| o == "full").unwrap();
+        assert_eq!(
+            ops[at..],
+            [
+                "full",
+                "sleep 10ms",
+                "vet Enter",
+                "gate Enter",
+                "write \"\\r\""
+            ]
+        );
+    }
+
     /// A PTY that takes every write whole and keeps each one apart.
     #[derive(Default)]
     struct Pieces(Vec<Vec<u8>>);
@@ -3861,6 +4549,7 @@ mod status_tests {
             fd: None,
             #[cfg(windows)]
             pipe: None,
+            trace: None,
         };
         let e = pw.write_now(b"x").unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);

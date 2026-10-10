@@ -5,6 +5,7 @@
 
 pub mod cli;
 pub mod connect;
+pub mod console_mode;
 pub mod env;
 pub mod job_exec;
 pub mod log;
@@ -45,6 +46,7 @@ pub fn main_entry() -> i32 {
             return xshell_core::agent_status::event_main(&args, &|k| std::env::var_os(k), default);
         }
         Command::JobExec { job, program, args } => return job_exec::run(&job, &program, &args),
+        Command::ConsoleMode { pid } => return console_mode::run(pid),
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
         #[cfg(windows)]
@@ -159,7 +161,63 @@ fn submit_probe(cfg: &mut server::Config) {
         // The probe splits where it likes: markers and characters too.
         cfg.submit_markers_alone = false;
     }
+    probe_seams(cfg);
 }
+
+/// The backpressure probe and the reply gate's test hooks (debug builds only):
+/// - `XSHELLD_TEST_DRAIN_PAUSE=<path>`: the output readers wait while `<path>` exists;
+/// - `XSHELLD_TEST_DRAIN_PAUSE_ON_PASTE=<ms>`: a reply creates that file once it wrote
+///   `XSHELLD_TEST_DRAIN_PAUSE_AFTER` bytes of its paste (default 0), then waits `<ms>`
+///   (first, until the file `XSHELLD_TEST_DRAIN_PAUSE_ACK` exists, if that is set);
+/// - `XSHELLD_TEST_SUBMIT_TRACE=<path>`: readings and writes are logged there;
+/// - `XSHELLD_TEST_SUBMIT_STALL_MS`, `XSHELLD_TEST_SUBMIT_ENTER_DELAY_MS`: the reply's stall
+///   limit and its pause before Enter;
+/// - `XSHELLD_TEST_CONSOLE_MODE=off|missing|garbage|fail|hang:<pidfile>|slow:<ms>`: no gate, a helper
+///   that does not exist, or one that misbehaves (`console_mode::SIM_ENV`);
+/// - `XSHELLD_TEST_CONSOLE_MODE_TIMEOUT_MS`: the helper's timeout.
+#[cfg(debug_assertions)]
+fn probe_seams(cfg: &mut server::Config) {
+    use std::time::Duration;
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let ms = |k: &str| {
+        var(k)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+    };
+    let seams = &mut cfg.submit_probe.seams;
+    seams.drain_pause = var("XSHELLD_TEST_DRAIN_PAUSE").map(PathBuf::from);
+    seams.pause_on_paste = ms("XSHELLD_TEST_DRAIN_PAUSE_ON_PASTE");
+    seams.pause_after = var("XSHELLD_TEST_DRAIN_PAUSE_AFTER")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    seams.pause_ack = var("XSHELLD_TEST_DRAIN_PAUSE_ACK").map(PathBuf::from);
+    seams.trace = var("XSHELLD_TEST_SUBMIT_TRACE").map(PathBuf::from);
+    if let Some(d) = ms("XSHELLD_TEST_SUBMIT_STALL_MS") {
+        cfg.submit_stall = d;
+    }
+    if let Some(d) = ms("XSHELLD_TEST_SUBMIT_ENTER_DELAY_MS") {
+        cfg.submit_enter_delay = d;
+    }
+    let timeout = ms("XSHELLD_TEST_CONSOLE_MODE_TIMEOUT_MS");
+    if let (server::InputModeGate::Helper { timeout: t, .. }, Some(d)) =
+        (&mut cfg.input_mode, timeout)
+    {
+        *t = d;
+    }
+    match var("XSHELLD_TEST_CONSOLE_MODE").as_deref() {
+        None => {}
+        Some("off") => cfg.input_mode = server::InputModeGate::Off,
+        Some("missing") => {
+            if let server::InputModeGate::Helper { exe, .. } = &mut cfg.input_mode {
+                *exe = exe.with_file_name("xshelld-console-mode-missing.exe");
+            }
+        }
+        Some(sim) => cfg.submit_probe.seams.mode_sim = Some(sim.to_string()),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn probe_seams(_cfg: &mut server::Config) {}
 
 /// What this platform does not run: on Windows a Persistent `serve` (only the app starts
 /// the Daemon there); elsewhere `--job`. `Some(2)`: refused, as a usage error.

@@ -14,10 +14,11 @@ use windows_sys::Win32::Foundation::{
     GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -107,6 +108,16 @@ impl Job {
         Ok(info.ActiveProcesses)
     }
 
+    /// Whether the process `process` (a process handle with
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`) runs in this job, nested jobs included.
+    pub fn contains(&self, process: RawHandle) -> io::Result<bool> {
+        let mut inside = 0;
+        if unsafe { IsProcessInJob(process as HANDLE, self.raw(), &mut inside) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(inside != 0)
+    }
+
     /// End every process in the job with exit code `code`.
     pub fn terminate(&self, code: u32) -> io::Result<()> {
         if unsafe { TerminateJobObject(self.raw(), code) } == 0 {
@@ -180,6 +191,27 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A process in the job is a member, its parent outside it is not.
+    #[test]
+    fn contains_tells_members_apart() {
+        let job = Job::new().unwrap();
+        let mut c = Command::new("cmd.exe")
+            .args(["/C", "ping -n 600 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let outside = Job::new().unwrap();
+        job.assign(c.as_raw_handle()).unwrap();
+        assert!(job.contains(c.as_raw_handle()).unwrap());
+        assert!(!outside.contains(c.as_raw_handle()).unwrap());
+        let me = unsafe { GetCurrentProcess() } as RawHandle;
+        assert!(!job.contains(me).unwrap());
+        job.terminate(1).unwrap();
+        let _ = c.wait();
     }
 
     #[test]

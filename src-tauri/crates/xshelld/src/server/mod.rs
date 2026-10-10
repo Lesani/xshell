@@ -162,6 +162,17 @@ pub struct Config {
     /// Test hook: how replies are written, for the Windows probes (`XSHELLD_TEST_SUBMIT_*`).
     #[doc(hidden)]
     pub submit_probe: SubmitProbe,
+    /// How a reply reads the agent console's input mode before its paste and again before
+    /// its Enter: a Windows Host reads it with its `console-mode` helper; elsewhere a PTY
+    /// has no such mode.
+    pub input_mode: InputModeGate,
+    /// A reading that refused a reply (no VT input, or no reading) refuses the Terminal's
+    /// next replies at once for this long (2 s), without reading again.
+    pub mode_refusal_ttl: Duration,
+    /// How long a reading of the input mode allows a write of a reply (100 ms), counted from
+    /// before the reading started. A reading allows one write; a wait for the agent's locks
+    /// spends it too.
+    pub mode_fresh: Duration,
     /// How often the drop directory (`save_dropped_file`) is swept of old files while the
     /// Daemon runs (1 h), besides once at start: a Persistent Daemon may run for weeks, and
     /// `$XDG_RUNTIME_DIR` is memory.
@@ -264,7 +275,70 @@ pub enum TestPoint {
     /// non-blocking writes (registry locked: do not block). Returning `true` leaves it
     /// without one.
     ReplyDescriptor,
+    /// The input thread is about to read the agent console's input mode for a reply (before
+    /// its paste, again before Enter, and after a delay; no lock held, may block).
+    SubmitMode,
+    /// A reading of the input mode allowed the reply's next write, which follows (no lock
+    /// held, may block: a long block makes the reading stale).
+    SubmitModeRead,
+    /// The reader fed a Terminal's output to its screen model, with that Terminal's screen
+    /// locked: a hook may block, but must not touch the Terminal.
+    ScreenFed,
 }
+
+/// How a reply reads the agent console's input mode (see [`Config::input_mode`]).
+#[derive(Clone)]
+pub enum InputModeGate {
+    /// No reading: every reply is written as on Unix.
+    Off,
+    /// The `xshelld console-mode` helper `exe`, ended after `timeout` (Windows).
+    Helper { exe: PathBuf, timeout: Duration },
+    /// Test hook: the mode is whatever this answers, given the Terminal's process id.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    Fake(ModeReader),
+}
+
+impl InputModeGate {
+    /// The Windows Host's gate: this executable's helper, 2 s. Elsewhere off.
+    pub fn host_default() -> Self {
+        match std::env::current_exe() {
+            Ok(exe) if cfg!(windows) => InputModeGate::Helper {
+                exe,
+                timeout: Duration::from_secs(2),
+            },
+            // Without its own executable a Windows Daemon cannot read the mode: a helper
+            // that does not exist fails every reading, so every reply is refused.
+            Err(_) if cfg!(windows) => InputModeGate::Helper {
+                exe: PathBuf::new(),
+                timeout: Duration::from_secs(2),
+            },
+            _ => InputModeGate::Off,
+        }
+    }
+}
+
+impl std::fmt::Debug for InputModeGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputModeGate::Off => f.write_str("Off"),
+            InputModeGate::Helper { exe, timeout } => f
+                .debug_struct("Helper")
+                .field("exe", exe)
+                .field("timeout", timeout)
+                .finish(),
+            #[cfg(any(test, debug_assertions))]
+            InputModeGate::Fake(_) => f.write_str("Fake"),
+        }
+    }
+}
+
+/// Test hook: answers a reading of the input mode for the Terminal process given (`None`
+/// for a Terminal without one): the mode, or why there is none.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ModeReader(pub Arc<dyn Fn(Option<u32>) -> Result<u32, String> + Send + Sync>);
 
 /// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
 #[doc(hidden)]
@@ -297,18 +371,46 @@ impl std::fmt::Debug for PushHooks {
 
 /// Test hook: how a reply is written, so a probe can split it where it likes.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubmitProbe {
     /// At most this many bytes per write of the paste (`SUBMIT_CHUNK` when `None`).
     pub max_piece: Option<usize>,
     /// The gate refuses the paste and Enter once this many bytes of the paste were written,
     /// as if the agent stopped accepting the reply there.
     pub stop_after: Option<usize>,
+    /// The backpressure probe (debug builds only): see [`ProbeSeams`].
+    #[cfg(any(test, debug_assertions))]
+    pub seams: ProbeSeams,
+}
+
+/// The backpressure probe's seams (`tests/windows_submit.rs`), debug builds only.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeSeams {
+    /// While this file exists, each Terminal's output reader waits (holding nothing) before
+    /// its next read, for at most 30 s: the agent's console backs up.
+    pub drain_pause: Option<PathBuf>,
+    /// A reply that has written `pause_after` bytes of its paste (0: before its first
+    /// piece) creates `drain_pause` and then waits this long before that write.
+    pub pause_on_paste: Option<Duration>,
+    pub pause_after: usize,
+    /// With `pause_on_paste`: before it creates `drain_pause`, the reply waits (at most
+    /// 20 s) until this file exists, so a test knows what the agent read up to there.
+    pub pause_ack: Option<PathBuf>,
+    /// Each reading of the input mode, each write of a reply and each blocking write of
+    /// input is logged to this file, a line each.
+    pub trace: Option<PathBuf>,
+    /// How the console-mode helper misbehaves (`console_mode::SIM_ENV`), or `missing`: the
+    /// Daemon starts a helper that does not exist.
+    pub mode_sim: Option<String>,
 }
 
 /// The lowest Windows build whose ConPTY is known to give the Daemon what a reply needs
 /// (the agent's bracketed paste mode, and its input as written). `u32::MAX`: none yet; the
-/// CI probes (`tests/windows_submit.rs`) measure it (Lesani/xshell#40).
+/// CI probes (`tests/windows_submit.rs`) measure it (Lesani/xshell#40). Besides the build,
+/// offering replies waits for an answer to the input-mode gate's residual race (see
+/// `console_mode`).
 pub const SUBMIT_MIN_BUILD: u32 = u32::MAX;
 
 /// Whether this Host takes Chat View replies (see [`Config::submit`]).
@@ -439,6 +541,9 @@ impl Config {
             submit_files: cfg!(unix),
             submit_markers_alone: cfg!(windows),
             submit_probe: SubmitProbe::default(),
+            input_mode: InputModeGate::host_default(),
+            mode_refusal_ttl: Duration::from_secs(2),
+            mode_fresh: Duration::from_millis(100),
             drop_sweep: Duration::from_secs(60 * 60),
             drop_max_age: xshell_core::files::DROPPED_FILE_MAX_AGE,
             drop_grace: Duration::from_secs(10 * 60),

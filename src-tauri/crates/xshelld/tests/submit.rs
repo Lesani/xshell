@@ -1860,3 +1860,429 @@ fn a_chip_removed_while_waiting_stops_the_reply() {
     assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
     t.expect_input(&pasted(&canonical(&path)));
 }
+
+// ── The input-mode gate (Windows Hosts; Lesani/xshell#40), with a fake reading ──────────
+
+/// The reply gate of a Windows Host, driven in-process with a fake reading of the agent
+/// console's input mode (a debug-build test hook).
+#[cfg(debug_assertions)]
+mod mode_gate {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use xshell_protocol::msg::SUBMIT_NO_VT_INPUT;
+    use xshelld::server::{InputModeGate, ModeReader};
+
+    /// A console mode with VT input, and one without (a reader of key events).
+    const VT: u32 = 0x0200 | 0x0007;
+    const RECORDS: u32 = 0x0018;
+
+    type OnRead = Box<dyn FnMut() + Send>;
+
+    /// What the fake reading answers, and how often it was asked.
+    #[derive(Clone, Default)]
+    struct Fake {
+        mode: Arc<AtomicU32>,
+        fail: Arc<AtomicBool>,
+        calls: Arc<Mutex<Vec<Option<u32>>>>,
+        /// Called at each reading, before it answers.
+        on_read: Arc<Mutex<Option<OnRead>>>,
+    }
+
+    impl Fake {
+        fn new(mode: u32) -> Self {
+            let f = Fake::default();
+            f.mode.store(mode, Ordering::SeqCst);
+            f
+        }
+
+        fn gate(&self) -> InputModeGate {
+            let f = self.clone();
+            InputModeGate::Fake(ModeReader(Arc::new(move |pid| {
+                f.calls.lock().unwrap().push(pid);
+                if let Some(cb) = f.on_read.lock().unwrap().as_mut() {
+                    cb();
+                }
+                if f.fail.load(Ordering::SeqCst) {
+                    return Err("no console".into());
+                }
+                Ok(f.mode.load(Ordering::SeqCst))
+            })))
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        fn set(&self, mode: u32) {
+            self.mode.store(mode, Ordering::SeqCst);
+        }
+    }
+
+    fn gated_env(fake: &Fake, tweak: impl FnOnce(&mut Config)) -> Env {
+        let gate = fake.gate();
+        env_with(move |c| {
+            c.input_mode = gate;
+            tweak(c);
+        })
+    }
+
+    /// S1: a VT reader gets the reply; the mode is read before the paste (nothing typed
+    /// yet) and again before Enter (the paste typed, Enter not).
+    #[test]
+    fn mode_gate_allows_a_vt_reader() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |_| {});
+        let t = e.ready("claude");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (s, tt) = (seen.clone(), t.clone());
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            s.lock().unwrap().push(tt.input());
+        }));
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "two\nlines"), Ok(Value::Null));
+        t.expect_input(&typed("two\nlines"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].is_empty());
+        assert_eq!(seen[1], b"\x1b[200~two\nlines\x1b[201~");
+        // The Terminal's process is the one read.
+        let pid = fake.calls.lock().unwrap()[0];
+        assert!(pid.is_some());
+    }
+
+    /// S2: an agent reading key events is refused before anything is typed.
+    #[test]
+    fn mode_gate_refuses_a_records_reader_before_anything_is_typed() {
+        let fake = Fake::new(RECORDS);
+        let mut e = gated_env(&fake, |_| {});
+        let t = e.ready("codex");
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "hi"), Err(SUBMIT_NO_VT_INPUT.into()));
+        assert_eq!(fake.calls(), 1);
+        t.expect_input(b"");
+    }
+
+    /// S3: the agent stops reading VT input before Enter: no Enter, the outcome unknown.
+    #[test]
+    fn mode_switch_before_enter_withholds_enter() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |_| {});
+        let t = e.ready("claude");
+        let f = fake.clone();
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            if f.calls() == 2 {
+                f.set(RECORDS);
+            }
+        }));
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "x"), Err(SUBMIT_UNCONFIRMED.into()));
+        t.expect_input(b"\x1b[200~x\x1b[201~");
+    }
+
+    /// S4: no reading is a refusal, and nothing is typed.
+    #[test]
+    fn mode_reading_failure_fails_closed() {
+        let fake = Fake::new(VT);
+        fake.fail.store(true, Ordering::SeqCst);
+        let mut e = gated_env(&fake, |_| {});
+        let t = e.ready("claude");
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "hi"), Err(SUBMIT_NO_VT_INPUT.into()));
+        t.expect_input(b"");
+    }
+
+    /// S5: the reading holds no lock: while it is held, a prompt answer is answered, the
+    /// agent's output reaches the Desktop, and readiness can be checked.
+    #[test]
+    fn mode_reading_holds_no_lock() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |_| {});
+        let t = e.ready("claude");
+        e.desk.attach(t.id);
+        let mut m = e.mobile();
+        e.hold.at(Some(TestPoint::SubmitMode));
+        let id = send_submit(&mut m, &t, "later");
+        e.hold.wait_held();
+        let answer = e.desk.request(&ClientMsg::TermAnswer {
+            terminal: t.id,
+            prompt: 999,
+            option: 0,
+        });
+        assert!(answer.is_err(), "{answer:?}");
+        // A window title: output that changes no cell of the composer.
+        t.run(r"printf '\033]0;still-drawn\007'");
+        e.desk.output_until(t.id, "still-drawn");
+        assert_eq!(e.srv.reply_ready(t.id), Some(Ok(())));
+        e.hold.at(None);
+        assert_eq!(m.wait_res(id), Ok(Value::Null));
+        t.expect_input(&typed("later"));
+    }
+
+    /// S6: a reading that refused refuses the next replies at once, without reading, until
+    /// it is `mode_refusal_ttl` old.
+    #[test]
+    fn negative_reading_refuses_at_admission_until_it_expires() {
+        let fake = Fake::new(RECORDS);
+        let mut e = gated_env(&fake, |c| c.mode_refusal_ttl = ms(400));
+        let t = e.ready("codex");
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "1"), Err(SUBMIT_NO_VT_INPUT.into()));
+        assert_eq!(fake.calls(), 1);
+        let t0 = Instant::now();
+        assert_eq!(submit(&mut m, &t, "2"), Err(SUBMIT_NO_VT_INPUT.into()));
+        assert_eq!(fake.calls(), 1, "read again within the TTL");
+        assert!(t0.elapsed() < ms(400));
+        std::thread::sleep(ms(500));
+        fake.set(VT);
+        assert_eq!(submit(&mut m, &t, "3"), Ok(Value::Null));
+        assert_eq!(fake.calls(), 3);
+        t.expect_input(&typed("3"));
+    }
+
+    /// A1: a reading goes stale. Held past `mode_fresh` after a reading (before the first
+    /// write, and before Enter), the mode is read again before the write; a flip in between
+    /// stops the reply at that write.
+    #[test]
+    fn a_stale_reading_is_read_again_before_the_write() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |c| c.submit_enter_delay = ms(300));
+        let t = e.ready("claude");
+        let mut m = e.mobile();
+        // Before the paste.
+        e.hold.at(Some(TestPoint::SubmitModeRead));
+        let id = send_submit(&mut m, &t, "a");
+        e.hold.wait_held();
+        fake.set(RECORDS);
+        std::thread::sleep(ms(250));
+        e.hold.at(None);
+        assert_eq!(m.wait_res(id), Err(SUBMIT_NO_VT_INPUT.into()));
+        assert_eq!(fake.calls(), 2);
+        t.expect_input(b"");
+        // Before Enter: the paste is typed, Enter is not.
+        std::thread::sleep(ms(2100)); // past the refusal's TTL
+        fake.set(VT);
+        let before = fake.calls();
+        let f = fake.clone();
+        let hold = e.hold.clone();
+        // Hold at the reading before Enter: the second of this reply.
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            if f.calls() == before + 2 {
+                hold.at(Some(TestPoint::SubmitModeRead));
+            }
+        }));
+        let id = send_submit(&mut m, &t, "b");
+        e.hold.wait_held();
+        fake.set(RECORDS);
+        std::thread::sleep(ms(250));
+        e.hold.at(None);
+        assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
+        assert_eq!(fake.calls(), before + 3);
+        t.expect_input(b"\x1b[200~b\x1b[201~");
+    }
+
+    /// A1: a flip while the reply waits for a PTY that takes nothing stops it at its next
+    /// write: the mode is read again before each retry. The paste is completed, never more
+    /// of the text, and Enter withheld.
+    #[test]
+    fn a_flip_during_retries_stops_at_the_next_write() {
+        let fake = Fake::new(VT);
+        let trace = Arc::new(Mutex::new(PathBuf::new()));
+        let tr = trace.clone();
+        let mut e = gated_env(&fake, move |c| {
+            let p = c.home.join("trace.log");
+            *tr.lock().unwrap() = p.clone();
+            c.submit_probe.seams.trace = Some(p);
+            c.submit_stall = Duration::from_secs(20);
+        });
+        let trace = trace.lock().unwrap().clone();
+        let t = e.ready("claude");
+        let mut m = e.mobile();
+        // Once the PTY took nothing, every reading says the agent reads key events.
+        let (f, tp) = (fake.clone(), trace.clone());
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            if fs::read_to_string(&tp)
+                .unwrap_or_default()
+                .contains("wouldblock")
+            {
+                f.set(RECORDS);
+            }
+        }));
+        let reader: i32 = String::from_utf8(t.file("pids.log"))
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe { libc::kill(reader, libc::SIGSTOP) };
+        let big = "w".repeat(SUBMIT_MAX_BYTES);
+        let mut delivered = 0;
+        let outcome = loop {
+            let id = send_submit(&mut m, &t, &big);
+            let deadline = Instant::now() + T;
+            let r = loop {
+                let res = m.try_msg(ms(20), |msg| matches!(msg, ServerMsg::Res(r) if r.id == id));
+                if let Some(ServerMsg::Res(r)) = res {
+                    break r.outcome.into_result();
+                }
+                // The mode was read after a write the PTY did not take: the agent reads
+                // again, so the stopped paste can be completed.
+                if fake.mode.load(Ordering::SeqCst) == RECORDS {
+                    unsafe { libc::kill(reader, libc::SIGCONT) };
+                }
+                assert!(Instant::now() < deadline, "no outcome");
+            };
+            if r.is_err() {
+                break r;
+            }
+            delivered += 1;
+            assert!(delivered < 32, "the PTY never filled");
+        };
+        unsafe { libc::kill(reader, libc::SIGCONT) };
+        assert!(
+            fs::read_to_string(&trace).unwrap().contains("wouldblock"),
+            "stopped before the PTY was full"
+        );
+        // Stopped part way (the usual case): the paste completed, no Enter. Stopped before
+        // its first byte (the PTY was full right at its start): nothing typed.
+        let typed_some = outcome == Err(SUBMIT_UNCONFIRMED.into());
+        if !typed_some {
+            assert_eq!(outcome, Err(SUBMIT_NO_VT_INPUT.into()));
+        }
+        let pastes_want = delivered + usize::from(typed_some);
+        let deadline = Instant::now() + T;
+        loop {
+            let (pastes, keys, inside) = as_agent_reads(&t.input());
+            if !inside && pastes.len() == pastes_want {
+                assert_eq!(
+                    keys,
+                    vec![b'\r'; delivered],
+                    "no Enter after the stopped paste"
+                );
+                if typed_some {
+                    let last = pastes.last().unwrap();
+                    assert!(last.len() < big.len(), "the whole text was typed");
+                    assert!(last.iter().all(|b| *b == b'w'));
+                }
+                break;
+            }
+            assert!(Instant::now() < deadline, "the paste was not completed");
+            std::thread::sleep(ms(50));
+        }
+    }
+
+    /// A1: a reading allows one write. The mode flips after the first piece of a long
+    /// paste was written (within the reading's freshness): the next piece is not written.
+    #[test]
+    fn a_flip_between_written_pieces_stops_at_the_next_piece() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |c| c.mode_fresh = Duration::from_secs(10));
+        let t = e.ready("claude");
+        let f = fake.clone();
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            if f.calls() == 2 {
+                f.set(RECORDS);
+            }
+        }));
+        let mut m = e.mobile();
+        let text = "p".repeat(3000);
+        assert_eq!(submit(&mut m, &t, &text), Err(SUBMIT_UNCONFIRMED.into()));
+        // The first write (the PTY may take less than a piece: macOS), then the frame closed.
+        std::thread::sleep(ms(300));
+        let (pastes, keys, inside) = as_agent_reads(&t.input());
+        assert!(
+            !inside && keys.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&t.input())
+        );
+        assert_eq!(pastes.len(), 1);
+        assert!(!pastes[0].is_empty() && pastes[0].len() <= 1024 - 6);
+        assert!(pastes[0].iter().all(|b| *b == b'p'));
+        assert_eq!(fake.calls(), 2);
+    }
+
+    /// A1: a wait for the agent's locks spends a reading, however short: the reader holds
+    /// the screen (feeding output) when the reply's write comes; once it has the locks, the
+    /// mode is read again, and the flip in between stops the reply before anything is typed.
+    #[test]
+    fn a_lock_wait_spends_the_reading() {
+        #[derive(Default)]
+        struct Steps {
+            arm_read: AtomicBool,
+            at_read: AtomicBool,
+            go_read: AtomicBool,
+            arm_screen: AtomicBool,
+            at_screen: AtomicBool,
+            go_screen: AtomicBool,
+        }
+        fn wait(flag: &AtomicBool) {
+            let deadline = Instant::now() + T;
+            while !flag.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "never released");
+                std::thread::sleep(ms(5));
+            }
+        }
+        let steps = Arc::new(Steps::default());
+        let st = steps.clone();
+        let hook = TestHook(Arc::new(move |_, p| {
+            if p == TestPoint::SubmitModeRead && st.arm_read.swap(false, Ordering::SeqCst) {
+                st.at_read.store(true, Ordering::SeqCst);
+                wait(&st.go_read);
+            }
+            if p == TestPoint::ScreenFed && st.arm_screen.swap(false, Ordering::SeqCst) {
+                st.at_screen.store(true, Ordering::SeqCst);
+                wait(&st.go_screen);
+            }
+            false
+        }));
+        let fake = Fake::new(VT);
+        // Fresh for long: only the lock wait can spend the reading.
+        let mut e = gated_env(&fake, |c| {
+            c.mode_fresh = Duration::from_secs(10);
+            c.test_hook = Some(hook);
+        });
+        let t = e.ready("claude");
+        let mut m = e.mobile();
+        steps.arm_read.store(true, Ordering::SeqCst);
+        let id = send_submit(&mut m, &t, "not now");
+        wait(&steps.at_read);
+        // The reader takes the screen with the next output, and holds it.
+        steps.arm_screen.store(true, Ordering::SeqCst);
+        t.run(r"printf '\033]0;held\007'");
+        wait(&steps.at_screen);
+        fake.set(RECORDS);
+        steps.go_read.store(true, Ordering::SeqCst);
+        // The reply's write waits for the screen.
+        std::thread::sleep(ms(50));
+        steps.go_screen.store(true, Ordering::SeqCst);
+        assert_eq!(m.wait_res(id), Err(SUBMIT_NO_VT_INPUT.into()));
+        assert_eq!(fake.calls(), 2);
+        t.expect_input(b"");
+    }
+
+    /// A reading is as old as the moment it started: one that takes longer than
+    /// `mode_fresh` to answer (the helper sampled the mode, then was slow) allows no write.
+    #[test]
+    fn a_slow_reading_allows_no_write() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |c| c.mode_fresh = ms(100));
+        let t = e.ready("claude");
+        *fake.on_read.lock().unwrap() = Some(Box::new(|| std::thread::sleep(ms(150))));
+        let mut m = e.mobile();
+        assert_eq!(submit(&mut m, &t, "slow"), Err(SUBMIT_NO_VT_INPUT.into()));
+        t.expect_input(b"");
+    }
+
+    /// S7: a Unix Host reads no input mode.
+    #[test]
+    fn gate_off_never_reads() {
+        let home = Path::new("/nonexistent");
+        let cfg = Config::new(home.into(), xshelld::paths::resolve(home, None, None));
+        assert!(
+            matches!(cfg.input_mode, InputModeGate::Off),
+            "{:?}",
+            cfg.input_mode
+        );
+    }
+}

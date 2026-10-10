@@ -32,6 +32,8 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    # NtQueryInformationFile: the backpressure probe's view of the ConPTY input pipe.
+    "Wdk_Storage_FileSystem",
     # RtlGetVersion: the Windows build Chat View replies need.
     "Wdk_System_SystemServices",
     "Win32_Foundation",
@@ -59,6 +61,8 @@ toml = "0.9"
 windows-sys = { version = "0.61", features = [
     # The Windows build the reply probes report (RtlGetVersion).
     "Wdk_System_SystemServices",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_Foundation",
     # The console fake agent of the reply probes (tests/windows_submit.rs).
     "Win32_Security",

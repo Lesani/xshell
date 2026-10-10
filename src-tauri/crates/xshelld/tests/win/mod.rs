@@ -665,3 +665,71 @@ impl Client {
         }
     }
 }
+
+impl Client {
+    /// Send `msg` as a request without waiting for its answer; its request id.
+    pub fn send_req(&mut self, msg: &ClientMsg) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(msg, Some(id));
+        id
+    }
+
+    /// The answer to request `id`, if it comes within `within`.
+    pub fn try_res(&mut self, id: u64, within: Duration) -> Option<Result<Value, String>> {
+        match self.try_msg(within, |m| matches!(m, ServerMsg::Res(r) if r.id == id)) {
+            Some(ServerMsg::Res(r)) => Some(r.outcome.into_result()),
+            _ => None,
+        }
+    }
+}
+
+/// Run the test `name` (this test binary's) in a child process, with `deadline`: the body
+/// runs there (this returns `true` in the child), and the parent (`false`) waits. Past the
+/// deadline the parent removes the file named in `<dir>/pause.path`, ends the Daemon named
+/// in `<dir>/daemon.pid` and the child, and fails: a probe that blocks never hangs CI.
+pub fn in_child(name: &str, deadline: Duration) -> bool {
+    if std::env::var("XSHELLD_WIN_CHILD").as_deref() == Ok(name) {
+        return true;
+    }
+    let dir = tempfile::Builder::new().prefix("xc").tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("XSHELLD_WIN_CHILD", name)
+        .env("XSHELLD_WIN_CHILD_DIR", dir.path())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let by = Instant::now() + deadline;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if Instant::now() >= by {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let Some(status) = status else {
+        if let Ok(p) = fs::read_to_string(dir.path().join("pause.path")) {
+            let _ = fs::remove_file(p.trim());
+        }
+        if let Ok(p) = fs::read_to_string(dir.path().join("daemon.pid")) {
+            if let Ok(pid) = p.trim().parse() {
+                kill_pid(pid);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{name} did not finish within {deadline:?}");
+    };
+    assert!(status.success(), "{name} failed in its child process");
+    false
+}
+
+/// In a child of [`in_child`]: note `what` (`daemon.pid`, `pause.path`) for the parent.
+pub fn child_note(what: &str, value: &str) {
+    if let Some(d) = std::env::var_os("XSHELLD_WIN_CHILD_DIR") {
+        let _ = fs::write(Path::new(&d).join(what), value);
+    }
+}

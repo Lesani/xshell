@@ -122,6 +122,9 @@ jobs:
       # On Windows the reply probes (#40) log what ConPTY does as facts, and the ConPTY
       # renderings of the prompt fixtures are kept as an artifact.
       - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked --no-fail-fast
+        # The backpressure probes (#40) stall a console on purpose; each ends itself after
+        # 90 s, and this bounds the whole step.
+        timeout-minutes: 45
         env:
           XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
           XSHELL_CONPTY_FIXTURE_OUT: ${{ runner.temp }}/conpty-fixtures
@@ -165,6 +168,7 @@ jobs:
           XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
       - if: always()
         run: cargo test -p xshelld --test windows_submit --locked
+        timeout-minutes: 30
         env:
           XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
           XSHELL_CONPTY_FIXTURE_OUT: ${{ runner.temp }}/conpty-fixtures

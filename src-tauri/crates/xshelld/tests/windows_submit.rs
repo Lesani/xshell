@@ -32,7 +32,7 @@ use xshell_core::launch::LaunchSpec;
 use xshell_core::prompt::{composer, composer_images, extract, ScreenModel};
 use xshell_protocol::msg::{
     AgentStatus, ClientMsg, SUBMIT_MAX_BYTES, SUBMIT_NEEDS_YOU, SUBMIT_NOT_READY,
-    SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
+    SUBMIT_NO_VT_INPUT, SUBMIT_STUCK, SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
 };
 
 const START: &[u8] = b"\x1b[200~";
@@ -64,8 +64,8 @@ fn typed(text: &str) -> Vec<u8> {
 
 // ── The console fake agent ────────────────────────────────────────────────
 
-/// Not a test unless `XSHELLD_WIN_FAKE` is set (`vt` or `records`): then it is a fake agent
-/// on its console (see [`console`]).
+/// Not a test unless `XSHELLD_WIN_FAKE` is set (`vt`, `vtw`, `vtw-records` or `records`):
+/// then it is a fake agent on its console (see [`console`]).
 #[test]
 fn helper_console_agent() {
     let Ok(mode) = std::env::var("XSHELLD_WIN_FAKE") else {
@@ -128,7 +128,15 @@ impl Parse {
 /// - `paste h|l`: bracketed paste on or off (`CSI ? 2004 h|l`);
 /// - `stall <ms>`: the next read is followed by a pause of `<ms>`;
 /// - `on-end <path>`: draw `<path>` as soon as the end of a paste is read;
-/// - `flood <ms>`: set the window title, two long ones in turn, for `<ms>`.
+/// - `on-end-mode vt|records`: set the input mode as soon as the end of a paste is read;
+/// - `mode vt|records`: set the input mode now (`ENABLE_VIRTUAL_TERMINAL_INPUT` on or off);
+/// - `flood <ms>`: set the window title, two long ones in turn, for `<ms>`; `flood.state`
+///   says how long the write in progress has been blocked and the longest one was
+///   (`<blocked ms> <longest ms> <writes>`, every 20 ms);
+/// - `ctrl-break`: Ctrl+Break to every process on the console (the fake ignores it).
+///
+/// Readers: `vt` (`ReadFile`), `vtw` (`ReadConsoleW`) and `vtw-records` (`ReadConsoleW`,
+/// but without VT input until `mode vt`) take VT input; `records` reads key events.
 mod console {
     use super::Parse;
     use serde_json::json;
@@ -213,15 +221,41 @@ mod console {
 
     struct Shared {
         dir: PathBuf,
+        conin: H,
         conout: H,
         stall: AtomicU64,
         on_end: Mutex<Option<PathBuf>>,
+        on_end_mode: Mutex<Option<bool>>,
+    }
+
+    unsafe extern "system" fn ignore_ctrl(kind: u32) -> windows_sys::core::BOOL {
+        (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) as windows_sys::core::BOOL
+    }
+
+    /// Set (`vt`) or clear the input's VT bit; the mode it has then.
+    fn set_vt(conin: H, vt: bool) -> u32 {
+        let m = mode(conin);
+        let want = if vt {
+            m | ENABLE_VIRTUAL_TERMINAL_INPUT
+        } else {
+            m & !ENABLE_VIRTUAL_TERMINAL_INPUT
+        };
+        unsafe { SetConsoleMode(conin.raw(), want) };
+        mode(conin)
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     pub fn run(mode_name: &str) -> ! {
         let dir = std::env::current_dir().unwrap();
         let (conin, conout) = (open("CONIN$"), open("CONOUT$"));
-        let vt = mode_name.starts_with("vt");
+        unsafe { SetConsoleCtrlHandler(Some(ignore_ctrl), 1) };
+        let vt = matches!(mode_name, "vt" | "vtw");
         unsafe {
             SetConsoleOutputCP(65001);
             SetConsoleMode(
@@ -242,6 +276,7 @@ mod console {
         }
         let got = mode(conin);
         let modes = json!({
+            "pid": std::process::id(),
             "reader": mode_name,
             "input": got,
             "output": mode(conout),
@@ -259,15 +294,17 @@ mod console {
         .unwrap();
         let sh = Arc::new(Shared {
             dir: dir.clone(),
+            conin,
             conout,
             stall: AtomicU64::new(0),
             on_end: Mutex::new(None),
+            on_end_mode: Mutex::new(None),
         });
         {
             let sh = sh.clone();
             match mode_name {
                 "vt" => std::thread::spawn(move || read_vt(conin, &sh)),
-                "vtw" => std::thread::spawn(move || read_vtw(conin, &sh)),
+                "vtw" | "vtw-records" => std::thread::spawn(move || read_vtw(conin, &sh)),
                 _ => std::thread::spawn(move || read_records(conin, &sh)),
             };
         }
@@ -290,16 +327,56 @@ mod console {
                 "paste" => out(conout, format!("\x1b[?2004{arg}").as_bytes()),
                 "stall" => sh.stall.store(arg.parse().unwrap(), Ordering::SeqCst),
                 "on-end" => *sh.on_end.lock().unwrap() = Some(PathBuf::from(arg)),
+                "on-end-mode" => *sh.on_end_mode.lock().unwrap() = Some(arg == "vt"),
+                "mode" => {
+                    let m = set_vt(conin, arg == "vt");
+                    append(&dir, "modes.log", format!("{m}\n").as_bytes());
+                }
+                "ctrl-break" => {
+                    let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) };
+                    append(&dir, "ctrl.log", format!("sent {ok}\n").as_bytes());
+                }
                 "flood" => {
                     // Output that never changes the screen: window titles, in turn.
                     let until = Instant::now() + Duration::from_millis(arg.parse().unwrap());
+                    // When the write in progress started (Unix ms, 0: none), the longest
+                    // write, and how many were made.
+                    let since = Arc::new(AtomicU64::new(0));
+                    let longest = Arc::new(AtomicU64::new(0));
+                    let writes = Arc::new(AtomicU64::new(0));
+                    let (s2, l2, w2) = (since.clone(), longest.clone(), writes.clone());
                     std::thread::spawn(move || {
                         let title = |c: char| format!("\x1b]0;{}\x07", c.to_string().repeat(400));
                         let (a, b) = (title('a'), title('b'));
                         while Instant::now() < until {
-                            out(conout, a.as_bytes());
-                            out(conout, b.as_bytes());
+                            for t in [&a, &b] {
+                                let t0 = now_ms();
+                                s2.store(t0, Ordering::SeqCst);
+                                out(conout, t.as_bytes());
+                                s2.store(0, Ordering::SeqCst);
+                                l2.fetch_max(now_ms() - t0, Ordering::SeqCst);
+                                w2.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
+                    });
+                    let dir = dir.clone();
+                    std::thread::spawn(move || loop {
+                        let t0 = since.load(Ordering::SeqCst);
+                        let blocked = if t0 == 0 {
+                            0
+                        } else {
+                            now_ms().saturating_sub(t0)
+                        };
+                        let line = format!(
+                            "{blocked} {} {}",
+                            longest.load(Ordering::SeqCst),
+                            writes.load(Ordering::SeqCst)
+                        );
+                        let tmp = dir.join(".flood.state");
+                        if fs::write(&tmp, line).is_ok() {
+                            let _ = fs::rename(&tmp, dir.join("flood.state"));
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
                     });
                 }
                 _ => panic!("unknown control {line:?}"),
@@ -311,6 +388,10 @@ mod console {
 
     fn after_read(sh: &Shared, parse: &mut Parse, ends_before: usize) {
         if parse.ends > ends_before {
+            if let Some(vt) = sh.on_end_mode.lock().unwrap().take() {
+                let m = set_vt(sh.conin, vt);
+                append(&sh.dir, "on-end.log", format!("mode {m}\n").as_bytes());
+            }
             if let Some(p) = sh.on_end.lock().unwrap().take() {
                 show(sh.conout, &p);
                 append(&sh.dir, "on-end.log", b"shown\n");
@@ -459,6 +540,8 @@ mod console {
 /// One fake agent Terminal: its working directory, where the fake logs.
 struct Fake {
     t: Uuid,
+    /// The Terminal's process: the launcher (`xshelld job-exec`) the fake runs under.
+    pid: u32,
     dir: PathBuf,
     /// The fake's window when it started, and how long it took to reach the Terminal's size
     /// (`None`: it never did, within the wait).
@@ -544,9 +627,14 @@ impl Fake {
 /// `codex`, reading as `reader` (`vt` or `records`), and a Desktop connection to it.
 struct Probe {
     h: TestHome,
-    _d: Daemon,
+    d: Daemon,
     c: Client,
     n: usize,
+    /// The Daemon's trace of readings and writes (`XSHELLD_TEST_SUBMIT_TRACE`).
+    trace: PathBuf,
+    /// While this file exists the Daemon does not read Terminal output
+    /// (`XSHELLD_TEST_DRAIN_PAUSE`).
+    pause: PathBuf,
 }
 
 impl Probe {
@@ -566,7 +654,17 @@ impl Probe {
     }
 
     fn with(h: TestHome, env: &[(&str, &str)]) -> Probe {
-        let mut all = vec![("XSHELLD_TEST_SUBMIT", "1")];
+        let trace = h.dir.path().join("trace.log");
+        let pause = h.dir.path().join("pause");
+        let (ts, ps) = (
+            trace.to_string_lossy().into_owned(),
+            pause.to_string_lossy().into_owned(),
+        );
+        let mut all = vec![
+            ("XSHELLD_TEST_SUBMIT", "1"),
+            ("XSHELLD_TEST_SUBMIT_TRACE", ts.as_str()),
+            ("XSHELLD_TEST_DRAIN_PAUSE", ps.as_str()),
+        ];
         all.extend_from_slice(env);
         let d = Daemon::start_with(&h, &all);
         let mut c = Client::connect(&h.pipe);
@@ -580,7 +678,37 @@ impl Probe {
             "{:?}",
             hello.capabilities
         );
-        Probe { h, _d: d, c, n: 0 }
+        Probe {
+            h,
+            d,
+            c,
+            n: 0,
+            trace,
+            pause,
+        }
+    }
+
+    /// The trace's lines, each without its time stamp.
+    fn trace(&self) -> Vec<String> {
+        fs::read_to_string(&self.trace)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.split_once(' ').map_or(l, |(_, r)| r).to_string())
+            .collect()
+    }
+
+    /// The trace's readings of the input mode.
+    fn readings(&self) -> Vec<Reading> {
+        self.trace()
+            .iter()
+            .filter_map(|l| Reading::parse(l))
+            .collect()
+    }
+
+    /// The Daemon's pid and pause file, for [`in_child`]'s parent.
+    fn note_for_parent(&self) {
+        child_note("daemon.pid", &self.d.pid().to_string());
+        child_note("pause.path", &self.pause.to_string_lossy());
     }
 
     /// Open `agent` (direct, as the Desktop does) at `cols` x `rows` and wait for the fake.
@@ -592,7 +720,7 @@ impl Probe {
             ..claude_spec(&dir)
         };
         let t = Uuid::new_v4();
-        self.c.open_sized(t, spec, cols, rows);
+        let pid = self.c.open_sized(t, spec, cols, rows);
         self.c.attach(t);
         assert!(
             wait_until(T, || dir.join("started").exists()),
@@ -601,6 +729,7 @@ impl Probe {
         );
         let mut f = Fake {
             t,
+            pid,
             dir,
             startup: (String::new(), None),
         };
@@ -648,6 +777,62 @@ impl Probe {
             files: files.iter().map(|s| s.to_string()).collect(),
         })
     }
+}
+
+/// One reading of the input mode in the Daemon's trace (`mode step=… leader=… raw=… vt=…
+/// procs=… ms=…`, or `… error=… ms=…`).
+#[derive(Debug, Clone)]
+struct Reading {
+    step: String,
+    leader: Option<u32>,
+    raw: Option<u32>,
+    vt: Option<bool>,
+    procs: Option<u32>,
+    error: Option<String>,
+    ms: u64,
+}
+
+impl Reading {
+    fn parse(line: &str) -> Option<Reading> {
+        let rest = line.strip_prefix("mode ")?;
+        let field = |k: &str| {
+            rest.split(' ')
+                .find_map(|w| w.strip_prefix(k).and_then(|v| v.strip_prefix('=')))
+        };
+        let (head, ms) = rest.rsplit_once(" ms=")?;
+        Some(Reading {
+            step: field("step")?.to_string(),
+            leader: field("leader").and_then(|v| v.parse().ok()),
+            raw: field("raw")
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+            vt: field("vt").map(|v| v == "1"),
+            procs: field("procs").and_then(|v| v.parse().ok()),
+            error: head.split_once(" error=").map(|(_, e)| e.to_string()),
+            ms: ms.parse().ok()?,
+        })
+    }
+}
+
+impl Fake {
+    /// The flood's state: how long the write in progress has been blocked, the longest
+    /// write, and how many there were (ms, ms, count).
+    fn flood(&self) -> (u64, u64, u64) {
+        let s = String::from_utf8(self.file("flood.state")).unwrap_or_default();
+        let v: Vec<u64> = s.split(' ').filter_map(|w| w.parse().ok()).collect();
+        match v[..] {
+            [a, b, c] => (a, b, c),
+            _ => (0, 0, 0),
+        }
+    }
+}
+
+/// `p50` and `max` of `v`.
+fn spread(mut v: Vec<u64>) -> (u64, u64) {
+    v.sort_unstable();
+    (
+        v.get(v.len() / 2).copied().unwrap_or(0),
+        v.last().copied().unwrap_or(0),
+    )
 }
 
 /// Whether `out` turns bracketed paste on (`h`) or off (`l`).
@@ -726,7 +911,8 @@ fn keys_down(f: &Fake) -> Vec<String> {
 /// (how its newline arrives decides whether it submits early).
 #[test]
 fn records_reader_sees_bracketed_paste_mode_too() {
-    let mut p = Probe::new("records", &[]);
+    // Measured without the input-mode gate, which refuses this reader (M2).
+    let mut p = Probe::new("records", &[("XSHELLD_TEST_CONSOLE_MODE", "off")]);
     let f = p.open("claude", 100, 30);
     let out = p.show(&f, "claude-composer-idle", Some('h'));
     let visible = shows_mode(&out, 'h');
@@ -812,6 +998,7 @@ fn node_reader_is_safe() {
     let r = p.submit(&f, text);
     let input = f.wait_input(if r.is_ok() { typed(text).len() } else { 1 });
     let submits = f.submits();
+    let readings = p.readings();
     fact(
         "P1",
         &format!(
@@ -820,13 +1007,50 @@ fn node_reader_is_safe() {
             esc(&input)
         ),
     );
+    // M7: the input mode Node's raw mode gives its console, as the gate read it.
+    fact(
+        "M7",
+        &format!(
+            "reader=node node={version} reply={r:?} modes={:?}",
+            readings
+                .iter()
+                .map(|r| format!(
+                    "{}:{:?}:{:?}",
+                    r.step,
+                    r.raw.map(|m| format!("{m:#06x}")),
+                    r.vt
+                ))
+                .collect::<Vec<_>>()
+        ),
+    );
+    // Replied exactly when the gate read VT input, before the paste and before Enter.
+    let vt = |step: &str| {
+        readings
+            .iter()
+            .filter(|x| x.step == step)
+            .all(|x| x.vt == Some(true))
+    };
     match r {
+        Err(e) if e == SUBMIT_NO_VT_INPUT => {
+            assert!(readings.iter().any(|x| x.vt != Some(true)), "{readings:?}");
+            assert!(input.is_empty(), "{}", esc(&input));
+        }
         Err(e) => {
             assert_eq!(e, SUBMIT_NOT_READY);
             assert!(input.is_empty(), "{}", esc(&input));
         }
         Ok(_) => {
             assert!(visible);
+            assert!(
+                vt("Paste") && vt("Enter") && readings.len() >= 2,
+                "{readings:?}"
+            );
+            // Measured with Node 24.21 (libuv 1.52.1) on 20348 and 26100: raw mode gives
+            // its console VT input (mode 0x0208).
+            assert!(
+                readings.iter().all(|r| r.raw == Some(0x0208)),
+                "{readings:?}"
+            );
             assert_eq!(esc(&input), esc(&typed(text)));
             assert_eq!(submits, [text]);
         }
@@ -1202,6 +1426,983 @@ fn full_input_and_output_backpressure_are_bounded() {
     // read, so every reply is delivered (in well under a second) and arrives whole.
     assert_eq!(delivered.len(), 4, "{outcomes:?}");
     assert_eq!(submits, delivered);
+}
+
+// ── M: the input-mode gate (PR2a) ─────────────────────────────────────────
+//
+// Before a reply's paste and again before its Enter the Daemon reads the agent console's
+// input mode with its `console-mode` helper (attached to the Terminal's console through its
+// launcher), and replies only to a console that gives VT input.
+
+/// M1: a VT reader is replied to; each reply reads the mode twice. FACT: how long a reading
+/// takes (the helper's whole run, from the Daemon), over 10 replies.
+#[test]
+fn vt_reader_is_allowed() {
+    let mut p = Probe::new("vtw", &[]);
+    let f = p.ready("claude");
+    let mut want = Vec::new();
+    for i in 0..10 {
+        let text = format!("reply {i}");
+        assert_eq!(p.submit(&f, &text), Ok(Value::Null), "{i}");
+        want.push(text);
+    }
+    assert_eq!(f.wait_submits(10), want);
+    let readings = p.readings();
+    let (p50, max) = spread(readings.iter().map(|r| r.ms).collect());
+    fact(
+        "M1",
+        &format!(
+            "readings={} p50Ms={p50} maxMs={max} procs={:?} raw={:?} leader={:?} terminalPid={}",
+            readings.len(),
+            readings.iter().map(|r| r.procs).collect::<Vec<_>>(),
+            readings
+                .first()
+                .and_then(|r| r.raw)
+                .map(|m| format!("{m:#06x}")),
+            readings.first().and_then(|r| r.leader),
+            f.pid
+        ),
+    );
+    // Every reply read VT input before its paste and again before its Enter (and maybe
+    // again before a retry: the pipe takes nothing while conhost has not read a piece).
+    assert!(readings.len() >= 20, "{readings:?}");
+    assert!(readings.iter().all(|r| r.vt == Some(true)), "{readings:?}");
+    assert_eq!(readings.iter().filter(|r| r.step == "Enter").count(), 10);
+    assert!(readings.iter().all(|r| r.leader == Some(f.pid)));
+    // Measured on 20348 and 26100 (CI run 38083262893): p50 11 and 18 ms, at most 12 and
+    // 24 ms, far under the helper's 2 s timeout. The console has four processes then: the
+    // launcher, cmd.exe, the agent, and the helper itself.
+    assert!(max < 1000, "a reading took {max} ms");
+    assert!(readings.iter().all(|r| r.procs == Some(4)), "{readings:?}");
+}
+
+/// M2: an agent that reads key events is refused before anything is typed, and again at
+/// once (no reading) while that refusal is recent.
+#[test]
+fn records_reader_is_refused_before_anything_is_typed() {
+    let mut p = Probe::new("records", &[]);
+    let f = p.ready("codex");
+    // The console's own records before the reply (its window resized at the start).
+    let events = f.file("events.jsonl");
+    assert_eq!(p.submit(&f, "two\nlines"), Err(SUBMIT_NO_VT_INPUT.into()));
+    let n = p.readings().len();
+    let t0 = Instant::now();
+    assert_eq!(p.submit(&f, "again"), Err(SUBMIT_NO_VT_INPUT.into()));
+    let again = t0.elapsed();
+    std::thread::sleep(ms(1000));
+    let readings = p.readings();
+    fact(
+        "M2",
+        &format!(
+            "reader=records readings={readings:?} againMs={} modes={}",
+            again.as_millis(),
+            f.modes()
+        ),
+    );
+    assert_eq!(n, 1, "{readings:?}");
+    assert_eq!(readings.len(), 1, "read again within the refusal's TTL");
+    assert_eq!(readings[0].vt, Some(false));
+    assert!(again < ms(250), "{again:?}");
+    assert!(
+        f.file("records.jsonl").is_empty(),
+        "{}",
+        esc(&f.file("records.jsonl"))
+    );
+    assert_eq!(
+        esc(&f.file("events.jsonl")),
+        esc(&events),
+        "the helper added records"
+    );
+    assert!(f.submits().is_empty());
+}
+
+/// M3: the agent stops taking VT input when it reads the end of the paste: the reading
+/// before Enter sees it, and Enter is withheld.
+#[test]
+fn reader_switching_mode_mid_reply_gets_no_enter() {
+    let mut p = Probe::new("vt", &[("XSHELLD_TEST_SUBMIT_ENTER_DELAY_MS", "500")]);
+    let f = p.ready("claude");
+    f.run("on-end-mode records");
+    let r = p.submit(&f, "then key events");
+    let input = f.wait_input(typed("then key events").len() - 1);
+    let readings = p.readings();
+    fact(
+        "M3",
+        &format!(
+            "reply={r:?} input={} readings={readings:?} onEnd={}",
+            esc(&input),
+            String::from_utf8_lossy(&f.file("on-end.log"))
+        ),
+    );
+    assert_eq!(r, Err(SUBMIT_UNCONFIRMED.into()));
+    assert!(input.ends_with(END), "{}", esc(&input));
+    assert!(!input.contains(&b'\r'), "{}", esc(&input));
+    assert!(f.submits().is_empty());
+    let last = readings.last().unwrap();
+    assert_eq!((last.step.as_str(), last.vt), ("Enter", Some(false)));
+}
+
+/// M3b: an agent that turns VT input on is replied to once the refusal is no longer recent.
+#[test]
+fn records_reader_switched_to_vt_is_allowed_after_the_ttl() {
+    let mut p = Probe::new("vtw-records", &[]);
+    let f = p.ready("claude");
+    assert_eq!(p.submit(&f, "not yet"), Err(SUBMIT_NO_VT_INPUT.into()));
+    f.run("mode vt");
+    // Still refused at once: the refusal is recent.
+    assert_eq!(p.submit(&f, "not yet"), Err(SUBMIT_NO_VT_INPUT.into()));
+    std::thread::sleep(ms(2200));
+    assert_eq!(p.submit(&f, "now"), Ok(Value::Null));
+    assert_eq!(f.wait_submits(1), ["now"]);
+    assert!(f.input().ends_with(&typed("now")), "{}", esc(&f.input()));
+}
+
+/// M4: a helper that hangs, prints garbage, fails, or does not exist refuses the reply
+/// within its timeout, and nothing is typed. One that hangs is ended.
+#[test]
+fn mode_helper_fails_closed() {
+    for sim in ["garbage", "fail", "missing", "hang"] {
+        let h = TestHome::new();
+        let pidfile = h.dir.path().join("helper.pid");
+        let env_sim = if sim == "hang" {
+            format!("hang:{}", pidfile.display())
+        } else {
+            sim.to_string()
+        };
+        for agent in ["claude", "codex"] {
+            let exe = std::env::current_exe().unwrap();
+            h.script(
+                agent,
+                &format!(
+                    "set XSHELLD_WIN_FAKE=vt\n\"{}\" --exact helper_console_agent --nocapture --test-threads=1 >NUL 2>&1",
+                    exe.display()
+                ),
+            );
+        }
+        let mut p = Probe::with(h, &[("XSHELLD_TEST_CONSOLE_MODE", &env_sim)]);
+        let f = p.ready("claude");
+        let t0 = Instant::now();
+        let r = p.submit(&f, "hi");
+        let took = t0.elapsed();
+        std::thread::sleep(ms(300));
+        let readings = p.readings();
+        fact(
+            "M4",
+            &format!(
+                "sim={sim} reply={r:?} tookMs={} readings={readings:?}",
+                took.as_millis()
+            ),
+        );
+        assert_eq!(r, Err(SUBMIT_NO_VT_INPUT.into()), "{sim}");
+        assert!(took < Duration::from_secs(3) + ms(1000), "{sim}: {took:?}");
+        assert!(f.input().is_empty(), "{sim}: {}", esc(&f.input()));
+        assert!(
+            readings.iter().all(|r| r.error.is_some()),
+            "{sim}: {readings:?}"
+        );
+        if sim == "hang" {
+            let pid = read_pid_file(&pidfile);
+            assert!(
+                wait_dead(pid, Duration::from_secs(5)),
+                "the hung helper {pid} lives"
+            );
+        }
+    }
+}
+
+/// A3: the helper ignores Ctrl+Break on the console it attached to, and ends when that
+/// console closes.
+#[test]
+fn mode_helper_ignores_ctrl_break_and_ends_with_the_console() {
+    let h = TestHome::new();
+    let pidfile = h.dir.path().join("helper.pid");
+    let exe = std::env::current_exe().unwrap();
+    h.script(
+        "claude",
+        &format!(
+            "set XSHELLD_WIN_FAKE=vt\n\"{}\" --exact helper_console_agent --nocapture --test-threads=1 >NUL 2>&1",
+            exe.display()
+        ),
+    );
+    let sim = format!("hang:{}", pidfile.display());
+    let mut p = Probe::with(
+        h,
+        &[
+            ("XSHELLD_TEST_CONSOLE_MODE", &sim),
+            ("XSHELLD_TEST_CONSOLE_MODE_TIMEOUT_MS", "60000"),
+        ],
+    );
+    let f = p.ready("claude");
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: "hi".into(),
+        files: vec![],
+    });
+    let helper = read_pid_file(&pidfile);
+    f.run("ctrl-break");
+    std::thread::sleep(ms(1500));
+    let survived = alive(helper);
+    let t0 = Instant::now();
+    p.c.close(f.t);
+    let ended = wait_dead(helper, Duration::from_secs(15));
+    let r = p.c.try_res(id, T);
+    fact(
+        "A3",
+        &format!(
+            "ctrl={} helperSurvivedCtrlBreak={survived} endedWithConsole={ended} afterMs={} reply={r:?}",
+            String::from_utf8_lossy(&f.file("ctrl.log")).trim(),
+            t0.elapsed().as_millis()
+        ),
+    );
+    assert!(
+        f.file("ctrl.log").starts_with(b"sent 1"),
+        "Ctrl+Break not sent"
+    );
+    assert!(survived, "Ctrl+Break ended the helper");
+    assert!(ended, "the helper outlived its console");
+    assert!(matches!(r, Some(Err(_))), "{r:?}");
+    assert!(f.input().is_empty(), "{}", esc(&f.input()));
+}
+
+/// M5: the mode is read through the launcher and `cmd.exe`, not from the fake itself: the
+/// leader read is the Terminal's process, and the VT bit is the fake's own.
+#[test]
+fn mode_is_read_through_the_cmd_wrapper() {
+    for reader in ["vt", "records"] {
+        let mut p = Probe::new(reader, &[]);
+        let f = p.ready("claude");
+        let r = p.submit(&f, "x");
+        let modes = f.modes();
+        let own: u32 = modes["pid"].as_u64().unwrap() as u32;
+        let readings = p.readings();
+        // The fake's own console mode, read directly by the CLI.
+        let direct = console_mode_cli(own);
+        fact(
+            "M5",
+            &format!(
+                "reader={reader} reply={r:?} leader={:?} fakePid={own} fakeVt={} viaLeader={:?} direct={direct:?}",
+                readings.first().and_then(|r| r.leader),
+                modes["vtInput"],
+                readings.first().map(|r| (r.raw, r.procs)),
+            ),
+        );
+        let first = &readings[0];
+        assert_eq!(first.leader, Some(f.pid));
+        assert_ne!(f.pid, own, "the fake is the Terminal's process itself");
+        assert_eq!(first.vt, modes["vtInput"].as_bool(), "{readings:?}");
+        assert_eq!(direct.0, 0, "{direct:?}");
+        assert_eq!(
+            direct.1.split_whitespace().nth(2).map(str::to_string),
+            first.raw.map(|m| format!("mode=0x{m:08x}")),
+            "the leader's console and the fake's are one: {direct:?}"
+        );
+    }
+}
+
+/// `xshelld console-mode <pid>` run as the Daemon runs it (detached): its exit code, its
+/// output and how long it took.
+fn console_mode_cli(pid: u32) -> (i32, String, Duration) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let t0 = Instant::now();
+    let out = std::process::Command::new(bin())
+        .args(["console-mode", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        t0.elapsed(),
+    )
+}
+
+/// M6: the helper itself, 20 times against a reader of key events: it reads the mode
+/// (VT off) and puts nothing in the console's input. It fails (exit 1, `error=attach:`) for
+/// a process that does not exist and for one without a console.
+#[test]
+fn console_mode_cli_never_writes_input() {
+    let mut p = Probe::new("records", &[("XSHELLD_TEST_CONSOLE_MODE", "off")]);
+    let f = p.open("codex", 100, 30);
+    // The console's own records (its window resized at the start).
+    std::thread::sleep(ms(500));
+    let events = f.file("events.jsonl");
+    let mut times = Vec::new();
+    let mut lines = Vec::new();
+    for _ in 0..20 {
+        let (code, out, took) = console_mode_cli(f.pid);
+        assert_eq!(code, 0, "{out:?}");
+        assert!(out.starts_with("xshelld-console-mode 1 mode=0x"), "{out:?}");
+        times.push(took.as_millis() as u64);
+        lines.push(out.trim().to_string());
+    }
+    std::thread::sleep(ms(1000));
+    let (p50, max) = spread(times.clone());
+    let gone = console_mode_cli(0x7fff_fff0);
+    // A process with no console: a detached cmd.exe.
+    use std::os::windows::process::CommandExt;
+    let mut lone = std::process::Command::new("cmd.exe")
+        .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0000_0008)
+        .spawn()
+        .unwrap();
+    let none = console_mode_cli(lone.id());
+    let _ = lone.kill();
+    let _ = lone.wait();
+    fact(
+        "M6",
+        &format!(
+            "cliP50Ms={p50} cliMaxMs={max} first={:?} gone={gone:?} noConsole={none:?} records={} events={}",
+            lines[0],
+            f.lines("records.jsonl").len(),
+            f.lines("events.jsonl").len()
+        ),
+    );
+    for l in &lines {
+        let m = u32::from_str_radix(&l["xshelld-console-mode 1 mode=0x".len()..][..8], 16).unwrap();
+        assert_eq!(m & 0x0200, 0, "{l}");
+    }
+    assert!(
+        f.file("records.jsonl").is_empty(),
+        "{}",
+        esc(&f.file("records.jsonl"))
+    );
+    assert_eq!(
+        esc(&f.file("events.jsonl")),
+        esc(&events),
+        "the helper added records"
+    );
+    // Measured on 20348 and 26100: AttachConsole works on a pseudoconsole; it fails with
+    // ERROR_INVALID_PARAMETER for a process that does not exist and ERROR_INVALID_HANDLE
+    // for one without a console.
+    assert_eq!(gone.0, 1, "{gone:?}");
+    assert_eq!(gone.1, "xshelld-console-mode 1 error=attach:87\n");
+    assert!(gone.2 < Duration::from_secs(1), "{gone:?}");
+    assert_eq!(none.0, 1, "{none:?}");
+    assert_eq!(none.1, "xshelld-console-mode 1 error=attach:6\n");
+    assert!(max < 1000, "the helper took {max} ms");
+}
+
+/// M8: a reader of key events on a console someone set to VT input passes the gate (the
+/// gate reads the console's mode, not the reader's API). FACT: what it gets.
+#[test]
+fn records_reader_on_a_vt_console_fact() {
+    let mut p = Probe::new("records", &[]);
+    let f = p.ready("claude");
+    f.run("mode vt");
+    let r = p.submit(&f, "one\ntwo");
+    std::thread::sleep(ms(1500));
+    fact(
+        "M8",
+        &format!(
+            "reply={r:?} keys={:?} events={} submits={:?} readings={:?}",
+            keys_down(&f),
+            f.lines("events.jsonl").len(),
+            f.submits(),
+            p.readings()
+        ),
+    );
+}
+
+// ── B: output backpressure (Sol's P2) ─────────────────────────────────────
+//
+// The Daemon's reading of Terminal output is paused (a test hook), so conhost's output
+// backs up and, the probes show, conhost stops taking input. Each probe runs in a child
+// process the test ends after 90 s.
+
+const B_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Whether the trace has `line` (exactly) after its `from`-th line.
+fn traced(p: &Probe, from: usize, pred: impl Fn(&str) -> bool) -> bool {
+    p.trace().iter().skip(from).any(|l| pred(l))
+}
+
+/// The `run` a Terminal's hooks report with.
+fn run_of(f: &Fake) -> u64 {
+    let id = String::from_utf8(f.file("terminal.id")).unwrap();
+    id.trim().rsplit_once('.').unwrap().1.parse().unwrap()
+}
+
+/// Stall the Terminal's output until a write of the fake's flood has been blocked for 1 s.
+fn stall_output(p: &Probe, f: &Fake) {
+    f.run("flood 40000");
+    fs::write(&p.pause, b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || f.flood().0 >= 1000),
+        "the output never blocked: {:?}",
+        f.flood()
+    );
+}
+
+/// The protocol answers while the output is stalled: a prompt answer (which takes the
+/// screen and prompt locks a reply holds while it writes) and a hook report (the status
+/// lock) on this connection within 1 s each, and a new connection's hello within 2 s.
+/// Their times.
+fn still_answers(p: &mut Probe, f: &Fake) -> String {
+    let t0 = Instant::now();
+    let a = p.c.request(&ClientMsg::TermAnswer {
+        terminal: f.t,
+        prompt: 999_999,
+        option: 0,
+    });
+    let answer = t0.elapsed();
+    assert!(a.is_err(), "{a:?}");
+    let t0 = Instant::now();
+    p.c.request(&ClientMsg::TermEvent {
+        terminal: f.t,
+        run: run_of(f),
+        status: AgentStatus::Working,
+        session_id: None,
+    })
+    .unwrap();
+    let event = t0.elapsed();
+    let t0 = Instant::now();
+    let mut other = Client::connect(&p.h.pipe);
+    assert!(other.hello().1.iter().any(|i| i.terminal == f.t));
+    let hello = t0.elapsed();
+    assert!(answer < ms(1000), "term.answer took {answer:?}");
+    assert!(event < ms(1000), "term.event took {event:?}");
+    assert!(hello < ms(2000), "hello took {hello:?}");
+    format!(
+        "answerMs={} eventMs={} helloMs={}",
+        answer.as_millis(),
+        event.as_millis(),
+        hello.as_millis()
+    )
+}
+
+/// B1: with the output stalled, conhost takes no input: a blocking write of 64 KiB (a
+/// Desktop's keys) does not complete for over a second, and the agent reads nothing. While
+/// that write is blocked the Daemon answers, takes more input and a reply; once the output
+/// drains again, everything arrives in order and the reply is submitted once.
+#[test]
+fn reply_waits_out_output_backpressure() {
+    if !in_child("reply_waits_out_output_backpressure", B_DEADLINE) {
+        return;
+    }
+    let mut p = Probe::new("vtw", &[("XSHELLD_TEST_CONSOLE_MODE_TIMEOUT_MS", "30000")]);
+    p.note_for_parent();
+    let f = p.ready("claude");
+    stall_output(&p, &f);
+    let read_before = f.input().len();
+    let mark = p.trace().len();
+    let witness = "k".repeat(64 * 1024);
+    p.c.input(f.t, &witness);
+    assert!(
+        wait_until(T, || traced(&p, mark, |l| l == "block start 65536")),
+        "{:?}",
+        p.trace()
+    );
+    let t0 = Instant::now();
+    std::thread::sleep(ms(1000));
+    // A2: the blocking write is still in progress after 1 s, and the agent read nothing.
+    let blocked = !traced(&p, mark, |l| {
+        l.starts_with("block done") || l.starts_with("block err")
+    });
+    let read_during = f.input().len() - read_before;
+    let answers = still_answers(&mut p, &f);
+    p.c.input(f.t, "x");
+    let text = "after the stall\nsecond line";
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: text.into(),
+        files: vec![],
+    });
+    // Still blocked: everything above happened inside the blocked interval.
+    let still = !traced(&p, mark, |l| {
+        l.starts_with("block done") || l.starts_with("block err")
+    });
+    let interval = t0.elapsed();
+    fs::remove_file(&p.pause).unwrap();
+    let r = p.c.try_res(id, Duration::from_secs(40));
+    let want = [witness.as_bytes(), b"x", &typed(text)].concat();
+    let input = f.wait_input(read_before + want.len());
+    let trace = p.trace();
+    fact(
+        "B1",
+        &format!(
+            "blockedAfter1s={blocked} stillBlockedAfterChecks={still} intervalMs={} readDuring={read_during} {answers} reply={r:?} flood={:?} readings={:?}",
+            interval.as_millis(),
+            f.flood(),
+            p.readings()
+        ),
+    );
+    assert!(
+        blocked,
+        "the input write completed while the output was stalled: {trace:?}"
+    );
+    assert_eq!(
+        read_during, 0,
+        "the agent read input while the output was stalled"
+    );
+    assert!(still, "the checks outlived the blocked interval: {trace:?}");
+    assert_eq!(r, Some(Ok(Value::Null)));
+    assert_eq!(input.len() - read_before, want.len());
+    assert!(
+        input[read_before..] == want[..],
+        "the input is not in order"
+    );
+    assert_eq!(f.wait_submits(1), [format!("{witness}x{text}")]);
+    assert!(trace.iter().any(|l| l == "block done"), "{trace:?}");
+    assert!(!trace.iter().any(|l| l.contains("err=")), "{trace:?}");
+}
+
+/// B1b: a reply meets the stall in the middle of its paste (the output stops draining
+/// before a piece) and waits it out: the pipe takes nothing (each try after a fresh
+/// reading of the mode), and once the output drains the reply is delivered whole. FACT: what
+/// the readings did while the console was stalled.
+#[test]
+fn reply_waits_out_backpressure_mid_paste() {
+    if !in_child("reply_waits_out_backpressure_mid_paste", B_DEADLINE) {
+        return;
+    }
+    let mut p = Probe::new(
+        "vtw",
+        &[
+            ("XSHELLD_TEST_CONSOLE_MODE_TIMEOUT_MS", "30000"),
+            ("XSHELLD_TEST_DRAIN_PAUSE_ON_PASTE", "1500"),
+            ("XSHELLD_TEST_DRAIN_PAUSE_AFTER", "2048"),
+            ("XSHELLD_TEST_SUBMIT_STALL_MS", "30000"),
+        ],
+    );
+    p.note_for_parent();
+    let f = p.ready("claude");
+    f.run("flood 40000");
+    let text = long_text(SUBMIT_MAX_BYTES);
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: text.clone(),
+        files: vec![],
+    });
+    assert!(wait_until(T, || traced(&p, 0, |l| l == "paused")));
+    let paused_at = p.trace().len();
+    assert!(
+        wait_until(Duration::from_secs(20), || f.flood().0 >= 1000),
+        "the output never blocked"
+    );
+    std::thread::sleep(ms(2000));
+    let during = p.trace()[paused_at..].to_vec();
+    let answers = still_answers(&mut p, &f);
+    fs::remove_file(&p.pause).unwrap();
+    let r = p.c.try_res(id, Duration::from_secs(60));
+    let input = f.wait_input(typed(&text).len());
+    fact(
+        "B1b",
+        &format!(
+            "reply={r:?} {answers} duringPause={during:?} readings={:?}",
+            p.readings()
+                .iter()
+                .map(|r| format!("{}:{:?}:{}ms:{:?}", r.step, r.vt, r.ms, r.error))
+                .collect::<Vec<_>>()
+        ),
+    );
+    assert_eq!(r, Some(Ok(Value::Null)));
+    assert!(input == typed(&text), "not delivered whole");
+    assert_eq!(f.wait_submits(1), [text]);
+    // Measured on 20348 and 26100: the reading the stall made stale (taken with the helper's
+    // timeout raised) waits until the output drains, then answers.
+    let readings = p.readings();
+    assert!(readings.iter().all(|r| r.vt == Some(true)), "{readings:?}");
+    assert!(readings.iter().any(|r| r.ms >= 1000), "{readings:?}");
+}
+
+/// B2 (A4): a reply stopped by the stall in the middle of its paste, at an acknowledged
+/// boundary: it gives up (unconfirmed), its paste cannot be completed while the output is
+/// stalled (stuck: the next reply is refused), and a Desktop's key still arrives once the
+/// output drains. The existing hazard D9 accepts, measured without the input-mode gate.
+#[test]
+fn reply_gives_up_under_output_backpressure_and_input_recovers() {
+    if in_child(
+        "reply_gives_up_under_output_backpressure_and_input_recovers",
+        B_DEADLINE,
+    ) {
+        stopped_mid_paste(false);
+    }
+}
+
+/// B2 with the gate, as a Windows Host runs it: the reading the stall makes stale cannot be
+/// taken again while conhost is stalled (the helper does not answer), so the reply stops
+/// there, within the helper's timeout, with the pipe still empty: its paste is completed (the
+/// end marker reaches the agent once the output drains), and the next reply is refused by
+/// that failed reading, not as stuck.
+#[test]
+fn gated_reply_stops_under_output_backpressure_and_completes_its_paste() {
+    if in_child(
+        "gated_reply_stops_under_output_backpressure_and_completes_its_paste",
+        B_DEADLINE,
+    ) {
+        stopped_mid_paste(true);
+    }
+}
+
+fn stopped_mid_paste(gate: bool) {
+    let h = TestHome::new();
+    let ack = h.dir.path().join("pause.ack");
+    let exe = std::env::current_exe().unwrap();
+    for agent in ["claude", "codex"] {
+        h.script(
+            agent,
+            &format!(
+                "set XSHELLD_WIN_FAKE=vtw\n\"{}\" --exact helper_console_agent --nocapture --test-threads=1 >NUL 2>&1",
+                exe.display()
+            ),
+        );
+    }
+    let ack_s = ack.to_string_lossy().into_owned();
+    let mut env = vec![
+        ("XSHELLD_TEST_SUBMIT_STALL_MS", "2000"),
+        // Long enough for the output to back up before the next piece.
+        ("XSHELLD_TEST_DRAIN_PAUSE_ON_PASTE", "3000"),
+        ("XSHELLD_TEST_DRAIN_PAUSE_AFTER", "2048"),
+        ("XSHELLD_TEST_DRAIN_PAUSE_ACK", ack_s.as_str()),
+    ];
+    if !gate {
+        env.push(("XSHELLD_TEST_CONSOLE_MODE", "off"));
+    }
+    let mut p = Probe::with(h, &env);
+    p.note_for_parent();
+    let f = p.ready("claude");
+    f.run("flood 40000");
+    let text = long_text(SUBMIT_MAX_BYTES);
+    let paste = typed(&text);
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: text.clone(),
+        files: vec![],
+    });
+    // The boundary: the reply wrote `at` bytes; the agent has read exactly those.
+    let mut at = None;
+    assert!(wait_until(T, || {
+        at = p.trace().iter().find_map(|l| {
+            l.strip_prefix("pause at ")
+                .and_then(|n| n.parse::<usize>().ok())
+        });
+        at.is_some()
+    }));
+    let at = at.unwrap();
+    assert!(
+        wait_until(T, || f.input().len() >= at),
+        "the agent read {} of {at}",
+        f.input().len()
+    );
+    assert_eq!(f.input(), paste[..at], "the prefix");
+    fs::write(&ack, b"").unwrap();
+    // The output backs up before the reply's next piece.
+    assert!(
+        wait_until(Duration::from_secs(20), || f.flood().0 >= 1000),
+        "the output never blocked"
+    );
+    // Held through the delivery's stall deadline and the completion's.
+    let t0 = Instant::now();
+    let r = p.c.try_res(id, Duration::from_secs(60));
+    let took = t0.elapsed();
+    let next = p.submit(&f, "next");
+    let mark = p.trace().len();
+    let answers = still_answers(&mut p, &f);
+    p.c.input(f.t, "k");
+    assert!(wait_until(T, || traced(&p, mark, |l| l == "block start 1")));
+    let read_stalled = f.input().len();
+    fs::remove_file(&p.pause).unwrap();
+    assert!(
+        wait_until(T, || f.input().ends_with(b"k")),
+        "the key never arrived"
+    );
+    std::thread::sleep(ms(500));
+    let input = f.input();
+    let mut other = Client::connect(&p.h.pipe);
+    let listed = other.hello().1.iter().any(|i| i.terminal == f.t);
+    fact(
+        if gate { "B2g" } else { "B2" },
+        &format!(
+            "pauseAt={at} reply={r:?} afterMs={} next={next:?} {answers} readWhileStalled={read_stalled} got={} readings={:?}",
+            took.as_millis(),
+            input.len(),
+            p.readings()
+                .iter()
+                .map(|r| format!("{}:{:?}:{}ms:{:?}", r.step, r.vt, r.ms, r.error))
+                .collect::<Vec<_>>()
+        ),
+    );
+    assert_eq!(r, Some(Err(SUBMIT_UNCONFIRMED.into())));
+    assert_eq!(
+        read_stalled, at,
+        "the agent read input while the output was stalled"
+    );
+    assert!(!input.contains(&b'\r'));
+    assert!(listed);
+    assert!(p.trace().iter().any(|l| l == "block done"));
+    let (typed_before, key) = input.split_at(input.len() - 1);
+    assert_eq!(key, b"k");
+    if gate {
+        // Measured on 20348 and 26100: the helper does not answer while conhost is stalled,
+        // so the reading before the next piece fails at its timeout; nothing more of the
+        // text, the end marker at once.
+        assert_eq!(next, Err(SUBMIT_NO_VT_INPUT.into()));
+        let last = p.readings().last().cloned().unwrap();
+        assert_eq!(
+            last.error.as_deref(),
+            Some("the console-mode helper did not answer in time"),
+            "{last:?}"
+        );
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(esc(typed_before), esc(&[&paste[..at], END].concat()));
+    } else {
+        // A prefix of the paste (at least to the boundary, never its end marker).
+        assert_eq!(next, Err(SUBMIT_STUCK.into()));
+        assert!(typed_before.len() >= at && typed_before.len() < paste.len() - END.len() - 1);
+        assert!(
+            typed_before == &paste[..typed_before.len()],
+            "not a prefix of the paste"
+        );
+    }
+}
+
+/// A `nowait` line of the trace: whether it took nothing, the unread bytes, the free bytes
+/// and the quota of the pipe after it.
+type Nowait = (bool, Option<u64>, Option<u64>, Option<u64>);
+
+/// The `nowait` lines of the trace from its `from`-th line.
+fn nowaits(p: &Probe, from: usize) -> Vec<Nowait> {
+    p.trace()
+        .iter()
+        .skip(from)
+        .filter(|l| l.starts_with("nowait "))
+        .map(|l| {
+            let field = |k: &str| {
+                l.split(' ')
+                    .find_map(|w| w.strip_prefix(k))
+                    .and_then(|v| v.parse::<u64>().ok())
+            };
+            (
+                l.contains(" wouldblock "),
+                field("avail="),
+                field("free="),
+                field("quota="),
+            )
+        })
+        .collect()
+}
+
+/// B4 (Sol's review of PR2a, item 3): the Daemon stays responsive while a reply's own
+/// non-blocking writes keep retrying against a full input pipe. Without the input-mode gate
+/// (its helper does not answer while conhost is stalled, B3), so the write path itself is
+/// what runs: the output stops draining at an acknowledged boundary of the paste, the next
+/// pieces fill the pipe (its free quota stays the same: nothing is read from it),
+/// and the reply retries. During the retries a prompt answer, a hook report and a new
+/// connection are answered; the retries go on after them; once the output drains the reply
+/// is delivered whole.
+#[test]
+fn daemon_answers_while_a_reply_retries_a_full_pipe() {
+    if !in_child(
+        "daemon_answers_while_a_reply_retries_a_full_pipe",
+        B_DEADLINE,
+    ) {
+        return;
+    }
+    let h = TestHome::new();
+    let ack = h.dir.path().join("pause.ack");
+    let exe = std::env::current_exe().unwrap();
+    for agent in ["claude", "codex"] {
+        h.script(
+            agent,
+            &format!(
+                "set XSHELLD_WIN_FAKE=vtw\n\"{}\" --exact helper_console_agent --nocapture --test-threads=1 >NUL 2>&1",
+                exe.display()
+            ),
+        );
+    }
+    let ack_s = ack.to_string_lossy().into_owned();
+    let mut p = Probe::with(
+        h,
+        &[
+            ("XSHELLD_TEST_CONSOLE_MODE", "off"),
+            ("XSHELLD_TEST_SUBMIT_PIECE", "4096"),
+            ("XSHELLD_TEST_SUBMIT_STALL_MS", "60000"),
+            // Long enough for the output to back up before the next piece.
+            ("XSHELLD_TEST_DRAIN_PAUSE_ON_PASTE", "3000"),
+            ("XSHELLD_TEST_DRAIN_PAUSE_AFTER", "4096"),
+            ("XSHELLD_TEST_DRAIN_PAUSE_ACK", &ack_s),
+        ],
+    );
+    p.note_for_parent();
+    let f = p.ready("claude");
+    f.run("flood 40000");
+    let text = format!("{}\n", "b".repeat(99)).repeat(160);
+    let paste = typed(&text);
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: text.clone(),
+        files: vec![],
+    });
+    let mut at = None;
+    assert!(wait_until(T, || {
+        at = p.trace().iter().find_map(|l| {
+            l.strip_prefix("pause at ")
+                .and_then(|n| n.parse::<usize>().ok())
+        });
+        at.is_some()
+    }));
+    let at = at.unwrap();
+    assert!(wait_until(T, || f.input().len() >= at));
+    assert!(f.input() == paste[..at], "the prefix");
+    let paused = p.trace().len();
+    fs::write(&ack, b"").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || f.flood().0 >= 1000),
+        "the output never blocked"
+    );
+    // The reply retries against a full pipe.
+    // The retries against a pipe conhost no longer reads: each takes nothing, and the pipe's
+    // free quota stays what it was at the first of them (nothing is read from it).
+    // Measured: on 26100 the pipe is full (no free quota); on 20348 conhost's reader took
+    // 256 bytes of the last piece before it blocked, and those 256 bytes stay free (a
+    // non-blocking write takes nothing while the pipe holds unread data: P5).
+    let stuck_free = |p: &Probe| {
+        nowaits(p, paused)
+            .into_iter()
+            .find(|(wb, _, free, _)| *wb && free.is_some())
+            .and_then(|(_, _, free, _)| free)
+    };
+    let full = |p: &Probe| {
+        let first = stuck_free(p);
+        let n = nowaits(p, paused);
+        let after: Vec<_> = n.iter().skip_while(|(wb, _, _, _)| !*wb).collect();
+        assert!(
+            after.iter().all(|(wb, _, free, _)| *wb && *free == first),
+            "the pipe was read from, or took a write: {n:?}"
+        );
+        after.len()
+    };
+    // At least 1 s of retries (each waits 10 ms first).
+    assert!(
+        wait_until(Duration::from_secs(20), || full(&p) >= 100),
+        "no retries against a full pipe: {:?}",
+        nowaits(&p, paused)
+    );
+    let before = full(&p);
+    let read_before = f.input().len();
+    let answers = still_answers(&mut p, &f);
+    let pending = p.c.try_res(id, ms(0)).is_none();
+    std::thread::sleep(ms(200));
+    let after = full(&p);
+    let read_during = f.input().len() - read_before;
+    let sample: Vec<_> = nowaits(&p, paused).into_iter().rev().take(3).collect();
+    fs::remove_file(&p.pause).unwrap();
+    let r = p.c.try_res(id, Duration::from_secs(60));
+    let input = f.wait_input(paste.len());
+    fact(
+        "B4",
+        &format!(
+            "pauseAt={at} {answers} retriesBefore={before} after={after} pending={pending} readDuring={read_during} freeQuota={:?} last={sample:?} reply={r:?} whole={}",
+            stuck_free(&p),
+            input == paste
+        ),
+    );
+    assert!(pending, "the reply ended during the checks");
+    assert!(after > before, "the retries stopped during the checks");
+    assert_eq!(read_during, 0);
+    assert_eq!(r, Some(Ok(Value::Null)));
+    assert!(input == paste, "not delivered whole");
+    assert_eq!(f.wait_submits(1), [text]);
+}
+
+/// M9: a reading is as old as the helper's start. A helper that samples the mode and then
+/// answers only after `mode_fresh` (a debug-build simulation) allows no write: the reply is
+/// refused with nothing typed.
+#[test]
+fn a_slow_helper_reading_allows_no_write() {
+    let mut p = Probe::new("vtw", &[("XSHELLD_TEST_CONSOLE_MODE", "slow:300")]);
+    let f = p.ready("claude");
+    let r = p.submit(&f, "too slow");
+    std::thread::sleep(ms(500));
+    let readings = p.readings();
+    fact(
+        "M9",
+        &format!(
+            "reply={r:?} readings={:?}",
+            readings
+                .iter()
+                .map(|r| format!("{}:{:?}:{}ms", r.step, r.vt, r.ms))
+                .collect::<Vec<_>>()
+        ),
+    );
+    assert_eq!(r, Err(SUBMIT_NO_VT_INPUT.into()));
+    assert!(f.input().is_empty(), "{}", esc(&f.input()));
+    assert!(readings.len() >= 2, "{readings:?}");
+    assert!(
+        readings.iter().all(|r| r.vt == Some(true) && r.ms >= 300),
+        "{readings:?}"
+    );
+    assert!(p.trace().iter().any(|l| l == "stale Paste"));
+}
+
+/// B3: the helper while conhost is stalled. FACT: does it answer? Either way the reply is
+/// safe: refused with nothing typed, or delivered once the output drains (or, read fine
+/// but then not, unconfirmed without Enter), and the Daemon answers meanwhile.
+#[test]
+fn mode_helper_under_output_backpressure() {
+    if !in_child("mode_helper_under_output_backpressure", B_DEADLINE) {
+        return;
+    }
+    let mut p = Probe::new("vtw", &[]);
+    p.note_for_parent();
+    let f = p.ready("claude");
+    stall_output(&p, &f);
+    let id = p.c.send_req(&ClientMsg::TermSubmit {
+        terminal: f.t,
+        text: "during the stall".into(),
+        files: vec![],
+    });
+    let t0 = Instant::now();
+    let mut r = p.c.try_res(id, Duration::from_secs(5));
+    let answered_stalled = r.is_some();
+    let answers = still_answers(&mut p, &f);
+    let during = p.readings();
+    fs::remove_file(&p.pause).unwrap();
+    if r.is_none() {
+        r = p.c.try_res(id, Duration::from_secs(40));
+    }
+    let r = r.expect("no outcome");
+    std::thread::sleep(ms(1500));
+    let input = f.input();
+    fact(
+        "B3",
+        &format!(
+            "reply={r:?} answeredWhileStalled={answered_stalled} afterMs={} {answers} readingsWhileStalled={:?} input={}",
+            t0.elapsed().as_millis(),
+            during
+                .iter()
+                .map(|r| format!("{}:{:?}:{}ms:{:?}", r.step, r.vt, r.ms, r.error))
+                .collect::<Vec<_>>(),
+            esc(&input)
+        ),
+    );
+    match &r {
+        Ok(_) => {
+            assert_eq!(f.wait_submits(1), ["during the stall"]);
+            assert!(input.ends_with(&typed("during the stall")));
+        }
+        Err(e) if e == SUBMIT_NO_VT_INPUT => assert!(input.is_empty(), "{}", esc(&input)),
+        Err(e) => {
+            assert_eq!(e, SUBMIT_UNCONFIRMED);
+            assert!(!input.contains(&b'\r'), "{}", esc(&input));
+        }
+    }
+    // Measured on 20348 and 26100 (CI run 38083262893): the helper does not answer while
+    // conhost's output is stalled (AttachConsole or GetConsoleMode waits for it), so the
+    // reply is refused at the helper's timeout, with nothing typed.
+    assert_eq!(r, Err(SUBMIT_NO_VT_INPUT.into()));
+    assert!(answered_stalled);
+    assert_eq!(during.len(), 1, "{during:?}");
+    assert_eq!(
+        during[0].error.as_deref(),
+        Some("the console-mode helper did not answer in time")
+    );
 }
 
 // ── W15: the composer and prompt fixtures through ConPTY ──────────────────
