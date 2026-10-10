@@ -4,7 +4,7 @@
 
 use super::agent;
 use super::calls::spawn_call;
-use super::outbox::{writer_loop, Outbox};
+use super::outbox::{writer_loop, Outbox, PaceCfg};
 use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
 use super::role::{self, Role};
@@ -64,7 +64,18 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         (Ok(w), Ok(a)) => (w, a),
         _ => return,
     };
-    let ob = Outbox::new(d.cfg.conn_output_cap, d.cfg.conn_total_cap, Some(asock));
+    // A Mobile's output is paced: it travels the Relay, envelope by envelope.
+    let pace = (role == Role::Mobile).then_some(PaceCfg {
+        idle: d.cfg.mobile_frame_idle,
+        burst: d.cfg.mobile_frame_burst,
+        window: d.cfg.mobile_burst_window,
+    });
+    let ob = Outbox::with_pace(
+        d.cfg.conn_output_cap,
+        d.cfg.conn_total_cap,
+        Some(asock),
+        pace,
+    );
     let (obw, stall) = (ob.clone(), d.cfg.write_stall_timeout);
     if std::thread::Builder::new()
         .name(format!("conn-{id}-w"))
@@ -184,7 +195,10 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         reg.conns.remove(&id);
         d.touch_idle(&mut reg);
         for t in c.touched.iter().filter_map(|t| reg.terminals.get(t)) {
-            t.detach(id);
+            // The size went back to a Desktop: persist it like a resize.
+            if t.detach(id) {
+                t.schedule_persist(&d);
+            }
         }
     }
     // After the connection left the registry: no stream result is queued for it from now on.
@@ -319,17 +333,23 @@ impl Conn {
                 let r =
                     self.with_listed(&terminal, |t| (t.clone(), t.attach(self.id, &self.ob, id)));
                 match r {
-                    Ok((t, dropped)) => {
+                    Ok((t, (dropped, alone))) => {
                         self.touched.insert(terminal);
                         d.nudge_overflowed(dropped);
-                        t.nudge(d.cfg.nudge_delay);
+                        // A Mobile's attach would reflow every other attached screen; it
+                        // relies on the replay unless nobody else is watching.
+                        if self.role == Role::Desktop || alone {
+                            t.nudge(d.cfg.nudge_delay);
+                        }
                     }
                     Err(e) => reply(&self.ob, id, Err(e)),
                 }
             }
             ClientMsg::TermDetach { terminal } => {
                 let r = self.with_listed(&terminal, |t| {
-                    t.detach(self.id);
+                    if t.detach(self.id) {
+                        t.schedule_persist(&d);
+                    }
                     Value::Null
                 });
                 reply(&self.ob, id, r);
@@ -340,8 +360,10 @@ impl Conn {
                 // Terminal a Relaunch is replacing is dropped like input to an ended one.
                 let r = self.terminal(&terminal).and_then(|t| {
                     t.note_input(&d, data.as_bytes());
+                    // A Mobile's echo comes back faster for a while.
+                    self.ob.note_input();
                     // Typing can hand the size to this connection; persist it like a resize.
-                    if t.write_input(self.id, data)? {
+                    if t.write_input(self.id, data, self.role == Role::Mobile)? {
                         t.schedule_persist(&d);
                     }
                     Ok(Value::Null)
@@ -356,7 +378,7 @@ impl Conn {
                 self.touched.insert(terminal);
                 let r = self
                     .with_listed(&terminal, |t| {
-                        t.resize(self.id, cols, rows)
+                        t.resize(self.id, cols, rows, self.role == Role::Mobile)
                             .map(|changed| (t.clone(), changed))
                     })
                     .and_then(|r| r)

@@ -70,6 +70,17 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Output a connection dropped from its queue for one Terminal: the Terminal, and the
+/// connection's outbox when it is a Mobile's (whose recovery differs; see
+/// [`Terminal::recover_mobile_overflow`]).
+pub(crate) type Overflow = (Uuid, Option<Arc<Outbox>>);
+
+/// The Terminals `ob` dropped output of, as [`Overflow`]s.
+pub(crate) fn overflowed(ob: &Arc<Outbox>, ids: Vec<Uuid>) -> impl Iterator<Item = Overflow> {
+    let mobile = ob.is_mobile().then(|| ob.clone());
+    ids.into_iter().map(move |id| (id, mobile.clone()))
+}
+
 /// Encode a server message. Never panics: a message that does not fit in a frame is logged
 /// and dropped (the list budget keeps `terminals` far below the limit).
 pub(crate) fn frame(msg: &ServerMsg) -> Option<Arc<[u8]>> {
@@ -175,12 +186,13 @@ impl Daemon {
         Ok(())
     }
 
-    /// Send `f`, a message about a Terminal running `spec`, to every connection that
-    /// [`sees`](role::sees) that Terminal.
-    pub fn broadcast_about(&self, reg: &Registry, spec: &LaunchSpec, f: Arc<[u8]>) {
+    /// Send `f`, a message about `terminal` (running `spec`), to every connection that
+    /// [`sees`](role::sees) that Terminal: a barrier its output never crosses
+    /// ([`Outbox::push_about`]).
+    pub fn broadcast_about(&self, reg: &Registry, terminal: Uuid, spec: &LaunchSpec, f: Arc<[u8]>) {
         for p in reg.conns.values() {
             if role::sees(p.role, spec) {
-                p.ob.push_control(f.clone());
+                p.ob.push_about(terminal, f.clone());
             }
         }
     }
@@ -214,19 +226,23 @@ impl Daemon {
         }
     }
 
-    /// Nudge Terminals whose queued output a connection just dropped (rate-limited).
-    pub fn nudge_overflowed(&self, ids: Vec<Uuid>) {
+    /// Recover Terminals whose queued output a connection just dropped: nudge them to
+    /// redraw (rate-limited), or for a Mobile see [`Terminal::recover_mobile_overflow`].
+    pub fn nudge_overflowed(&self, ids: Vec<Overflow>) {
         if ids.is_empty() {
             return;
         }
-        let ts: Vec<Arc<Terminal>> = {
+        let ts: Vec<(Arc<Terminal>, Option<Arc<Outbox>>)> = {
             let reg = self.reg.lock().unwrap();
-            ids.iter()
-                .filter_map(|id| reg.terminals.get(id).cloned())
+            ids.into_iter()
+                .filter_map(|(id, mobile)| Some((reg.terminals.get(&id)?.clone(), mobile)))
                 .collect()
         };
-        for t in ts {
-            t.overflow_nudge(self.cfg.nudge_delay);
+        for (t, mobile) in ts {
+            match mobile {
+                None => t.overflow_nudge(self.cfg.nudge_delay),
+                Some(ob) => t.recover_mobile_overflow(&ob, self.cfg.nudge_delay),
+            }
         }
     }
 

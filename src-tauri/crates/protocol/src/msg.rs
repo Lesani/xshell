@@ -437,6 +437,15 @@ pub enum ServerMsg {
     Terminals { list: Vec<TerminalInfo> },
     #[serde(rename = "term.exit")]
     TermExit { terminal: Uuid, code: i32 },
+    /// The size now applied to the Terminal's PTY. Sent only to a Mobile attached to the
+    /// Terminal, whenever that size changes; never for the transient redraw nudge. Capability
+    /// `term.mobile`.
+    #[serde(rename = "term.size")]
+    TermSize {
+        terminal: Uuid,
+        cols: u16,
+        rows: u16,
+    },
     /// Connection-level failure; the Host closes the connection after it.
     #[serde(rename = "error")]
     Error { code: String, message: String },
@@ -466,6 +475,7 @@ const SERVER_TYPES: &[&str] = &[
     "term.exit",
     "error",
     "session.append",
+    "term.size",
 ];
 
 /// `{"t":"res","id":7,"ok":<any>}` or `{"t":"res","id":7,"err":"…"}`.
@@ -944,6 +954,52 @@ mod tests {
         assert_eq!(
             decode_server(&body(encode_msg(&exit, None).unwrap())).unwrap(),
             exit
+        );
+    }
+
+    #[test]
+    fn term_size_golden_roundtrip() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
+        let m = ServerMsg::TermSize {
+            terminal: id,
+            cols: 40,
+            rows: 20,
+        };
+        let b = body(encode_msg(&m, None).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"t":"term.size","terminal":"00000000-0000-0000-0000-000000000007","cols":40,"rows":20}"#
+        );
+        assert_eq!(decode_server(&b).unwrap(), m);
+    }
+
+    /// A decoder from before `term.size` reports it as an unknown type, which every client
+    /// skips (additive protocol).
+    #[test]
+    fn term_size_unknown_to_older_decoder() {
+        let b = body(
+            encode_msg(
+                &ServerMsg::TermSize {
+                    terminal: Uuid::new_v4(),
+                    cols: 40,
+                    rows: 20,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let (v, t, id) = split(&b).unwrap();
+        let older: Vec<&str> = SERVER_TYPES
+            .iter()
+            .copied()
+            .filter(|t| *t != "term.size")
+            .collect();
+        assert_eq!(
+            typed::<ServerMsg>(v, t, id, &older).unwrap_err(),
+            DecodeError::UnknownType {
+                id: None,
+                t: "term.size".into()
+            }
         );
     }
 

@@ -262,7 +262,10 @@ fn unresolved_cleanup_does_not_relaunch() {
     // Attaching shows it ended; input is refused.
     let id = c.request_id();
     c.send(&ClientMsg::TermAttach { terminal: t }, Some(id));
-    assert_eq!(c.wait_res(id).unwrap(), json!({"exitCode": -1}));
+    assert_eq!(
+        c.wait_res(id).unwrap(),
+        json!({"exitCode": -1, "cols": 80, "rows": 24})
+    );
     let err = c
         .request(&ClientMsg::TermInput {
             terminal: t,

@@ -135,7 +135,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 - **Sidebar Layout** belongs to the **Desktop**, not the **Host**: pinning or arranging a remote **Project** is never mirrored to other **Desktops**
 - While a **Remote Host** is offline, the **Desktop** keeps showing its last known **Terminals** and **Project** data as stale and refuses to start new **Terminals** there; on reconnect it reconciles with the **Daemon**
 - Several **Desktops** may show the same **Terminal** at once; all may type into it, and its size follows whichever **Desktop** last interacted with it
-- A **Mobile** only claims a **Terminal**'s size when typing into its **Terminal View**; viewing, and replying from the **Chat View**, never resize it
+- A **Mobile** only claims a **Terminal**'s size when typing into its **Terminal View**; viewing, and replying from the **Chat View**, never resize it. When a **Mobile** that holds the size leaves, the size returns to the **Desktop** that last held it
 - A **Daemon** that restarts relaunches its **Terminals**, resuming each agent's session; the **Local Host**'s come back this way when the **Desktop** starts its **GUI-bound Daemon** again, and Tabs saved by an older **Desktop** move into that **Daemon** once
 
 ## Flagged ambiguities

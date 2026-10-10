@@ -2,8 +2,7 @@
 //! and the connections attached to it.
 
 use super::outbox::Outbox;
-use super::registry::Registry;
-use super::registry::{frame, now_ms, Daemon};
+use super::registry::{frame, now_ms, overflowed, Daemon, Overflow, Registry};
 use super::size::SizeArbiter;
 use super::{ConnId, TestPoint};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
@@ -94,6 +93,8 @@ pub(crate) struct Terminal {
     nudge_pending: AtomicBool,
     last_overflow_nudge: Mutex<Option<Instant>>,
     persist_pending: AtomicBool,
+    /// The most a Mobile is replayed (`Config::mobile_replay_cap`).
+    mobile_replay_cap: usize,
     /// For a Terminal restored without a process: the previous run's leader, kept in the
     /// state file so a later start retries ending it.
     kept_leader: Option<Leader>,
@@ -349,6 +350,7 @@ pub(crate) fn spawn_with(
         nudge_pending: AtomicBool::new(false),
         last_overflow_nudge: Mutex::new(None),
         persist_pending: AtomicBool::new(false),
+        mobile_replay_cap: d.cfg.mobile_replay_cap,
         kept_leader: None,
         run,
         status: Mutex::new(StatusCell::new(tracker, 0)),
@@ -480,7 +482,7 @@ impl Terminal {
             let mut o = self.out.lock().unwrap();
             o.replay.push(bytes);
             for ob in o.subs.values() {
-                dropped.extend(ob.push_output(self.id, chunk.clone()));
+                dropped.extend(overflowed(ob, ob.push_output(self.id, chunk.clone())));
             }
         }
         d.nudge_overflowed(dropped);
@@ -592,7 +594,7 @@ impl Terminal {
             terminal: self.id,
             code,
         }) {
-            d.broadcast_about(reg, &self.spec(), f);
+            d.broadcast_about(reg, self.id, &self.spec(), f);
         }
         if closing {
             reg.terminals.remove(&self.id);
@@ -655,8 +657,9 @@ impl Terminal {
 
     /// Move the attached connections and the size arbiter to `next`, which replaces this
     /// Terminal under its UUID, and send them `next`'s replay: a reset, then whatever `next`
-    /// printed so far. Returns Terminals whose queued output was dropped.
-    pub fn hand_over(&self, next: &Terminal) -> Vec<Uuid> {
+    /// printed so far (a Mobile: its tail). A size this Terminal took after `next` started
+    /// is applied to `next`. Returns the overflows to recover.
+    pub fn hand_over(&self, next: &Terminal) -> Vec<Overflow> {
         let (subs, arb) = {
             let mut io = self.io.lock().unwrap();
             let mut o = self.out.lock().unwrap();
@@ -674,14 +677,24 @@ impl Terminal {
         *next.last_line.lock().unwrap() = line;
         let mut dropped = Vec::new();
         let mut io = next.io.lock().unwrap();
+        let spawned = io.arb.current();
         io.arb = arb;
+        let size = io.arb.current();
         let mut o = next.out.lock().unwrap();
-        let snap = o.replay.snapshot();
+        let (full, tail) = (
+            o.replay.snapshot(),
+            o.replay.snapshot_tail(next.mobile_replay_cap),
+        );
         for (conn, ob) in subs {
+            let snap = if ob.is_mobile() { &tail } else { &full };
             for piece in snap.chunks(REPLAY_CHUNK) {
-                dropped.extend(ob.push_output(self.id, Arc::from(piece)));
+                dropped.extend(overflowed(&ob, ob.push_replay(self.id, Arc::from(piece))));
             }
             o.subs.insert(conn, ob);
+        }
+        // A size taken while `next` was starting (it started at the size read then).
+        if size != spawned && Self::apply_size(&io, size).is_ok() {
+            next.notify_size(&o, size);
         }
         dropped
     }
@@ -702,41 +715,109 @@ impl Terminal {
         true
     }
 
-    /// Subscribe `conn`: queue the reply, then the replay, atomically with respect to new
-    /// output (both happen under the output lock the reader takes). For an exited Terminal,
-    /// `term.exit` follows the replay. Returns Terminals whose queued output was dropped.
-    pub fn attach(&self, conn: ConnId, ob: &Arc<Outbox>, id: Option<u64>) -> Vec<Uuid> {
+    /// Subscribe `conn`: queue the reply (`{exitCode, cols, rows}`), then the replay (a
+    /// Mobile's is a shorter tail), atomically with respect to new output and size changes
+    /// (both happen under the size and output locks). For an exited Terminal, `term.exit`
+    /// follows the replay. Returns the overflows to recover, and whether no other connection
+    /// is attached.
+    pub fn attach(&self, conn: ConnId, ob: &Arc<Outbox>, id: Option<u64>) -> (Vec<Overflow>, bool) {
         let mut dropped = Vec::new();
+        let io = self.io.lock().unwrap();
         let mut o = self.out.lock().unwrap();
         if let Some(id) = id {
-            ob.push_control(Arc::from(encode_res(
-                id,
-                Ok(json!({ "exitCode": o.exit_code })),
-            )));
+            let (cols, rows) = io.arb.current();
+            let res = json!({ "exitCode": o.exit_code, "cols": cols, "rows": rows });
+            ob.push_about(self.id, Arc::from(encode_res(id, Ok(res))));
         }
-        let snap = o.replay.snapshot();
+        let snap = if ob.is_mobile() {
+            o.replay.snapshot_tail(self.mobile_replay_cap)
+        } else {
+            o.replay.snapshot()
+        };
         for piece in snap.chunks(REPLAY_CHUNK) {
-            dropped.extend(ob.push_output(self.id, Arc::from(piece)));
+            dropped.extend(overflowed(ob, ob.push_replay(self.id, Arc::from(piece))));
         }
+        let alone = o.subs.keys().all(|c| *c == conn);
         match o.exit_code {
             Some(code) => {
                 if let Some(f) = frame(&ServerMsg::TermExit {
                     terminal: self.id,
                     code,
                 }) {
-                    ob.push_control(f);
+                    ob.push_about(self.id, f);
                 }
             }
             None => {
                 o.subs.insert(conn, ob.clone());
             }
         }
-        dropped
+        (dropped, alone)
     }
 
-    pub fn detach(&self, conn: ConnId) {
-        self.io.lock().unwrap().arb.forget(conn);
-        self.out.lock().unwrap().subs.remove(&conn);
+    /// Unsubscribe `conn` and forget its size. A Mobile's output still queued is dropped.
+    /// Returns whether the size changed (an owning Mobile left; see [`SizeArbiter::forget`]).
+    pub fn detach(&self, conn: ConnId) -> bool {
+        let mut io = self.io.lock().unwrap();
+        let mut o = self.out.lock().unwrap();
+        if let Some(ob) = o.subs.remove(&conn) {
+            if ob.is_mobile() {
+                ob.cancel_output(self.id);
+            }
+        }
+        match io.arb.forget(conn) {
+            Some(sz) if Self::apply_size(&io, sz).is_ok() => {
+                self.notify_size(&o, sz);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Tell the attached Mobiles the size now applied.
+    fn notify_size(&self, o: &TermOutput, (cols, rows): (u16, u16)) {
+        let mut mobiles = o.subs.values().filter(|ob| ob.is_mobile()).peekable();
+        if mobiles.peek().is_none() {
+            return;
+        }
+        if let Some(f) = frame(&ServerMsg::TermSize {
+            terminal: self.id,
+            cols,
+            rows,
+        }) {
+            for ob in mobiles {
+                ob.push_size(self.id, f.clone());
+            }
+        }
+    }
+
+    /// Recover a Mobile connection's dropped output: the redraw nudge when nobody else is
+    /// attached, else (a nudge would reflow everyone's screen) a fresh tail of the replay in
+    /// place of what is still queued.
+    pub fn recover_mobile_overflow(self: &Arc<Self>, ob: &Arc<Outbox>, delay: Duration) {
+        let more = {
+            let o = self.out.lock().unwrap();
+            if !o.subs.values().any(|s| Arc::ptr_eq(s, ob)) {
+                return;
+            }
+            if o.subs.len() > 1 {
+                ob.drop_output(self.id);
+                let tail = o.replay.snapshot_tail(self.mobile_replay_cap);
+                let mut more = Vec::new();
+                for piece in tail.chunks(REPLAY_CHUNK) {
+                    more.extend(ob.push_output(self.id, Arc::from(piece)));
+                }
+                Some(more)
+            } else {
+                None
+            }
+        };
+        match more {
+            None => self.overflow_nudge(delay),
+            Some(more) if !more.is_empty() => {
+                crate::log!("WARN", "a Mobile's send queue overflowed again on recovery")
+            }
+            Some(_) => {}
+        }
     }
 
     fn apply_size(io: &TermIo, (cols, rows): (u16, u16)) -> Result<(), String> {
@@ -753,22 +834,31 @@ impl Terminal {
             .map_err(|e| format!("resize failed: {e}"))
     }
 
+    /// `conn` (a Mobile when `mobile`) resized its view; see [`SizeArbiter::on_resize`].
     /// Returns whether the PTY size changed.
-    pub fn resize(&self, conn: ConnId, cols: u16, rows: u16) -> Result<bool, String> {
+    pub fn resize(&self, conn: ConnId, cols: u16, rows: u16, mobile: bool) -> Result<bool, String> {
         let mut io = self.io.lock().unwrap();
-        match io.arb.on_resize(conn, cols, rows) {
-            Some(sz) => Self::apply_size(&io, sz).map(|_| true),
+        match io.arb.on_resize(conn, cols, rows, mobile) {
+            Some(sz) => {
+                Self::apply_size(&io, sz)?;
+                self.notify_size(&self.out.lock().unwrap(), sz);
+                Ok(true)
+            }
             None => Ok(false),
         }
     }
 
-    /// `conn` typed: it takes over the size. Returns whether the PTY size changed.
-    pub fn write_input(&self, conn: ConnId, data: String) -> Result<bool, String> {
+    /// `conn` (a Mobile when `mobile`) typed: it takes over the size. Returns whether the PTY
+    /// size changed.
+    pub fn write_input(&self, conn: ConnId, data: String, mobile: bool) -> Result<bool, String> {
         let changed = {
             let mut io = self.io.lock().unwrap();
-            match io.arb.on_input(conn) {
-                Some(sz) => Self::apply_size(&io, sz).is_ok(),
-                None => false,
+            match io.arb.on_input(conn, mobile) {
+                Some(sz) if Self::apply_size(&io, sz).is_ok() => {
+                    self.notify_size(&self.out.lock().unwrap(), sz);
+                    true
+                }
+                _ => false,
             }
         };
         let g = self.input.lock().unwrap();
@@ -1112,6 +1202,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         nudge_pending: AtomicBool::new(false),
         last_overflow_nudge: Mutex::new(None),
         persist_pending: AtomicBool::new(false),
+        mobile_replay_cap: d.cfg.mobile_replay_cap,
         kept_leader: p.leader,
         run: d.next_run.fetch_add(1, Ordering::SeqCst),
         status: Mutex::new(status),
@@ -1459,6 +1550,153 @@ mod status_tests {
         assert!(event(&mut c, AgentStatus::Working, 9000));
         c.raise_floor(5000);
         assert_eq!(c.listed().1, Some(9000));
+    }
+
+    /// A Relaunch's replacement starts at the size read before it started; a size taken on
+    /// the old Terminal after that (late input) is applied to it at the hand-over, and the
+    /// attached Mobiles are told. The replacement is a real process: its PTY's size is read
+    /// back.
+    #[cfg(unix)]
+    #[test]
+    fn hand_over_applies_a_size_taken_while_the_replacement_started() {
+        use super::super::outbox::{Out, PaceCfg};
+        let dir = tempfile::tempdir().unwrap();
+        let d = super::super::role::tests::daemon(dir.path());
+        let id = Uuid::new_v4();
+        let persisted = || PersistedTerminal {
+            terminal: id,
+            spec: LaunchSpec {
+                agent: Some("claude".into()),
+                ..Default::default()
+            },
+            meta: Map::new(),
+            cols: 80,
+            rows: 24,
+            created_at_ms: 0,
+            leader: None,
+        };
+        let prev = unresolved(&d, persisted());
+        let prog = dir.path().join("quiet");
+        std::fs::write(&prog, "#!/bin/sh\nexec sleep 100\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = LaunchSpec {
+            cwd: dir.path().to_string_lossy().into_owned(),
+            shell_mode: Some("raw".into()),
+            shell_command: Some(prog.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        // Started at the size read before the late input.
+        let next = spawn(&d, id, spec, Map::new(), 80, 24, 0).unwrap();
+        let pty_size = |t: &Terminal| {
+            let io = t.io.lock().unwrap();
+            let s = io.master.as_ref().unwrap().get_size().unwrap();
+            (s.cols, s.rows)
+        };
+        assert_eq!(pty_size(&next), (80, 24));
+        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None);
+        let pace = PaceCfg {
+            idle: Duration::from_secs(1),
+            burst: Duration::from_millis(100),
+            window: Duration::from_secs(3),
+        };
+        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace));
+        {
+            let mut o = prev.out.lock().unwrap();
+            o.subs.insert(1, desk.clone());
+            o.subs.insert(2, mob.clone());
+        }
+        // The Mobile typed after the replacement started at 80×24.
+        prev.io.lock().unwrap().arb.on_resize(2, 40, 20, true);
+        prev.io.lock().unwrap().arb.on_input(2, true);
+        prev.hand_over(&next);
+        assert_eq!(next.io.lock().unwrap().arb.current(), (40, 20));
+        assert_eq!(
+            pty_size(&next),
+            (40, 20),
+            "the replacement's PTY was not resized"
+        );
+        assert_eq!(next.attached(), 2);
+        let kinds = |ob: &Outbox| -> Vec<String> {
+            ob.take_all()
+                .into_iter()
+                .map(|o| match o {
+                    Out::Output { urgent, .. } => format!("output urgent={urgent}"),
+                    Out::Size { frame, .. } => String::from_utf8_lossy(&frame[5..]).into(),
+                    _ => "other".into(),
+                })
+                .collect()
+        };
+        assert_eq!(kinds(&desk), vec!["output urgent=true"]);
+        assert_eq!(
+            kinds(&mob),
+            vec![
+                "output urgent=true".to_string(),
+                format!(r#"{{"t":"term.size","terminal":"{id}","cols":40,"rows":20}}"#)
+            ]
+        );
+        // Unchanged size: no notice.
+        let third = unresolved(&d, persisted());
+        third.io.lock().unwrap().arb = SizeArbiter::new(40, 20);
+        next.hand_over(&third);
+        assert_eq!(kinds(&mob), vec!["output urgent=true"]);
+        next.kill(Duration::from_millis(100));
+        assert!(next.wait_exited(Instant::now() + Duration::from_secs(5)));
+    }
+
+    /// An overflow recovered with a fresh replay keeps the size notice still queued.
+    #[test]
+    fn mobile_overflow_recovery_keeps_the_size_notice() {
+        use super::super::outbox::{Out, PaceCfg};
+        let dir = tempfile::tempdir().unwrap();
+        let d = super::super::role::tests::daemon(dir.path());
+        let t = unresolved(
+            &d,
+            PersistedTerminal {
+                terminal: Uuid::new_v4(),
+                spec: LaunchSpec::default(),
+                meta: Map::new(),
+                cols: 80,
+                rows: 24,
+                created_at_ms: 0,
+                leader: None,
+            },
+        );
+        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None);
+        let pace = PaceCfg {
+            idle: Duration::from_secs(1),
+            burst: Duration::from_millis(100),
+            window: Duration::from_secs(3),
+        };
+        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace));
+        {
+            let mut o = t.out.lock().unwrap();
+            o.subs.insert(1, desk.clone());
+            o.subs.insert(2, mob.clone());
+            mob.push_output(t.id, Arc::from(&b"stale"[..]));
+            t.notify_size(&o, (40, 20));
+            mob.push_output(t.id, Arc::from(&b"more"[..]));
+        }
+        t.recover_mobile_overflow(&mob, Duration::from_millis(10));
+        let got: Vec<String> = mob
+            .take_all()
+            .into_iter()
+            .map(|o| match o {
+                Out::Output { data, .. } => format!("out {}", String::from_utf8_lossy(&data)),
+                Out::Size { frame, .. } => String::from_utf8_lossy(&frame[5..]).into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                format!(
+                    r#"{{"t":"term.size","terminal":"{}","cols":40,"rows":20}}"#,
+                    t.id
+                ),
+                "out \u{1b}c".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -44,7 +44,11 @@ fn open_attach_replay() {
     let t = Uuid::new_v4();
     let ok = a.open(t, sh_spec(&h.project("p")));
     assert!(ok_pid(&ok) > 1);
-    assert_eq!(a.attach(t), json!({"exitCode": null}));
+    // The size is the one `term.open` gave (`open_msg`: 80×24).
+    assert_eq!(
+        a.attach(t),
+        json!({"exitCode": null, "cols": 80, "rows": 24})
+    );
     a.marker(t, "abc");
 
     let mut b = client(&srv);
@@ -291,7 +295,10 @@ fn attach_exited_sends_exit_after_replay() {
     let mut b = client(&srv);
     let id = b.request_id();
     b.send(&ClientMsg::TermAttach { terminal: t }, Some(id));
-    assert_eq!(b.wait_res(id).unwrap(), json!({"exitCode": 7}));
+    assert_eq!(
+        b.wait_res(id).unwrap(),
+        json!({"exitCode": 7, "cols": 80, "rows": 24})
+    );
     b.output_until(t, "bye");
     assert_eq!(exit_of(&mut b, t), 7);
     let res = b

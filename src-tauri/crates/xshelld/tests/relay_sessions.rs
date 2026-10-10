@@ -631,3 +631,57 @@ fn mobile_signed_roster_is_refused_by_every_device() {
     assert!(srv.connections() <= base + 1);
     ring.quit();
 }
+
+/// The Terminal View through the Relay bridge: the attach `res` carries the size and the
+/// replay follows; output is paced; the phone's resize is recorded until it types, and then
+/// it is told the size it took.
+#[test]
+fn mobile_terminal_view_over_relay() {
+    use xshell_protocol::msg::ServerMsg;
+    let s = setup();
+    let project = s.h.project("p");
+    std::fs::write(
+        project.join("agent.sh"),
+        "trap 'echo \"size $(stty size)\"' WINCH\necho ready\n\
+         while :; do echo tick; sleep 0.02; done\n",
+    )
+    .unwrap();
+    let fake = Fake::in_dir(&project);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let mut d = Client::in_process(&s.srv, Role::Desktop);
+    let term = Uuid::new_v4();
+    d.open(term, claude_spec(&project, None));
+    d.resize(term, 100, 30);
+    d.attach(term);
+    d.output_until(term, "ready");
+    d.drain_for(Duration::from_millis(400));
+    d.skip_output(term);
+
+    let phone = Peer::new(&s.r, &s.ring.chain, &s.mobile);
+    let mut c = phone.client(&s.daemon);
+    let attached = Instant::now();
+    assert_eq!(
+        c.request(&ClientMsg::TermAttach { terminal: term }),
+        Ok(json!({ "exitCode": null, "cols": 100, "rows": 30 }))
+    );
+    c.output_until(term, "tick");
+    // Idle: about one frame per second.
+    c.drain_for(Duration::from_millis(2500).saturating_sub(attached.elapsed()));
+    let frames = c
+        .log
+        .iter()
+        .filter(|e| matches!(e, Ev::Out(t, _) if *t == term))
+        .count();
+    assert!((2..=4).contains(&frames), "{frames} frames in 2.5 s");
+    // Viewing never resizes; typing claims the recorded size.
+    c.resize(term, 40, 20);
+    assert!(d
+        .try_output_until(term, b"size ", Duration::from_millis(500))
+        .is_none());
+    c.input(term, "\r");
+    d.output_until(term, "size 20 40");
+    c.expect_msg(
+        "term.size",
+        |m| matches!(m, ServerMsg::TermSize { terminal, cols: 40, rows: 20 } if *terminal == term),
+    );
+}

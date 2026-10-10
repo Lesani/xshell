@@ -39,6 +39,13 @@ pub const CAPABILITIES: &[&str] = &[
     // `session.subscribe`, `session.page`, `session.unsubscribe` and `session.append`: an
     // agent Terminal's conversation for the Chat View.
     "session.stream",
+    // The Mobile's Terminal View: a Mobile's `term.resize` records its size without applying
+    // it, and its `term.input` claims it; `term.size` notices to attached Mobiles; output to a
+    // Mobile paced (at most one frame per Terminal per second, ten per second for three
+    // seconds after its input); the attach `res` carries `{exitCode, cols, rows}`; a Mobile's
+    // attach nudges only when nobody else is attached; a Mobile's replay is a shorter tail;
+    // the size goes back to the last Desktop that held it when an owning Mobile leaves.
+    "term.mobile",
 ];
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -87,6 +94,11 @@ mod tests {
     #[test]
     fn capabilities_include_session_stream() {
         assert!(CAPABILITIES.contains(&"session.stream"));
+    }
+
+    #[test]
+    fn capabilities_include_term_mobile() {
+        assert!(CAPABILITIES.contains(&"term.mobile"));
     }
 
     #[test]

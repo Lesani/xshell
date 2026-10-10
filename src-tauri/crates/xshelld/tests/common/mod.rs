@@ -257,7 +257,8 @@ pub fn fake_claude_with(h: &TestHome, trap: &str, body: &str) -> Fake {
 /// Fake `claude`, `codex` and `cursor-agent` for in-process servers, whose Terminals inherit
 /// this test process's environment: one shared directory, put in front of `PATH` once per
 /// test binary. Each launch ignores SIGHUP, logs into its working directory (see
-/// [`Fake::in_dir`]), prints `pid <pid> size <rows> <cols> args <argv>.` and sleeps.
+/// [`Fake::in_dir`]), prints `pid <pid> size <rows> <cols> args <argv>.`, runs
+/// `./agent.sh` (sourced) if its working directory has one, and sleeps.
 pub fn shared_fake_agents() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -269,7 +270,8 @@ pub fn shared_fake_agents() {
             fs::write(
                 &tmp,
                 "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> argv.log\necho $$ >> pids.log\n\
-                 echo \"pid $$ size $(stty size) args $*.\"\nexec sleep 1000\n",
+                 echo \"pid $$ size $(stty size) args $*.\"\n\
+                 if [ -f ./agent.sh ]; then . ./agent.sh; fi\nexec sleep 1000\n",
             )
             .unwrap();
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -595,8 +597,10 @@ pub enum Ev {
 /// order; `expect_msg` consumes messages, output accumulates per Terminal.
 pub struct Client {
     w: Box<dyn Write + Send>,
-    rx: Receiver<Option<Frame>>,
+    rx: Receiver<Option<(Instant, Frame)>>,
     pub log: Vec<Ev>,
+    /// When each `log` entry arrived (read off the socket).
+    pub at: Vec<Instant>,
     consumed: HashSet<usize>,
     pub out: HashMap<Uuid, Vec<u8>>,
     marks: HashMap<Uuid, usize>,
@@ -642,7 +646,7 @@ impl Client {
             loop {
                 match read_frame(&mut r, MAX_FRAME_LEN) {
                     Ok(Some(f)) => {
-                        if tx.send(Some(f)).is_err() {
+                        if tx.send(Some((Instant::now(), f))).is_err() {
                             return;
                         }
                     }
@@ -657,6 +661,7 @@ impl Client {
             w: Box::new(w),
             rx,
             log: Vec::new(),
+            at: Vec::new(),
             consumed: HashSet::new(),
             out: HashMap::new(),
             marks: HashMap::new(),
@@ -694,12 +699,13 @@ impl Client {
         }
         let left = deadline.saturating_duration_since(Instant::now());
         match self.rx.recv_timeout(left) {
-            Ok(Some(Frame::Json(j))) => {
+            Ok(Some((at, Frame::Json(j)))) => {
                 let m = decode_server(&j).unwrap_or_else(|e| panic!("bad server message: {e}"));
                 self.log.push(Ev::Msg(m));
+                self.at.push(at);
                 true
             }
-            Ok(Some(Frame::Output { terminal, data })) => {
+            Ok(Some((at, Frame::Output { terminal, data }))) => {
                 let buf = self.out.entry(terminal).or_default();
                 buf.extend_from_slice(&data);
                 if self.quiet {
@@ -711,10 +717,11 @@ impl Client {
                     }
                 } else {
                     self.log.push(Ev::Out(terminal, data));
+                    self.at.push(at);
                 }
                 true
             }
-            Ok(Some(Frame::Unknown { .. })) => true,
+            Ok(Some((_, Frame::Unknown { .. }))) => true,
             Ok(None) | Err(RecvTimeoutError::Disconnected) => {
                 self.eof = true;
                 false

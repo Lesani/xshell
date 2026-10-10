@@ -533,7 +533,8 @@ impl Link {
                 Ok(ServerMsg::Error { message, .. }) => {
                     *self.remote_error.lock().unwrap() = Some(message);
                 }
-                Ok(ServerMsg::Hello(_)) => {}
+                // For Mobiles only; a Desktop is never sent one.
+                Ok(ServerMsg::Hello(_) | ServerMsg::TermSize { .. }) => {}
                 // The Desktop subscribes to no conversation yet.
                 Ok(ServerMsg::SessionAppend { .. }) => {}
                 // A newer Daemon's message type: additive, skip it.

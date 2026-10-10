@@ -2,11 +2,13 @@
 //! Daemon lifecycle.
 //!
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
-//! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
-//! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status),
-//! `Terminal.last_line`, the last-line worker's queue and the session-stream queue are taken
-//! last, and nothing is locked while one is held (the session-stream worker queues its
-//! results under the registry lock, like every publish: `Registry` → `Outbox`). No lock is held across a blocking PTY or
+//! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox` (a connection's send queue,
+//! the last lock wherever it is taken: size notices are queued holding `io` and `out`);
+//! `Terminal.life` and `Terminal.input` are taken last and alone; `Terminal.status` (the Agent
+//! Status), `Terminal.last_line`, the last-line worker's queue and the session-stream queue
+//! are taken last, and nothing is locked while one is held (the session-stream worker queues
+//! its results under the registry lock, like every publish: `Registry` → `Outbox`). No lock
+//! is held across a blocking PTY or
 //! socket write: writers own their sockets, input threads own PTY writers. The push
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
@@ -70,6 +72,13 @@ pub struct Config {
     pub conn_total_cap: usize,
     /// Gap between the two size changes of a redraw nudge.
     pub nudge_delay: Duration,
+    /// A Mobile gets a Terminal's output at most once per this interval…
+    pub mobile_frame_idle: Duration,
+    /// …and at most once per this one for `mobile_burst_window` after it typed.
+    pub mobile_frame_burst: Duration,
+    pub mobile_burst_window: Duration,
+    /// The most of a Terminal's replay buffer a Mobile is sent when it attaches.
+    pub mobile_replay_cap: usize,
     pub max_calls_per_conn: usize,
     /// Size changes are persisted at most this often per Terminal.
     pub resize_persist_delay: Duration,
@@ -263,6 +272,10 @@ impl Config {
             conn_output_cap: 8 * 1024 * 1024,
             conn_total_cap: 16 * 1024 * 1024,
             nudge_delay: Duration::from_millis(60),
+            mobile_frame_idle: Duration::from_secs(1),
+            mobile_frame_burst: Duration::from_millis(100),
+            mobile_burst_window: Duration::from_secs(3),
+            mobile_replay_cap: 256 * 1024,
             max_calls_per_conn: 32,
             resize_persist_delay: Duration::from_secs(1),
             max_terminal_bytes: 256 * 1024,
