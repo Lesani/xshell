@@ -48,6 +48,8 @@ pub enum ClientMsg {
         #[serde(default)]
         params: Value,
     },
+    /// Start a Terminal. Answered with [`OpenReply`]; with `adoptExisting` (capability
+    /// `term.open-existing`) the answer may name the Terminal that already runs the session.
     #[serde(rename = "term.open")]
     TermOpen { spec: OpenSpec },
     #[serde(rename = "term.attach")]
@@ -243,6 +245,33 @@ pub const SUBMIT_STUCK: &str = "terminal input is stuck";
 /// agent but Enter was not typed (the agent stopped accepting the reply in between, or the
 /// Terminal ended). The text may be waiting in the agent's composer.
 pub const SUBMIT_UNCONFIRMED: &str = "reply pasted but not submitted";
+
+/// The refusal of a `term.open` that resumes an agent session another listed Terminal runs
+/// (capability `term.open-existing`): the client did not set `adoptExisting`, it may not see
+/// that Terminal, or the open carries a first message. Nothing was started. A client that may
+/// see that Terminal gets its UUID after `": "`. Never contains "already exists" (that names a
+/// reused Terminal UUID).
+pub const SESSION_OPEN: &str = "session is open in another terminal";
+/// The refusal of a `term.open` that resumes an agent session whose Terminal is being closed
+/// (capability `term.open-existing`). Nothing was started; retry once it has left the list.
+pub const SESSION_CLOSING: &str = "session is still closing; try again";
+
+/// The answer to a `term.open`. A Daemon without capability `term.open-existing` answers
+/// only `pid`, which reads as `terminal: None, existed: false`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenReply {
+    /// The process id of the Terminal's agent or shell (`None` once it has exited).
+    pub pid: Option<u32>,
+    /// The Terminal that runs the spec: the requested one, or (`existed`) the listed Terminal
+    /// that already runs its agent session.
+    #[serde(default)]
+    pub terminal: Option<Uuid>,
+    /// Nothing was started: `terminal` already ran this agent session (only with
+    /// `adoptExisting`).
+    #[serde(default)]
+    pub existed: bool,
+}
 
 /// Why [`submit_text`] refused a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +682,11 @@ pub struct OpenSpec {
     /// refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_message: Option<String>,
+    /// Gated on capability `term.open-existing`: when a listed Terminal already runs this
+    /// spec's agent session, answer that Terminal ([`OpenReply::existed`]) instead of refusing
+    /// with [`SESSION_OPEN`]. A second agent is never started on one session either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub adopt_existing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -988,9 +1022,68 @@ mod tests {
                     rows: 24,
                     meta,
                     first_message: None,
+                    adopt_existing: false,
                 }
             }
         );
+    }
+
+    #[test]
+    fn open_spec_adopt_existing_golden() {
+        let id = Uuid::new_v4();
+        let spec = OpenSpec {
+            terminal: id,
+            launch: LaunchSpec {
+                agent: Some("claude".into()),
+                session_id: Some("s".into()),
+                cwd: "/x".into(),
+                ..Default::default()
+            },
+            cols: 80,
+            rows: 24,
+            adopt_existing: true,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["adoptExisting"], json!(true));
+        assert!(v.get("adopt_existing").is_none());
+        assert_eq!(serde_json::from_value::<OpenSpec>(v).unwrap(), spec);
+        let off = serde_json::to_value(OpenSpec {
+            adopt_existing: false,
+            ..spec.clone()
+        })
+        .unwrap();
+        assert!(off.get("adoptExisting").is_none(), "{off}");
+        let old = json!({"terminal":id,"sessionId":"s","cwd":"/x","cols":80,"rows":24});
+        assert!(
+            !serde_json::from_value::<OpenSpec>(old)
+                .unwrap()
+                .adopt_existing
+        );
+    }
+
+    #[test]
+    fn open_reply_reads_older_daemons() {
+        let old: OpenReply = serde_json::from_value(json!({"pid":7})).unwrap();
+        assert_eq!(
+            old,
+            OpenReply {
+                pid: Some(7),
+                terminal: None,
+                existed: false
+            }
+        );
+        let id = Uuid::new_v4();
+        let full = OpenReply {
+            pid: None,
+            terminal: Some(id),
+            existed: true,
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v, json!({"pid":null,"terminal":id,"existed":true}));
+        assert_eq!(serde_json::from_value::<OpenReply>(v).unwrap(), full);
+        assert!(!SESSION_OPEN.contains("already exists"));
+        assert!(!SESSION_CLOSING.contains("already exists"));
     }
 
     #[test]

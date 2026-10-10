@@ -48,6 +48,24 @@ impl LaunchSpec {
                 .unwrap_or("claude"),
         )
     }
+
+    /// The agent session this spec runs, as (agent, session id): `agent` (or `"claude"` when
+    /// it is unset or empty) and a non-empty `session_id`. `None` for a raw shell and for a
+    /// spec without a session id. Wrapped agents and launch prefixes count too: they resume
+    /// the same session. A Host runs one session in at most one live Terminal (capability
+    /// `term.open-existing`); the Daemon and the Mobile share this one key.
+    pub fn agent_session(&self) -> Option<(&str, &str)> {
+        if self.shell_mode.as_deref() == Some("raw") {
+            return None;
+        }
+        let sid = self.session_id.as_deref().filter(|s| !s.is_empty())?;
+        let agent = self
+            .agent
+            .as_deref()
+            .filter(|a| !a.is_empty())
+            .unwrap_or("claude");
+        Some((agent, sid))
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +155,49 @@ mod tests {
         for s in not_direct() {
             assert_eq!(s.direct_agent(), None, "{s:?}");
         }
+    }
+
+    #[test]
+    fn agent_session_rules() {
+        assert_eq!(agent("/p").agent_session(), Some(("claude", "s1")));
+        // A raw shell never runs a session, even with a stray id.
+        assert_eq!(
+            LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..agent("/p")
+            }
+            .agent_session(),
+            None
+        );
+        for sid in [None, Some(String::new())] {
+            let s = LaunchSpec {
+                session_id: sid,
+                ..agent("/p")
+            };
+            assert_eq!(s.agent_session(), None, "{s:?}");
+        }
+        for a in [None, Some(String::new())] {
+            let s = LaunchSpec {
+                agent: a,
+                ..agent("/p")
+            };
+            assert_eq!(s.agent_session(), Some(("claude", "s1")), "{s:?}");
+        }
+        let codex = LaunchSpec {
+            agent: Some("codex".into()),
+            ..agent("/p")
+        };
+        assert_eq!(codex.agent_session(), Some(("codex", "s1")));
+        // Wrapped and prefixed launches resume the same session.
+        let wrapped = LaunchSpec {
+            shell_id: Some("bash".into()),
+            ..agent("/p")
+        };
+        assert_eq!(wrapped.agent_session(), Some(("claude", "s1")));
+        let prefixed = LaunchSpec {
+            launch_prefix: Some(vec!["env".into()]),
+            ..agent("/p")
+        };
+        assert_eq!(prefixed.agent_session(), Some(("claude", "s1")));
     }
 }

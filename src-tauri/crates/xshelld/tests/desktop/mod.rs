@@ -203,12 +203,14 @@ pub fn open(h: &HostHandle, t: Uuid, launch: LaunchSpec, sink: Arc<VecSink>) -> 
                 rows: 24,
                 meta: Map::new(),
                 first_message: None,
+                adopt_existing: false,
             },
             sink,
             w,
         )
     })
     .unwrap_or_else(|e| panic!("term_open: {e:?}"))
+    .pid
 }
 
 pub fn attach(h: &HostHandle, t: Uuid, sink: Arc<VecSink>) -> Option<i32> {

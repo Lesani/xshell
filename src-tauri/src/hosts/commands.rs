@@ -131,7 +131,18 @@ pub async fn host_call(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenResult {
+    pid: Option<u32>,
+    /// The Terminal that runs the spec: the requested one, or (`existed`) the one that
+    /// already ran its agent session. `None` from a Daemon that predates this.
+    terminal: Option<String>,
+    /// Nothing was started: `terminal` already ran this agent session.
+    existed: bool,
+}
+
+#[derive(Serialize)]
+pub struct RelaunchResult {
     pid: Option<u32>,
 }
 
@@ -154,8 +165,11 @@ pub async fn host_term_open(
     rows: u16,
     on_data: Channel<Response>,
     on_exit: Channel<RemoteExit>,
+    adopt: Option<bool>,
 ) -> Result<OpenResult, HostError> {
     let h = handle(&state, &host)?;
+    // `adopt`: answer the Terminal that already runs this agent session instead of a refusal
+    // (only a Daemon with capability `term.open-existing`). Local migration leaves it off.
     let open = OpenSpec {
         terminal: uuid(&terminal)?,
         launch: spec,
@@ -163,13 +177,18 @@ pub async fn host_term_open(
         rows,
         meta,
         first_message: None,
+        adopt_existing: adopt.unwrap_or(false),
     };
     let sink = Arc::new(ChannelSink {
         data: on_data,
         exit: on_exit,
     });
-    let pid = reply(|w| h.term_open(open, sink, w)).await?;
-    Ok(OpenResult { pid })
+    let r = reply(|w| h.term_open(open, sink, w)).await?;
+    Ok(OpenResult {
+        pid: r.pid,
+        terminal: r.terminal.map(|t| t.to_string()),
+        existed: r.existed,
+    })
 }
 
 #[tauri::command]
@@ -260,11 +279,11 @@ pub async fn host_term_relaunch(
     host: String,
     terminal: String,
     skip_permissions: bool,
-) -> Result<OpenResult, HostError> {
+) -> Result<RelaunchResult, HostError> {
     let h = handle(&state, &host)?;
     let t = uuid(&terminal)?;
     let pid = reply(|w| h.term_relaunch(t, skip_permissions, w)).await?;
-    Ok(OpenResult { pid })
+    Ok(RelaunchResult { pid })
 }
 
 #[tauri::command]

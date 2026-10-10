@@ -27,7 +27,6 @@ use xshelld::server::{Config, PushHooks, PushPoint, Role};
 
 use AgentStatus::*;
 
-const SID: &str = "11111111-2222-3333-4444-555555555555";
 /// The push window in these tests.
 const W: Duration = Duration::from_millis(1000);
 /// Long enough to be sure nothing more comes.
@@ -190,7 +189,8 @@ impl P {
             f(LaunchSpec {
                 agent: Some(agent.into()),
                 shell_mode: Some("claude".into()),
-                session_id: Some(SID.into()),
+                // A session of its own: a Host runs one session in one Terminal only.
+                session_id: Some(Uuid::new_v4().to_string()),
                 cwd: cwd.to_string_lossy().into_owned(),
                 ..Default::default()
             }),
@@ -608,7 +608,7 @@ fn registration_survives_restart_mode_0600() {
     let cwd = h.project("app2");
     let _reaper = FakeReaper(cwd.join("pids.log"));
     let t = Uuid::new_v4();
-    desk.open(t, claude_spec(&cwd, Some(SID)));
+    desk.open(t, claude_spec(&cwd, Some(&Uuid::new_v4().to_string())));
     let run = wait_run(&cwd, t, None);
     desk.request(&ClientMsg::TermEvent {
         terminal: t,
@@ -776,7 +776,7 @@ fn relay_without_push_cap_gets_no_push_frames() {
     let cwd = s.h.project("app");
     let _reaper = FakeReaper(cwd.join("pids.log"));
     let t = Uuid::new_v4();
-    desk.open(t, claude_spec(&cwd, Some(SID)));
+    desk.open(t, claude_spec(&cwd, Some(&Uuid::new_v4().to_string())));
     let run = wait_run(&cwd, t, None);
     desk.request(&ClientMsg::TermEvent {
         terminal: t,
@@ -1086,7 +1086,7 @@ fn a_seq_that_cannot_be_saved_is_never_sent() {
     let cwd = h.project("app2");
     let _reaper = FakeReaper(cwd.join("pids.log"));
     let t = Uuid::new_v4();
-    desk.open(t, claude_spec(&cwd, Some(SID)));
+    desk.open(t, claude_spec(&cwd, Some(&Uuid::new_v4().to_string())));
     let run = wait_run(&cwd, t, None);
     desk.request(&ClientMsg::TermEvent {
         terminal: t,
@@ -1141,7 +1141,7 @@ fn shutdown_waits_for_a_held_save() {
     let cwd = h.project("app2");
     let _reaper = FakeReaper(cwd.join("pids.log"));
     let t = Uuid::new_v4();
-    desk.open(t, claude_spec(&cwd, Some(SID)));
+    desk.open(t, claude_spec(&cwd, Some(&Uuid::new_v4().to_string())));
     let run = wait_run(&cwd, t, None);
     desk.request(&ClientMsg::TermEvent {
         terminal: t,

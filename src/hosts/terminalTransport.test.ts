@@ -471,3 +471,40 @@ describe("local Daemon Tabs (terminal set, no host) route host_term_* with \"loc
     expect(calls("host_term_detach")).toEqual([["host_term_detach", { host: "local", terminal: "l2" }]]);
   });
 });
+
+describe("an open answered with the Terminal that already runs its session (xshell#41)", () => {
+  it("asks the Daemon to adopt, then hands the Tab over to the owner and never closes it", async () => {
+    const rt = new RemoteTerminals();
+    invoke.mockImplementation((cmd: string) => (cmd === "host_term_open" ? Promise.resolve({ pid: 7, terminal: "owner", existed: true }) : Promise.resolve()));
+    pendingOpens.set("u20", { host: H, spec: { cwd: "/p", agent: "claude", sessionId: "s1" }, meta: {}, state: "opening" });
+    const adopted: unknown[] = [];
+    const off = rt.onAdopted(a => adopted.push(a));
+    const g = rt.mount(H, "u20", sinks().s);
+    const r = await rt.start(H, "u20", g, opts);
+    expect(calls("host_term_open")[0][1]).toMatchObject({ terminal: "u20", adopt: true });
+    expect(r).toEqual({ kind: "opened", exitCode: null, pid: 7, adoptedBy: "owner" });
+    expect(adopted).toEqual([{ host: H, from: "u20", to: "owner" }]);
+    expect(pendingOpens.has("u20")).toBe(false);
+    // Nothing runs under the Tab's UUID: unmounting and closing it touch nothing on the Host.
+    rt.unmount("u20", g);
+    await rt.close(H, "u20");
+    expect(calls("host_term_detach")).toEqual([]);
+    expect(calls("host_term_close")).toEqual([]);
+    off();
+  });
+
+  it("a started Terminal (or an older Daemon's bare pid) is no adoption", async () => {
+    const rt = new RemoteTerminals();
+    const adopted: unknown[] = [];
+    rt.onAdopted(a => adopted.push(a));
+    const cases: [string, { pid: number; terminal?: string; existed?: boolean }][] = [["u21", { pid: 8, terminal: "u21", existed: false }], ["u22", { pid: 9 }]];
+    for (const [uuid, reply] of cases) {
+      invoke.mockImplementation((cmd: string) => (cmd === "host_term_open" ? Promise.resolve(reply) : Promise.resolve()));
+      pendingOpens.set(uuid, { host: H, spec: { cwd: "/p" }, meta: {}, state: "opening" });
+      const r = await rt.start(H, uuid, rt.mount(H, uuid, sinks().s), opts);
+      expect(r).toEqual({ kind: "opened", exitCode: null, pid: reply.pid });
+      expect(pendingOpens.get(uuid)?.state).toBe("sent");
+    }
+    expect(adopted).toEqual([]);
+  });
+});

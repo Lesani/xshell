@@ -721,6 +721,7 @@ fn mobile_answers_prompt_over_relay() {
             rows: 30,
             meta: Default::default(),
             first_message: None,
+            adopt_existing: false,
         },
     })
     .unwrap();

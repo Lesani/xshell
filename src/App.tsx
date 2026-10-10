@@ -26,7 +26,7 @@ import { asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey,
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
 import { cache } from "./hosts/cache";
-import { applyFocusRemovals, applyGroupRemovals, applyTabDeltas, reconcileHosts } from "./hosts/reconcile";
+import { adoptTab, applyFocusRemovals, dissolveSmallGroups, keepsFocusWhenListed, applyGroupRemovals, applyTabDeltas, focusOf, reconcileHosts, remoteTabId, type Focus } from "./hosts/reconcile";
 import { localEdits, metaSync } from "./hosts/metaSync";
 import { planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
@@ -885,23 +885,25 @@ export default function App() {
     return plan.tab;
   }, [showNotice]);
 
+  // Show a Tab: a Tab inside a group surfaces that group with the matching pane focused.
+  const applyFocus = useCallback((f: Focus) => {
+    setActiveTabId(f.activeTabId);
+    if (f.leaf) {
+      const { groupId, tabId } = f.leaf;
+      setActiveLeafByGroup(prev => ({ ...prev, [groupId]: tabId }));
+    }
+  }, []);
+
   // Amendment 18: one host-aware open path for every session-open entry point.
   const openSession = useCallback((session: SessionInfo, project: ProjectInfo | undefined, opts: { background: boolean }) => {
     const plan = planOpenSession(session, project, tabs, openContext());
     if (plan.kind === "focus") {
       if (opts.background) return;
-      const existingTab = plan.tab;
-      if (existingTab.groupId) {
-        // Tab lives inside a group — surface that group and focus the matching pane.
-        setActiveTabId(existingTab.groupId);
-        setActiveLeafByGroup(prev => ({ ...prev, [existingTab.groupId!]: existingTab.id }));
-      } else {
-        setActiveTabId(existingTab.id);
-      }
+      applyFocus(focusOf(plan.tab));
       return;
     }
     applyPlan(plan, !opts.background);
-  }, [tabs, openContext, applyPlan]);
+  }, [tabs, openContext, applyPlan, applyFocus]);
 
   const handleOpenSession = useCallback((session: SessionInfo, project?: ProjectInfo) => openSession(session, project, { background: false }), [openSession]);
   // Add as tab without switching to it — stays on current view.
@@ -1024,6 +1026,8 @@ export default function App() {
   useEffect(() => { groupsRef.current = groups; }, [groups]);
   // Which leaf inside an active group currently has focus (receives input).
   const [activeLeafByGroup, setActiveLeafByGroup] = useState<Record<string, string>>({});
+  const activeLeafByGroupRef = useRef<Record<string, string>>({});
+  useEffect(() => { activeLeafByGroupRef.current = activeLeafByGroup; }, [activeLeafByGroup]);
   // Live drag state: which tab is being dragged, which leaf it's hovering over, which edge zone.
   const [dragOver, setDragOver] = useState<{ tabId: string; targetTabId: string | null; zone: DropZone | null } | null>(null);
   // Pointer position for rendering the floating drag ghost.
@@ -1132,6 +1136,33 @@ export default function App() {
     setReconcileTick(n => n + 1);
     showNotice(f.error);
   }), [showNotice]);
+  // xshell#41: the Host answered an open with the Terminal that already runs its agent
+  // session. The pending Tab gives way to that Terminal's Tab, which the user lands on if
+  // they were looking at the pending one: now, or once the Host lists it.
+  const focusWhenListedRef = useRef<string | null>(null);
+  useEffect(() => remoteTerminals.onAdopted(a => {
+    const r = adoptTab({ tabs: tabsRef.current, groups: groupsRef.current, activeLeafByGroup: activeLeafByGroupRef.current }, activeTabIdRef.current, a.from, a.to);
+    remoteTerminals.forget(a.from);
+    const removed = r.removed;
+    if (removed.length) {
+      for (const id of removed) metaSync.forget(id);
+      setTabs(prev => prev.filter(t => !removed.includes(t.id)));
+      setGroups(prev => applyGroupRemovals(prev, removed));
+      setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, removed), removed));
+    }
+    if (r.focus) applyFocus(r.focus);
+    if (r.focusWhenListed) focusWhenListedRef.current = r.focusWhenListed;
+  }), [applyFocus]);
+  useEffect(() => {
+    const want = focusWhenListedRef.current;
+    if (!want) return;
+    const t = tabs.find(x => x.id === remoteTabId(want));
+    if (!t) return;
+    focusWhenListedRef.current = null;
+    applyFocus(focusOf(t));
+  }, [tabs, applyFocus]);
+  // The user went elsewhere meanwhile: never pull them back.
+  useEffect(() => { if (!keepsFocusWhenListed(activeTabId)) focusWhenListedRef.current = null; }, [activeTabId]);
   useEffect(() => {
     if (!tabsRestored) return;
     const fresh: [HostId, TerminalInfo[]][] = []; // by wire id ("local" included)
@@ -1198,28 +1229,12 @@ export default function App() {
 
   // Dissolve a group when it has 0 or 1 leaves left; 1-leaf groups are pointless.
   useEffect(() => {
-    const dissolved: string[] = [];
-    const updatedTabs: Tab[] = [];
-    let changed = false;
-    for (const g of groups) {
-      const leaves = collectLeafIds(g.layout);
-      if (leaves.length <= 1) {
-        dissolved.push(g.id);
-        changed = true;
-      }
-    }
-    if (!changed) return;
-    for (const t of tabs) {
-      if (t.groupId && dissolved.includes(t.groupId)) updatedTabs.push({ ...t, groupId: undefined });
-      else updatedTabs.push(t);
-    }
-    setTabs(updatedTabs);
-    setGroups(prev => prev.filter(g => !dissolved.includes(g.id)));
+    const d = dissolveSmallGroups(tabs, groups, activeTabIdRef.current);
+    if (!d) return;
+    setTabs(d.tabs);
+    setGroups(prev => prev.filter(g => !d.dissolved.includes(g.id)));
     // If the active entry was a dissolved group, switch to the remaining leaf (or home).
-    if (dissolved.includes(activeTabIdRef.current)) {
-      const survivors = tabs.filter(t => t.groupId && dissolved.includes(t.groupId));
-      setActiveTabId(survivors[0]?.id || "home");
-    }
+    if (d.activeTabId !== activeTabIdRef.current) setActiveTabId(d.activeTabId);
   }, [groups, tabs]);
 
   // Drop a tab into the current work area. If `targetTabId` is a standalone tab, a new

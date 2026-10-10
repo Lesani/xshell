@@ -3,14 +3,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 
 import {
   CONFIRM_MS, LOCK_WAIT_MS, NO_MIGRATION, REFUSAL_CHECK_MS,
-  _resetMigrationOnce, applyLocalMigration, dedupeBySession, groupsToPersist, isRefusal, migrateLocalTabs, migrateLocalTabsOnce, migrationNotice, openTabsToPersist, planLocalMigration, renderedGroups, runLocalMigration,
+  _resetMigrationOnce, applyLocalMigration, dedupeBySession, groupsToPersist, isRefusal, migrateLocalTabs, migrateLocalTabsOnce, migrationNotice, openTabsToPersist, planLocalMigration, renderedGroups, runLocalMigration, sessionConflict,
   type Journal, type MigrationDeps, type MigrationOp, type OpResult, type StoreState,
 } from "./localMigration";
 import { persistableTabs, restorableTabs, restoreGroups } from "./appTabs";
 import { collectLeafIds } from "../layout";
 import { S } from "./strings";
 import type { Group, Tab } from "../types";
-import type { HostError, TerminalInfo } from "./types";
+import { SESSION_CLOSING, SESSION_OPEN, type HostError, type TerminalInfo } from "./types";
 
 const legacy = (id: string, sid: string, over: Partial<Tab> = {}): Tab =>
   ({ id, type: "terminal", title: `T ${id}`, sessionId: sid, projectPath: "/p", projectName: "p", lastActiveAt: 50, ...over });
@@ -155,7 +155,27 @@ describe("runLocalMigration", () => {
     expect(d.opened).toEqual(["u-a"]);
   });
 
+  it("xshell#41: a session another client runs is held, never failed; its listed owner is reported", async () => {
+    const d = new FakeDaemon();
+    const owner = "0f0e0d0c-0000-4000-8000-000000000001";
+    d.list.push(info(owner, 1, { sessionId: "s1" }));
+    d.behave["u-a"] = { error: hostErr("remote", `${SESSION_OPEN}: ${owner}`) };
+    d.behave["u-b"] = { error: hostErr("remote", SESSION_CLOSING) };
+    d.behave["u-c"] = { error: hostErr("remote", `${SESSION_OPEN}: 0f0e0d0c-0000-4000-8000-0000000000ff`) };
+    const owners: Record<string, string> = {};
+    const r = await runLocalMigration(ops("a", "b", "c", "d"), d, owners);
+    expect(r).toEqual({ "u-a": "held", "u-b": "held", "u-c": "held", "u-d": "ok" });
+    // Only a Terminal confirmed in the list is the owner.
+    expect(owners).toEqual({ "u-a": owner });
+  });
+
   it("classifies refusals", () => {
+    expect(isRefusal(hostErr("remote", SESSION_OPEN))).toBe(false);
+    expect(isRefusal(hostErr("remote", `${SESSION_OPEN}: 0f0e0d0c-0000-4000-8000-000000000001`))).toBe(false);
+    expect(isRefusal(hostErr("remote", SESSION_CLOSING))).toBe(false);
+    expect(sessionConflict(hostErr("remote", `${SESSION_OPEN}: 0F0E0D0C-0000-4000-8000-000000000001`))).toEqual({ owner: "0f0e0d0c-0000-4000-8000-000000000001" });
+    expect(sessionConflict(hostErr("remote", SESSION_OPEN))).toEqual({ owner: null });
+    expect(sessionConflict(hostErr("remote", "no such dir"))).toBeNull();
     expect(isRefusal(hostErr("invalid"))).toBe(true);
     expect(isRefusal(hostErr("unknown-host"))).toBe(true);
     expect(isRefusal(hostErr("remote", "cannot save the terminal list: x"))).toBe(true);
@@ -346,6 +366,50 @@ describe("migrateLocalTabs", () => {
     const r = restoreFrom(o2, cached);
     expect(r.tabs.map(t => t.id)).toEqual(["remote-u-a", "remote-u-b", "remote-u-c"]);
     expect(r.groups.map(g => collectLeafIds(g.layout))).toEqual([["remote-u-a", "remote-u-b"]]);
+  });
+
+  it("A1: a Mobile opens the session between the snapshot and the open: the Tab becomes the Mobile's Terminal, never in-process", async () => {
+    const d = new FakeDaemon();
+    const a = legacy("a", "s1", { groupId: "g" }), b = legacy("b", "s2", { groupId: "g" });
+    const owner = "0f0e0d0c-0000-4000-8000-000000000001";
+    const disk: Disk = { open_tabs: [a, b], open_groups: [split("g", "a", "b")] };
+    // The snapshot's list is empty; the Mobile's open lands just before the migration's.
+    const open = async (op: MigrationOp) => {
+      if (op.uuid === "u-a") {
+        d.list.push(info(owner, 5, { sessionId: "s1" }));
+        throw hostErr("remote", `${SESSION_OPEN}: ${owner}`);
+      }
+      await d.open(op);
+    };
+    const o = await instance("A", disk, d, { open }).start();
+    await o.settle();
+    expect(o.inProcess).toEqual([]);
+    expect(o.heldBack).toEqual([]);
+    expect(o.failed).toBe(0);
+    expect(o.migrated.map(i => i.terminal)).toEqual([owner, "u-b"]);
+    expect(disk.open_groups).toEqual([split("g", `remote-${owner}`, "remote-u-b")]);
+    const r = restoreFrom(o, null);
+    expect(r.tabs.map(t => t.id)).toEqual([`remote-${owner}`, "remote-u-b"]);
+    expect(d.list.filter(i => i.spec.sessionId === "s1")).toHaveLength(1);
+  });
+
+  it("A1: a session still closing elsewhere is held back for the next start, never in-process", async () => {
+    const d = new FakeDaemon();
+    const a = legacy("a", "s1"), b = legacy("b", "s2");
+    d.behave["u-a"] = { error: hostErr("remote", SESSION_CLOSING) };
+    const disk: Disk = { open_tabs: [a, b] };
+    const o = await instance("A", disk, d).start();
+    await o.settle();
+    expect(o.inProcess).toEqual([]);
+    expect(o.heldBack).toEqual([a]);
+    expect(o.migrated.map(i => i.terminal)).toEqual(["u-b"]);
+    expect(disk.journal?.sent).toEqual(["a"]);
+    expect(disk.open_tabs).toEqual([a]);
+    // The next start finds the session free and moves the Tab.
+    lockState.holder = null;
+    delete d.behave["u-a"];
+    const o2 = await instance("A2", disk, d).start();
+    expect(o2.migrated.map(i => i.terminal)).toEqual(["u-a"]);
   });
 
   it("deferred without a journal: one in-process Tab per session, the duplicates wait; the lock stays held", async () => {

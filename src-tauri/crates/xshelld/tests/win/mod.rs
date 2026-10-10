@@ -328,6 +328,7 @@ pub fn open_msg(id: Uuid, launch: LaunchSpec) -> ClientMsg {
             cols: 200,
             rows: 40,
             first_message: None,
+            adopt_existing: false,
         },
     }
 }

@@ -208,3 +208,58 @@ export function applyHostsReconcile(s: ReconcileState, r: HostsReconcile): Recon
   const activeLeafByGroup = applyFocusRemovals(s.activeLeafByGroup, groups, r.removed);
   return { tabs, groups, activeLeafByGroup };
 }
+
+// ── An open answered with another Terminal (xshell#41) ──────────────
+
+// Where showing `tab` lands: its group with `tab` as the group's active leaf, or the Tab.
+export interface Focus { activeTabId: string; leaf?: { groupId: string; tabId: string } }
+export const focusOf = (tab: Tab): Focus =>
+  tab.groupId ? { activeTabId: tab.groupId, leaf: { groupId: tab.groupId, tabId: tab.id } } : { activeTabId: tab.id };
+
+export interface Adopted extends ReconcileState {
+  removed: string[];
+  // `from`'s Tab was the one shown.
+  shown: boolean;
+  // Where to go when it was shown (null when it was not): `to`'s Tab or, while `to` is not
+  // listed yet, Home.
+  focus: Focus | null;
+  // Set when `focus` is Home: the Terminal whose Tab to show once the Host lists it.
+  focusWhenListed: string | null;
+}
+
+// Home stands in for a Tab that is not listed yet. Any other selection, the user's or an
+// automatic repair such as a group's dissolution, cancels the deferred focus.
+export const keepsFocusWhenListed = (activeTabId: string) => activeTabId === "home";
+
+// The Daemon answered the open of Terminal `from` with `to`, which already runs its agent
+// session: `from`'s Tab (and its group leaf) gives way to `to`'s.
+export function adoptTab(s: ReconcileState, activeTabId: string, from: string, to: string): Adopted {
+  const fromId = remoteTabId(from);
+  const gone = s.tabs.find(t => t.id === fromId);
+  const shown = activeTabId === fromId || (!!gone?.groupId && activeTabId === gone.groupId && s.activeLeafByGroup[gone.groupId] === fromId);
+  const removed = gone ? [fromId] : [];
+  const tabs = gone ? s.tabs.filter(t => t.id !== fromId) : s.tabs;
+  const groups = applyGroupRemovals(s.groups, removed);
+  const activeLeafByGroup = applyFocusRemovals(s.activeLeafByGroup, groups, removed);
+  const owner = tabs.find(t => t.id === remoteTabId(to));
+  const base = { tabs, groups, activeLeafByGroup, removed, shown };
+  if (!shown) return { ...base, focus: null, focusWhenListed: null };
+  if (owner) return { ...base, focus: focusOf(owner), focusWhenListed: null };
+  // Home, even when `from` was a pane of a group that survives: the group's own focus repair
+  // (or its dissolution) would otherwise select another Tab and cancel the deferred focus.
+  return { ...base, focus: { activeTabId: "home" }, focusWhenListed: to };
+}
+
+// Groups left with one leaf or none dissolve; their Tabs become standalone. When the selected
+// entry was such a group, its surviving Tab (or Home) is selected instead.
+export function dissolveSmallGroups(tabs: Tab[], groups: Group[], activeTabId: string): { tabs: Tab[]; groups: Group[]; dissolved: string[]; activeTabId: string } | null {
+  const dissolved = groups.filter(g => collectLeafIds(g.layout).length <= 1).map(g => g.id);
+  if (dissolved.length === 0) return null;
+  const next = tabs.map(t => t.groupId && dissolved.includes(t.groupId) ? { ...t, groupId: undefined } : t);
+  let active = activeTabId;
+  if (dissolved.includes(activeTabId)) {
+    const survivors = tabs.filter(t => t.groupId && dissolved.includes(t.groupId));
+    active = survivors[0]?.id || "home";
+  }
+  return { tabs: next, groups: groups.filter(g => !dissolved.includes(g.id)), dissolved, activeTabId: active };
+}

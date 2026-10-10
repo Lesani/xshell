@@ -1023,6 +1023,7 @@ fn full_list_with_widest_last_lines_fits_the_queue() {
                     rows: 24,
                     meta,
                     first_message: None,
+                    adopt_existing: false,
                 },
             });
             match r {
@@ -1073,6 +1074,9 @@ struct Links {
     counts: Counts,
     done: Counts,
     hold: Arc<Mutex<Option<Hold>>>,
+    /// While set, every `term.open` waits before the registry lock until this many have
+    /// arrived (bounded), so they race for it.
+    meet: Arc<(Mutex<Option<usize>>, Condvar)>,
 }
 
 fn bump(c: &Counts, id: Uuid) {
@@ -1106,6 +1110,18 @@ impl Links {
                 bump(&me.counts, id);
             } else if p == TestPoint::LinkDone {
                 bump(&me.done, id);
+            } else if p == TestPoint::OpenDecide {
+                let (m, cv) = &*me.meet;
+                let mut left = m.lock().unwrap();
+                if let Some(n) = left.as_mut() {
+                    *n = n.saturating_sub(1);
+                    cv.notify_all();
+                    let _ = cv
+                        .wait_timeout_while(left, Duration::from_secs(10), |l| {
+                            l.is_some_and(|n| n > 0)
+                        })
+                        .unwrap();
+                }
             }
             false
         }))
@@ -1124,6 +1140,11 @@ impl Links {
     /// dropped or found replaced.
     fn wait_done(&self, t: Uuid, n: usize) {
         wait_count(&self.done, t, n, "decided");
+    }
+
+    /// The next `n` opens meet before any of them locks the registry.
+    fn meet(&self, n: usize) {
+        *self.meet.0.lock().unwrap() = Some(n);
     }
 
     /// Hold the next check; returns where it says it is held and what releases it.
@@ -1532,4 +1553,76 @@ fn codex_link_refused_by_budget_is_not_the_agents() {
     // Not linked, so not the agent's: the Desktop's link of a short id passes.
     e.update(t, Some(CODEX_B), None).unwrap();
     assert_eq!(e.session(t).as_deref(), Some(CODEX_B));
+}
+
+// ── One agent per session (xshell#41) ─────────────────────────────────────────
+
+/// A `term.open` of `launch` under a new UUID that is answered with the Terminal already
+/// running its session.
+fn adopt_msg(launch: LaunchSpec) -> (Uuid, ClientMsg) {
+    let t = Uuid::new_v4();
+    let msg = ClientMsg::TermOpen {
+        spec: xshell_protocol::msg::OpenSpec {
+            terminal: t,
+            launch,
+            cols: 80,
+            rows: 24,
+            adopt_existing: true,
+            ..Default::default()
+        },
+    };
+    (t, msg)
+}
+
+/// A Codex chat the Daemon linked to `CODEX_A` is that session: a Desktop and a Mobile
+/// resuming it at the same moment both get it, and no agent starts.
+#[test]
+fn codex_mobile_and_desktop_resume_linked_session_one_agent() {
+    use xshell_protocol::msg::OpenReply;
+    let (mut e, links) = env_links();
+    let t = e.open("codex", None);
+    e.rollout(CODEX_A, "Built.");
+    e.turn_end(CODEX_A);
+    Env::wait_session(&mut e.c, t, CODEX_A);
+    let launches = e.fake.launches().len();
+    let mut m = Client::in_process(&e.srv, Role::Mobile);
+    let resume = spec(&e.cwd, "codex", Some(CODEX_A));
+    links.meet(2);
+    let (_, desk_msg) = adopt_msg(resume.clone());
+    let (_, mob_msg) = adopt_msg(resume);
+    let (id_d, id_m) = (e.c.request_id(), m.request_id());
+    e.c.send(&desk_msg, Some(id_d));
+    m.send(&mob_msg, Some(id_m));
+    for r in [e.c.wait_res(id_d), m.wait_res(id_m)] {
+        let r: OpenReply = serde_json::from_value(r.unwrap()).unwrap();
+        assert!(r.existed, "{r:?}");
+        assert_eq!(r.terminal, Some(t));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(e.fake.launches().len(), launches);
+}
+
+/// D6: a Codex report that is not checked yet holds no session; once it is linked, it does.
+#[test]
+fn codex_pending_report_does_not_match() {
+    use xshell_protocol::msg::OpenReply;
+    let (mut e, links) = env_links();
+    let t = e.open("codex", None);
+    let run = e.run_id();
+    e.rollout(CODEX_A, "from A");
+    let (held, release) = links.arm();
+    e.report(t, run, CODEX_A).unwrap();
+    held.recv_timeout(T).expect("the check of A");
+    let (t2, msg) = adopt_msg(spec(&e.cwd, "codex", Some(CODEX_A)));
+    let r: OpenReply = serde_json::from_value(e.c.request(&msg).unwrap()).unwrap();
+    assert!(!r.existed, "{r:?}");
+    assert_eq!(r.terminal, Some(t2));
+    release.send(()).unwrap();
+    Env::wait_session(&mut e.c, t, CODEX_A);
+    links.wait_done(t, 1);
+    // Both run it now (a link is never refused for that, D7): the older one is the session.
+    let (_, msg) = adopt_msg(spec(&e.cwd, "codex", Some(CODEX_A)));
+    let r: OpenReply = serde_json::from_value(e.c.request(&msg).unwrap()).unwrap();
+    assert!(r.existed, "{r:?}");
+    assert_eq!(r.terminal, Some(t));
 }

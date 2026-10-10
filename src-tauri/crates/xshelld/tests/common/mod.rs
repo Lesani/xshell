@@ -157,6 +157,7 @@ pub fn open_msg(id: Uuid, launch: LaunchSpec) -> ClientMsg {
             rows: 24,
             meta: Map::new(),
             first_message: None,
+            adopt_existing: false,
         },
     }
 }

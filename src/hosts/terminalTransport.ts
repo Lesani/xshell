@@ -4,7 +4,7 @@ import { getShellById } from "../shells";
 import { registry } from "./registry";
 import { daemonHost } from "./localHost";
 import { backoffDelay, sleep } from "./backoff";
-import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type RemoteExit, type TerminalMeta } from "./types";
+import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type OpenResult, type RemoteExit, type TerminalMeta } from "./types";
 
 // The one place TerminalTab talks to a PTY. In-process Local tabs use today's
 // spawn/write/resize/close commands unchanged; Daemon Tabs (Remote, and Local ones under the
@@ -142,15 +142,24 @@ export async function startWithRetry<T>(host: HostId, start: () => Promise<T>, s
   }
 }
 
-export interface RemoteStartResult { kind: "opened" | "attached"; exitCode: number | null; pid: number | null }
+// `adoptedBy`: the Daemon answered the open with another Terminal that already runs this
+// session; nothing runs under this Tab's UUID (see `RemoteTerminals.onAdopted`).
+export interface RemoteStartResult { kind: "opened" | "attached"; exitCode: number | null; pid: number | null; adoptedBy?: string }
+
+// An open answered with the Terminal that already runs its session (xshell#41).
+export interface Adoption { host: HostId; from: string; to: string }
 
 export class RemoteTerminals {
   private entries = new Map<string, Entry>();
   private gen = 0;
   private closeFailedListeners = new Set<(f: CloseFailure) => void>();
+  private adoptedListeners = new Set<(a: Adoption) => void>();
   constructor(private deps: RemoteTerminalsDeps = registryDeps) {}
 
   onCloseFailed(cb: (f: CloseFailure) => void): () => void { this.closeFailedListeners.add(cb); return () => { this.closeFailedListeners.delete(cb); }; }
+
+  // A pending open was answered with another Terminal: its Tab should give way to that one's.
+  onAdopted(cb: (a: Adoption) => void): () => void { this.adoptedListeners.add(cb); return () => { this.adoptedListeners.delete(cb); }; }
 
   private entry(host: HostId, uuid: string): Entry {
     let e = this.entries.get(uuid);
@@ -229,12 +238,23 @@ export class RemoteTerminals {
     const { onData, onExit } = this.channels(e);
     if (pending && pending.state === "opening") {
       pending.state = "sent";
-      const call = invoke<{ pid: number | null }>("host_term_open", {
-        host: e.host, terminal: e.uuid, spec: pending.spec, meta: pending.meta, cols: o.cols, rows: o.rows, onData, onExit,
+      // `adopt`: a Daemon that already runs this agent session answers with its Terminal
+      // instead of starting a second agent on it.
+      const call = invoke<OpenResult>("host_term_open", {
+        host: e.host, terminal: e.uuid, spec: pending.spec, meta: pending.meta, cols: o.cols, rows: o.rows, onData, onExit, adopt: true,
       });
       e.opening = call;
       try {
         const r = await call;
+        const owner = r?.existed ? r.terminal : null;
+        if (owner && owner !== e.uuid) {
+          // Nothing runs under this UUID (hostlink dropped its attachment): the Tab gives way.
+          pendingOpens.delete(e.uuid);
+          e.gone = true;
+          e.attached = false;
+          for (const cb of this.adoptedListeners) cb({ host: e.host, from: e.uuid, to: owner });
+          return { kind: "opened", exitCode: null, pid: r.pid ?? null, adoptedBy: owner };
+        }
         e.attached = true;
         return { kind: "opened", exitCode: null, pid: r?.pid ?? null };
       } catch (err) {

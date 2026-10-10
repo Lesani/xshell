@@ -9,7 +9,7 @@ use super::prompt_cell::InputCarry;
 use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
 use super::role::{self, Role};
-use super::terminal::{self, Terminal};
+use super::terminal::{self, SessionHold, Terminal};
 use super::transport::Stream;
 use super::{ConnId, ExitReason, TestPoint};
 use serde_json::{json, Value};
@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{
-    decode_inbound, encode_res, submit_reply, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
+    decode_inbound, encode_res, submit_reply, ClientMsg, DecodeError, Hello, Inbound, OpenReply,
+    OpenSpec, ServerMsg, SESSION_CLOSING, SESSION_OPEN,
 };
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::ring::Member;
@@ -269,6 +270,35 @@ impl Conn {
         self.with_listed(id, Arc::clone)
     }
 
+    /// The answer to a `term.open` whose agent session `owner` already holds (registry
+    /// locked): `owner` itself when the client asked for it and may see it, else a refusal.
+    /// Nothing is started, saved or broadcast.
+    fn open_existing(
+        &self,
+        spec: &OpenSpec,
+        owner: &Arc<Terminal>,
+        hold: SessionHold,
+    ) -> Result<Value, String> {
+        if hold == SessionHold::Closing {
+            return Err(SESSION_CLOSING.into());
+        }
+        let visible = role::sees(self.role, &owner.spec());
+        if spec.adopt_existing && visible && spec.first_message.is_none() {
+            let r = OpenReply {
+                pid: owner.info().pid,
+                terminal: Some(owner.id),
+                existed: true,
+            };
+            return Ok(json!(r));
+        }
+        // A client never learns the UUID of a Terminal it may not see.
+        Err(if visible {
+            format!("{SESSION_OPEN}: {}", owner.id)
+        } else {
+            SESSION_OPEN.into()
+        })
+    }
+
     fn on_msg(&mut self, m: Inbound) {
         let id = m.id;
         let d = self.d.clone();
@@ -291,7 +321,26 @@ impl Conn {
                         return;
                     }
                 }
+                // The agent session this open resumes. Looking for its holder and starting the
+                // Terminal are one step under one registry lock: two opens of one session at
+                // once start one agent (capability `term.open-existing`).
+                let session = spec
+                    .launch
+                    .agent_session()
+                    .map(|(a, s)| (a.to_string(), s.to_string()));
+                d.test_point(spec.terminal, TestPoint::OpenDecide);
                 let mut reg = d.reg.lock().unwrap();
+                if !reg.frozen && !reg.terminals.contains_key(&spec.terminal) {
+                    if let Some((agent, sid)) = &session {
+                        if let Some((owner, hold)) = d.session_owner(&reg, agent, sid) {
+                            let r = self.open_existing(&spec, &owner, hold);
+                            drop(reg);
+                            reply(&self.ob, id, r);
+                            return;
+                        }
+                        d.test_point(spec.terminal, TestPoint::OpenLooked);
+                    }
+                }
                 let r = if reg.frozen {
                     Err(("xshelld is upgrading or shutting down".to_string(), None))
                 } else if reg.terminals.contains_key(&spec.terminal) {
@@ -329,7 +378,12 @@ impl Conn {
                         d.broadcast_terminals(&reg);
                         drop(reg);
                         d.last_lines.request(t.id);
-                        reply(&self.ob, id, Ok(json!({ "pid": pid })));
+                        let r = OpenReply {
+                            pid,
+                            terminal: Some(t.id),
+                            existed: false,
+                        };
+                        reply(&self.ob, id, Ok(json!(r)));
                     }
                     // The process started but its threads did not: it is being ended.
                     Err((e, Some(t))) => {

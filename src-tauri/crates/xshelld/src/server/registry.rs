@@ -2,7 +2,7 @@
 
 use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
-use super::terminal::{self, Terminal};
+use super::terminal::{self, SessionHold, Terminal};
 use super::transport::{self, Listener};
 use super::{conn, role, Config, ConnId, ExitReason, Role, TestPoint};
 use serde_json::{Map, Value};
@@ -115,6 +115,32 @@ impl Daemon {
     /// same UUID, and a replacement that failed to start is never listed.
     pub fn is_current(&self, reg: &Registry, t: &Arc<Terminal>) -> bool {
         reg.terminals.get(&t.id).is_some_and(|c| Arc::ptr_eq(c, t))
+    }
+
+    /// The listed Terminal that holds `agent`'s session `sid` (capability
+    /// `term.open-existing`), with how it holds it: a live one (also one in the middle of a
+    /// Relaunch) first, then one being closed, then an unresolved restored one. Among several
+    /// (older duplicates, a relinked Terminal) the oldest wins, then the lowest UUID. A
+    /// Terminal whose process ended holds nothing. Call with `reg` locked, so an open that
+    /// finds no holder starts its Terminal before any other open looks.
+    pub fn session_owner(
+        &self,
+        reg: &Registry,
+        agent: &str,
+        sid: &str,
+    ) -> Option<(Arc<Terminal>, SessionHold)> {
+        let rank = |h: SessionHold| match h {
+            SessionHold::Live => 0,
+            SessionHold::Closing => 1,
+            SessionHold::Unresolved => 2,
+            SessionHold::Ended => 3,
+        };
+        reg.terminals
+            .values()
+            .filter(|t| t.runs_session(agent, sid))
+            .map(|t| (t.clone(), t.session_hold()))
+            .filter(|(_, h)| *h != SessionHold::Ended)
+            .min_by_key(|(t, h)| (rank(*h), t.created_at_ms(), t.id))
     }
 
     pub fn list(&self, reg: &Registry) -> Vec<TerminalInfo> {
@@ -392,6 +418,7 @@ impl Daemon {
         for t in reg.terminals.values() {
             self.last_lines.request(t.id);
         }
+        warn_restored_duplicates(&reg);
         if had > 0 || self.cfg.paths.state.exists() {
             self.persist(&reg);
         }
@@ -549,5 +576,26 @@ impl Daemon {
         }
         *self.exit.lock().unwrap() = Some(reason);
         self.exit_cv.notify_all();
+    }
+}
+
+/// Log every agent session more than one restored Terminal resumes (a state file written
+/// before capability `term.open-existing`, or a relinked Terminal). All of them are kept: a
+/// Terminal is never ended silently; `term.open` resumes the oldest.
+fn warn_restored_duplicates(reg: &Registry) {
+    let mut seen: BTreeMap<(String, String), Vec<Uuid>> = BTreeMap::new();
+    for t in reg.terminals.values() {
+        if let Some((a, s)) = t.spec().agent_session() {
+            seen.entry((a.to_string(), s.to_string()))
+                .or_default()
+                .push(t.id);
+        }
+    }
+    for ((agent, sid), ids) in seen.into_iter().filter(|(_, ids)| ids.len() > 1) {
+        crate::log!(
+            "WARN",
+            "{} restored terminals resume {agent} session {sid}: {ids:?}; all are kept",
+            ids.len()
+        );
     }
 }

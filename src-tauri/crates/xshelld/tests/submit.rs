@@ -28,8 +28,6 @@ use xshell_protocol::msg::{
 };
 use xshelld::server::{Config, Role, ServerHandle, TestHook, TestPoint};
 
-const SID: &str = "11111111-2222-3333-4444-555555555555";
-
 const AGENT: &str = r#"exec 3<&0
 stty raw -echo
 trap 'stty size >> sizes.log' WINCH
@@ -207,10 +205,12 @@ fn env_with(tweak: impl FnOnce(&mut Config)) -> Env {
 
 impl Env {
     fn open(&mut self, agent: &'static str) -> Term {
+        // A session of its own per Terminal: a Host runs one session in one Terminal only.
+        let sid = Uuid::new_v4().to_string();
         let spec = |cwd: &Path| LaunchSpec {
             agent: Some(agent.into()),
             shell_mode: Some("claude".into()),
-            session_id: (agent == "claude").then(|| SID.to_string()),
+            session_id: (agent == "claude").then_some(sid),
             cwd: cwd.to_string_lossy().into_owned(),
             ..Default::default()
         };
@@ -220,7 +220,13 @@ impl Env {
     fn open_spec(&mut self, agent: &'static str, spec: impl FnOnce(&Path) -> LaunchSpec) -> Term {
         let cwd = self.h.project(&format!("p{}", self.reapers.len()));
         fs::write(cwd.join("agent.sh"), AGENT).unwrap();
-        make_jsonl(&self.h, &cwd, SID);
+        let launch = spec(&cwd);
+        let sid = launch.session_id.clone();
+        make_jsonl(
+            &self.h,
+            &cwd,
+            &sid.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        );
         self.reapers.push(FakeReaper(cwd.join("pids.log")));
         let id = Uuid::new_v4();
         // The size the fixtures are drawn at.
@@ -228,11 +234,12 @@ impl Env {
             .request(&ClientMsg::TermOpen {
                 spec: OpenSpec {
                     terminal: id,
-                    launch: spec(&cwd),
+                    launch,
                     cols: 100,
                     rows: 30,
                     meta: Default::default(),
                     first_message: None,
+                    adopt_existing: false,
                 },
             })
             .unwrap();

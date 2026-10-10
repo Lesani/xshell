@@ -105,6 +105,21 @@ export interface HostError {
   message: string;
 }
 
+// `host_term_open`'s answer. `terminal` is the Terminal that runs the spec: the requested one,
+// or (`existed`) the one that already ran its agent session (capability `term.open-existing`,
+// asked for with `adopt`). An older Daemon answers only `pid`.
+export interface OpenResult {
+  pid: number | null;
+  terminal?: string | null;
+  existed?: boolean;
+}
+
+// The Daemon's refusals of a `term.open` whose agent session another Terminal runs
+// (`xshell_protocol::msg::SESSION_OPEN` / `SESSION_CLOSING`). Nothing was started. The first
+// may end with `": <uuid>"`, the Terminal that runs it.
+export const SESSION_OPEN = "session is open in another terminal";
+export const SESSION_CLOSING = "session is still closing; try again";
+
 export interface HostTestResult {
   ok: boolean;
   os: string | null;

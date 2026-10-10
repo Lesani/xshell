@@ -132,6 +132,88 @@ describe("groups with remote leaves (amendment 22)", () => {
   });
 });
 
+// xshell#41: an open answered with the Terminal that already runs its session.
+import { adoptTab, dissolveSmallGroups, focusOf, keepsFocusWhenListed } from "./reconcile";
+describe("adoptTab", () => {
+  const leaf = (tabId: string) => ({ kind: "leaf" as const, tabId });
+  const split = (a: any, b: any) => ({ kind: "split" as const, direction: "col" as const, ratio: 0.5, children: [a, b] as [any, any] });
+  const pending = (uuid: string): Tab => ({ id: remoteTabId(uuid), type: "terminal", title: "T", host: H, terminal: uuid, sessionId: "s1" });
+
+  it("the shown pending Tab gives way to the owner's standalone Tab", () => {
+    const owner = tabFromTerminal(H, info("o"));
+    const other = tabFromTerminal(H, info("x"));
+    const r = adoptTab(state([owner, other, pending("p")]), remoteTabId("p"), "p", "o");
+    expect(r.tabs.map(t => t.id)).toEqual([owner.id, other.id]);
+    expect(r.removed).toEqual([remoteTabId("p")]);
+    expect(r.shown).toBe(true);
+    expect(r.focus).toEqual({ activeTabId: owner.id });
+  });
+
+  it("A3: a grouped owner is shown in its group, as the group's active leaf", () => {
+    const owner = { ...tabFromTerminal(H, info("o")), groupId: "g1" };
+    const mate = { ...tabFromTerminal(H, info("m")), groupId: "g1" };
+    const g: Group = { id: "g1", name: "Group 1", layout: split(leaf(mate.id), leaf(owner.id)) };
+    const r = adoptTab(state([mate, owner, pending("p")], [g], { g1: mate.id }), remoteTabId("p"), "p", "o");
+    expect(r.focus).toEqual({ activeTabId: "g1", leaf: { groupId: "g1", tabId: owner.id } });
+    expect(r.groups).toEqual([g]);
+    expect(focusOf(owner)).toEqual(r.focus);
+  });
+
+  it("a pending leaf of a group is removed with its leaf; focus moves within the group", () => {
+    const a = { ...tabFromTerminal(H, info("a")), groupId: "g1" };
+    const p = { ...pending("p"), groupId: "g1" };
+    const b = { ...tabFromTerminal(H, info("b")), groupId: "g1" };
+    const g: Group = { id: "g1", name: "Group 1", layout: split(leaf(a.id), split(leaf(p.id), leaf(b.id))) };
+    const r = adoptTab(state([a, p, b], [g], { g1: p.id }), "g1", "p", "o");
+    expect(r.shown).toBe(true);
+    expect(r.groups[0].layout).toEqual(split(leaf(a.id), leaf(b.id)));
+    expect(r.activeLeafByGroup.g1).toBe(a.id);
+    // The owner is not listed yet: Home stands in until the Host lists it.
+    expect(r.focus).toEqual({ activeTabId: "home" });
+    expect(r.focusWhenListed).toBe("o");
+  });
+
+  // Sol diff review P2: the App's steps after an adoption, in order. Removing a pending pane
+  // dissolves its two-pane group; that automatic selection must not cancel the deferred focus.
+  for (const grouped of [false, true]) {
+    it(`a removed pending pane whose group dissolves still lands on the ${grouped ? "grouped" : "standalone"} owner once listed`, () => {
+      const a = { ...tabFromTerminal(H, info("a")), groupId: "g1" };
+      const p = { ...pending("p"), groupId: "g1" };
+      const g1: Group = { id: "g1", name: "Group 1", layout: split(leaf(p.id), leaf(a.id)) };
+      let s = state([p, a], [g1], { g1: p.id });
+      let active = "g1";
+      // 1. The open of p adopts o, which is not listed yet.
+      const r = adoptTab(s, active, "p", "o");
+      s = r;
+      if (r.focus) active = r.focus.activeTabId;
+      let want = r.focusWhenListed;
+      if (!keepsFocusWhenListed(active)) want = null;
+      // 2. The group, down to one pane, dissolves.
+      const d = dissolveSmallGroups(s.tabs, s.groups, active);
+      expect(d?.dissolved).toEqual(["g1"]);
+      s = { ...s, tabs: d!.tabs, groups: d!.groups };
+      active = d!.activeTabId;
+      if (!keepsFocusWhenListed(active)) want = null;
+      // 3. The Host lists o, inside a restored group or alone.
+      const mate = { ...tabFromTerminal(H, info("m")), groupId: grouped ? "g2" : undefined };
+      const owner = { ...tabFromTerminal(H, info("o")), groupId: grouped ? "g2" : undefined };
+      s = { ...s, tabs: [...s.tabs, mate, owner] };
+      // 4. The listed owner takes focus.
+      expect(want).toBe("o");
+      const t = s.tabs.find(x => x.id === remoteTabId(want!))!;
+      expect(focusOf(t)).toEqual(grouped ? { activeTabId: "g2", leaf: { groupId: "g2", tabId: owner.id } } : { activeTabId: owner.id });
+    });
+  }
+
+  it("a background open never steals focus", () => {
+    const owner = tabFromTerminal(H, info("o"));
+    const r = adoptTab(state([owner, pending("p")]), "home", "p", "o");
+    expect(r.shown).toBe(false);
+    expect(r.focus).toBeNull();
+    expect(r.tabs).toEqual([owner]);
+  });
+});
+
 // Sol finding 3: removals from several Hosts are one transaction — focus never lands on a
 // pane another Host's list removed in the same pass.
 import { applyHostsReconcile, reconcileHosts } from "./reconcile";

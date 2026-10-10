@@ -2,7 +2,7 @@ import type { Group, LayoutNode, Tab } from "../types";
 import { collectLeafIds } from "../layout";
 import { remoteTabId } from "./reconcile";
 import { fmt } from "./strings";
-import { isHostError, type LaunchSpec, type TerminalInfo, type TerminalMeta } from "./types";
+import { isHostError, SESSION_CLOSING, SESSION_OPEN, type LaunchSpec, type TerminalInfo, type TerminalMeta } from "./types";
 
 // Moving the saved in-process Local Tabs (`open_tabs`, from before local Daemon mode or from a
 // run in fallback mode) into the local Daemon, once each, at startup (issue #4, ADR-0005).
@@ -77,7 +77,10 @@ export function planLocalMigration(i: PlanInput): MigrationPlan {
 
 // "ok": the Terminal is listed. "failed": the Daemon refused it, so it does not exist and the
 // Tab may run in-process. "unresolved": it may exist; the Tab is neither run nor dropped.
-export type OpResult = "ok" | "failed" | "unresolved";
+// "held": another Terminal runs (or is still closing) its session (xshell#41): nothing was
+// started, but the session must never also run in-process; the Tab becomes that Terminal's
+// once it is confirmed listed, or waits for the next start.
+export type OpResult = "ok" | "failed" | "unresolved" | "held";
 
 export interface ApplyInput {
   saved: Tab[];                        // `open_tabs`, saved order
@@ -180,12 +183,23 @@ export interface RunDeps {
 export function isRefusal(e: unknown): boolean {
   if (!isHostError(e)) return false;
   if (e.code === "invalid" || e.code === "unknown-host") return true;
-  return e.code === "remote" && !/already exists/i.test(e.message);
+  return e.code === "remote" && !/already exists/i.test(e.message) && !sessionConflict(e);
+}
+
+// The Daemon refused the open because another Terminal runs its agent session (xshell#41):
+// `owner` is that Terminal when the Daemon named it, null while it is still closing.
+export function sessionConflict(e: unknown): { owner: string | null } | null {
+  if (!isHostError(e) || e.code !== "remote") return null;
+  if (e.message.startsWith(SESSION_CLOSING)) return { owner: null };
+  if (!e.message.startsWith(SESSION_OPEN)) return null;
+  const named = /^: ([0-9a-f-]{36})$/i.exec(e.message.slice(SESSION_OPEN.length));
+  return { owner: named ? named[1].toLowerCase() : null };
 }
 
 // Opens one after another, in saved order. An open that cannot be confirmed stops the rest:
-// they were never sent, so they cannot exist and count as refused.
-export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps): Promise<Record<string, OpResult>> {
+// they were never sent, so they cannot exist and count as refused. `owners` gets, by UUID, the
+// listed Terminal that runs a "held" open's session.
+export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps, owners: Record<string, string> = {}): Promise<Record<string, OpResult>> {
   const results: Record<string, OpResult> = {};
   let stopped = false;
   for (const op of ops) {
@@ -196,8 +210,14 @@ export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps): Prom
       // OK means the Daemon saved it (xshelld persists before answering); wait for the list.
       r = (await deps.listed(op.uuid, CONFIRM_MS)) ? "ok" : "unresolved";
     } catch (e) {
+      const conflict = sessionConflict(e);
+      if (conflict) {
+        // Another client opened the session since the snapshot: nothing was started here.
+        r = "held";
+        if (conflict.owner && (await deps.listed(conflict.owner, CONFIRM_MS))) owners[op.uuid] = conflict.owner;
+      }
       // The join of open and attach can fail on the attach after a good open: check the list.
-      if (isRefusal(e)) r = (await deps.listed(op.uuid, REFUSAL_CHECK_MS)) ? "ok" : "failed";
+      else if (isRefusal(e)) r = (await deps.listed(op.uuid, REFUSAL_CHECK_MS)) ? "ok" : "failed";
       else r = (await deps.listed(op.uuid, CONFIRM_MS)) ? "ok" : "unresolved";
     }
     results[op.uuid] = r;
@@ -349,7 +369,10 @@ async function migrate(settings: MigrationSettings, deps: MigrationDeps): Promis
   const uuidOf: Record<string, string> = {};
   for (const t of legacy) uuidOf[t.id] = await deps.uuid(t.id);
   const plan = planLocalMigration({ saved: legacy, live: ready, uuidOf, now: deps.now(), ...settings });
-  const results = await runLocalMigration(plan.ops, deps);
+  const owners: Record<string, string> = {};
+  const results = await runLocalMigration(plan.ops, deps, owners);
+  // A session another client opened meanwhile: its Tabs become that Terminal's.
+  for (const [id, uuid] of Object.entries(plan.target)) if (owners[uuid]) plan.target[id] = owners[uuid];
   const live = deps.live();
   const applied = applyLocalMigration({ saved: legacy, groups: base.openGroups, zoom: base.zoom, plan, results, live });
   const keep = new Set([...applied.inProcess, ...applied.heldBack].map(t => t.id));

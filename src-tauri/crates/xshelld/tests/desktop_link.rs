@@ -470,6 +470,7 @@ fn stall_delivery(fx: &Fx) -> (Uuid, std::sync::Arc<Gate>) {
             rows: 24,
             meta: Default::default(),
             first_message: None,
+            adopt_existing: false,
         },
         gate.clone(),
         Box::new(move |r| {

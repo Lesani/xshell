@@ -71,7 +71,35 @@ struct Life {
     held_exit: Option<i32>,
 }
 
+/// How a listed Terminal holds the agent session its spec names (capability
+/// `term.open-existing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionHold {
+    /// Running, or in the middle of a Relaunch (its exit is held back): it is the session.
+    Live,
+    /// `term.close` is ending it: a new agent on the session would run next to it.
+    Closing,
+    /// Restored without a process, leftovers of its previous run maybe still running.
+    Unresolved,
+    /// Its process ended: it holds nothing.
+    Ended,
+}
+
 impl Life {
+    /// How a Terminal in this state holds its session; `unresolved` says it was restored
+    /// without a process while its previous run's leader is kept.
+    fn hold(&self, unresolved: bool) -> SessionHold {
+        if self.closing {
+            SessionHold::Closing
+        } else if self.exited.is_none() || self.relaunching {
+            SessionHold::Live
+        } else if unresolved {
+            SessionHold::Unresolved
+        } else {
+            SessionHold::Ended
+        }
+    }
+
     /// Whether a Relaunch may start.
     fn check_relaunch(&self) -> Result<(), String> {
         if self.exited.is_some() {
@@ -1626,6 +1654,23 @@ impl Terminal {
         self.record.lock().unwrap().spec.clone()
     }
 
+    /// Whether this Terminal's current spec runs `agent`'s session `sid`
+    /// (`LaunchSpec::agent_session`).
+    pub fn runs_session(&self, agent: &str, sid: &str) -> bool {
+        self.record.lock().unwrap().spec.agent_session() == Some((agent, sid))
+    }
+
+    /// How this Terminal holds its session now. Locks `life` alone.
+    pub fn session_hold(&self) -> SessionHold {
+        let unresolved = self.pid.is_none() && self.kept_leader.is_some();
+        self.life.lock().unwrap().hold(unresolved)
+    }
+
+    /// When this Terminal was first opened (kept across Relaunches and restarts).
+    pub fn created_at_ms(&self) -> u64 {
+        self.record.lock().unwrap().created_at_ms
+    }
+
     /// Whether a Relaunch may start now.
     pub fn check_relaunch(&self) -> Result<(), String> {
         self.life.lock().unwrap().check_relaunch()
@@ -2536,6 +2581,37 @@ mod status_tests {
     fn event(c: &mut StatusCell, s: AgentStatus, now: u64) -> bool {
         let changed = c.tracker.on_event(s).unwrap();
         c.stamp(changed, now)
+    }
+
+    #[test]
+    fn life_hold_states() {
+        let running = Life::default();
+        assert_eq!(running.hold(false), SessionHold::Live);
+        // In the middle of a Relaunch the old process's exit is held: still the session.
+        let relaunching = Life {
+            relaunching: true,
+            exited: Some(0),
+            held_exit: Some(0),
+            ..Life::default()
+        };
+        assert_eq!(relaunching.hold(false), SessionHold::Live);
+        let closing = Life {
+            closing: true,
+            ..Life::default()
+        };
+        assert_eq!(closing.hold(false), SessionHold::Closing);
+        let closed = Life {
+            closing: true,
+            exited: Some(0),
+            ..Life::default()
+        };
+        assert_eq!(closed.hold(false), SessionHold::Closing);
+        let exited = Life {
+            exited: Some(0),
+            ..Life::default()
+        };
+        assert_eq!(exited.hold(false), SessionHold::Ended);
+        assert_eq!(exited.hold(true), SessionHold::Unresolved);
     }
 
     #[test]

@@ -201,6 +201,12 @@ pub enum TestPoint {
     /// Restore is about to relaunch this persisted Terminal (registry locked: the Daemon does
     /// not serve yet, so a hook may block to stall the start).
     Restore,
+    /// A `term.open` passed its own checks and is about to lock the registry to look for the
+    /// Terminal that holds its agent session (no lock held; a hook may block).
+    OpenDecide,
+    /// A `term.open` that resumes an agent session found no Terminal holding it and is about
+    /// to start its own (registry locked: do not block on the Daemon).
+    OpenLooked,
     /// A `term.open`'s started Terminal is not kept (it could not be saved, or its threads
     /// did not start); it is about to be ended (on the thread that waits for it, no lock held).
     RefusedOpen,

@@ -56,6 +56,12 @@ impl Env {
         claude_spec(&self.cwd, Some(SID))
     }
 
+    /// An agent on a session of its own, next to `SID`'s: a Host runs one session in one
+    /// Terminal only.
+    fn other_session(&self) -> LaunchSpec {
+        claude_spec(&self.cwd, Some(&Uuid::new_v4().to_string()))
+    }
+
     fn shell(&self) -> LaunchSpec {
         sh_spec(&self.cwd)
     }
@@ -196,6 +202,14 @@ fn mobile_refuses_open_variants() {
         ),
     ];
     for (what, spec) in variants {
+        // Each on a session of its own, so the Desktop's opens all start.
+        let spec = match spec.session_id.as_deref() {
+            Some(SID) => LaunchSpec {
+                session_id: e.other_session().session_id,
+                ..spec
+            },
+            _ => spec,
+        };
         let e2 = try_open(&mut e.mob, spec.clone()).expect_err(what);
         assert!(e2.starts_with(FORBIDDEN), "{what}: {e2}");
         let r = try_open(&mut e.desk, spec);
@@ -318,7 +332,7 @@ fn mobile_refuses_ops_on_shell_terminal() {
                 .map(String::from)
                 .to_vec(),
         ),
-        ..e.claude()
+        ..e.other_session()
     };
     for spec in [e.shell(), prefixed] {
         let t = e.desk_open(spec);
@@ -356,7 +370,7 @@ fn mobile_refuses_relaunch_of_shell_and_wrapped_agent() {
     let wrapped = e.desk_open(LaunchSpec {
         shell_command: Some("/bin/sh".into()),
         shell_id: Some("bash".into()),
-        ..e.claude()
+        ..e.other_session()
     });
     refused(e.mob.request(&relaunch(wrapped)));
     let r = e.desk.request(&relaunch(wrapped)).unwrap();
@@ -795,7 +809,7 @@ fn wrapped(e: &Env) -> LaunchSpec {
     LaunchSpec {
         shell_command: Some("/bin/sh".into()),
         shell_id: Some("bash".into()),
-        ..e.claude()
+        ..e.other_session()
     }
 }
 
@@ -808,7 +822,7 @@ fn hidden_specs(e: &Env) -> Vec<LaunchSpec> {
                 .map(String::from)
                 .to_vec(),
         ),
-        ..e.claude()
+        ..e.other_session()
     };
     vec![e.shell(), wrapped(e), prefixed]
 }
@@ -826,6 +840,7 @@ fn open_titled(c: &mut Client, spec: LaunchSpec, title: &str) -> Uuid {
             rows: 24,
             meta,
             first_message: None,
+            adopt_existing: false,
         },
     };
     let r = c

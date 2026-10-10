@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_protocol::msg::{ClientMsg, JoinExpect, OpenSpec, TerminalInfo};
+use xshell_protocol::msg::{ClientMsg, JoinExpect, OpenReply, OpenSpec, TerminalInfo};
 
 /// Where one Tab's output goes.
 pub trait TermSink: Send + Sync {
@@ -48,6 +48,9 @@ const RING_REFUSED: &str = "this Host's xshelld cannot join a ring; upgrade it f
 ///
 /// [`LaunchSpec`]: xshell_core::launch::LaunchSpec
 const LAUNCH_PREFIX_CAPABILITY: &str = "launch.prefix";
+/// The hello capability of Daemons that resume an agent session at most once: a `term.open`
+/// may set `adoptExisting` and is answered with the Terminal that already runs it.
+const OPEN_EXISTING_CAPABILITY: &str = xshell_protocol::cap::TERM_OPEN_EXISTING;
 
 pub(crate) struct SinkSlot {
     sink: Arc<dyn TermSink>,
@@ -605,6 +608,15 @@ pub struct HostHandle {
     retired: AtomicBool,
 }
 
+/// A `term.open` reply; an older Daemon's `{pid}` (or anything unexpected) reads as a
+/// started Terminal with that pid.
+fn open_reply(v: &Value) -> OpenReply {
+    serde_json::from_value(v.clone()).unwrap_or_else(|_| OpenReply {
+        pid: opt_u32(v, "pid"),
+        ..OpenReply::default()
+    })
+}
+
 fn opt_u32(v: &Value, k: &str) -> Option<u32> {
     v.get(k).and_then(Value::as_u64).map(|n| n as u32)
 }
@@ -745,12 +757,17 @@ impl HostHandle {
         self.request(ClientMsg::Call { method, params }, timeout, w);
     }
 
-    /// `term.open`, then `term.attach` with `sink` installed first. Answers the pid.
+    /// `term.open`, then `term.attach` with `sink` installed first. Answers the open's reply.
+    ///
+    /// `spec.adopt_existing` is the caller's wish; it is sent only to a Daemon with capability
+    /// `term.open-existing` (an older one answers just the pid). When the Daemon answers that
+    /// another Terminal already runs the session (`existed`), the attach to the requested UUID
+    /// fails by design: its sink and size are dropped and the owner's id is answered.
     pub fn term_open(
         &self,
         spec: OpenSpec,
         sink: Arc<dyn TermSink>,
-        w: Box<dyn FnOnce(Result<Option<u32>, HostError>) + Send>,
+        w: Box<dyn FnOnce(Result<OpenReply, HostError>) + Send>,
     ) {
         let once = Once::new(w);
         let t = spec.terminal;
@@ -759,16 +776,43 @@ impl HostHandle {
         let joined: Joined = Arc::new(Mutex::new((0, None)));
         let finish = {
             let once = once.clone();
+            let sh = Arc::downgrade(&self.sh);
             move |open: Option<Reply>, attach: Reply| {
+                let open = open.map(|r| r.map(|v| open_reply(&v)));
                 let r = match (open, attach) {
+                    // Another Terminal runs the session: nothing listens on `t`.
+                    (Some(Ok(o)), _) if o.existed && o.terminal.is_some_and(|o| o != t) => {
+                        if let Some(sh) = sh.upgrade() {
+                            let mut st = sh.lock();
+                            Shared::detach_locked(&mut st, t, &sh.sizes);
+                            sh.sizes.lock().unwrap().remove(&t);
+                        }
+                        Ok(o)
+                    }
                     (Some(Err(e)), _) | (_, Err(e)) => Err(e),
-                    (Some(Ok(v)), Ok(_)) => Ok(opt_u32(&v, "pid")),
-                    (None, Ok(_)) => Ok(None),
+                    (Some(Ok(o)), Ok(_)) => Ok(o),
+                    (None, Ok(_)) => Ok(OpenReply::default()),
                 };
                 once.call(r);
             }
         };
         let finish = Arc::new(Mutex::new(Some(finish)));
+        let on_attach = {
+            let (j2, f2) = (joined.clone(), finish.clone());
+            Arc::new(move |r: Reply| {
+                let mut j = j2.lock().unwrap();
+                j.0 += 1;
+                if j.0 == 2 {
+                    let open = j.1.take();
+                    drop(j);
+                    if let Some(f) = f2.lock().unwrap().take() {
+                        f(open, r);
+                    }
+                } else {
+                    j.1 = Some(r);
+                }
+            })
+        };
         let timeout = self.sh.mc.term_timeout;
         let mut spec = spec;
         let sent = {
@@ -778,17 +822,15 @@ impl HostHandle {
                 // that predates prefixes would drop it and run the agent bare, so it is
                 // refused instead.
                 spec.launch.launch_prefix = st.cfg.launch_prefix(&spec.launch);
+                let caps = &st.status.daemon_capabilities;
                 if spec.launch.launch_prefix.is_some()
-                    && !st
-                        .status
-                        .daemon_capabilities
-                        .iter()
-                        .any(|c| c == LAUNCH_PREFIX_CAPABILITY)
+                    && !caps.iter().any(|c| c == LAUNCH_PREFIX_CAPABILITY)
                 {
                     return Err(HostError::invalid(
                         "this Host's xshelld cannot run launch prefixes; upgrade it first",
                     ));
                 }
+                spec.adopt_existing &= caps.iter().any(|c| c == OPEN_EXISTING_CAPABILITY);
                 let (j1, f1) = (joined.clone(), finish.clone());
                 let w_open: Waiter = Box::new(move |r| {
                     let mut j = j1.lock().unwrap();
@@ -805,26 +847,21 @@ impl HostHandle {
                 });
                 link.request(ClientMsg::TermOpen { spec }, timeout, w_open)?;
                 self.sh.sizes.lock().unwrap().insert(t, size);
-                let (j2, f2) = (joined.clone(), finish.clone());
-                let done: Callback<Reply> = Box::new(move |r| {
-                    let mut j = j2.lock().unwrap();
-                    j.0 += 1;
-                    if j.0 == 2 {
-                        let open = j.1.take();
-                        drop(j);
-                        if let Some(f) = f2.lock().unwrap().take() {
-                            f(open, r);
-                        }
-                    } else {
-                        j.1 = Some(r);
-                    }
-                });
-                // If this fails, the open still runs; the Terminal shows up in the list.
-                self.sh.begin_attach(&mut st, (&link, gen), (t, sink), done)
+                let a = on_attach.clone();
+                let done: Callback<Reply> = Box::new(move |r| a(r));
+                // If this fails, the open still runs: its answer decides (an adopted owner,
+                // or the Terminal shows up in the list), so the failure joins it below,
+                // outside the lock.
+                Ok(self
+                    .sh
+                    .begin_attach(&mut st, (&link, gen), (t, sink), done)
+                    .err())
             })
         };
-        if let Err(e) = sent {
-            once.call(Err(e));
+        match sent {
+            Err(e) => once.call(Err(e)),
+            Ok(Some(e)) => on_attach(Err(e)),
+            Ok(None) => {}
         }
     }
 
@@ -1558,6 +1595,7 @@ pub(crate) mod tests {
                 rows: 30,
                 meta: Map::new(),
                 first_message: None,
+                adopt_existing: false,
             },
             sink.clone(),
             w,
@@ -1576,7 +1614,7 @@ pub(crate) mod tests {
         ));
         b.extend(out_frame(t, b"hi"));
         peer.write(&b);
-        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(Some(77)));
+        assert_eq!(rx.recv_timeout(T5).unwrap().map(|r| r.pid), Ok(Some(77)));
         sink.wait_text("hi");
         assert_eq!(sh.sizes.lock().unwrap().get(&t), Some(&(90, 30)));
         // A failed open reports the open's error and removes the attachment.
@@ -1590,6 +1628,7 @@ pub(crate) mod tests {
                 rows: 24,
                 meta: Map::new(),
                 first_message: None,
+                adopt_existing: false,
             },
             Arc::new(VecSink::default()),
             w,
@@ -1607,6 +1646,168 @@ pub(crate) mod tests {
             Err(HostError::remote("no such cwd"))
         );
         assert!(!sh.lock().atts.contains_key(&t2));
+    }
+
+    fn adopting_spec(t: Uuid) -> OpenSpec {
+        OpenSpec {
+            adopt_existing: true,
+            ..open_spec(
+                t,
+                LaunchSpec {
+                    agent: Some("claude".into()),
+                    session_id: Some("s1".into()),
+                    ..LaunchSpec::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn term_open_sends_adopt_only_with_capability() {
+        // An older Daemon would answer a Terminal the caller did not ask for: never sent.
+        let sh = shared();
+        let mut peer = connect_capable(&sh, vec![], &["term"]);
+        let h = handle(&sh);
+        let (w, _rx) = res_slot();
+        h.term_open(
+            adopting_spec(Uuid::new_v4()),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let open = peer.expect("term.open");
+        assert!(open["spec"].get("adoptExisting").is_none(), "{open}");
+
+        let sh = shared();
+        let mut peer = connect_capable(&sh, vec![], &["term", "term.open-existing"]);
+        let h = handle(&sh);
+        let (w, _rx) = res_slot();
+        h.term_open(
+            adopting_spec(Uuid::new_v4()),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let open = peer.expect("term.open");
+        assert_eq!(open["spec"]["adoptExisting"], json!(true));
+        // The caller's "no" stays no (local migration).
+        let (w, _rx) = res_slot();
+        h.term_open(
+            open_spec(Uuid::new_v4(), LaunchSpec::default()),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let open = peer.expect("term.open");
+        assert!(open["spec"].get("adoptExisting").is_none(), "{open}");
+    }
+
+    #[test]
+    fn term_open_existed_returns_owner_and_drops_requested_sink() {
+        let sh = shared();
+        let owner = Uuid::new_v4();
+        let mut peer = connect_capable(&sh, vec![info(owner)], &["term", "term.open-existing"]);
+        let h = handle(&sh);
+        let t = Uuid::new_v4();
+        let (w, rx) = res_slot();
+        h.term_open(adopting_spec(t), Arc::new(VecSink::default()), w);
+        let open = peer.expect("term.open");
+        let attach = peer.expect("term.attach");
+        assert_eq!(attach["terminal"], json!(t));
+        let mut b = res_frame(
+            open["id"].as_u64().unwrap(),
+            Ok(json!({"pid": 77, "terminal": owner, "existed": true})),
+        );
+        // The Daemon has no Terminal under the requested UUID.
+        b.extend(res_frame(
+            attach["id"].as_u64().unwrap(),
+            Err(format!("unknown terminal {t}")),
+        ));
+        peer.write(&b);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap(),
+            Ok(OpenReply {
+                pid: Some(77),
+                terminal: Some(owner),
+                existed: true
+            })
+        );
+        assert!(!sh.lock().atts.contains_key(&t));
+        assert!(!sh.sizes.lock().unwrap().contains_key(&t));
+        // An older Daemon's `{pid}` reads as the requested Terminal started.
+        let t2 = Uuid::new_v4();
+        let (w, rx) = res_slot();
+        h.term_open(
+            open_spec(t2, LaunchSpec::default()),
+            Arc::new(VecSink::default()),
+            w,
+        );
+        let open = peer.expect("term.open");
+        let attach = peer.expect("term.attach");
+        let mut b = res_frame(open["id"].as_u64().unwrap(), Ok(json!({"pid": 5})));
+        b.extend(res_frame(
+            attach["id"].as_u64().unwrap(),
+            Ok(json!({"exitCode": null})),
+        ));
+        peer.write(&b);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap(),
+            Ok(OpenReply {
+                pid: Some(5),
+                terminal: None,
+                existed: false
+            })
+        );
+        assert!(sh.lock().atts.contains_key(&t2));
+    }
+
+    /// A2: the attach could not even be queued (no request slot left). The open's answer
+    /// still decides: an adoption wins, anything else reports the attach's failure.
+    #[test]
+    fn term_open_attach_enqueue_failure_waits_for_the_open() {
+        let sh = shared();
+        let owner = Uuid::new_v4();
+        let limits = crate::link::LinkLimits {
+            max_pending: 1,
+            ..Default::default()
+        };
+        let (mut peer, _l, _, _) = connect_full(
+            &sh,
+            vec![info(owner)],
+            limits,
+            &["term", "term.open-existing"],
+        );
+        let h = handle(&sh);
+        let t = Uuid::new_v4();
+        let (w, rx) = res_slot();
+        h.term_open(adopting_spec(t), Arc::new(VecSink::default()), w);
+        let open = peer.expect("term.open");
+        // Not answered before the open is.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        peer.reply(
+            open["id"].as_u64().unwrap(),
+            Ok(json!({"pid": 9, "terminal": owner, "existed": true})),
+        );
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap(),
+            Ok(OpenReply {
+                pid: Some(9),
+                terminal: Some(owner),
+                existed: true
+            })
+        );
+        assert!(!sh.lock().atts.contains_key(&t));
+        assert!(!sh.sizes.lock().unwrap().contains_key(&t));
+
+        // A started Terminal whose attach was never sent: the attach's failure is answered.
+        let t2 = Uuid::new_v4();
+        let (w, rx) = res_slot();
+        h.term_open(adopting_spec(t2), Arc::new(VecSink::default()), w);
+        let open = peer.expect("term.open");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        peer.reply(
+            open["id"].as_u64().unwrap(),
+            Ok(json!({"pid": 10, "terminal": t2, "existed": false})),
+        );
+        let err = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(err.code, HostErrorCode::Busy, "{err:?}");
     }
 
     /// Attach `sink` and complete it with a reply (no output).
@@ -1761,6 +1962,7 @@ pub(crate) mod tests {
             rows: 24,
             meta: Map::new(),
             first_message: None,
+            adopt_existing: false,
         }
     }
 

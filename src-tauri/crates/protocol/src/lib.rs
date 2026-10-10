@@ -44,6 +44,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::AGENT_PROMPT,
     cap::TERM_FIRST_MESSAGE,
     cap::PROJECT_SESSIONS,
+    cap::TERM_OPEN_EXISTING,
     #[cfg(unix)]
     cap::TERM_SUBMIT,
     #[cfg(unix)]
@@ -96,6 +97,13 @@ pub mod cap {
     /// `call get_project_sessions`: one Project's Claude Code and Codex sessions, newest
     /// first, paged (`msg::PastSessionsPage`).
     pub const PROJECT_SESSIONS: &str = "project.sessions";
+    /// A Host runs an agent session in at most one live Terminal. A `term.open` that resumes
+    /// a session (`LaunchSpec::agent_session`) a listed Terminal runs, is relaunching or
+    /// holds unresolved never starts a second agent: with `adoptExisting` it answers that
+    /// Terminal (`msg::OpenReply` with `existed: true`), otherwise it is refused with
+    /// `msg::SESSION_OPEN`; while that Terminal is closing it is refused with the retryable
+    /// `msg::SESSION_CLOSING`. The lookup and the start are one step under the Daemon's lock.
+    pub const TERM_OPEN_EXISTING: &str = "term.open-existing";
     /// `term.submit`: a reply from the Chat View, typed into the agent's chat composer as one
     /// bracketed paste and Enter, never taking the Terminal's size; refused while the agent
     /// needs you or its composer is not on screen (`msg::ClientMsg::TermSubmit`). Unix Hosts
@@ -168,6 +176,12 @@ mod tests {
     #[test]
     fn capabilities_include_term_first_message() {
         assert!(CAPABILITIES.contains(&"term.first-message"));
+    }
+
+    #[test]
+    fn capabilities_include_term_open_existing() {
+        assert!(CAPABILITIES.contains(&"term.open-existing"));
+        assert_eq!(cap::TERM_OPEN_EXISTING, "term.open-existing");
     }
 
     #[test]

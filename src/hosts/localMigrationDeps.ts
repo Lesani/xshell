@@ -85,7 +85,8 @@ export const localMigrationDeps: MigrationDeps = {
     const onData = new Channel<ArrayBuffer>();
     const onExit = new Channel<unknown>();
     try {
-      await invoke("host_term_open", { host: LOCAL_HOST, terminal: op.uuid, spec: op.spec, meta: op.meta, cols: 80, rows: 24, onData, onExit });
+      // Never answered with another Terminal: a session another client runs is refused (xshell#41).
+      await invoke("host_term_open", { host: LOCAL_HOST, terminal: op.uuid, spec: op.spec, meta: op.meta, cols: 80, rows: 24, onData, onExit, adopt: false });
     } finally {
       await invoke("host_term_detach", { host: LOCAL_HOST, terminal: op.uuid }).catch(() => {});
     }

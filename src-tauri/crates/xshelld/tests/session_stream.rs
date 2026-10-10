@@ -635,7 +635,8 @@ fn mobile_refused_for_shell_prefix_and_other_agents() {
     let shell = e.open_spec(sh_spec(&e.cwd.clone()));
     let prefixed = e.open_spec(LaunchSpec {
         launch_prefix: Some(vec!["env".into()]),
-        ..spec(&e.cwd, "claude", Some(SID))
+        // A session of its own: `SID` is opened below, and a Host runs it in one Terminal.
+        ..spec(&e.cwd, "claude", Some(&Uuid::new_v4().to_string()))
     });
     let cursor = e.open("cursor", None);
     let mut m = e.mobile();
@@ -757,7 +758,10 @@ fn unsubscribe_and_disconnect_release() {
 #[test]
 fn subscription_cap() {
     let mut e = env();
-    let ts: Vec<Uuid> = (0..9).map(|_| e.open("claude", Some(SID))).collect();
+    // Nine sessions: a Host runs each one in one Terminal only.
+    let ts: Vec<Uuid> = (0..9)
+        .map(|_| e.open("claude", Some(&Uuid::new_v4().to_string())))
+        .collect();
     let mut m = e.mobile();
     for t in &ts[..8] {
         subscribe(&mut m, *t).unwrap();

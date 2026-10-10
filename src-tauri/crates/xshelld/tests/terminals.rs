@@ -770,6 +770,7 @@ fn terminal_list_budget_enforced() {
                 rows: 24,
                 meta,
                 first_message: None,
+                adopt_existing: false,
             },
         });
         (t, r)
