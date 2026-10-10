@@ -65,6 +65,49 @@ fn hello_no_overlap_rejected() {
 }
 
 #[test]
+fn default_range_is_protocol() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::connect(&srv.socket);
+    let (hello, _) = c.hello(range(1, 1));
+    assert_eq!(hello.protocol, xshell_protocol::PROTOCOL);
+}
+
+#[test]
+fn hello_uses_configured_range() {
+    let h = TestHome::new();
+    let srv = start(&h, |c| c.protocol = range(2, 3));
+    let mut c = Client::connect(&srv.socket);
+    c.send(
+        &ClientMsg::Hello(xshell_protocol::msg::Hello {
+            protocol: range(1, 1),
+            version: "old".into(),
+            capabilities: vec![],
+        }),
+        None,
+    );
+    let m = c.expect_msg("hello", |m| matches!(m, ServerMsg::Hello(_)));
+    let ServerMsg::Hello(hello) = m else {
+        unreachable!()
+    };
+    assert_eq!(hello.protocol, range(2, 3));
+    let m = c.expect_msg("error", |m| matches!(m, ServerMsg::Error { .. }));
+    let ServerMsg::Error { code, message } = m else {
+        unreachable!()
+    };
+    assert_eq!(code, "protocol_mismatch");
+    assert!(
+        message.contains("1..1") && message.contains("2..3"),
+        "{message}"
+    );
+    c.expect_eof();
+
+    let mut ok = Client::connect(&srv.socket);
+    let (hello, _) = ok.hello(range(3, 4));
+    assert_eq!(hello.protocol, range(2, 3));
+}
+
+#[test]
 fn first_message_must_be_hello() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});

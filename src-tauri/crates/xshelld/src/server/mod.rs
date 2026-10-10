@@ -127,6 +127,10 @@ pub struct Config {
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
+    /// Test hook: the range offered in `hello` and negotiated against, as an older or newer
+    /// Daemon would.
+    #[doc(hidden)]
+    pub protocol: xshell_protocol::msg::ProtocolRange,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -296,6 +300,7 @@ impl Config {
             max_session_requests: 16,
             max_session_queue: 256,
             hide_capabilities: Vec::new(),
+            protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
             test_hook: None,
         }

@@ -2,7 +2,7 @@
 //! pending, or unusable until one side is upgraded.
 
 use xshell_protocol::msg::{Hello, ProtocolRange};
-use xshell_protocol::negotiate::negotiate;
+use xshell_protocol::negotiate::{negotiate, Older};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncompatibleReason {
@@ -48,11 +48,10 @@ pub fn classify(desktop: &str, ours: ProtocolRange, hello: &Hello, managed: bool
                 upgrade_pending: managed && older,
             }
         }
-        Err(_) => Classified::Incompatible {
-            reason: if hello.protocol.max < ours.min {
-                IncompatibleReason::Older
-            } else {
-                IncompatibleReason::Newer
+        Err(m) => Classified::Incompatible {
+            reason: match m.older() {
+                Older::Theirs => IncompatibleReason::Older,
+                Older::Ours => IncompatibleReason::Newer,
             },
             message: incompatible_message(ours, hello),
         },

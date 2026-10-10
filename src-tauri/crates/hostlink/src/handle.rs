@@ -37,7 +37,7 @@ pub trait TermSink: Send + Sync {
 
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// The hello capability of Daemons that serve `term.relaunch`.
-const RELAUNCH_CAPABILITY: &str = "term.relaunch";
+const RELAUNCH_CAPABILITY: &str = xshell_protocol::cap::TERM_RELAUNCH;
 /// The hello capability of Daemons that serve `ring.identity` and `ring.join`.
 pub const RING_CAPABILITY: &str = "ring";
 /// `ring.join` takes `expect`: the Daemon refuses the join unless its membership is still

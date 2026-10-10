@@ -30,7 +30,7 @@ One byte stream per connection (the `ssh` process's stdio on the Desktop; the Un
 - kind `0` — JSON message (UTF-8). Every message has `"t"` (type). Requests carry `"id"`; responses echo it with `"ok"` or `"err"`. `id` is optional on every Desktop→Host message: without it the Host sends no response (the Desktop omits it on `term.input`/`term.resize`).
 - kind `1` — Terminal output: 16-byte Terminal UUID followed by raw bytes. Output is never JSON-encoded.
 
-Handshake: first message from each side is `hello { protocol: { min, max }, version, capabilities[] }`. The connection uses the highest common protocol version; no overlap → the Daemon replies with an error naming both ranges and closes. Changes are additive: unknown message types get an `err` response, unknown fields are ignored, and new features are gated on `capabilities`.
+Handshake: first message from each side is `hello { protocol: { min, max }, version, capabilities[] }`. The connection uses the highest common protocol version; no overlap → the Daemon replies with an error naming both ranges and closes. Changes are additive: unknown message types get an `err` response, unknown fields are ignored, and new features are gated on `capabilities`. A Mobile performs the same `hello` inside its Noise session; its `capabilities` list only what that app handles, and the Daemon does not use them yet.
 
 Messages (protocol 1):
 

@@ -8,6 +8,25 @@ pub struct Mismatch {
     pub theirs: ProtocolRange,
 }
 
+/// Which side must update to close a [`Mismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Older {
+    Ours,
+    Theirs,
+}
+
+impl Mismatch {
+    /// The side that speaks only older versions: `Theirs` when their newest version is below
+    /// our oldest, else `Ours`.
+    pub fn older(&self) -> Older {
+        if self.theirs.max < self.ours.min {
+            Older::Theirs
+        } else {
+            Older::Ours
+        }
+    }
+}
+
 impl fmt::Display for Mismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -54,5 +73,21 @@ mod tests {
         let e = negotiate(r(1, 1), r(2, 3)).unwrap_err();
         let s = e.to_string();
         assert!(s.contains("1..1") && s.contains("2..3"), "{s}");
+    }
+
+    #[test]
+    fn older_side_theirs() {
+        assert_eq!(
+            negotiate(r(2, 3), r(1, 1)).unwrap_err().older(),
+            Older::Theirs
+        );
+    }
+
+    #[test]
+    fn older_side_ours() {
+        assert_eq!(
+            negotiate(r(1, 1), r(2, 4)).unwrap_err().older(),
+            Older::Ours
+        );
     }
 }

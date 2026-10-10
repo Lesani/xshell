@@ -15,43 +15,74 @@ pub mod ring;
 pub use launch::LaunchSpec;
 use msg::ProtocolRange;
 
+/// Support window (PRD, Lesani/xshell#1): a Mobile release speaks every protocol version that
+/// any Desktop release from the last 12 months could install. The Mobile pins this crate, so
+/// raising `PROTOCOL_MIN` (or narrowing the range in any other way) drops older Daemons for the
+/// Mobile too: before doing so, check the protocol ranges of the Desktop releases from the last
+/// 12 months.
 pub const PROTOCOL_MIN: u32 = 1;
 pub const PROTOCOL_MAX: u32 = 1;
 pub const PROTOCOL: ProtocolRange = ProtocolRange {
     min: PROTOCOL_MIN,
     max: PROTOCOL_MAX,
 };
-/// Feature gates advertised in `hello` (additive; peers ignore unknown entries).
+/// Feature gates advertised in `hello` (additive; peers ignore unknown entries). Each is
+/// documented at its constant in [`cap`].
 pub const CAPABILITIES: &[&str] = &[
-    "call",
-    "term",
-    "daemon.upgrade",
-    "term.relaunch",
-    "launch.prefix",
-    "agent.status",
-    // `TerminalInfo.lastLine`: the newest text message of an agent Terminal's session.
-    "agent.last-line",
-    "ring",
-    // `ring.join` takes `expect` (a conditional join).
-    "ring.cjoin",
-    // `push.register` and `push.unregister` (from a Mobile).
-    "push",
-    // `session.subscribe`, `session.page`, `session.unsubscribe` and `session.append`: an
-    // agent Terminal's conversation for the Chat View.
-    "session.stream",
-    // The Mobile's Terminal View: a Mobile's `term.resize` records its size without applying
-    // it, and its `term.input` claims it; `term.size` notices to attached Mobiles; output to a
-    // Mobile paced (at most one frame per Terminal per second, ten per second for three
-    // seconds after its input); the attach `res` carries `{exitCode, cols, rows}`; a Mobile's
-    // attach nudges only when nobody else is attached; a Mobile's replay is a shorter tail;
-    // the size goes back to the last Desktop that held it when an owning Mobile leaves.
-    "term.mobile",
-    // `term.open` takes `firstMessage`: a new Claude Code or Codex chat starts with that
-    // prompt. Unix only: on Windows the agent runs through `cmd.exe /C`, which would parse the
-    // text as a command line.
+    cap::CALL,
+    cap::TERM,
+    cap::DAEMON_UPGRADE,
+    cap::TERM_RELAUNCH,
+    cap::LAUNCH_PREFIX,
+    cap::AGENT_STATUS,
+    cap::AGENT_LAST_LINE,
+    cap::RING,
+    cap::RING_CJOIN,
+    cap::PUSH,
+    cap::SESSION_STREAM,
+    cap::TERM_MOBILE,
     #[cfg(unix)]
-    "term.first-message",
+    cap::TERM_FIRST_MESSAGE,
 ];
+
+/// The names in [`CAPABILITIES`], so peers gate on a constant instead of a string literal.
+pub mod cap {
+    /// `call` requests.
+    pub const CALL: &str = "call";
+    /// Terminal requests (`term.*`).
+    pub const TERM: &str = "term";
+    /// `daemon.upgrade` (Desktop only).
+    pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
+    /// `term.relaunch`.
+    pub const TERM_RELAUNCH: &str = "term.relaunch";
+    /// Launch prefixes in `term.open`.
+    pub const LAUNCH_PREFIX: &str = "launch.prefix";
+    /// `TerminalInfo.agentStatus`.
+    pub const AGENT_STATUS: &str = "agent.status";
+    /// `TerminalInfo.lastLine`: the newest text message of an agent Terminal's session.
+    pub const AGENT_LAST_LINE: &str = "agent.last-line";
+    /// Ring identity and join (Desktop only).
+    pub const RING: &str = "ring";
+    /// `ring.join` takes `expect` (a conditional join).
+    pub const RING_CJOIN: &str = "ring.cjoin";
+    /// `push.register` and `push.unregister` (from a Mobile).
+    pub const PUSH: &str = "push";
+    /// `session.subscribe`, `session.page`, `session.unsubscribe` and `session.append`: an
+    /// agent Terminal's conversation for the Chat View.
+    pub const SESSION_STREAM: &str = "session.stream";
+    /// The Mobile's Terminal View: a Mobile's `term.resize` records its size without applying
+    /// it, and its `term.input` claims it; `term.size` notices to attached Mobiles; output to a
+    /// Mobile paced (at most one frame per Terminal per second, ten per second for three
+    /// seconds after its input); the attach `res` carries `{exitCode, cols, rows}`; a Mobile's
+    /// attach nudges only when nobody else is attached; a Mobile's replay is a shorter tail;
+    /// the size goes back to the last Desktop that held it when an owning Mobile leaves.
+    pub const TERM_MOBILE: &str = "term.mobile";
+    /// `term.open` takes `firstMessage`: a new Claude Code or Codex chat starts with that
+    /// prompt. Unix only: on Windows the agent runs through `cmd.exe /C`, which would parse the
+    /// text as a command line.
+    #[cfg(unix)]
+    pub const TERM_FIRST_MESSAGE: &str = "term.first-message";
+}
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
 /// is GUI-bound, ADR-0005) and xshell is closed: nothing was started.

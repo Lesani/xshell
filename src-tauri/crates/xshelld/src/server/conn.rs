@@ -24,7 +24,7 @@ use xshell_protocol::msg::{
 };
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::ring::Member;
-use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE, PROTOCOL};
+use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE};
 
 /// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
 pub(crate) const UPGRADE_REFUSED: &str =
@@ -85,7 +85,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         return;
     }
     if let Some(f) = frame(&ServerMsg::Hello(Hello {
-        protocol: PROTOCOL,
+        protocol: d.cfg.protocol,
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: CAPABILITIES
             .iter()
@@ -117,7 +117,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         ob.close();
         return;
     };
-    if let Err(m) = negotiate(PROTOCOL, theirs.protocol) {
+    if let Err(m) = negotiate(d.cfg.protocol, theirs.protocol) {
         push_error(&ob, "protocol_mismatch", m.to_string());
         ob.close();
         return;
