@@ -23,6 +23,7 @@ pub mod past;
 pub mod paths;
 pub mod pipe;
 pub mod private_fs;
+pub mod prompt;
 pub mod sessions;
 pub mod skills;
 pub mod stats;

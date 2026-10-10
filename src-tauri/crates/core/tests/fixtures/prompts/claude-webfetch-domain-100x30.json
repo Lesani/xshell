@@ -1,0 +1,19 @@
+{
+  "agent": "claude",
+  "version": "2.1.296",
+  "cols": 100,
+  "rows": 30,
+  "synthetic": true,
+  "source": "gen_synthetic.py: built from the CLI's strings and rendering, not recorded (xshell-remote#8, D9)",
+  "expect": {
+    "textContains": [
+      "https://example.com/docs",
+      "Do you want to allow Claude to fetch this content?"
+    ],
+    "options": [
+      "Yes",
+      "Yes, and don't ask again for example.com",
+      "No, and tell Claude what to do differently"
+    ]
+  }
+}

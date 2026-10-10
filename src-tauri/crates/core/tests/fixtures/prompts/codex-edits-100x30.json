@@ -1,0 +1,19 @@
+{
+  "agent": "codex",
+  "version": "0.154.0",
+  "cols": 100,
+  "rows": 30,
+  "synthetic": true,
+  "source": "gen_synthetic.py: built from the CLI's strings and rendering, not recorded (xshell-remote#8, D9)",
+  "expect": {
+    "textContains": [
+      "Would you like to make the following edits?",
+      "src/main.rs"
+    ],
+    "options": [
+      "Yes, proceed",
+      "Yes, and don't ask again for these files",
+      "No, and tell Codex what to do differently"
+    ]
+  }
+}

@@ -1241,6 +1241,7 @@ pub(crate) mod tests {
             agent_status: None,
             status_at_ms: None,
             last_line: None,
+            permission_prompt: None,
         }
     }
 

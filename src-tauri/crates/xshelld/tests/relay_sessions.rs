@@ -685,3 +685,74 @@ fn mobile_terminal_view_over_relay() {
         |m| matches!(m, ServerMsg::TermSize { terminal, cols: 40, rows: 20 } if *terminal == term),
     );
 }
+
+/// A Permission Prompt through the Relay bridge: the phone is told the prompt in its list and
+/// answers it; the key reaches the agent.
+#[test]
+fn mobile_answers_prompt_over_relay() {
+    use xshell_protocol::msg::OpenSpec;
+    let s = setup();
+    let project = s.h.project("p");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../core/tests/fixtures/prompts/codex-exec-100x30.raw");
+    std::fs::write(
+        project.join("agent.sh"),
+        format!(
+            "exec 3<&0\nstty -icanon -echo min 1 time 0\ncat '{}'\n\
+             printf '\\033]9;Approval requested\\007'\n\
+             while :; do k=$(dd bs=1 count=1 <&3 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n\
+             [ -n \"$k\" ] || exit 0; echo \"$k\" >> keys.log; done\n",
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    let fake = Fake::in_dir(&project);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let mut d = Client::in_process(&s.srv, Role::Desktop);
+    let term = Uuid::new_v4();
+    d.request(&ClientMsg::TermOpen {
+        spec: OpenSpec {
+            terminal: term,
+            launch: xshell_core::launch::LaunchSpec {
+                agent: Some("codex".into()),
+                ..claude_spec(&project, None)
+            },
+            cols: 100,
+            rows: 30,
+            meta: Default::default(),
+            first_message: None,
+        },
+    })
+    .unwrap();
+
+    let phone = Peer::new(&s.r, &s.ring.chain, &s.mobile);
+    let session = phone.sessions.open(&s.daemon).expect("session opens");
+    let mut c = Client::from_io(session.try_clone(), session);
+    // The list after `hello` may carry the prompt already.
+    let (_, first) = c.hello(range(1, 1));
+    let has = |l: &[xshell_protocol::msg::TerminalInfo]| {
+        l.iter()
+            .find(|i| i.terminal == term)
+            .and_then(|i| i.permission_prompt.clone())
+    };
+    let p = match has(&first) {
+        Some(p) => p,
+        None => has(&c.terminals_where(|l| has(l).is_some())).unwrap(),
+    };
+    assert_eq!(p.options[0].label, "Yes, proceed");
+    assert_eq!(
+        c.request(&ClientMsg::TermAnswer {
+            terminal: term,
+            prompt: p.id,
+            option: 0,
+        }),
+        Ok(Value::Null)
+    );
+    wait_until("the key", T, || {
+        std::fs::read_to_string(project.join("keys.log")).unwrap_or_default() == "31\n"
+    });
+    c.terminals_where(|l| {
+        l.iter()
+            .any(|i| i.terminal == term && i.permission_prompt.is_none())
+    });
+}

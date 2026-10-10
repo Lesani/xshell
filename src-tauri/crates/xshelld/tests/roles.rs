@@ -14,7 +14,9 @@ use uuid::Uuid;
 use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::frame::Frame;
-use xshell_protocol::msg::{ClientMsg, Hello, OpenSpec, PastSessionsPage, ServerMsg};
+use xshell_protocol::msg::{
+    ClientMsg, Hello, OpenSpec, PastSessionsPage, ServerMsg, PROMPT_ANSWERED,
+};
 use xshelld::server::{ExitReason, Role, ServerHandle};
 
 const SID: &str = "11111111-2222-3333-4444-555555555555";
@@ -982,4 +984,49 @@ fn roles_are_per_connection() {
     sock.marker(t, "sockok");
     refused(try_open(&mut mob2, e.shell()));
     e.desk.open(Uuid::new_v4(), e.shell());
+}
+
+// ── Permission Prompts ────────────────────────────────────────────────────
+
+fn answer_msg(t: Uuid) -> ClientMsg {
+    ClientMsg::TermAnswer {
+        terminal: t,
+        prompt: 1,
+        option: 0,
+    }
+}
+
+#[test]
+fn mobile_may_answer_agent_terminals() {
+    let mut e = env();
+    for spec in [
+        e.claude(),
+        LaunchSpec {
+            agent: Some("codex".into()),
+            session_id: None,
+            ..e.claude()
+        },
+    ] {
+        let t = e.desk_open(spec);
+        // It reaches the Terminal: no prompt is listed, so the answer is stale, not refused.
+        for c in [&mut e.mob, &mut e.desk] {
+            assert_eq!(c.request(&answer_msg(t)), Err(PROMPT_ANSWERED.into()));
+        }
+    }
+    let gone = Uuid::new_v4();
+    assert_eq!(
+        e.mob.request(&answer_msg(gone)),
+        Err(format!("unknown terminal {gone}"))
+    );
+}
+
+#[test]
+fn mobile_answer_refused_for_hidden_terminal() {
+    let mut e = env();
+    for spec in hidden_specs(&e) {
+        let t = e.desk_open(spec);
+        refused(e.mob.request(&answer_msg(t)));
+        // A Desktop's answer reaches it (and finds no prompt).
+        assert_eq!(e.desk.request(&answer_msg(t)), Err(PROMPT_ANSWERED.into()));
+    }
 }

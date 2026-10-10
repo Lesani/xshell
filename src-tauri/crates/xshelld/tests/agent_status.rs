@@ -1010,7 +1010,8 @@ fn restore_recomputes_last_line() {
 #[test]
 fn full_list_with_widest_last_lines_fits_the_queue() {
     use xshell_protocol::msg::{encode_msg, OpenSpec, ServerMsg, LAST_LINE_MAX_CHARS};
-    const LIST: usize = 12_000;
+    // Room for a handful of entries, each reserving its optional fields.
+    const LIST: usize = 40_000;
     let mut e = env_with(|c| {
         c.max_list_bytes = LIST;
         c.conn_total_cap = LIST;

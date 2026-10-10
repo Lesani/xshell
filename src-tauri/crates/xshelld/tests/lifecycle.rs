@@ -123,6 +123,7 @@ fn failed_relaunch_dropped() {
         rows: 24,
         created_at_ms: 1,
         leader: None,
+        prompt_id_floor: None,
     };
     let cwd = h.project("p");
     save_atomic(
@@ -196,6 +197,7 @@ fn persisted(id: Uuid, cwd: &std::path::Path, title: &str) -> PersistedTerminal 
         rows: 24,
         created_at_ms: 1,
         leader: None,
+        prompt_id_floor: None,
     }
 }
 

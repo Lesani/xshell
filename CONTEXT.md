@@ -48,7 +48,7 @@ What an agent **Terminal** is doing as its agent's hooks report it: working, nee
 _Avoid_: activity, state
 
 **Permission Prompt**:
-An agent's question that blocks its turn until answered, with the options its TUI offers; a **Mobile** shows it as buttons, and whoever answers first, at any **Desktop**, wins.
+An agent's question that blocks its turn until answered, with the options its TUI offers; a **Mobile** shows it as buttons, and whoever answers first, at any **Desktop**, wins. Each shown prompt has an id; an answer to a prompt that is no longer current, because someone answered or typed at it first, is "already answered". A prompt whose options cannot be read safely is shown as text only.
 _Avoid_: approval dialog, confirmation
 
 **Tab**:

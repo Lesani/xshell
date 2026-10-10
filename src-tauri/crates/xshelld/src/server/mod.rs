@@ -4,11 +4,16 @@
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox` (a connection's send queue,
 //! the last lock wherever it is taken: size notices are queued holding `io` and `out`);
-//! `Terminal.life` and `Terminal.input` are taken last and alone; `Terminal.status` (the Agent
-//! Status), `Terminal.last_line`, the last-line worker's queue and the session-stream queue
-//! are taken last, and nothing is locked while one is held (the session-stream worker queues
-//! its results under the registry lock, like every publish: `Registry` → `Outbox`). No lock
-//! is held across a blocking PTY or
+//! `Terminal.life` and `Terminal.input` are taken last and alone, except that
+//! `Terminal.screen` (the screen model) → `Terminal.prompt` (the Permission Prompt) →
+//! `Terminal.input`, and nothing else is taken under `screen` or `prompt` but the input
+//! thread's progress (`Terminal.written`, last); `screen` is taken alone or after `io` (a
+//! resize), `prompt` also after the other Terminal locks; `Terminal.status` (the Agent Status),
+//! `Terminal.last_line`, the last-line and prompt workers' queues and the session-stream
+//! queue are taken last, and nothing is locked while one is held (the session-stream worker
+//! queues its results under the registry lock, like every publish: `Registry` → `Outbox`); the
+//! state file's lock (`Daemon.saves`) is taken after `Registry` or alone, last. No
+//! lock is held across a blocking PTY or
 //! socket write: writers own their sockets, input threads own PTY writers. The push
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
@@ -21,6 +26,8 @@ mod orphans;
 pub use orphans::Cleanup;
 mod outbox;
 pub mod parent;
+mod prompt_cell;
+mod prompts;
 mod push;
 mod registry;
 mod relaunch;
@@ -124,6 +131,17 @@ pub struct Config {
     pub max_session_requests: usize,
     /// Session requests queued over all connections.
     pub max_session_queue: usize,
+    /// An agent Terminal's screen is read for a Permission Prompt this long after the last
+    /// output or status change that may show one (150 ms).
+    pub prompt_settle: Duration,
+    /// A needs-you without a prompt read in this long gets a text-only prompt (1 s).
+    pub prompt_grace: Duration,
+    /// The screen is read again this long after an answer or typing, for a prompt the TUI
+    /// ignored (1.5 s).
+    pub prompt_recheck: Duration,
+    /// Test hook: replaces the clock prompt ids are drawn from (Unix ms).
+    #[doc(hidden)]
+    pub prompt_clock: Option<PromptClock>,
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
@@ -173,6 +191,15 @@ pub enum TestPoint {
     /// The session-stream worker read this Terminal's session file (a page, a reset or an
     /// append) and is about to check and queue the result (no lock held).
     SessionRead,
+    /// The prompt worker read this Terminal's screen and is about to commit the result (no
+    /// lock held).
+    PromptRead,
+    /// The prompt worker is about to write a snapshot with a new prompt-id floor; the prompt
+    /// waiting for it is not listed yet (no lock held).
+    PromptPersist,
+    /// An answer was checked against the screen and is about to be queued, with this
+    /// Terminal's screen and prompt locked: a hook may block, but must not touch the Terminal.
+    AnswerChecked,
 }
 
 /// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
@@ -251,6 +278,17 @@ impl std::fmt::Debug for StopLatch {
     }
 }
 
+/// A test hook: the clock prompt ids are drawn from (Unix ms), one per server.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PromptClock(pub Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl std::fmt::Debug for PromptClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PromptClock")
+    }
+}
+
 /// A test hook: called with the Terminal and the point reached.
 #[doc(hidden)]
 #[derive(Clone)]
@@ -299,6 +337,10 @@ impl Config {
             max_session_subs: 8,
             max_session_requests: 16,
             max_session_queue: 256,
+            prompt_settle: Duration::from_millis(150),
+            prompt_grace: Duration::from_secs(1),
+            prompt_recheck: Duration::from_millis(1500),
+            prompt_clock: None,
             hide_capabilities: Vec::new(),
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
@@ -442,6 +484,7 @@ impl Server {
             ring.set_on_head(Arc::new(move |epoch, c| p.on_head(epoch, c)));
         }
         let last_lines = last_line::LastLines::new(cfg.last_line_retry);
+        let prompts = prompts::Prompts::new(cfg.prompt_settle, cfg.prompt_recheck);
         let session_streams = session_stream::SessionStreams::new(
             cfg.session_poll,
             cfg.max_session_subs,
@@ -466,12 +509,16 @@ impl Server {
             ring,
             push,
             last_lines,
+            prompts,
+            saves: Mutex::new(0),
+            snap_seq: AtomicU64::new(0),
             session_streams,
         });
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
         d.push.bind(Arc::downgrade(&d));
         d.last_lines.bind(Arc::downgrade(&d));
+        d.prompts.bind(Arc::downgrade(&d));
         d.session_streams.bind(Arc::downgrade(&d));
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
@@ -596,6 +643,14 @@ impl ServerHandle {
     pub fn attached(&self) -> usize {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.values().map(|t| t.attached()).sum()
+    }
+
+    /// Test hook: the screen-model revision of Terminal `t` (bumped by its output and
+    /// resizes).
+    #[doc(hidden)]
+    pub fn screen_rev(&self, t: Uuid) -> Option<u64> {
+        let reg = self.d.reg.lock().unwrap();
+        reg.terminals.get(&t).map(|t| t.screen_rev())
     }
 
     /// Test hook: session subscriptions held, over all connections.

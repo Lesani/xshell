@@ -2,6 +2,7 @@
 //! and the connections attached to it.
 
 use super::outbox::Outbox;
+use super::prompt_cell::{Outcome, PromptCell, Read as PromptRead};
 use super::registry::{frame, now_ms, overflowed, Daemon, Overflow, Registry};
 use super::size::SizeArbiter;
 use super::{ConnId, TestPoint};
@@ -10,16 +11,17 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::agent_status::{AgentStatus, TerminalHooks, Tracker};
+use xshell_core::agent_status::{AgentStatus, HookAgent, TerminalHooks, Tracker};
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
+use xshell_core::prompt::{extract, screen_tail, ScreenModel};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
-use xshell_protocol::msg::{encode_res, LastLine, ServerMsg, TerminalInfo};
+use xshell_protocol::msg::{encode_res, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED};
 
 const READ_BUF: usize = 16 * 1024;
 const INPUT_BACKLOG: usize = 1024;
@@ -79,6 +81,24 @@ impl Life {
     }
 }
 
+/// An agent Terminal's screen model, for its Permission Prompts.
+struct Screen {
+    model: ScreenModel,
+    agent: HookAgent,
+}
+
+impl Screen {
+    /// The prompt the screen shows, if any, and its rows.
+    fn read(&self) -> (Option<xshell_core::prompt::Found>, Vec<String>) {
+        let rows = self.model.rows();
+        (extract(self.agent, &rows), rows)
+    }
+}
+
+/// How far the input thread got: inputs written, and the screen revision at the last write.
+/// One lock, taken last and alone, so the two are read together.
+type Written = Mutex<(u64, u64)>;
+
 pub(crate) struct Terminal {
     pub id: Uuid,
     record: Mutex<Record>,
@@ -107,6 +127,17 @@ pub(crate) struct Terminal {
     /// The newest text message of the agent's session, as the last-line worker last read
     /// it. Locked last, never across another lock.
     last_line: Mutex<Option<LastLine>>,
+    /// Claude and Codex run directly: a model of the screen, fed with the output and resized
+    /// with the PTY. Locked alone, or after `io`; `prompt` and `input` may be taken under it.
+    screen: Mutex<Option<Screen>>,
+    /// The screen's revision: bumped under `screen` by every feed and resize.
+    screen_rev: Arc<AtomicU64>,
+    /// The Permission Prompt. Locked after the other Terminal locks (`status` and `last_line`
+    /// aside), `screen` included; only `input` and `written` may be taken under it.
+    prompt: Mutex<PromptCell>,
+    /// Inputs queued for the PTY (counted under `input`) and written by the input thread.
+    queued: AtomicU64,
+    written: Arc<Written>,
     /// The Daemon's pending SIGKILLs, which [`Terminal::kill`] adds to.
     escalations: Arc<super::orphans::Escalations>,
     /// Windows: the kill-on-close Job Object the process runs in, with everything it
@@ -169,12 +200,17 @@ impl StatusCell {
 const ENTRY_OVERHEAD: usize = 256;
 
 /// Reserved per entry for the fields the Daemon fills in after admission, at their largest
-/// serialized: `agentStatus`, `statusAtMs` and a `lastLine` of [`LAST_LINE_MAX_CHARS`]
-/// four-byte characters (control characters never reach it; `"` and `\` escape to two bytes).
-/// Counted in every entry's budget, so filling them never grows a list past its limit.
+/// serialized: `agentStatus`, `statusAtMs`, a `lastLine` of [`LAST_LINE_MAX_CHARS`]
+/// four-byte characters (control characters never reach it; `"` and `\` escape to two bytes)
+/// and a `permissionPrompt` of [`PROMPT_TEXT_MAX_CHARS`] and [`PROMPT_OPTIONS_MAX`] labels
+/// of [`PROMPT_OPTION_MAX_CHARS`] such characters (about 5.9 KB). Counted in every entry's
+/// budget, so filling them never grows a list past its limit.
 ///
 /// [`LAST_LINE_MAX_CHARS`]: xshell_protocol::msg::LAST_LINE_MAX_CHARS
-pub const OPTIONAL_FIELDS_BYTES: usize = 1024;
+/// [`PROMPT_TEXT_MAX_CHARS`]: xshell_protocol::msg::PROMPT_TEXT_MAX_CHARS
+/// [`PROMPT_OPTIONS_MAX`]: xshell_protocol::msg::PROMPT_OPTIONS_MAX
+/// [`PROMPT_OPTION_MAX_CHARS`]: xshell_protocol::msg::PROMPT_OPTION_MAX_CHARS
+pub const OPTIONAL_FIELDS_BYTES: usize = 7168;
 
 /// The size a Terminal with this spec and metadata adds to a serialized `terminals` list.
 pub(crate) fn entry_bytes(spec: &LaunchSpec, meta: &Map<String, Value>) -> usize {
@@ -245,6 +281,9 @@ pub(crate) fn spawn_with(
     });
     let plan = xshell_core::plan_command_first(&d.ctx, &spec, hooks, first)?;
     let tracker = Tracker::new(&spec);
+    // Only an agent run directly draws its own dialogs on the whole screen; a wrapping shell
+    // or launch prefix may print anything around it (and a Mobile never sees those).
+    let screen_agent = tracker.agent().filter(|_| spec.is_direct_agent());
     let pair = native_pty_system()
         .openpty(PtySize {
             rows,
@@ -374,6 +413,14 @@ pub(crate) fn spawn_with(
         mobile_replay_cap: d.cfg.mobile_replay_cap,
         kept_leader: None,
         run,
+        screen: Mutex::new(screen_agent.map(|agent| Screen {
+            model: ScreenModel::new(cols, rows),
+            agent,
+        })),
+        screen_rev: Arc::new(AtomicU64::new(0)),
+        prompt: Mutex::new(PromptCell::new(0)),
+        queued: AtomicU64::new(0),
+        written: Arc::new(Mutex::new((0, 0))),
         status: Mutex::new(StatusCell::new(tracker, 0)),
         last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
@@ -438,15 +485,21 @@ pub(crate) fn spawn_with(
     } else {
         std::thread::Builder::new()
             .name(format!("pty-in-{tag}"))
-            .spawn(move || {
-                let mut writer = writer;
-                for data in rx {
-                    if writer
-                        .write_all(&data)
-                        .and_then(|_| writer.flush())
-                        .is_err()
-                    {
-                        break;
+            .spawn({
+                let (written, rev) = (t.written.clone(), t.screen_rev.clone());
+                move || {
+                    let mut writer = writer;
+                    for data in rx {
+                        if writer
+                            .write_all(&data)
+                            .and_then(|_| writer.flush())
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let mut w = written.lock().unwrap();
+                        w.0 += 1;
+                        w.1 = rev.load(Ordering::SeqCst);
                     }
                 }
             })
@@ -478,7 +531,9 @@ impl Terminal {
                     let (out, answer) = startup.feed(&buf[..n]);
                     if answer {
                         if let Some(tx) = self.input.lock().unwrap().as_ref() {
-                            let _ = tx.try_send(win::CURSOR_AT_ORIGIN.to_vec());
+                            if tx.try_send(win::CURSOR_AT_ORIGIN.to_vec()).is_ok() {
+                                self.queued.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     }
                     if !out.is_empty() {
@@ -507,16 +562,188 @@ impl Terminal {
             }
         }
         d.nudge_overflowed(dropped);
+        self.feed_screen(d, bytes);
         let changed = {
             let mut c = self.status.lock().unwrap();
             let changed = c.tracker.on_output(bytes);
-            c.stamp(changed, now_ms())
+            c.stamp(changed, now_ms()).then(|| c.listed())
         };
-        if changed {
+        if let Some((status, stamp)) = changed {
+            self.follow_status(d, status, stamp);
             super::agent::changed(d, self);
             // Codex's OSC 9 notification: the agent itself says it needs you.
             d.push.notify(self.id, self.run, AgentStatus::NeedsYou);
         }
+    }
+
+    /// Feed the screen model. A listed prompt the screen no longer shows becomes
+    /// unanswerable at once, before anything else sees the new screen; the worker reads the
+    /// screen once it settles.
+    fn feed_screen(&self, d: &Daemon, bytes: &[u8]) {
+        let mut g = self.screen.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            return;
+        };
+        s.model.feed(bytes);
+        self.screen_rev.fetch_add(1, Ordering::SeqCst);
+        let mut p = self.prompt.lock().unwrap();
+        if p.watching().is_some() {
+            p.observe(s.read().0.map(|f| f.fingerprint));
+        }
+        let interested = p.interested();
+        drop(p);
+        drop(g);
+        if interested {
+            d.prompts.request(self.id);
+        }
+    }
+
+    /// The Agent Status changed to `status` (stamped `stamp`): a needs-you starts a prompt
+    /// episode; anything else ends it and unlists the prompt, in the list that carries the
+    /// new status.
+    fn follow_status(&self, d: &Daemon, status: Option<AgentStatus>, stamp: Option<u64>) {
+        if self.screen.lock().unwrap().is_none() {
+            return;
+        }
+        let mut p = self.prompt.lock().unwrap();
+        match status {
+            Some(AgentStatus::NeedsYou) => {
+                let now = Instant::now();
+                p.needs_you(stamp.unwrap_or(0), now);
+                drop(p);
+                d.prompts.request(self.id);
+                d.prompts.at(self.id, now + d.cfg.prompt_grace);
+            }
+            Some(AgentStatus::Ended) => {
+                p.end();
+            }
+            _ => {
+                p.left_needs_you();
+            }
+        }
+    }
+
+    /// The prompt worker's read: snapshot the screen, extract without a lock, then commit
+    /// unless the prompt changed meanwhile (an answer, typing, a status change: the result
+    /// is dropped, and whatever changed it asked for its own read). The commit holds the
+    /// screen: a screen that changed since the snapshot is read again, and none changes
+    /// before the commit is done.
+    pub fn read_prompt(&self, d: &Daemon, recheck: bool) -> Outcome {
+        let gen = self.prompt.lock().unwrap().gen();
+        let snap = {
+            let g = self.screen.lock().unwrap();
+            let Some(s) = g.as_ref() else {
+                return Outcome::default();
+            };
+            (
+                s.model.rows(),
+                self.screen_rev.load(Ordering::SeqCst),
+                s.agent,
+            )
+        };
+        let (rows, rev, agent) = snap;
+        let found = extract(agent, &rows);
+        d.test_point(self.id, super::TestPoint::PromptRead);
+        let g = self.screen.lock().unwrap();
+        let Some(s) = g.as_ref() else {
+            return Outcome::default();
+        };
+        let mut p = self.prompt.lock().unwrap();
+        if p.gen() != gen {
+            return Outcome {
+                recheck_again: recheck,
+                ..Outcome::default()
+            };
+        }
+        let now_rev = self.screen_rev.load(Ordering::SeqCst);
+        let (found, rows, rev) = if now_rev != rev {
+            let (f, r) = s.read();
+            (f, r, now_rev)
+        } else {
+            (found, rows, rev)
+        };
+        // The writer's progress as one snapshot, then the inputs queued so far (never fewer
+        // than it has written).
+        let written = *self.written.lock().unwrap();
+        let queued = self.queued.load(Ordering::SeqCst);
+        let tail = || screen_tail(&rows);
+        p.commit(&PromptRead {
+            found: found.as_ref(),
+            tail: &tail,
+            rev,
+            recheck,
+            written,
+            queued,
+            now: Instant::now(),
+            now_ms: d.cfg.prompt_clock.as_ref().map_or_else(now_ms, |c| (c.0)()),
+            grace: d.cfg.prompt_grace,
+            recheck_delay: d.cfg.prompt_recheck,
+        })
+    }
+
+    /// The prompt-id floor `floor` was persisted (`ok`) or could not be: list the prompt
+    /// waiting for it, or drop it. `true` when the listed prompt changed.
+    pub fn confirm_prompt(&self, floor: u64, ok: bool) -> bool {
+        self.prompt.lock().unwrap().confirm(floor, ok)
+    }
+
+    /// Answer the listed prompt `id` with `option`: type that option's key, without taking
+    /// the size. Refused with [`PROMPT_ANSWERED`] unless `id` is listed and the screen still
+    /// shows it, with `PROMPT_NO_OPTION` for an option it does not have. The screen is held
+    /// from that check until the key is queued and the prompt spent: no output lands in
+    /// between.
+    pub fn answer(&self, d: &Daemon, id: u64, option: u32) -> Result<(), String> {
+        let keys = {
+            let g = self.screen.lock().unwrap();
+            let mut p = self.prompt.lock().unwrap();
+            let (keys, fp) = p.check_answer(id, option)?;
+            let shows = g.as_ref().and_then(|s| s.read().0).map(|f| f.fingerprint) == Some(fp);
+            if !shows {
+                p.set_gone();
+                drop(p);
+                drop(g);
+                d.prompts.request(self.id);
+                return Err(PROMPT_ANSWERED.into());
+            }
+            d.test_point(self.id, super::TestPoint::AnswerChecked);
+            let input = self.input.lock().unwrap();
+            let tx = input.as_ref().ok_or("terminal has exited")?;
+            match tx.try_send(keys.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err("input backlog full".into()),
+                Err(TrySendError::Disconnected(_)) => return Err("terminal has exited".into()),
+            }
+            let seq = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
+            p.spend(seq, self.screen_rev.load(Ordering::SeqCst), Instant::now());
+            keys
+        };
+        // A Codex answer key also says the turn goes on.
+        self.note_input(d, &keys);
+        self.publish_prompt(d);
+        d.prompts.recheck(self.id);
+        Ok(())
+    }
+
+    /// Publish the list after the prompt changed, if this Terminal is the one listed.
+    fn publish_prompt(&self, d: &Daemon) {
+        let reg = d.reg.lock().unwrap();
+        let listed = reg
+            .terminals
+            .get(&self.id)
+            .is_some_and(|c| std::ptr::eq(Arc::as_ptr(c), self));
+        if listed && !reg.frozen {
+            d.broadcast_terminals(&reg);
+        }
+    }
+
+    /// Continue prompt ids above `floor`, persisted by the run before a restart.
+    pub fn restore_prompt_floor(&self, floor: u64) {
+        self.prompt.lock().unwrap().restored(floor);
+    }
+
+    /// Test hook: the screen model's revision.
+    pub fn screen_rev(&self) -> u64 {
+        self.screen_rev.load(Ordering::SeqCst)
     }
 
     /// Start this run's Agent Status afresh, as a running process would (tests only: a
@@ -532,27 +759,40 @@ impl Terminal {
         self.status.lock().unwrap().tracker.status()
     }
 
-    /// A hook's report for process `run`.
-    pub fn on_agent_event(&self, run: u64, status: AgentStatus) -> Result<bool, String> {
-        let mut c = self.status.lock().unwrap();
-        if c.tracker.agent().is_none() {
-            return Err("not an agent terminal".into());
+    /// A hook's report for process `run`. A change reaches the prompt before the list that
+    /// carries it is published.
+    pub fn on_agent_event(
+        &self,
+        d: &Daemon,
+        run: u64,
+        status: AgentStatus,
+    ) -> Result<bool, String> {
+        let changed = {
+            let mut c = self.status.lock().unwrap();
+            if c.tracker.agent().is_none() {
+                return Err("not an agent terminal".into());
+            }
+            if run != self.run {
+                return Err("stale run".into());
+            }
+            let changed = c.tracker.on_event(status)?;
+            c.stamp(changed, now_ms()).then(|| c.listed())
+        };
+        if let Some((status, stamp)) = changed {
+            self.follow_status(d, status, stamp);
         }
-        if run != self.run {
-            return Err("stale run".into());
-        }
-        let changed = c.tracker.on_event(status)?;
-        Ok(c.stamp(changed, now_ms()))
+        Ok(changed.is_some())
     }
 
-    /// Input about to be written: it may answer a prompt or interrupt a turn.
+    /// Input just queued (or refused): it may answer a prompt or interrupt a turn.
     pub fn note_input(&self, d: &Daemon, data: &[u8]) {
         let changed = {
             let mut c = self.status.lock().unwrap();
             let changed = c.tracker.on_input(data);
-            c.stamp(changed, now_ms())
+            c.stamp(changed, now_ms()).then(|| c.listed())
         };
-        if changed {
+        if let Some((status, stamp)) = changed {
+            self.follow_status(d, status, stamp);
             super::agent::changed(d, self);
         }
     }
@@ -590,6 +830,7 @@ impl Terminal {
             let changed = c.tracker.on_exit();
             c.stamp(changed, now_ms());
         }
+        self.prompt.lock().unwrap().end();
         {
             let mut o = self.out.lock().unwrap();
             o.exit_code = Some(code);
@@ -694,6 +935,12 @@ impl Terminal {
         // also one it made already (its reader runs before the hand-over).
         let floor = self.status.lock().unwrap().last_stamp();
         next.status.lock().unwrap().raise_floor(floor);
+        // Prompt ids too: an answer to this run's prompt never matches the next run's.
+        let (ids, reserved) = {
+            let p = self.prompt.lock().unwrap();
+            (p.high_water(), p.reserved())
+        };
+        next.prompt.lock().unwrap().inherit(ids, reserved);
         let line = self.last_line.lock().unwrap().clone();
         *next.last_line.lock().unwrap() = line;
         let mut dropped = Vec::new();
@@ -714,7 +961,7 @@ impl Terminal {
             o.subs.insert(conn, ob);
         }
         // A size taken while `next` was starting (it started at the size read then).
-        if size != spawned && Self::apply_size(&io, size).is_ok() {
+        if size != spawned && next.apply_size(&io, size).is_ok() {
             next.notify_size(&o, size);
         }
         dropped
@@ -786,7 +1033,7 @@ impl Terminal {
             }
         }
         match io.arb.forget(conn) {
-            Some(sz) if Self::apply_size(&io, sz).is_ok() => {
+            Some(sz) if self.apply_size(&io, sz).is_ok() => {
                 self.notify_size(&o, sz);
                 true
             }
@@ -841,18 +1088,23 @@ impl Terminal {
         }
     }
 
-    fn apply_size(io: &TermIo, (cols, rows): (u16, u16)) -> Result<(), String> {
-        let Some(master) = &io.master else {
-            return Ok(());
-        };
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("resize failed: {e}"))
+    /// Resize the PTY (`io` locked), and the screen model with it.
+    fn apply_size(&self, io: &TermIo, (cols, rows): (u16, u16)) -> Result<(), String> {
+        if let Some(master) = &io.master {
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("resize failed: {e}"))?;
+        }
+        if let Some(s) = self.screen.lock().unwrap().as_mut() {
+            s.model.resize(cols, rows);
+            self.screen_rev.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// `conn` (a Mobile when `mobile`) resized its view; see [`SizeArbiter::on_resize`].
@@ -861,7 +1113,7 @@ impl Terminal {
         let mut io = self.io.lock().unwrap();
         match io.arb.on_resize(conn, cols, rows, mobile) {
             Some(sz) => {
-                Self::apply_size(&io, sz)?;
+                self.apply_size(&io, sz)?;
                 self.notify_size(&self.out.lock().unwrap(), sz);
                 Ok(true)
             }
@@ -869,26 +1121,44 @@ impl Terminal {
         }
     }
 
-    /// `conn` (a Mobile when `mobile`) typed: it takes over the size. Returns whether the PTY
-    /// size changed.
-    pub fn write_input(&self, conn: ConnId, data: String, mobile: bool) -> Result<bool, String> {
+    /// `conn` (a Mobile when `mobile`) typed: it takes over the size. Input that
+    /// `may_answer` the listed prompt makes it stale, atomically with queueing it, so an
+    /// answer racing it either goes first or is refused. Returns whether the PTY size changed.
+    pub fn write_input(
+        &self,
+        d: &Daemon,
+        conn: ConnId,
+        data: String,
+        mobile: bool,
+        may_answer: bool,
+    ) -> Result<bool, String> {
         let changed = {
             let mut io = self.io.lock().unwrap();
             match io.arb.on_input(conn, mobile) {
-                Some(sz) if Self::apply_size(&io, sz).is_ok() => {
+                Some(sz) if self.apply_size(&io, sz).is_ok() => {
                     self.notify_size(&self.out.lock().unwrap(), sz);
                     true
                 }
                 _ => false,
             }
         };
-        let g = self.input.lock().unwrap();
-        let tx = g.as_ref().ok_or("terminal has exited")?;
-        match tx.try_send(data.into_bytes()) {
-            Ok(()) => Ok(changed),
-            Err(TrySendError::Full(_)) => Err("input backlog full".into()),
-            Err(TrySendError::Disconnected(_)) => Err("terminal has exited".into()),
+        let spent = {
+            let mut p = self.prompt.lock().unwrap();
+            let g = self.input.lock().unwrap();
+            let tx = g.as_ref().ok_or("terminal has exited")?;
+            match tx.try_send(data.into_bytes()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => return Err("input backlog full".into()),
+                Err(TrySendError::Disconnected(_)) => return Err("terminal has exited".into()),
+            }
+            let seq = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
+            may_answer && p.spend(seq, self.screen_rev.load(Ordering::SeqCst), Instant::now())
+        };
+        if spent {
+            self.publish_prompt(d);
+            d.prompts.recheck(self.id);
         }
+        Ok(changed)
     }
 
     /// Force full-screen TUIs to repaint: shrink by a row, then restore the current size.
@@ -905,14 +1175,14 @@ impl Terminal {
                     let io = t.io.lock().unwrap();
                     let (cols, rows) = io.arb.current();
                     if rows > 1 {
-                        let _ = Self::apply_size(&io, (cols, rows - 1));
+                        let _ = t.apply_size(&io, (cols, rows - 1));
                     }
                 }
                 std::thread::sleep(delay);
                 {
                     // The current size, so a real resize during the gap wins.
                     let io = t.io.lock().unwrap();
-                    let _ = Self::apply_size(&io, io.arb.current());
+                    let _ = t.apply_size(&io, io.arb.current());
                 }
                 t.nudge_pending.store(false, Ordering::SeqCst);
             });
@@ -1138,6 +1408,7 @@ impl Terminal {
             agent_status,
             status_at_ms,
             last_line: self.last_line.lock().unwrap().clone(),
+            permission_prompt: self.prompt.lock().unwrap().listed(),
         }
     }
 
@@ -1179,6 +1450,7 @@ impl Terminal {
             leader: leader
                 .or_else(|| r.replacement.clone())
                 .or_else(|| self.kept_leader.clone()),
+            prompt_id_floor: self.prompt.lock().unwrap().persist_floor(),
         }
     }
 }
@@ -1226,6 +1498,11 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         mobile_replay_cap: d.cfg.mobile_replay_cap,
         kept_leader: p.leader,
         run: d.next_run.fetch_add(1, Ordering::SeqCst),
+        screen: Mutex::new(None),
+        screen_rev: Arc::new(AtomicU64::new(0)),
+        prompt: Mutex::new(PromptCell::new(p.prompt_id_floor.unwrap_or(0))),
+        queued: AtomicU64::new(0),
+        written: Arc::new(Mutex::new((0, 0))),
         status: Mutex::new(status),
         last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
@@ -1455,7 +1732,10 @@ mod status_tests {
 
     #[test]
     fn optional_fields_fit_their_reserve() {
-        use xshell_protocol::msg::{Speaker, LAST_LINE_MAX_CHARS};
+        use xshell_protocol::msg::{
+            PermissionPrompt, PromptOption, Speaker, LAST_LINE_MAX_CHARS, PROMPT_OPTIONS_MAX,
+            PROMPT_OPTION_MAX_CHARS, PROMPT_TEXT_MAX_CHARS,
+        };
         let bare = TerminalInfo {
             terminal: Uuid::new_v4(),
             spec: LaunchSpec::default(),
@@ -1466,6 +1746,7 @@ mod status_tests {
             agent_status: None,
             status_at_ms: None,
             last_line: None,
+            permission_prompt: None,
         };
         let size = |i: &TerminalInfo| serde_json::to_vec(i).unwrap().len();
         // The widest character in JSON: four UTF-8 bytes, or two for an escaped `"`.
@@ -1478,6 +1759,16 @@ mod status_tests {
                 last_line: Some(LastLine {
                     from: Speaker::Agent,
                     text,
+                }),
+                permission_prompt: Some(PermissionPrompt {
+                    id: u64::MAX,
+                    text: widest.repeat(PROMPT_TEXT_MAX_CHARS),
+                    options: vec![
+                        PromptOption {
+                            label: widest.repeat(PROMPT_OPTION_MAX_CHARS),
+                        };
+                        PROMPT_OPTIONS_MAX
+                    ],
                 }),
                 ..bare.clone()
             };
@@ -1527,6 +1818,7 @@ mod status_tests {
             rows: 24,
             created_at_ms: 0,
             leader: None,
+            prompt_id_floor: None,
         };
         let prev = unresolved(&d, persisted());
         let next = unresolved(&d, persisted());
@@ -1582,6 +1874,7 @@ mod status_tests {
             rows: 24,
             created_at_ms: 0,
             leader: None,
+            prompt_id_floor: None,
         };
         let prev = unresolved(&d, persisted());
         let prog = dir.path().join("quiet");
@@ -1668,6 +1961,7 @@ mod status_tests {
                 rows: 24,
                 created_at_ms: 0,
                 leader: None,
+                prompt_id_floor: None,
             },
         );
         let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None);

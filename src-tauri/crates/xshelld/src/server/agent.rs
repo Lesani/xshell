@@ -47,7 +47,7 @@ pub(crate) fn on_event(
     let r = match reg.terminals.get(&terminal) {
         None => Err(format!("unknown terminal {terminal}")),
         Some(t) => t
-            .on_agent_event(run, status)
+            .on_agent_event(d, run, status)
             .inspect(|_| {
                 // Accepted: the agent's session has a new message, also when the status
                 // repeats (another turn finished).

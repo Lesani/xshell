@@ -41,6 +41,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::PUSH,
     cap::SESSION_STREAM,
     cap::TERM_MOBILE,
+    cap::AGENT_PROMPT,
     cap::TERM_FIRST_MESSAGE,
     cap::PROJECT_SESSIONS,
 ];
@@ -77,6 +78,13 @@ pub mod cap {
     /// attach nudges only when nobody else is attached; a Mobile's replay is a shorter tail;
     /// the size goes back to the last Desktop that held it when an owning Mobile leaves.
     pub const TERM_MOBILE: &str = "term.mobile";
+    /// Permission Prompt buttons: `TerminalInfo.permissionPrompt`, the prompt an agent
+    /// Terminal shows, read from a screen model of its output; and `term.answer`, which answers
+    /// it. The Daemon types the option's key (its index digit) into the Terminal without taking
+    /// the Terminal's size. Input that may answer the prompt (anything but focus reports,
+    /// cursor-position replies and cursor keys) makes it stale first: an answer to a prompt
+    /// someone answered or typed at is refused with `already answered`.
+    pub const AGENT_PROMPT: &str = "agent.prompt";
     /// `term.open` takes `firstMessage`: a new Claude Code or Codex chat starts with that
     /// prompt. On Windows the agent then starts without `cmd.exe` (an `.exe` or an npm package),
     /// and an open is refused when it cannot.
@@ -148,6 +156,12 @@ mod tests {
     fn capabilities_include_project_sessions() {
         assert!(CAPABILITIES.contains(&"project.sessions"));
         assert_eq!(cap::PROJECT_SESSIONS, "project.sessions");
+    }
+
+    #[test]
+    fn capabilities_include_agent_prompt() {
+        assert!(CAPABILITIES.contains(&"agent.prompt"));
+        assert_eq!(cap::AGENT_PROMPT, "agent.prompt");
     }
 
     #[test]

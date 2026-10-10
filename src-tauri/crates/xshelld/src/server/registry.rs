@@ -41,6 +41,13 @@ pub(crate) struct Daemon {
     pub push: Arc<super::push::Push>,
     /// Reads agent Terminals' last lines.
     pub last_lines: super::last_line::LastLines,
+    /// Reads agent Terminals' Permission Prompts off their screens.
+    pub prompts: super::prompts::Prompts,
+    /// The state file's writes: the version of the snapshot last put in place. Taken after
+    /// `Registry` (every save under it), or alone (a prompt-id floor), and nothing under it.
+    pub saves: Mutex<u64>,
+    /// Snapshot versions, drawn under the registry lock: a higher one holds newer state.
+    pub snap_seq: AtomicU64,
     /// Streams agent Terminals' conversations to subscribed connections.
     pub session_streams: super::session_stream::SessionStreams,
 }
@@ -207,15 +214,49 @@ impl Daemon {
         if reg.frozen {
             return Ok(());
         }
-        let list: Vec<_> = reg.terminals.values().map(|t| t.persisted()).collect();
-        state::save_atomic(&self.cfg.paths.state, &list).map_err(|e| {
-            crate::log!(
-                "ERROR",
-                "cannot save {}: {e}",
-                self.cfg.paths.state.display()
-            );
-            format!("cannot save the terminal list: {e}")
-        })
+        let (version, list) = self.snapshot(reg);
+        let mut last = self.saves.lock().unwrap();
+        state::save_atomic(&self.cfg.paths.state, &list).map_err(|e| self.save_failed(e))?;
+        *last = (*last).max(version);
+        Ok(())
+    }
+
+    /// What the state file would hold now, and the snapshot's version.
+    pub fn snapshot(&self, reg: &Registry) -> (u64, Vec<state::PersistedTerminal>) {
+        let version = self.snap_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let list = reg.terminals.values().map(|t| t.persisted()).collect();
+        (version, list)
+    }
+
+    /// Save a snapshot taken for `terminal`'s new prompt-id floor, with no registry lock held:
+    /// written and synced aside, then put in place only if no newer snapshot is there already
+    /// (a newer one holds the floor too: a floor waiting to be saved is in every snapshot).
+    pub fn save_snapshot(
+        &self,
+        terminal: Uuid,
+        (version, list): (u64, Vec<state::PersistedTerminal>),
+    ) -> Result<(), String> {
+        self.test_point(terminal, TestPoint::PromptPersist);
+        let tag = format!("{version}.tmp");
+        let prepared =
+            state::prepare(&self.cfg.paths.state, &list, &tag).map_err(|e| self.save_failed(e))?;
+        let mut last = self.saves.lock().unwrap();
+        if version <= *last {
+            prepared.discard();
+            return Ok(());
+        }
+        prepared.commit().map_err(|e| self.save_failed(e))?;
+        *last = version;
+        Ok(())
+    }
+
+    fn save_failed(&self, e: std::io::Error) -> String {
+        crate::log!(
+            "ERROR",
+            "cannot save {}: {e}",
+            self.cfg.paths.state.display()
+        );
+        format!("cannot save the terminal list: {e}")
     }
 
     pub fn touch_idle(&self, reg: &mut Registry) {
@@ -299,6 +340,7 @@ impl Daemon {
                     continue;
                 }
             }
+            let floor = p.prompt_id_floor.unwrap_or(0);
             match terminal::spawn(
                 self,
                 p.terminal,
@@ -309,6 +351,8 @@ impl Daemon {
                 p.created_at_ms,
             ) {
                 Ok(t) => {
+                    // Prompt ids continue above the previous run's, whatever the clock says.
+                    t.restore_prompt_floor(floor);
                     reg.terminals.insert(t.id, t);
                 }
                 Err(e) => crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal),
@@ -386,6 +430,7 @@ impl Daemon {
         }
         self.push.stop();
         self.last_lines.stop();
+        self.prompts.stop();
         self.session_streams.stop();
         // The goodbye runs alongside ending the Terminals and is over before the lock is
         // released, so an upgraded successor connects only after it.

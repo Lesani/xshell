@@ -14,6 +14,9 @@ portable-pty = { workspace = true }
 rusqlite = { workspace = true }
 md5 = { workspace = true }
 uuid = { workspace = true }
+# The headless screen model Permission Prompts are read from (exact pin: its rendering is
+# part of what the extractor relies on).
+vt100 = "=0.16.2"
 
 [target.'cfg(unix)'.dependencies]
 # The hook client's deadline-bound socket (non-blocking connect and poll).

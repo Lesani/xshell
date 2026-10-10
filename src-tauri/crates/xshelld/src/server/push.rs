@@ -1461,10 +1461,11 @@ mod tests {
                 rows: 24,
                 created_at_ms: 0,
                 leader: None,
+                prompt_id_floor: None,
             },
         );
         t.reset_status_for_test();
-        assert_eq!(t.on_agent_event(t.run, AgentStatus::NeedsYou), Ok(true));
+        assert_eq!(t.on_agent_event(d, t.run, AgentStatus::NeedsYou), Ok(true));
         d.reg.lock().unwrap().terminals.insert(t.id, t.clone());
         t
     }

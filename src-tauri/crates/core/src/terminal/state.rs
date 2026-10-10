@@ -51,6 +51,10 @@ pub struct PersistedTerminal {
     pub created_at_ms: u64,
     #[serde(default)]
     pub leader: Option<Leader>,
+    /// Permission Prompt ids of the Terminal's next run stay above this (the highest the
+    /// Daemon handed out), so they never repeat across a restart, whatever the clock does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id_floor: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,6 +104,19 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 /// Replace the state file atomically: write `<path>.tmp` (0600), fsync, rename, fsync the
 /// directory. Creates the parent directory (0700) if needed.
 pub fn save_atomic(path: &Path, list: &[PersistedTerminal]) -> io::Result<()> {
+    prepare(path, list, "tmp")?.commit()
+}
+
+/// A state file written and synced next to its place, not yet in it.
+#[must_use = "commit or discard it"]
+pub struct Prepared {
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+/// The first half of [`save_atomic`]: write `list` to `<path>.<tag>` and sync it. Writers
+/// that prepare concurrently use distinct tags.
+pub fn prepare(path: &Path, list: &[PersistedTerminal], tag: &str) -> io::Result<Prepared> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
@@ -114,20 +131,45 @@ pub fn save_atomic(path: &Path, list: &[PersistedTerminal]) -> io::Result<()> {
     };
     let json = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
+    tmp_name.push(".");
+    tmp_name.push(tag);
     let tmp = path.with_file_name(tmp_name);
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(&tmp)?;
-    f.write_all(&json)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    let written = opts.open(&tmp).and_then(|mut f| {
+        f.write_all(&json)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(Prepared {
+        tmp,
+        path: path.to_path_buf(),
+    })
+}
+
+impl Prepared {
+    /// Put it in place (atomically) and sync the directory.
+    pub fn commit(self) -> io::Result<()> {
+        if let Err(e) = fs::rename(&self.tmp, &self.path) {
+            let _ = fs::remove_file(&self.tmp);
+            return Err(e);
+        }
+        #[cfg(unix)]
+        if let Some(dir) = self.path.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Drop it: a newer state is in place already.
+    pub fn discard(self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
 }
 
 #[cfg(test)]
@@ -164,7 +206,42 @@ mod tests {
                     },
                 ],
             }),
+            prompt_id_floor: Some(1_700_000_000_123),
         }
+    }
+
+    #[test]
+    fn prompt_id_floor_is_optional() {
+        let e = entry("/w");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["promptIdFloor"], json!(1_700_000_000_123u64));
+        let none = serde_json::to_value(PersistedTerminal {
+            prompt_id_floor: None,
+            ..e
+        })
+        .unwrap();
+        assert!(none.get("promptIdFloor").is_none(), "{none}");
+        // A state file from before it.
+        let old: PersistedTerminal = serde_json::from_value(json!({"terminal": Uuid::new_v4(),
+            "spec": {"cwd": "/w"}, "cols": 80, "rows": 24, "createdAtMs": 1}))
+        .unwrap();
+        assert_eq!(old.prompt_id_floor, None);
+    }
+
+    #[test]
+    fn prepared_save_commits_or_discards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminals.json");
+        save_atomic(&path, &[entry("/a")]).unwrap();
+        let older = prepare(&path, &[entry("/old")], "7.tmp").unwrap();
+        let newer = prepare(&path, &[entry("/new"), entry("/b")], "8.tmp").unwrap();
+        newer.commit().unwrap();
+        older.discard();
+        let l = load(&path).unwrap();
+        assert_eq!(l.terminals.len(), 2);
+        assert_eq!(l.terminals[0].spec.cwd, "/new");
+        let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "temporary files left behind");
     }
 
     #[test]

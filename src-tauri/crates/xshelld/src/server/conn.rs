@@ -5,6 +5,7 @@
 use super::agent;
 use super::calls::spawn_call;
 use super::outbox::{writer_loop, Outbox, PaceCfg};
+use super::prompt_cell::InputCarry;
 use super::registry::{frame, now_ms, Daemon};
 use super::relaunch;
 use super::role::{self, Role};
@@ -12,7 +13,7 @@ use super::terminal::{self, Terminal};
 use super::transport::Stream;
 use super::{ConnId, ExitReason, TestPoint};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -57,6 +58,8 @@ struct Conn {
     /// Terminals this connection attached to or sized; all are released on disconnect.
     touched: HashSet<Uuid>,
     inflight: Arc<AtomicUsize>,
+    /// Per Terminal: whether this connection's last input ended inside an escape sequence.
+    carry: HashMap<Uuid, InputCarry>,
 }
 
 pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer: Option<Member>) {
@@ -152,6 +155,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         ob: ob.clone(),
         touched: HashSet::new(),
         inflight: Arc::new(AtomicUsize::new(0)),
+        carry: HashMap::new(),
     };
     // A clean EOF lets queued replies drain; a protocol error drops them.
     let mut clean = false;
@@ -367,12 +371,23 @@ impl Conn {
                 self.touched.insert(terminal);
                 // Not under the registry lock: input is the hot path. Input that reaches a
                 // Terminal a Relaunch is replacing is dropped like input to an ended one.
+                let may_answer = self
+                    .carry
+                    .entry(terminal)
+                    .or_default()
+                    .may_answer(data.as_bytes());
                 let r = self.terminal(&terminal).and_then(|t| {
-                    t.note_input(&d, data.as_bytes());
                     // A Mobile's echo comes back faster for a while.
                     self.ob.note_input();
+                    // Queued (and the prompt it may answer spent) before the Agent Status
+                    // follows it: a status change unlists the prompt, which must already be
+                    // recorded as typed at for the recheck.
+                    let bytes = data.as_bytes().to_vec();
+                    let mobile = self.role == Role::Mobile;
+                    let written = t.write_input(&d, self.id, data, mobile, may_answer);
+                    t.note_input(&d, &bytes);
                     // Typing can hand the size to this connection; persist it like a resize.
-                    if t.write_input(self.id, data, self.role == Role::Mobile)? {
+                    if written? {
                         t.schedule_persist(&d);
                     }
                     Ok(Value::Null)
@@ -453,6 +468,18 @@ impl Conn {
                 terminal,
                 skip_permissions,
             } => relaunch::start(&d, &self.ob, id, terminal, skip_permissions, self.role),
+            // Not typing: no burst of output pacing, no size claim, nothing touched.
+            ClientMsg::TermAnswer {
+                terminal,
+                prompt,
+                option,
+            } => {
+                let r = self
+                    .terminal(&terminal)
+                    .and_then(|t| t.answer(&d, prompt, option))
+                    .map(|()| Value::Null);
+                reply(&self.ob, id, r);
+            }
             // From agent hooks on this Host; role::check refuses it for a Mobile (#6).
             ClientMsg::TermEvent {
                 terminal,

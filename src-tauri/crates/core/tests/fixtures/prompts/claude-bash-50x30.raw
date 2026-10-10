@@ -1,0 +1,32 @@
+[?25l╭────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                      │
+│                                                │
+│   cwd: /home/dev/proj                          │
+╰────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────╮
+│ >                                              │
+╰────────────────────────────────────────────────╯
+[2m  ? for shortcuts[0m[2K[1A[2K[1A[2K[1A[2K[G> list the files in /tmp
+
+[38;5;220m✻ Thinking… [0m[2m(esc to interrupt)[0m
+
+╭────────────────────────────────────────────────╮
+│ >                                              │
+╰────────────────────────────────────────────────╯
+[2m  ? for shortcuts[0m[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G⏺ I'll list the files in /tmp.
+
+[2m──────────────────────────────────────────────────[0m
+ [1mBash command[0m
+
+   ls -la /tmp
+   [2mList the files in /tmp[0m
+
+ Do you want to proceed?
+[38;5;153m ❯ 1. Yes[0m
+   2. Yes, and don't ask again for ls commands in
+      /home/dev/proj
+   3. No, and tell Claude what to do differently
+      [1m(esc)[0m
+
+ [2mEsc to cancel[0m

@@ -1,0 +1,20 @@
+{
+  "agent": "claude",
+  "version": "2.1.296",
+  "cols": 50,
+  "rows": 30,
+  "synthetic": true,
+  "source": "gen_synthetic.py: built from the CLI's strings and rendering, not recorded (xshell-remote#8, D9)",
+  "expect": {
+    "textContains": [
+      "Bash command",
+      "ls -la /tmp",
+      "Do you want to proceed?"
+    ],
+    "options": [
+      "Yes",
+      "Yes, and don't ask again for ls commands in /home/dev/proj",
+      "No, and tell Claude what to do differently"
+    ]
+  }
+}

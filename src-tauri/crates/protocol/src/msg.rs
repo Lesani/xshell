@@ -151,6 +151,69 @@ pub enum ClientMsg {
     /// the `res`. Answers `null` also when there was none.
     #[serde(rename = "session.unsubscribe")]
     SessionUnsubscribe { terminal: Uuid },
+    /// Answer agent Terminal `terminal`'s current [`PermissionPrompt`] `prompt` with its
+    /// option `option` (0-based, in the order listed): the Daemon types that option's key into
+    /// the Terminal, without taking the Terminal's size. Answers `null`; [`PROMPT_ANSWERED`]
+    /// when `prompt` is no longer the current prompt (someone answered or typed at it first,
+    /// or it went away), [`PROMPT_NO_OPTION`] when it has no such option (a text-only prompt
+    /// has none). Gated on the `agent.prompt` capability.
+    #[serde(rename = "term.answer")]
+    TermAnswer {
+        terminal: Uuid,
+        prompt: u64,
+        option: u32,
+    },
+}
+
+/// The refusal of a `term.answer` whose prompt is no longer the Terminal's current one: it
+/// was answered (at a Desktop, another Mobile, or by typing at it), or it went away.
+pub const PROMPT_ANSWERED: &str = "already answered";
+/// The refusal of a `term.answer` naming an option the prompt does not have (a text-only
+/// prompt has none).
+pub const PROMPT_NO_OPTION: &str = "no such option";
+
+/// The most characters (Unicode scalar values) of a [`PermissionPrompt`]'s text.
+pub const PROMPT_TEXT_MAX_CHARS: usize = 500;
+/// The most options a [`PermissionPrompt`] lists (one key each: `1` to `9`).
+pub const PROMPT_OPTIONS_MAX: usize = 9;
+/// The most characters of one [`PromptOption`]'s label.
+pub const PROMPT_OPTION_MAX_CHARS: usize = 100;
+
+/// A Permission Prompt an agent Terminal shows, read from its screen (capability
+/// `agent.prompt`).
+///
+/// `id` identifies this showing of the prompt and fences answers: a `term.answer` must name
+/// it. It is assigned by the Daemon, strictly increases per Terminal (across Relaunches and
+/// Daemon restarts too, whatever the clock does), is never reused, and stays below 2^53.
+/// A prompt read again unchanged keeps its id; one published again after an ignored answer
+/// gets a new one.
+///
+/// `options: []` is a text-only prompt: the Daemon saw that the agent needs you but could not
+/// read options it could safely answer; `text` is the bottom of the screen, and the user
+/// answers in the Terminal View. Text and labels never contain control characters.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionPrompt {
+    pub id: u64,
+    pub text: String,
+    pub options: Vec<PromptOption>,
+}
+
+/// One answer a [`PermissionPrompt`] offers, as its TUI labels it (key hints such as `(esc)`
+/// removed).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOption {
+    pub label: String,
+}
+
+/// `TerminalInfo.permission_prompt`: a value this side cannot read (not an object, no `id`,
+/// bad options) reads as absent, so it never fails the whole `terminals` list.
+fn lenient_permission_prompt<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<PermissionPrompt>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// The refusal of a `session.page` for a generation the subscription has left (a reset
@@ -433,6 +496,7 @@ const CLIENT_TYPES: &[&str] = &[
     "session.subscribe",
     "session.page",
     "session.unsubscribe",
+    "term.answer",
 ];
 
 /// The longest `firstMessage` a `term.open` may carry, in bytes of UTF-8.
@@ -493,6 +557,15 @@ pub struct TerminalInfo {
         deserialize_with = "lenient_last_line"
     )]
     pub last_line: Option<LastLine>,
+    /// The Permission Prompt the agent Terminal shows now (capability `agent.prompt`). Absent
+    /// when it shows none the Daemon has read, for Terminals that are not a Claude or Codex
+    /// agent, and from older Daemons.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_permission_prompt"
+    )]
+    pub permission_prompt: Option<PermissionPrompt>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1024,6 +1097,7 @@ mod tests {
                 agent_status: None,
                 status_at_ms: None,
                 last_line: None,
+                permission_prompt: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -1045,6 +1119,7 @@ mod tests {
                 agent_status: None,
                 status_at_ms: None,
                 last_line: None,
+                permission_prompt: None,
             }],
         };
         let b = body(encode_msg(&list, None).unwrap());
@@ -1117,6 +1192,7 @@ mod tests {
             agent_status: status,
             status_at_ms: None,
             last_line: None,
+            permission_prompt: None,
         }
     }
 
@@ -1555,5 +1631,134 @@ mod tests {
             serde_json::to_value(&last).unwrap(),
             json!({"sessions": [], "next": null})
         );
+    }
+
+    fn sample_prompt() -> PermissionPrompt {
+        PermissionPrompt {
+            id: 1_700_000_000_123,
+            text: "Bash command\nls -la\nDo you want to proceed?".into(),
+            options: vec![
+                PromptOption {
+                    label: "Yes".into(),
+                },
+                PromptOption {
+                    label: "No, and tell Claude what to do differently".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn permission_prompt_golden() {
+        let info = TerminalInfo {
+            permission_prompt: Some(sample_prompt()),
+            ..info_with(Some(AgentStatus::NeedsYou))
+        };
+        let list = ServerMsg::Terminals { list: vec![info] };
+        let b = body(encode_msg(&list, None).unwrap());
+        let s = String::from_utf8(b.clone()).unwrap();
+        assert!(
+            s.ends_with(concat!(
+                r#""agentStatus":"needs-you","permissionPrompt":{"id":1700000000123,"#,
+                r#""text":"Bash command\nls -la\nDo you want to proceed?","options":["#,
+                r#"{"label":"Yes"},{"label":"No, and tell Claude what to do differently"}]}}]}"#
+            )),
+            "{s}"
+        );
+        assert_eq!(decode_server(&b).unwrap(), list);
+        // A text-only prompt lists no options.
+        let text_only = PermissionPrompt {
+            id: 2,
+            text: "x".into(),
+            options: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&text_only).unwrap(),
+            r#"{"id":2,"text":"x","options":[]}"#
+        );
+        // Omitted when `None`.
+        let b = body(
+            encode_msg(
+                &ServerMsg::Terminals {
+                    list: vec![info_with(Some(AgentStatus::NeedsYou))],
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(!String::from_utf8_lossy(&b).contains("permissionPrompt"));
+    }
+
+    #[test]
+    fn permission_prompt_malformed_reads_absent() {
+        let id = Uuid::new_v4();
+        let entry = |p: Value| {
+            json!({"terminal":id,"spec":{"cwd":"/w"},"meta":{},"createdAtMs":1,"pid":2,
+                   "exitCode":null,"agentStatus":"needs-you","permissionPrompt":p})
+        };
+        let raw = json!({"t":"terminals","list":[
+            entry(json!("Do you want to proceed?")),
+            entry(json!({"text":"x","options":[]})),
+            entry(json!({"id":"7","text":"x","options":[]})),
+            entry(json!({"id":7,"text":"x","options":[{"title":"Yes"}]})),
+            entry(json!({"id":7,"text":"x","options":"Yes"})),
+            entry(json!({"id":-1,"text":"x","options":[]})),
+            entry(json!(null)),
+            entry(json!({"id":7,"text":"x","options":[{"label":"Yes","key":"1"}],"future":1})),
+        ]});
+        let ServerMsg::Terminals { list } = decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(list.len(), 8);
+        for t in &list[..7] {
+            assert_eq!(t.permission_prompt, None);
+            assert_eq!(t.agent_status, Some(AgentStatus::NeedsYou));
+        }
+        // Unknown extra fields are ignored.
+        assert_eq!(
+            list[7].permission_prompt,
+            Some(PermissionPrompt {
+                id: 7,
+                text: "x".into(),
+                options: vec![PromptOption {
+                    label: "Yes".into()
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn term_answer_golden_roundtrip() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
+        let msg = ClientMsg::TermAnswer {
+            terminal: id,
+            prompt: 1_700_000_000_123,
+            option: 1,
+        };
+        let b = body(encode_msg(&msg, Some(9)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":9,"t":"term.answer","terminal":"00000000-0000-0000-0000-000000000007","prompt":1700000000123,"option":1}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(9), msg });
+        assert!(CLIENT_TYPES.contains(&"term.answer"));
+    }
+
+    #[test]
+    fn term_answer_missing_field_invalid_with_id() {
+        let id = Uuid::new_v4();
+        for raw in [
+            json!({"t":"term.answer","id":5,"terminal":id,"option":0}),
+            json!({"t":"term.answer","id":5,"terminal":id,"prompt":3}),
+            json!({"t":"term.answer","id":5,"prompt":3,"option":0}),
+            json!({"t":"term.answer","id":5,"terminal":id,"prompt":3,"option":-1}),
+        ] {
+            let e = decode_inbound(raw.to_string().as_bytes()).unwrap_err();
+            assert!(
+                matches!(&e, DecodeError::Invalid { id: Some(5), t, .. } if t == "term.answer"),
+                "{raw}: {e:?}"
+            );
+        }
     }
 }

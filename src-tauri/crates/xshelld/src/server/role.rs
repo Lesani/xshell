@@ -218,6 +218,8 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::SessionSubscribe { .. }
         | ClientMsg::SessionPage { .. }
         | ClientMsg::SessionUnsubscribe { .. } => Ok(()),
+        // A Mobile answers the prompts of the agent Terminals it sees (`listed`).
+        ClientMsg::TermAnswer { .. } => Ok(()),
     }
 }
 
@@ -789,6 +791,12 @@ pub(crate) mod tests {
                 limit: None,
             },
             ClientMsg::SessionUnsubscribe { terminal: t },
+            // Answers too: a Mobile answers the agent Terminals it sees.
+            ClientMsg::TermAnswer {
+                terminal: t,
+                prompt: 1,
+                option: 0,
+            },
         ] {
             assert_eq!(check(Role::Mobile, &ctx, &m), Ok(()));
         }
@@ -825,6 +833,12 @@ pub(crate) mod tests {
                 },
             )),
             last_lines: crate::server::last_line::LastLines::new(std::time::Duration::from_secs(1)),
+            prompts: crate::server::prompts::Prompts::new(
+                std::time::Duration::from_millis(150),
+                std::time::Duration::from_millis(1500),
+            ),
+            saves: Mutex::new(0),
+            snap_seq: AtomicU64::new(0),
             session_streams: crate::server::session_stream::SessionStreams::new(
                 std::time::Duration::from_secs(1),
                 8,
@@ -850,6 +864,7 @@ pub(crate) mod tests {
                 rows: 24,
                 created_at_ms: 0,
                 leader: None,
+                prompt_id_floor: None,
             },
         );
         d.reg.lock().unwrap().terminals.insert(id, t.clone());

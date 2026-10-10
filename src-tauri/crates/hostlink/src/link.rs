@@ -138,6 +138,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::SessionSubscribe { .. } => "session.subscribe",
         ClientMsg::SessionPage { .. } => "session.page",
         ClientMsg::SessionUnsubscribe { .. } => "session.unsubscribe",
+        ClientMsg::TermAnswer { .. } => "term.answer",
     }
 }
 
@@ -752,6 +753,7 @@ mod tests {
             agent_status: None,
             status_at_ms: None,
             last_line: None,
+            permission_prompt: None,
         }
     }
 
