@@ -9,7 +9,7 @@
 //! `Terminal.input`, and nothing else is taken under `screen` or `prompt` but the input
 //! thread's progress (`Terminal.written`, last); `screen` is taken alone or after `io` (a
 //! resize), `prompt` also after the other Terminal locks; `Terminal.status` (the Agent Status),
-//! `Terminal.last_line`, the last-line and prompt workers' queues and the session-stream
+//! `Terminal.last_line`, `Terminal.link` (the session the agent reported), the last-line and prompt workers' queues and the session-stream
 //! queue are taken last, and nothing is locked while one is held (the session-stream worker
 //! queues its results under the registry lock, like every publish: `Registry` → `Outbox`); the
 //! state file's lock (`Daemon.saves`) is taken after `Registry` or alone, last. No
@@ -20,6 +20,7 @@
 
 mod agent;
 mod calls;
+mod codex_link;
 mod conn;
 mod last_line;
 mod orphans;
@@ -193,6 +194,12 @@ pub enum TestPoint {
     /// The last-line worker read this Terminal's session file and is about to store and
     /// publish the result (no lock held).
     LastLineRead,
+    /// The last-line worker checked the session a Codex hook reported for this Terminal and
+    /// is about to link it, keep it for the retry or drop it (no lock held).
+    LinkChecked,
+    /// The last-line worker linked, kept or dropped that report, or found it replaced (no
+    /// lock held). Follows every [`TestPoint::LinkChecked`].
+    LinkDone,
     /// The session-stream worker read this Terminal's session file (a page, a reset or an
     /// append) and is about to check and queue the result (no lock held).
     SessionRead,

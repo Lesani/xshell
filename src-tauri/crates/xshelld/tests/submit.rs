@@ -285,6 +285,7 @@ impl Env {
                 terminal: t.id,
                 run,
                 status: s,
+                session_id: None,
             })
             .unwrap();
     }
@@ -731,6 +732,7 @@ fn report_async(e: &Env, c: &mut Client, t: &Term, s: AgentStatus) -> u64 {
             terminal: t.id,
             run: e.run_of(t),
             status: s,
+            session_id: None,
         },
         Some(id),
     );

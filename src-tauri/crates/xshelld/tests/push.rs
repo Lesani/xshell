@@ -205,6 +205,7 @@ impl P {
                 terminal: t,
                 run,
                 status,
+                session_id: None,
             })
             .expect("term.event");
     }
@@ -613,6 +614,7 @@ fn registration_survives_restart_mode_0600() {
         terminal: t,
         run,
         status: NeedsYou,
+        session_id: None,
     })
     .unwrap();
     let got = gw.wait_requests(2, T);
@@ -780,6 +782,7 @@ fn relay_without_push_cap_gets_no_push_frames() {
         terminal: t,
         run,
         status: NeedsYou,
+        session_id: None,
     })
     .unwrap();
     std::thread::sleep(QUIET);
@@ -1089,6 +1092,7 @@ fn a_seq_that_cannot_be_saved_is_never_sent() {
         terminal: t,
         run,
         status: NeedsYou,
+        session_id: None,
     })
     .unwrap();
     let got = gw.wait_requests(2, T);
@@ -1143,6 +1147,7 @@ fn shutdown_waits_for_a_held_save() {
         terminal: t,
         run,
         status: NeedsYou,
+        session_id: None,
     })
     .unwrap();
     assert_eq!(gw.wait_requests(1, T).len(), 1);

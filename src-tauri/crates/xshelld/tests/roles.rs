@@ -298,6 +298,7 @@ fn mobile_refuses_term_event_desktop_reports() {
         terminal: t,
         run,
         status: xshell_protocol::msg::AgentStatus::NeedsYou,
+        session_id: None,
     };
     // Hooks report from the Host itself; a phone never does.
     refused(e.mob.request(&ev(0)));

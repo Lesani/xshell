@@ -470,6 +470,7 @@ fn event_for_raw_shell_rejected() {
         terminal: t,
         run: 0,
         status: Working,
+        session_id: None,
     });
     assert_eq!(r, Err("not an agent terminal".into()));
     // The default socket is the Daemon's: no --socket needed.
@@ -506,6 +507,7 @@ fn relaunch_resets_status() {
             terminal: t,
             run: old_run,
             status: Ended,
+            session_id: None,
         }),
         Err("stale run".into())
     );
@@ -1054,4 +1056,480 @@ fn full_list_with_widest_last_lines_fits_the_queue() {
     let mut c = Client::connect(&e.srv.socket);
     let (_, list) = c.hello(range(1, 1));
     assert!(full(&list));
+}
+
+// ── The Daemon's own Codex link (xshell#36) ───────────────────────────────────
+
+const CODEX_A: &str = "0199aaaa-0000-7000-8000-00000000000a";
+const CODEX_B: &str = "0199bbbb-0000-7000-8000-00000000000b";
+const CODEX_C: &str = "0199cccc-0000-7000-8000-00000000000c";
+
+type Counts = Arc<(Mutex<HashMap<Uuid, usize>>, Condvar)>;
+
+/// Counts the link checks per Terminal and the decisions that follow them, and can hold one
+/// check (before its decision) until released.
+#[derive(Clone, Default)]
+struct Links {
+    counts: Counts,
+    done: Counts,
+    hold: Arc<Mutex<Option<Hold>>>,
+}
+
+fn bump(c: &Counts, id: Uuid) {
+    let (m, cv) = &**c;
+    *m.lock().unwrap().entry(id).or_default() += 1;
+    cv.notify_all();
+}
+
+/// Wait until `c` has counted `n` for `t`.
+fn wait_count(c: &Counts, t: Uuid, n: usize, what: &str) {
+    let (m, cv) = &**c;
+    let deadline = Instant::now() + T;
+    let mut g = m.lock().unwrap();
+    while g.get(&t).copied().unwrap_or(0) < n {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "{t} not {what} {n} times within {T:?}");
+        g = cv.wait_timeout(g, left).unwrap().0;
+    }
+}
+
+impl Links {
+    fn hook(&self) -> TestHook {
+        let me = self.clone();
+        TestHook(Arc::new(move |id, p| {
+            if p == TestPoint::LinkChecked {
+                let hold = me.hold.lock().unwrap().take();
+                if let Some((held, release)) = hold {
+                    held.send(()).unwrap();
+                    let _ = release.recv_timeout(T);
+                }
+                bump(&me.counts, id);
+            } else if p == TestPoint::LinkDone {
+                bump(&me.done, id);
+            }
+            false
+        }))
+    }
+
+    fn count(&self, t: Uuid) -> usize {
+        self.counts.0.lock().unwrap().get(&t).copied().unwrap_or(0)
+    }
+
+    /// Wait until `t`'s reports have been checked `n` times in all.
+    fn wait(&self, t: Uuid, n: usize) {
+        wait_count(&self.counts, t, n, "checked");
+    }
+
+    /// Wait until `n` checks of `t`'s reports have been decided in all: linked, kept,
+    /// dropped or found replaced.
+    fn wait_done(&self, t: Uuid, n: usize) {
+        wait_count(&self.done, t, n, "decided");
+    }
+
+    /// Hold the next check; returns where it says it is held and what releases it.
+    fn arm(&self) -> (Receiver<()>, Sender<()>) {
+        let (held_tx, held_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        *self.hold.lock().unwrap() = Some((held_tx, release_rx));
+        (held_rx, release_tx)
+    }
+}
+
+/// [`env`] with a short last-line retry (the link's retry too) and the check counter.
+fn env_links_with(tweak: impl FnOnce(&mut xshelld::server::Config)) -> (Env, Links) {
+    let links = Links::default();
+    let hook = links.hook();
+    let e = env_with(|c| {
+        c.last_line_retry = Duration::from_millis(300);
+        c.test_hook = Some(hook);
+        tweak(c);
+    });
+    (e, links)
+}
+
+fn env_links() -> (Env, Links) {
+    env_links_with(|_| {})
+}
+
+fn codex_event(kind: &str, text: &str) -> Value {
+    serde_json::json!({"type": "event_msg", "payload": {"type": kind, "message": text}})
+}
+
+impl Env {
+    /// Where Codex keeps the rollout of session `sid`.
+    fn rollout_path(&self, sid: &str) -> PathBuf {
+        self.h
+            .home()
+            .join(".codex/sessions/2026/10/10")
+            .join(format!("rollout-2026-10-10T10-00-00-{sid}.jsonl"))
+    }
+
+    /// Write Codex's rollout for session `id` at `path`: its `session_meta` (in `cwd`, from
+    /// `source`), then a user message and `said` by the agent.
+    fn write_rollout(&self, path: &Path, id: &str, cwd: &Path, source: Value, said: &str) {
+        append(
+            path,
+            &serde_json::json!({"type": "session_meta", "payload": {
+                "id": id, "cwd": cwd, "source": source, "cli_version": "0.154.0"}}),
+        );
+        append(path, &codex_event("user_message", "build it"));
+        append(path, &codex_event("agent_message", said));
+    }
+
+    /// A rollout for `sid` in this Env's Project, written by the Codex CLI.
+    fn rollout(&self, sid: &str, said: &str) -> PathBuf {
+        let p = self.rollout_path(sid);
+        self.write_rollout(&p, sid, &self.cwd, "cli".into(), said);
+        p
+    }
+
+    /// Codex's `notify` after a turn of session `sid`, through the real hook client.
+    fn turn_end(&self, sid: &str) {
+        let payload = serde_json::json!({"type": "agent-turn-complete", "thread-id": sid,
+            "turn-id": "1", "cwd": self.cwd, "input-messages": ["build it"],
+            "last-assistant-message": "done"});
+        self.codex_notify_with(&payload.to_string());
+    }
+
+    /// The newest launch's run.
+    fn run_id(&self) -> u64 {
+        self.terminal_id_env()
+            .rsplit_once('.')
+            .unwrap()
+            .1
+            .parse()
+            .unwrap()
+    }
+
+    /// A `term.event` reporting `sid` for run `run` of `t`, sent as the hook client would.
+    fn report(&mut self, t: Uuid, run: u64, sid: &str) -> Result<Value, String> {
+        self.c.request(&ClientMsg::TermEvent {
+            terminal: t,
+            run,
+            status: Finished,
+            session_id: Some(sid.into()),
+        })
+    }
+
+    fn update(&mut self, t: Uuid, sid: Option<&str>, title: Option<&str>) -> Result<Value, String> {
+        let meta = title.map(|title| {
+            let mut m = serde_json::Map::new();
+            m.insert("title".into(), title.into());
+            m
+        });
+        self.c.request(&ClientMsg::TermUpdate {
+            terminal: t,
+            session_id: sid.map(str::to_owned),
+            meta,
+        })
+    }
+
+    /// Wait until `c` is told `t` runs session `sid`.
+    fn wait_session(c: &mut Client, t: Uuid, sid: &str) -> TerminalInfo {
+        let list = c.terminals_where(|l| {
+            l.iter()
+                .any(|i| i.terminal == t && i.spec.session_id.as_deref() == Some(sid))
+        });
+        list.into_iter().find(|i| i.terminal == t).unwrap()
+    }
+
+    fn session(&self, t: Uuid) -> Option<String> {
+        self.info(t).spec.session_id
+    }
+
+    /// A Desktop connection subscribed to `t`'s conversation.
+    fn subscriber(&self, t: Uuid) -> (Client, Value) {
+        let mut s = Client::connect(&self.srv.socket);
+        s.hello(range(1, 1));
+        let page = s
+            .request(&ClientMsg::SessionSubscribe {
+                terminal: t,
+                limit: None,
+            })
+            .expect("session.subscribe");
+        (s, page)
+    }
+}
+
+/// The next reset of `t`'s conversation `s` is sent.
+fn next_reset(s: &mut Client, t: Uuid) -> (Option<String>, usize) {
+    use xshell_protocol::msg::ServerMsg;
+    let deadline = Instant::now() + T;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let m = s.try_msg(left, |m| {
+            matches!(m, ServerMsg::SessionAppend { terminal, reset: true, .. } if *terminal == t)
+        });
+        match m {
+            Some(ServerMsg::SessionAppend { session, items, .. }) => return (session, items.len()),
+            Some(_) => {}
+            None => panic!("no reset of {t}: {:?}", s.summary()),
+        }
+    }
+}
+
+#[test]
+fn codex_notify_links_session_without_desktop() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    // A Chat View opened before the link: nothing linked yet.
+    let (mut sub, page) = e.subscriber(t);
+    assert_eq!(page["session"], Value::Null, "{page}");
+    e.rollout(CODEX_A, "Built.");
+    // No Desktop sends a term.update: Codex's notify alone links the session.
+    e.turn_end(CODEX_A);
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "Built."));
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_A));
+    assert_eq!(i.agent_status, Some(Finished));
+    // Persisted.
+    let state = e.h.state_json();
+    assert_eq!(
+        state["terminals"][0]["spec"]["sessionId"].as_str(),
+        Some(CODEX_A),
+        "{state}"
+    );
+    // The Chat View follows it.
+    let (session, items) = next_reset(&mut sub, t);
+    assert_eq!(session.as_deref(), Some(CODEX_A));
+    assert_eq!(items, 2);
+    // And a Relaunch resumes it.
+    let n = e.fake.pids().len();
+    e.c.request(&ClientMsg::TermRelaunch {
+        terminal: t,
+        skip_permissions: true,
+    })
+    .unwrap();
+    e.fake.wait_pids(n + 1);
+    let argv = e.argv();
+    let at = argv
+        .iter()
+        .position(|a| a == "resume")
+        .expect("codex resume");
+    assert!(argv[at..].iter().any(|a| a == CODEX_A), "{argv:?}");
+}
+
+#[test]
+fn codex_link_validation() {
+    use std::os::unix::fs::symlink;
+    let (mut e, links) = env_links();
+    let t = e.open("codex", None);
+    let run = e.run_id();
+    let other = e.h.project("other");
+    // A rollout outside storage, linked into it.
+    let outside = e.h.root().join("outside.jsonl");
+    e.write_rollout(
+        &outside,
+        "0199dddd-0000-7000-8000-symlinked000",
+        &e.cwd,
+        "cli".into(),
+        "x",
+    );
+    let linked = e.rollout_path("0199dddd-0000-7000-8000-symlinked000");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    symlink(&outside, &linked).unwrap();
+    // Another Project's session.
+    let elsewhere = "0199eeee-0000-7000-8000-elsewhere0000";
+    e.write_rollout(
+        &e.rollout_path(elsewhere),
+        elsewhere,
+        &other,
+        "cli".into(),
+        "x",
+    );
+    // A subagent's thread.
+    let sub = "0199ffff-0000-7000-8000-subagent00000";
+    let spawn = serde_json::json!({"subagent": {"thread_spawn": {"parent_thread_id": CODEX_A}}});
+    e.write_rollout(&e.rollout_path(sub), sub, &e.cwd, spawn, "x");
+    // A rollout named for one session whose meta names another.
+    let renamed = "0199abab-0000-7000-8000-renamed00000";
+    e.write_rollout(&e.rollout_path(renamed), CODEX_B, &e.cwd, "cli".into(), "x");
+    let long = "x".repeat(201);
+    for (sid, checks) in [
+        ("../x", 1),
+        ("-x", 1),
+        (long.as_str(), 1),
+        // Missing: looked for again at the retry, then dropped.
+        ("0199aaaa-0000-7000-8000-missing00000", 2),
+        ("0199dddd-0000-7000-8000-symlinked000", 1),
+        (elsewhere, 1),
+        (sub, 1),
+        (renamed, 1),
+    ] {
+        let before = links.count(t);
+        e.report(t, run, sid).unwrap();
+        // Every check of this report is decided before the list is looked at.
+        links.wait_done(t, before + checks);
+        assert_eq!(links.count(t), before + checks, "{sid}");
+        assert_eq!(e.session(t), None, "{sid}");
+    }
+    // A dropped report stays dropped: its rollout appearing later links nothing.
+    e.rollout("0199aaaa-0000-7000-8000-missing00000", "late");
+    e.codex_notify_with(r#"{"type":"agent-turn-complete"}"#);
+    e.wait(t, Some(Finished));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(e.session(t), None);
+    // The control: a valid report links.
+    e.rollout(CODEX_A, "valid");
+    e.report(t, run, CODEX_A).unwrap();
+    Env::wait_session(&mut e.c, t, CODEX_A);
+}
+
+#[test]
+fn codex_link_daemon_then_desktop() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    e.rollout(CODEX_A, "from A");
+    e.rollout(CODEX_B, "from B");
+    e.turn_end(CODEX_A);
+    Env::wait_session(&mut e.c, t, CODEX_A);
+    // The Desktop's guess of another session is refused, its title too.
+    assert_eq!(
+        e.update(t, Some(CODEX_B), Some("B's title")),
+        Err(format!(
+            "cannot link this chat to another session: its agent reported session {CODEX_A}"
+        ))
+    );
+    let i = e.info(t);
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_A));
+    assert!(!i.meta.contains_key("title"));
+    // The same session, and metadata alone, pass.
+    e.update(t, Some(CODEX_A), Some("A's title")).unwrap();
+    e.update(t, None, Some("renamed")).unwrap();
+    let i = e.info(t);
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_A));
+    assert_eq!(i.meta["title"], "renamed");
+    assert_eq!(i.last_line, line(Speaker::Agent, "from A"));
+}
+
+#[test]
+fn codex_link_desktop_then_daemon() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    e.rollout(CODEX_A, "from A");
+    e.rollout(CODEX_B, "from B");
+    // The Desktop guesses B first.
+    e.link(t, CODEX_B);
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "from B"));
+    let (mut sub, page) = e.subscriber(t);
+    assert_eq!(page["session"], CODEX_B, "{page}");
+    // Codex reports A: the agent's report wins.
+    e.turn_end(CODEX_A);
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "from A"));
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_A));
+    let (session, _) = next_reset(&mut sub, t);
+    assert_eq!(session.as_deref(), Some(CODEX_A));
+    // The Desktop's guess, sent again, is refused now.
+    assert!(e.update(t, Some(CODEX_B), None).is_err());
+    assert_eq!(e.session(t).as_deref(), Some(CODEX_A));
+}
+
+#[test]
+fn codex_link_follows_new_thread() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    e.rollout(CODEX_A, "from A");
+    e.turn_end(CODEX_A);
+    Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "from A"));
+    // `/new` in Codex: the next turn is another thread, in the same directory.
+    e.rollout(CODEX_C, "from C");
+    e.turn_end(CODEX_C);
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "from C"));
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_C));
+    // The Desktop may no longer name A.
+    assert!(e.update(t, Some(CODEX_A), None).is_err());
+}
+
+#[test]
+fn codex_link_rollout_written_late() {
+    let (mut e, links) = env_links();
+    let t = e.open("codex", None);
+    // The notify comes before the rollout is on disk: the first check misses it.
+    e.turn_end(CODEX_A);
+    links.wait_done(t, 1);
+    assert_eq!(e.session(t), None);
+    e.rollout(CODEX_A, "late");
+    // The retry finds it.
+    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "late"));
+    assert_eq!(i.spec.session_id.as_deref(), Some(CODEX_A));
+}
+
+/// A newer report replaces one being checked: the older one is never linked.
+#[test]
+fn codex_link_newer_report_wins() {
+    let (mut e, links) = env_links();
+    let t = e.open("codex", None);
+    let run = e.run_id();
+    e.rollout(CODEX_A, "from A");
+    e.rollout(CODEX_C, "from C");
+    let (held_a, release_a) = links.arm();
+    e.report(t, run, CODEX_A).unwrap();
+    held_a.recv_timeout(T).expect("the check of A");
+    // C arrives while A is being checked; C's check is held before its decision too.
+    let (held_c, release_c) = links.arm();
+    e.report(t, run, CODEX_C).unwrap();
+    release_a.send(()).unwrap();
+    held_c.recv_timeout(T).expect("the check of C");
+    // A's decision is over (the one worker is at C's), and it applied nothing.
+    links.wait_done(t, 1);
+    assert_eq!(e.session(t), None, "the replaced report of A was linked");
+    release_c.send(()).unwrap();
+    Env::wait_session(&mut e.c, t, CODEX_C);
+    links.wait_done(t, 2);
+    links.wait(t, 2);
+    assert_eq!(e.session(t).as_deref(), Some(CODEX_C));
+    assert!(e.update(t, Some(CODEX_A), None).is_err());
+}
+
+/// A Relaunch resumes the agent's session and keeps it the agent's; a report of the run it
+/// replaced changes nothing.
+#[test]
+fn codex_link_survives_relaunch_and_ignores_older_run() {
+    let mut e = env();
+    let t = e.open("codex", None);
+    e.rollout(CODEX_A, "from A");
+    e.rollout(CODEX_C, "from C");
+    e.turn_end(CODEX_A);
+    Env::wait_session(&mut e.c, t, CODEX_A);
+    let old_run = e.run_id();
+    let n = e.fake.pids().len();
+    e.c.request(&ClientMsg::TermRelaunch {
+        terminal: t,
+        skip_permissions: true,
+    })
+    .unwrap();
+    e.fake.wait_pids(n + 1);
+    assert_ne!(e.run_id(), old_run);
+    // Before the new run reports anything, the Desktop's other guess is still refused.
+    assert!(e.update(t, Some(CODEX_C), None).is_err());
+    // The old run's late report of another session is refused.
+    assert_eq!(e.report(t, old_run, CODEX_C), Err("stale run".into()));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(e.session(t).as_deref(), Some(CODEX_A));
+}
+
+/// A link the list budget refuses is not the agent's: the Desktop may still link.
+#[test]
+fn codex_link_refused_by_budget_is_not_the_agents() {
+    const BUDGET: usize = 12_000;
+    let (mut e, links) = env_links_with(|c| c.max_terminal_bytes = BUDGET);
+    let t = e.open("codex", None);
+    let run = e.run_id();
+    // The longest title that fits, then 60 bytes less: room for a short session id only.
+    let (mut lo, mut hi) = (0usize, BUDGET);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        match e.update(t, None, Some(&"t".repeat(mid))) {
+            Ok(_) => lo = mid,
+            Err(_) => hi = mid,
+        }
+    }
+    e.update(t, None, Some(&"t".repeat(lo - 60))).unwrap();
+    let long = format!("a{}", "b".repeat(199));
+    e.rollout(&long, "long");
+    e.report(t, run, &long).unwrap();
+    links.wait_done(t, 1);
+    assert_eq!(e.session(t), None);
+    // Not linked, so not the agent's: the Desktop's link of a short id passes.
+    e.update(t, Some(CODEX_B), None).unwrap();
+    assert_eq!(e.session(t).as_deref(), Some(CODEX_B));
 }

@@ -1436,7 +1436,7 @@ mod tests {
     }
 
     fn send(sock: &std::path::Path, token: Uuid, run: u64, s: AgentStatus) -> Result<(), String> {
-        xshell_core::agent_status::send_event(sock, token, run, s)
+        xshell_core::agent_status::send_event(sock, token, run, s, None)
     }
 
     #[test]

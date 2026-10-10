@@ -34,7 +34,9 @@ pub(crate) fn hooks(cfg: &Config) -> Option<AgentHooks> {
 }
 
 /// `term.event`: a hook reports `status` for `terminal`'s process `run`. Refused for an
-/// unknown Terminal, an older run and a Terminal whose agent reports none.
+/// unknown Terminal, an older run and a Terminal whose agent reports none. A `session` it
+/// names is checked and linked later, by the last-line worker (`codex_link`): no file is
+/// read here, the hook client is waiting.
 pub(crate) fn on_event(
     d: &Arc<Daemon>,
     ob: &Outbox,
@@ -42,6 +44,7 @@ pub(crate) fn on_event(
     terminal: Uuid,
     run: u64,
     status: AgentStatus,
+    session: Option<String>,
 ) {
     let reg = d.reg.lock().unwrap();
     let r = match reg.terminals.get(&terminal) {
@@ -49,6 +52,10 @@ pub(crate) fn on_event(
         Some(t) => t
             .on_agent_event(d, run, status)
             .inspect(|_| {
+                if let Some(sid) = session {
+                    // Before the request below: its read checks the link first.
+                    t.request_link(sid);
+                }
                 // Accepted: the agent's session has a new message, also when the status
                 // repeats (another turn finished).
                 d.last_lines.request(terminal);

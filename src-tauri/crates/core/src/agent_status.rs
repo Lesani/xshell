@@ -13,7 +13,9 @@
 //! Nothing here writes the agents' own configuration (`~/.claude`, `~/.codex`): everything
 //! is passed per launch.
 
+use crate::chat::SESSION_ID_MAX;
 use crate::launch::agent_binary;
+use crate::sessions::valid_session_id;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -447,14 +449,38 @@ fn parse_terminal_id(s: &str) -> Result<(Uuid, u64), String> {
     Ok((id, run))
 }
 
-/// Whether Codex's `notify` payload is a turn end. Codex sends only that type today; other
-/// types and other JSON are ignored, so a future one never reads as finished. Text that is
-/// not JSON is no payload.
-fn payload_is_turn_end(payload: &str) -> bool {
+/// What Codex's `notify` payload says: `None` when it is not a turn end (nothing is sent),
+/// else the session it names. Codex sends only the turn-end type today; other types and
+/// other JSON are ignored, so a future one never reads as finished. Text that is not JSON
+/// is no payload: a turn end with no session.
+fn payload_turn_end(payload: &str) -> Option<Option<String>> {
     match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(v) => v.get("type").and_then(|t| t.as_str()) == Some("agent-turn-complete"),
-        Err(_) => true,
+        Ok(v) if v.get("type").and_then(|t| t.as_str()) == Some("agent-turn-complete") => {
+            Some(payload_thread(&v))
+        }
+        Ok(_) => None,
+        Err(_) => Some(None),
     }
+}
+
+/// The session a turn-end payload names: its `thread-id`, when that is a valid session id
+/// of at most [`SESSION_ID_MAX`] characters. Anything else is dropped here, so the Daemon
+/// never sees an id that could look like an option or a path.
+fn payload_thread(v: &serde_json::Value) -> Option<String> {
+    v.get("thread-id")
+        .and_then(|t| t.as_str())
+        .filter(|s| s.len() <= SESSION_ID_MAX && valid_session_id(s))
+        .map(str::to_owned)
+}
+
+/// One `term.event` to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedEvent {
+    socket: PathBuf,
+    terminal: Uuid,
+    run: u64,
+    status: AgentStatus,
+    session: Option<String>,
 }
 
 /// What one `event` command does: `Ok(None)` when there is nothing to send.
@@ -462,13 +488,12 @@ fn plan_event(
     a: &EventArgs,
     env: &dyn Fn(&str) -> Option<OsString>,
     default_socket: Option<PathBuf>,
-) -> Result<Option<(PathBuf, Uuid, u64, AgentStatus)>, String> {
-    if a.payload
-        .as_deref()
-        .is_some_and(|p| !payload_is_turn_end(p))
-    {
-        return Ok(None);
-    }
+) -> Result<Option<PlannedEvent>, String> {
+    let session = match a.payload.as_deref().map(payload_turn_end) {
+        Some(None) => return Ok(None),
+        Some(Some(s)) => s,
+        None => None,
+    };
     let status =
         AgentStatus::parse(&a.status).ok_or_else(|| format!("unknown status {:?}", a.status))?;
     let id = if a.terminal == "-" {
@@ -486,7 +511,13 @@ fn plan_event(
         .or_else(|| env(EVENT_SOCKET_ENV).map(PathBuf::from))
         .or(default_socket)
         .ok_or_else(|| format!("{EVENT_SOCKET_ENV} is not set"))?;
-    Ok(Some((socket, terminal, run, status)))
+    Ok(Some(PlannedEvent {
+        socket,
+        terminal,
+        run,
+        status,
+        session,
+    }))
 }
 
 /// How long the hook client may take in all, connecting included. A hook must never hold
@@ -494,18 +525,20 @@ fn plan_event(
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 const CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Send one `term.event` and wait for its `res`, all within [`CLIENT_TIMEOUT`].
+/// Send one `term.event` and wait for its `res`, all within [`CLIENT_TIMEOUT`]. `session`
+/// is the agent's own session id, when its hook reported one.
 #[cfg(unix)]
 pub fn send_event(
     socket: &Path,
     terminal: Uuid,
     run: u64,
     status: AgentStatus,
+    session: Option<String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + CLIENT_TIMEOUT;
     let mut s = deadline_io::connect(socket, deadline)
         .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
-    exchange(&mut s, terminal, run, status, Some(deadline))
+    exchange(&mut s, terminal, run, status, session, Some(deadline))
 }
 
 /// A unix stream bound by an absolute deadline: a non-blocking connect, then reads and
@@ -710,6 +743,7 @@ pub fn send_event(
     terminal: Uuid,
     run: u64,
     status: AgentStatus,
+    session: Option<String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + CLIENT_TIMEOUT;
     let s = crate::pipe::connect(socket, deadline, &|| false)
@@ -719,6 +753,7 @@ pub fn send_event(
         terminal,
         run,
         status,
+        session,
         Some(deadline),
     )
 }
@@ -764,7 +799,13 @@ impl Write for PipeDeadline {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn send_event(socket: &Path, _: Uuid, _: u64, _: AgentStatus) -> Result<(), String> {
+pub fn send_event(
+    socket: &Path,
+    _: Uuid,
+    _: u64,
+    _: AgentStatus,
+    _: Option<String>,
+) -> Result<(), String> {
     Err(format!(
         "no event socket on this platform ({})",
         socket.display()
@@ -779,6 +820,7 @@ fn exchange(
     terminal: Uuid,
     run: u64,
     status: AgentStatus,
+    session_id: Option<String>,
     deadline: Option<std::time::Instant>,
 ) -> Result<(), String> {
     use xshell_protocol::msg::{decode_server, ServerMsg};
@@ -791,6 +833,7 @@ fn exchange(
         terminal,
         run,
         status,
+        session_id,
     };
     let mut out = encode_msg(&hello, None).map_err(|e| e.to_string())?;
     out.extend(encode_msg(&ev, Some(1)).map_err(|e| e.to_string())?);
@@ -828,7 +871,7 @@ pub fn event_main(
 ) -> i32 {
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
     let r = parse_event_args(args).and_then(|a| match plan_event(&a, env, default_socket)? {
-        Some((socket, terminal, run, status)) => send_event(&socket, terminal, run, status),
+        Some(e) => send_event(&e.socket, e.terminal, e.run, e.status, e.session),
         None => Ok(()),
     });
     if let Err(e) = r {
@@ -885,6 +928,7 @@ pub fn serve_event_conn(
                     terminal,
                     run,
                     status,
+                    ..
                 } => (m.id, on(terminal, run, status)),
                 _ => (m.id, Err("only term.event is served here".to_string())),
             },
@@ -1247,7 +1291,16 @@ mod tests {
             (EVENT_SOCKET_ENV, "/s.sock"),
         ]);
         let plan = |v: &[&str]| plan_event(&parse_event_args(&args(v)).unwrap(), &env, None);
-        let want = Some((PathBuf::from("/s.sock"), id, 7, Finished));
+        let ev = |socket: &str, run, status, session: Option<&str>| {
+            Some(PlannedEvent {
+                socket: socket.into(),
+                terminal: id,
+                run,
+                status,
+                session: session.map(str::to_owned),
+            })
+        };
+        let want = ev("/s.sock", 7, Finished, None);
         assert_eq!(plan(&["-", "finished"]), Ok(want.clone()));
         assert_eq!(
             plan(&[
@@ -1255,7 +1308,7 @@ mod tests {
                 "finished",
                 r#"{"type":"agent-turn-complete","thread-id":"t"}"#
             ]),
-            Ok(want.clone())
+            Ok(ev("/s.sock", 7, Finished, Some("t")))
         );
         assert_eq!(
             plan(&["-", "finished", r#"{"type":"something-else"}"#]),
@@ -1266,7 +1319,7 @@ mod tests {
         // Explicit id and socket; a bare UUID is run 0.
         assert_eq!(
             plan(&["--socket", "/o.sock", &id.to_string(), "working"]),
-            Ok(Some((PathBuf::from("/o.sock"), id, 0, Working)))
+            Ok(ev("/o.sock", 0, Working, None))
         );
         assert_eq!(
             plan_event(
@@ -1274,7 +1327,7 @@ mod tests {
                 &envmap(&[(TERMINAL_ID_ENV, &format!("{id}.1"))]),
                 Some("/d.sock".into())
             ),
-            Ok(Some((PathBuf::from("/d.sock"), id, 1, Ended)))
+            Ok(ev("/d.sock", 1, Ended, None))
         );
         assert!(plan(&["-", "bogus"]).is_err());
         assert!(plan(&["nope", "working"]).is_err());
@@ -1285,6 +1338,52 @@ mod tests {
         )
         .is_err());
         assert!(parse_event_args(&args(&["-"])).is_err());
+    }
+
+    #[test]
+    fn plan_event_extracts_thread_id() {
+        let id = Uuid::new_v4();
+        let env = envmap(&[
+            (TERMINAL_ID_ENV, &format!("{id}.2")),
+            (EVENT_SOCKET_ENV, "/s.sock"),
+        ]);
+        let session = |payload: &str| {
+            plan_event(
+                &parse_event_args(&args(&["-", "finished", payload])).unwrap(),
+                &env,
+                None,
+            )
+            .map(|p| p.map(|p| p.session))
+        };
+        let turn = |tid: serde_json::Value| {
+            serde_json::json!({"type": "agent-turn-complete", "thread-id": tid, "cwd": "/p"})
+                .to_string()
+        };
+        // Valid ids are carried.
+        for ok in ["019a2b3c-dead-beef", "a", "A_b-9", &"x".repeat(200)] {
+            assert_eq!(
+                session(&turn(ok.into())),
+                Ok(Some(Some(ok.to_string()))),
+                "{ok}"
+            );
+        }
+        // Bad ids are dropped, the status is still sent.
+        for bad in [
+            serde_json::json!("../x"),
+            serde_json::json!("-x"),
+            serde_json::json!(""),
+            serde_json::json!("a/b"),
+            serde_json::json!("x".repeat(201)),
+            serde_json::json!(42),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(session(&turn(bad.clone())), Ok(Some(None)), "{bad}");
+        }
+        assert_eq!(session(r#"{"type":"agent-turn-complete"}"#), Ok(Some(None)));
+        // A payload that is not a turn end sends nothing, even with a thread id.
+        assert_eq!(session(r#"{"type":"other","thread-id":"abc"}"#), Ok(None));
+        // Text that is not JSON: a status with no session.
+        assert_eq!(session("thread-id abc"), Ok(Some(None)));
     }
 
     #[cfg(unix)]
@@ -1463,7 +1562,7 @@ mod tests {
                 }
             })
         });
-        assert_eq!(exchange(&mut a, known, 4, NeedsYou, None), Ok(()));
+        assert_eq!(exchange(&mut a, known, 4, NeedsYou, None, None), Ok(()));
         drop(a);
         server.join().unwrap();
         // A second connection, for an unknown Terminal.
@@ -1477,7 +1576,7 @@ mod tests {
         });
         let other = Uuid::new_v4();
         assert_eq!(
-            exchange(&mut a, other, 1, Working, None),
+            exchange(&mut a, other, 1, Working, None, None),
             Err("unknown terminal".into())
         );
         drop(a);
@@ -1532,10 +1631,10 @@ mod tests {
                 });
             }
         });
-        assert_eq!(send_event(&pipe, known, 4, NeedsYou), Ok(()));
+        assert_eq!(send_event(&pipe, known, 4, NeedsYou, None), Ok(()));
         let other = Uuid::new_v4();
         assert_eq!(
-            send_event(&pipe, other, 1, Working),
+            send_event(&pipe, other, 1, Working, None),
             Err("unknown terminal".into())
         );
         server.join().unwrap();

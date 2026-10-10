@@ -1179,9 +1179,20 @@ export default function App() {
       const args: Record<string, unknown> = { host: u.host, terminal: u.terminal };
       if (u.sessionId !== undefined) args.sessionId = u.sessionId;
       if (u.meta) args.meta = u.meta;
+      // Once settled, the Host's latest list is reconciled again: a list that arrived while
+      // the update was in flight could not settle it (the Daemon may have linked the agent's
+      // own session meanwhile, and refuses a guess of another one).
+      const reconcileAgain = () => {
+        delete appliedLiveRef.current[u.host];
+        setReconcileTick(n => n + 1);
+      };
       invoke("host_term_update", args)
-        .then(() => metaSync.settled(u, true))
-        .catch(() => { metaSync.settled(u, false); if (metaSync.hasPending()) window.setTimeout(() => setMetaTick(n => n + 1), 2000); });
+        .then(() => { metaSync.settled(u, true); reconcileAgain(); })
+        .catch(() => {
+          metaSync.settled(u, false);
+          reconcileAgain();
+          if (metaSync.hasPending()) window.setTimeout(() => setMetaTick(n => n + 1), 2000);
+        });
     }
   }, [tabs, tabsRestored, hostsSnap.status, metaTick]);
 

@@ -354,6 +354,7 @@ impl Env {
                     terminal: t.id,
                     run,
                     status: s,
+                    session_id: None,
                 })
                 .unwrap();
         }

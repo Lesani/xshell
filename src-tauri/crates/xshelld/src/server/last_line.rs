@@ -4,7 +4,8 @@
 //!
 //! A request reads now and once more after [`Config::last_line_retry`](super::Config), which
 //! covers a transcript written after the hook that triggered the read. Requests for a
-//! Terminal coalesce while one is pending.
+//! Terminal coalesce while one is pending. Each read first checks and links a session a Codex
+//! hook reported (`codex_link`), so that check runs here too, off the connection threads.
 
 use super::registry::Daemon;
 use super::TestPoint;
@@ -158,6 +159,8 @@ impl Inner {
         let Some(t) = d.reg.lock().unwrap().terminals.get(&id).cloned() else {
             return;
         };
+        // A session the agent reported is linked first, so its line is the one read.
+        super::codex_link::resolve(&d, &t);
         let spec = t.spec();
         let line = xshell_core::last_line::last_line(&d.ctx, &spec);
         d.test_point(id, TestPoint::LastLineRead);

@@ -76,6 +76,45 @@ describe("metaSync", () => {
     expect(m.isDirty(t.id, "title")).toBe(false);
     expect(m.takeUpdates([t])).toEqual([]);
   });
+
+  // The Daemon linked the agent's own session (xshell#36) while the Desktop's guess was in
+  // flight: the list that says so arrives before the update settles. App reconciles the same
+  // list again once the update settles, which then drops the entry and lets the list win.
+  it("inflight entry contradicted, then acked, then re-observe of the same list drops it", () => {
+    const m = new MetaSync();
+    const before = tabFromTerminal(H, info("u", null, "New Chat"));
+    const guessed: Tab = { ...before, sessionId: "guess" };
+    for (const e of localEdits([before], [guessed])) m.markDirty(e.tabId, e.field, e.value);
+    const [u] = m.takeUpdates([guessed]);
+    const list = [info("u", "agent", "New Chat")];
+    m.observe(H, list, [guessed]);
+    // In flight: kept, and reconcile does not apply the listed session over it.
+    expect(m.isDirty(guessed.id, "sessionId")).toBe(true);
+    m.settled(u, true);
+    m.observe(H, list, [guessed]);
+    expect(m.isDirty(guessed.id, "sessionId")).toBe(false);
+    // Before the update settled the list could not win; now it does.
+    const d = reconcile([guessed], H, list, new Set(), (id, f) => m.isDirty(id, f));
+    const { tabs } = applyReconcile({ tabs: [guessed], groups: [], activeLeafByGroup: {} }, d);
+    expect(tabs.find(t => t.id === guessed.id)?.sessionId).toBe("agent");
+  });
+
+  it("refused update (the agent's session wins) drops after its retry and the list applies", () => {
+    const m = new MetaSync();
+    const before = tabFromTerminal(H, info("u", null, "New Chat"));
+    const guessed: Tab = { ...before, sessionId: "guess" };
+    for (const e of localEdits([before], [guessed])) m.markDirty(e.tabId, e.field, e.value);
+    const list = [info("u", "agent", "New Chat")];
+    for (let i = 0; i < 2; i++) {
+      const [u] = m.takeUpdates([guessed]);
+      m.observe(H, list, [guessed]);
+      m.settled(u, false);
+    }
+    expect(m.isDirty(guessed.id, "sessionId")).toBe(false);
+    const d = reconcile([guessed], H, list, new Set(), (id, f) => m.isDirty(id, f));
+    const { tabs } = applyReconcile({ tabs: [guessed], groups: [], activeLeafByGroup: {} }, d);
+    expect(tabs.find(t => t.id === guessed.id)?.sessionId).toBe("agent");
+  });
 });
 
 // Two Desktops (A, B) on one Terminal. The daemon list is the only channel between them.

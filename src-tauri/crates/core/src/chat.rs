@@ -35,7 +35,7 @@ pub const FORWARD_SCAN_MAX: u64 = 16 * 1024 * 1024;
 /// The most items one session line gives.
 pub const LINE_MAX_ITEMS: usize = 64;
 /// The longest session id a stream follows (longer ones cannot name a file anyway).
-const SESSION_ID_MAX: usize = 200;
+pub const SESSION_ID_MAX: usize = 200;
 /// Room a page or append message keeps for its own fields (terminal, generation, session,
 /// cursor, the `res` envelope): entries are collected within [`CHAT_PAGE_MAX_BYTES`] less
 /// this, so the whole message stays within [`CHAT_PAGE_MAX_BYTES`].

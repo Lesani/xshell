@@ -193,6 +193,54 @@ fn read_rollout_meta(path: &Path) -> Option<RolloutMeta> {
     })
 }
 
+/// What a rollout's first line (`session_meta`) says about the session, for linking a
+/// Terminal to it: see [`session_meta_in`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexSessionMeta {
+    pub id: String,
+    pub cwd: String,
+    /// The session is a subagent's thread (its `source` is an object, or names a subagent),
+    /// never the one a Terminal runs.
+    pub subagent: bool,
+}
+
+/// `~/.codex/sessions`, where Codex keeps its rollouts.
+pub fn sessions_root(ctx: &HostCtx) -> Option<PathBuf> {
+    Some(ctx.home()?.join(".codex").join("sessions"))
+}
+
+/// The [`CodexSessionMeta`] of the rollout at `path`, opened only if it is a regular file
+/// whose real path stays inside `root` (see `last_line::open_confined`). Reads only the
+/// first line, at most 1 MiB of it (the meta line can hold long instructions): `None` when
+/// that is not a complete `session_meta` line naming an id and a cwd.
+pub fn session_meta_in(root: &Path, path: &Path) -> Option<CodexSessionMeta> {
+    use std::io::Read;
+    let f = crate::last_line::open_confined(root, path)?;
+    let mut first = Vec::new();
+    BufReader::new(f.take(META_LINE_MAX))
+        .read_until(b'\n', &mut first)
+        .ok()?;
+    if first.last() != Some(&b'\n') {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&first).ok()?;
+    if json.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    let payload = json.get("payload")?;
+    let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let subagent = match payload.get("source") {
+        Some(serde_json::Value::String(src)) => src.to_ascii_lowercase().contains("subagent"),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    };
+    Some(CodexSessionMeta {
+        id: s("id").filter(|i| !i.is_empty())?,
+        cwd: s("cwd").filter(|c| !c.is_empty())?,
+        subagent,
+    })
+}
+
 /// The newest user or agent message in the tail of a Codex rollout: the `message` of an
 /// `event_msg` of type `user_message` or `agent_message`.
 pub fn last_line_in(path: &Path) -> Option<LastLine> {
@@ -906,6 +954,71 @@ mod tests {
         assert_eq!(s.cost_usd, 0.0);
         assert!(s.is_authoritative_stats);
         assert_eq!(s.agent, "codex");
+    }
+
+    #[test]
+    fn session_meta_in_reads_first_line_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        fs::create_dir_all(root.join("2026")).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = root.join("2026").join(name);
+            fs::write(&p, body).unwrap();
+            p
+        };
+        let meta = |src: serde_json::Value| {
+            serde_json::json!({"type":"session_meta","payload":{"id":"s1","cwd":"/p","source":src}})
+                .to_string()
+                + "\n{\"type\":\"event_msg\"}\n"
+        };
+        let cli = write("rollout-a-s1.jsonl", &meta(serde_json::json!("cli")));
+        assert_eq!(
+            session_meta_in(&root, &cli),
+            Some(CodexSessionMeta {
+                id: "s1".into(),
+                cwd: "/p".into(),
+                subagent: false
+            })
+        );
+        let sub = write(
+            "rollout-b-s1.jsonl",
+            &meta(serde_json::json!({"subagent": {"thread_spawn": {}}})),
+        );
+        assert!(session_meta_in(&root, &sub).unwrap().subagent);
+        let named = write("rollout-c-s1.jsonl", &meta(serde_json::json!("SubAgent")));
+        assert!(session_meta_in(&root, &named).unwrap().subagent);
+        // No source at all: not a subagent.
+        let bare = write(
+            "rollout-d-s1.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"cwd\":\"/p\"}}\n",
+        );
+        assert!(!session_meta_in(&root, &bare).unwrap().subagent);
+        // An incomplete first line, another first record, no id: nothing.
+        let part = write(
+            "rollout-e-s1.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"cwd\":\"/p\"}}",
+        );
+        assert_eq!(session_meta_in(&root, &part), None);
+        let other = write(
+            "rollout-f-s1.jsonl",
+            "{\"type\":\"event_msg\",\"payload\":{\"id\":\"s1\",\"cwd\":\"/p\"}}\n",
+        );
+        assert_eq!(session_meta_in(&root, &other), None);
+        let noid = write(
+            "rollout-g-s1.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/p\"}}\n",
+        );
+        assert_eq!(session_meta_in(&root, &noid), None);
+        // Outside the root, or a symlink: refused.
+        let outside = dir.path().join("rollout-x-s1.jsonl");
+        fs::write(&outside, meta(serde_json::json!("cli"))).unwrap();
+        assert_eq!(session_meta_in(&root, &outside), None);
+        #[cfg(unix)]
+        {
+            let link = root.join("2026").join("rollout-h-s1.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert_eq!(session_meta_in(&root, &link), None);
+        }
     }
 
     #[test]

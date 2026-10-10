@@ -159,6 +159,7 @@ impl Env {
                 terminal: t,
                 run,
                 status,
+                session_id: None,
             })
             .unwrap();
     }

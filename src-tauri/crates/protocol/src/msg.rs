@@ -87,12 +87,18 @@ pub enum ClientMsg {
     /// Terminals), never by a Desktop's UI. `run` names the Terminal's process (a Relaunch
     /// or restore starts a new run): a report for an older run is refused. Gated on the
     /// `agent.status` capability.
-    #[serde(rename = "term.event")]
+    ///
+    /// `sessionId` is the agent's own session id when its hook reports one (Codex's
+    /// `thread-id` from its notify payload). The Daemon validates it against the agent's
+    /// session storage and links the Terminal to it. Additive: older senders omit it.
+    #[serde(rename = "term.event", rename_all = "camelCase")]
     TermEvent {
         terminal: Uuid,
         #[serde(default)]
         run: u64,
         status: AgentStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// This Host's Ring identity: its public keys and name, and its membership if it has
     /// one. Creates the keys on first use; the private keys never leave the Host. Desktop
@@ -1289,6 +1295,7 @@ mod tests {
             terminal: id,
             run: 3,
             status: AgentStatus::NeedsYou,
+            session_id: None,
         };
         let b = body(encode_msg(&msg, Some(1)).unwrap());
         assert_eq!(
@@ -1305,8 +1312,42 @@ mod tests {
             ClientMsg::TermEvent {
                 terminal: id,
                 run: 0,
-                status: AgentStatus::Working
+                status: AgentStatus::Working,
+                session_id: None,
             }
+        );
+    }
+
+    #[test]
+    fn term_event_session_id_roundtrip() {
+        let id = Uuid::new_v4();
+        let msg = ClientMsg::TermEvent {
+            terminal: id,
+            run: 2,
+            status: AgentStatus::Finished,
+            session_id: Some("019a-thread".into()),
+        };
+        let b = body(encode_msg(&msg, Some(4)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            format!(
+                r#"{{"id":4,"t":"term.event","terminal":"{id}","run":2,"status":"finished","sessionId":"019a-thread"}}"#
+            )
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(4), msg });
+        // Absent: not serialized, and the old shape still decodes to `None`.
+        let none = ClientMsg::TermEvent {
+            terminal: id,
+            run: 2,
+            status: AgentStatus::Finished,
+            session_id: None,
+        };
+        let b = body(encode_msg(&none, None).unwrap());
+        assert!(!String::from_utf8_lossy(&b).contains("sessionId"));
+        let raw = json!({"t":"term.event","terminal":id,"run":2,"status":"finished"});
+        assert_eq!(
+            decode_inbound(raw.to_string().as_bytes()).unwrap().msg,
+            none
         );
     }
 

@@ -444,22 +444,17 @@ impl Conn {
                 let reg = d.reg.lock().unwrap();
                 let r = match reg.terminals.get(&terminal) {
                     None => Err(format!("unknown terminal {terminal}")),
-                    Some(t) => {
-                        let (spec, meta) = t.updated(session_id, meta);
-                        let relinked = spec.session_id != t.spec().session_id;
-                        d.check_budget(&reg, terminal, &spec, &meta).map(|_| {
-                            t.set_record(spec, meta);
-                            if relinked {
-                                // The line was the previous session's; the new one's is read.
-                                t.set_last_line(None);
-                                d.last_lines.request(terminal);
-                                d.session_streams.wake(terminal);
-                            }
-                            d.persist(&reg);
-                            d.broadcast_terminals(&reg);
-                            Value::Null
-                        })
-                    }
+                    Some(t) => match (session_id.as_deref(), t.agent_session()) {
+                        // The agent's own report wins: an update naming another session is
+                        // refused as a whole, its metadata (a wrong session's title) too.
+                        (Some(s), Some(a)) if s != a => Err(format!(
+                            "cannot link this chat to another session: its agent reported session {a}"
+                        )),
+                        _ => {
+                            let (spec, meta) = t.updated(session_id, meta);
+                            d.apply_record(&reg, t, spec, meta).map(|()| Value::Null)
+                        }
+                    },
                 };
                 drop(reg);
                 reply(&self.ob, id, r);
@@ -502,7 +497,8 @@ impl Conn {
                 terminal,
                 run,
                 status,
-            } => agent::on_event(&d, &self.ob, id, terminal, run, status),
+                session_id,
+            } => agent::on_event(&d, &self.ob, id, terminal, run, status, session_id),
             // xshell on this machine brings its own Daemon; one replaced from elsewhere
             // would only be started again in the old version.
             ClientMsg::DaemonUpgrade if d.cfg.gui_bound.is_some() => {

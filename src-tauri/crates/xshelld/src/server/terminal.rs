@@ -438,6 +438,9 @@ pub(crate) struct Terminal {
     /// The newest text message of the agent's session, as the last-line worker last read
     /// it. Locked last, never across another lock.
     last_line: Mutex<Option<LastLine>>,
+    /// The session the agent reported itself (Codex's notify `thread-id`): linked, and still
+    /// to be checked. Locked last, never across another lock.
+    link: Mutex<LinkCell>,
     /// Claude and Codex run directly: a model of the screen, fed with the output and resized
     /// with the PTY. Locked alone, or after `io`; `prompt` and `input` may be taken under it.
     screen: Mutex<Option<Screen>>,
@@ -459,6 +462,29 @@ pub(crate) struct Terminal {
     /// starts. Closing it (the Terminal and its escalation dropped) ends them all.
     #[cfg(windows)]
     job: Option<Arc<xshell_core::job::Job>>,
+}
+
+/// The session an agent reported for its Terminal, and a report the last-line worker has
+/// still to check (see `codex_link`).
+#[derive(Default)]
+struct LinkCell {
+    /// The session the agent reported and the Daemon checked and linked: a `term.update`
+    /// naming another one is refused. Not persisted (the spec keeps the link).
+    agent_session: Option<String>,
+    /// The newest report not yet checked.
+    pending: Option<PendingLink>,
+    /// The last generation drawn: every report gets a new one.
+    gen: u64,
+}
+
+/// A session report waiting to be checked: only the newest one (its generation still
+/// current) may be linked, kept for a retry or dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingLink {
+    pub gen: u64,
+    pub sid: String,
+    /// When it was reported: a missing rollout is looked for again until a retry later.
+    pub at: Instant,
 }
 
 /// A run's Agent Status and the time of its last change.
@@ -756,6 +782,7 @@ pub(crate) fn spawn_with(
         written: Arc::new(Mutex::new((0, 0))),
         status: Mutex::new(StatusCell::new(tracker, 0)),
         last_line: Mutex::new(None),
+        link: Mutex::new(LinkCell::default()),
         escalations: d.escalations.clone(),
         reply_writes,
         reply_stuck: AtomicBool::new(false),
@@ -1456,6 +1483,12 @@ impl Terminal {
         next.prompt.lock().unwrap().inherit(ids, reserved);
         let line = self.last_line.lock().unwrap().clone();
         *next.last_line.lock().unwrap() = line;
+        // The replacement resumes the session the agent linked: a `term.update` naming
+        // another one is still refused before the new run reports. A report still waiting
+        // was the old run's and stays behind.
+        let resumes = next.spec().session_id;
+        let agent = self.agent_session().filter(|a| resumes.as_ref() == Some(a));
+        next.link.lock().unwrap().agent_session = agent;
         let mut dropped = Vec::new();
         let mut io = next.io.lock().unwrap();
         let spawned = io.arb.current();
@@ -1881,6 +1914,52 @@ impl Terminal {
         r.meta = meta;
     }
 
+    /// The agent reported session `sid`: it waits for the last-line worker to check it,
+    /// replacing any earlier report still waiting.
+    pub fn request_link(&self, sid: String) {
+        let mut l = self.link.lock().unwrap();
+        l.gen += 1;
+        l.pending = Some(PendingLink {
+            gen: l.gen,
+            sid,
+            at: Instant::now(),
+        });
+    }
+
+    /// The session report waiting to be checked.
+    pub fn pending_link(&self) -> Option<PendingLink> {
+        self.link.lock().unwrap().pending.clone()
+    }
+
+    /// Drop report `gen`, if it is still the one waiting; `true` when it was.
+    pub fn drop_link(&self, gen: u64) -> bool {
+        let mut l = self.link.lock().unwrap();
+        let current = l.pending.as_ref().is_some_and(|p| p.gen == gen);
+        if current {
+            l.pending = None;
+        }
+        current
+    }
+
+    /// Report `gen` was checked and its session is linked: it becomes the agent's session.
+    /// Call under the registry lock that linked it; `false` (nothing changes) when a newer
+    /// report replaced it.
+    pub fn commit_link(&self, gen: u64) -> bool {
+        let mut l = self.link.lock().unwrap();
+        match l.pending.take_if(|p| p.gen == gen) {
+            Some(p) => {
+                l.agent_session = Some(p.sid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The session the agent reported and the Daemon linked, if any.
+    pub fn agent_session(&self) -> Option<String> {
+        self.link.lock().unwrap().agent_session.clone()
+    }
+
     /// Store the last line the worker read; `true` when it changed.
     pub fn set_last_line(&self, line: Option<LastLine>) -> bool {
         let mut l = self.last_line.lock().unwrap();
@@ -2018,6 +2097,7 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         written: Arc::new(Mutex::new((0, 0))),
         status: Mutex::new(status),
         last_line: Mutex::new(None),
+        link: Mutex::new(LinkCell::default()),
         escalations: d.escalations.clone(),
         reply_writes: false,
         reply_stuck: AtomicBool::new(false),

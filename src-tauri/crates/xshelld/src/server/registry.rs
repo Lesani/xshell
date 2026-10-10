@@ -193,6 +193,31 @@ impl Daemon {
         Ok(())
     }
 
+    /// Make `spec` and `meta` `t`'s record, as a `term.update` and the Daemon's own Codex
+    /// link do: checked against the list budget first (refused: nothing changes), then
+    /// stored, persisted and published. A changed session drops the previous session's last
+    /// line, reads the new one's and resets its session streams.
+    pub fn apply_record(
+        &self,
+        reg: &Registry,
+        t: &Terminal,
+        spec: LaunchSpec,
+        meta: Map<String, Value>,
+    ) -> Result<(), String> {
+        self.check_budget(reg, t.id, &spec, &meta)?;
+        let relinked = spec.session_id != t.spec().session_id;
+        t.set_record(spec, meta);
+        if relinked {
+            // The line was the previous session's; the new one's is read.
+            t.set_last_line(None);
+            self.last_lines.request(t.id);
+            self.session_streams.wake(t.id);
+        }
+        self.persist(reg);
+        self.broadcast_terminals(reg);
+        Ok(())
+    }
+
     /// Send `f`, a message about `terminal` (running `spec`), to every connection that
     /// [`sees`](role::sees) that Terminal: a barrier its output never crosses
     /// ([`Outbox::push_about`]).
