@@ -1143,3 +1143,237 @@ fn connector_reports_accepted_frames() {
     assert_eq!(accepted(&rec), 2, "a refusal is not accepted");
     c.stop(ByeReason::quit());
 }
+
+// ---- Quota refusals at connect and quota closes (xshell#43) ------------------------------
+
+use xshell_protocol::ring::relay::wire::{close, QUOTA_REFUSALS_BEFORE_CLOSE};
+
+fn quota_errors(rec: &Rec) -> Vec<Option<SignKey>> {
+    rec.all()
+        .into_iter()
+        .filter_map(|e| match e {
+            Ev::Error(ErrorCode::Quota, to) => Some(to),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_waiting(e: &Ev) -> bool {
+    matches!(e, Ev::State(LinkState::Waiting { .. }))
+}
+
+/// A Relay that is ahead of the Daemon's chain, with the Ring's quota used up: the Relay
+/// refuses the catch-up the connect asks for.
+fn ahead_and_over_quota() -> (TestRelay, TestRing) {
+    let r = quota_relay(8);
+    let mut ring = TestRing::new(&r.url());
+    let (desk, _) = connect(&r.target(), &ring.chain, ring.desktop.clone());
+    let v3 = ring.next(|_| {});
+    desk.publish_roster(&v3).unwrap();
+    use_up_quota(&r, &ring);
+    (r, ring)
+}
+
+#[test]
+fn connect_refused_for_quota_reports_quota() {
+    let (r, ring) = ahead_and_over_quota();
+    let (c, rec) = start(cfg(&r, &ring.up_to(2), ring.daemon.clone()));
+    let waiting = rec
+        .wait(WAIT, is_waiting)
+        .expect("waiting after the refusal");
+    match &waiting {
+        Ev::State(LinkState::Waiting { error, .. }) => assert!(error.contains("quota"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+    let all = rec.all();
+    let report = all
+        .iter()
+        .position(|e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
+        .expect("the refusal is reported as quota");
+    let first_wait = all.iter().position(is_waiting).unwrap();
+    assert!(report < first_wait, "reported before Waiting: {all:?}");
+    // Each refused attempt reports it.
+    wait_until("a second report", || quota_errors(&rec).len() >= 2);
+    assert!(quota_errors(&rec).iter().all(Option::is_none));
+    assert!(!rec
+        .all()
+        .iter()
+        .any(|e| matches!(e, Ev::State(LinkState::Connected { .. }))));
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn quota_close_after_refusals_reports_quota() {
+    let r = quota_relay(8);
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
+    assert!(rec.connected());
+    use_up_quota(&r, &ring);
+    rec.clear();
+    let phone = ring.mobile.sign_key();
+    for _ in 0..QUOTA_REFUSALS_BEFORE_CLOSE {
+        c.send(&phone, b"x").unwrap();
+    }
+    assert!(rec.wait(WAIT, is_waiting).is_some(), "{:?}", rec.all());
+    let all = rec.all();
+    let first_wait = all.iter().position(is_waiting).unwrap();
+    let before: Vec<_> = all[..first_wait]
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Error(ErrorCode::Quota, to) => Some(*to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(before.len(), QUOTA_REFUSALS_BEFORE_CLOSE + 1, "{all:?}");
+    assert!(before[..QUOTA_REFUSALS_BEFORE_CLOSE]
+        .iter()
+        .all(|to| *to == Some(phone)));
+    assert_eq!(before[QUOTA_REFUSALS_BEFORE_CLOSE], None, "the close");
+    // Authentication costs no quota: the Daemon connects again.
+    assert!(rec.connected());
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn quota_close_code_alone_reports_quota() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
+    assert!(rec.connected());
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.daemon.sign_key(), close::QUOTA));
+    assert!(rec.wait(WAIT, is_waiting).is_some());
+    let all = rec.all();
+    let report = all
+        .iter()
+        .position(|e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
+        .expect("the close is reported as quota");
+    assert!(report < all.iter().position(is_waiting).unwrap(), "{all:?}");
+    assert!(rec.connected());
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn other_close_reports_no_quota() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
+    assert!(rec.connected());
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.daemon.sign_key(), 1011));
+    assert!(rec.connected());
+    std::thread::sleep(QUIET);
+    assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
+    c.stop(ByeReason::quit());
+}
+
+/// A stable connection retries at once after an ordinary drop (see
+/// `stable_connection_resets_backoff`), but not after a close for quota.
+#[test]
+fn quota_close_backs_off_even_after_a_stable_connection() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let mut cc = cfg(&r, &ring.chain, ring.daemon.clone());
+    cc.stable_after = Duration::ZERO;
+    let (c, rec) = start(cc);
+    assert!(rec.connected());
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.daemon.sign_key(), close::QUOTA));
+    match rec.wait(WAIT, is_waiting) {
+        Some(Ev::State(LinkState::Waiting { retry_in, .. })) => {
+            assert_eq!(retry_in, Duration::from_millis(50))
+        }
+        other => panic!("{other:?}: {:?}", rec.all()),
+    }
+    assert!(rec.connected());
+    c.stop(ByeReason::quit());
+}
+
+/// A move owed to a Relay that refuses this Ring for quota: those refusals are a move
+/// failure, never a quota report (the quota is the old Relay's).
+#[test]
+fn a_move_owed_to_a_relay_over_quota_reports_no_quota() {
+    let b = relay();
+    // The old Relay is ahead of the move's start and over quota: its connect is refused.
+    let (a, mut ring) = ahead_and_over_quota();
+    ring.next(|d| d.relay_url = b.url());
+    let job = MoveJob::new(&ring.chain, 2).unwrap();
+    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
+    cc.move_attempts = 2;
+    cc.pending_move = Some(job.clone());
+    let (desk, drec) = start(cc);
+    assert!(drec
+        .wait(WAIT, |e| matches!(e, Ev::Moved(MoveState::Failed { .. })))
+        .is_some());
+    match drec.wait(WAIT, is_waiting) {
+        Some(Ev::State(LinkState::Waiting { error, .. })) => {
+            assert!(error.contains("quota"), "{error}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
+    assert!(!online(&b, &ring, &ring.desktop.sign_key()));
+    desk.stop(ByeReason::quit());
+}
+
+/// The same when the old Relay lets the Desktop in but refuses the versions it publishes
+/// there for quota.
+#[test]
+fn a_move_whose_publication_is_refused_for_quota_reports_no_quota() {
+    let (a, b) = (quota_relay(8), relay());
+    let mut ring = TestRing::new(&a.url());
+    use_up_quota(&a, &ring);
+    ring.next(|d| d.relay_url = b.url());
+    let job = MoveJob::new(&ring.chain, 2).unwrap();
+    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
+    cc.move_attempts = 2;
+    cc.pending_move = Some(job);
+    let (desk, drec) = start(cc);
+    assert!(drec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Moved(MoveState::Failed { error, .. }) if error.contains("quota")
+        ))
+        .is_some());
+    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
+    assert!(!drec.all().iter().any(|e| matches!(e, Ev::Accepted)));
+    desk.stop(ByeReason::quit());
+}
+
+/// A close for quota while a move is owed backs off, and a kick still ends that wait.
+#[test]
+fn a_quota_close_during_a_move_backs_off_until_kicked() {
+    let (a, b) = (relay(), relay());
+    let mut ring = TestRing::new(&a.url());
+    let key = ring.desktop.sign_key();
+    a.refuse_roster_puts(true);
+    ring.next(|d| d.relay_url = b.url());
+    let job = MoveJob::new(&ring.chain, 2).unwrap();
+    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
+    // Waits long enough that only a kick ends them within the test.
+    cc.backoff_unit = Duration::from_secs(30);
+    cc.pending_move = Some(job);
+    let (desk, drec) = start(cc);
+    assert!(drec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Moved(MoveState::Moving { error: Some(_), .. })
+        ))
+        .is_some());
+    wait_until("on the old Relay", || online(&a, &ring, &key));
+    drec.clear();
+    assert!(a.kick(&ring.ring_id(), &key, close::QUOTA));
+    match drec.wait(WAIT, is_waiting) {
+        Some(Ev::State(LinkState::Waiting { retry_in, .. })) => {
+            assert_eq!(retry_in, Duration::from_secs(30))
+        }
+        other => panic!("{other:?}: {:?}", drec.all()),
+    }
+    std::thread::sleep(QUIET);
+    assert!(!online(&a, &ring, &key), "no redial during the wait");
+    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
+    desk.kick();
+    assert!(drec.connected(), "the kick ends the wait");
+    wait_until("back on the old Relay", || online(&a, &ring, &key));
+    desk.stop(ByeReason::quit());
+}

@@ -852,6 +852,12 @@ impl ConnectorEvents for SessionEvents {
             n.error(code, to);
         }
     }
+    fn quota(&self, relay: &str, to: Option<SignKey>) {
+        self.sessions.error(&ErrorCode::Quota, to);
+        if let Some(n) = &self.next {
+            n.quota(relay, to);
+        }
+    }
     fn entitlement(&self, token: Option<&str>) {
         if let Some(n) = &self.next {
             n.entitlement(token);

@@ -29,7 +29,11 @@
 //! sent under; no probe is sent while this connection has had [`PROBE_STREAK_LIMIT`] refusals
 //! in a row, so the probes never make the Relay close the socket (4029); an accepted counted
 //! frame ([`ConnectorEvents::accepted`]), a new connection or the lapse of the notice ends the
-//! run. Reports of a retired Connector (an older [`Live::epoch`]) change nothing.
+//! run. Reports of a retired Connector (an older [`Live::epoch`]) change nothing. The
+//! Connector also reports a connect the Relay refused for quota and a close for quota
+//! (xshell#43), so the notice shows while the link is waiting too. When the Ring's Relay
+//! changes, the notice is the old Relay's and is cleared; no probe is sent while a move is
+//! still owed to the old Relay, and the Connector reports nothing about its quota.
 
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
@@ -536,8 +540,8 @@ struct Quota {
 }
 
 impl Quota {
-    /// The Connector is retired: nothing it reported, or a probe on it answers, counts any
-    /// more.
+    /// The Connector is retired, or the Ring's Relay changed: nothing reported so far, or a
+    /// probe sent so far answers, counts any more. The next probe decides afresh.
     fn retire(&mut self) {
         *self = Quota {
             rev: self.rev + 1,
@@ -706,12 +710,9 @@ impl ConnectorEvents for Events {
         }
     }
 
-    fn error(&self, code: &ErrorCode, _to: Option<SignKey>) {
-        if *code != ErrorCode::Quota {
-            return;
-        }
+    fn quota(&self, relay: &str, _to: Option<SignKey>) {
         if let Some(r) = self.ring.upgrade() {
-            if r.quota_refused(self.epoch) {
+            if r.quota_refused(self.epoch, relay) {
                 r.emit();
             }
         }
@@ -920,7 +921,14 @@ impl DesktopRing {
                 .state
                 .as_ref()
                 .is_some_and(|c| c.chain.ring_id() != s.chain.ring_id());
+            let other_relay = l.state.as_ref().is_some_and(|c| {
+                c.chain.head().roster().relay_url != s.chain.head().roster().relay_url
+            });
             l.state = Some(s.clone());
+            if other_relay && !other_ring {
+                // The quota notice was the old Relay's.
+                l.quota.retire();
+            }
             if other_ring {
                 l.moving = None;
                 l.link = None;
@@ -1804,13 +1812,19 @@ impl DesktopRing {
         v
     }
 
-    /// A quota refusal on the current connection: the notice shows until the Relay's day
-    /// ends, and the refusal counts toward the streak of that connection. `true`: noted (a
-    /// retired Connector's late report, from an older `epoch`, is not).
-    fn quota_refused(&self, epoch: u64) -> bool {
+    /// A quota refusal on the current connection, to `relay`: the notice shows until the
+    /// Relay's day ends, and the refusal counts toward the streak of that connection. `true`:
+    /// noted. A retired Connector's late report (from an older `epoch`) is not, and neither is
+    /// one about a Relay the Ring has left (the report crossed the change, which cleared that
+    /// Relay's notice): checked here, under the same lock the change is adopted under.
+    fn quota_refused(&self, epoch: u64, relay: &str) -> bool {
         let at = now();
         let mut l = self.lock();
-        if l.epoch != epoch || l.connector.is_none() {
+        let ours = l
+            .state
+            .as_ref()
+            .is_some_and(|s| s.chain.head().roster().relay_url == relay);
+        if l.epoch != epoch || l.connector.is_none() || !ours {
             return false;
         }
         let conn = l.conn_epoch;
@@ -1856,7 +1870,7 @@ impl DesktopRing {
     }
 
     /// Sends a quota probe if this window runs the connection, it is up, a phone is in the
-    /// Roster, none is in flight, one is due, and the connection is not near the Relay's
+    /// Roster, no Relay move is owed, none is in flight, one is due, and the connection is not near the Relay's
     /// close for refusals in a row. Its answer is waited for on a thread of its own.
     fn maybe_probe(&self) {
         let (c, tag) = {
@@ -1869,7 +1883,14 @@ impl DesktopRing {
                     .iter()
                     .any(|m| m.role == Role::Mobile)
             });
-            if l.quitting || !phone || !matches!(l.link, Some(LinkState::Connected { .. })) {
+            // While a move is owed, the connection is the old Relay's: its quota is not the
+            // Ring's any more.
+            let moving = l.state.as_ref().is_some_and(|s| s.pending_move.is_some());
+            if l.quitting
+                || !phone
+                || moving
+                || !matches!(l.link, Some(LinkState::Connected { .. }))
+            {
                 return;
             }
             let Some(c) = l.connector.clone() else {
@@ -4075,7 +4096,7 @@ mod tests {
         ring.enable(None, true).unwrap();
         wait_view(&ring, "the new Ring connected", connected);
         let conn_epoch = ring.lock().conn_epoch;
-        old.error(&ErrorCode::Quota, None);
+        old.quota(&r.url(), None);
         old.state(&LinkState::Stopped { error: None });
         let v = ring.view();
         assert_eq!(v.quota_reset_at, None, "no notice on the new Ring");
@@ -4113,6 +4134,112 @@ mod tests {
         wait_until("the second probe", || probe_results(&ring).len() == 2);
         assert!(ring.view().quota_reset_at.is_some(), "the notice stays");
         assert_eq!(probe_results(&ring), vec![true, false], "fenced off");
+        ring.quit();
+    }
+
+    // ---- Quota refusals at connect and quota closes (#43) ---------------------------------
+
+    use xshell_protocol::ring::relay::wire::close;
+
+    /// The Relay closes the Desktop's socket for quota: the notice shows.
+    #[test]
+    fn quota_close_shows_the_notice() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let (ring, _, _, chain) = with_phone_cfg(probing(t.path(), &r, hour, hour));
+        wait_until("the first probe", || probe_results(&ring).len() == 1);
+        assert_eq!(ring.view().quota_reset_at, None);
+        assert!(r.kick(chain.ring_id(), &this_app(&ring), close::QUOTA));
+        let v = wait_view(&ring, "the quota notice", |v| v.quota_reset_at.is_some());
+        assert_eq!(v.quota_reset_at, Some(next_utc_midnight(now())));
+        ring.quit();
+    }
+
+    /// The Relay is ahead of the Desktop's chain and the Ring is over quota: the connect is
+    /// refused, the link waits, and the notice shows.
+    #[test]
+    fn connect_time_quota_refusal_shows_the_notice() {
+        let r = quota_relay(60);
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let c = probing(t.path(), &r, hour, hour);
+        let (ring, _, phone, _) = with_phone_cfg(c.clone());
+        let (keys, mut chain) = {
+            let l = ring.lock();
+            let s = l.state.as_ref().unwrap();
+            (s.keys.clone(), s.chain.clone())
+        };
+        ring.quit();
+        // Another Desktop of this Ring would have published this: the Relay gets ahead.
+        let next = chain
+            .head()
+            .next(&*keys, now(), |d| d.relay_url = r.url())
+            .unwrap();
+        let (other, _) = contract::connect(&r.target(), &chain, keys.clone());
+        other.publish_roster(&next).unwrap();
+        drop(other);
+        chain.accept(std::slice::from_ref(&next)).unwrap();
+        use_up_quota(&r, &chain, &phone);
+
+        let (ring, _) = open(c);
+        let v = wait_view(&ring, "waiting with the notice", |v| {
+            v.connection == "waiting" && v.quota_reset_at.is_some()
+        });
+        assert_eq!(v.quota_reset_at, Some(next_utc_midnight(now())));
+        ring.quit();
+    }
+
+    /// The Ring's Relay changes while the old one is over quota: the old Relay's notice is
+    /// cleared, and while the move is owed to it, nothing of its quota shows again.
+    #[test]
+    fn a_relay_change_clears_the_old_relays_notice() {
+        let (a, b) = (quota_relay(60), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, phone, chain) = with_phone_cfg(probing(t.path(), &a, 50, 50));
+        use_up_quota(&a, &chain, &phone);
+        wait_view(&ring, "the old Relay's notice", |v| {
+            v.quota_reset_at.is_some()
+        });
+        ring.set_relay_url(&b.url()).unwrap();
+        let v = ring.view();
+        assert_eq!(v.relay_url.as_deref(), Some(b.url().as_str()));
+        assert_eq!(v.quota_reset_at, None, "cleared with the change");
+        // The old Relay refuses the move's publication for quota, again and again.
+        wait_view(&ring, "the move failed", |v| {
+            v.moving.as_ref().is_some_and(|m| m.state == "failed")
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let v = ring.view();
+        assert!(v.moving.is_some(), "still owed to the old Relay");
+        assert_eq!(v.quota_reset_at, None, "no notice for the new Relay");
+        ring.quit();
+    }
+
+    /// A quota report about the old Relay that crosses a Relay change (the refusal was on
+    /// its way when the change was adopted) shows no notice; one about the new Relay does.
+    #[test]
+    fn an_old_relays_quota_report_after_a_relay_change_shows_no_notice() {
+        let (a, b) = (relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &a.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        // The Connector's report, held until after the change.
+        let held = Events {
+            ring: Arc::downgrade(&ring),
+            epoch: ring.lock().epoch,
+        };
+        ring.set_relay_url(&b.url()).unwrap();
+        held.quota(&a.url(), None);
+        assert_eq!(ring.view().quota_reset_at, None, "the old Relay's report");
+        assert_eq!(ring.lock().quota.streak.1, 0);
+        held.quota(&b.url(), None);
+        assert_eq!(
+            ring.view().quota_reset_at,
+            Some(next_utc_midnight(now())),
+            "the new Relay's report"
+        );
         ring.quit();
     }
 }

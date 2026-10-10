@@ -138,8 +138,19 @@ pub trait ConnectorEvents: Send + Sync {
     /// `entitlement_required`, …), `to` naming the envelope's addressee. Every `quota`
     /// refusal comes here too, also one that answers a request (an
     /// [`Connector::put_entitlement`], say): its caller gets the error as its result first,
-    /// so one place can show the Ring's quota notice.
+    /// so one place can show the Ring's quota notice. Quota refusals come through
+    /// [`ConnectorEvents::quota`], which by default passes them on here.
     fn error(&self, _code: &ErrorCode, _to: Option<SignKey>) {}
+    /// A `quota` refusal on a connection to `relay` (the Relay the attempt dialed), `to` as
+    /// for [`ConnectorEvents::error`]. A connect the Relay refused for quota and a close for
+    /// quota ([`close::QUOTA`]) come here as `to: None`. Reported only while `relay` is the
+    /// one the trusted head names: nothing comes from an attempt at the old Relay of a move
+    /// owed, whose quota is no longer the Ring's. A report can still cross a change of the
+    /// Relay, so an owner that keeps quota state checks `relay` against its own head when it
+    /// applies the report. By default: [`ConnectorEvents::error`] with [`ErrorCode::Quota`].
+    fn quota(&self, _relay: &str, to: Option<SignKey>) {
+        self.error(&ErrorCode::Quota, to);
+    }
     /// The Relay accepted a counted frame of the current connection (see
     /// [`RingEvents::accepted`]): it ends a run of `quota` refusals there.
     fn accepted(&self) {}
@@ -190,6 +201,9 @@ struct Inner {
     backoff_unit: Duration,
     stable_after: Duration,
     move_attempts: u32,
+    /// Test hook: runs on the worker right before a quota report's fence.
+    #[cfg(test)]
+    before_quota: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 /// Keeps a device connected to its Ring's Relay; see the module docs.
@@ -243,6 +257,28 @@ fn holds(c: &RingClient, next: &SignedRoster) -> bool {
         .is_some_and(|r| r.token() == next.token())
 }
 
+/// Whether the Relay closed the connection because the Ring is over its daily quota. Only
+/// the close code says so: a close's `error` is the last error of the connection, not why it
+/// closed.
+fn quota_close(why: &CloseReason) -> bool {
+    matches!(
+        why,
+        CloseReason::Relay {
+            close_code: Some(close::QUOTA),
+            ..
+        }
+    )
+}
+
+/// Whether a connect failed because the Ring is over its Relay's daily quota.
+fn quota_error(e: &RingError) -> bool {
+    match e {
+        RingError::Relay { code, .. } => *code == ErrorCode::Quota,
+        RingError::Closed(why) => quota_close(why),
+        _ => false,
+    }
+}
+
 fn removed_error(e: &RingError) -> bool {
     match e {
         RingError::Relay { code, .. } => matches!(code, ErrorCode::NotMember | ErrorCode::Removed),
@@ -255,6 +291,9 @@ fn removed_error(e: &RingError) -> bool {
 struct Attempt {
     inner: Weak<Inner>,
     gen: u64,
+    /// The Relay this attempt dialed. Nothing about the quota is reported once the trusted
+    /// head names another (a move owed to the old Relay, or a Relay change since).
+    dialed: String,
 }
 
 impl RingEvents for Attempt {
@@ -311,6 +350,12 @@ impl RingEvents for Attempt {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
+        if code == ErrorCode::Quota {
+            if inner.quota_current(self.gen, &self.dialed) {
+                inner.events.quota(&self.dialed, to);
+            }
+            return;
+        }
         if inner.is_current(self.gen) {
             inner.events.error(&code, to);
         }
@@ -320,7 +365,7 @@ impl RingEvents for Attempt {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        if inner.is_current(self.gen) {
+        if inner.quota_current(self.gen, &self.dialed) {
             inner.events.accepted();
         }
     }
@@ -374,6 +419,30 @@ impl Inner {
     fn is_current(&self, gen: u64) -> bool {
         let st = lock(&self.st);
         st.gen == gen && st.stop.is_none()
+    }
+
+    /// Whether attempt `gen`, which dialed `dialed`, may report about the quota: it is
+    /// current, no stop was asked for, and the trusted head still names that Relay.
+    fn quota_current(&self, gen: u64, dialed: &str) -> bool {
+        let st = lock(&self.st);
+        st.gen == gen && st.stop.is_none() && st.chain.head().roster().relay_url == dialed
+    }
+
+    /// The Relay refused attempt `gen` for quota (a connect or a close): reported with
+    /// `to: None`, only while [`Inner::quota_current`].
+    fn report_quota(&self, gen: u64, dialed: &str) {
+        #[cfg(test)]
+        if let Some(h) = self
+            .before_quota
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            h();
+        }
+        if self.quota_current(gen, dialed) {
+            self.events.quota(dialed, None);
+        }
     }
 
     fn set_link(&self, link: LinkState) {
@@ -517,6 +586,7 @@ impl Inner {
             let events = Arc::new(Attempt {
                 inner: Arc::downgrade(&self),
                 gen,
+                dialed: dialed.clone(),
             });
             let r = RingClient::connect(cfg, events);
             let c = {
@@ -561,8 +631,10 @@ impl Inner {
                     }
                 }
                 Err(e) => {
-                    if let Some(j) = &moving {
-                        self.move_failed(j, e.to_string());
+                    match &moving {
+                        Some(j) => self.move_failed(j, e.to_string()),
+                        None if quota_error(&e) => self.report_quota(gen, &dialed),
+                        None => {}
                     }
                     let retry_in = backoff.failed(self.backoff_unit);
                     if self.backoff_wait(retry_in, e.to_string()) {
@@ -615,6 +687,16 @@ impl Inner {
                                     self.finish(Some(c));
                                     break 'attempt;
                                 }
+                                Woke::Closed(why) if quota_close(&why) => {
+                                    // Over the old Relay's quota: dialing it again at once
+                                    // would only be refused again.
+                                    self.abandon();
+                                    let retry_in = backoff.failed(self.backoff_unit);
+                                    if self.backoff_wait(retry_in, why.to_string()) {
+                                        break 'attempt;
+                                    }
+                                    continue 'attempt;
+                                }
                                 Woke::Closed(_) | Woke::Dirty => {
                                     self.abandon();
                                     continue 'attempt;
@@ -647,6 +729,11 @@ impl Inner {
                         }
                     }
                     Woke::Closed(why) => {
+                        let quota = quota_close(&why);
+                        if quota {
+                            // Before `abandon`, which fences this attempt off.
+                            self.report_quota(gen, &dialed);
+                        }
                         self.abandon();
                         if removed_close(&why) {
                             self.set_link(LinkState::Stopped {
@@ -660,8 +747,13 @@ impl Inner {
                                 _ => continue 'attempt,
                             }
                         }
-                        let retry_in =
-                            backoff.ended(up_at.elapsed(), self.stable_after, self.backoff_unit);
+                        // A close for quota is a failure however long the connection was up:
+                        // a busy Ring must not redial through its quota closes at once.
+                        let retry_in = if quota {
+                            backoff.failed(self.backoff_unit)
+                        } else {
+                            backoff.ended(up_at.elapsed(), self.stable_after, self.backoff_unit)
+                        };
                         if !retry_in.is_zero() && self.backoff_wait(retry_in, why.to_string()) {
                             break 'attempt;
                         }
@@ -739,13 +831,17 @@ impl Connector {
         cfg: ConnectorConfig,
         events: Arc<dyn ConnectorEvents>,
     ) -> std::io::Result<Connector> {
+        Connector::launch(Connector::inner(cfg, events))
+    }
+
+    fn inner(cfg: ConnectorConfig, events: Arc<dyn ConnectorEvents>) -> Inner {
         let move_state =
             live_move(&cfg.client.chain, cfg.pending_move.as_ref()).map(|job| MoveState::Moving {
                 job,
                 failures: 0,
                 error: None,
             });
-        let inner = Arc::new(Inner {
+        Inner {
             st: Mutex::new(St {
                 chain: cfg.client.chain.clone(),
                 pending_move: cfg.pending_move,
@@ -768,7 +864,13 @@ impl Connector {
             backoff_unit: cfg.backoff_unit,
             stable_after: cfg.stable_after,
             move_attempts: cfg.move_attempts.max(1),
-        });
+            #[cfg(test)]
+            before_quota: Mutex::new(None),
+        }
+    }
+
+    fn launch(inner: Inner) -> std::io::Result<Connector> {
+        let inner = Arc::new(inner);
         let i = inner.clone();
         let thread = std::thread::Builder::new()
             .name("ring-connector".into())
@@ -1090,5 +1192,131 @@ impl Drop for Connector {
             st.stop = Some(Stop { reason: None });
         }
         self.inner.cv.notify_all();
+    }
+}
+
+#[cfg(all(test, feature = "test-relay"))]
+mod tests {
+    use super::*;
+    use crate::ring::relay::contract::{config, connect, RawConn, TestRing, WAIT};
+    use crate::ring::relay::test_relay::{TestRelay, TestRelayOptions};
+    use crate::ring::relay::wire::{ClientFrame, RelayFrame};
+    use std::sync::mpsc;
+
+    #[derive(Default)]
+    struct Errors(Mutex<Vec<(ErrorCode, Option<SignKey>)>>);
+
+    impl ConnectorEvents for Errors {
+        fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((code.clone(), to));
+        }
+    }
+
+    /// A stop asked for while a connect refused for quota is about to be reported: the
+    /// report is fenced off, and nothing about the quota comes during the stop either.
+    #[test]
+    fn a_stop_while_a_quota_report_is_held_reports_nothing() {
+        let r = TestRelay::start_with(TestRelayOptions {
+            auth_timeout: Duration::from_millis(500),
+            quota_frames_per_day: Some(8),
+            ..TestRelayOptions::default()
+        });
+        let mut ring = TestRing::new(&r.url());
+        // The Relay is ahead of the Daemon's chain, so its connect asks for version 3 …
+        let (desk, _) = connect(&r.target(), &ring.chain, ring.desktop.clone());
+        let v3 = ring.next(|_| {});
+        desk.publish_roster(&v3).unwrap();
+        // … and the Ring's quota is used up, so the Relay refuses that.
+        let mut m = RawConn::login(&r.target(), &ring.chain, &*ring.mobile);
+        let mut refused = false;
+        for id in 1..=100 {
+            m.send(&ClientFrame::RosterGet { id, since: 3 }.encode())
+                .unwrap();
+            if let Some(RelayFrame::Error {
+                code: ErrorCode::Quota,
+                ..
+            }) = m.frame(WAIT)
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the quota was never reached");
+
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let mut cc = ConnectorConfig::new(config(&r.target(), &ring.up_to(2), ring.daemon.clone()));
+        cc.backoff_unit = Duration::from_secs(30);
+        let rec = Arc::new(Errors::default());
+        let inner = Connector::inner(cc, rec.clone());
+        *inner.before_quota.lock().unwrap() = Some(Box::new(move || {
+            let _ = held_tx.send(());
+            let _ = go_rx.recv_timeout(WAIT);
+        }));
+        let c = Connector::launch(inner).unwrap();
+        held_rx
+            .recv_timeout(WAIT)
+            .expect("the worker reaches the quota report");
+        // The stop is asked for while the worker is held right before the report.
+        {
+            let mut st = lock(&c.inner.st);
+            st.stop = Some(Stop {
+                reason: Some(ByeReason::quit()),
+            });
+            c.inner.cv.notify_all();
+        }
+        go_tx.send(()).unwrap();
+        c.stop(ByeReason::quit());
+        assert_eq!(c.state(), LinkState::Stopped { error: None });
+        let errors = rec.0.lock().unwrap().clone();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[derive(Default)]
+    struct Quotas(Mutex<Vec<String>>);
+
+    impl ConnectorEvents for Quotas {
+        fn quota(&self, relay: &str, _to: Option<SignKey>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(relay.to_string());
+        }
+        fn accepted(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("accepted".into());
+        }
+    }
+
+    /// A quota refusal of a current attempt whose Relay the trusted head no longer names (it
+    /// arrived after a Relay change, before the worker abandoned the attempt) is not
+    /// reported; one about the head's Relay is, with that Relay.
+    #[test]
+    fn a_quota_refusal_from_a_relay_the_head_no_longer_names_is_dropped() {
+        let ring = TestRing::new("ws://127.0.0.1:1");
+        let rec = Arc::new(Quotas::default());
+        let cc = ConnectorConfig::new(RingClientConfig::new(
+            ring.chain.clone(),
+            ring.desktop.clone(),
+        ));
+        let inner = Arc::new(Connector::inner(cc, rec.clone()));
+        let attempt = |dialed: &str| Attempt {
+            inner: Arc::downgrade(&inner),
+            gen: lock(&inner.st).gen,
+            dialed: dialed.to_string(),
+        };
+        let old = attempt("ws://127.0.0.1:2");
+        old.error(ErrorCode::Quota, None, None);
+        old.accepted();
+        inner.report_quota(old.gen, &old.dialed);
+        assert!(rec.0.lock().unwrap().is_empty());
+        let ours = attempt("ws://127.0.0.1:1");
+        ours.error(ErrorCode::Quota, None, None);
+        assert_eq!(*rec.0.lock().unwrap(), vec!["ws://127.0.0.1:1".to_string()]);
     }
 }
