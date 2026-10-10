@@ -14,7 +14,7 @@ use uuid::Uuid;
 use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::frame::Frame;
-use xshell_protocol::msg::{ClientMsg, Hello, ServerMsg};
+use xshell_protocol::msg::{ClientMsg, Hello, OpenSpec, ServerMsg};
 use xshelld::server::{ExitReason, Role, ServerHandle};
 
 const SID: &str = "11111111-2222-3333-4444-555555555555";
@@ -56,6 +56,11 @@ impl Env {
 
     fn shell(&self) -> LaunchSpec {
         sh_spec(&self.cwd)
+    }
+
+    /// A Terminal the Desktop opened with `title` in its meta.
+    fn desk_titled(&mut self, spec: LaunchSpec, title: &str) -> Uuid {
+        open_titled(&mut self.desk, spec, title)
     }
 
     /// A Terminal the Desktop opened.
@@ -319,7 +324,16 @@ fn mobile_refuses_ops_on_shell_terminal() {
         let out = String::from_utf8_lossy(&e.desk.out[&t]).into_owned();
         assert!(!out.contains("hi\r\n"), "{out}");
     }
-    assert_eq!(e.srv.attached(), 2);
+    // An agent wrapped in a shell. Its fake agent only sleeps, so no marker: the Desktop's
+    // attach replays the agent's startup line.
+    let t = e.desk_open(wrapped(&e));
+    for m in per_terminal(t) {
+        refused(e.mob.request(&m));
+    }
+    assert!(listed(&e.srv).contains(&t), "not closed");
+    e.desk.attach(t);
+    e.desk.output_until(t, "args");
+    assert_eq!(e.srv.attached(), 3);
 }
 
 #[test]
@@ -627,6 +641,220 @@ fn mobile_escaping_parent_with_missing_leaf_refused() {
     let p = json!({ "encodedName": "escape", "sessionId": "missing", "limit": 5 });
     refused(e.mob.call("get_session_messages", p.clone()));
     assert_eq!(e.desk.call("get_session_messages", p), Ok(json!([])));
+}
+
+// ── Visibility ────────────────────────────────────────────────────────────
+
+/// An agent run inside a wrapping shell.
+fn wrapped(e: &Env) -> LaunchSpec {
+    LaunchSpec {
+        shell_command: Some("/bin/sh".into()),
+        shell_id: Some("bash".into()),
+        ..e.claude()
+    }
+}
+
+/// Every kind of Terminal a Mobile is never told about: a raw shell, a wrapped agent and an
+/// agent under a launch prefix.
+fn hidden_specs(e: &Env) -> Vec<LaunchSpec> {
+    let prefixed = LaunchSpec {
+        launch_prefix: Some(
+            ["bash", "-c", "exec sh -i", "--"]
+                .map(String::from)
+                .to_vec(),
+        ),
+        ..e.claude()
+    };
+    vec![e.shell(), wrapped(e), prefixed]
+}
+
+/// Open `spec` from `c` with `title` in its meta.
+fn open_titled(c: &mut Client, spec: LaunchSpec, title: &str) -> Uuid {
+    let t = Uuid::new_v4();
+    let mut meta = serde_json::Map::new();
+    meta.insert("title".into(), json!(title));
+    let msg = ClientMsg::TermOpen {
+        spec: OpenSpec {
+            terminal: t,
+            launch: spec,
+            cols: 80,
+            rows: 24,
+            meta,
+        },
+    };
+    let r = c
+        .request(&msg)
+        .unwrap_or_else(|e| panic!("term.open failed: {e}"));
+    assert!(r["pid"].is_u64(), "{r}");
+    t
+}
+
+/// The Desktop opens every hidden kind (titled `HIDDEN-<n>`), then one direct agent.
+fn open_hidden_and_agent(e: &mut Env) -> (Vec<Uuid>, Uuid) {
+    let hidden = hidden_specs(e)
+        .into_iter()
+        .enumerate()
+        .map(|(n, s)| e.desk_titled(s, &format!("HIDDEN-{n}")))
+        .collect();
+    let a = e.desk_titled(e.claude(), "agent");
+    (hidden, a)
+}
+
+/// The Terminals a new connection of `role` is told about in its hello.
+fn hello_list(srv: &ServerHandle, role: Role) -> Vec<Uuid> {
+    let s = srv.connect_in_process(role).unwrap();
+    let mut c = Client::from_io(s.try_clone().unwrap(), s);
+    c.hello(range(1, 1)).1.iter().map(|t| t.terminal).collect()
+}
+
+/// Nothing `c` received names a Terminal in `hidden`: no list entry, no exit, no output, and
+/// no hidden title anywhere.
+#[track_caller]
+fn never_saw(c: &Client, hidden: &[Uuid]) {
+    for ev in &c.log {
+        match ev {
+            Ev::Msg(ServerMsg::Terminals { list }) => {
+                for i in list {
+                    assert!(!hidden.contains(&i.terminal), "listed {}", i.terminal);
+                }
+            }
+            Ev::Msg(ServerMsg::TermExit { terminal, .. }) => {
+                assert!(!hidden.contains(terminal), "told {terminal} exited");
+            }
+            Ev::Out(t, _) => assert!(!hidden.contains(t), "output of {t}"),
+            _ => {}
+        }
+    }
+    let leaked: Vec<_> = c
+        .summary()
+        .into_iter()
+        .filter(|l| l.contains("HIDDEN-"))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
+}
+
+fn set_title(c: &mut Client, t: Uuid, title: &str) {
+    let mut meta = serde_json::Map::new();
+    meta.insert("title".into(), json!(title));
+    let upd = ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: None,
+        meta: Some(meta),
+    };
+    assert_eq!(c.request(&upd), Ok(Value::Null));
+}
+
+fn titled(list: &[xshell_protocol::msg::TerminalInfo], t: Uuid, title: &str) -> bool {
+    list.iter()
+        .any(|i| i.terminal == t && i.meta.get("title") == Some(&json!(title)))
+}
+
+#[test]
+fn mobile_list_holds_only_direct_agents() {
+    let mut e = env();
+    let (hidden, a) = open_hidden_and_agent(&mut e);
+    assert_eq!(hello_list(&e.srv, Role::Mobile), vec![a]);
+    let mut all = hello_list(&e.srv, Role::Desktop);
+    all.sort();
+    let mut want: Vec<_> = hidden.iter().copied().chain([a]).collect();
+    want.sort();
+    assert_eq!(all, want);
+    // Connected before the opens: every broadcast it got was filtered.
+    let l = e.mob.terminals_where(|l| l.iter().any(|t| t.terminal == a));
+    assert_eq!(l.iter().map(|t| t.terminal).collect::<Vec<_>>(), vec![a]);
+    never_saw(&e.mob, &hidden);
+}
+
+#[test]
+fn mobile_list_follows_changes_without_hidden_terminals() {
+    let mut e = env();
+    let (hidden, a) = open_hidden_and_agent(&mut e);
+    set_title(&mut e.desk, hidden[0], "HIDDEN-updated");
+    set_title(&mut e.desk, a, "seen");
+    e.desk
+        .terminals_where(|l| titled(l, hidden[0], "HIDDEN-updated") && titled(l, a, "seen"));
+    // Ordered after the hidden update under the registry lock.
+    let l = e.mob.terminals_where(|l| titled(l, a, "seen"));
+    assert_eq!(l.len(), 1);
+    never_saw(&e.mob, &hidden);
+}
+
+#[test]
+fn mobile_gets_no_exit_of_hidden_terminals() {
+    let mut e = env();
+    let a = e.desk_titled(e.claude(), "agent");
+    let closed = e.desk_titled(e.shell(), "HIDDEN-closed");
+    let exits = e.desk_titled(e.shell(), "HIDDEN-exits");
+    let exit_of = |t: Uuid| move |m: &ServerMsg| matches!(m, ServerMsg::TermExit { terminal, .. } if *terminal == t);
+    // Closed by the Desktop.
+    assert_eq!(
+        e.desk.request(&ClientMsg::TermClose { terminal: closed }),
+        Ok(Value::Null)
+    );
+    e.desk
+        .expect_msg("exit of the closed shell", exit_of(closed));
+    // Ends by itself and stays listed as exited.
+    e.desk.attach(exits);
+    e.desk.input(exits, "exit\n");
+    e.desk.expect_msg("exit of the shell", exit_of(exits));
+    e.desk.terminals_where(|l| {
+        l.iter()
+            .any(|i| i.terminal == exits && i.exit_code.is_some())
+    });
+    // A direct agent's exit still reaches the Mobile, after the shells' exits.
+    assert_eq!(
+        e.desk.request(&ClientMsg::TermClose { terminal: a }),
+        Ok(Value::Null)
+    );
+    e.mob.expect_msg("exit of the agent", exit_of(a));
+    never_saw(&e.mob, &[closed, exits]);
+}
+
+#[test]
+fn mobile_list_hides_wrapped_agent_through_relaunch() {
+    let mut e = env();
+    let a = e.desk_titled(e.claude(), "agent");
+    let w = e.desk_titled(wrapped(&e), "HIDDEN-wrapped");
+    let old = e
+        .desk
+        .terminals_where(|l| l.iter().any(|i| i.terminal == w && i.pid.is_some()))
+        .into_iter()
+        .find(|i| i.terminal == w)
+        .unwrap()
+        .pid;
+    let r = e
+        .desk
+        .request(&ClientMsg::TermRelaunch {
+            terminal: w,
+            skip_permissions: true,
+        })
+        .unwrap();
+    assert_eq!(r["relaunched"], json!(true));
+    e.desk.terminals_where(|l| {
+        l.iter()
+            .any(|i| i.terminal == w && i.pid.is_some() && i.pid != old)
+    });
+    // Ordered after the Relaunch's list on the Mobile's connection.
+    set_title(&mut e.desk, a, "after relaunch");
+    e.mob.terminals_where(|l| titled(l, a, "after relaunch"));
+    never_saw(&e.mob, &[w]);
+}
+
+#[test]
+fn mobile_hello_after_restart_lists_only_direct_agents() {
+    let mut e = env();
+    let s = e.desk_open(e.shell());
+    let a = e.desk_open(e.claude());
+    e.fake.wait_pids(1);
+    e.srv.stopper().shutdown();
+    assert!(e.srv.wait_timeout(T).is_some());
+    e.srv = start(&e.h, |_| {});
+    assert_eq!(hello_list(&e.srv, Role::Mobile), vec![a]);
+    let mut all = hello_list(&e.srv, Role::Desktop);
+    all.sort();
+    let mut want = vec![s, a];
+    want.sort();
+    assert_eq!(all, want);
 }
 
 // ── The role cannot change ────────────────────────────────────────────────

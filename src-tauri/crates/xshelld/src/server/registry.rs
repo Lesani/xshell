@@ -4,7 +4,7 @@ use super::orphans::{self, Cleanup};
 use super::outbox::Outbox;
 use super::terminal::{self, Terminal};
 use super::transport::{self, Listener};
-use super::{conn, Config, ConnId, ExitReason, Role, TestPoint};
+use super::{conn, role, Config, ConnId, ExitReason, Role, TestPoint};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -43,10 +43,16 @@ pub(crate) struct Daemon {
     pub last_lines: super::last_line::LastLines,
 }
 
+/// A registered connection: its outbox and the role that decides what it is told.
+pub(crate) struct Peer {
+    pub ob: Arc<Outbox>,
+    pub role: Role,
+}
+
 #[derive(Default)]
 pub(crate) struct Registry {
     pub terminals: BTreeMap<Uuid, Arc<Terminal>>,
-    pub conns: HashMap<ConnId, Arc<Outbox>>,
+    pub conns: HashMap<ConnId, Peer>,
     /// `Some` iff there are no Terminals and no connections.
     pub idle_since: Option<Instant>,
     /// Upgrading or shutting down: no persistence, no `term.open`, no list changes.
@@ -93,16 +99,44 @@ impl Daemon {
         reg.terminals.values().map(|t| t.info()).collect()
     }
 
-    pub fn terminals_frame(&self, reg: &Registry) -> Option<Arc<[u8]>> {
-        frame(&ServerMsg::Terminals {
-            list: self.list(reg),
-        })
+    /// The `terminals` frame for a connection of `role`: the Terminals it [`sees`](role::sees).
+    pub fn terminals_frame(&self, reg: &Registry, role: Role) -> Option<Arc<[u8]>> {
+        let mut list = self.list(reg);
+        list.retain(|i| role::sees(role, &i.spec));
+        frame(&ServerMsg::Terminals { list })
     }
 
+    /// Send every connection the current `terminals` list for its role. Both lists come from
+    /// one snapshot, each is encoded once, and only for a role that is connected.
     pub fn broadcast_terminals(&self, reg: &Registry) {
-        if let Some(f) = self.terminals_frame(reg) {
-            for ob in reg.conns.values() {
-                ob.push_terminals(f.clone());
+        let (desk, mob) = reg.conns.values().fold((false, false), |(d, m), p| {
+            (d || p.role == Role::Desktop, m || p.role == Role::Mobile)
+        });
+        if !desk && !mob {
+            return;
+        }
+        let list = self.list(reg);
+        // Only the entries a Mobile sees are copied, and only when a Mobile is connected.
+        let mobile = mob
+            .then(|| {
+                let list = list
+                    .iter()
+                    .filter(|i| role::sees(Role::Mobile, &i.spec))
+                    .cloned()
+                    .collect();
+                frame(&ServerMsg::Terminals { list })
+            })
+            .flatten();
+        let full = desk
+            .then(|| frame(&ServerMsg::Terminals { list }))
+            .flatten();
+        for p in reg.conns.values() {
+            let f = match p.role {
+                Role::Desktop => &full,
+                Role::Mobile => &mobile,
+            };
+            if let Some(f) = f {
+                p.ob.push_terminals(f.clone());
             }
         }
     }
@@ -139,9 +173,13 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn broadcast(&self, reg: &Registry, f: Arc<[u8]>) {
-        for ob in reg.conns.values() {
-            ob.push_control(f.clone());
+    /// Send `f`, a message about a Terminal running `spec`, to every connection that
+    /// [`sees`](role::sees) that Terminal.
+    pub fn broadcast_about(&self, reg: &Registry, spec: &LaunchSpec, f: Arc<[u8]>) {
+        for p in reg.conns.values() {
+            if role::sees(p.role, spec) {
+                p.ob.push_control(f.clone());
+            }
         }
     }
 
@@ -369,7 +407,7 @@ impl Daemon {
         let conns: Vec<Arc<Outbox>> = {
             let mut reg = self.reg.lock().unwrap();
             reg.closed = true;
-            reg.conns.values().cloned().collect()
+            reg.conns.values().map(|p| p.ob.clone()).collect()
         };
         for ob in &conns {
             ob.close();

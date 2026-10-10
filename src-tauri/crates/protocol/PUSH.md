@@ -28,7 +28,8 @@ Over its session (`SESSIONS.md` section 5), a Mobile sends this to every Daemon 
   member, and anyone else gets `err "push.register is for a Mobile"`. A registration
   replaces the previous one and clears any dormant or paused state. The Daemon keeps it
   while its trusted head lists that Mobile with the same `signKey` and `noiseKey`.
-- The Daemon pushes when an agent itself reports an Agent Status change to needs you or
+- The Daemon pushes when a direct agent (no shell, shell command, shell id or launch
+  prefix: the Terminals a Mobile is shown) itself reports an Agent Status change to needs you or
   finished (a hook, or Codex's needs-you notification) and that trigger is on; never for a
   change made by input (an interrupt), never for working or ended. It sends nothing while
   any Mobile of the Ring is in the foreground (`RELAY.md` section 17; the Relay checks
@@ -57,7 +58,7 @@ sealedPayload = b64u(sealed)          at most 2860 characters (the gateway takes
 - `host` is the Daemon's sign key; `project` the Terminal's working directory; `title`
   (optional) its title, cut to 120 bytes. If the JSON is longer than 2046 bytes, `project`
   is shortened from the left and starts with `…`, then `title` from the right.
-- `needsYou` counts the Host's Terminals that need you now, so a replacement notification
+- `needsYou` counts the Host's direct agent Terminals that need you now, so a replacement notification
   (the same `collapseId`) loses nothing.
 - `seq` is strictly increasing per Daemon and Mobile, written to the Daemon's disk before
   the push is sent (it is at least the Daemon's clock in ms, so it keeps growing even if

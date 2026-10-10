@@ -901,6 +901,11 @@ impl Inner {
             return None;
         }
         let info = t.info();
+        // Only what the Mobile's Inbox lists: a direct agent (ADR-0004). A wrapped agent's
+        // cwd and title stay on the Host.
+        if !info.spec.is_direct_agent() {
+            return None;
+        }
         let agent = match hook_agent(&info.spec)? {
             HookAgent::Claude => PushAgent::Claude,
             HookAgent::Codex => PushAgent::Codex,
@@ -908,7 +913,9 @@ impl Inner {
         let needs_you = reg
             .terminals
             .values()
-            .filter(|t| t.agent_status() == Some(AgentStatus::NeedsYou))
+            .filter(|t| {
+                t.agent_status() == Some(AgentStatus::NeedsYou) && t.spec().is_direct_agent()
+            })
             .count();
         Some(Snap {
             agent,
@@ -1179,6 +1186,11 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::role::tests::daemon;
+    use crate::server::terminal::{self, Terminal};
+    use serde_json::Map;
+    use xshell_core::launch::LaunchSpec;
+    use xshell_core::terminal::state::PersistedTerminal;
 
     const W: Duration = Duration::from_secs(10);
 
@@ -1433,5 +1445,77 @@ mod tests {
         assert!(!wants(&t, AgentStatus::Finished));
         assert!(!wants(&t, AgentStatus::Working));
         assert!(!wants(&t, AgentStatus::Ended));
+    }
+
+    /// A listed Terminal without a process, running `spec`, whose current run needs you.
+    fn needs_you(d: &Arc<Daemon>, spec: LaunchSpec, title: &str) -> Arc<Terminal> {
+        let mut meta = Map::new();
+        meta.insert("title".into(), title.into());
+        let t = terminal::unresolved(
+            d,
+            PersistedTerminal {
+                terminal: Uuid::new_v4(),
+                spec,
+                meta,
+                cols: 80,
+                rows: 24,
+                created_at_ms: 0,
+                leader: None,
+            },
+        );
+        t.reset_status_for_test();
+        assert_eq!(t.on_agent_event(t.run, AgentStatus::NeedsYou), Ok(true));
+        d.reg.lock().unwrap().terminals.insert(t.id, t.clone());
+        t
+    }
+
+    fn ev(t: &Terminal) -> AgentEvent {
+        AgentEvent {
+            terminal: t.id,
+            run: t.run,
+            status: AgentStatus::NeedsYou,
+            at: 0,
+        }
+    }
+
+    #[test]
+    fn only_direct_agents_push_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = daemon(dir.path());
+        let claude = |cwd: &str| LaunchSpec {
+            agent: Some("claude".into()),
+            shell_mode: Some("claude".into()),
+            cwd: cwd.into(),
+            ..Default::default()
+        };
+        let wrapped = needs_you(
+            &d,
+            LaunchSpec {
+                shell_command: Some("/bin/sh".into()),
+                shell_id: Some("bash".into()),
+                ..claude("/wrapped")
+            },
+            "HIDDEN-wrapped",
+        );
+        let prefixed = needs_you(
+            &d,
+            LaunchSpec {
+                launch_prefix: Some(vec!["env".into()]),
+                ..claude("/prefixed")
+            },
+            "HIDDEN-prefixed",
+        );
+        let direct = needs_you(&d, claude("/direct"), "seen");
+        let reg = d.reg.lock().unwrap();
+        // Hook agents, listed, current run, needs you: still no push.
+        for t in [&wrapped, &prefixed] {
+            assert!(hook_agent(&t.spec()).is_some());
+            assert!(Inner::current_in(&reg, &ev(t)).is_none());
+        }
+        let s = Inner::current_in(&reg, &ev(&direct)).expect("direct agent pushes");
+        assert_eq!(s.project, "/direct");
+        assert_eq!(s.title.as_deref(), Some("seen"));
+        // Three Terminals need you; the Mobile is shown one.
+        assert_eq!(s.needs_you, 1);
     }
 }

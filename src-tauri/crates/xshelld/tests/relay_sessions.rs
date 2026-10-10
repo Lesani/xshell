@@ -116,9 +116,21 @@ fn paired_mobile_session_enforces_mobile_role() {
     let phone_keys = contract::keys();
     let chain = pair_phone(&ring, &phone_keys);
     let phone = Peer::new(&r, &chain, &phone_keys);
-    let mut c = phone.client(&daemon);
-    let cwd = h.project("p");
-    let cwd = cwd.to_string_lossy().into_owned();
+    // Opened on the Host before the phone connects: a shell and a direct agent.
+    let project = h.project("p");
+    let fake = Fake::in_dir(&project);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let mut d = Client::in_process(&srv, Role::Desktop);
+    let (shell, agent) = (Uuid::new_v4(), Uuid::new_v4());
+    d.open(shell, sh_spec(&project));
+    d.open(agent, claude_spec(&project, None));
+    // The phone's first list names only the agent.
+    let s = phone.sessions.open(&daemon).expect("session opens");
+    let mut c = Client::from_io(s.try_clone(), s);
+    let (_, list) = c.hello(range(1, 1));
+    let ids: Vec<Uuid> = list.iter().map(|i| i.terminal).collect();
+    assert_eq!(ids, vec![agent]);
+    let cwd = project.to_string_lossy().into_owned();
     // Files: refused. Session data: served.
     assert_eq!(
         c.call("list_dir", json!({ "path": cwd })),
@@ -130,10 +142,18 @@ fn paired_mobile_session_enforces_mobile_role() {
         .request(&open_msg(Uuid::new_v4(), sh_spec(&h.project("p"))))
         .unwrap_err();
     assert!(e.starts_with(FORBIDDEN), "{e}");
+    refused_attach(&mut c, shell);
     // The local Desktop is unaffected and may do all of it.
-    let mut d = Client::in_process(&srv, Role::Desktop);
     assert!(d.call("list_dir", json!({ "path": cwd })).is_ok());
     ring.quit();
+}
+
+#[track_caller]
+fn refused_attach(c: &mut Client, t: Uuid) {
+    let e = c
+        .request(&ClientMsg::TermAttach { terminal: t })
+        .unwrap_err();
+    assert!(e.starts_with(FORBIDDEN), "{e}");
 }
 
 /// The second computer `h2` (running `srv2`) pairs itself with `xshelld pair`, its code

@@ -1095,6 +1095,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relaunch_keeps_direct_agent() {
+        // Who sees a Terminal (a Mobile only direct agents) must not change under its UUID.
+        let agent = LaunchSpec {
+            agent: Some("claude".into()),
+            shell_mode: Some("claude".into()),
+            session_id: Some("id1".into()),
+            ..spec("/w")
+        };
+        let wrapped = LaunchSpec {
+            shell_command: Some("/bin/sh".into()),
+            shell_id: Some("bash".into()),
+            ..agent.clone()
+        };
+        let prefixed = LaunchSpec {
+            launch_prefix: Some(strings(&["env"])),
+            ..agent.clone()
+        };
+        for s in [&agent, &wrapped, &prefixed] {
+            for skip in [true, false] {
+                let next = relaunch_spec(s, skip).unwrap();
+                assert_eq!(next.is_direct_agent(), s.is_direct_agent(), "{s:?}");
+            }
+        }
+        assert!(agent.is_direct_agent());
+        assert!(!wrapped.is_direct_agent() && !prefixed.is_direct_agent());
+    }
+
     // ── Agent hooks ──
 
     fn hooks() -> crate::agent_status::AgentHooks {

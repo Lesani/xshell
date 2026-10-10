@@ -8,6 +8,9 @@
 //! Message-level rules run in [`check`], before anything is looked up or locked. Rules about a
 //! Terminal run in [`listed`], on the exact instance the handler then acts on, under the same
 //! registry lock as its lookup.
+//!
+//! A Mobile is never told about a Terminal it may not act on: `terminals` lists and
+//! `term.exit` leave them out ([`sees`]).
 
 use super::registry::Registry;
 use super::terminal::Terminal;
@@ -150,6 +153,14 @@ pub(crate) fn check_relaunch(role: Role, spec: &LaunchSpec) -> Result<(), String
     check_session_id(spec)
 }
 
+/// Whether `role` is told about, and may act on, a Terminal running `spec`. A Mobile sees
+/// only direct agent Terminals (ADR-0004); a Desktop sees all. Visibility must never change
+/// during a listed Terminal's life (`term.update` and Relaunch keep `is_direct_agent`):
+/// output subscriptions are checked only on attach.
+pub(crate) fn sees(role: Role, spec: &LaunchSpec) -> bool {
+    role == Role::Desktop || spec.is_direct_agent()
+}
+
 /// The Terminal listed under `id`, if `role` may act on it. Lookup and check are one step on
 /// one registry lock, so the check always covers the instance the caller acts on: a
 /// Terminal listed later under the same UUID is checked anew.
@@ -162,7 +173,7 @@ pub(crate) fn listed<'a>(
         .terminals
         .get(id)
         .ok_or_else(|| format!("unknown terminal {id}"))?;
-    if role == Role::Mobile && !t.spec().is_direct_agent() {
+    if !sees(role, &t.spec()) {
         return Err(forbidden("a shell or a wrapped agent Terminal"));
     }
     Ok(t)
@@ -384,6 +395,27 @@ pub(crate) mod tests {
         fs::write(c.join("rollout-1.jsonl"), first.to_string() + "\n").unwrap();
         let ctx = HostCtx::with_home(home, dir.path().join("tmp"));
         (dir, ctx)
+    }
+
+    #[test]
+    fn sees_rules() {
+        let a = agent("/w");
+        let wrapped = LaunchSpec {
+            shell_command: Some("/bin/sh".into()),
+            shell_id: Some("bash".into()),
+            ..agent("/w")
+        };
+        let prefixed = LaunchSpec {
+            launch_prefix: Some(vec!["bash".into(), "-c".into(), "exec sh -i".into()]),
+            ..agent("/w")
+        };
+        for s in [&a, &raw_shell("/w"), &wrapped, &prefixed] {
+            assert!(sees(Role::Desktop, s));
+        }
+        assert!(sees(Role::Mobile, &a));
+        for s in [&raw_shell("/w"), &wrapped, &prefixed] {
+            assert!(!sees(Role::Mobile, s));
+        }
     }
 
     #[test]

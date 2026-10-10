@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::agent_status::AgentStatus;
+use xshell_core::launch::LaunchSpec;
 use xshell_protocol::msg::{ClientMsg, PushTriggers};
 use xshell_protocol::ring::push::{self, collapse_id, PushAgent, PushPayload, PushStatus};
 use xshell_protocol::ring::relay::contract::{self, FakeGateway, RawConn, Reply};
@@ -171,18 +172,28 @@ impl P {
 
     /// Opens `agent` in a Project of its own; its UUID and run.
     fn open(&mut self, name: &str, agent: &str) -> (Uuid, u64) {
+        self.open_with(name, agent, |s| s)
+    }
+
+    /// [`P::open`], with the launch spec changed by `f`.
+    fn open_with(
+        &mut self,
+        name: &str,
+        agent: &str,
+        f: impl FnOnce(LaunchSpec) -> LaunchSpec,
+    ) -> (Uuid, u64) {
         let cwd = self.s.h.project(name);
         self.reapers.push(FakeReaper(cwd.join("pids.log")));
         let t = Uuid::new_v4();
         self.desk.open(
             t,
-            xshell_core::launch::LaunchSpec {
+            f(LaunchSpec {
                 agent: Some(agent.into()),
                 shell_mode: Some("claude".into()),
                 session_id: Some(SID.into()),
                 cwd: cwd.to_string_lossy().into_owned(),
                 ..Default::default()
-            },
+            }),
         );
         (t, wait_run(&cwd, t, None))
     }
@@ -464,6 +475,30 @@ fn interrupt_input_does_not_push() {
     assert!(!list.is_empty());
     std::thread::sleep(QUIET);
     assert!(p.requests().is_empty());
+}
+
+#[test]
+fn wrapped_agent_does_not_push() {
+    let mut p = harness();
+    // A Claude in a wrapping shell reports through its hooks, but the Mobile never lists it.
+    let w = p.open_with("wrapped", "claude", |s| LaunchSpec {
+        shell_command: Some("/bin/sh".into()),
+        shell_id: Some("bash".into()),
+        ..s
+    });
+    p.event(w, NeedsYou);
+    let a = p.open("app", "claude");
+    p.event(a, NeedsYou);
+    // One push, about the direct agent, counting only it.
+    let got = p.exactly(1);
+    let (_, payload) = open(&p.phone, &p.ring_id(), &got[0]);
+    assert_eq!(payload.terminal, a.0);
+    assert_eq!(payload.project, p.cwd("app"));
+    assert_eq!(payload.needs_you, 1);
+    for o in p.opened(&p.phone) {
+        assert_ne!(o.terminal, w.0);
+        assert_ne!(o.project, p.cwd("wrapped"));
+    }
 }
 
 #[test]

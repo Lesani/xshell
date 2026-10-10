@@ -496,6 +496,14 @@ impl Terminal {
         }
     }
 
+    /// Start this run's Agent Status afresh, as a running process would (tests only: a
+    /// Terminal restored without a process has ended).
+    #[cfg(test)]
+    pub(crate) fn reset_status_for_test(&self) {
+        let tracker = Tracker::new(&self.spec());
+        *self.status.lock().unwrap() = StatusCell::new(tracker, 0);
+    }
+
     /// The Agent Status of this run.
     pub fn agent_status(&self) -> Option<AgentStatus> {
         self.status.lock().unwrap().tracker.status()
@@ -584,7 +592,7 @@ impl Terminal {
             terminal: self.id,
             code,
         }) {
-            d.broadcast(reg, f);
+            d.broadcast_about(reg, &self.spec(), f);
         }
         if closing {
             reg.terminals.remove(&self.id);

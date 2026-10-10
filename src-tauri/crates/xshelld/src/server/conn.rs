@@ -116,9 +116,15 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
             ob.close();
             return;
         }
-        reg.conns.insert(id, ob.clone());
+        reg.conns.insert(
+            id,
+            super::registry::Peer {
+                ob: ob.clone(),
+                role,
+            },
+        );
         d.touch_idle(&mut reg);
-        if let Some(f) = d.terminals_frame(&reg) {
+        if let Some(f) = d.terminals_frame(&reg, role) {
             ob.push_terminals(f);
         }
     }
