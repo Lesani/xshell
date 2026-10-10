@@ -475,13 +475,19 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\n
             }
         }
         fn put(&self, rel: &str, text: &str) -> PathBuf {
-            let p = self.dir.path().join(rel);
+            // Join per component: `/` in `rel` must become the native separator.
+            let p = rel
+                .split('/')
+                .fold(self.dir.path().to_path_buf(), |p, c| p.join(c));
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, text).unwrap();
             p
         }
         fn d(&self, rel: &str) -> String {
-            let p = self.dir.path().join(rel);
+            // Join per component: `/` in `rel` must become the native separator.
+            let p = rel
+                .split('/')
+                .fold(self.dir.path().to_path_buf(), |p, c| p.join(c));
             fs::create_dir_all(&p).unwrap();
             p.to_string_lossy().into_owned()
         }
