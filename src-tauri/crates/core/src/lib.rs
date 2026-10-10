@@ -9,6 +9,7 @@ pub mod claude;
 pub mod codex;
 pub mod ctx;
 pub mod cursor;
+pub mod direct_exec;
 pub mod dispatch;
 pub mod files;
 pub mod git;

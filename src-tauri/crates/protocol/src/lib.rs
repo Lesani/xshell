@@ -41,7 +41,6 @@ pub const CAPABILITIES: &[&str] = &[
     cap::PUSH,
     cap::SESSION_STREAM,
     cap::TERM_MOBILE,
-    #[cfg(unix)]
     cap::TERM_FIRST_MESSAGE,
     cap::PROJECT_SESSIONS,
 ];
@@ -79,9 +78,8 @@ pub mod cap {
     /// the size goes back to the last Desktop that held it when an owning Mobile leaves.
     pub const TERM_MOBILE: &str = "term.mobile";
     /// `term.open` takes `firstMessage`: a new Claude Code or Codex chat starts with that
-    /// prompt. Unix only: on Windows the agent runs through `cmd.exe /C`, which would parse the
-    /// text as a command line.
-    #[cfg(unix)]
+    /// prompt. On Windows the agent then starts without `cmd.exe` (an `.exe` or an npm package),
+    /// and an open is refused when it cannot.
     pub const TERM_FIRST_MESSAGE: &str = "term.first-message";
     /// `call get_project_sessions`: one Project's Claude Code and Codex sessions, newest
     /// first, paged (`msg::PastSessionsPage`).
@@ -141,16 +139,9 @@ mod tests {
         assert!(CAPABILITIES.contains(&"term.mobile"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn capabilities_include_term_first_message() {
         assert!(CAPABILITIES.contains(&"term.first-message"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn capabilities_exclude_term_first_message_on_windows() {
-        assert!(!CAPABILITIES.contains(&"term.first-message"));
     }
 
     #[test]

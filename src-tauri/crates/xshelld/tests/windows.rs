@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use win::*;
+use xshell_core::launch::LaunchSpec;
 use xshell_hostlink::{
     CancelToken, Dialer, LocalDaemon, LocalDaemonConfig, LocalDialer, NamedPipeDialer,
 };
@@ -171,27 +172,370 @@ fn pipe_serves_hello_and_terminals() {
     assert!(c2.hello().1.is_empty());
 }
 
-/// A first message would be parsed by `cmd.exe /C`: not advertised, and refused before
-/// anything starts.
+// ── First messages (#37) ──────────────────────────────────────────────────
+
+const SID: &str = "11111111-2222-3333-4444-555555555555";
+
+/// The cmd-shim npm writes for a package's bin, running `<rel>` (relative to the shim's
+/// directory) with node. Verbatim npm `cmd-shim` output apart from the script path.
+fn npm_shim(rel: &str) -> String {
+    format!(
+        "@ECHO off\r\n\
+         GOTO start\r\n\
+         :find_dp0\r\n\
+         SET dp0=%~dp0\r\n\
+         EXIT /b\r\n\
+         :start\r\n\
+         SETLOCAL\r\n\
+         CALL :find_dp0\r\n\
+         \r\n\
+         IF EXIST \"%dp0%\\node.exe\" (\r\n\
+         \x20 SET \"_prog=%dp0%\\node.exe\"\r\n\
+         ) ELSE (\r\n\
+         \x20 SET \"_prog=node\"\r\n\
+         \x20 SET PATHEXT=%PATHEXT:;.JS;=;%\r\n\
+         )\r\n\
+         \r\n\
+         endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\{rel}\" %*\r\n"
+    )
+}
+
+/// A fake npm-installed agent `bin\<name>.cmd`: its script writes its argv (after node and
+/// the script) as JSON to `%FAKE_ARGV%`, prints `%FAKE_NONCE%`, then idles. node.exe comes
+/// from PATH (CI installs Node).
+fn npm_agent(h: &TestHome, name: &str) {
+    let rel = format!("node_modules\\fake-{name}\\cli.js");
+    let js = h.bin_dir().join(&rel);
+    fs::create_dir_all(js.parent().unwrap()).unwrap();
+    fs::write(
+        &js,
+        "const fs = require('fs');\n\
+         fs.writeFileSync(process.env.FAKE_ARGV, JSON.stringify(process.argv.slice(2)));\n\
+         console.log(process.env.FAKE_NONCE);\n\
+         setInterval(() => {}, 1 << 30);\n",
+    )
+    .unwrap();
+    fs::write(h.bin_dir().join(format!("{name}.cmd")), npm_shim(&rel)).unwrap();
+}
+
+/// The Daemon environment the fake npm agents report through.
+fn fake_env(argv: &Path, word: &str) -> Vec<(String, String)> {
+    vec![
+        ("FAKE_ARGV".into(), argv.to_string_lossy().into_owned()),
+        ("FAKE_NONCE".into(), word.into()),
+    ]
+}
+
+fn start_fake(h: &TestHome, argv: &Path, word: &str, extra: &[(&str, &str)]) -> Daemon {
+    let env = fake_env(argv, word);
+    let mut all: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    all.extend_from_slice(extra);
+    Daemon::start_with(h, &all)
+}
+
+fn open_first(
+    c: &mut Client,
+    t: Uuid,
+    launch: LaunchSpec,
+    msg: &str,
+) -> Result<serde_json::Value, String> {
+    let ClientMsg::TermOpen { mut spec } = open_msg(t, launch) else {
+        unreachable!()
+    };
+    spec.first_message = Some(msg.into());
+    c.request(&ClientMsg::TermOpen { spec })
+}
+
+/// The argv a fake npm agent wrote, once it is complete JSON.
+fn read_argv(p: &Path) -> Vec<String> {
+    let mut got = None;
+    assert!(
+        wait_until(T, || {
+            got = fs::read(p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok());
+            got.is_some()
+        }),
+        "{} was never written",
+        p.display()
+    );
+    got.unwrap()
+}
+
+/// Every character `cmd.exe` or a batch file would act on, a CRLF and an LF, non-ASCII text,
+/// and a command that would create `canary` if anything parsed the message.
+fn hostile_message(canary: &Path) -> String {
+    format!(
+        "a & b | c < d > e ^ f %PATH% !x! \"q\" 'y' \\\\tail\\\\ \r\nline2\nline3 é 🚀 & echo pwned > {}",
+        canary.display()
+    )
+}
+
+fn claude_new_chat(cwd: &Path) -> LaunchSpec {
+    LaunchSpec {
+        session_id: Some(SID.into()),
+        ..claude_spec(cwd)
+    }
+}
+
 #[test]
-fn first_message_not_advertised_and_refused_on_windows() {
+fn first_message_advertised_on_windows() {
     let h = TestHome::new();
     let _d = Daemon::start(&h);
     let mut c = Client::connect(&h.pipe);
     let (hello, _) = c.hello();
     assert!(
-        !hello.capabilities.iter().any(|c| c == "term.first-message"),
+        hello.capabilities.iter().any(|c| c == "term.first-message"),
         "{:?}",
         hello.capabilities
     );
-    let ClientMsg::TermOpen { mut spec } = open_msg(Uuid::new_v4(), claude_spec(&h.project("p")))
-    else {
-        unreachable!()
+}
+
+/// Acceptance: the message reaches an npm-installed Claude Code as one argv word, byte for
+/// byte, and nothing parses it.
+#[test]
+fn first_message_reaches_npm_claude_unchanged() {
+    let h = TestHome::new();
+    npm_agent(&h, "claude");
+    let (argv, canary, word) = (
+        h.dir.path().join("argv.json"),
+        h.dir.path().join("canary.txt"),
+        nonce(),
+    );
+    let _d = start_fake(&h, &argv, &word, &[]);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let msg = hostile_message(&canary);
+    let t = Uuid::new_v4();
+    open_first(&mut c, t, claude_new_chat(&h.project("p")), &msg).unwrap();
+    c.attach(t);
+    c.output_until(t, &word);
+    let got = read_argv(&argv);
+    assert_eq!(got.len(), 6, "{got:?}");
+    assert_eq!(got[..3], ["--session-id", SID, "--settings"], "{got:?}");
+    assert!(got[3].ends_with("claude-hooks.json"), "{got:?}");
+    assert_eq!(got[4..], ["--".to_string(), msg], "{got:?}");
+    assert!(!canary.exists());
+}
+
+/// The same for Codex, whose `-c` hook overrides carry quotes of their own.
+#[test]
+fn first_message_reaches_npm_codex_unchanged() {
+    let h = TestHome::new();
+    npm_agent(&h, "codex");
+    let (argv, canary, word) = (
+        h.dir.path().join("argv.json"),
+        h.dir.path().join("canary.txt"),
+        nonce(),
+    );
+    let _d = start_fake(&h, &argv, &word, &[]);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let msg = hostile_message(&canary);
+    let t = Uuid::new_v4();
+    let codex = LaunchSpec {
+        agent: Some("codex".into()),
+        ..claude_spec(&h.project("p"))
     };
-    spec.first_message = Some("hello & echo pwned".into());
-    let e = c.request(&ClientMsg::TermOpen { spec }).unwrap_err();
-    assert!(e.contains("not supported on Windows"), "{e}");
+    open_first(&mut c, t, codex, &msg).unwrap();
+    c.attach(t);
+    c.output_until(t, &word);
+    let got = read_argv(&argv);
+    assert_eq!(got.len(), 10, "{got:?}");
+    // The notify command names the Daemon's own executable: read it back as Codex would.
+    let notify: toml::Table = toml::from_str(&got[1]).unwrap();
+    let exe = notify["notify"][0].as_str().unwrap().to_string();
+    let want = xshell_core::agent_status::AgentHooks {
+        exe: exe.into(),
+        endpoint: String::new(),
+        claude_settings: Default::default(),
+    }
+    .codex_overrides();
+    assert_eq!(got[..8], want[..], "{got:?}");
+    assert_eq!(got[8..], ["--".to_string(), msg], "{got:?}");
+    assert!(!canary.exists());
+}
+
+/// A hand-written batch file can only run through `cmd.exe`: refused, nothing starts.
+#[test]
+fn first_message_refused_for_unresolvable_agent() {
+    let h = TestHome::new();
+    let canary = h.dir.path().join("ran.txt");
+    h.script(
+        "claude",
+        &format!("echo ran> \"{}\"\n{SLEEP}", canary.display()),
+    );
+    let _d = Daemon::start(&h);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let e = open_first(
+        &mut c,
+        Uuid::new_v4(),
+        claude_new_chat(&h.project("p")),
+        "hello & echo pwned",
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "a first message on Windows needs claude installed as an .exe or an npm package"
+    );
     assert!(Client::connect(&h.pipe).hello().1.is_empty());
+    assert!(h.state_ids().is_empty());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!canary.exists());
+}
+
+/// Neither the Project directory (`cmd.exe` searches it first) nor PATH entries that would
+/// resolve against it are searched: the shim on PATH runs.
+#[test]
+fn first_message_ignores_cwd_shadow() {
+    let h = TestHome::new();
+    npm_agent(&h, "claude");
+    let p = h.project("p");
+    let canary = h.dir.path().join("shadow.txt");
+    fs::write(
+        p.join("claude.cmd"),
+        format!("@echo off\r\necho shadow> \"{}\"\r\n", canary.display()),
+    )
+    .unwrap();
+    fs::create_dir_all(p.join("tools")).unwrap();
+    fs::copy(bin(), p.join("tools").join("claude.exe")).unwrap();
+    let path = format!("tools;.\\tools;;\\tools;C:tools;{}", h.path_env());
+    let (argv, word) = (h.dir.path().join("argv.json"), nonce());
+    let _d = start_fake(&h, &argv, &word, &[("PATH", &path)]);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let t = Uuid::new_v4();
+    open_first(&mut c, t, claude_new_chat(&p), "hi there").unwrap();
+    c.attach(t);
+    c.output_until(t, &word);
+    assert_eq!(read_argv(&argv)[4..], ["--", "hi there"]);
+    assert!(!canary.exists());
+}
+
+/// The message is in no list or state file, and a restore runs the plain `cmd.exe /C`
+/// launch without it.
+#[test]
+fn first_message_not_persisted_or_relaunched() {
+    let h = TestHome::new();
+    npm_agent(&h, "claude");
+    let (argv, word) = (h.dir.path().join("argv.json"), nonce());
+    let mut d = start_fake(&h, &argv, &word, &[]);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let secret = nonce();
+    let msg = format!("remember {secret}");
+    let t = Uuid::new_v4();
+    open_first(&mut c, t, claude_new_chat(&h.project("p")), &msg).unwrap();
+    c.attach(t);
+    c.output_until(t, &word);
+    assert_eq!(read_argv(&argv)[4..], ["--".to_string(), msg]);
+    let state = h
+        .home()
+        .join(".xshell")
+        .join("daemon")
+        .join("terminals.json");
+    assert!(!fs::read_to_string(&state).unwrap().contains(&secret));
+    let (_, list) = Client::connect(&h.pipe).hello();
+    assert!(!format!("{list:?}").contains(&secret));
+    d.stop();
+    assert_eq!(d.wait_exit(T), Some(0));
+    drop(d);
+
+    let (argv2, word2) = (h.dir.path().join("argv2.json"), nonce());
+    let _d = start_fake(&h, &argv2, &word2, &[]);
+    let mut c = Client::connect(&h.pipe);
+    let (_, list) = c.hello();
+    assert!(list.iter().any(|i| i.terminal == t), "{list:?}");
+    let got = read_argv(&argv2);
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert_eq!(got[..3], ["--session-id", SID, "--settings"], "{got:?}");
+    assert!(!format!("{got:?}").contains(&secret));
+}
+
+/// A dangling `claude.exe` is no match, and its batch sibling is refused: neither runs.
+#[test]
+fn first_message_dangling_exe_never_runs_batch_sibling() {
+    let h = TestHome::new();
+    let canary = h.dir.path().join("batch.txt");
+    h.script("claude", &format!("echo batch> \"{}\"", canary.display()));
+    let link = h.bin_dir().join("claude.exe");
+    if let Err(e) = std::os::windows::fs::symlink_file(h.dir.path().join("gone.exe"), &link) {
+        eprintln!("skipped: no symlink privilege here: {e}");
+        return;
+    }
+    let _d = Daemon::start(&h);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let e = open_first(
+        &mut c,
+        Uuid::new_v4(),
+        claude_new_chat(&h.project("p")),
+        "hello & echo pwned",
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "a first message on Windows needs claude installed as an .exe or an npm package"
+    );
+    assert!(Client::connect(&h.pipe).hello().1.is_empty());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!canary.exists());
+}
+
+/// A `claude.com` first match is refused: the launcher would run `claude.com.exe` instead.
+#[test]
+fn first_message_refuses_com() {
+    let h = TestHome::new();
+    fs::copy(bin(), h.bin_dir().join("claude.com")).unwrap();
+    fs::copy(bin(), h.bin_dir().join("claude.com.exe")).unwrap();
+    let _d = Daemon::start(&h);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let e = open_first(
+        &mut c,
+        Uuid::new_v4(),
+        claude_new_chat(&h.project("p")),
+        "hi there",
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        "a first message on Windows needs claude installed as an .exe or an npm package"
+    );
+    assert!(Client::connect(&h.pipe).hello().1.is_empty());
+    assert!(h.state_ids().is_empty());
+}
+
+/// A3: a message whose command line would not fit CreateProcess's limit is refused before
+/// anything starts; a maximum-size plain message fits and arrives whole.
+#[test]
+fn first_message_command_line_budget() {
+    let h = TestHome::new();
+    npm_agent(&h, "claude");
+    let (argv, word) = (h.dir.path().join("argv.json"), nonce());
+    let _d = start_fake(&h, &argv, &word, &[]);
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let max = xshell_core::FIRST_MESSAGE_MAX_BYTES;
+    let quotes = format!("{} ", "\"".repeat(max - 1));
+    let e = open_first(
+        &mut c,
+        Uuid::new_v4(),
+        claude_new_chat(&h.project("p")),
+        &quotes,
+    )
+    .unwrap_err();
+    assert_eq!(e, "a first message is too long for a Windows host");
+    assert!(Client::connect(&h.pipe).hello().1.is_empty());
+    assert!(!argv.exists());
+
+    let plain = "x ".repeat(max / 2);
+    let t = Uuid::new_v4();
+    open_first(&mut c, t, claude_new_chat(&h.project("p")), &plain).unwrap();
+    c.attach(t);
+    c.output_until(t, &word);
+    assert_eq!(read_argv(&argv)[4..], ["--".to_string(), plain]);
 }
 
 #[test]

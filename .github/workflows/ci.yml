@@ -113,6 +113,11 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
+      # The Windows first-message tests run fake npm-installed agents with node.exe.
+      - if: runner.os == 'Windows'
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
       - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked
       # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.

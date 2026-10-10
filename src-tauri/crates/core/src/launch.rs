@@ -1,6 +1,7 @@
 use crate::agent_status::{hook_agent, HookAgent};
 use crate::claude::encode_project_name;
 use crate::ctx::HostCtx;
+use crate::direct_exec::{self, DirectExec};
 use portable_pty::CommandBuilder;
 use std::path::PathBuf;
 
@@ -208,8 +209,9 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
 /// ends option parsing, then the message. Refused unless `spec` runs Claude Code or Codex
 /// directly (no shell, no launch prefix) as a new chat (Claude Code: no session or a session
 /// with no JSONL yet; Codex: no session), and unless the message is not blank, at most
-/// [`FIRST_MESSAGE_MAX_BYTES`] and free of NUL. Refused on Windows, where a direct agent runs
-/// through `cmd.exe /C`, which would parse the text as a command line.
+/// [`FIRST_MESSAGE_MAX_BYTES`] and free of NUL. On Windows the agent must also start without
+/// `cmd.exe`, which would parse the text as a command line: it is refused unless it resolves
+/// to an `.exe` or an npm package (see [`direct_exec`]).
 ///
 /// A message without whitespace gets one trailing space: Claude Code's parser (Commander)
 /// still runs a subcommand named by the first word after `--` (`claude -- update` updates),
@@ -224,14 +226,27 @@ pub fn first_message_args(
 ) -> Result<Vec<String>, String> {
     let agent_bin = agent_binary(spec.agent.as_deref());
     let resume = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
-    first_words(spec, &resume, msg)
+    let words = first_words(spec, &resume, msg)?;
+    if let Some(resolve) = windows_resolver() {
+        resolve(agent_bin)?;
+    }
+    Ok(words)
+}
+
+/// How a first-message launch finds its agent without `cmd.exe`: on Windows only. Elsewhere
+/// the agent is exec'd directly anyway.
+type Resolver<'a> = &'a dyn Fn(&str) -> Result<DirectExec, String>;
+
+fn windows_resolver() -> Option<Resolver<'static>> {
+    if cfg!(windows) {
+        Some(&direct_exec::resolve_direct_env)
+    } else {
+        None
+    }
 }
 
 /// [`first_message_args`] against `resume`, the resume arguments already resolved for `spec`.
 fn first_words(spec: &LaunchSpec, resume: &[String], msg: &str) -> Result<Vec<String>, String> {
-    if cfg!(windows) {
-        return Err("a first message is not supported on Windows hosts".into());
-    }
     let agent_bin = match spec.direct_agent() {
         Some(a @ ("claude" | "codex")) => a,
         _ => return Err("a first message needs Claude Code or Codex, run directly".into()),
@@ -279,18 +294,26 @@ pub fn plan_command_first(
     hooks: Option<TerminalHooks>,
     first: Option<&str>,
 ) -> Result<CommandPlan, String> {
-    plan_command_inner(ctx, spec, hooks, first, &|cwd, sid| {
-        claude_jsonl_exists(ctx, cwd, sid)
-    })
+    plan_command_inner(
+        ctx,
+        spec,
+        hooks,
+        first,
+        &|cwd, sid| claude_jsonl_exists(ctx, cwd, sid),
+        windows_resolver(),
+    )
 }
 
 /// [`plan_command_first`], asking `jsonl_exists` (once) whether a Claude session file exists.
+/// With `direct` (Windows), a launch with a first message runs what `direct` resolves the
+/// agent to, never `cmd.exe`, and only if its command line fits the Windows budget.
 fn plan_command_inner(
     ctx: &HostCtx,
     spec: &LaunchSpec,
     hooks: Option<TerminalHooks>,
     first: Option<&str>,
     jsonl_exists: &dyn Fn(&str, &str) -> bool,
+    direct: Option<Resolver>,
 ) -> Result<CommandPlan, String> {
     let mode = spec.shell_mode.as_deref().unwrap_or("claude");
     let agent_bin = agent_binary(spec.agent.as_deref());
@@ -307,6 +330,12 @@ fn plan_command_inner(
     let first_words = first
         .map(|msg| first_words(spec, &agent_args, msg))
         .transpose()?;
+    // A first message on Windows: the agent itself, found without `cmd.exe`. `first_words`
+    // accepted only a direct agent, so no shell or prefix wraps it below.
+    let direct_exec = match (direct, &first_words) {
+        (Some(resolve), Some(_)) => Some(resolve(agent_bin)?),
+        _ => None,
+    };
     if mode != "raw" && spec.skip_permissions == Some(true) {
         if let Some(flag) = permission_flag(agent_bin) {
             // `codex resume` is a subcommand with its own options, so the flag goes after it.
@@ -325,7 +354,7 @@ fn plan_command_inner(
     }
     // Last: everything after `--` is the message. A first message needs a direct agent, so
     // it is never part of a shell's command line: on Unix the agent is exec'd with it as one
-    // argv word.
+    // argv word, on Windows the resolved executable gets it (see `direct_exec` above).
     if let Some(words) = first_words {
         agent_args.extend(words);
     }
@@ -353,7 +382,25 @@ fn plan_command_inner(
         }
         None => (agent_bin, agent_args),
     };
-    let (program, args): (String, Vec<String>) = if mode == "raw" {
+    let (program, args): (String, Vec<String>) = if let Some(de) = direct_exec {
+        let program = de
+            .program
+            .to_str()
+            .ok_or_else(|| direct_exec::not_direct(agent_bin))?
+            .to_string();
+        let mut args = de.lead_args;
+        args.extend(exec_args);
+        let mut argv = vec![program.as_str()];
+        argv.extend(args.iter().map(String::as_str));
+        // The Daemon's launcher goes in front of this command line; it checks the whole line
+        // again before it starts anything.
+        if direct_exec::command_line_units(&argv) + direct_exec::LAUNCHER_RESERVE
+            > direct_exec::COMMAND_LINE_BUDGET
+        {
+            return Err(direct_exec::TOO_LONG.into());
+        }
+        (program, args)
+    } else if mode == "raw" {
         // Raw shell: spawn the chosen shell directly (no claude wrapping).
         let shell = effective_shell.unwrap_or(if cfg!(windows) {
             "powershell.exe"
@@ -1667,20 +1714,179 @@ mod tests {
         assert!(refused(ok, &format!("{max}x")).contains("longer than 16384 bytes"));
     }
 
-    #[cfg(windows)]
+    /// The Windows planning, with a stub in place of the PATH search, so it runs on every OS.
+    fn direct_plan(
+        ctx: &HostCtx,
+        s: &LaunchSpec,
+        h: Option<&crate::agent_status::AgentHooks>,
+        first: Option<&str>,
+        resolve: Resolver,
+    ) -> Result<CommandPlan, String> {
+        plan_command_inner(
+            ctx,
+            s,
+            h.map(|h| TerminalHooks {
+                hooks: h,
+                terminal: TID.parse().unwrap(),
+                run: 3,
+            }),
+            first,
+            &|_, _| false,
+            Some(resolve),
+        )
+    }
+
+    const NODE: &str = "C:\\Program Files\\nodejs\\node.exe";
+    const CLI: &str = "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js";
+
+    fn npm(bin: &str) -> Result<DirectExec, String> {
+        Ok(DirectExec {
+            program: NODE.into(),
+            lead_args: vec![format!("{CLI}:{bin}")],
+        })
+    }
+
     #[test]
-    fn first_message_refused_on_windows() {
+    fn plan_first_message_windows_direct() {
         let fx = Fixture::new();
         let ctx = fx.ctx();
-        for agent in ["claude", "codex"] {
-            let s = LaunchSpec {
-                agent: Some(agent.into()),
-                ..spec("C:\\w")
-            };
-            let e = first_message_args(&ctx, &s, "hello there").unwrap_err();
-            assert!(e.contains("Windows"), "{e}");
-            assert!(plan_command_first(&ctx, &s, None, Some("hello there")).is_err());
-        }
+        let h = hooks();
+        let msg = "a & b | c\r\nline2 %PATH% \"q\"";
+        let claude = LaunchSpec {
+            session_id: Some("sid".into()),
+            ..spec("C:\\w")
+        };
+        let plan = direct_plan(&ctx, &skipping(claude.clone()), Some(&h), Some(msg), &npm).unwrap();
+        assert_eq!(plan.program, NODE);
+        assert_eq!(
+            plan.args,
+            strings(&[
+                &format!("{CLI}:claude"),
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "sid",
+                "--settings",
+                "/h/.xshell/daemon/claude-hooks.json",
+                "--",
+                msg
+            ])
+        );
+        assert_builder(&plan);
+        // The renderer and hook variables are as without a message.
+        let mut want = plan_env(CLAUDE_ENV);
+        want.extend(
+            TerminalHooks {
+                hooks: &h,
+                terminal: TID.parse().unwrap(),
+                run: 3,
+            }
+            .env(),
+        );
+        assert_eq!(plan.env, want);
+        // An .exe install: the agent itself, no lead arguments.
+        let exe = |_: &str| {
+            Ok(DirectExec {
+                program: "C:\\Users\\u\\.local\\bin\\claude.exe".into(),
+                lead_args: vec![],
+            })
+        };
+        let plan = direct_plan(&ctx, &claude, None, Some("hi there"), &exe).unwrap();
+        assert_eq!(plan.program, "C:\\Users\\u\\.local\\bin\\claude.exe");
+        assert_eq!(
+            plan.args,
+            strings(&["--session-id", "sid", "--", "hi there"])
+        );
+        // Codex: the `-c` overrides come before `--`.
+        let codex = LaunchSpec {
+            agent: Some("codex".into()),
+            ..spec("C:\\w")
+        };
+        let plan = direct_plan(&ctx, &codex, Some(&h), Some("go"), &npm).unwrap();
+        let mut want = vec![format!("{CLI}:codex")];
+        want.extend(h.codex_overrides());
+        want.extend(strings(&["--", "go "]));
+        assert_eq!(plan.program, NODE);
+        assert_eq!(plan.args, want);
+        // Never `cmd.exe`, and without a message the resolver is not asked.
+        let never = |_: &str| -> Result<DirectExec, String> { panic!("resolved") };
+        let plain = direct_plan(&ctx, &claude, None, None, &never).unwrap();
+        assert_eq!(
+            plain,
+            plan_command_inner(&ctx, &claude, None, None, &|_, _| false, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn plan_first_message_windows_refusals() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        let claude = spec("C:\\w");
+        // The resolver's refusal is the plan's: nothing starts.
+        let refuse = |bin: &str| Err(direct_exec::not_direct(bin));
+        assert_eq!(
+            direct_plan(&ctx, &claude, None, Some("hi there"), &refuse).unwrap_err(),
+            "a first message on Windows needs claude installed as an .exe or an npm package"
+        );
+        // The message rules come first: the resolver is not asked for a refused message.
+        let never = |_: &str| -> Result<DirectExec, String> { panic!("resolved") };
+        assert_eq!(
+            direct_plan(&ctx, &claude, None, Some("  "), &never).unwrap_err(),
+            "a first message must not be blank"
+        );
+        // A quote-heavy maximum-size message does not fit the Windows command line.
+        let quotes = format!("{} ", "\"".repeat(FIRST_MESSAGE_MAX_BYTES - 1));
+        assert_eq!(quotes.len(), FIRST_MESSAGE_MAX_BYTES);
+        assert_eq!(
+            direct_plan(&ctx, &claude, None, Some(&quotes), &npm).unwrap_err(),
+            "a first message is too long for a Windows host"
+        );
+        // A plain maximum-size one does.
+        let plain = "x ".repeat(FIRST_MESSAGE_MAX_BYTES / 2);
+        let plan = direct_plan(&ctx, &claude, None, Some(&plain), &npm).unwrap();
+        assert_eq!(plan.args.last().unwrap(), &plain);
+    }
+
+    /// The message rules are the same on every OS (the Unix tests cover them through the
+    /// planner).
+    #[test]
+    fn first_words_rules_unchanged() {
+        let ok = spec("C:\\w");
+        let none: &[String] = &[];
+        assert_eq!(first_words(&ok, none, "a b"), Ok(strings(&["--", "a b"])));
+        assert_eq!(
+            first_words(&ok, none, "update"),
+            Ok(strings(&["--", "update "]))
+        );
+        assert_eq!(
+            first_words(&ok, &strings(&["--session-id", "s"]), "a b"),
+            Ok(strings(&["--", "a b"]))
+        );
+        assert_eq!(
+            first_words(&ok, &strings(&["--resume", "s"]), "a b").unwrap_err(),
+            "a first message needs a new chat"
+        );
+        assert_eq!(
+            first_words(&ok, none, " \n").unwrap_err(),
+            "a first message must not be blank"
+        );
+        assert_eq!(
+            first_words(&ok, none, "a\0 b").unwrap_err(),
+            "a first message must not contain NUL"
+        );
+        let max = "x ".repeat(FIRST_MESSAGE_MAX_BYTES / 2);
+        assert!(first_words(&ok, none, &max).is_ok());
+        assert!(first_words(&ok, none, &format!("{max}x"))
+            .unwrap_err()
+            .contains("longer than 16384 bytes"));
+        let wrapped = LaunchSpec {
+            shell_id: Some("cmd".into()),
+            shell_command: Some("cmd.exe".into()),
+            ..ok
+        };
+        assert_eq!(
+            first_words(&wrapped, none, "a b").unwrap_err(),
+            "a first message needs Claude Code or Codex, run directly"
+        );
     }
 
     /// The planner resolves the resume mode once and checks the first message against that
@@ -1706,7 +1912,7 @@ mod tests {
                     !first_answer
                 }
             };
-            let r = plan_command_inner(&ctx, &s, None, Some("hi there"), &exists);
+            let r = plan_command_inner(&ctx, &s, None, Some("hi there"), &exists, None);
             assert_eq!(looks.get(), 1, "one look at the session file");
             if first_answer {
                 assert_eq!(r.unwrap_err(), "a first message needs a new chat");

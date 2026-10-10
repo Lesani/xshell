@@ -274,6 +274,24 @@ pub(crate) fn spawn_with(
         let launcher = d.cfg.job_launcher.as_deref();
         (job, win::command(&plan, launcher, &name))
     };
+    // A first message runs the resolved executable by its exact path: only the launcher
+    // starts it that way (portable-pty would search again, PATHEXT included), it must still
+    // be there, and the whole command line, the launcher's words included, must fit
+    // CreateProcess's limit.
+    #[cfg(windows)]
+    if first.is_some() {
+        use xshell_core::direct_exec as de;
+        if d.cfg.job_launcher.is_none() {
+            return Err(de::NO_LAUNCHER.to_string().into());
+        }
+        if !de::runnable_file(Path::new(&plan.program)) {
+            let agent = xshell_core::launch::agent_binary(spec.agent.as_deref());
+            return Err(de::not_direct(agent).into());
+        }
+        if !de::fits_command_line(cmd.get_argv()) {
+            return Err(de::TOO_LONG.to_string().into());
+        }
+    }
     #[cfg(unix)]
     let spawned_child = pair.slave.spawn_command(cmd);
     #[cfg(windows)]
@@ -1289,21 +1307,8 @@ mod win {
         for a in &plan.args {
             cmd.arg(a);
         }
-        let registry_path = cmd
-            .get_env("PATH")
-            .map(|p| p.to_string_lossy().into_owned());
-        for (k, v) in std::env::vars_os() {
-            cmd.env(k, v);
-        }
-        if let (Ok(ours), Some(reg)) = (std::env::var("PATH"), registry_path) {
-            let mut all: Vec<&str> = ours.split(';').filter(|e| !e.is_empty()).collect();
-            for e in reg.split(';').filter(|e| !e.is_empty()) {
-                if !all.iter().any(|a| a.eq_ignore_ascii_case(e)) {
-                    all.push(e);
-                }
-            }
-            cmd.env("PATH", all.join(";"));
-        }
+        // Shared with the first-message search, so it finds the agent this Terminal runs.
+        xshell_core::direct_exec::terminal_env(&mut cmd, std::env::vars_os());
         for (k, v) in &plan.env {
             cmd.env(k, v);
         }
