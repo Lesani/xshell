@@ -229,13 +229,22 @@ impl Term {
     /// The newest run's `XSHELL_TERMINAL_ID` run number.
     fn run(&self) -> u64 {
         let pid = self.pid().to_string();
-        let log = fs::read_to_string(self.cwd.join("env.log")).unwrap();
-        let line = log
-            .lines()
-            .rev()
-            .find(|l| l.split(' ').next() == Some(pid.as_str()))
-            .expect("the run's environment");
-        line.rsplit_once('.').unwrap().1.parse().unwrap()
+        // The fake writes its pid before its environment line: wait for that line.
+        let deadline = Instant::now() + T;
+        loop {
+            let log = fs::read_to_string(self.cwd.join("env.log")).unwrap_or_default();
+            // A line still being written does not parse yet.
+            let run = log
+                .lines()
+                .rev()
+                .find(|l| l.split(' ').next() == Some(pid.as_str()))
+                .and_then(|l| l.rsplit_once('.')?.1.parse().ok());
+            if let Some(run) = run {
+                return run;
+            }
+            assert!(Instant::now() < deadline, "the run's environment");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn keys(&self) -> Vec<String> {
