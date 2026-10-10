@@ -699,7 +699,8 @@ fn mobile_never_adopts_a_hidden_terminal() {
         shell_id: Some("bash".into()),
         ..e.claude(SID)
     });
-    let before = e.fake.launches().len();
+    // The wrapped agent records its launch after the open answers: wait for it.
+    let before = e.fake.wait_launches(1).len();
     let err = session_open(e.mob_a.request(&adopt_msg(Uuid::new_v4(), e.claude(SID))));
     assert_eq!(err, SESSION_OPEN);
     assert!(!err.contains(&t.to_string()));
