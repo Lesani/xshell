@@ -17,13 +17,15 @@ use xshell_hostlink::ring::{
     RingObserver, RingView,
 };
 use xshell_protocol::msg::ClientMsg;
-use xshell_protocol::ring::noise::{Header, Kind};
+use xshell_protocol::ring::noise::{Header, Initiator, Kind};
 use xshell_protocol::ring::pairing::PairingOffer;
 use xshell_protocol::ring::relay::contract;
 use xshell_protocol::ring::relay::pair::{pair_as_guest, GuestRequest, PairOptions};
 use xshell_protocol::ring::relay::sessions::SessionError;
 use xshell_protocol::ring::relay::test_relay::{TestRelay, Verdict};
-use xshell_protocol::ring::{DeviceKeys, Role as RingRole, RosterChain};
+use xshell_protocol::ring::relay::wire::{ClientFrame, ErrorCode, RelayFrame};
+use xshell_protocol::ring::relay::LinkState;
+use xshell_protocol::ring::{b64, DeviceKeys, RingError, Role as RingRole, RosterChain, SignKey};
 use xshelld::server::{Role, ServerHandle};
 
 const FORBIDDEN: &str = "forbidden for mobile";
@@ -134,15 +136,10 @@ fn paired_mobile_session_enforces_mobile_role() {
     ring.quit();
 }
 
-#[test]
-fn every_daemon_accepts_new_member_within_seconds() {
-    let r = relay();
-    let (h1, h2) = (TestHome::new(), TestHome::new());
-    let (srv1, srv2) = (start(&h1, fast), start(&h2, fast));
-    let t = tempfile::tempdir().unwrap();
-    let ring = desktop_with_daemon(&r, t.path(), &srv1);
-    // The second computer pairs itself with `xshelld pair`, its code typed on the Desktop.
-    let (d2, _, _) = identity(&srv2);
+/// The second computer `h2` (running `srv2`) pairs itself with `xshelld pair`, its code
+/// typed on the Desktop: it never gets a local `ring.join`. Returns once it is online.
+fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: &ServerHandle) {
+    let (d2, _, _) = identity(srv2);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     struct Lines(std::sync::mpsc::Sender<String>, Vec<u8>);
     impl Write for Lines {
@@ -181,7 +178,18 @@ fn every_daemon_accepts_new_member_within_seconds() {
         .unwrap();
     assert_eq!(pairing.join().unwrap(), 0);
     let id = ring.chain().unwrap().ring_id().clone();
-    wait_until("the second daemon is online", T, || online(&r, &id, &d2));
+    wait_until("the second daemon is online", T, || online(r, &id, &d2));
+}
+
+#[test]
+fn every_daemon_accepts_new_member_within_seconds() {
+    let r = relay();
+    let (h1, h2) = (TestHome::new(), TestHome::new());
+    let (srv1, srv2) = (start(&h1, fast), start(&h2, fast));
+    let t = tempfile::tempdir().unwrap();
+    let ring = desktop_with_daemon(&r, t.path(), &srv1);
+    pair_second_computer(&r, &ring, &h2, &srv2);
+    let (d2, _, _) = identity(&srv2);
 
     // A phone pairs; both Daemons take its sessions within seconds of the new version.
     let (d1, _, _) = identity(&srv1);
@@ -425,4 +433,181 @@ fn tampering_relay_end_to_end() {
     );
     d.attach(term);
     d.marker(term, "still-here");
+}
+
+// ---- Roster management (#22) -------------------------------------------------------------------
+
+/// Acceptance (a): the Desktop removes a paired phone, and every Daemon cuts it within
+/// seconds through the Relay alone (neither gets a local `ring.join` after the removal; the
+/// second never got one). The phone stops, and can neither log in nor open a session again.
+#[test]
+fn removing_a_phone_cuts_it_on_every_daemon_within_seconds() {
+    let r = relay();
+    let (h1, h2) = (TestHome::new(), TestHome::new());
+    let (srv1, srv2) = (start(&h1, fast), start(&h2, fast));
+    let t = tempfile::tempdir().unwrap();
+    let ring = desktop_with_daemon(&r, t.path(), &srv1);
+    pair_second_computer(&r, &ring, &h2, &srv2);
+    let ((d1, _, _), (d2, _, _)) = (identity(&srv1), identity(&srv2));
+    let phone_keys = contract::keys();
+    let chain = pair_phone(&ring, &phone_keys);
+    let phone = Peer::new(&r, &chain, &phone_keys);
+    let (base1, base2) = (settled(&srv1), settled(&srv2));
+    let mut c1 = phone.client(&d1);
+    let mut c2 = phone.client(&d2);
+    assert!(c1.call("list_claude_projects", json!({})).is_ok());
+    assert!(c2.call("list_claude_projects", json!({})).is_ok());
+    assert_eq!(
+        (srv1.connections(), srv2.connections()),
+        (base1 + 1, base2 + 1)
+    );
+
+    let t0 = Instant::now();
+    let c = ring.remove_member(&phone_keys.sign_key()).unwrap();
+    assert!(c.head().member(&phone_keys.sign_key()).is_none());
+    wait_connections(&srv1, base1, Duration::from_secs(5));
+    wait_connections(&srv2, base2, Duration::from_secs(5));
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+
+    wait_until("the phone stops", T, || {
+        matches!(
+            phone.connector.state(),
+            LinkState::Stopped { error: Some(_) }
+        )
+    });
+    match contract::try_connect(&r.target(), &chain, phone_keys.clone()) {
+        Err(RingError::Relay { code, .. }) => assert_eq!(code, ErrorCode::NotMember),
+        Err(e) => panic!("expected not_member, got {e}"),
+        Ok(_) => panic!("the removed phone logged in"),
+    }
+    assert!(phone.sessions.open(&d1).is_err());
+    assert!(phone.sessions.open(&d2).is_err());
+    assert!(ring
+        .view()
+        .members
+        .iter()
+        .all(|m| m.sign_key != phone_keys.sign_key()));
+    ring.quit();
+}
+
+fn env_frame(from: &SignKey, payload: &[u8]) -> String {
+    json!({"t": "env", "from": from, "payload": b64::encode(payload)}).to_string()
+}
+
+/// Acceptance (b): a version a phone signed (adding an intruder Desktop, dropping the real
+/// one) is refused by the Relay, and by the Daemon and the Desktop when a Relay sends it
+/// anyway; the intruder it names gets no session.
+#[test]
+fn mobile_signed_roster_is_refused_by_every_device() {
+    let r = relay();
+    let h = TestHome::new();
+    let srv = start(&h, fast);
+    let t = tempfile::tempdir().unwrap();
+    let ring = desktop_with_daemon(&r, t.path(), &srv);
+    let (daemon, _, _) = identity(&srv);
+    let phone_keys = contract::keys();
+    let chain = pair_phone(&ring, &phone_keys);
+    let rid = chain.ring_id().clone();
+    let version = chain.head().version();
+    let me = ring
+        .view()
+        .members
+        .iter()
+        .find(|m| m.this_app)
+        .unwrap()
+        .sign_key;
+    let intruder = contract::keys();
+    let forged = contract::raw_next(chain.head(), &*phone_keys, |x| {
+        x.members.retain(|m| m.sign_key != me);
+        x.members
+            .push(contract::member(&intruder, "intruder", RingRole::Desktop));
+    });
+
+    // The Relay refuses the phone's upload.
+    {
+        let mut raw = contract::RawConn::login(&r.target(), &chain, &*phone_keys);
+        raw.send(
+            &ClientFrame::RosterPut {
+                id: 1,
+                roster: forged.token().to_string(),
+            }
+            .encode(),
+        )
+        .unwrap();
+        let e = raw.error(contract::WAIT).expect("an error");
+        assert_eq!(
+            (e.0, e.1, e.2.as_deref()),
+            (
+                ErrorCode::RosterInvalid,
+                Some(1),
+                Some("signer_not_desktop")
+            )
+        );
+    }
+    assert_eq!(r.head_version(&rid), Some(version));
+
+    // A live phone session.
+    let phone = Peer::new(&r, &chain, &phone_keys);
+    let base = settled(&srv);
+    let mut c = phone.client(&daemon);
+    assert!(c.call("list_claude_projects", json!({})).is_ok());
+    let daemon_version = || identity(&srv).2["ring"]["version"].as_u64();
+    assert_eq!(daemon_version(), Some(version));
+
+    // A Relay sends the forged version anyway, to the Daemon and to the Desktop.
+    let frame = RelayFrame::Roster {
+        roster: forged.token().to_string(),
+    }
+    .encode();
+    assert!(r.inject(&rid, &daemon, &frame));
+    assert!(r.inject(&rid, &me, &frame));
+    // Markers behind it on the same sockets, so the checks below come after it was handled:
+    // the session's next call (Daemon) and a presence frame (Desktop).
+    assert!(c.call("list_claude_projects", json!({})).is_ok());
+    let marker = json!({
+        "t": "presence", "signKey": daemon, "online": false,
+        "lastSeen": 1, "lastReason": "marker-22",
+    })
+    .to_string();
+    assert!(r.inject(&rid, &me, &marker));
+    wait_until("the desktop handled the marker", T, || {
+        ring.view()
+            .members
+            .iter()
+            .any(|m| m.sign_key == daemon && m.presence.reason.as_deref() == Some("marker-22"))
+    });
+    assert_eq!(daemon_version(), Some(version));
+    let v = ring.view();
+    assert_eq!(v.version, Some(version));
+    assert!(v.members.iter().any(|m| m.this_app));
+    assert!(v.members.iter().all(|m| m.sign_key != intruder.sign_key()));
+    assert_eq!(ring.chain().unwrap().head().version(), version);
+
+    // The intruder's handshake, injected straight to the Daemon (no client of its own would
+    // send it): no session, and no answer. The test Relay records every envelope the Daemon
+    // sends, before it refuses one to a non-member. The phone's own handshake, injected the
+    // same way right after, is the marker: the Daemon handles its envelopes in order, so once
+    // it answered the phone it had handled the intruder's.
+    let dm = chain.head().member(&daemon).unwrap().clone();
+    r.record_payloads(true);
+    let (ii, hs1) = Initiator::start(&intruder, &rid, &dm, contract::now_ms()).unwrap();
+    assert!(r.inject(&rid, &daemon, &env_frame(&intruder.sign_key(), &hs1)));
+    let (pi, hs1) = Initiator::start(&phone_keys, &rid, &dm, contract::now_ms() + 60_000).unwrap();
+    assert!(r.inject(&rid, &daemon, &env_frame(&phone_keys.sign_key(), &hs1)));
+    let answered = |sid| {
+        r.recorded_attempts().iter().any(|(from, _, p)| {
+            *from == daemon
+                && Header::parse(p).is_ok_and(|(h, _)| h.kind == Kind::Hs2 && h.sid == sid)
+        })
+    };
+    wait_until("the daemon answers the phone", T, || answered(pi.sid()));
+    let attempts = r.recorded_attempts();
+    assert!(
+        attempts.iter().all(|(_, to, _)| *to != intruder.sign_key()),
+        "the daemon answered the intruder"
+    );
+    assert!(!answered(ii.sid()));
+    // No session for the intruder (the phone's new handshake replaces its old session).
+    assert!(srv.connections() <= base + 1);
+    ring.quit();
 }

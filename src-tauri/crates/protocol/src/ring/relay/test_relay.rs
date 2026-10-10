@@ -361,6 +361,9 @@ struct Shared {
     /// Every envelope payload routed, decoded, while recording is on.
     recording: AtomicBool,
     recorded: Mutex<Vec<Vec<u8>>>,
+    /// Every `env` a client sent while recording is on, before any check (refused ones
+    /// included): (sender, addressee, decoded payload).
+    attempts: Mutex<Vec<(SignKey, SignKey, Vec<u8>)>>,
     /// The pairing pipe's slots and the per-address open log.
     pair: Mutex<PairState>,
     /// `push` frames received (any outcome).
@@ -584,6 +587,7 @@ impl TestRelay {
             tampers: Mutex::new(HashMap::new()),
             recording: AtomicBool::new(false),
             recorded: Mutex::new(Vec::new()),
+            attempts: Mutex::new(Vec::new()),
             pair: Mutex::new(PairState::default()),
             push_frames: std::sync::atomic::AtomicUsize::new(0),
             opts,
@@ -697,6 +701,16 @@ impl TestRelay {
     pub fn recorded_payloads(&self) -> Vec<Vec<u8>> {
         self.shared
             .recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Every `env` sent to this Relay while recording was on, before any check, refused
+    /// ones included (an envelope to a non-member, say): (sender, addressee, decoded payload).
+    pub fn recorded_attempts(&self) -> Vec<(SignKey, SignKey, Vec<u8>)> {
+        self.shared
+            .attempts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -1858,6 +1872,14 @@ impl Conn {
         }
         match frame {
             ClientFrame::Env { to, payload } => {
+                if self.shared.recording.load(Ordering::Acquire) {
+                    let bytes = super::super::b64::decode(&payload).unwrap_or_default();
+                    self.shared
+                        .attempts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((me, to, bytes));
+                }
                 let refusal = if let Err(code) = check_payload(&payload) {
                     Some(code)
                 } else if to == me {

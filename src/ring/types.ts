@@ -12,8 +12,11 @@ export interface MemberView {
   signKey: string;
   thisApp: boolean;
   thisComputer: boolean;
-  // The configured Remote Host whose Daemon this member is.
+  // The configured Remote Host (still in Settings → Hosts) whose Daemon this member is.
   hostId: string | null;
+  // Settings → Mobile offers to remove it: not this app, not this computer, and no configured
+  // Host's Daemon.
+  removable: boolean;
   presence: { kind: PresenceKind; reason?: string; at?: number };
 }
 

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { canClaim, canEnable, canSave, connectionLine, hostLine, startsOver, initialForm, isDirty, localLine, moveLine, presenceChip, presenceKey, problemLine, relayChoice, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
@@ -27,7 +27,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
 }
 
 function member(kind: MemberView["presence"]["kind"], over: Partial<MemberView> = {}): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, presence: { kind }, ...over };
+  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, ...over };
 }
 
 describe("presence", () => {
@@ -158,5 +158,85 @@ describe("relay form", () => {
     expect(urlError({ choice: "custom", url: "" })).toBeNull();
     expect(urlError({ choice: "custom", url: "ws://r.example" })).toBe(fmt("mobile.relay.err.invalid"));
     expect(urlError({ choice: "hosted", url: "ws://r.example" })).toBeNull();
+  });
+});
+
+describe("removing a device", () => {
+  const phone = (over: Partial<MemberView> = {}) => member("online", { name: "Pixel", role: "mobile", signKey: "p", removable: true, ...over });
+
+  it("offers Remove only for removable devices, in the window that runs the connection", () => {
+    expect(canRemove(phone(), status())).toBe(true);
+    expect(canRemove(phone(), status({ connection: "waiting" }))).toBe(true);
+    expect(canRemove(phone(), status({ connection: "other-window" }))).toBe(false);
+    expect(canRemove(phone({ removable: false }), status())).toBe(false);
+    expect(canRemove(phone({ thisApp: true }), status())).toBe(false);
+    expect(canRemove(phone({ thisComputer: true }), status())).toBe(false);
+  });
+
+  it("explains why a Host has no Remove button", () => {
+    const hint = fmt("mobile.remove.hostHint");
+    expect(removeHint(member("online", { thisComputer: true }))).toBe(hint);
+    expect(removeHint(member("online", { hostId: "h_aaaaaaaa" }))).toBe(hint);
+    expect(removeHint(member("online", { thisApp: true, role: "desktop" }))).toBeNull();
+    expect(removeHint(phone())).toBeNull();
+    expect(removeHint(member("online", { removable: true }))).toBeNull();
+  });
+
+  describe("last seen", () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("says when a closed or unreachable device was last seen", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-10-10T12:00:00Z"));
+      const at = Date.parse("2026-10-10T11:55:00Z") / 1000;
+      expect(lastSeenLine(member("closed", { presence: { kind: "closed", reason: "quit", at } }), status())).toBe("Last seen 5m ago");
+      expect(lastSeenLine(member("unreachable", { presence: { kind: "unreachable", at: at + 290 } }), status())).toBe("Last seen just now");
+      const closed = member("closed", { presence: { kind: "closed", at } });
+      expect(lastSeenLine(closed, status({ connection: "waiting" }))).toBeNull();
+      expect(lastSeenLine(member("closed"), status())).toBeNull();
+      expect(lastSeenLine(member("online", { presence: { kind: "online", at } }), status())).toBeNull();
+      expect(lastSeenLine(member("never"), status())).toBeNull();
+    });
+  });
+
+  it("confirms with a body for the device's role", () => {
+    const c = removeConfirm({ name: "Pixel", role: "mobile" });
+    expect(c.title).toBe("Remove Pixel?");
+    expect(c.body).toBe(fmt("mobile.remove.confirmBody.mobile", { name: "Pixel" }));
+    expect(c.body).toContain("Pixel");
+    expect(c.confirm).toBe("Remove");
+    expect(removeConfirm({ name: "build-box", role: "daemon" }).body).toBe(fmt("mobile.remove.confirmBody.daemon", { name: "build-box" }));
+    expect(removeConfirm({ name: "laptop", role: "desktop" }).body).toBe(fmt("mobile.remove.confirmBody.desktop", { name: "laptop" }));
+  });
+
+  it("maps the Desktop's refusals", () => {
+    expect(removeErrorLine("Pixel", "in_use: this device belongs to a host")).toBe(fmt("mobile.remove.err.inUse"));
+    expect(removeErrorLine("Pixel", "self: this app can't remove itself")).toBe(fmt("mobile.remove.err.self"));
+    expect(removeErrorLine("Pixel", "other_window: another xshell window manages your devices")).toBe(fmt("mobile.remove.err.otherWindow"));
+    expect(removeErrorLine("Pixel", "not_enabled: mobile access is not enabled")).toBe("Couldn't remove Pixel: mobile access is not enabled");
+    expect(removeErrorLine("Pixel", { message: "disk full" })).toBe("Couldn't remove Pixel: disk full");
+  });
+
+  it("notes a removal made while not connected to the relay", () => {
+    expect(removePendingLine(status(), "Pixel")).toBeNull();
+    for (const connection of ["connecting", "waiting", "stopped"] as const) {
+      expect(removePendingLine(status({ connection }), "Pixel")).toBe(fmt("mobile.remove.pending", { name: "Pixel" }));
+    }
+  });
+
+  it("follows a removal from the question to its note", () => {
+    const m = phone();
+    let r = removalReducer(REMOVAL_IDLE, { type: "ask", member: m });
+    expect(r).toEqual({ state: "confirming", member: m });
+    expect(removalReducer(r, { type: "cancel" })).toEqual(REMOVAL_IDLE);
+    r = removalReducer(r, { type: "start" });
+    expect(r).toEqual({ state: "removing", signKey: "p", name: "Pixel" });
+    // Another row's Remove does nothing meanwhile.
+    expect(removalReducer(r, { type: "ask", member: member("online") })).toBe(r);
+    const failed = removalReducer(r, { type: "failed", error: "in_use: x" });
+    expect(removalNote(failed)).toEqual({ text: fmt("mobile.remove.err.inUse"), error: true });
+    const done = removalReducer(r, { type: "done", status: status({ connection: "waiting" }) });
+    expect(removalNote(done)).toEqual({ text: fmt("mobile.remove.pending", { name: "Pixel" }), error: false });
+    expect(removalNote(removalReducer(r, { type: "done", status: status() }))).toBeNull();
   });
 });

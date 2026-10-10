@@ -819,7 +819,9 @@ Relay; their target's `gateway` holds the gateway signing key the Relay trusts, 
 mint tokens (`hosted_routing_ends_when_the_last_token_expires` is the routing cutoff test).
 `contract::QUOTA_SCENARIOS` (`quota_refuses_then_closes`) run against a Relay with a small
 daily quota (at most 1000 frames), which their target's `quota_frames_per_day` names.
-`SCENARIOS` includes the pairing pipe's `pair_pipe_joins_two`, `pair_pipe_refuses_third`,
+`SCENARIOS` includes the removal scenarios `removed_member_is_disconnected`,
+`removed_member_is_unknown_recipient` and `auth_chain_signed_by_mobile_is_refused` (sections
+7, 10 and 11). `SCENARIOS` also includes the pairing pipe's `pair_pipe_joins_two`, `pair_pipe_refuses_third`,
 `pair_pipe_caps_messages` and `pair_pipe_closes_peer`. `contract::PAIR_TTL_SCENARIOS`
 (`pair_pipe_expires`, `pair_pipe_used_slot_stays_busy`) need a Relay with a slot lifetime of at most 5 s (`pair_ttl`), and
 `contract::PAIR_RATE_SCENARIOS` (`pair_pipe_rate_limited`) one with a rate limit of at most

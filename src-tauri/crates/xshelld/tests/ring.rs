@@ -339,6 +339,41 @@ fn join_refuses_stale_or_forked_chain() {
     assert_eq!(identity(&mut c).raw["ring"]["version"], 3);
 }
 
+/// Only a Desktop signs a new version: a chain whose head a Mobile signed is refused on the
+/// local path too, and the trusted head stays.
+#[test]
+fn join_refuses_a_mobile_signed_chain() {
+    let r = relay();
+    let h = TestHome::new();
+    let srv = server(&h);
+    let mut c = desktop(&srv);
+    let id = identity(&mut c);
+    let mut ring = Ring::new(&r.url(), &id, RingRole::Daemon);
+    let phone = DeviceKeys::generate().unwrap();
+    ring.next(|d| {
+        d.add(Member::new(
+            "phone",
+            RingRole::Mobile,
+            phone.sign_key(),
+            phone.noise_key(),
+            now(),
+        ))
+    });
+    join(&mut c, ring.tokens()).unwrap();
+    let intruder = DeviceKeys::generate().unwrap();
+    let forged = contract::raw_next(ring.chain.head(), &phone, |x| {
+        x.members
+            .push(contract::member(&intruder, "intruder", RingRole::Desktop));
+    });
+    let mut toks = ring.tokens();
+    toks.push(forged.token().to_string());
+    assert_eq!(
+        join(&mut c, toks).unwrap_err(),
+        "roster refused: signer_not_desktop"
+    );
+    assert_eq!(identity(&mut c).raw["ring"]["version"], 3);
+}
+
 #[test]
 fn join_of_other_ring_replaces_membership() {
     let (a, b) = (relay(), relay());

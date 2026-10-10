@@ -1,5 +1,6 @@
 //! Settings → Mobile: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status`,
-//! `ring_enable`, `ring_set_relay_url` and `ring_claim_host`; the event `ring:status`.
+//! `ring_enable`, `ring_set_relay_url`, `ring_claim_host` and `ring_remove_member` (#22); the
+//! event `ring:status`.
 //! Pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`, `ring_pair_computer` and
 //! `ring_pair_cancel`; the event `ring:pairing`.
 //!
@@ -10,10 +11,11 @@
 use serde::Serialize;
 use std::sync::Arc;
 use xshell_hostlink::ring::{
-    default_relay_url, DesktopRing, DesktopRingConfig, HostRingState, HostSync, PairingEvent,
-    PairingFlow, PairingObserver, RingObserver, RingView, SyncWorker,
+    configured_hosts, default_relay_url, DesktopRing, DesktopRingConfig, HostRingState, HostSync,
+    PairingEvent, PairingFlow, PairingObserver, RingObserver, RingView, SyncWorker,
 };
 use xshell_hostlink::{HostStatus, LOCAL_HOST_ID};
+use xshell_protocol::ring::SignKey;
 
 /// The one the app's Host Observer feeds.
 pub static HOST_SYNC: HostSync = HostSync::new();
@@ -124,6 +126,23 @@ pub fn setup(app: &AppHandle) {
             }
         }),
     );
+    // A Host counts as configured when this window has it or `settings.json` on disk lists
+    // it (another window may have saved it): its Daemon is not offered for removal.
+    match app
+        .path()
+        .resolve("settings.json", tauri::path::BaseDirectory::AppData)
+    {
+        Ok(settings) => {
+            let c = app.clone();
+            worker
+                .ring
+                .set_configured_hosts(configured_hosts(settings, move |id| {
+                    c.try_state::<crate::hosts::Hosts>()
+                        .is_some_and(|h| h.manager.host(id).is_some())
+                }));
+        }
+        Err(e) => eprintln!("xshell: cannot find settings.json: {e}"),
+    }
     app.manage(RingState {
         worker: worker.clone(),
     });
@@ -201,6 +220,20 @@ pub async fn ring_claim_host(app: AppHandle, host: String) -> Result<RingStatus,
     let w = worker(&app)?;
     run(move || {
         w.claim(&host)?;
+        Ok(status_of(&app, w.ring.view()))
+    })
+    .await
+}
+
+/// Removes a device from the Ring (#22): a new Roster version without it. Every Daemon
+/// connected over its Host link is told at once; the others learn it from the Relay.
+#[tauri::command]
+pub async fn ring_remove_member(app: AppHandle, sign_key: String) -> Result<RingStatus, String> {
+    let w = worker(&app)?;
+    run(move || {
+        let key = SignKey::parse(&sign_key).map_err(|e| e.to_string())?;
+        w.remove_member(&key)?;
+        HOST_SYNC.poke_all();
         Ok(status_of(&app, w.ring.view()))
     })
     .await

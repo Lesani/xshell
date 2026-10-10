@@ -1039,6 +1039,81 @@ pub fn removed_member_is_disconnected(t: &RelayTarget) {
     assert_eq!(c.error(WAIT).map(|e| e.0), Some(ErrorCode::NotMember));
 }
 
+/// After a removal the Relay stops routing for the removed member: an envelope addressed to
+/// it is `unknown_recipient` (the socket stays open), and its presence is forgotten.
+pub fn removed_member_is_unknown_recipient(t: &RelayTarget) {
+    let mut r = TestRing::new(&t.url);
+    let (a, rec_a) = connect(t, &r.chain, signer(&r.desktop));
+    let (_m, rec_m) = connect(t, &r.chain, signer(&r.mobile));
+    let gone = r.mobile.sign_key();
+    let v3 = r.next(|d| {
+        d.remove(&gone);
+    });
+    a.publish_roster(&v3).expect("publish");
+    assert!(rec_m.closed(WAIT).is_some(), "the removed member is cut");
+    let mut d = RawConn::login(t, &r.chain, &*r.desktop2);
+    d.env(&gone, b"still there?");
+    let deadline = Instant::now() + WAIT;
+    let refused = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match d.frame(left) {
+            Some(RelayFrame::Error { code, to, .. }) => break Some((code, to)),
+            Some(_) => continue,
+            None => break None,
+        }
+    };
+    assert_eq!(refused, Some((ErrorCode::UnknownRecipient, Some(gone))));
+    // The socket stays open.
+    d.env(&r.desktop.sign_key(), b"still here");
+    assert!(rec_a
+        .wait_for(
+            WAIT,
+            |e| matches!(e, Event::Envelope { payload, .. } if payload == b"still here")
+        )
+        .is_some());
+    // A device logging in now hears nothing of the removed member.
+    let mut c = RawConn::open(t, &r.ring_id()).expect("open");
+    let (nonce, v) = c.challenge();
+    assert_eq!(v, 3);
+    c.auth(&*r.daemon, &t.origin(), &r.ring_id(), &nonce);
+    match c.frame(WAIT) {
+        Some(RelayFrame::Welcome { presence, .. }) => {
+            assert!(presence.iter().all(|p| p.sign_key != gone), "{presence:?}");
+            assert!(presence.iter().any(|p| p.sign_key == r.daemon.sign_key()));
+        }
+        other => panic!("expected welcome, got {other:?}"),
+    }
+}
+
+/// A Mobile-signed extension staged through `auth.chain` is refused before anything is
+/// committed: only a Desktop may sign a new version.
+pub fn auth_chain_signed_by_mobile_is_refused(t: &RelayTarget) {
+    let r = TestRing::new(&t.url);
+    let (_a, _) = connect(t, &r.chain, signer(&r.desktop));
+    assert_eq!(relay_version(t, &r.ring_id()), 2);
+    let intruder = keys();
+    let forged = raw_next(r.chain.head(), &*r.mobile, |x| {
+        x.members.push(member(&intruder, "intruder", Role::Desktop));
+    });
+    let mut c = RawConn::open(t, &r.ring_id()).expect("open");
+    let (nonce, v) = c.challenge();
+    assert_eq!(v, 2);
+    c.auth_chain(&[&forged]);
+    c.auth(&*r.mobile, &t.origin(), &r.ring_id(), &nonce);
+    let e = c.error(WAIT).expect("an error");
+    assert_eq!(
+        (e.0, e.2.as_deref()),
+        (ErrorCode::RosterInvalid, Some("signer_not_desktop"))
+    );
+    assert_eq!(c.close_code(WAIT), Some(close::REFUSED));
+    assert_eq!(relay_version(t, &r.ring_id()), 2);
+    // The intruder the forged version names is no member.
+    let mut i = RawConn::open(t, &r.ring_id()).expect("open");
+    let (nonce, _) = i.challenge();
+    i.auth(&*intruder, &t.origin(), &r.ring_id(), &nonce);
+    assert_eq!(i.error(WAIT).map(|e| e.0), Some(ErrorCode::NotMember));
+}
+
 pub fn client_syncs_newer_roster_on_welcome(t: &RelayTarget) {
     let mut r = TestRing::new(&t.url);
     let old = r.chain.clone();
@@ -2334,6 +2409,14 @@ pub const SCENARIOS: &[(&str, Scenario)] = &[
     (
         "removed_member_is_disconnected",
         removed_member_is_disconnected,
+    ),
+    (
+        "removed_member_is_unknown_recipient",
+        removed_member_is_unknown_recipient,
+    ),
+    (
+        "auth_chain_signed_by_mobile_is_refused",
+        auth_chain_signed_by_mobile_is_refused,
     ),
     (
         "client_syncs_newer_roster_on_welcome",

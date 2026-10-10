@@ -58,6 +58,8 @@ scenario!(
     roster_put_is_broadcast_and_accepted,
     relay_refuses_stale_or_mobile_signed_put,
     removed_member_is_disconnected,
+    removed_member_is_unknown_recipient,
+    auth_chain_signed_by_mobile_is_refused,
     client_syncs_newer_roster_on_welcome,
     entitlement_slot_round_trips,
     auth_timeout_closes,
@@ -120,7 +122,7 @@ fn state_foreground_lease_expires() {
 #[test]
 fn every_scenario_is_listed_and_run_here() {
     // The macros above and the lists must not drift apart.
-    assert_eq!(SCENARIOS.len(), 37);
+    assert_eq!(SCENARIOS.len(), 39);
     assert_eq!(PUSH_SCENARIOS.len(), 5);
     assert_eq!(PUSH_UNAVAILABLE_SCENARIOS.len(), 1);
     assert_eq!(FOREGROUND_LEASE_SCENARIOS.len(), 1);

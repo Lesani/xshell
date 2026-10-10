@@ -50,10 +50,17 @@ export function useRing() {
     if (mounted.current) setStatus(s);
   }, []);
 
+  // Removes a device (#22): a new Roster version without it.
+  const removeMember = useCallback(async (signKey: string) => {
+    const s = await invoke<RingStatus>("ring_remove_member", { signKey });
+    if (mounted.current) setStatus(s);
+    return s;
+  }, []);
+
   const startPhone = useCallback(() => invoke<PhoneStart>("ring_pair_phone_start"), []);
   const cancelPhone = useCallback(() => invoke<void>("ring_pair_phone_cancel"), []);
   const pairComputer = useCallback((code: string) => invoke<void>("ring_pair_computer", { code }), []);
   const cancelComputer = useCallback(() => invoke<void>("ring_pair_cancel"), []);
 
-  return { status, enable, setRelayUrl, claimHost, pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
+  return { status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
 }

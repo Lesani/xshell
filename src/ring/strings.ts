@@ -1,4 +1,4 @@
-// Every user-facing string of Settings → Mobile (#8, #21, pairing #9): the binding copy
+// Every user-facing string of Settings → Mobile (#8, #21, pairing #9, removal #22): the binding copy
 // tables and the adopted review copy, verbatim. `{param}` placeholders are filled by fmt().
 
 export const S = {
@@ -64,6 +64,20 @@ export const S = {
   "mobile.pair.computer.invalid": "Enter 16 letters and digits in the form XXXX-XXXX-XXXX-XXXX.",
   "mobile.pair.err.role": "That device can't be added as a computer.",
   "mobile.pair.err.full": "You've reached the limit of 64 devices. Remove a device, then try again.",
+  "mobile.member.lastSeen": "Last seen {ago}",
+  "mobile.member.remove": "Remove",
+  "mobile.member.removing": "Removing…",
+  "mobile.remove.confirmTitle": "Remove {name}?",
+  "mobile.remove.confirmBody.mobile": "{name} will lose access now, and its open connections to your computers will end. Pair this phone again to add it back.",
+  "mobile.remove.confirmBody.daemon": "Phones will no longer be able to reach agents on {name}. Pair this Host again to add it back.",
+  "mobile.remove.confirmBody.desktop": "{name} will no longer be able to add or remove devices.",
+  "mobile.remove.confirm": "Remove",
+  "mobile.remove.failed": "Couldn't remove {name}: {error}",
+  "mobile.remove.err.inUse": "This device belongs to a Host in Settings → Hosts. Remove the Host there first.",
+  "mobile.remove.err.self": "This app can't remove itself.",
+  "mobile.remove.err.otherWindow": "Another xshell window manages mobile access. Remove the device there.",
+  "mobile.remove.hostHint": "To remove a Host, remove it in Settings → Hosts first. This computer stays while mobile access is on.",
+  "mobile.remove.pending": "{name} was removed here. Other devices will refuse it once xshell reconnects to the relay.",
 } as const;
 
 export type StringKey = keyof typeof S;

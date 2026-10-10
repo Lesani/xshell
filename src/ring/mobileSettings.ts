@@ -1,5 +1,6 @@
 import { fmt, type StringKey } from "./strings";
 import type { HostRingState, MemberRole, MemberView, RingStatus } from "./types";
+import { timeAgo } from "../utils";
 
 // Settings → Mobile, the pure part: status lines, labels and the Relay URL form.
 
@@ -89,6 +90,99 @@ export function canEnable(s: Pick<RingStatus, "enabled" | "problem">): boolean {
 export function problemLine(s: RingStatus): string | null {
   if (s.problem === "recovered") return fmt("mobile.problem.recovered", { path: s.problemDetail ?? "" });
   if (s.problem === "unreadable") return fmt("mobile.problem.unreadable", { error: s.problemDetail ?? "" });
+  return null;
+}
+
+// ── Removing a device (#22) ─────────────────────────────────────────────────
+
+// Whether a member's row offers Remove: the Desktop says it may go, and this window runs the
+// connection (another window's removal would be refused).
+export function canRemove(m: MemberView, s: Pick<RingStatus, "connection">): boolean {
+  return m.removable && !m.thisApp && !m.thisComputer && s.connection !== "other-window";
+}
+
+// Why a Host's row (this computer's, or a configured Remote Host's) has no Remove button.
+export function removeHint(m: MemberView): string | null {
+  if (m.removable || m.thisApp) return null;
+  return m.thisComputer || m.hostId ? fmt("mobile.remove.hostHint") : null;
+}
+
+// "Last seen …" under a device that is closed or unreachable, while this Desktop is connected
+// and so knows. Uses Date.now().
+export function lastSeenLine(m: MemberView, s: Pick<RingStatus, "connection">): string | null {
+  if (s.connection !== "connected" || m.thisApp) return null;
+  const { kind, at } = m.presence;
+  if ((kind !== "closed" && kind !== "unreachable") || at == null) return null;
+  const ago = timeAgo(new Date(at * 1000).toISOString());
+  return ago ? fmt("mobile.member.lastSeen", { ago }) : null;
+}
+
+const CONFIRM_BODY: Record<MemberRole, StringKey> = {
+  mobile: "mobile.remove.confirmBody.mobile",
+  daemon: "mobile.remove.confirmBody.daemon",
+  desktop: "mobile.remove.confirmBody.desktop",
+};
+
+export function removeConfirm(m: Pick<MemberView, "name" | "role">): { title: string; body: string; confirm: string } {
+  return {
+    title: fmt("mobile.remove.confirmTitle", { name: m.name }),
+    body: fmt(CONFIRM_BODY[m.role], { name: m.name }),
+    confirm: fmt("mobile.remove.confirm"),
+  };
+}
+
+const REMOVE_REFUSAL: Record<string, StringKey> = {
+  in_use: "mobile.remove.err.inUse",
+  self: "mobile.remove.err.self",
+  other_window: "mobile.remove.err.otherWindow",
+};
+
+// A failed removal: the Desktop's refusals start with a code (`in_use: …`).
+export function removeErrorLine(name: string, e: unknown): string {
+  const text = errorText(e);
+  const m = /^([a-z_]+): (.*)$/s.exec(text);
+  const key = m ? REMOVE_REFUSAL[m[1]] : undefined;
+  if (key) return fmt(key);
+  return fmt("mobile.remove.failed", { name, error: m ? m[2] : text });
+}
+
+// After a removal while this Desktop is not connected to the relay: removed here only, so far.
+export function removePendingLine(s: Pick<RingStatus, "connection">, name: string): string | null {
+  return s.connection === "connected" ? null : fmt("mobile.remove.pending", { name });
+}
+
+// A removal as Settings → Mobile follows it, kept apart from the member list (the row goes
+// away when it succeeds; the notes stay).
+export type Removal =
+  | { state: "idle" }
+  | { state: "confirming"; member: MemberView }
+  | { state: "removing"; signKey: string; name: string }
+  | { state: "failed"; signKey: string; line: string }
+  | { state: "removed"; pending: string | null };
+
+export type RemovalAction =
+  | { type: "ask"; member: MemberView }
+  | { type: "cancel" }
+  | { type: "start" }
+  | { type: "done"; status: Pick<RingStatus, "connection"> }
+  | { type: "failed"; error: unknown };
+
+export const REMOVAL_IDLE: Removal = { state: "idle" };
+
+export function removalReducer(r: Removal, a: RemovalAction): Removal {
+  switch (a.type) {
+    case "ask": return r.state === "removing" ? r : { state: "confirming", member: a.member };
+    case "cancel": return r.state === "confirming" ? REMOVAL_IDLE : r;
+    case "start": return r.state === "confirming" ? { state: "removing", signKey: r.member.signKey, name: r.member.name } : r;
+    case "done": return r.state === "removing" ? { state: "removed", pending: removePendingLine(a.status, r.name) } : r;
+    case "failed": return r.state === "removing" ? { state: "failed", signKey: r.signKey, line: removeErrorLine(r.name, a.error) } : r;
+  }
+}
+
+// The note under the device list for a removal, if any.
+export function removalNote(r: Removal): { text: string; error: boolean } | null {
+  if (r.state === "failed") return { text: r.line, error: true };
+  if (r.state === "removed" && r.pending) return { text: r.pending, error: false };
   return null;
 }
 

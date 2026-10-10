@@ -7,12 +7,20 @@
 //! across app instances, applied to the state as on disk now, written atomically. The
 //! Connector's callbacks persist newer chains through the same transactions and never hold a
 //! lock of their own while they do.
+//!
+//! **Lock order.** The configured-Hosts predicate ([`DesktopRing::set_configured_hosts`])
+//! may take the Hosts manager's lock or read the settings file. It is only ever called with
+//! no `DesktopRing` lock held (neither `commit` nor `live`): [`DesktopRing::view`] calls it on
+//! a copy of the state, and [`DesktopRing::remove_member`] takes its answers before its
+//! transaction and checks against them. A view emission asked for under `commit` (the
+//! Connector reports a move synchronously from `set_chain` during an adoption) is deferred
+//! until the commit lock is released.
 
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -122,8 +130,8 @@ fn mapping(s: &RingState) -> BTreeMap<String, (SignKey, String)> {
 /// - a key in the head with another role is refused for that Host;
 /// - a new key is added; the Host's previous key is removed in the same version only when
 ///   it is a reinstall (the same place, a new key) and no Host, the Local Host included,
-///   maps to it afterwards. A Host retargeted elsewhere keeps its old member (#22 removes
-///   members);
+///   maps to it afterwards. A Host retargeted elsewhere keeps its old member, which the user
+///   removes in Settings → Mobile ([`DesktopRing::remove_member`]);
 /// - the member's name is that of the Host with the smallest id that maps to it, when that
 ///   Host is in the batch;
 /// - new keys that do not fit under [`MAX_MEMBERS`] are refused as `full`, the last (by
@@ -344,6 +352,15 @@ pub struct PhoneOffer {
 pub const PAIR_NOT_ENABLED: &str = "not_enabled: mobile access is not enabled";
 pub const PAIR_OTHER_WINDOW: &str = "other_window: another xshell window manages your devices";
 
+/// Refusals of [`DesktopRing::remove_member`] start with these codes (or with
+/// [`PAIR_NOT_ENABLED`] / [`PAIR_OTHER_WINDOW`]).
+pub const REMOVE_SELF: &str = "self: this app can't remove itself";
+pub const REMOVE_IN_USE: &str = "in_use: this device belongs to a host in Settings → Hosts";
+
+/// Whether a Host id is still configured in Settings → Hosts. See
+/// [`DesktopRing::set_configured_hosts`].
+pub type ConfiguredHosts = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// One member's presence as Settings → Mobile shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -386,8 +403,12 @@ pub struct MemberView {
     pub sign_key: SignKey,
     pub this_app: bool,
     pub this_computer: bool,
-    /// The configured Remote Host (the smallest id) whose Daemon this member is.
+    /// The configured Remote Host (the smallest id still in Settings → Hosts) whose Daemon
+    /// this member is.
     pub host_id: Option<String>,
+    /// Settings → Mobile offers to remove it: not this app, not this computer's Daemon, and
+    /// no configured Host's Daemon.
+    pub removable: bool,
     pub presence: PresenceView,
 }
 
@@ -458,9 +479,51 @@ pub struct DesktopRing {
     /// Connector), so results are adopted in commit order.
     commit: Mutex<()>,
     me: Weak<DesktopRing>,
+    /// Which Host ids are still configured; every one until set. Called without any other
+    /// `DesktopRing` lock held (see the module docs).
+    configured: Mutex<ConfiguredHosts>,
+    /// A view emission asked for while this thread held `commit` (the Connector reports a
+    /// move synchronously from `set_chain`): made once the commit scope ends.
+    deferred_emit: AtomicBool,
     /// Test hook: runs between a commit and the adoption of its result.
     #[cfg(test)]
     after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// The thread holding `commit`, for the lock-order test.
+    #[cfg(test)]
+    commit_owner: Mutex<Option<std::thread::ThreadId>>,
+}
+
+thread_local! {
+    /// How many `DesktopRing` commit locks this thread holds.
+    static COMMITS_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `commit`, held. Dropping it releases the lock first, then makes the emission deferred
+/// while it was held, so no view (and no configured-Hosts predicate) is built under it.
+struct CommitGuard<'a> {
+    ring: &'a DesktopRing,
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl Drop for CommitGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            *self
+                .ring
+                .commit_owner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        self.guard.take();
+        let held = COMMITS_HELD.with(|c| {
+            c.set(c.get().saturating_sub(1));
+            c.get()
+        });
+        if held == 0 && self.ring.deferred_emit.swap(false, Ordering::AcqRel) {
+            self.ring.emit();
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -518,8 +581,12 @@ impl DesktopRing {
             live: Mutex::new(Live::default()),
             commit: Mutex::new(()),
             me: me.clone(),
+            configured: Mutex::new(Arc::new(|_: &str| true)),
+            deferred_emit: AtomicBool::new(false),
             #[cfg(test)]
             after_commit: Mutex::new(None),
+            #[cfg(test)]
+            commit_owner: Mutex::new(None),
         });
         let mut seen = ring.store.signature();
         ring.reload();
@@ -551,12 +618,44 @@ impl DesktopRing {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn lock_commit(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.commit.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_commit(&self) -> CommitGuard<'_> {
+        let guard = self.commit.lock().unwrap_or_else(|e| e.into_inner());
+        COMMITS_HELD.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        {
+            *self.commit_owner.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::thread::current().id());
+        }
+        CommitGuard {
+            ring: self,
+            guard: Some(guard),
+        }
     }
 
+    /// Tells the observer about the current view. Under a commit lock (a Connector callback
+    /// made synchronously from `adopt`), only noted: the guard emits when it is released.
     fn emit(&self) {
+        if COMMITS_HELD.with(|c| c.get()) > 0 {
+            self.deferred_emit.store(true, Ordering::Release);
+            return;
+        }
         self.observer.changed(&self.view());
+    }
+
+    /// Tells which Host ids are still configured in Settings → Hosts (by default every one
+    /// is). A Daemon member mapped only by Hosts that are not is shown without a Host and can
+    /// be removed. `f` may take the Hosts manager's lock or read the settings file: it is
+    /// never called under a `DesktopRing` lock.
+    pub fn set_configured_hosts(&self, f: ConfiguredHosts) {
+        *self.configured.lock().unwrap_or_else(|e| e.into_inner()) = f;
+        self.emit();
+    }
+
+    fn configured(&self) -> ConfiguredHosts {
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Re-reads the state from disk and adopts it (under the commit lock, fenced), then
@@ -1272,6 +1371,86 @@ impl DesktopRing {
         })
     }
 
+    /// Removes `key` from the Ring: a new Roster version without it, committed, adopted and
+    /// published through the Connector (the Relay then cuts the member and refuses it). Like
+    /// pairing, it needs this instance to run the connection. Refused for this app
+    /// ([`REMOVE_SELF`]), this computer's Daemon and the Daemon of a Host still configured
+    /// ([`REMOVE_IN_USE`]: the Host worker would add it back). Every Host entry mapped to the
+    /// key goes with it. A key the head does not list is a no-op. During a Relay move the
+    /// move's obligation grows to the new version, so the old Relay learns of the removal
+    /// too before the Connector leaves it. Returns the chain, for the Daemons.
+    pub fn remove_member(&self, key: &SignKey) -> Result<RosterChain, String> {
+        // The configured-Hosts answers, taken before any Ring lock (see the module docs). A
+        // Host id mapped to the key that was not asked about counts as configured.
+        let ids: Vec<String> = self
+            .lock()
+            .state
+            .as_ref()
+            .map(|s| {
+                s.host_members
+                    .iter()
+                    .filter(|(_, h)| h.sign_key == *key)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let configured = self.configured();
+        let unconfigured: BTreeSet<String> = ids.into_iter().filter(|id| !configured(id)).collect();
+        let chain = {
+            let _c = self.lock_commit();
+            self.pairing_state()?;
+            let (s, changed) = self.tx(|cur, _| {
+                let Some(mut s) = cur else {
+                    return Err(PAIR_NOT_ENABLED.to_string());
+                };
+                if *key == s.keys.sign_key() {
+                    return Err(REMOVE_SELF.to_string());
+                }
+                if s.chain.head().member(key).is_none() {
+                    return Ok((None, (s, false)));
+                }
+                let in_use = s.local_member == Some(*key)
+                    || s.host_members
+                        .iter()
+                        .any(|(id, h)| h.sign_key == *key && !unconfigured.contains(id));
+                if in_use {
+                    return Err(REMOVE_IN_USE.to_string());
+                }
+                let next = s
+                    .chain
+                    .head()
+                    .next(&*s.keys, now(), |d| {
+                        d.remove(key);
+                    })
+                    .map_err(|e| e.to_string())?;
+                s.chain
+                    .accept(std::slice::from_ref(&next))
+                    .map_err(|e| e.to_string())?;
+                s.host_members.retain(|_, h| h.sign_key != *key);
+                // A move still owed to the old Relay now owes it this version too: the
+                // devices still there must learn of the removal. The Connector and
+                // `clear_pending_move` clear only the job they acknowledged, so the old job's
+                // acknowledgement leaves this one standing.
+                if let Some(job) = &s.pending_move {
+                    if let Some(j) =
+                        MoveJob::new(&s.chain, job.from).filter(|j| j.source == job.source)
+                    {
+                        s.pending_move = Some(j);
+                    }
+                }
+                Ok((Some(s.clone()), (s, true)))
+            })?;
+            if !changed {
+                return Ok(s.chain);
+            }
+            self.hook();
+            self.adopt(s.clone());
+            s.chain
+        };
+        self.emit();
+        Ok(chain)
+    }
+
     /// The chain held, if a Ring exists.
     pub fn chain(&self) -> Option<RosterChain> {
         self.lock().state.as_ref().map(|s| s.chain.clone())
@@ -1352,6 +1531,14 @@ impl DesktopRing {
             },
         });
         let me = s.keys.sign_key();
+        // Asked here, on a copy of the state, with no Ring lock held.
+        let configured = self.configured();
+        let configured: BTreeSet<&str> = s
+            .host_members
+            .keys()
+            .map(String::as_str)
+            .filter(|id| configured(id))
+            .collect();
         let live = if v.connection == "connected" {
             connector.and_then(|c| c.members())
         } else {
@@ -1376,18 +1563,22 @@ impl DesktopRing {
                         .unwrap_or_else(PresenceView::unknown),
                     None => PresenceView::unknown(),
                 };
+                let this_app = m.sign_key == me;
+                let this_computer = s.local_member == Some(m.sign_key);
+                // `host_members` iterates in id order: the first is the smallest.
+                let host_id = s
+                    .host_members
+                    .iter()
+                    .find(|(id, h)| h.sign_key == m.sign_key && configured.contains(id.as_str()))
+                    .map(|(id, _)| id.clone());
                 MemberView {
                     name: m.name.clone(),
                     role: m.role,
                     sign_key: m.sign_key,
-                    this_app: m.sign_key == me,
-                    this_computer: s.local_member == Some(m.sign_key),
-                    // `host_members` iterates in id order: the first is the smallest.
-                    host_id: s
-                        .host_members
-                        .iter()
-                        .find(|(_, h)| h.sign_key == m.sign_key)
-                        .map(|(id, _)| id.clone()),
+                    this_app,
+                    this_computer,
+                    removable: !this_app && !this_computer && host_id.is_none(),
+                    host_id,
                     presence,
                 }
             })
@@ -2594,5 +2785,338 @@ mod tests {
         );
         a.quit();
         b.quit();
+    }
+
+    // ---- Removal (#22) ------------------------------------------------------------------
+
+    use xshell_protocol::ring::relay::wire::RelayFrame;
+
+    /// A Ring on `r` with a paired phone; returns the ring, the phone's keys and its chain.
+    fn with_phone(
+        t: &tempfile::TempDir,
+        r: &TestRelay,
+    ) -> (Arc<DesktopRing>, Arc<DeviceKeys>, RosterChain) {
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let offer = ring.pair_phone(Arc::new(Pairings::default())).unwrap();
+        let phone = Arc::new(DeviceKeys::generate().unwrap());
+        let chain = scan(&offer.payload, &phone).unwrap();
+        (ring, phone, chain)
+    }
+
+    fn wait_until(what: &str, pred: impl Fn() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !pred() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The Relay's answer to `keys` logging in now.
+    fn login_error(r: &TestRelay, rid: &RingId, keys: &DeviceKeys) -> Option<ErrorCodeOf> {
+        let t = r.target();
+        let mut c = contract::RawConn::open(&t, rid).unwrap();
+        let (nonce, _) = c.challenge();
+        c.auth(keys, &t.origin(), rid, &nonce);
+        c.error(WAIT).map(|e| e.0)
+    }
+
+    type ErrorCodeOf = xshell_protocol::ring::relay::wire::ErrorCode;
+
+    #[test]
+    fn remove_member_publishes_a_version_without_it() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, phone, chain) = with_phone(&t, &r);
+        let rid = chain.ring_id().clone();
+        assert_eq!(chain.head().version(), 2);
+        let c = ring.remove_member(&phone.sign_key()).unwrap();
+        assert_eq!(c.head().version(), 3);
+        assert!(c.head().member(&phone.sign_key()).is_none());
+        assert_eq!(stored(&t).chain, c, "committed");
+        assert!(ring
+            .view()
+            .members
+            .iter()
+            .all(|m| m.sign_key != phone.sign_key()));
+        // Published through the Connector: the Relay holds it and refuses the phone.
+        wait_until("v3 on the relay", || r.head_version(&rid) == Some(3));
+        assert_eq!(login_error(&r, &rid, &phone), Some(ErrorCodeOf::NotMember));
+        ring.quit();
+    }
+
+    #[test]
+    fn remove_member_refuses_this_app() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let me = ring.view().members[0].sign_key;
+        assert_eq!(ring.remove_member(&me).unwrap_err(), REMOVE_SELF);
+        assert_eq!(ring.view().version, Some(1));
+        assert_eq!(stored(&t).chain.head().version(), 1);
+        ring.quit();
+    }
+
+    #[test]
+    fn remove_member_refuses_hosts_still_configured() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let (_, l) = identity();
+        ring.ensure_local_daemon(&l).unwrap();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a.clone())]);
+        let version = ring.view().version;
+        ring.set_configured_hosts(Arc::new(|_: &str| true));
+        assert_eq!(ring.remove_member(&a.sign_key).unwrap_err(), REMOVE_IN_USE);
+        assert_eq!(ring.remove_member(&l.sign_key).unwrap_err(), REMOVE_IN_USE);
+        assert_eq!(ring.view().version, version, "nothing signed");
+        // Once its Host is gone from Settings → Hosts, the member can go, and its mapping
+        // with it.
+        ring.set_configured_hosts(Arc::new(|id: &str| id != "h_aaaaaaaa"));
+        let c = ring.remove_member(&a.sign_key).unwrap();
+        assert!(c.head().member(&a.sign_key).is_none());
+        assert!(!stored(&t).host_members.contains_key("h_aaaaaaaa"));
+        // This computer's Daemon stays refused whatever is configured.
+        ring.set_configured_hosts(Arc::new(|_: &str| false));
+        assert_eq!(ring.remove_member(&l.sign_key).unwrap_err(), REMOVE_IN_USE);
+        ring.quit();
+    }
+
+    /// Window B saved Host H in the shared settings file; window A, which does not have H in
+    /// memory, still refuses to remove H's Daemon.
+    #[test]
+    fn remove_member_refuses_a_host_saved_by_another_window() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a.clone())]);
+        let settings = t.path().join("settings.json");
+        ring.set_configured_hosts(super::super::configured_hosts(settings.clone(), |_| false));
+        std::fs::write(&settings, r#"{"hosts":[{"id":"h_aaaaaaaa","name":"A"}]}"#).unwrap();
+        assert_eq!(ring.remove_member(&a.sign_key).unwrap_err(), REMOVE_IN_USE);
+        let m = |ring: &DesktopRing| {
+            ring.view()
+                .members
+                .into_iter()
+                .find(|m| m.sign_key == a.sign_key)
+        };
+        assert!(!m(&ring).unwrap().removable);
+        std::fs::write(&settings, r#"{"hosts":[]}"#).unwrap();
+        assert!(m(&ring).unwrap().removable);
+        ring.remove_member(&a.sign_key).unwrap();
+        assert!(m(&ring).is_none());
+        ring.quit();
+    }
+
+    #[test]
+    fn remove_member_is_idempotent() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, a) = identity();
+        let sig = Store::new(t.path().join("ring")).signature();
+        let c = ring.remove_member(&a.sign_key).unwrap();
+        assert_eq!(c.head().version(), 1);
+        assert_eq!(
+            Store::new(t.path().join("ring")).signature(),
+            sig,
+            "nothing written"
+        );
+        ring.quit();
+    }
+
+    #[test]
+    fn remove_member_needs_the_connection_owner() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (_, k) = identity();
+        let (none, _) = open(cfg(t.path(), &r.url()));
+        assert_eq!(
+            none.remove_member(&k.sign_key).unwrap_err(),
+            PAIR_NOT_ENABLED
+        );
+        none.quit();
+        let (a, _) = open(cfg(t.path(), &r.url()));
+        a.enable(None, false).unwrap();
+        wait_view(&a, "a connected", connected);
+        let (b, _) = open(cfg(t.path(), &r.url()));
+        wait_view(&b, "b defers", |v| v.connection == "other-window");
+        assert_eq!(b.remove_member(&k.sign_key).unwrap_err(), PAIR_OTHER_WINDOW);
+        a.quit();
+        b.quit();
+    }
+
+    #[test]
+    fn view_marks_removable_and_only_configured_host_ids() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, phone, _) = with_phone(&t, &r);
+        let (_, l) = identity();
+        let (_, a) = identity();
+        let (_, b) = identity();
+        ring.ensure_local_daemon(&l).unwrap();
+        ensure(
+            &ring,
+            &[
+                (href("h_aaaaaaaa", "A", "a|"), a.clone()),
+                (href("h_bbbbbbbb", "B", "b|"), b.clone()),
+            ],
+        );
+        ring.set_configured_hosts(Arc::new(|id: &str| id == "h_aaaaaaaa"));
+        let v = ring.view();
+        let of = |k: &SignKey| v.members.iter().find(|m| m.sign_key == *k).unwrap();
+        let me = v.members.iter().find(|m| m.this_app).unwrap();
+        assert!(!me.removable);
+        assert!(of(&l.sign_key).this_computer && !of(&l.sign_key).removable);
+        assert_eq!(of(&a.sign_key).host_id.as_deref(), Some("h_aaaaaaaa"));
+        assert!(!of(&a.sign_key).removable);
+        assert_eq!(
+            of(&b.sign_key).host_id,
+            None,
+            "its Host is no longer configured"
+        );
+        assert!(of(&b.sign_key).removable);
+        assert!(of(&phone.sign_key()).removable);
+        let json = serde_json::to_value(of(&phone.sign_key())).unwrap();
+        assert_eq!(json["removable"], true);
+        ring.quit();
+    }
+
+    /// A Roster the Relay sends that a phone signed is ignored: the Desktop keeps its head.
+    #[test]
+    fn desktop_ring_ignores_a_mobile_signed_roster() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, phone, chain) = with_phone(&t, &r);
+        let rid = chain.ring_id().clone();
+        let me = ring
+            .view()
+            .members
+            .iter()
+            .find(|m| m.this_app)
+            .unwrap()
+            .sign_key;
+        let intruder = Arc::new(DeviceKeys::generate().unwrap());
+        let forged = contract::raw_next(chain.head(), &*phone, |x| {
+            x.members.retain(|m| m.sign_key != me);
+            x.members
+                .push(contract::member(&intruder, "intruder", Role::Desktop));
+        });
+        let frame = RelayFrame::Roster {
+            roster: forged.token().to_string(),
+        }
+        .encode();
+        assert!(r.inject(&rid, &me, &frame));
+        // The phone coming online is announced on the same socket after the forged Roster:
+        // once the view shows it, the forged one was handled.
+        let (_pc, _) = contract::connect(&r.target(), &chain, phone.clone());
+        wait_view(&ring, "the phone online", |v| {
+            v.members
+                .iter()
+                .any(|m| m.sign_key == phone.sign_key() && m.presence.kind == "online")
+        });
+        let v = ring.view();
+        assert_eq!(v.version, Some(2));
+        assert!(v.members.iter().all(|m| m.sign_key != intruder.sign_key()));
+        assert!(v.members.iter().any(|m| m.this_app));
+        assert_eq!(stored(&t).chain.head().version(), 2);
+        ring.quit();
+    }
+
+    /// A removal while a Relay move is still owed reaches the old Relay too, before the
+    /// Connector leaves it: the old Relay refuses the removed phone even when the new Relay
+    /// is down. The move's older acknowledgement does not clear the grown obligation.
+    #[test]
+    fn removal_during_a_pending_move_reaches_both_relays() {
+        for dest_up in [true, false] {
+            let one = relay();
+            let two = relay();
+            let dest = if dest_up {
+                two.url()
+            } else {
+                "ws://127.0.0.1:9".to_string()
+            };
+            let t = tempfile::tempdir().unwrap();
+            let (ring, phone, chain) = with_phone(&t, &one);
+            let rid = chain.ring_id().clone();
+            let (_pc, prec) = contract::connect(&one.target(), &chain, phone.clone());
+            one.refuse_roster_puts(true);
+            ring.set_relay_url(&dest).unwrap();
+            let moved = stored(&t).pending_move.unwrap();
+            assert_eq!((moved.from, moved.target), (2, 3));
+            let c = ring.remove_member(&phone.sign_key()).unwrap();
+            assert_eq!(c.head().version(), 4);
+            let grown = stored(&t).pending_move.unwrap();
+            assert_eq!(
+                (grown.source.as_str(), grown.from, grown.target),
+                (one.url().as_str(), 2, 4),
+                "dest_up {dest_up}"
+            );
+            // The first job's acknowledgement leaves the grown one standing.
+            ring.clear_pending_move(&moved);
+            assert_eq!(stored(&t).pending_move, Some(grown.clone()));
+            one.refuse_roster_puts(false);
+            wait_until("v4 on the old relay", || one.head_version(&rid) == Some(4));
+            assert!(
+                prec.closed(WAIT).is_some(),
+                "the phone was cut on the old relay"
+            );
+            assert_eq!(
+                login_error(&one, &rid, &phone),
+                Some(ErrorCodeOf::NotMember),
+                "dest_up {dest_up}"
+            );
+            wait_until("the move cleared", || stored(&t).pending_move.is_none());
+            if dest_up {
+                wait_until("v4 on the new relay", || two.head_version(&rid) == Some(4));
+                assert_eq!(
+                    login_error(&two, &rid, &phone),
+                    Some(ErrorCodeOf::NotMember)
+                );
+            }
+            ring.quit();
+        }
+    }
+
+    /// The configured-Hosts predicate may take the Hosts manager's lock: it never runs while
+    /// this thread holds the commit lock, also when the Connector reports a pending move
+    /// synchronously from the adoption of a removal.
+    #[test]
+    fn the_configured_predicate_never_runs_under_the_commit_lock() {
+        use std::sync::atomic::AtomicUsize;
+        let (one, two) = (relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, views) = open(cfg(t.path(), &one.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let (_, a) = identity();
+        ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a.clone())]);
+        let (calls, under) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (c2, u2) = (calls.clone(), under.clone());
+        let weak = Arc::downgrade(&ring);
+        ring.set_configured_hosts(Arc::new(move |_: &str| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            if let Some(r) = weak.upgrade() {
+                let owner = *r.commit_owner.lock().unwrap();
+                if owner == Some(std::thread::current().id()) {
+                    u2.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            false
+        }));
+        one.refuse_roster_puts(true);
+        ring.set_relay_url(&two.url()).unwrap();
+        let before = calls.load(Ordering::SeqCst);
+        ring.remove_member(&a.sign_key).unwrap();
+        assert!(calls.load(Ordering::SeqCst) > before, "the view was built");
+        assert_eq!(
+            under.load(Ordering::SeqCst),
+            0,
+            "asked under the commit lock"
+        );
+        // The deferred emission still reached the observer, with the removal in it.
+        let last = views.last.lock().unwrap().clone().unwrap();
+        assert!(last.members.iter().all(|m| m.sign_key != a.sign_key));
+        assert!(last.moving.is_some());
+        ring.quit();
     }
 }

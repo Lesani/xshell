@@ -242,6 +242,7 @@ struct Note {
 }
 
 type Lookup = Box<dyn Fn(&str) -> Option<Arc<HostHandle>> + Send + Sync>;
+type SharedLookup = Arc<dyn Fn(&str) -> Option<Arc<HostHandle>> + Send + Sync>;
 
 /// One batch's jobs and answers.
 #[derive(Default)]
@@ -266,7 +267,7 @@ struct Ready {
 pub struct SyncWorker {
     pub ring: Arc<DesktopRing>,
     sync: &'static HostSync,
-    host: Lookup,
+    host: SharedLookup,
     changed: Box<dyn Fn() + Send + Sync>,
     notes: Mutex<BTreeMap<String, Note>>,
     /// The worker's own queue, for claims and the answers of requests it sent.
@@ -297,12 +298,18 @@ fn target_of(cfg: &crate::HostConfig) -> String {
 }
 
 impl SyncWorker {
+    /// Also tells `ring` that the Hosts `host` finds are the configured ones (an app with
+    /// several windows widens that with [`super::configured_hosts`]).
     pub fn new(
         ring: Arc<DesktopRing>,
         sync: &'static HostSync,
         host: Lookup,
         changed: Box<dyn Fn() + Send + Sync>,
     ) -> Arc<SyncWorker> {
+        let host: SharedLookup = Arc::from(host);
+        // The predicate holds the lookup only, never the worker: no cycle.
+        let lookup = host.clone();
+        ring.set_configured_hosts(Arc::new(move |id: &str| lookup(id).is_some()));
         Arc::new(SyncWorker {
             ring,
             sync,
@@ -404,6 +411,14 @@ impl SyncWorker {
                 None
             }
         }
+    }
+
+    /// Removes a member from the Ring ([`DesktopRing::remove_member`]).
+    pub fn remove_member(
+        &self,
+        key: &xshell_protocol::ring::SignKey,
+    ) -> Result<RosterChain, String> {
+        self.ring.remove_member(key)
     }
 
     /// Pairs a Host that is in another Ring with this Desktop's: bound to the key and the

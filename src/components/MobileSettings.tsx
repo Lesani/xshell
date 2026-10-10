@@ -1,14 +1,16 @@
 import { Fragment, useEffect, useReducer, useState } from "react";
-import { Monitor, Smartphone } from "lucide-react";
+import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canClaim, canEnable, canSave, connectionLine, errorText, hostLine, initialForm, localLine, moveLine, presenceChip, presenceKey, problemLine, roleKey, startsOver, targetUrl, urlError, type RelayForm } from "../ring/mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
 import { useRing, type PairingEvents } from "../ring/useRing";
 import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
 // Settings → Mobile (#8, #21): enable Mobile access (creates the Ring), choose its Relay, see
 // the Ring's devices and how they stand, and which Remote Hosts could not join. Pairing (#9):
-// pair a phone by QR code, add a computer by the code `xshelld pair` shows.
+// pair a phone by QR code, add a computer by the code `xshelld pair` shows. Removal (#22):
+// remove a device from the list.
 
 export interface Pairing {
   events: PairingEvents;
@@ -132,8 +134,10 @@ function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
 }
 
 
-function MemberRow({ m, s }: { m: MemberView; s: RingStatus }) {
+function MemberRow({ m, s, removing, onRemove }: { m: MemberView; s: RingStatus; removing: boolean; onRemove: (m: MemberView) => void }) {
   const key = presenceKey(m, s);
+  const seen = lastSeenLine(m, s);
+  const hint = removeHint(m);
   return (
     <div className="host-row">
       <div className="host-row-head">
@@ -144,9 +148,34 @@ function MemberRow({ m, s }: { m: MemberView; s: RingStatus }) {
             {m.thisApp ? ` · ${fmt("mobile.member.thisApp")}` : ""}
             {m.thisComputer ? ` · ${fmt("mobile.member.thisComputer")}` : ""}
           </span>
+          {seen && <span className="host-row-muted">{seen}</span>}
         </div>
         <span className={`host-chip host-chip-${presenceChip(key)}`}><span className="host-chip-dot" />{fmt(key)}</span>
       </div>
+      {hint && <div className="host-row-note">{hint}</div>}
+      {canRemove(m, s) && (
+        <div className="host-row-actions">
+          <span style={{ flex: 1 }} />
+          <button className="btn btn-ghost settings-action-btn host-row-remove" disabled={removing} onClick={() => onRemove(m)}>
+            <Trash2 size={11} /> {removing ? fmt("mobile.member.removing") : fmt("mobile.member.remove")}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The device list and a removal's note, which stays below the list after the removed row is
+// gone.
+export function MembersSection({ s, removal, onRemove, onClaimHost }: { s: RingStatus; removal: Removal; onRemove: (m: MemberView) => void; onClaimHost: (host: string) => Promise<void> }) {
+  const note = removalNote(removal);
+  const busy = removal.state === "removing";
+  return (
+    <div className="edit-field">
+      <label className="edit-label">{fmt("mobile.members.title")}</label>
+      {s.members.map(m => <MemberRow key={m.signKey} m={m} s={s} removing={busy && removal.signKey === m.signKey} onRemove={onRemove} />)}
+      {note && <div className={note.error ? "host-form-error" : "host-row-note"}>{note.text}</div>}
+      {s.hosts.map(h => <HostNote key={h.host} h={h} onClaim={onClaimHost} />)}
     </div>
   );
 }
@@ -231,9 +260,21 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
   );
 }
 
-export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, pairing }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void>; pairing?: Pairing }) {
+export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRemoveMember, pairing }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void>; onRemoveMember: (signKey: string) => Promise<RingStatus>; pairing?: Pairing }) {
   const [enabling, setEnabling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [removal, dispatchRemoval] = useReducer(removalReducer, REMOVAL_IDLE);
+  const remove = async () => {
+    if (removal.state !== "confirming") return;
+    const key = removal.member.signKey;
+    dispatchRemoval({ type: "start" });
+    try {
+      dispatchRemoval({ type: "done", status: await onRemoveMember(key) });
+    } catch (e) {
+      dispatchRemoval({ type: "failed", error: e });
+    }
+  };
+  const confirm = removal.state === "confirming" ? removeConfirm(removal.member) : null;
   const enable = async () => {
     setEnabling(true);
     setError(null);
@@ -269,11 +310,8 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, pair
             <RelaySettings s={s} onSave={onSaveRelay} />
             {conn && <div className="host-row-note">{conn}</div>}
             {move && <div className={`host-row-note ${s.move?.state === "failed" ? "host-row-warn" : ""}`}>{move}</div>}
-            <div className="edit-field">
-              <label className="edit-label">{fmt("mobile.members.title")}</label>
-              {s.members.map(m => <MemberRow key={m.signKey} m={m} s={s} />)}
-              {s.hosts.map(h => <HostNote key={h.host} h={h} onClaim={onClaimHost} />)}
-            </div>
+            <MembersSection s={s} removal={removal} onRemove={m => dispatchRemoval({ type: "ask", member: m })} onClaimHost={onClaimHost} />
+            {confirm && <ConfirmDialog title={confirm.title} body={confirm.body} confirm={confirm.confirm} onConfirm={remove} onCancel={() => dispatchRemoval({ type: "cancel" })} />}
             {pairing && s.connection !== "other-window" && (
               <>
                 <PhonePanel p={pairing} />
@@ -289,8 +327,8 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, pair
 }
 
 export function MobileSettings() {
-  const { status, enable, setRelayUrl, claimHost, pairing, startPhone, cancelPhone, pairComputer, cancelComputer } = useRing();
+  const { status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, pairComputer, cancelComputer } = useRing();
   if (!status) return null;
   const p: Pairing = { events: pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
-  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} pairing={p} />;
+  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} onRemoveMember={removeMember} pairing={p} />;
 }
