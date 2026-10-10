@@ -202,6 +202,7 @@ pub fn open(h: &HostHandle, t: Uuid, launch: LaunchSpec, sink: Arc<VecSink>) -> 
                 cols: 80,
                 rows: 24,
                 meta: Map::new(),
+                first_message: None,
             },
             sink,
             w,

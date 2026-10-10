@@ -5,6 +5,7 @@ use portable_pty::CommandBuilder;
 use std::path::PathBuf;
 
 pub use crate::agent_status::TerminalHooks;
+pub use xshell_protocol::msg::FIRST_MESSAGE_MAX_BYTES;
 pub use xshell_protocol::LaunchSpec;
 
 /// The process a [`LaunchSpec`] resolves to, as plain data. `env` holds only the variables
@@ -143,6 +144,29 @@ pub fn resume_args(
     session_id: Option<&str>,
     cwd: &str,
 ) -> Vec<String> {
+    resume_args_with(agent_bin, session_id, cwd, &|cwd, sid| {
+        claude_jsonl_exists(ctx, cwd, sid)
+    })
+}
+
+/// Whether Claude Code has a session file for `sid` in the Project `cwd`.
+fn claude_jsonl_exists(ctx: &HostCtx, cwd: &str, sid: &str) -> bool {
+    ctx.claude_projects_dir()
+        .map(|d| {
+            d.join(encode_project_name(cwd))
+                .join(format!("{}.jsonl", sid))
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
+/// [`resume_args`], asking `jsonl_exists(cwd, sid)` whether a Claude session file exists.
+fn resume_args_with(
+    agent_bin: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+    jsonl_exists: &dyn Fn(&str, &str) -> bool,
+) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(sid) = session_id {
         match agent_bin {
@@ -162,15 +186,7 @@ pub fn resume_args(
                 v.push(sid.to_string());
             }
             _ => {
-                let jsonl_exists = ctx
-                    .claude_projects_dir()
-                    .map(|d| {
-                        d.join(encode_project_name(cwd))
-                            .join(format!("{}.jsonl", sid))
-                            .exists()
-                    })
-                    .unwrap_or(false);
-                v.push(if jsonl_exists {
+                v.push(if jsonl_exists(cwd, sid) {
                     "--resume".into()
                 } else {
                     "--session-id".into()
@@ -188,6 +204,59 @@ pub fn plan_command(ctx: &HostCtx, spec: &LaunchSpec) -> Result<CommandPlan, Str
     plan_command_with(ctx, spec, None)
 }
 
+/// The words a new chat's first message adds at the end of the agent's argv: `--`, which
+/// ends option parsing, then the message. Refused unless `spec` runs Claude Code or Codex
+/// directly (no shell, no launch prefix) as a new chat (Claude Code: no session or a session
+/// with no JSONL yet; Codex: no session), and unless the message is not blank, at most
+/// [`FIRST_MESSAGE_MAX_BYTES`] and free of NUL. Refused on Windows, where a direct agent runs
+/// through `cmd.exe /C`, which would parse the text as a command line.
+///
+/// A message without whitespace gets one trailing space: Claude Code's parser (Commander)
+/// still runs a subcommand named by the first word after `--` (`claude -- update` updates),
+/// and no subcommand name contains whitespace.
+///
+/// The Daemon calls this to refuse early; the planner checks again against the resume
+/// arguments it builds the command from (see [`plan_command_first`]).
+pub fn first_message_args(
+    ctx: &HostCtx,
+    spec: &LaunchSpec,
+    msg: &str,
+) -> Result<Vec<String>, String> {
+    let agent_bin = agent_binary(spec.agent.as_deref());
+    let resume = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
+    first_words(spec, &resume, msg)
+}
+
+/// [`first_message_args`] against `resume`, the resume arguments already resolved for `spec`.
+fn first_words(spec: &LaunchSpec, resume: &[String], msg: &str) -> Result<Vec<String>, String> {
+    if cfg!(windows) {
+        return Err("a first message is not supported on Windows hosts".into());
+    }
+    let agent_bin = match spec.direct_agent() {
+        Some(a @ ("claude" | "codex")) => a,
+        _ => return Err("a first message needs Claude Code or Codex, run directly".into()),
+    };
+    if !(resume.is_empty() || agent_bin == "claude" && resume[0] == "--session-id") {
+        return Err("a first message needs a new chat".into());
+    }
+    if msg.trim().is_empty() {
+        return Err("a first message must not be blank".into());
+    }
+    if msg.len() > FIRST_MESSAGE_MAX_BYTES {
+        return Err(format!(
+            "a first message is longer than {FIRST_MESSAGE_MAX_BYTES} bytes"
+        ));
+    }
+    if msg.contains('\0') {
+        return Err("a first message must not contain NUL".into());
+    }
+    let mut word = msg.to_string();
+    if !word.chars().any(char::is_whitespace) {
+        word.push(' ');
+    }
+    Ok(vec!["--".into(), word])
+}
+
 /// [`plan_command`], with the agent set up to report its Agent Status through `hooks`. Only
 /// agents with hooks (Claude Code, Codex) outside raw shells get them; the rest plan as
 /// without. Claude Code gets `--settings <hooks file>`, Codex its `-c` overrides, both the
@@ -198,11 +267,46 @@ pub fn plan_command_with(
     spec: &LaunchSpec,
     hooks: Option<TerminalHooks>,
 ) -> Result<CommandPlan, String> {
+    plan_command_first(ctx, spec, hooks, None)
+}
+
+/// [`plan_command_with`], with the agent started on `first`, a new chat's first message
+/// (see [`first_message_args`]). Its words come last, after the hook arguments. `first` is
+/// not part of `spec`, so it is never persisted, restored or relaunched.
+pub fn plan_command_first(
+    ctx: &HostCtx,
+    spec: &LaunchSpec,
+    hooks: Option<TerminalHooks>,
+    first: Option<&str>,
+) -> Result<CommandPlan, String> {
+    plan_command_inner(ctx, spec, hooks, first, &|cwd, sid| {
+        claude_jsonl_exists(ctx, cwd, sid)
+    })
+}
+
+/// [`plan_command_first`], asking `jsonl_exists` (once) whether a Claude session file exists.
+fn plan_command_inner(
+    ctx: &HostCtx,
+    spec: &LaunchSpec,
+    hooks: Option<TerminalHooks>,
+    first: Option<&str>,
+    jsonl_exists: &dyn Fn(&str, &str) -> bool,
+) -> Result<CommandPlan, String> {
     let mode = spec.shell_mode.as_deref().unwrap_or("claude");
     let agent_bin = agent_binary(spec.agent.as_deref());
     let hooked = hook_agent(spec).zip(hooks);
-    // The resume check uses the raw cwd, before the empty-cwd fallback below.
-    let mut agent_args = resume_args(ctx, agent_bin, spec.session_id.as_deref(), &spec.cwd);
+    // The resume check uses the raw cwd, before the empty-cwd fallback below. It is made
+    // once: the first message is checked against the same resume arguments the command gets,
+    // so a session file appearing meanwhile never pairs `--resume` with a first message.
+    let mut agent_args = resume_args_with(
+        agent_bin,
+        spec.session_id.as_deref(),
+        &spec.cwd,
+        jsonl_exists,
+    );
+    let first_words = first
+        .map(|msg| first_words(spec, &agent_args, msg))
+        .transpose()?;
     if mode != "raw" && spec.skip_permissions == Some(true) {
         if let Some(flag) = permission_flag(agent_bin) {
             // `codex resume` is a subcommand with its own options, so the flag goes after it.
@@ -218,6 +322,12 @@ pub fn plan_command_with(
         // Last: `codex resume [flag] <id>` takes `-c` after its positionals too.
         Some((HookAgent::Codex, h)) => agent_args.extend(h.hooks.codex_overrides()),
         None => {}
+    }
+    // Last: everything after `--` is the message. A first message needs a direct agent, so
+    // it is never part of a shell's command line: on Unix the agent is exec'd with it as one
+    // argv word.
+    if let Some(words) = first_words {
+        agent_args.extend(words);
     }
     let shell_kind = spec.shell_id.as_deref().unwrap_or("");
     // Override the frontend-supplied `bash.exe` for the Git Bash preset with an absolute path
@@ -1350,6 +1460,275 @@ mod tests {
             pwsh.args[3],
             "& 'claude' '--settings' '/h/.xshell/daemon/claude-hooks.json'; \
              & '/opt/x shell/xshelld' 'event' '-' 'ended'"
+        );
+    }
+
+    // ── First message ──
+
+    #[cfg(unix)]
+    fn first(
+        ctx: &HostCtx,
+        s: &LaunchSpec,
+        h: Option<&crate::agent_status::AgentHooks>,
+        msg: &str,
+    ) -> CommandPlan {
+        plan_command_first(
+            ctx,
+            s,
+            h.map(|h| TerminalHooks {
+                hooks: h,
+                terminal: TID.parse().unwrap(),
+                run: 3,
+            }),
+            Some(msg),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_message_appended_last_after_hooks() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        let h = hooks();
+        let claude = LaunchSpec {
+            session_id: Some("sid".into()),
+            ..spec("/w")
+        };
+        let plan = first(&ctx, &skipping(claude.clone()), Some(&h), "fix the bug");
+        assert_eq!(plan.program, "claude");
+        assert_eq!(
+            plan.args,
+            strings(&[
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "sid",
+                "--settings",
+                "/h/.xshell/daemon/claude-hooks.json",
+                "--",
+                "fix the bug"
+            ])
+        );
+        assert_builder(&plan);
+        // Without hooks, and with no session at all.
+        assert_eq!(
+            first(&ctx, &claude, None, "a b").args,
+            strings(&["--session-id", "sid", "--", "a b"])
+        );
+        assert_eq!(
+            first(&ctx, &spec("/w"), None, "a b").args,
+            strings(&["--", "a b"])
+        );
+        let codex = LaunchSpec {
+            agent: Some("codex".into()),
+            ..spec("/w")
+        };
+        let plan = first(&ctx, &codex, Some(&h), "hello\nworld");
+        assert_eq!(plan.program, "codex");
+        let mut want = codex_overrides();
+        want.extend(strings(&["--", "hello\nworld"]));
+        assert_eq!(plan.args, want);
+        assert_eq!(
+            first(&ctx, &skipping(codex), None, "go on").args,
+            strings(&["--dangerously-bypass-approvals-and-sandbox", "--", "go on"])
+        );
+        // The plan without a message is unchanged.
+        assert_eq!(
+            plan_command_first(&ctx, &claude, None, None).unwrap(),
+            plan_command(&ctx, &claude).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_message_single_word_gets_space() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        for agent in ["claude", "codex"] {
+            let s = LaunchSpec {
+                agent: Some(agent.into()),
+                ..spec("/w")
+            };
+            assert_eq!(
+                first(&ctx, &s, None, "update").args,
+                strings(&["--", "update "]),
+                "{agent}"
+            );
+            // Whitespace anywhere means no subcommand name matches: kept as given.
+            assert_eq!(first(&ctx, &s, None, "update\t").args[1], "update\t");
+            assert_eq!(first(&ctx, &s, None, " update").args[1], " update");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_message_leading_dash_after_separator() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        assert_eq!(
+            first(&ctx, &spec("/w"), None, "-rf").args,
+            strings(&["--", "-rf "])
+        );
+        assert_eq!(
+            first(&ctx, &spec("/w"), None, "--version please").args,
+            strings(&["--", "--version please"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_message_refused_for_resume_shell_other_agents_blank_nul_oversize() {
+        let fx = Fixture::new();
+        let cwd = "/w";
+        fx.write(
+            format!(
+                "home/.claude/projects/{}/old.jsonl",
+                encode_project_name(cwd)
+            ),
+            "{}\n",
+        );
+        let ctx = fx.ctx();
+        let refused = |s: LaunchSpec, msg: &str| {
+            let e = first_message_args(&ctx, &s, msg).unwrap_err();
+            // The plan is refused too, so nothing starts.
+            assert_eq!(
+                plan_command_first(&ctx, &s, None, Some(msg)).unwrap_err(),
+                e
+            );
+            e
+        };
+        let new_chat = refused(
+            LaunchSpec {
+                session_id: Some("old".into()),
+                ..spec(cwd)
+            },
+            "hi there",
+        );
+        assert_eq!(new_chat, "a first message needs a new chat");
+        assert_eq!(
+            refused(
+                LaunchSpec {
+                    agent: Some("codex".into()),
+                    session_id: Some("id1".into()),
+                    ..spec(cwd)
+                },
+                "hi there"
+            ),
+            "a first message needs a new chat"
+        );
+        let not_direct = [
+            LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..spec(cwd)
+            },
+            LaunchSpec {
+                shell_id: Some("bash".into()),
+                shell_command: Some("bash".into()),
+                ..spec(cwd)
+            },
+            prefixed(spec(cwd)),
+            LaunchSpec {
+                agent: Some("cursor".into()),
+                ..spec(cwd)
+            },
+            LaunchSpec {
+                agent: Some("opencode".into()),
+                ..spec(cwd)
+            },
+            LaunchSpec {
+                agent: Some("antigravity".into()),
+                ..spec(cwd)
+            },
+            LaunchSpec {
+                agent: Some("something-else".into()),
+                ..spec(cwd)
+            },
+        ];
+        for s in not_direct {
+            assert_eq!(
+                refused(s.clone(), "hi there"),
+                "a first message needs Claude Code or Codex, run directly",
+                "{s:?}"
+            );
+        }
+        let ok = spec(cwd);
+        assert_eq!(refused(ok.clone(), ""), "a first message must not be blank");
+        assert_eq!(
+            refused(ok.clone(), " \n\t "),
+            "a first message must not be blank"
+        );
+        assert_eq!(
+            refused(ok.clone(), "a\0b c"),
+            "a first message must not contain NUL"
+        );
+        let max = "x ".repeat(FIRST_MESSAGE_MAX_BYTES / 2);
+        assert_eq!(max.len(), FIRST_MESSAGE_MAX_BYTES);
+        assert_eq!(first_message_args(&ctx, &ok, &max).unwrap()[1], max);
+        assert!(refused(ok, &format!("{max}x")).contains("longer than 16384 bytes"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_message_refused_on_windows() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        for agent in ["claude", "codex"] {
+            let s = LaunchSpec {
+                agent: Some(agent.into()),
+                ..spec("C:\\w")
+            };
+            let e = first_message_args(&ctx, &s, "hello there").unwrap_err();
+            assert!(e.contains("Windows"), "{e}");
+            assert!(plan_command_first(&ctx, &s, None, Some("hello there")).is_err());
+        }
+    }
+
+    /// The planner resolves the resume mode once and checks the first message against that
+    /// same result, whatever the session file does in between.
+    #[cfg(unix)]
+    #[test]
+    fn first_message_checked_against_the_resume_args_used() {
+        let fx = Fixture::new();
+        let ctx = fx.ctx();
+        let s = LaunchSpec {
+            session_id: Some("sid".into()),
+            ..spec("/w")
+        };
+        // The session file "appears" right after the first look (and vanishes after the
+        // second): every later look disagrees with the first.
+        for first_answer in [false, true] {
+            let looks = std::cell::Cell::new(0);
+            let exists = |_: &str, _: &str| {
+                looks.set(looks.get() + 1);
+                if looks.get() == 1 {
+                    first_answer
+                } else {
+                    !first_answer
+                }
+            };
+            let r = plan_command_inner(&ctx, &s, None, Some("hi there"), &exists);
+            assert_eq!(looks.get(), 1, "one look at the session file");
+            if first_answer {
+                assert_eq!(r.unwrap_err(), "a first message needs a new chat");
+            } else {
+                assert_eq!(
+                    r.unwrap().args,
+                    strings(&["--session-id", "sid", "--", "hi there"])
+                );
+            }
+        }
+        // The early check and the plan agree as the file appears.
+        assert!(first_message_args(&ctx, &s, "hi there").is_ok());
+        fx.write(
+            format!(
+                "home/.claude/projects/{}/sid.jsonl",
+                encode_project_name("/w")
+            ),
+            "{}\n",
+        );
+        assert_eq!(
+            plan_command_first(&ctx, &s, None, Some("hi there")).unwrap_err(),
+            "a first message needs a new chat"
         );
     }
 }

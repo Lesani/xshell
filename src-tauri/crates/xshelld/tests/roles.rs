@@ -680,6 +680,7 @@ fn open_titled(c: &mut Client, spec: LaunchSpec, title: &str) -> Uuid {
             cols: 80,
             rows: 24,
             meta,
+            first_message: None,
         },
     };
     let r = c

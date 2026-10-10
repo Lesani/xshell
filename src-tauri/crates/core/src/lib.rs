@@ -32,4 +32,7 @@ pub(crate) mod testutil;
 
 pub use ctx::HostCtx;
 pub use dispatch::{dispatch, METHODS};
-pub use launch::{plan_command, plan_command_with, CommandPlan, LaunchSpec};
+pub use launch::{
+    first_message_args, plan_command, plan_command_first, plan_command_with, CommandPlan,
+    LaunchSpec, FIRST_MESSAGE_MAX_BYTES,
+};

@@ -46,6 +46,11 @@ pub const CAPABILITIES: &[&str] = &[
     // attach nudges only when nobody else is attached; a Mobile's replay is a shorter tail;
     // the size goes back to the last Desktop that held it when an owning Mobile leaves.
     "term.mobile",
+    // `term.open` takes `firstMessage`: a new Claude Code or Codex chat starts with that
+    // prompt. Unix only: on Windows the agent runs through `cmd.exe /C`, which would parse the
+    // text as a command line.
+    #[cfg(unix)]
+    "term.first-message",
 ];
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -99,6 +104,18 @@ mod tests {
     #[test]
     fn capabilities_include_term_mobile() {
         assert!(CAPABILITIES.contains(&"term.mobile"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capabilities_include_term_first_message() {
+        assert!(CAPABILITIES.contains(&"term.first-message"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capabilities_exclude_term_first_message_on_windows() {
+        assert!(!CAPABILITIES.contains(&"term.first-message"));
     }
 
     #[test]

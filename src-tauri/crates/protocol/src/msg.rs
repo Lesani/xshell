@@ -376,9 +376,12 @@ const CLIENT_TYPES: &[&str] = &[
     "session.unsubscribe",
 ];
 
-/// `term.open`'s spec: a launch spec plus the Desktop-chosen UUID, initial size and opaque
+/// The longest `firstMessage` a `term.open` may carry, in bytes of UTF-8.
+pub const FIRST_MESSAGE_MAX_BYTES: usize = 16 * 1024;
+
+/// `term.open`'s spec: a launch spec plus the client-chosen UUID, initial size and opaque
 /// display metadata (title, projectName, createdAt…).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenSpec {
     pub terminal: Uuid,
@@ -388,6 +391,13 @@ pub struct OpenSpec {
     pub rows: u16,
     #[serde(default)]
     pub meta: Map<String, Value>,
+    /// The prompt a new chat starts with (capability `term.first-message`). Open-time only:
+    /// the Daemon passes it to this one launch and never persists, lists, restores or
+    /// relaunches it. Only for a new direct Claude Code or Codex chat (no session to resume),
+    /// at most [`FIRST_MESSAGE_MAX_BYTES`], not blank and without NUL; otherwise the open is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -713,9 +723,43 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     meta,
+                    first_message: None,
                 }
             }
         );
+    }
+
+    #[test]
+    fn open_spec_first_message_golden() {
+        let id = Uuid::new_v4();
+        let spec = OpenSpec {
+            terminal: id,
+            launch: LaunchSpec {
+                agent: Some("claude".into()),
+                cwd: "/x".into(),
+                ..Default::default()
+            },
+            cols: 120,
+            rows: 40,
+            first_message: Some("hello there".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["firstMessage"], json!("hello there"));
+        assert!(v.get("first_message").is_none());
+        let back: OpenSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back, spec);
+        // Absent when `None`, and JSON from peers that predate it still decodes.
+        let none = serde_json::to_value(OpenSpec {
+            first_message: None,
+            ..spec.clone()
+        })
+        .unwrap();
+        assert!(none.get("firstMessage").is_none(), "{none}");
+        let old = json!({"terminal":id,"agent":"claude","cwd":"/x","cols":120,"rows":40});
+        let back: OpenSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(back.first_message, None);
+        assert_eq!(back.launch.agent.as_deref(), Some("claude"));
     }
 
     #[test]

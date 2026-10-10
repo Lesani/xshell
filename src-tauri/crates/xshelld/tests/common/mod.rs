@@ -136,6 +136,7 @@ pub fn open_msg(id: Uuid, launch: LaunchSpec) -> ClientMsg {
             cols: 80,
             rows: 24,
             meta: Map::new(),
+            first_message: None,
         },
     }
 }
@@ -223,8 +224,8 @@ pub struct Fake {
     pub pids_log: PathBuf,
 }
 
-/// `fake-bin/claude`: ignores SIGHUP like a stubborn agent, logs argv (one block per launch,
-/// ended by `--`) and then its pid, then sleeps. A logged pid means the trap is in place.
+/// `fake-bin/claude`: ignores SIGHUP like a stubborn agent, logs argv (one record per launch,
+/// see [`Fake::raw_launches`]) and then its pid, then sleeps. A logged pid means the trap is in place.
 pub fn fake_claude(h: &TestHome) -> Fake {
     fake_claude_with(h, "trap '' HUP", "exec sleep 1000")
 }
@@ -239,7 +240,7 @@ pub fn fake_claude_with(h: &TestHome, trap: &str, body: &str) -> Fake {
     fs::write(
         &p,
         format!(
-            "#!/bin/sh\n{trap}\nprintf '%s\\n' \"$@\" -- >> '{}'\necho $$ >> '{}'\n{body}\n",
+            "#!/bin/sh\n{trap}\nprintf '%s\\0' \"$#\" \"$@\" >> '{}'\necho $$ >> '{}'\n{body}\n",
             argv_log.display(),
             pids_log.display()
         ),
@@ -269,7 +270,7 @@ pub fn shared_fake_agents() {
             let tmp = bin.join(format!(".{name}.{}", std::process::id()));
             fs::write(
                 &tmp,
-                "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> argv.log\necho $$ >> pids.log\n\
+                "#!/bin/sh\ntrap '' HUP\nprintf '%s\\0' \"$#\" \"$@\" >> argv.log\necho $$ >> pids.log\n\
                  echo \"pid $$ size $(stty size) args $*.\"\n\
                  if [ -f ./agent.sh ]; then . ./agent.sh; fi\nexec sleep 1000\n",
             )
@@ -307,6 +308,7 @@ impl Fake {
 
     /// argv blocks, one per launch, without the Agent Status hook arguments xshell adds
     /// (`--settings <file>` for Claude, `-c <override>` for Codex; see [`Fake::raw_launches`]).
+    /// Everything from a `--` on (a first message) is kept as given.
     pub fn launches(&self) -> Vec<Vec<String>> {
         self.raw_launches()
             .into_iter()
@@ -314,7 +316,10 @@ impl Fake {
                 let mut out = vec![];
                 let mut it = argv.into_iter();
                 while let Some(a) = it.next() {
-                    if a == "--settings" || a == "-c" {
+                    if a == "--" {
+                        out.push(a);
+                        out.extend(it.by_ref());
+                    } else if a == "--settings" || a == "-c" {
                         it.next();
                     } else {
                         out.push(a);
@@ -325,17 +330,24 @@ impl Fake {
             .collect()
     }
 
-    /// argv blocks, one per launch, as the agent got them.
+    /// argv blocks, one per launch, as the agent got them. The fakes log each launch as
+    /// NUL-terminated fields, its argument count and then each argument (`printf '%s\0' "$#"
+    /// "$@"`), so an argument may hold any text but NUL. A record still being written is left
+    /// out.
     pub fn raw_launches(&self) -> Vec<Vec<String>> {
-        let s = fs::read_to_string(&self.argv_log).unwrap_or_default();
+        let bytes = fs::read(&self.argv_log).unwrap_or_default();
+        let done = bytes.iter().rposition(|b| *b == 0).map_or(0, |i| i + 1);
+        let s = String::from_utf8_lossy(&bytes[..done]);
+        let mut fields: Vec<&str> = s.split('\0').collect();
+        fields.pop(); // after the last NUL
         let mut out = vec![];
-        let mut cur = vec![];
-        for l in s.lines() {
-            if l == "--" {
-                out.push(std::mem::take(&mut cur));
-            } else {
-                cur.push(l.to_string());
+        let mut it = fields.into_iter();
+        while let Some(n) = it.next().and_then(|n| n.parse::<usize>().ok()) {
+            let argv: Vec<String> = it.by_ref().take(n).map(str::to_string).collect();
+            if argv.len() < n {
+                break;
             }
+            out.push(argv);
         }
         out
     }

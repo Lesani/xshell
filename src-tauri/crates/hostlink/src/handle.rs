@@ -1556,6 +1556,7 @@ pub(crate) mod tests {
                 cols: 90,
                 rows: 30,
                 meta: Map::new(),
+                first_message: None,
             },
             sink.clone(),
             w,
@@ -1587,6 +1588,7 @@ pub(crate) mod tests {
                 cols: 80,
                 rows: 24,
                 meta: Map::new(),
+                first_message: None,
             },
             Arc::new(VecSink::default()),
             w,
@@ -1757,6 +1759,7 @@ pub(crate) mod tests {
             cols: 80,
             rows: 24,
             meta: Map::new(),
+            first_message: None,
         }
     }
 

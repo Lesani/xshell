@@ -279,6 +279,14 @@ impl Conn {
                 spawn_call(&d, &self.ob, &self.inflight, id, method, params)
             }
             ClientMsg::TermOpen { spec } => {
+                // A first message is checked for every role, after the role's own checks and
+                // before the registry is locked: a refusal here starts nothing.
+                if let Some(msg) = spec.first_message.as_deref() {
+                    if let Err(e) = xshell_core::first_message_args(&d.ctx, &spec.launch, msg) {
+                        reply(&self.ob, id, Err(e));
+                        return;
+                    }
+                }
                 let mut reg = d.reg.lock().unwrap();
                 let r = if reg.frozen {
                     Err(("xshelld is upgrading or shutting down".to_string(), None))
@@ -295,6 +303,7 @@ impl Conn {
                         spec.meta,
                         (spec.cols, spec.rows),
                         now_ms(),
+                        spec.first_message.as_deref(),
                         |_| {},
                     )
                     .map_err(|e| (e.message, e.started))

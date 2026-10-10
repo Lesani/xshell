@@ -162,6 +162,7 @@ pub async fn host_term_open(
         cols,
         rows,
         meta,
+        first_message: None,
     };
     let sink = Arc::new(ChannelSink {
         data: on_data,

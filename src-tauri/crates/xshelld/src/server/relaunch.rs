@@ -180,7 +180,7 @@ fn replacement(
         d.persist(reg);
         d.test_point(t.id, TestPoint::ReplacementSpawned { pid: leader.pid });
     };
-    terminal::spawn_with(d, t.id, spec, meta, size, created_at_ms, spawned).map_err(|e| {
+    terminal::spawn_with(d, t.id, spec, meta, size, created_at_ms, None, spawned).map_err(|e| {
         SpawnError {
             message: format!("restart failed: {}", e.message),
             started: e.started,

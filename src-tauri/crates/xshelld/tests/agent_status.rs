@@ -42,7 +42,7 @@ fn hook_fake_agents() {
             let tmp = bin.join(format!(".{name}.{}", std::process::id()));
             fs::write(
                 &tmp,
-                "#!/bin/sh\ntrap '' HUP\nprintf '%s\\n' \"$@\" -- >> argv.log\n\
+                "#!/bin/sh\ntrap '' HUP\nprintf '%s\\0' \"$#\" \"$@\" >> argv.log\n\
                  env | grep '^XSHELL_' >> env.log\necho $$ >> pids.log\necho \"ready $$.\"\n\
                  n=0\nwhile :; do\n  f=\"$PWD/ctl.$$.$n\"\n\
                    if [ -f \"$f\" ]; then . \"$f\"; : > \"$PWD/ack.$$.$n\"; n=$((n + 1));\n\
@@ -1034,6 +1034,7 @@ fn full_list_with_widest_last_lines_fits_the_queue() {
                     cols: 80,
                     rows: 24,
                     meta,
+                    first_message: None,
                 },
             });
             match r {

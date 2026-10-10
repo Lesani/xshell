@@ -327,6 +327,7 @@ pub fn open_msg(id: Uuid, launch: LaunchSpec) -> ClientMsg {
             // Wide, so ConPTY never wraps a marker.
             cols: 200,
             rows: 40,
+            first_message: None,
         },
     }
 }

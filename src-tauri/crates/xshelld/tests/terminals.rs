@@ -769,6 +769,7 @@ fn terminal_list_budget_enforced() {
                 cols: 80,
                 rows: 24,
                 meta,
+                first_message: None,
             },
         });
         (t, r)

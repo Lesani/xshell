@@ -217,11 +217,13 @@ pub(crate) fn spawn(
     rows: u16,
     created_at_ms: u64,
 ) -> Result<Arc<Terminal>, String> {
-    spawn_with(d, id, spec, meta, (cols, rows), created_at_ms, |_| {}).map_err(|e| e.message)
+    spawn_with(d, id, spec, meta, (cols, rows), created_at_ms, None, |_| {}).map_err(|e| e.message)
 }
 
 /// [`spawn`], calling `spawned` with the new process's identity as soon as it exists, before
-/// any of its threads start.
+/// any of its threads start. `first` is a new chat's first message (`term.open` only): it
+/// goes to this launch's argv and nowhere else, so a restore or Relaunch never sends it again.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_with(
     d: &Arc<Daemon>,
     id: Uuid,
@@ -229,6 +231,7 @@ pub(crate) fn spawn_with(
     meta: Map<String, Value>,
     (cols, rows): (u16, u16),
     created_at_ms: u64,
+    first: Option<&str>,
     spawned: impl FnOnce(&Leader),
 ) -> Result<Arc<Terminal>, SpawnError> {
     if !spec.cwd.is_empty() && !Path::new(&spec.cwd).is_dir() {
@@ -240,7 +243,7 @@ pub(crate) fn spawn_with(
         terminal: id,
         run,
     });
-    let plan = xshell_core::plan_command_with(&d.ctx, &spec, hooks)?;
+    let plan = xshell_core::plan_command_first(&d.ctx, &spec, hooks, first)?;
     let tracker = Tracker::new(&spec);
     let pair = native_pty_system()
         .openpty(PtySize {

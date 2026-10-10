@@ -37,7 +37,7 @@ Messages (protocol 1):
 | Direction | Type | Purpose |
 |---|---|---|
 | D→H | `call { id, method, params }` | Any Host-side command by its Tauri name and the same JSON params the frontend sends today (camelCase). One dispatch table in core serves both. |
-| D→H | `term.open { id, spec }` | Start a Terminal from a launch spec (agent, session id, cwd, shell mode/id/command, flags, initial size, display metadata). The Desktop picks the Terminal UUID. |
+| D→H | `term.open { id, spec }` | Start a Terminal from a launch spec (agent, session id, cwd, shell mode/id/command, flags, initial size, display metadata). The Desktop picks the Terminal UUID. Optional `firstMessage` (capability `term.first-message`, Unix Hosts only): see "First messages" below. |
 | D→H | `term.attach { id, terminal }` | Subscribe; Daemon replies `{ exitCode, cols, rows }` (`cols`/`rows`: the size applied to the PTY now), then sends the replay buffer as kind-1 frames, then live output. |
 | D→H | `term.detach`, `term.input`, `term.resize`, `term.close`, `term.update { meta }` | `term.update` records late-bound metadata (e.g. a session id linked after start) so restore resumes the right session. |
 | H→D | `terminals { list }` | Full Terminal list; sent after `hello` and whenever it changes. The Desktop reconciles Tabs against it (ADR-0001). Each entry: `terminal`, `spec`, `meta`, `createdAtMs`, `pid`, `exitCode`, and the optional entry fields below. On a Mobile connection the list holds only direct agent Terminals (no shell, shell command, shell id or launch prefix). |
@@ -68,6 +68,18 @@ The Chat View reads an agent Terminal's conversation through a subscription. The
 - **Generations**: each subscription has a `gen`, renewed by every reset. Pages and appends carry it; a `session.page` for an older one is refused, so a stale page never mixes into a new conversation.
 - **Bounds**: a page or append message is at most 256 KiB, serialized (one line alone always fits, its entries cut further if needed); a page scans at most 16 MiB of the file, an append read too; lines longer than 8 MiB are skipped, also when a read resumes inside one. Appends wait while the connection has more than 1 MiB queued, so a slow phone is never disconnected for them. Each connection may have 8 subscriptions and 16 queued session requests, and at most 256 requests are queued over all connections (beyond: `too many session requests`).
 - **Live updates**: the Daemon checks each subscribed file every second (agents write during a turn, hooks fire only at its end) and at once on an agent report, an Agent Status change or a `term.update` relink. An older page is refused with `session changed` (and a reset follows) once the file no longer holds what the generation read. Results are checked again just before they are queued (the connection, the Terminal instance, the role's access, the session, agent and working directory), so nothing of a session the Terminal has left is sent after the change; a Terminal that is gone or no longer visible ends the subscription without a message (the `terminals` list says why). A Codex Terminal has no session until a Desktop links it: `session` is `null` and the first linked page comes as a reset.
+
+### First messages (capability `term.first-message`)
+
+A Mobile starts a new chat with its first prompt in `term.open`'s `firstMessage`. The Daemon puts it at the end of the agent's argv, after every other argument: `claude [--dangerously-skip-permissions] [--session-id <id>] [--settings <hooks>] -- <message>`, or `codex [flag] [-c <hook overrides>…] -- <message>`. The agent is executed directly, never through a shell.
+
+- **Only a new direct chat**: Claude Code or Codex with no shell, shell command, shell id or launch prefix; Claude Code with no session id or one with no session file yet (`--session-id`), Codex with no session id. Anything else is refused with `a first message needs a new chat` or `a first message needs Claude Code or Codex, run directly`, and nothing starts. The check applies to every role, after a Mobile's usual checks (a known Project, else `forbidden for mobile: …`) and before any other.
+- **The message**: at most 16 KiB of UTF-8 (`FIRST_MESSAGE_MAX_BYTES`), not blank, no NUL. A message without whitespace gets one trailing space, because Claude Code still runs a subcommand named by the first word after `--` (`claude -- update` updates) and no subcommand name contains whitespace.
+- **Never persisted**: the message is not part of the launch spec. It is not in the state file or the `terminals` list, and a restore or Relaunch never sends it again.
+- **Visible to local users**: while the agent runs, its argv, and so the message, can be read by other users of the Host (`ps`, `/proc/<pid>/cmdline`). On a Host shared with other users, a Mobile's first message is as visible as any command line.
+- **Unix only**: on Windows a direct agent runs through `cmd.exe /C`, which would parse the message as a command line, so a Windows Daemon does not advertise the capability and refuses `firstMessage` with `a first message is not supported on Windows hosts`.
+
+A peer that sends `firstMessage` to a Daemon without the capability gets a plain new chat (unknown fields are ignored), so the Mobile only offers it to Hosts that advertise `term.first-message`.
 
 ## Daemon (`xshelld`)
 

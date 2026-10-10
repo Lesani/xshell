@@ -171,6 +171,29 @@ fn pipe_serves_hello_and_terminals() {
     assert!(c2.hello().1.is_empty());
 }
 
+/// A first message would be parsed by `cmd.exe /C`: not advertised, and refused before
+/// anything starts.
+#[test]
+fn first_message_not_advertised_and_refused_on_windows() {
+    let h = TestHome::new();
+    let _d = Daemon::start(&h);
+    let mut c = Client::connect(&h.pipe);
+    let (hello, _) = c.hello();
+    assert!(
+        !hello.capabilities.iter().any(|c| c == "term.first-message"),
+        "{:?}",
+        hello.capabilities
+    );
+    let ClientMsg::TermOpen { mut spec } = open_msg(Uuid::new_v4(), claude_spec(&h.project("p")))
+    else {
+        unreachable!()
+    };
+    spec.first_message = Some("hello & echo pwned".into());
+    let e = c.request(&ClientMsg::TermOpen { spec }).unwrap_err();
+    assert!(e.contains("not supported on Windows"), "{e}");
+    assert!(Client::connect(&h.pipe).hello().1.is_empty());
+}
+
 #[test]
 fn open_attach_input_output_over_conpty() {
     let h = TestHome::new();
