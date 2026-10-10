@@ -1,5 +1,7 @@
 [workspace]
 members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink"]
+# Vendored, patched crates (see each one's XSHELL-PATCH.md): not workspace members.
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -56,6 +58,10 @@ libc = { workspace = true }
 tempfile = "3"
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
+# The ConPTY input pipe for replies' writes that must not block (Lesani/xshell#40).
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }
+
 [profile.dev]
 incremental = true
 opt-level = 0

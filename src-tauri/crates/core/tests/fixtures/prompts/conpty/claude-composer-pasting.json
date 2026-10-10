@@ -1,0 +1,12 @@
+{
+  "agent": "claude",
+  "cols": 100,
+  "composer": false,
+  "expect": null,
+  "rows": 30,
+  "source": "claude-composer-pasting.raw drawn by the console fake through ConPTY on Windows build 26100 (crates/xshelld/tests/windows_submit.rs conpty_renders_fixtures), as the Daemon read it",
+  "synthetic": true,
+  "version": "2.1.296",
+  "via": "conpty",
+  "windowsBuild": 26100
+}

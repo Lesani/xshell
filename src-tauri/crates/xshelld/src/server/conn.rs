@@ -22,7 +22,7 @@ use uuid::Uuid;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{
     decode_inbound, encode_res, submit_reply, ClientMsg, DecodeError, Hello, Inbound, OpenReply,
-    OpenSpec, ServerMsg, SESSION_CLOSING, SESSION_OPEN,
+    OpenSpec, ServerMsg, SESSION_CLOSING, SESSION_OPEN, SUBMIT_UNSUPPORTED,
 };
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::ring::Member;
@@ -36,6 +36,17 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     if let Some(id) = id {
         ob.push_control(Arc::from(encode_res(id, r)));
     }
+}
+
+/// Whether `hello` offers capability `c`: not hidden by a test, and Chat View replies
+/// (with files) only where this Host takes them.
+fn offered(cfg: &super::Config, c: &str) -> bool {
+    let off = match c {
+        "term.submit" => !cfg.submit,
+        "term.submit-files" => !cfg.submit || !cfg.submit_files,
+        _ => false,
+    };
+    !off && !cfg.hide_capabilities.iter().any(|h| h == c)
 }
 
 fn push_error(ob: &Outbox, code: &str, message: String) {
@@ -93,7 +104,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: CAPABILITIES
             .iter()
-            .filter(|c| !d.cfg.hide_capabilities.iter().any(|h| h == *c))
+            .filter(|c| offered(&d.cfg, c))
             .map(|s| s.to_string())
             .collect(),
     })) {
@@ -543,6 +554,9 @@ impl Conn {
                     .map_err(|e| e.to_string())
                     .and_then(|text| {
                         let t = self.terminal(&terminal)?;
+                        if !files.is_empty() && !d.cfg.submit_files {
+                            return Err(SUBMIT_UNSUPPORTED.to_string());
+                        }
                         // Checked and held in one step: the sweep keeps them from now until
                         // the grace after the outcome.
                         let (paths, held) = d.drops.reserve(&d.ctx, &files)?;

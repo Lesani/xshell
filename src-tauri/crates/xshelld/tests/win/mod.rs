@@ -590,3 +590,78 @@ pub fn read_pid_file(path: &Path) -> u32 {
     );
     pid.unwrap()
 }
+
+// ── Probes (Lesani/xshell#40) ─────────────────────────────────────────────
+
+/// This Windows's build number (`RtlGetVersion`).
+pub fn windows_build() -> u32 {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    let mut v = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { RtlGetVersion(&mut v) }, 0);
+    v.dwBuildNumber
+}
+
+/// A measured fact for the CI log, tagged with the Windows build: printed, and appended to
+/// `$XSHELL_PROBE_FACTS` when it is set (CI prints and uploads that file).
+pub fn fact(tag: &str, what: &str) {
+    let line = format!("{tag} build={} {what}", windows_build());
+    eprintln!("FACT {line}");
+    if let Some(p) = std::env::var_os("XSHELL_PROBE_FACTS") {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// `bytes` with everything but printable ASCII escaped, for a fact.
+pub fn esc(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut s, &b| {
+        if (0x20..0x7f).contains(&b) && b != b'\\' {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("\\x{b:02x}"));
+        }
+        s
+    })
+}
+
+impl Client {
+    /// Open a Terminal of `cols` x `rows`; returns its pid.
+    pub fn open_sized(&mut self, id: Uuid, launch: LaunchSpec, cols: u16, rows: u16) -> u32 {
+        let v = self
+            .request(&ClientMsg::TermOpen {
+                spec: OpenSpec {
+                    terminal: id,
+                    launch,
+                    meta: Map::new(),
+                    cols,
+                    rows,
+                    first_message: None,
+                    adopt_existing: false,
+                },
+            })
+            .unwrap_or_else(|e| panic!("term.open failed: {e}"));
+        v["pid"].as_u64().expect("a pid") as u32
+    }
+
+    /// All output of `t` so far.
+    pub fn output(&self, t: Uuid) -> &[u8] {
+        self.out.get(&t).map_or(&[], Vec::as_slice)
+    }
+
+    /// Read until `t` printed nothing for `quiet` (at most [`T`]).
+    pub fn settle(&mut self, t: Uuid, quiet: Duration) {
+        let deadline = Instant::now() + T;
+        loop {
+            let before = self.output(t).len();
+            self.try_msg(quiet, |_| false);
+            if self.output(t).len() == before || Instant::now() >= deadline {
+                return;
+            }
+        }
+    }
+}

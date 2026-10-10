@@ -207,6 +207,12 @@ pub(crate) struct Submit {
     stuck: Option<Box<dyn FnOnce() + Send>>,
     /// Some of the paste was written.
     pasted: bool,
+    /// Each bracketed paste's start and end marker is a piece of its own, and no piece ends
+    /// inside a UTF-8 character (Windows: the ConPTY's input decoder is not trusted with a
+    /// marker or a character split across two reads).
+    pub markers_alone: bool,
+    /// The most bytes one piece of the paste has ([`SUBMIT_CHUNK`]; a probe makes it less).
+    pub max_piece: usize,
 }
 
 impl Submit {
@@ -223,6 +229,8 @@ impl Submit {
             done: Some(done),
             stuck: None,
             pasted: false,
+            markers_alone: false,
+            max_piece: SUBMIT_CHUNK,
         }
     }
 
@@ -271,13 +279,56 @@ impl Drop for Submit {
 
 impl Submit {
     /// Where the next piece of the paste after its first `off` bytes ends: at most
-    /// [`SUBMIT_CHUNK`] on, and never across the start or end of a bracketed paste.
+    /// `max_piece` on, and never across the start or end of a bracketed paste. With
+    /// `markers_alone`, never across the end of a start marker or the start of an end marker
+    /// either, and never inside a UTF-8 character.
     fn piece_end(&self, off: usize) -> usize {
-        self.frames
+        let alone = self.markers_alone;
+        if alone {
+            // A marker (or what is left of one) is a piece of its own, whatever its length.
+            if let Some(f) = self.frames.iter().find(|f| f.start <= off && off < f.end) {
+                let (body, tail) = (f.start + PASTE_START.len(), f.end - PASTE_END.len());
+                if off < body {
+                    return body;
+                }
+                if off >= tail {
+                    return f.end;
+                }
+            }
+        }
+        let end = self
+            .frames
             .iter()
-            .flat_map(|f| [f.start, f.end])
+            .flat_map(|f| {
+                let (body, tail) = (f.start + PASTE_START.len(), f.end - PASTE_END.len());
+                if alone {
+                    vec![f.start, body, tail, f.end]
+                } else {
+                    vec![f.start, f.end]
+                }
+            })
             .filter(|&b| b > off)
-            .fold((off + SUBMIT_CHUNK).min(self.paste.len()), usize::min)
+            .fold(
+                (off + self.max_piece.max(1)).min(self.paste.len()),
+                usize::min,
+            );
+        if !alone {
+            return end;
+        }
+        // Back to the start of a character cut at `end`; on to its end when the piece is
+        // shorter than the character.
+        let inside = |i: usize| self.paste.get(i).is_some_and(|b| (b & 0xC0) == 0x80);
+        let mut cut = end;
+        while cut > off + 1 && inside(cut) {
+            cut -= 1;
+        }
+        if inside(cut) {
+            cut = end;
+            while inside(cut) {
+                cut += 1;
+            }
+        }
+        cut
     }
 
     /// What completes the paste once its first `off` bytes were written: the bracketed
@@ -396,11 +447,14 @@ pub(crate) trait PtyIn: Write {
 
 /// A Terminal's PTY writer. Unix: with its own descriptor of the PTY master for writes that
 /// must not block (`O_NONBLOCK` is set only for that one write; the reader, which shares the
-/// open file, retries a read that would block meanwhile).
+/// open file, retries a read that would block meanwhile). Windows: with its own handle of the
+/// ConPTY's input pipe, set to `PIPE_NOWAIT` only for that one write.
 struct PtyWriter {
     w: Box<dyn Write + Send>,
     #[cfg(unix)]
     fd: Option<std::os::fd::OwnedFd>,
+    #[cfg(windows)]
+    pipe: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl Write for PtyWriter {
@@ -418,6 +472,10 @@ impl PtyIn for PtyWriter {
         if let Some(fd) = &self.fd {
             use std::os::fd::AsRawFd;
             return nonblocking_write(fd.as_raw_fd(), data);
+        }
+        #[cfg(windows)]
+        if let Some(pipe) = &self.pipe {
+            return win::nowait_write(pipe, data);
         }
         // Never a blocking write in its place: it could block holding the agent's state.
         let _ = data;
@@ -899,6 +957,14 @@ pub(crate) fn spawn_with(
     let pty_master = &pair.master;
     #[cfg(windows)]
     let pty_master = pair.master();
+    // The input pipe for replies' writes that must not block: taken before the writer, which
+    // owns it afterwards.
+    #[cfg(windows)]
+    let pipe = if d.test_point(id, TestPoint::ReplyDescriptor) {
+        None
+    } else {
+        win::input_pipe(pty_master)
+    };
     let pty = pty_master
         .try_clone_reader()
         .map_err(|e| format!("failed to clone PTY reader: {e}"))
@@ -922,11 +988,13 @@ pub(crate) fn spawn_with(
                     .try_clone_to_owned()
                     .ok()
             }),
+        #[cfg(windows)]
+        pipe,
     };
     #[cfg(unix)]
     let reply_writes = writer.fd.is_some();
     #[cfg(windows)]
-    let reply_writes = false;
+    let reply_writes = writer.pipe.is_some();
     #[cfg(windows)]
     let master = pair.into_master();
     #[cfg(unix)]
@@ -1420,7 +1488,7 @@ impl Terminal {
         typing: Typing,
         done: Box<dyn FnOnce(Result<(), String>) + Send>,
     ) -> Result<(), String> {
-        if cfg!(windows) {
+        if !d.cfg.submit {
             return Err(SUBMIT_UNSUPPORTED.into());
         }
         let agent = self.status.lock().unwrap().tracker.agent();
@@ -1439,6 +1507,8 @@ impl Terminal {
         // admission: input queued ahead of this reply may change the composer).
         let images = Arc::new(AtomicUsize::new(0));
         let (weak, dg, base) = (Arc::downgrade(self), d.clone(), images.clone());
+        // A probe's refusal once this many bytes of the paste were written.
+        let (stop_after, mut sent) = (d.cfg.submit_probe.stop_after, 0usize);
         let gate: SubmitGate = Box::new(move |step, write| {
             dg.test_point(
                 id,
@@ -1448,9 +1518,17 @@ impl Terminal {
                     SubmitStep::Close => TestPoint::SubmitClose,
                 },
             );
-            weak.upgrade()
+            if step != SubmitStep::Close && stop_after.is_some_and(|k| sent >= k) {
+                return Err(SUBMIT_NOT_READY.into());
+            }
+            let r = weak
+                .upgrade()
                 .ok_or_else(|| "terminal has exited".to_string())?
-                .write_if_ready(&dg, step, write, &base)
+                .write_if_ready(&dg, step, write, &base);
+            if let Ok(Ok(n)) = &r {
+                sent += n;
+            }
+            r
         });
         let dd = d.clone();
         let done = Box::new(move |r: Result<(), String>| {
@@ -1489,6 +1567,10 @@ impl Terminal {
             .on_attach(attach);
         item.stall = d.cfg.submit_stall;
         item.attach_timeout = d.cfg.submit_attach_timeout;
+        item.markers_alone = d.cfg.submit_markers_alone;
+        if let Some(n) = d.cfg.submit_probe.max_piece {
+            item.max_piece = n;
+        }
         let refused = match tx.try_send(Input::Submit(Box::new(item))) {
             Ok(()) => None,
             Err(TrySendError::Full(i)) => Some((i, "input backlog full")),
@@ -2365,12 +2447,90 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
     Arc::new(t)
 }
 
+/// This Windows's build number (`RtlGetVersion`, which no compatibility shim changes).
+#[cfg(windows)]
+pub(crate) fn windows_build() -> Option<u32> {
+    win::build()
+}
+
 #[cfg(windows)]
 mod win {
     use portable_pty::{CommandBuilder, MasterPty, PtyPair, SlavePty};
     use std::io::{Read, Write};
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::sync::Arc;
     use xshell_core::job::Job;
+
+    /// See [`super::windows_build`].
+    pub(super) fn build() -> Option<u32> {
+        use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+        let mut v = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `v` is a valid OSVERSIONINFOW with its size set.
+        (unsafe { RtlGetVersion(&mut v) } == 0).then_some(v.dwBuildNumber)
+    }
+
+    /// A handle of the ConPTY's input pipe of its own (`None` if it cannot have one), for
+    /// [`nowait_write`]. Must be taken before the master's writer.
+    pub(super) fn input_pipe(m: &(dyn MasterPty + Send)) -> Option<OwnedHandle> {
+        let m: &dyn MasterPty = m;
+        let con = m.downcast_ref::<portable_pty::win::conpty::ConPtyMasterPty>()?;
+        match con.try_clone_input() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                crate::log!("WARN", "no handle of the console's input for replies: {e}");
+                None
+            }
+        }
+    }
+
+    /// One `WriteFile` to the input pipe `h` with `PIPE_NOWAIT` set for it, as Unix sets
+    /// `O_NONBLOCK` for one write: what the pipe takes now, `WouldBlock` when it takes
+    /// nothing. The pipe is shared with the Terminal's (blocking) writer: if its mode cannot
+    /// be put back, the write fails, and with it the input thread.
+    pub(super) fn nowait_write(h: &OwnedHandle, data: &[u8]) -> std::io::Result<usize> {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_WAIT};
+        let raw = h.as_raw_handle();
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        // Measured (Lesani/xshell#40, P5, builds 20348 and 26100): while the pipe holds
+        // unread data, setting PIPE_NOWAIT fails with ERROR_PIPE_BUSY (the mode stays
+        // PIPE_WAIT), and a write larger than the pipe takes nothing. The pipe takes nothing
+        // now: WouldBlock.
+        let busy = |e: std::io::Error| {
+            if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+                std::io::ErrorKind::WouldBlock.into()
+            } else {
+                e
+            }
+        };
+        // SAFETY: `raw` is a pipe handle this Terminal owns; `data` is valid for `len`.
+        unsafe {
+            if SetNamedPipeHandleState(raw, &PIPE_NOWAIT, std::ptr::null(), std::ptr::null()) == 0 {
+                return Err(busy(std::io::Error::last_os_error()));
+            }
+            let mut n = 0u32;
+            let ok = WriteFile(raw, data.as_ptr(), len, &mut n, std::ptr::null_mut());
+            let err = std::io::Error::last_os_error();
+            if SetNamedPipeHandleState(raw, &PIPE_WAIT, std::ptr::null(), std::ptr::null()) == 0 {
+                return Err(std::io::Error::other(format!(
+                    "cannot put the console's input back in blocking mode: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if ok == 0 {
+                Err(busy(err))
+            } else if n == 0 && !data.is_empty() {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(n as usize)
+            }
+        }
+    }
 
     /// How long a Terminal's output may go on after its process exited and its console was
     /// closed.
@@ -2560,6 +2720,161 @@ mod win {
             let mut q = StartupQuery::default();
             assert_eq!(q.feed(b"\x1b[2J"), (b"\x1b[2J".to_vec(), false));
             assert_eq!(q.feed(b"\x1b[6n"), (b"\x1b[6n".to_vec(), false));
+        }
+
+        /// A measured fact for the CI log (Lesani/xshell#40): printed, and appended to
+        /// `$XSHELL_PROBE_FACTS` when it is set.
+        fn fact(line: &str) {
+            eprintln!("FACT {line}");
+            if let Some(p) = std::env::var_os("XSHELL_PROBE_FACTS") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+
+        /// An anonymous pipe of `size` bytes, as ConPTY's input pipe is made.
+        fn pipe(size: u32) -> (OwnedHandle, OwnedHandle) {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::System::Pipes::CreatePipe;
+            let (mut r, mut w) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: out-pointers to two handles, owned from here on.
+            unsafe {
+                assert_ne!(CreatePipe(&mut r, &mut w, std::ptr::null(), size), 0);
+                (
+                    OwnedHandle::from_raw_handle(r),
+                    OwnedHandle::from_raw_handle(w),
+                )
+            }
+        }
+
+        /// The probe itself, in the child [`pipe_nowait_write_semantics`] starts: one
+        /// `PROBE key=value` line per measurement on stdout.
+        fn pipe_probe() {
+            let say = |k: &str, v: String| println!("PROBE {k}={v}");
+            let show = |r: &std::io::Result<usize>| match r {
+                Ok(n) => format!("ok:{n}"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => "wouldblock".into(),
+                Err(e) => format!("err:{e}"),
+            };
+            // Filling a 4 KiB pipe 1000 bytes at a time: how much each write takes.
+            let (r, w) = pipe(4096);
+            let mut seq = Vec::new();
+            for _ in 0..64 {
+                let res = nowait_write(&w, &[b'x'; 1000]);
+                let stop = !matches!(res, Ok(n) if n > 0);
+                seq.push(show(&res));
+                if stop {
+                    break;
+                }
+            }
+            say("fill_4k_by_1000", seq.join(","));
+            // One write larger than the pipe, into an empty one.
+            let (r2, w2) = pipe(4096);
+            say(
+                "big_64k_into_empty_4k",
+                show(&nowait_write(&w2, &[b'y'; 65536])),
+            );
+            // The handle is back in blocking mode: a blocking write of 64 KiB through a
+            // duplicate waits for the reader and arrives whole.
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut f = std::fs::File::from(r2);
+                let mut got = Vec::new();
+                let mut buf = [0u8; 8192];
+                while got.len() < 4096 + 65536 + 65536 {
+                    match f.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                got.len()
+            });
+            let mut blocking = std::fs::File::from(w2.try_clone().unwrap());
+            say(
+                "blocking_after_nowait",
+                match blocking.write_all(&[b'z'; 65536]) {
+                    Ok(()) => "ok".into(),
+                    Err(e) => format!("err:{e}"),
+                },
+            );
+            drop(blocking);
+            drop(w2);
+            say("read_back", reader.join().unwrap().to_string());
+            drop((r, w));
+            say("done", "1".into());
+        }
+
+        /// P5: `PIPE_NOWAIT` writes to an anonymous pipe never block, a full pipe takes
+        /// nothing, and the pipe is blocking again afterwards. Run in a child process killed
+        /// after a deadline, so a write that blocks fails the test instead of hanging CI.
+        #[test]
+        fn pipe_nowait_write_semantics() {
+            if std::env::var_os("XSHELLD_PIPE_PROBE").is_some() {
+                pipe_probe();
+                return;
+            }
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server::terminal::win::tests::pipe_nowait_write_semantics",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("XSHELLD_PIPE_PROBE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut out = child.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let status = loop {
+                if let Some(st) = child.try_wait().unwrap() {
+                    break Some(st);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let out = reader.join().unwrap();
+            let probes: std::collections::HashMap<&str, &str> = out
+                .lines()
+                // libtest's `test … ... ` has no newline before the test's own output.
+                .filter_map(|l| l[l.find("PROBE ")? + 6..].split_once('='))
+                .collect();
+            for (k, v) in &probes {
+                fact(&format!(
+                    "P5 build={} {k}={v}",
+                    build().map_or("?".into(), |b| b.to_string())
+                ));
+            }
+            assert!(status.is_some(), "the probe blocked: {out}");
+            assert!(status.unwrap().success(), "{out}");
+            assert_eq!(probes.get("done"), Some(&"1"), "{out}");
+            // Measured on builds 20348 and 26100: a write to a pipe that holds unread data
+            // takes nothing (ERROR_PIPE_BUSY, which `nowait_write` reports as WouldBlock),
+            // and one larger than the pipe takes nothing even when it is empty. Never part
+            // of a write, never a blocking one.
+            assert_eq!(probes["fill_4k_by_1000"], "ok:1000,wouldblock", "{out}");
+            assert_eq!(probes["big_64k_into_empty_4k"], "wouldblock", "{out}");
+            assert_eq!(probes["blocking_after_nowait"], "ok", "{out}");
+            let back: usize = probes["read_back"].parse().unwrap();
+            assert_eq!(back, 65536, "only the blocking write arrived: {out}");
         }
     }
 }
@@ -3416,6 +3731,113 @@ mod status_tests {
         assert_eq!(w.input.len(), 10);
     }
 
+    /// A PTY that takes every write whole and keeps each one apart.
+    #[derive(Default)]
+    struct Pieces(Vec<Vec<u8>>);
+
+    impl Write for Pieces {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl PtyIn for Pieces {
+        fn write_now(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.write(b)
+        }
+    }
+
+    /// The writes a reply of `text` is typed in, pieces as `alone` and `max` say, with
+    /// `gates` as [`submit_of`]; and its outcome.
+    fn pieces_of(
+        text: &str,
+        alone: bool,
+        max: usize,
+        gates: Vec<Result<(), String>>,
+    ) -> (Vec<Vec<u8>>, Vec<Result<(), String>>) {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let out = Outcome::default();
+        let Input::Submit(mut s) = submit_of(text, &ops, &out, gates) else {
+            unreachable!()
+        };
+        s.markers_alone = alone;
+        s.max_piece = max;
+        let mut w = Pieces::default();
+        write_item(&mut w, Input::Submit(s), &|_| {}).unwrap();
+        let out = out.lock().unwrap().clone();
+        (w.0, out)
+    }
+
+    /// Windows' piece rule: each marker is a write of its own, and every other piece of the
+    /// paste is whole characters; the bytes are the same as without the rule.
+    #[test]
+    fn markers_alone_pieces_never_split_a_marker_or_char() {
+        // Two- to four-byte characters across every 1024-byte border.
+        let text: String = "aé€🚀\n".chars().cycle().take(1400).collect();
+        assert!(text.len() > 3000, "{}", text.len());
+        let (plain, _) = pieces_of(&text, false, SUBMIT_CHUNK, vec![]);
+        let (pieces, out) = pieces_of(&text, true, SUBMIT_CHUNK, vec![]);
+        assert_eq!(out, [Ok(())]);
+        assert_eq!(pieces.concat(), plain.concat(), "the same bytes");
+        assert_eq!(pieces.first().unwrap(), PASTE_START);
+        assert_eq!(pieces[pieces.len() - 2], PASTE_END);
+        assert_eq!(pieces.last().unwrap(), b"\r");
+        let body = &pieces[1..pieces.len() - 2];
+        assert!(body.len() >= 3, "{}", body.len());
+        for p in body {
+            assert!(p.len() <= SUBMIT_CHUNK);
+            let s = std::str::from_utf8(p).expect("whole characters");
+            assert!(!s.contains('\x1b'));
+        }
+        // Without the rule some piece cuts a character (the test text is worth its name).
+        assert!(plain.iter().any(|p| std::str::from_utf8(p).is_err()));
+        // Pieces shorter than a character still carry whole ones.
+        let (tiny, _) = pieces_of("🚀é", true, 1, vec![]);
+        assert_eq!(
+            tiny,
+            [
+                PASTE_START,
+                "🚀".as_bytes(),
+                "é".as_bytes(),
+                PASTE_END,
+                b"\r".as_slice()
+            ]
+        );
+        // A probe's one-byte pieces without the rule split everything.
+        let (bytes, out) = pieces_of("é", false, 1, vec![]);
+        assert_eq!(bytes.len(), bracketed("é").len() + 1);
+        assert!(bytes.iter().all(|p| p.len() == 1));
+        assert_eq!(out, [Ok(())]);
+    }
+
+    /// A reply refused after its start marker alone: only the end marker follows.
+    #[test]
+    fn a_stopped_marker_alone_paste_is_closed() {
+        let (pieces, out) = pieces_of(
+            "fix it\nplease",
+            true,
+            SUBMIT_CHUNK,
+            vec![Ok(()), Err(SUBMIT_NOT_READY.into())],
+        );
+        assert_eq!(pieces, [PASTE_START, PASTE_END]);
+        assert_eq!(out, [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        // Refused inside the text: the end marker, never more text, never Enter.
+        let (pieces, out) = pieces_of(
+            &"é".repeat(SUBMIT_CHUNK),
+            true,
+            SUBMIT_CHUNK,
+            vec![Ok(()), Ok(()), Err(SUBMIT_NEEDS_YOU.into())],
+        );
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        assert_eq!(pieces[2], PASTE_END);
+        assert!(std::str::from_utf8(&pieces[1]).is_ok());
+        assert_eq!(out, [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
     /// No descriptor for writes that cannot block: a reply is refused, and nothing is
     /// written in its place.
     #[test]
@@ -3437,6 +3859,8 @@ mod status_tests {
             w: Box::new(rec),
             #[cfg(unix)]
             fd: None,
+            #[cfg(windows)]
+            pipe: None,
         };
         let e = pw.write_now(b"x").unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);

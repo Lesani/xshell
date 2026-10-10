@@ -65,6 +65,25 @@ replace them, extraction is strict (an unrecognised screen gives a text-only pro
 buttons), and an answer the TUI ignores is published again under a new id (the Daemon's
 recheck).
 
+## ConPTY renderings (`conpty/`, Lesani/xshell#40)
+
+On Windows an agent draws into a ConPTY, and the Daemon reads ConPTY's own rendering of the
+console, not the agent's bytes. `conpty/` holds each fixture above as ConPTY renders it: the
+xshelld Windows test `conpty_renders_fixtures` (`crates/xshelld/tests/windows_submit.rs`)
+draws the fixture with a console fake agent at the fixture's size and records the Daemon's
+output. Their sidecars are the source's, plus `"via": "conpty"` and `"windowsBuild"`; they
+are still `"synthetic": true` (synthetic screens, real rendering). The core test
+`conpty_renderings_read_as_their_sources` checks on every OS that each reads as its source.
+
+To refresh them, download the `conpty-probes-windows-latest` artifact of a CI run and copy
+its `conpty-fixtures/*` here.
+
+Real recordings of Claude Code and Codex on Windows come from the ignored test
+`hitl_real_agent_probe` in the same file (on a Windows machine with a logged-in agent:
+`AGENT=claude|codex cargo test -p xshelld --test windows_submit hitl_real_agent_probe --
+--ignored --nocapture`). Cut its dump as in step 3 below and commit it with
+`"synthetic": false, "via": "conpty"`.
+
 ## Recording real fixtures (xshell-remote#17, HITL)
 
 On a machine with a Claude Code and a Codex login, in a throwaway directory:

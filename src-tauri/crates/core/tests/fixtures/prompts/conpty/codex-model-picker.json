@@ -1,0 +1,12 @@
+{
+  "agent": "codex",
+  "cols": 100,
+  "composer": false,
+  "expect": null,
+  "rows": 30,
+  "source": "codex-model-picker.raw drawn by the console fake through ConPTY on Windows build 26100 (crates/xshelld/tests/windows_submit.rs conpty_renders_fixtures), as the Daemon read it",
+  "synthetic": true,
+  "version": "0.154.0",
+  "via": "conpty",
+  "windowsBuild": 26100
+}

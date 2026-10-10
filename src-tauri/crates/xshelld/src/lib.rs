@@ -136,7 +136,29 @@ pub fn main_entry() -> i32 {
             cfg.job_launcher = Some(p.into());
         }
     }
+    submit_probe(&mut cfg);
     server::run_serve(cfg, stop)
+}
+
+/// Test hook, debug builds only (a release build ignores it): the Windows reply probes
+/// (`tests/windows_submit.rs`) let this Daemon take replies without offering
+/// `term.submit` (`XSHELLD_TEST_SUBMIT=1`, before the build gate allows it), and write them
+/// in pieces of at most `XSHELLD_TEST_SUBMIT_PIECE` bytes, refused once
+/// `XSHELLD_TEST_SUBMIT_STOP_AFTER` bytes were written.
+fn submit_probe(cfg: &mut server::Config) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    if std::env::var_os("XSHELLD_TEST_SUBMIT").as_deref() == Some("1".as_ref()) {
+        cfg.submit = true;
+    }
+    cfg.submit_probe.max_piece = num("XSHELLD_TEST_SUBMIT_PIECE");
+    cfg.submit_probe.stop_after = num("XSHELLD_TEST_SUBMIT_STOP_AFTER");
+    if cfg.submit_probe.max_piece.is_some() {
+        // The probe splits where it likes: markers and characters too.
+        cfg.submit_markers_alone = false;
+    }
 }
 
 /// What this platform does not run: on Windows a Persistent `serve` (only the app starts

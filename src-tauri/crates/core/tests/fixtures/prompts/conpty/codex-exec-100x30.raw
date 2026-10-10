@@ -1,0 +1,116 @@
+c[?9001h[?1004h[m]0;D:\a\xshell\xshell\src-tauri\target\debug\xshelld.exe[?25h[?25l[8;29;100t[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[2J[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[2J[1m>_ OpenAI Codex[22m (v0.154.0)[K
+[K[2m
+model: [22mgpt-5-codex   [2mdirectory: [22m~/proj[K
+[K[1m
+user[22m[K
+list the files in /tmp[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+  Would you like to run the following command?[K
+[K
+  Reason: list the files in /tmp[K
+[K
+  $ ls -la /tmp[K
+[K[36m
+› 1. Yes, proceed (y)[K[m
+  2. Yes, and don't ask again for this command in this session (a)[K
+  3. No, and tell Codex what to do differently (esc)[K
+[K
+  [2mPress [22menter[2m to confirm or [22mesc[2m to cancel[22m[K[?25l[59C

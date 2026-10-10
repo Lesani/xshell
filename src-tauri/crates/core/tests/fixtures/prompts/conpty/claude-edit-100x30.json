@@ -1,0 +1,23 @@
+{
+  "agent": "claude",
+  "cols": 100,
+  "composer": false,
+  "expect": {
+    "options": [
+      "Yes",
+      "Yes, allow all edits during this session",
+      "No, and tell Claude what to do differently"
+    ],
+    "textContains": [
+      "Edit file",
+      "src/main.rs",
+      "Do you want to make this edit to main.rs?"
+    ]
+  },
+  "rows": 30,
+  "source": "claude-edit-100x30.raw drawn by the console fake through ConPTY on Windows build 26100 (crates/xshelld/tests/windows_submit.rs conpty_renders_fixtures), as the Daemon read it",
+  "synthetic": true,
+  "version": "2.1.296",
+  "via": "conpty",
+  "windowsBuild": 26100
+}

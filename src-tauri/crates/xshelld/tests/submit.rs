@@ -24,7 +24,7 @@ use xshell_core::launch::LaunchSpec;
 use xshell_protocol::msg::{
     ClientMsg, OpenSpec, ServerMsg, SUBMIT_MAX_BYTES, SUBMIT_MAX_FILES, SUBMIT_NEEDS_YOU,
     SUBMIT_NOT_CHAT, SUBMIT_NOT_DROPPED, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_STUCK,
-    SUBMIT_TOO_MANY_FILES, SUBMIT_UNCONFIRMED,
+    SUBMIT_TOO_MANY_FILES, SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
 };
 use xshelld::server::{Config, Role, ServerHandle, TestHook, TestPoint};
 
@@ -937,6 +937,59 @@ fn no_nonblocking_descriptor_refuses_replies() {
     t.expect_input(b"");
     e.desk.input(t.id, "x");
     t.expect_input(b"x");
+}
+
+/// The capabilities a new Desktop connection is offered.
+fn offered(e: &Env) -> Vec<String> {
+    let mut c = Client::connect(&e.srv.socket);
+    c.hello(range(1, 1)).0.capabilities
+}
+
+/// A Host that takes no replies (a Windows Host below the build gate): neither capability is
+/// offered, a reply to a ready agent is refused as unsupported, and nothing is typed.
+#[test]
+fn submit_unsupported_host_refuses_and_hides_capability() {
+    let mut e = env_with(|c| c.submit = false);
+    let caps = offered(&e);
+    assert!(
+        !caps.iter().any(|c| c.starts_with("term.submit")),
+        "{caps:?}"
+    );
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    assert_eq!(submit(&mut m, &t, "hi"), Err(SUBMIT_UNSUPPORTED.into()));
+    t.expect_input(b"");
+}
+
+/// A Host that takes replies but not their files (Windows): `term.submit-files` is not
+/// offered, a reply with a file is refused before the file is held (the sweep still takes
+/// it), and nothing is typed; a reply without files still goes.
+#[test]
+fn files_refused_where_not_offered() {
+    let mut e = env_with(|c| {
+        c.submit_files = false;
+        c.drop_sweep = ms(50);
+        c.drop_max_age = Duration::from_secs(60);
+    });
+    let caps = offered(&e);
+    assert!(caps.iter().any(|c| c == "term.submit"), "{caps:?}");
+    assert!(!caps.iter().any(|c| c == "term.submit-files"), "{caps:?}");
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let path = drop_photo(&mut m, "photo.jpg");
+    assert_eq!(
+        submit_files(&mut m, &t, "look", &[&path]),
+        Err(SUBMIT_UNSUPPORTED.into())
+    );
+    t.expect_input(b"");
+    age(Path::new(&path), Duration::from_secs(120));
+    let deadline = Instant::now() + T;
+    while Path::new(&path).exists() {
+        assert!(Instant::now() < deadline, "the refused reply held its file");
+        std::thread::sleep(ms(20));
+    }
+    assert_eq!(submit(&mut m, &t, "text only"), Ok(Value::Null));
+    t.expect_input(&typed("text only"));
 }
 
 /// A PTY that stops taking input in the middle of a reply, and then its end marker too:

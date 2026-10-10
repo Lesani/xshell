@@ -119,7 +119,24 @@ jobs:
         with:
           node-version: lts/*
       - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
-      - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked
+      # On Windows the reply probes (#40) log what ConPTY does as facts, and the ConPTY
+      # renderings of the prompt fixtures are kept as an artifact.
+      - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked --no-fail-fast
+        env:
+          XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
+          XSHELL_CONPTY_FIXTURE_OUT: ${{ runner.temp }}/conpty-fixtures
+      - name: Reply probe facts
+        if: always() && runner.os == 'Windows'
+        shell: bash
+        run: cat "$RUNNER_TEMP/probe-facts.txt" || true
+      - if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpty-probes-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/probe-facts.txt
+            ${{ runner.temp }}/conpty-fixtures
+          if-no-files-found: ignore
       # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.
       - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol --all-features --locked
@@ -127,6 +144,42 @@ jobs:
       - name: Desktop compiles for Windows
         if: matrix.os == 'windows-latest'
         run: cargo check -p xshell --locked
+  windows-2022:
+    # The reply probes (#40) on a second ConPTY build (Windows Server 2022, build 20348): the
+    # Windows build a Windows Host offers replies from is the lowest one they pass on.
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: cargo test -p xshelld --lib --locked
+        env:
+          XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
+      - if: always()
+        run: cargo test -p xshelld --test windows_submit --locked
+        env:
+          XSHELL_PROBE_FACTS: ${{ runner.temp }}/probe-facts.txt
+          XSHELL_CONPTY_FIXTURE_OUT: ${{ runner.temp }}/conpty-fixtures
+      - name: Reply probe facts
+        if: always()
+        shell: bash
+        run: cat "$RUNNER_TEMP/probe-facts.txt" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conpty-probes-windows-2022
+          path: |
+            ${{ runner.temp }}/probe-facts.txt
+            ${{ runner.temp }}/conpty-fixtures
+          if-no-files-found: ignore
   xshelld-musl:
     # The Daemon ships as a static musl binary. rusqlite (bundled) compiles C, so each target
     # builds natively with musl-gcc on a runner of its own architecture. The release workflow

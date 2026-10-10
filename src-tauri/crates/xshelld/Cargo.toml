@@ -32,11 +32,18 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    # RtlGetVersion: the Windows build Chat View replies need.
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Security",
+    # WriteFile and PIPE_NOWAIT: replies' writes to the ConPTY input that must not block.
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
@@ -50,6 +57,14 @@ toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
+    # The Windows build the reply probes report (RtlGetVersion).
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
+    # The console fake agent of the reply probes (tests/windows_submit.rs).
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

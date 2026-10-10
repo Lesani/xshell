@@ -149,6 +149,19 @@ pub struct Config {
     pub submit_enter_delay: Duration,
     /// A reply whose PTY takes nothing of it for this long is ended (10 s).
     pub submit_stall: Duration,
+    /// Whether this Host takes Chat View replies (`term.submit`): Unix Hosts do; Windows
+    /// Hosts from build [`SUBMIT_MIN_BUILD`] on. Without it the capability is not offered and
+    /// a reply is refused with `SUBMIT_UNSUPPORTED`.
+    pub submit: bool,
+    /// Whether a reply may carry files (`term.submit-files`): Unix Hosts only. Without it the
+    /// capability is not offered and a reply with files is refused before any file is held.
+    pub submit_files: bool,
+    /// Each bracketed paste's markers are written as pieces of their own, and no piece ends
+    /// inside a character (Windows, for the ConPTY's input decoder).
+    pub submit_markers_alone: bool,
+    /// Test hook: how replies are written, for the Windows probes (`XSHELLD_TEST_SUBMIT_*`).
+    #[doc(hidden)]
+    pub submit_probe: SubmitProbe,
     /// How often the drop directory (`save_dropped_file`) is swept of old files while the
     /// Daemon runs (1 h), besides once at start: a Persistent Daemon may run for weeks, and
     /// `$XDG_RUNTIME_DIR` is memory.
@@ -282,6 +295,34 @@ impl std::fmt::Debug for PushHooks {
     }
 }
 
+/// Test hook: how a reply is written, so a probe can split it where it likes.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubmitProbe {
+    /// At most this many bytes per write of the paste (`SUBMIT_CHUNK` when `None`).
+    pub max_piece: Option<usize>,
+    /// The gate refuses the paste and Enter once this many bytes of the paste were written,
+    /// as if the agent stopped accepting the reply there.
+    pub stop_after: Option<usize>,
+}
+
+/// The lowest Windows build whose ConPTY is known to give the Daemon what a reply needs
+/// (the agent's bracketed paste mode, and its input as written). `u32::MAX`: none yet; the
+/// CI probes (`tests/windows_submit.rs`) measure it (Lesani/xshell#40).
+pub const SUBMIT_MIN_BUILD: u32 = u32::MAX;
+
+/// Whether this Host takes Chat View replies (see [`Config::submit`]).
+pub fn submit_supported() -> bool {
+    #[cfg(windows)]
+    {
+        terminal::windows_build().is_some_and(|b| (SUBMIT_MIN_BUILD..).contains(&b))
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 /// `serve --gui-bound --parent-pid N`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuiBound {
@@ -394,6 +435,10 @@ impl Config {
             prompt_clock: None,
             submit_enter_delay: Duration::from_millis(50),
             submit_stall: terminal::SUBMIT_STALL,
+            submit: submit_supported(),
+            submit_files: cfg!(unix),
+            submit_markers_alone: cfg!(windows),
+            submit_probe: SubmitProbe::default(),
             drop_sweep: Duration::from_secs(60 * 60),
             drop_max_age: xshell_core::files::DROPPED_FILE_MAX_AGE,
             drop_grace: Duration::from_secs(10 * 60),

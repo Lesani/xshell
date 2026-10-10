@@ -1,0 +1,105 @@
+c[?9001h[?1004h[m]0;D:\a\xshell\xshell\src-tauri\target\debug\xshelld.exe[?25h[?25l[8;29;100t[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[2J[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[?25l╭──────────────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                                │
+│                                                          │
+│   cwd: /home/dev/proj                                    │
+╰──────────────────────────────────────────────────────────╯[7;1H> greet the world[K
+[K
+⏺ I'll update the greeting.[K
+[K
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ [1mEdit file[22m                                                                                        │
+│ src/main.rs                                                                                      │
+│   12 -    println!("hello");                                                                     │
+│   12 +    println!("hello, world");                                                              │
+│                                                                                                  │
+│ Do you want to make this edit to main.rs?                                                        │
+│ [38;5;153m❯ 1. Yes[89X[m[89C│
+│   2. Yes, allow all edits during this session [1m(shift+tab)[22m                                        │
+│   3. No, and tell Claude what to do differently [1m(esc)[22m                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

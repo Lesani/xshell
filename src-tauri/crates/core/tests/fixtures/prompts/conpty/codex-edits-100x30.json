@@ -1,0 +1,22 @@
+{
+  "agent": "codex",
+  "cols": 100,
+  "composer": false,
+  "expect": {
+    "options": [
+      "Yes, proceed",
+      "Yes, and don't ask again for these files",
+      "No, and tell Codex what to do differently"
+    ],
+    "textContains": [
+      "Would you like to make the following edits?",
+      "src/main.rs"
+    ]
+  },
+  "rows": 30,
+  "source": "codex-edits-100x30.raw drawn by the console fake through ConPTY on Windows build 26100 (crates/xshelld/tests/windows_submit.rs conpty_renders_fixtures), as the Daemon read it",
+  "synthetic": true,
+  "version": "0.154.0",
+  "via": "conpty",
+  "windowsBuild": 26100
+}

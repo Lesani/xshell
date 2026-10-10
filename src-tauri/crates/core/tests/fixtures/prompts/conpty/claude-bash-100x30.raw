@@ -1,0 +1,102 @@
+c[?9001h[?1004h[?25l[m[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H]0;D:\a\xshell\xshell\src-tauri\target\debug\xshelld.exe[?25h[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[2J[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[?25l╭──────────────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                                │
+│                                                          │
+│   cwd: /home/dev/proj                                    │
+╰──────────────────────────────────────────────────────────╯[7;1H> list the files in /tmp[K
+[K
+⏺ I'll list the files in /tmp.[K
+[K[2m
+────────────────────────────────────────────────────────────────────────────────────────────────────[22m
+ [1mBash command[22m[K
+[K
+   ls -la /tmp[K
+   [2mList the files in /tmp[22m[17;1H Do you want to proceed?[38;5;153m
+ ❯ 1. Yes[m
+   2. Yes, and don't ask again for ls commands in /home/dev/proj
+   3. No, and tell Claude what to do differently [1m(esc)[22m[22;1H [2mEsc to cancel

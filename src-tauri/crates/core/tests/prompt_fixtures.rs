@@ -299,3 +299,48 @@ fn bracketed_paste_follows_the_output() {
     assert!(m.bracketed_paste(), "drawing keeps it");
     assert!(composer(fx.agent, &m.rows()));
 }
+
+/// The prompt fixtures as a real ConPTY renders them (`fixtures/prompts/conpty`, recorded by
+/// xshelld's Windows test `conpty_renders_fixtures`, Lesani/xshell#40): each reads as its
+/// source does, on every OS. They are kept out of [`Fixture::all`].
+#[test]
+fn conpty_renderings_read_as_their_sources() {
+    let dir = dir().join("conpty");
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            (p.extension()? == "raw").then(|| p.file_stem().unwrap().to_string_lossy().into())
+        })
+        .collect();
+    names.sort();
+    assert!(names.len() >= 20, "{names:?}");
+    for name in &names {
+        let meta: Value =
+            serde_json::from_slice(&fs::read(dir.join(format!("{name}.json"))).unwrap()).unwrap();
+        assert_eq!(meta["via"], "conpty", "{name}");
+        assert!(meta["windowsBuild"].as_u64().is_some(), "{name}");
+        let source = Fixture::load(name);
+        let agent = source.agent;
+        let mut m = ScreenModel::new(source.cols, source.rows);
+        m.feed(&fs::read(dir.join(format!("{name}.raw"))).unwrap());
+        let screen = m.rows();
+        assert_eq!(
+            composer(agent, &screen),
+            composer(agent, &source.screen()),
+            "{name}:\n{}",
+            screen.join("\n")
+        );
+        assert_eq!(
+            composer_images(agent, &screen),
+            composer_images(agent, &source.screen()),
+            "{name}"
+        );
+        assert_eq!(
+            extract(agent, &screen).map(|f| labels(&f)),
+            source.found().map(|f| labels(&f)),
+            "{name}:\n{}",
+            screen.join("\n")
+        );
+    }
+}
