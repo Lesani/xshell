@@ -206,6 +206,11 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::RingJoin { .. } => Err(forbidden("ring.join")),
         // A Mobile's own push registration; the handler refuses anyone else.
         ClientMsg::PushRegister { .. } | ClientMsg::PushUnregister => Ok(()),
+        // About a Terminal: the stream worker judges them in `listed`, on the instance it
+        // reads, and again before anything is sent.
+        ClientMsg::SessionSubscribe { .. }
+        | ClientMsg::SessionPage { .. }
+        | ClientMsg::SessionUnsubscribe { .. } => Ok(()),
     }
 }
 
@@ -670,6 +675,22 @@ pub(crate) mod tests {
         for m in [&reg, &ClientMsg::PushUnregister] {
             assert_eq!(check(Role::Mobile, &ctx, m), Ok(()));
         }
+        // Session streams are about a Terminal: judged in `listed` by the worker.
+        for m in [
+            ClientMsg::SessionSubscribe {
+                terminal: t,
+                limit: None,
+            },
+            ClientMsg::SessionPage {
+                terminal: t,
+                gen: 1,
+                before: 0,
+                limit: None,
+            },
+            ClientMsg::SessionUnsubscribe { terminal: t },
+        ] {
+            assert_eq!(check(Role::Mobile, &ctx, &m), Ok(()));
+        }
     }
 
     pub(crate) fn daemon(dir: &Path) -> Arc<Daemon> {
@@ -703,6 +724,12 @@ pub(crate) mod tests {
                 },
             )),
             last_lines: crate::server::last_line::LastLines::new(std::time::Duration::from_secs(1)),
+            session_streams: crate::server::session_stream::SessionStreams::new(
+                std::time::Duration::from_secs(1),
+                8,
+                16,
+                256,
+            ),
         })
     }
 

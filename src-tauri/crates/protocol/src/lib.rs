@@ -36,6 +36,9 @@ pub const CAPABILITIES: &[&str] = &[
     "ring.cjoin",
     // `push.register` and `push.unregister` (from a Mobile).
     "push",
+    // `session.subscribe`, `session.page`, `session.unsubscribe` and `session.append`: an
+    // agent Terminal's conversation for the Chat View.
+    "session.stream",
 ];
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -79,6 +82,11 @@ mod tests {
     #[test]
     fn capabilities_include_push() {
         assert!(CAPABILITIES.contains(&"push"));
+    }
+
+    #[test]
+    fn capabilities_include_session_stream() {
+        assert!(CAPABILITIES.contains(&"session.stream"));
     }
 
     #[test]

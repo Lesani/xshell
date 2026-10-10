@@ -125,6 +125,147 @@ pub enum ClientMsg {
     /// Forget this Mobile's push registration. Mobile only; gated on `push`.
     #[serde(rename = "push.unregister")]
     PushUnregister,
+    /// Follow the conversation of agent Terminal `terminal` (a direct Claude or Codex): the
+    /// `res` is its newest [`SessionPage`] of at most `limit` entries ([`CHAT_PAGE_DEFAULT`],
+    /// at most [`CHAT_PAGE_MAX`]), then `session.append` messages carry what is added. Replaces
+    /// this connection's earlier subscription to the same Terminal. Gated on the
+    /// `session.stream` capability.
+    #[serde(rename = "session.subscribe")]
+    SessionSubscribe {
+        terminal: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// The entries before `before` (a cursor from a page or a reset) of generation `gen` of
+    /// this connection's subscription to `terminal`: an older [`SessionPage`]. Refused with
+    /// [`SESSION_CHANGED`] once the subscription has moved to another generation.
+    #[serde(rename = "session.page")]
+    SessionPage {
+        terminal: Uuid,
+        gen: u64,
+        before: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// End this connection's subscription to `terminal`; no `session.append` for it follows
+    /// the `res`. Answers `null` also when there was none.
+    #[serde(rename = "session.unsubscribe")]
+    SessionUnsubscribe { terminal: Uuid },
+}
+
+/// The refusal of a `session.page` for a generation the subscription has left (a reset
+/// follows or has already been sent).
+pub const SESSION_CHANGED: &str = "session changed";
+/// The refusal of a `session.page` without a subscription to that Terminal.
+pub const NOT_SUBSCRIBED: &str = "not subscribed";
+/// The refusal of a `session.subscribe` for a Terminal whose agent has no session stream
+/// (anything but a direct Claude or Codex).
+pub const NO_SESSION_STREAM: &str = "no session stream for this agent";
+
+/// Entries a page or append carries by default and at most.
+pub const CHAT_PAGE_DEFAULT: u32 = 50;
+pub const CHAT_PAGE_MAX: u32 = 200;
+/// The most bytes one page or append message takes, serialized as a frame: a `res` carrying
+/// a [`SessionPage`], or a `session.append`. One entry alone always fits.
+pub const CHAT_PAGE_MAX_BYTES: usize = 256 * 1024;
+/// The most characters (Unicode scalar values) of a user or agent text.
+pub const CHAT_TEXT_MAX_CHARS: usize = 32 * 1024;
+/// The most characters of a tool call's input (compact JSON or raw text).
+pub const CHAT_TOOL_INPUT_MAX_CHARS: usize = 2048;
+/// The most characters of a tool result's text.
+pub const CHAT_TOOL_RESULT_MAX_CHARS: usize = 4096;
+/// The most characters of a tool's name and of a call id.
+pub const CHAT_TOOL_NAME_MAX_CHARS: usize = 128;
+/// The most characters of a tool call's one-line summary.
+pub const CHAT_TOOL_SUMMARY_MAX_CHARS: usize = 200;
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One item of an agent conversation, as read from the agent's session. Text is cut at a
+/// character boundary to its cap, with `truncated` set; nothing is ever HTML.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ChatItem {
+    /// What the user typed (a slash command as `/name args`; an image as `[image]`).
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    /// The agent's reply text (Markdown as the agent wrote it).
+    Agent {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    /// The agent called a tool. `call` pairs it with its [`ChatItem::ToolResult`]; `summary`
+    /// is one line (a command, a path, a pattern…); `input` the arguments, cut to
+    /// [`CHAT_TOOL_INPUT_MAX_CHARS`] (`truncated`).
+    ToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<String>,
+        name: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+    /// A tool's output, cut to [`CHAT_TOOL_RESULT_MAX_CHARS`]; `error` when the tool failed.
+    ToolResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        error: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        truncated: bool,
+    },
+}
+
+/// A [`ChatItem`] with its place in the conversation. `id` is unique within a subscription's
+/// generation and stable across its pages and appends (`"<gen>:<offset>"`, or
+/// `"<gen>:<offset>.<n>"` for the n-th item of one session line); `atMs` is when the agent
+/// recorded it (Unix ms), if it did.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    #[serde(flatten)]
+    pub item: ChatItem,
+}
+
+/// Chat entries: one this side cannot read (an unknown `kind` from a newer Daemon, a missing
+/// field, not an object) is dropped, never the whole message.
+fn lenient_chat_entries<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ChatEntry>, D::Error> {
+    let v = Option::<Vec<Value>>::deserialize(d)?;
+    Ok(v.unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| serde_json::from_value(e).ok())
+        .collect())
+}
+
+/// A page of a conversation, oldest entry first: the answer to `session.subscribe` and
+/// `session.page`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPage {
+    /// The subscription's generation; `session.page` names it.
+    pub gen: u64,
+    /// The agent session shown; `null` while the Terminal has none linked.
+    pub session: Option<String>,
+    #[serde(default, deserialize_with = "lenient_chat_entries")]
+    pub items: Vec<ChatEntry>,
+    /// An opaque cursor for the next older page (`session.page`'s `before`); absent at the
+    /// start of the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<u64>,
 }
 
 /// Which Agent Status changes wake a Mobile. Both are required.
@@ -230,6 +371,9 @@ const CLIENT_TYPES: &[&str] = &[
     "ring.join",
     "push.register",
     "push.unregister",
+    "session.subscribe",
+    "session.page",
+    "session.unsubscribe",
 ];
 
 /// `term.open`'s spec: a launch spec plus the Desktop-chosen UUID, initial size and opaque
@@ -296,9 +440,33 @@ pub enum ServerMsg {
     /// Connection-level failure; the Host closes the connection after it.
     #[serde(rename = "error")]
     Error { code: String, message: String },
+    /// New entries of a subscribed conversation (`session.subscribe`), in order, for
+    /// generation `gen`. With `reset` the subscription moved to a new generation (another
+    /// session was linked, the session file was replaced or truncated, or it appeared):
+    /// `items` is its newest page and replaces everything shown, and `before` continues it.
+    #[serde(rename = "session.append")]
+    SessionAppend {
+        terminal: Uuid,
+        gen: u64,
+        #[serde(default)]
+        reset: bool,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default, deserialize_with = "lenient_chat_entries")]
+        items: Vec<ChatEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+    },
 }
 
-const SERVER_TYPES: &[&str] = &["hello", "res", "terminals", "term.exit", "error"];
+const SERVER_TYPES: &[&str] = &[
+    "hello",
+    "res",
+    "terminals",
+    "term.exit",
+    "error",
+    "session.append",
+];
 
 /// `{"t":"res","id":7,"ok":<any>}` or `{"t":"res","id":7,"err":"…"}`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -986,5 +1154,219 @@ mod tests {
                 text: "hi".into()
             })
         );
+    }
+
+    #[test]
+    fn session_subscribe_page_unsubscribe_golden() {
+        let id = Uuid::new_v4();
+        for (msg, want) in [
+            (
+                ClientMsg::SessionSubscribe {
+                    terminal: id,
+                    limit: None,
+                },
+                format!(r#"{{"id":3,"t":"session.subscribe","terminal":"{id}"}}"#),
+            ),
+            (
+                ClientMsg::SessionSubscribe {
+                    terminal: id,
+                    limit: Some(20),
+                },
+                format!(r#"{{"id":3,"t":"session.subscribe","terminal":"{id}","limit":20}}"#),
+            ),
+            (
+                ClientMsg::SessionPage {
+                    terminal: id,
+                    gen: 7,
+                    before: 4096,
+                    limit: Some(50),
+                },
+                format!(
+                    r#"{{"id":3,"t":"session.page","terminal":"{id}","gen":7,"before":4096,"limit":50}}"#
+                ),
+            ),
+            (
+                ClientMsg::SessionUnsubscribe { terminal: id },
+                format!(r#"{{"id":3,"t":"session.unsubscribe","terminal":"{id}"}}"#),
+            ),
+        ] {
+            let b = body(encode_msg(&msg, Some(3)).unwrap());
+            assert_eq!(String::from_utf8(b.clone()).unwrap(), want);
+            assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(3), msg });
+        }
+        // `gen` and `before` are required on a page request.
+        let raw = json!({"t":"session.page","id":4,"terminal":id,"before":1});
+        assert!(matches!(
+            decode_inbound(raw.to_string().as_bytes()),
+            Err(DecodeError::Invalid { id: Some(4), .. })
+        ));
+    }
+
+    fn sample_entries() -> Vec<ChatEntry> {
+        vec![
+            ChatEntry {
+                id: "2:0".into(),
+                at_ms: Some(1_700_000_000_000),
+                item: ChatItem::User {
+                    text: "fix it".into(),
+                    truncated: false,
+                },
+            },
+            ChatEntry {
+                id: "2:90.1".into(),
+                at_ms: None,
+                item: ChatItem::ToolCall {
+                    call: Some("toolu_1".into()),
+                    name: "Bash".into(),
+                    summary: "npm test".into(),
+                    input: Some(r#"{"command":"npm test"}"#.into()),
+                    truncated: false,
+                },
+            },
+            ChatEntry {
+                id: "2:200".into(),
+                at_ms: None,
+                item: ChatItem::ToolResult {
+                    call: Some("toolu_1".into()),
+                    text: "3 passed".into(),
+                    error: true,
+                    truncated: true,
+                },
+            },
+            ChatEntry {
+                id: "2:300".into(),
+                at_ms: None,
+                item: ChatItem::Agent {
+                    text: "Done.".into(),
+                    truncated: true,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn session_append_golden() {
+        let id = Uuid::new_v4();
+        let msg = ServerMsg::SessionAppend {
+            terminal: id,
+            gen: 2,
+            reset: true,
+            session: Some("s1".into()),
+            items: sample_entries(),
+            before: Some(12),
+        };
+        let b = body(encode_msg(&msg, None).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            format!(
+                concat!(
+                    r#"{{"t":"session.append","terminal":"{}","gen":2,"reset":true,"session":"s1","items":["#,
+                    r#"{{"id":"2:0","atMs":1700000000000,"kind":"user","text":"fix it"}},"#,
+                    r#"{{"id":"2:90.1","kind":"tool-call","call":"toolu_1","name":"Bash","summary":"npm test","input":"{{\"command\":\"npm test\"}}"}},"#,
+                    r#"{{"id":"2:200","kind":"tool-result","call":"toolu_1","text":"3 passed","error":true,"truncated":true}},"#,
+                    r#"{{"id":"2:300","kind":"agent","text":"Done.","truncated":true}}],"before":12}}"#
+                ),
+                id
+            )
+        );
+        assert_eq!(decode_server(&b).unwrap(), msg);
+        // A plain append: no `before`, and an unlinked session is `null`.
+        let msg = ServerMsg::SessionAppend {
+            terminal: id,
+            gen: 3,
+            reset: false,
+            session: None,
+            items: vec![],
+            before: None,
+        };
+        let b = body(encode_msg(&msg, None).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            format!(
+                r#"{{"t":"session.append","terminal":"{id}","gen":3,"reset":false,"session":null,"items":[]}}"#
+            )
+        );
+        assert_eq!(decode_server(&b).unwrap(), msg);
+    }
+
+    #[test]
+    fn session_page_golden() {
+        let page = SessionPage {
+            gen: 1,
+            session: None,
+            items: vec![],
+            before: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&page).unwrap(),
+            r#"{"gen":1,"session":null,"items":[]}"#
+        );
+        let page = SessionPage {
+            gen: 4,
+            session: Some("abc".into()),
+            items: sample_entries(),
+            before: Some(99),
+        };
+        let v = serde_json::to_value(&page).unwrap();
+        assert_eq!(v["before"], json!(99));
+        assert_eq!(serde_json::from_value::<SessionPage>(v).unwrap(), page);
+    }
+
+    #[test]
+    fn chat_entries_lenient() {
+        let id = Uuid::new_v4();
+        let items = json!([
+            {"id":"1:0","kind":"user","text":"kept"},
+            {"id":"1:1","kind":"hologram","text":"newer daemon"},
+            {"id":"1:2","kind":"agent"},
+            7,
+            {"kind":"agent","text":"no id"},
+            {"id":"1:3","kind":"tool-result","text":"out","future":true},
+        ]);
+        let raw = json!({"t":"session.append","terminal":id,"gen":1,"reset":false,
+                         "session":"s","items":items});
+        let ServerMsg::SessionAppend { items: got, .. } =
+            decode_server(raw.to_string().as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        let ids: Vec<_> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["1:0", "1:3"]);
+        assert_eq!(
+            got[1].item,
+            ChatItem::ToolResult {
+                call: None,
+                text: "out".into(),
+                error: false,
+                truncated: false
+            }
+        );
+        let page: SessionPage =
+            serde_json::from_value(json!({"gen":1,"session":null,"items":items,"before":5}))
+                .unwrap();
+        assert_eq!(page.items, got);
+        assert_eq!(page.before, Some(5));
+        // `items` missing or null reads as none.
+        let page: SessionPage =
+            serde_json::from_value(json!({"gen":1,"session":null,"items":null})).unwrap();
+        assert!(page.items.is_empty());
+    }
+
+    #[test]
+    fn session_append_is_known_server_type() {
+        assert!(SERVER_TYPES.contains(&"session.append"));
+        // A bad known message is Invalid (answerable), an unknown type is UnknownType.
+        let raw = json!({"t":"session.append","gen":1});
+        assert!(matches!(
+            decode_server(raw.to_string().as_bytes()),
+            Err(DecodeError::Invalid { .. })
+        ));
+        assert!(matches!(
+            decode_server(br#"{"t":"session.future"}"#),
+            Err(DecodeError::UnknownType { .. })
+        ));
+        for t in ["session.subscribe", "session.page", "session.unsubscribe"] {
+            assert!(CLIENT_TYPES.contains(&t), "{t}");
+        }
     }
 }

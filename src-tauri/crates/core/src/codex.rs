@@ -21,13 +21,24 @@ use xshell_protocol::msg::{LastLine, Speaker};
 // context bar renders: the numbers come from Codex itself, not an estimate.
 
 pub fn codex_rollout_files(ctx: &HostCtx) -> Vec<std::path::PathBuf> {
+    rollout_files_within(ctx, usize::MAX).unwrap_or_default()
+}
+
+/// [`codex_rollout_files`], visiting at most `max_entries` directory entries: `None` past
+/// that.
+fn rollout_files_within(ctx: &HostCtx, max_entries: usize) -> Option<Vec<PathBuf>> {
     let Some(home) = ctx.home.clone() else {
-        return vec![];
+        return Some(vec![]);
     };
     let mut files = vec![];
+    let mut seen = 0usize;
     let mut stack = vec![home.join(".codex").join("sessions")];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).ok().into_iter().flatten().flatten() {
+            seen += 1;
+            if seen > max_entries {
+                return None;
+            }
             let p = entry.path();
             if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
                 stack.push(p);
@@ -38,17 +49,22 @@ pub fn codex_rollout_files(ctx: &HostCtx) -> Vec<std::path::PathBuf> {
             }
         }
     }
-    files
+    Some(files)
 }
 
 /// The rollout of Codex session `sid`: the file under `~/.codex/sessions` whose name ends
 /// in `-{sid}.jsonl`. The newest by path (the date directories sort by date) when several do.
 pub fn rollout_for(ctx: &HostCtx, sid: &str) -> Option<PathBuf> {
+    rollout_for_within(ctx, sid, usize::MAX)
+}
+
+/// [`rollout_for`], giving up (`None`) after visiting `max_entries` directory entries.
+pub fn rollout_for_within(ctx: &HostCtx, sid: &str, max_entries: usize) -> Option<PathBuf> {
     if sid.is_empty() {
         return None;
     }
     let suffix = format!("-{sid}.jsonl");
-    codex_rollout_files(ctx)
+    rollout_files_within(ctx, max_entries)?
         .into_iter()
         .filter(|p| {
             p.file_name()
@@ -71,18 +87,24 @@ pub(crate) fn last_line_in_window(path: &Path, window: u64) -> Option<LastLine> 
 /// [`last_line_in`] for a file already opened (and checked).
 pub(crate) fn last_line_from(f: &mut std::fs::File, window: u64) -> Option<LastLine> {
     crate::last_line::newest_in_tail(f, window, |json| {
-        if json.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
-            return None;
-        }
-        let payload = json.get("payload")?;
-        let from = match payload.get("type").and_then(|v| v.as_str()) {
-            Some("user_message") => Speaker::User,
-            Some("agent_message") => Speaker::Agent,
-            _ => return None,
-        };
-        let text = payload.get("message").and_then(|v| v.as_str())?;
-        Some((from, text.to_string()))
+        event_message(json).map(|(from, text)| (from, text.to_string()))
     })
+}
+
+/// The speaker and text of a rollout line that is a user or agent message: an `event_msg`
+/// of type `user_message` or `agent_message` (the `response_item` messages repeat them).
+pub(crate) fn event_message(json: &serde_json::Value) -> Option<(Speaker, &str)> {
+    if json.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = json.get("payload")?;
+    let from = match payload.get("type").and_then(|v| v.as_str()) {
+        Some("user_message") => Speaker::User,
+        Some("agent_message") => Speaker::Agent,
+        _ => return None,
+    };
+    let text = payload.get("message").and_then(|v| v.as_str())?;
+    Some((from, text))
 }
 
 // User-assigned session names (Codex's rename feature) don't live in the rollout files —

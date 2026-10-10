@@ -41,6 +41,8 @@ pub(crate) struct Daemon {
     pub push: Arc<super::push::Push>,
     /// Reads agent Terminals' last lines.
     pub last_lines: super::last_line::LastLines,
+    /// Streams agent Terminals' conversations to subscribed connections.
+    pub session_streams: super::session_stream::SessionStreams,
 }
 
 /// A registered connection: its outbox and the role that decides what it is told.
@@ -368,6 +370,7 @@ impl Daemon {
         }
         self.push.stop();
         self.last_lines.stop();
+        self.session_streams.stop();
         // The goodbye runs alongside ending the Terminals and is over before the lock is
         // released, so an upgraded successor connects only after it.
         let me = self.clone();

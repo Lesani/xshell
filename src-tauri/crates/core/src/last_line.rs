@@ -1,10 +1,9 @@
 //! The last line of an agent Terminal: the newest user or agent text message of its
 //! session, read from the tail of the session file inside the agent's session storage.
 
-use crate::claude::encode_project_name;
+use crate::chat::{self, ChatAgent};
 use crate::ctx::HostCtx;
 use crate::paths::stays_inside;
-use crate::sessions::valid_session_id;
 use crate::{claude, codex};
 use serde_json::Value;
 use std::fs::{self, File};
@@ -20,27 +19,11 @@ pub(crate) const TAIL_WINDOW: u64 = 256 * 1024;
 /// on a valid session id, whose session file is a regular file (not a symlink) that resolves
 /// inside the agent's session storage (`~/.claude/projects` or `~/.codex/sessions`).
 pub fn last_line(ctx: &HostCtx, spec: &LaunchSpec) -> Option<LastLine> {
-    let agent = spec.direct_agent()?;
-    let sid = spec.session_id.as_deref().filter(|s| valid_session_id(s))?;
-    let home = ctx.home()?;
-    match agent {
-        "claude" => {
-            let enc = encode_project_name(&spec.cwd);
-            if enc.is_empty() {
-                return None;
-            }
-            let root = home.join(".claude").join("projects");
-            let path = root.join(enc).join(format!("{sid}.jsonl"));
-            let mut f = open_confined(&root, &path)?;
-            claude::last_line_from(&mut f, TAIL_WINDOW)
-        }
-        "codex" => {
-            let root = home.join(".codex").join("sessions");
-            let path = codex::rollout_for(ctx, sid)?;
-            let mut f = open_confined(&root, &path)?;
-            codex::last_line_from(&mut f, TAIL_WINDOW)
-        }
-        _ => None,
+    let sf = chat::session_file(ctx, spec)?;
+    let mut f = chat::open(&sf)?;
+    match sf.agent {
+        ChatAgent::Claude => claude::last_line_from(&mut f, TAIL_WINDOW),
+        ChatAgent::Codex => codex::last_line_from(&mut f, TAIL_WINDOW),
     }
 }
 
@@ -67,7 +50,7 @@ thread_local! {
 /// lookup, or a hard link into storage, both of which need write access to the agent's
 /// session storage on the Host (the same limit as the Mobile call checks in xshelld's
 /// `role.rs`).
-fn open_confined(root: &Path, path: &Path) -> Option<File> {
+pub(crate) fn open_confined(root: &Path, path: &Path) -> Option<File> {
     let plain = path.starts_with(root)
         && path
             .symlink_metadata()
@@ -117,14 +100,14 @@ pub(crate) fn open_no_follow(path: &Path) -> Option<File> {
 /// What identifies an open file on its machine: device and inode, or volume serial number
 /// and file index.
 #[cfg(unix)]
-fn file_id(f: &File) -> Option<(u64, u64)> {
+pub(crate) fn file_id(f: &File) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let m = f.metadata().ok()?;
     Some((m.dev(), m.ino()))
 }
 
 #[cfg(windows)]
-fn file_id(f: &File) -> Option<(u64, u64)> {
+pub(crate) fn file_id(f: &File) -> Option<(u64, u64)> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
@@ -195,6 +178,7 @@ pub(crate) fn newest_in_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::claude::encode_project_name;
     use crate::testutil::Fixture;
     use serde_json::json;
 

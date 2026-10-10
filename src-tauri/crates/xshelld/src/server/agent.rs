@@ -52,6 +52,7 @@ pub(crate) fn on_event(
                 // Accepted: the agent's session has a new message, also when the status
                 // repeats (another turn finished).
                 d.last_lines.request(terminal);
+                d.session_streams.wake(terminal);
             })
             .map(|changed| {
                 if changed && !reg.frozen {
@@ -80,5 +81,6 @@ pub(crate) fn changed(d: &Daemon, t: &Terminal) {
     drop(reg);
     if listed {
         d.last_lines.request(t.id);
+        d.session_streams.wake(t.id);
     }
 }

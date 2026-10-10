@@ -76,7 +76,11 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
     if let Some(f) = frame(&ServerMsg::Hello(Hello {
         protocol: PROTOCOL,
         version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+        capabilities: CAPABILITIES
+            .iter()
+            .filter(|c| !d.cfg.hide_capabilities.iter().any(|h| h == *c))
+            .map(|s| s.to_string())
+            .collect(),
     })) {
         ob.push_control(f);
     }
@@ -183,6 +187,8 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
             t.detach(id);
         }
     }
+    // After the connection left the registry: no stream result is queued for it from now on.
+    d.session_streams.drop_conn(id);
     if clean {
         ob.close();
     } else {
@@ -401,6 +407,7 @@ impl Conn {
                                 // The line was the previous session's; the new one's is read.
                                 t.set_last_line(None);
                                 d.last_lines.request(terminal);
+                                d.session_streams.wake(terminal);
                             }
                             d.persist(&reg);
                             d.broadcast_terminals(&reg);
@@ -441,6 +448,21 @@ impl Conn {
                 let r = d.push.register(peer, &blob, &seal_key, triggers);
                 reply(&self.ob, id, r)
             }
+            // Answered by the session-stream worker.
+            ClientMsg::SessionSubscribe { terminal, limit } => d
+                .session_streams
+                .subscribe(self.id, self.role, &self.ob, id, terminal, limit),
+            ClientMsg::SessionPage {
+                terminal,
+                gen,
+                before,
+                limit,
+            } => d.session_streams.page(
+                self.id, self.role, &self.ob, id, terminal, gen, before, limit,
+            ),
+            ClientMsg::SessionUnsubscribe { terminal } => d
+                .session_streams
+                .unsubscribe(self.id, self.role, &self.ob, id, terminal),
             ClientMsg::PushUnregister => {
                 let peer = self.peer.as_ref().filter(|_| self.role == Role::Mobile);
                 reply(&self.ob, id, d.push.unregister(peer))

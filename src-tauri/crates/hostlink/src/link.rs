@@ -135,6 +135,9 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::RingJoin { .. } => "ring.join",
         ClientMsg::PushRegister { .. } => "push.register",
         ClientMsg::PushUnregister => "push.unregister",
+        ClientMsg::SessionSubscribe { .. } => "session.subscribe",
+        ClientMsg::SessionPage { .. } => "session.page",
+        ClientMsg::SessionUnsubscribe { .. } => "session.unsubscribe",
     }
 }
 
@@ -531,6 +534,8 @@ impl Link {
                     *self.remote_error.lock().unwrap() = Some(message);
                 }
                 Ok(ServerMsg::Hello(_)) => {}
+                // The Desktop subscribes to no conversation yet.
+                Ok(ServerMsg::SessionAppend { .. }) => {}
                 // A newer Daemon's message type: additive, skip it.
                 Err(DecodeError::UnknownType { .. }) => {}
                 Err(e) => return Err(format!("protocol error: {e}")),

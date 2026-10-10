@@ -4,8 +4,9 @@
 //! Threads only, blocking std I/O. Lock order, never reversed: `Registry` →
 //! `Terminal.record` → `Terminal.io` → `Terminal.out` → `Outbox`; `Terminal.life` and
 //! `Terminal.input` are taken last and alone; `Terminal.status` (the Agent Status),
-//! `Terminal.last_line` and the last-line worker's queue are taken last, and nothing is
-//! locked while one is held. No lock is held across a blocking PTY or
+//! `Terminal.last_line`, the last-line worker's queue and the session-stream queue are taken
+//! last, and nothing is locked while one is held (the session-stream worker queues its
+//! results under the registry lock, like every publish: `Registry` → `Outbox`). No lock is held across a blocking PTY or
 //! socket write: writers own their sockets, input threads own PTY writers. The push
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
@@ -24,6 +25,7 @@ mod relaunch;
 mod relay_conn;
 pub(crate) mod ring;
 mod role;
+mod session_stream;
 pub use role::Role;
 mod signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
@@ -104,6 +106,18 @@ pub struct Config {
     /// A Terminal's last line is read when asked for and once more after this long, for a
     /// session file written after the hook that asked.
     pub last_line_retry: Duration,
+    /// How often a subscribed session file is checked for appended lines (1 s); agent
+    /// reports and relinks read it at once.
+    pub session_poll: Duration,
+    /// Session subscriptions per connection.
+    pub max_session_subs: usize,
+    /// Session requests (subscribe, page, unsubscribe) queued per connection.
+    pub max_session_requests: usize,
+    /// Session requests queued over all connections.
+    pub max_session_queue: usize,
+    /// Test hook: capabilities left out of `hello`, as an older Daemon would.
+    #[doc(hidden)]
+    pub hide_capabilities: Vec<String>,
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
@@ -143,6 +157,9 @@ pub enum TestPoint {
     /// The last-line worker read this Terminal's session file and is about to store and
     /// publish the result (no lock held).
     LastLineRead,
+    /// The session-stream worker read this Terminal's session file (a page, a reset or an
+    /// append) and is about to check and queue the result (no lock held).
+    SessionRead,
 }
 
 /// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
@@ -261,6 +278,11 @@ impl Config {
             push_retry: Duration::from_secs(2),
             push_hooks: PushHooks::default(),
             last_line_retry: Duration::from_secs(1),
+            session_poll: Duration::from_secs(1),
+            max_session_subs: 8,
+            max_session_requests: 16,
+            max_session_queue: 256,
+            hide_capabilities: Vec::new(),
             cleanup_override: None,
             test_hook: None,
         }
@@ -402,6 +424,12 @@ impl Server {
             ring.set_on_head(Arc::new(move |epoch, c| p.on_head(epoch, c)));
         }
         let last_lines = last_line::LastLines::new(cfg.last_line_retry);
+        let session_streams = session_stream::SessionStreams::new(
+            cfg.session_poll,
+            cfg.max_session_subs,
+            cfg.max_session_requests,
+            cfg.max_session_queue,
+        );
         let d = Arc::new(Daemon {
             cfg,
             ctx: Arc::new(ctx),
@@ -420,11 +448,13 @@ impl Server {
             ring,
             push,
             last_lines,
+            session_streams,
         });
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
         d.push.bind(Arc::downgrade(&d));
         d.last_lines.bind(Arc::downgrade(&d));
+        d.session_streams.bind(Arc::downgrade(&d));
         if !d.restore() {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);
@@ -548,6 +578,12 @@ impl ServerHandle {
     pub fn attached(&self) -> usize {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.values().map(|t| t.attached()).sum()
+    }
+
+    /// Test hook: session subscriptions held, over all connections.
+    #[doc(hidden)]
+    pub fn session_subs(&self) -> usize {
+        self.d.session_streams.count()
     }
 
     /// Test hook: the connections registered (local, SSH and Relay sessions alike).

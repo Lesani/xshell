@@ -194,6 +194,13 @@ impl Outbox {
         self.inner.lock().unwrap().state == State::Open
     }
 
+    /// Bytes queued and not yet taken by the writer. Producers of deferrable control frames
+    /// (session appends) wait while it is high instead of growing a queue that is never
+    /// dropped.
+    pub fn queued_bytes(&self) -> usize {
+        self.inner.lock().unwrap().total_bytes
+    }
+
     /// Wait until the writer has finished (flushed and shut down), at most until `deadline`.
     pub fn wait_done(&self, deadline: Instant) -> bool {
         let mut g = self.inner.lock().unwrap();

@@ -4,6 +4,7 @@ pub mod agent_context;
 pub mod agent_status;
 pub mod agents;
 pub mod antigravity;
+pub mod chat;
 pub mod claude;
 pub mod codex;
 pub mod ctx;
