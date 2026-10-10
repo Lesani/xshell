@@ -270,6 +270,15 @@ fn join_connects_daemon_to_relay() {
             .iter()
             .any(|m| m.member.sign_key == id.sign && online(&m.presence))
     });
+    // The Relay can show the Daemon online before the Daemon records its own state.
+    let deadline = Instant::now() + T;
+    while identity(&mut c).raw["ring"]["state"] != "connected" {
+        assert!(
+            Instant::now() < deadline,
+            "the Daemon's state never connected"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let i = identity(&mut c);
     assert_eq!(i.raw["ring"]["ringId"], ring.chain.ring_id().as_str());
     assert_eq!(i.raw["ring"]["version"], 2);
