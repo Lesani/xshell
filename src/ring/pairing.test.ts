@@ -66,6 +66,7 @@ describe("failures", () => {
       ["not_found", "mobile.pair.computer.notFound"],
       ["invalid_code", "mobile.pair.computer.invalid"],
       ["expired", "mobile.pair.expired"],
+      ["publish_failed", "mobile.pair.err.publishFailed"],
       ["relay", "mobile.pair.failed"],
       ["other", "mobile.pair.failed"],
     ];
@@ -177,7 +178,8 @@ describe("pairing strings", () => {
     "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired", "mobile.pair.failed",
     "mobile.pair.computer", "mobile.pair.computer.desc", "mobile.pair.computer.label", "mobile.pair.computer.placeholder",
     "mobile.pair.computer.connecting", "mobile.pair.computer.notFound", "mobile.pair.computer.invalid",
-    "mobile.pair.err.role", "mobile.pair.err.full",
+    "mobile.pair.err.role", "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
+    "mobile.pair.needsRelay", "mobile.pair.needsMember",
   ];
 
   it("has every key", () => {

@@ -26,7 +26,10 @@ use tungstenite::{Message, WebSocket};
 pub struct PairOptions {
     /// TLS for `wss://`; `None`: the Mozilla roots.
     pub tls: Option<Arc<ClientConfig>>,
-    /// Dialing and each handshake step once both sides are on the pipe.
+    /// Dialing and each handshake step once both sides are on the pipe. A guest waits this
+    /// long for the Desktop's answer to its join, which the Desktop sends only once the
+    /// Relay holds the new Roster version: the Desktop's wait for that
+    /// (`DesktopRingConfig::pair_publish_wait`, 10 s) must stay below the guest's step.
     pub step: Duration,
     /// How often a waiting socket pings the Relay.
     pub ping_interval: Duration,

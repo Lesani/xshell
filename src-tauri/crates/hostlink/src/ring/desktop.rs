@@ -287,6 +287,11 @@ pub struct DesktopRingConfig {
     pub owner_retry: Duration,
     /// How long a pairing secret (a phone's QR, a computer's code) stays good.
     pub pair_ttl: Duration,
+    /// How long a pairing waits for the Relay to hold the new Roster version (for the
+    /// connection to come up, say) before it refuses the device. Below the guest's step
+    /// ([`PairOptions::step`], 15 s by default), so the device hears the refusal rather than
+    /// timing out; never past the pairing secret's time.
+    pub pair_publish_wait: Duration,
 }
 
 impl DesktopRingConfig {
@@ -302,6 +307,7 @@ impl DesktopRingConfig {
             move_attempts: 5,
             owner_retry: Duration::from_secs(2),
             pair_ttl: Duration::from_secs(xshell_protocol::ring::pairing::PAIR_TTL_SECS),
+            pair_publish_wait: Duration::from_secs(10),
         }
     }
 }
@@ -488,6 +494,9 @@ pub struct DesktopRing {
     /// Test hook: runs between a commit and the adoption of its result.
     #[cfg(test)]
     after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Test hook: runs when a pairing starts waiting for the Relay to hold its version.
+    #[cfg(test)]
+    before_publish_wait: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// The thread holding `commit`, for the lock-order test.
     #[cfg(test)]
     commit_owner: Mutex<Option<std::thread::ThreadId>>,
@@ -585,6 +594,8 @@ impl DesktopRing {
             deferred_emit: AtomicBool::new(false),
             #[cfg(test)]
             after_commit: Mutex::new(None),
+            #[cfg(test)]
+            before_publish_wait: Mutex::new(None),
             #[cfg(test)]
             commit_owner: Mutex::new(None),
         });
@@ -722,6 +733,16 @@ impl DesktopRing {
 
     #[cfg(not(test))]
     fn hook(&self) {}
+
+    #[cfg(test)]
+    fn publish_wait_hook(&self) {
+        if let Some(h) = self.before_publish_wait.lock().unwrap().as_ref() {
+            h();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn publish_wait_hook(&self) {}
 
     /// Adopts a committed state (this instance's or another's) into `live` and the
     /// Connector. Under the commit lock; a state older than the one held (same Ring, lower
@@ -1117,6 +1138,7 @@ impl DesktopRing {
     /// this returns; a thread waits for the phone and runs the Desktop's side.
     pub fn pair_phone(&self, observer: Arc<dyn PairingObserver>) -> Result<PhoneOffer, String> {
         let s = self.pairing_state()?;
+        self.hurry_connection();
         let secret = PairSecret::generate().map_err(|e| e.to_string())?;
         let head = s.chain.head();
         let ttl = self.cfg.pair_ttl;
@@ -1171,6 +1193,7 @@ impl DesktopRing {
     ) -> Result<(), String> {
         let code = PairCode::parse(code).map_err(|e| format!("{}: {e}", e.as_code()))?;
         let s = self.pairing_state()?;
+        self.hurry_connection();
         let secret = code.secret();
         let cancel = self.start_pairing(PairingFlow::Computer);
         let opts = self.pair_options();
@@ -1239,6 +1262,20 @@ impl DesktopRing {
         Ok(s)
     }
 
+    /// A pairing starts: a Connector waiting out its backoff dials now, as the pairing
+    /// needs the connection to publish the new version.
+    fn hurry_connection(&self) {
+        let (connector, link) = {
+            let l = self.lock();
+            (l.connector.clone(), l.link.clone())
+        };
+        if !matches!(link, Some(LinkState::Connected { .. })) {
+            if let Some(c) = connector {
+                c.kick();
+            }
+        }
+    }
+
     /// A new pairing of `flow`: the previous one is cancelled.
     fn start_pairing(&self, flow: PairingFlow) -> Cancel {
         self.cancel_pairing(flow);
@@ -1277,6 +1314,7 @@ impl DesktopRing {
             ring: self,
             used: AtomicBool::new(false),
             until,
+            cancel: cancel.clone(),
         };
         host_pairing(
             pipe,
@@ -1294,8 +1332,15 @@ impl DesktopRing {
 
     /// Adds a paired device: a new Roster version, committed, adopted and published, and
     /// acknowledged by the Relay. The same keys with the same role again are a member
-    /// already, not an error.
-    fn add_paired_member(&self, req: &JoinRequest) -> Result<Joined, PairRefusal> {
+    /// already, not an error. Waits for the Relay to hold the version (for the connection
+    /// to come up, say) up to `pair_publish_wait` and never past `until`; `cancel` (the
+    /// pairing cancelled, the app quitting) ends the wait.
+    fn add_paired_member(
+        &self,
+        req: &JoinRequest,
+        until: Instant,
+        cancel: &Cancel,
+    ) -> Result<Joined, PairRefusal> {
         let (s, next) = {
             let _c = self.lock_commit();
             let r = self.tx(|cur, _| {
@@ -1354,7 +1399,10 @@ impl DesktopRing {
         self.emit();
         let head = next.unwrap_or_else(|| s.chain.head().clone());
         let connector = self.lock().connector.clone();
-        match connector.map(|c| c.publish(&head)) {
+        let deadline = until.min(Instant::now() + self.cfg.pair_publish_wait);
+        self.publish_wait_hook();
+        // No Ring lock is held while waiting.
+        match connector.map(|c| c.publish_until(&head, deadline, Some(cancel))) {
             Some(Ok(())) => {}
             Some(Err(e)) => {
                 eprintln!("xshell: cannot publish the new roster: {e}");
@@ -1611,6 +1659,7 @@ struct Adder<'a> {
     ring: &'a DesktopRing,
     used: AtomicBool,
     until: Instant,
+    cancel: Cancel,
 }
 
 impl PairingHost for Adder<'_> {
@@ -1625,7 +1674,7 @@ impl PairingHost for Adder<'_> {
     }
 
     fn add(&self, req: &JoinRequest) -> Result<Joined, PairRefusal> {
-        self.ring.add_paired_member(req)
+        self.ring.add_paired_member(req, self.until, &self.cancel)
     }
 }
 
@@ -2785,6 +2834,123 @@ mod tests {
         );
         a.quit();
         b.quit();
+    }
+
+    // ---- Pairing while the connection is not up (xshell#38) -----------------------------
+
+    /// A Ring on `r` whose Relay connection cannot authenticate (the Relay expects another
+    /// origin) while the pairing pipe still works, with a hook that reports when a pairing
+    /// starts waiting for the Relay to hold its version. Returns the real origin.
+    fn unauthenticated(
+        r: &TestRelay,
+        c: DesktopRingConfig,
+    ) -> (Arc<DesktopRing>, String, std::sync::mpsc::Receiver<Instant>) {
+        let real = r.origin();
+        r.set_origin("https://wrong.example");
+        let (ring, _) = open(c);
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "a failed attempt", |v| v.connection == "waiting");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        *ring.before_publish_wait.lock().unwrap() = Some(Box::new(move || {
+            let _ = tx.lock().unwrap().send(Instant::now());
+        }));
+        (ring, real, rx)
+    }
+
+    fn scan_in_thread(
+        payload: &str,
+    ) -> (
+        Arc<DeviceKeys>,
+        std::thread::JoinHandle<Result<RosterChain, PairError>>,
+    ) {
+        let phone = Arc::new(DeviceKeys::generate().unwrap());
+        let (p, k) = (payload.to_string(), phone.clone());
+        (phone, std::thread::spawn(move || scan(&p, &k)))
+    }
+
+    #[test]
+    fn pairing_while_connecting_waits_and_succeeds() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, real, waiting) = unauthenticated(&r, cfg(t.path(), &r.url()));
+        let obs = Arc::new(Pairings::default());
+        let offer = ring.pair_phone(obs.clone()).unwrap();
+        let (phone, guest) = scan_in_thread(&offer.payload);
+        waiting
+            .recv_timeout(WAIT)
+            .expect("the pairing waits for the relay");
+        assert!(!connected(&ring.view()), "{:?}", ring.view());
+        r.set_origin(&real);
+        assert_eq!(
+            obs.outcome(PairingFlow::Phone),
+            PairingEvent::Paired {
+                name: "my phone".into(),
+                role: Role::Mobile
+            }
+        );
+        let chain = guest.join().unwrap().expect("the phone is paired");
+        assert_eq!(
+            chain.head().member(&phone.sign_key()).unwrap().role,
+            Role::Mobile
+        );
+        let rid = chain.ring_id().clone();
+        assert_eq!(r.head_version(&rid), Some(chain.head().version()));
+        assert_eq!(ring.chain().unwrap().head(), chain.head());
+        ring.quit();
+    }
+
+    #[test]
+    fn pairing_publish_wait_is_bounded() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let mut c = cfg(t.path(), &r.url());
+        // Below the guest's 3 s step.
+        c.pair_publish_wait = Duration::from_millis(1500);
+        let (ring, _real, waiting) = unauthenticated(&r, c);
+        let obs = Arc::new(Pairings::default());
+        let offer = ring.pair_phone(obs.clone()).unwrap();
+        let (_phone, guest) = scan_in_thread(&offer.payload);
+        let started = waiting.recv_timeout(WAIT).expect("the pairing waits");
+        assert_eq!(
+            obs.outcome(PairingFlow::Phone),
+            PairingEvent::Failed {
+                code: "publish_failed".into()
+            }
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(1400) && took < Duration::from_millis(2500),
+            "{took:?}"
+        );
+        // The phone hears the refusal, not a step timeout.
+        assert_eq!(
+            guest.join().unwrap().unwrap_err(),
+            PairError::Refused(PairRefusal::PublishFailed)
+        );
+        ring.quit();
+    }
+
+    #[test]
+    fn pairing_wait_ends_on_quit() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _real, waiting) = unauthenticated(&r, cfg(t.path(), &r.url()));
+        let obs = Arc::new(Pairings::default());
+        let offer = ring.pair_phone(obs.clone()).unwrap();
+        let (_phone, guest) = scan_in_thread(&offer.payload);
+        waiting.recv_timeout(WAIT).expect("the pairing waits");
+        let q = Instant::now();
+        ring.quit();
+        assert!(q.elapsed() < Duration::from_secs(2), "{:?}", q.elapsed());
+        match obs.outcome(PairingFlow::Phone) {
+            PairingEvent::Failed { code } => {
+                assert!(code == "publish_failed" || code == "cancelled", "{code}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(q.elapsed() < Duration::from_secs(2), "{:?}", q.elapsed());
+        assert!(guest.join().unwrap().is_err());
     }
 
     // ---- Removal (#22) ------------------------------------------------------------------

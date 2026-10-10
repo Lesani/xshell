@@ -441,6 +441,29 @@ impl Ticket {
             }
         }
     }
+
+    /// Waits for the answer until `until`, looking at `give_up` every few milliseconds:
+    /// `Err(Timeout)` when the deadline passed or `give_up` said so (the outcome unknown).
+    pub(crate) fn wait_until(
+        self,
+        until: Instant,
+        give_up: impl Fn() -> bool,
+    ) -> Result<(), RingError> {
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() || give_up() {
+                lock(&self.state).waiting.remove(&self.id);
+                return Err(RingError::Timeout);
+            }
+            match self.rx.recv_timeout(left.min(Duration::from_millis(25))) {
+                Ok(r) => return r,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(RingError::Closed(CloseReason::Local))
+                }
+            }
+        }
+    }
 }
 
 /// What a Daemon asks the Relay to forward to the Push Gateway (section 18).
@@ -787,19 +810,23 @@ impl RingClient {
     /// Uploads the next Roster version and waits for the Relay to accept it. It must extend
     /// this client's trusted head.
     pub fn publish_roster(&self, next: &SignedRoster) -> Result<(), RingError> {
+        self.publish_roster_start(next)?.wait(self.timeouts.request)
+    }
+
+    /// [`RingClient::publish_roster`] in two steps: checks and queues the upload without
+    /// blocking and returns the ticket its answer comes through.
+    pub(crate) fn publish_roster_start(&self, next: &SignedRoster) -> Result<Ticket, RingError> {
         lock(&self.state)
             .chain
             .extended(std::slice::from_ref(next))?;
         // On `ok` the IO thread accepts the version through the same path as the Relay's
         // broadcast, so `RingEvents::roster` fires exactly once whichever arrives first.
-        self.request(
-            Some(next.token().to_string()),
-            self.timeouts.request,
-            |id| ClientFrame::RosterPut {
+        self.request_start(Some(next.token().to_string()), |id| {
+            ClientFrame::RosterPut {
                 id,
                 roster: next.token().to_string(),
-            },
-        )
+            }
+        })
     }
 
     /// Stores a Push Gateway entitlement token in the Ring's slot on the Relay.

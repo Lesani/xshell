@@ -4,7 +4,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use xshell_protocol::ring::relay::contract::{config, connect, TestRing, WAIT};
-use xshell_protocol::ring::relay::test_relay::{TestRelay, TestRelayOptions, TrickleProxy};
+use xshell_protocol::ring::relay::test_relay::{Fault, TestRelay, TestRelayOptions, TrickleProxy};
 use xshell_protocol::ring::relay::wire::{ByeReason, MemberPresence};
 use xshell_protocol::ring::relay::{
     Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState, RingTimeouts,
@@ -495,4 +495,191 @@ fn stop_while_the_move_is_acknowledged_says_goodbye_on_the_old_relay() {
         "said goodbye: {p:?}"
     );
     assert!(!online(&b, &ring, &key));
+}
+
+// ---- publish_until (xshell#38) ----------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[test]
+fn publish_until_succeeds_when_sync_published_first() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    for _ in 0..5 {
+        let next = ring.next(|_| {});
+        // The worker's sync and this call race to upload the same version.
+        c.set_chain(ring.chain.clone(), None);
+        c.publish_until(&next, Instant::now() + WAIT, None)
+            .expect("published");
+        assert_eq!(r.head_version(&ring.ring_id()), Some(next.version()));
+    }
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn publish_until_waits_for_connection() {
+    let r = relay();
+    // Ring authentication fails (the signed origin is wrong) until the origin is restored.
+    let real = r.origin();
+    r.set_origin("https://wrong.example");
+    let mut ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::State(LinkState::Waiting { .. })))
+        .is_some());
+    let next = ring.next(|_| {});
+    c.set_chain(ring.chain.clone(), None);
+    assert!(c.connection().is_none());
+    assert!(
+        matches!(c.publish(&next), Err(RingError::Closed(_))),
+        "plain publish fails at once"
+    );
+    let started = Instant::now();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            r.set_origin(&real);
+        });
+        c.publish_until(&next, Instant::now() + WAIT, None)
+            .expect("published once connected");
+    });
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(r.head_version(&ring.ring_id()), Some(next.version()));
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn publish_until_is_bounded_while_puts_go_unanswered() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    r.ignore_roster_puts(true);
+    let next = ring.next(|_| {});
+    // Far below the client's 2 s request timeout.
+    let t = Instant::now();
+    let e = c
+        .publish_until(&next, t + Duration::from_millis(400), None)
+        .unwrap_err();
+    assert!(matches!(e, RingError::Timeout), "{e:?}");
+    let took = t.elapsed();
+    assert!(
+        took < Duration::from_millis(1200),
+        "bounded by the deadline: {took:?}"
+    );
+    // Cancellation ends a wait for an answer, too.
+    let cancel = AtomicBool::new(false);
+    let t = Instant::now();
+    let e = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.store(true, Ordering::Release);
+        });
+        c.publish_until(&next, t + WAIT, Some(&cancel)).unwrap_err()
+    });
+    assert!(matches!(e, RingError::Closed(_)), "{e:?}");
+    assert!(
+        t.elapsed() < Duration::from_millis(1200),
+        "{:?}",
+        t.elapsed()
+    );
+    // Already cancelled: no success reported even though the Relay would accept it.
+    r.ignore_roster_puts(false);
+    let e = c
+        .publish_until(&next, Instant::now() + WAIT, Some(&cancel))
+        .unwrap_err();
+    assert!(matches!(e, RingError::Closed(_)), "{e:?}");
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn publish_until_waits_for_the_versions_before_it() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    // The worker's upload of v3 goes unanswered: the client stays at v2.
+    r.ignore_roster_puts(true);
+    ring.next(|_| {});
+    c.set_chain(ring.chain.clone(), None);
+    let v4 = ring.next(|_| {});
+    c.set_chain(ring.chain.clone(), None);
+    // A version that skips one and is not in the trusted chain is refused at once.
+    let alt3 = ring
+        .up_to(2)
+        .head()
+        .next(&*ring.desktop, 1, |d| {
+            d.relay_url = "ws://127.0.0.1:1".into()
+        })
+        .unwrap();
+    let alt4 = alt3.next(&*ring.desktop, 2, |_| {}).unwrap();
+    let t = Instant::now();
+    let e = c.publish_until(&alt4, t + WAIT, None).unwrap_err();
+    assert!(matches!(e, RingError::Roster(_)), "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(1));
+    let t = Instant::now();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            r.ignore_roster_puts(false);
+        });
+        // v4 cannot go before v3 (a Gap for the client): it waits for ordered sync.
+        c.publish_until(&v4, Instant::now() + Duration::from_secs(8), None)
+            .expect("published after v3");
+    });
+    assert!(t.elapsed() >= Duration::from_millis(300), "it waited");
+    assert_eq!(r.head_version(&ring.ring_id()), Some(4));
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn publish_until_accepts_exactly_a_version_the_relay_moved_past() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let me = ring.desktop.sign_key();
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    wait_until("online", || online(&r, &ring, &me));
+    // This client stops hearing broadcasts, so it never sees what the other Desktop
+    // publishes; the Relay's direct answers still reach it.
+    assert!(r.fault(&ring.ring_id(), &me, Fault::Mute));
+    let v2 = ring.chain.head().clone();
+    let v3 = ring.next(|_| {});
+    ring.next(|_| {});
+    let (other, orec) = start(cfg(&r, &ring.up_to(2), ring.desktop2.clone()));
+    assert!(orec.connected());
+    other.set_chain(ring.chain.clone(), None);
+    wait_until("v4 on the Relay", || {
+        r.head_version(&ring.ring_id()) == Some(4)
+    });
+    // The exact historical bytes: the Relay answers `roster_stale` while this client has
+    // not seen v3; it retries, and once a new connection brings it the Relay's chain, v3 is
+    // held.
+    let stale_before = r.stale_roster_puts();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            wait_until("a stale answer", || r.stale_roster_puts() > stale_before);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(r.kick(&ring.ring_id(), &me, 1011));
+        });
+        c.publish_until(&v3, Instant::now() + WAIT, None)
+            .expect("v3 is held");
+    });
+    assert!(r.stale_roster_puts() > stale_before);
+    // Different bytes at version 3: refused, not waited out.
+    let alt = v2
+        .next(&*ring.desktop, 1, |d| {
+            d.relay_url = "ws://127.0.0.1:1".into()
+        })
+        .unwrap();
+    assert_eq!(alt.version(), 3);
+    assert_ne!(alt.token(), v3.token());
+    let t = Instant::now();
+    let e = c.publish_until(&alt, t + WAIT, None).unwrap_err();
+    assert!(matches!(e, RingError::Roster(_)), "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    other.stop(ByeReason::quit());
+    c.stop(ByeReason::quit());
 }

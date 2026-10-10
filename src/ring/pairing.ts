@@ -81,6 +81,7 @@ export function failureKey(code: string): StringKey {
     case "not_found": return "mobile.pair.computer.notFound";
     case "invalid_code": return "mobile.pair.computer.invalid";
     case "expired": return "mobile.pair.expired";
+    case "publish_failed": return "mobile.pair.err.publishFailed";
     default: return "mobile.pair.failed";
   }
 }

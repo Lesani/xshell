@@ -20,10 +20,11 @@
 //! acknowledgement. The owner keeps the job on disk and passes it again at its next start.
 
 use super::super::chain::RosterChain;
-use super::super::{RingError, SignKey, SignedRoster};
+use super::super::{RingError, RosterError, SignKey, SignedRoster};
 use super::client::{MemberStatus, PushRequest, RingClient, RingClientConfig, RingEvents, Ticket};
 use super::wire::{close, ByeReason, CloseReason, ErrorCode, MemberPresence};
 use crate::backoff::Backoff;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -220,6 +221,13 @@ fn removed_close(why: &CloseReason) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether the Relay `c` is connected to holds exactly `next` (as far as `c` has seen).
+fn holds(c: &RingClient, next: &SignedRoster) -> bool {
+    c.chain()
+        .get(next.version())
+        .is_some_and(|r| r.token() == next.token())
 }
 
 fn removed_error(e: &RingError) -> bool {
@@ -777,12 +785,96 @@ impl Connector {
 
     /// Uploads `next` on the current connection and waits for the Relay's answer. Best
     /// effort: `Err` when not connected (the next connect stages it anyway once it is in the
-    /// chain given to [`Connector::set_chain`]).
+    /// chain given to [`Connector::set_chain`]). A caller that must know the Relay has it
+    /// uses [`Connector::publish_until`].
     pub fn publish(&self, next: &SignedRoster) -> Result<(), RingError> {
         let c = lock(&self.inner.st).client.clone();
         match c {
             Some(c) if !c.is_closed() => c.publish_roster(next),
             _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// Gets `next` to the Relay by `until`: done once the Relay holds exactly this version
+    /// (same bytes), whether this call uploaded it or the worker's sync (or another device)
+    /// did. Unlike [`Connector::publish`], it waits for a connection (kicking a Connector in
+    /// backoff once), for the versions before `next` that the worker is still publishing
+    /// (when `next` is in the trusted chain), and retries an upload the connection lost.
+    /// Every wait, an unanswered upload included, ends at `until`, when the Connector stops,
+    /// or when `cancel` is set (`Err(Closed)`). `Err` otherwise: the last error seen
+    /// (`Closed` when never connected), or the Relay's refusal of different bytes.
+    pub fn publish_until(
+        &self,
+        next: &SignedRoster,
+        until: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), RingError> {
+        let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Acquire));
+        let halted = || cancelled() || lock(&self.inner.st).stop.is_some();
+        let closed = || RingError::Closed(CloseReason::Local);
+        let mut kicked = false;
+        let mut last: Option<RingError> = None;
+        loop {
+            if halted() {
+                return Err(closed());
+            }
+            let c = lock(&self.inner.st)
+                .client
+                .clone()
+                .filter(|c| !c.is_closed());
+            match c {
+                Some(c) if holds(&c, next) => {
+                    // Recheck: a cancelled pairing does not report success.
+                    return if halted() { Err(closed()) } else { Ok(()) };
+                }
+                Some(c) => {
+                    if Instant::now() >= until {
+                        return Err(last.unwrap_or_else(closed));
+                    }
+                    let r = c
+                        .publish_roster_start(next)
+                        .and_then(|t| t.wait_until(until, || halted() || c.is_closed()));
+                    if halted() {
+                        return Err(closed());
+                    }
+                    match r {
+                        Ok(()) => return Ok(()),
+                        Err(_) if holds(&c, next) => return Ok(()),
+                        Err(e) if self.retryable(&e, next) => last = Some(e),
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => {
+                    if !kicked {
+                        kicked = true;
+                        self.kick();
+                    }
+                }
+            }
+            if Instant::now() >= until {
+                return Err(last.unwrap_or_else(closed));
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            std::thread::sleep(left.min(Duration::from_millis(25)));
+        }
+    }
+
+    /// Whether [`Connector::publish_until`] tries again after `e`: the connection was lost
+    /// or the answer did not come, the Relay holds a newer version this client has not seen
+    /// yet (the local check then decides), or the client lacks versions before `next` that
+    /// the worker publishes in order (only when `next` is in the trusted chain).
+    fn retryable(&self, e: &RingError, next: &SignedRoster) -> bool {
+        match e {
+            RingError::Closed(_) | RingError::Timeout => true,
+            RingError::Relay {
+                code: ErrorCode::RosterStale,
+                ..
+            } => true,
+            RingError::Roster(RosterError::Gap) => lock(&self.inner.st)
+                .chain
+                .get(next.version())
+                .is_some_and(|r| r.token() == next.token()),
+            _ => false,
         }
     }
 

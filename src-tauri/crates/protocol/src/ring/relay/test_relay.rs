@@ -356,6 +356,8 @@ struct Shared {
     refuse_puts: AtomicBool,
     /// Drop every `roster.put` without an answer (see `ignore_roster_puts`).
     ignore_puts: AtomicBool,
+    /// `roster.put`s answered `roster_stale` (see `stale_roster_puts`).
+    stale_puts: std::sync::atomic::AtomicUsize,
     /// Envelope rewriters by (Ring, addressee).
     tampers: Mutex<HashMap<(RingId, SignKey), Tamper>>,
     /// Every envelope payload routed, decoded, while recording is on.
@@ -584,6 +586,7 @@ impl TestRelay {
             flooding: AtomicBool::new(false),
             refuse_puts: AtomicBool::new(false),
             ignore_puts: AtomicBool::new(false),
+            stale_puts: std::sync::atomic::AtomicUsize::new(0),
             tampers: Mutex::new(HashMap::new()),
             recording: AtomicBool::new(false),
             recorded: Mutex::new(Vec::new()),
@@ -763,6 +766,11 @@ impl TestRelay {
     /// acknowledgements); envelopes are still routed.
     pub fn ignore_roster_puts(&self, on: bool) {
         self.shared.ignore_puts.store(on, Ordering::Release);
+    }
+
+    /// How many `roster.put`s were answered `roster_stale` so far.
+    pub fn stale_roster_puts(&self) -> usize {
+        self.shared.stale_puts.load(Ordering::Acquire)
     }
 
     fn command(&self, ring: &RingId, key: &SignKey, cmd: Cmd) -> bool {
@@ -1967,7 +1975,10 @@ impl Conn {
                     Err(e) => {
                         drop(rings);
                         let code = match e {
-                            RosterError::Stale => ErrorCode::RosterStale,
+                            RosterError::Stale => {
+                                self.shared.stale_puts.fetch_add(1, Ordering::AcqRel);
+                                ErrorCode::RosterStale
+                            }
                             RosterError::PrevMismatch => ErrorCode::RosterConflict,
                             _ => ErrorCode::RosterInvalid,
                         };

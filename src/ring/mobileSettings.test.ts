@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
@@ -82,6 +82,36 @@ describe("connection line", () => {
     expect(localLine(status({ local: "too-old" }))).toBe(fmt("mobile.local.tooOld"));
     expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toContain("/p/ring.json.bad-1");
     expect(problemLine(status())).toBeNull();
+  });
+});
+
+describe("pairing and the connection", () => {
+  it("disables pairing only where it cannot succeed", () => {
+    expect(pairingBlocked(status({ connection: "connected" }))).toBeNull();
+    expect(pairingBlocked(status({ connection: "connecting" }))).toBeNull();
+    expect(pairingBlocked(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
+    expect(pairingBlocked(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
+  });
+
+  it("notes that pairing waits for the connection, or why it is disabled", () => {
+    expect(pairingNote(status({ connection: "connecting" }))).toBe("mobile.pair.connecting");
+    expect(pairingNote(status({ connection: "connected" }))).toBeNull();
+    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
+    expect(pairingNote(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
+  });
+
+  it("keeps a shown offer waiting for the connection while it retries", () => {
+    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }), true)).toBe("mobile.pair.connecting");
+    expect(pairingNote(status({ connection: "connecting" }), true)).toBe("mobile.pair.connecting");
+    expect(pairingNote(status({ connection: "connected" }), true)).toBeNull();
+    // No longer a member: the offer cannot succeed.
+    expect(pairingNote(status({ connection: "stopped" }), true)).toBe("mobile.pair.needsMember");
+  });
+
+  it("has the notes' strings", () => {
+    for (const k of ["mobile.pair.connecting", "mobile.pair.needsRelay", "mobile.pair.needsMember"] as const) {
+      expect(S[k], k).toBeTruthy();
+    }
   });
 });
 

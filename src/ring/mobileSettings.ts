@@ -93,6 +93,26 @@ export function problemLine(s: RingStatus): string | null {
   return null;
 }
 
+// ── Pairing and the connection (xshell#38) ──────────────────────────────────
+
+// Why pairing cannot succeed now, as the note shown with its buttons disabled; null when it
+// can. While connecting it is offered: the Desktop waits for the connection to add a device.
+export function pairingBlocked(s: Pick<RingStatus, "connection">): StringKey | null {
+  switch (s.connection) {
+    case "waiting": return "mobile.pair.needsRelay";
+    case "stopped": return "mobile.pair.needsMember";
+    default: return null;
+  }
+}
+
+// The note under a pairing panel's title: that pairing waits for the connection (while
+// connecting, or while an offer already shown stays valid during a retry), or why it is
+// disabled; null when connected.
+export function pairingNote(s: Pick<RingStatus, "connection">, offerShown = false): StringKey | null {
+  if (s.connection === "connecting" || (offerShown && s.connection === "waiting")) return "mobile.pair.connecting";
+  return pairingBlocked(s);
+}
+
 // ── Removing a device (#22) ─────────────────────────────────────────────────
 
 // Whether a member's row offers Remove: the Desktop says it may go, and this window runs the

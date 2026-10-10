@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useReducer, useState } from "react";
 import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
+import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
 import { useRing, type PairingEvents } from "../ring/useRing";
 import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
@@ -36,7 +36,15 @@ function QrCode({ qr }: { qr: Qr }) {
   );
 }
 
-function PhonePanel({ p }: { p: Pairing }) {
+// Why pairing is disabled, or that it waits for the connection, under a panel's title.
+// `offerShown`: a phone offer is up, and stays valid while the connection retries.
+export function PairingNote({ s, offerShown = false }: { s: RingStatus; offerShown?: boolean }) {
+  const key = pairingNote(s, offerShown);
+  if (!key) return null;
+  return <div className={`host-row-note ${key === "mobile.pair.connecting" ? "" : "host-row-warn"}`}>{fmt(key)}</div>;
+}
+
+function PhonePanel({ s, p }: { s: RingStatus; p: Pairing }) {
   const [st, dispatch] = useReducer(phoneReducer, PHONE_IDLE);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { if (p.events.phone) dispatch({ type: "event", event: p.events.phone }); }, [p.events.phone]);
@@ -63,9 +71,11 @@ function PhonePanel({ p }: { p: Pairing }) {
     }
   };
   const busy = st.state === "starting" || waiting;
+  const blocked = pairingBlocked(s) !== null;
   return (
     <div className="edit-field">
       <label className="edit-label">{fmt("mobile.pair.phone")}</label>
+      <PairingNote s={s} offerShown={waiting} />
       {st.state === "waiting" && (
         <>
           <div className="edit-hint">{fmt("mobile.pair.phone.desc")}</div>
@@ -83,13 +93,25 @@ function PhonePanel({ p }: { p: Pairing }) {
             {fmt("mobile.pair.phone.copy")}
           </button>
         ) : (
-          <button className="btn btn-primary settings-action-btn" disabled={busy} onClick={start}>
+          <button className="btn btn-primary settings-action-btn" disabled={busy || blocked} onClick={() => { if (!blocked) start(); }}>
             <Smartphone size={11} /> {fmt(offersNewCode(st) ? "mobile.pair.phone.new" : "mobile.pair.phone")}
           </button>
         )}
       </div>
     </div>
   );
+}
+
+// "Add a computer", from its button and from Enter alike: nothing while the code is not
+// ready or pairing cannot succeed.
+export async function submitComputer(code: string, st: ComputerState, s: RingStatus, pairComputer: (code: string) => Promise<void>, dispatch: (a: ComputerAction) => void): Promise<void> {
+  if (!canSubmit(code, st) || pairingBlocked(s) !== null) return;
+  dispatch({ type: "submit" });
+  try {
+    await pairComputer(normalizeCode(code));
+  } catch (e) {
+    dispatch({ type: "submitFailed", error: errorText(e) });
+  }
 }
 
 function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
@@ -100,20 +122,14 @@ function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
   // Leaving Settings while it looks for the computer stops looking.
   useEffect(() => () => { p.cancelComputer().catch(() => {}); }, []);
 
-  const submit = async () => {
-    if (!canSubmit(code, st)) return;
-    dispatch({ type: "submit" });
-    try {
-      await p.pairComputer(normalizeCode(code));
-    } catch (e) {
-      dispatch({ type: "submitFailed", error: errorText(e) });
-    }
-  };
+  const submit = () => submitComputer(code, st, s, p.pairComputer, dispatch);
+  const blocked = pairingBlocked(s) !== null;
   const invalid = codeError(code);
   const line = computerLine(st);
   return (
     <div className="edit-field">
       <label className="edit-label">{fmt("mobile.pair.computer")}</label>
+      <PairingNote s={s} />
       <div className="edit-hint"><WithCode text={computerDesc(s)} /></div>
       <div className="edit-field">
         <label className="edit-label">{fmt("mobile.pair.computer.label")}</label>
@@ -124,7 +140,7 @@ function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
         {invalid && <div className="host-form-error">{invalid}</div>}
       </div>
       <div className="host-row-actions">
-        <button className="btn btn-primary settings-action-btn" disabled={!canSubmit(code, st)} onClick={submit}>
+        <button className="btn btn-primary settings-action-btn" disabled={!canSubmit(code, st) || blocked} onClick={submit}>
           <Monitor size={11} /> {fmt("mobile.pair.computer")}
         </button>
       </div>
@@ -314,7 +330,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
             {confirm && <ConfirmDialog title={confirm.title} body={confirm.body} confirm={confirm.confirm} onConfirm={remove} onCancel={() => dispatchRemoval({ type: "cancel" })} />}
             {pairing && s.connection !== "other-window" && (
               <>
-                <PhonePanel p={pairing} />
+                <PhonePanel s={s} p={pairing} />
                 <ComputerPanel s={s} p={pairing} />
               </>
             )}
