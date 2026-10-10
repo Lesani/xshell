@@ -36,6 +36,11 @@ export interface RingStatus {
   problem: "recovered" | "unreadable" | null;
   problemDetail: string | null;
   members: MemberView[];
+  // While the Ring is over its Relay's daily message quota: when the quota resets (Unix
+  // seconds). Only in the window that runs the connection; null otherwise.
+  quotaResetAt: number | null;
+  // The Ring's Relay is the Hosted one, not the user's own (the Desktop compares origins).
+  relayHosted: boolean;
   // How this computer's terminals run: a Daemon that can join, inside the app, or a Daemon too
   // old to join.
   local: "daemon" | "in-process" | "too-old";

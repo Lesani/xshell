@@ -363,6 +363,8 @@ struct Shared {
     refuse_puts: AtomicBool,
     /// Drop every `roster.put` without an answer (see `ignore_roster_puts`).
     ignore_puts: AtomicBool,
+    /// Drop every `roster.get` without an answer (see `ignore_roster_gets`).
+    ignore_gets: AtomicBool,
     /// `roster.put`s answered `roster_stale` (see `stale_roster_puts`).
     stale_puts: std::sync::atomic::AtomicUsize,
     /// Envelope rewriters by (Ring, addressee).
@@ -598,6 +600,7 @@ impl TestRelay {
             flooding: AtomicBool::new(false),
             refuse_puts: AtomicBool::new(false),
             ignore_puts: AtomicBool::new(false),
+            ignore_gets: AtomicBool::new(false),
             stale_puts: std::sync::atomic::AtomicUsize::new(0),
             tampers: Mutex::new(HashMap::new()),
             recording: AtomicBool::new(false),
@@ -778,6 +781,12 @@ impl TestRelay {
     /// acknowledgements); envelopes are still routed.
     pub fn ignore_roster_puts(&self, on: bool) {
         self.shared.ignore_puts.store(on, Ordering::Release);
+    }
+
+    /// While on, every `roster.get` after `welcome` is dropped unanswered (it still counts
+    /// toward the quota); frames injected for a socket are its only answers.
+    pub fn ignore_roster_gets(&self, on: bool) {
+        self.shared.ignore_gets.store(on, Ordering::Release);
     }
 
     /// How many `roster.put`s were answered `roster_stale` so far.
@@ -1999,6 +2008,9 @@ impl Conn {
                 }
             }
             ClientFrame::RosterGet { id, since } => {
+                if self.shared.ignore_gets.load(Ordering::Acquire) {
+                    return;
+                }
                 let tokens: Vec<String> = match self.rings().get(&ring) {
                     Some(s) => s
                         .chain

@@ -28,7 +28,7 @@ pub struct RingTimeouts {
     pub ping_interval: Duration,
     /// No complete frame from the Relay for this long means the connection is dead.
     pub dead_after: Duration,
-    /// A `roster.put` or `entitlement.put` waits this long for its answer.
+    /// A request (`roster.put`, `entitlement.put`, a quota probe) waits this long for its answer.
     pub request: Duration,
     /// `bye` waits this long for the Relay to close.
     pub bye: Duration,
@@ -106,6 +106,11 @@ pub trait RingEvents: Send + Sync {
     /// and every `quota` refusal, also one that answers a request (whose caller gets it
     /// first, as its result).
     fn error(&self, _code: ErrorCode, _to: Option<SignKey>, _detail: Option<String>) {}
+    /// The Relay accepted a frame this client sent that its daily quota counts: an `ok`, or
+    /// a `roster.chain` (which answers only a `roster.get`). Called before the request's
+    /// waiter, if any, gets its answer. Each accepted frame ends a run of `quota` refusals on
+    /// this connection.
+    fn accepted(&self) {}
     fn entitlement(&self, _token: Option<&str>) {}
     /// Exactly once, last.
     fn closed(&self, why: CloseReason);
@@ -119,11 +124,22 @@ pub struct MemberStatus {
 
 type Waiter = mpsc::SyncSender<Result<(), RingError>>;
 
-/// A request awaiting its `ok` or `error`.
+/// Which answer a waiting request takes. A frame of the other kind that carries its id (a
+/// Relay that echoes ids wrongly) leaves it waiting; an `error` answers either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Answered by `ok`.
+    Request,
+    /// A probe's `roster.get`: answered by `roster.chain`.
+    Probe,
+}
+
+/// A request awaiting its answer.
 struct Pending {
     waiter: Waiter,
     /// For `roster.put`: the token to accept on `ok`, through the same path as broadcasts.
     accept: Option<String>,
+    kind: Kind,
 }
 
 struct State {
@@ -433,6 +449,11 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    /// The request's `id` on the wire.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Waits up to `timeout` for the answer; `Err(Timeout)` leaves the outcome unknown.
     pub fn wait(self, timeout: Duration) -> Result<(), RingError> {
         match self.rx.recv_timeout(timeout) {
@@ -780,16 +801,35 @@ impl RingClient {
         accept: Option<String>,
         frame: impl FnOnce(u64) -> ClientFrame,
     ) -> Result<Ticket, RingError> {
+        self.waited(Kind::Request, accept, |id, _| frame(id))
+    }
+
+    /// Queues a frame whose answer of `kind` comes through the ticket (never blocks).
+    /// `frame` gets the id and the trusted head's version.
+    fn waited(
+        &self,
+        kind: Kind,
+        accept: Option<String>,
+        frame: impl FnOnce(u64, u64) -> ClientFrame,
+    ) -> Result<Ticket, RingError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(1);
-        {
+        let head = {
             let mut st = lock(&self.state);
             if st.closed {
                 return Err(RingError::Closed(CloseReason::Local));
             }
-            st.waiting.insert(id, Pending { waiter: tx, accept });
-        }
-        if let Err(e) = self.outbox.send_text(frame(id).encode()) {
+            st.waiting.insert(
+                id,
+                Pending {
+                    waiter: tx,
+                    accept,
+                    kind,
+                },
+            );
+            st.chain.head().version()
+        };
+        if let Err(e) = self.outbox.send_text(frame(id, head).encode()) {
             lock(&self.state).waiting.remove(&id);
             return Err(e);
         }
@@ -838,6 +878,20 @@ impl RingClient {
         self.request_start(None, |id| ClientFrame::EntitlementPut {
             id,
             token: token.to_string(),
+        })
+    }
+
+    /// Asks the Relay for the Roster versions after the trusted head (`roster.get`): a frame
+    /// the Ring's daily quota counts, with no side effect. `Ok` once the Relay answered with a
+    /// chain, which says only that it accepted the frame: what the chain holds is verified
+    /// like any other (a newer head, a refusal, a gap are reported through the events) and
+    /// does not change the answer. `Err(Relay{quota})` while the Ring is over its quota (the
+    /// refusal reaches [`RingEvents::error`] too). Never blocks; the answer comes through the
+    /// ticket.
+    pub fn probe_start(&self) -> Result<Ticket, RingError> {
+        self.waited(Kind::Probe, None, |id, since| ClientFrame::RosterGet {
+            id,
+            since,
         })
     }
 
@@ -970,6 +1024,15 @@ impl ClientHandler {
         }
     }
 
+    /// The request waiting under `id`, if it takes an answer of `kind`.
+    fn take_waiter(&self, id: u64, kind: Kind) -> Option<Pending> {
+        let mut st = lock(&self.state);
+        match st.waiting.get(&id) {
+            Some(p) if p.kind == kind => st.waiting.remove(&id),
+            _ => None,
+        }
+    }
+
     fn roster_get(&self, since: u64) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self
@@ -1022,15 +1085,22 @@ impl Handler for ClientHandler {
                     self.roster_get(since);
                 }
             }
-            RelayFrame::RosterChain { rosters, more, .. } => {
+            RelayFrame::RosterChain { id, rosters, more } => {
+                self.events.accepted();
                 let gap = matches!(self.accept(&rosters), Acceptance::Gap);
                 if more || gap {
                     let since = lock(&self.state).chain.head().version();
                     self.roster_get(since);
                 }
+                // A probe's answer: the Relay accepted the frame, whatever the verification
+                // above made of the chain.
+                if let Some(p) = self.take_waiter(id, Kind::Probe) {
+                    let _ = p.waiter.send(Ok(()));
+                }
             }
             RelayFrame::Ok { id } => {
-                let Some(p) = lock(&self.state).waiting.remove(&id) else {
+                self.events.accepted();
+                let Some(p) = self.take_waiter(id, Kind::Request) else {
                     return;
                 };
                 let r = match p.accept {

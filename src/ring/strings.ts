@@ -39,6 +39,8 @@ export const S = {
   "mobile.conn.moving": "Telling your paired devices about the new relay…",
   "mobile.conn.moveFailed": "Some paired devices may still use the old relay. xshell keeps trying to reach them.",
   "mobile.conn.otherWindow": "Another xshell window manages the connection to your devices.",
+  "mobile.quota.hosted": "Your devices have reached the daily message limit on the hosted relay. The limit resets at {time}; replies and agent output won't reach your phone until then.",
+  "mobile.quota.ownRelay": "Your devices have reached the daily message limit on your own relay. The limit resets at {time}; replies and agent output won't reach your phone until then.",
   "mobile.problem.recovered": "Couldn't read your mobile access settings. Saved the old file at {path}. Enable mobile access again, then pair your devices again.",
   "mobile.problem.unreadable": "Couldn't read your mobile access settings. Mobile access is unavailable: {error}",
   "mobile.host.tooOld": "Update xshelld on {name} in Settings → Hosts to make it reachable from your phone.",

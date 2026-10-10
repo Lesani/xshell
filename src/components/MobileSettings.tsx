@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useReducer, useState } from "react";
 import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
 import { useRing, type PairingEvents } from "../ring/useRing";
@@ -303,6 +303,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
     }
   };
   const conn = connectionLine(s);
+  const quota = quotaLine(s, Date.now());
   const move = moveLine(s);
   const local = localLine(s);
   const problem = problemLine(s);
@@ -325,6 +326,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
           <>
             <RelaySettings s={s} onSave={onSaveRelay} />
             {conn && <div className="host-row-note">{conn}</div>}
+            {quota && <div className="host-row-note host-row-warn">{quota}</div>}
             {move && <div className={`host-row-note ${s.move?.state === "failed" ? "host-row-warn" : ""}`}>{move}</div>}
             <MembersSection s={s} removal={removal} onRemove={m => dispatchRemoval({ type: "ask", member: m })} onClaimHost={onClaimHost} />
             {confirm && <ConfirmDialog title={confirm.title} body={confirm.body} confirm={confirm.confirm} onConfirm={remove} onCancel={() => dispatchRemoval({ type: "cancel" })} />}

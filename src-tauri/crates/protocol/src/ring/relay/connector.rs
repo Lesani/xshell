@@ -140,6 +140,9 @@ pub trait ConnectorEvents: Send + Sync {
     /// [`Connector::put_entitlement`], say): its caller gets the error as its result first,
     /// so one place can show the Ring's quota notice.
     fn error(&self, _code: &ErrorCode, _to: Option<SignKey>) {}
+    /// The Relay accepted a counted frame of the current connection (see
+    /// [`RingEvents::accepted`]): it ends a run of `quota` refusals there.
+    fn accepted(&self) {}
     /// The Relay's entitlement slot as this connection sees it: called after every
     /// `Connected` report (with the token from `welcome`, or the latest broadcast) and on
     /// every `entitlement` broadcast. Calls from the Connector's thread and the client's may
@@ -310,6 +313,15 @@ impl RingEvents for Attempt {
         };
         if inner.is_current(self.gen) {
             inner.events.error(&code, to);
+        }
+    }
+
+    fn accepted(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.is_current(self.gen) {
+            inner.events.accepted();
         }
     }
 
@@ -986,6 +998,18 @@ impl Connector {
         let c = lock(&self.inner.st).client.clone();
         match c {
             Some(c) if !c.is_closed() => c.put_entitlement_start(token),
+            _ => Err(RingError::Closed(CloseReason::Local)),
+        }
+    }
+
+    /// Probes the Relay with a counted frame without side effects (see
+    /// [`RingClient::probe_start`]): `Ok` says the Relay accepts this Ring's traffic,
+    /// `Err(Relay{quota})` that the Ring is over its daily quota. Never blocks; `Err(Closed)`
+    /// when not connected.
+    pub fn probe_start(&self) -> Result<Ticket, RingError> {
+        let c = lock(&self.inner.st).client.clone();
+        match c {
+            Some(c) if !c.is_closed() => c.probe_start(),
             _ => Err(RingError::Closed(CloseReason::Local)),
         }
     }

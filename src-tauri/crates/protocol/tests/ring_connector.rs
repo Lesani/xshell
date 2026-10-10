@@ -21,6 +21,7 @@ enum Ev {
     Moved(MoveState),
     Entitlement(Option<String>),
     Error(ErrorCode, Option<SignKey>),
+    Accepted,
 }
 
 #[derive(Default)]
@@ -88,6 +89,10 @@ impl ConnectorEvents for Rec {
     }
     fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
         self.ev.lock().unwrap().push(Ev::Error(code.clone(), to));
+        self.cv.notify_all();
+    }
+    fn accepted(&self) {
+        self.ev.lock().unwrap().push(Ev::Accepted);
         self.cv.notify_all();
     }
 }
@@ -903,5 +908,238 @@ fn connector_quota_refusal_of_a_request_reaches_error() {
     assert!(rec
         .wait(WAIT, |e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
         .is_some());
+    c.stop(ByeReason::quit());
+}
+
+// ---- Quota probes (xshell#42) -------------------------------------------------------------
+
+use xshell_protocol::ring::relay::contract::{member, raw_next, Event, RawConn, Recorder};
+use xshell_protocol::ring::relay::wire::{ClientFrame, RelayFrame};
+use xshell_protocol::ring::relay::RingClient;
+use xshell_protocol::ring::Role;
+
+fn quota_relay(limit: u64) -> TestRelay {
+    TestRelay::start_with(TestRelayOptions {
+        auth_timeout: Duration::from_millis(500),
+        quota_frames_per_day: Some(limit),
+        ..TestRelayOptions::default()
+    })
+}
+
+/// Uses up the Ring's quota for the day from the phone's own socket.
+fn use_up_quota(r: &TestRelay, ring: &TestRing) {
+    let mut m = RawConn::login(&r.target(), &ring.chain, &*ring.mobile);
+    let head = ring.chain.head().version();
+    for id in 1..=1000 {
+        m.send(&ClientFrame::RosterGet { id, since: head }.encode())
+            .expect("send roster.get");
+        match m.frame(WAIT) {
+            Some(RelayFrame::RosterChain { .. }) => {}
+            Some(RelayFrame::Error {
+                code: ErrorCode::Quota,
+                ..
+            }) => return,
+            other => panic!("expected roster.chain or quota, got {other:?}"),
+        }
+    }
+    panic!("the quota was never reached");
+}
+
+/// The Desktop connected to a Relay that leaves every `roster.get` unanswered: a probe's
+/// only answers are the frames injected for it.
+fn deaf(r: &TestRelay, ring: &TestRing) -> (RingClient, Arc<Recorder>) {
+    let mut cfg = config(&r.target(), &ring.chain, ring.desktop.clone());
+    cfg.timeouts.request = Duration::from_millis(800);
+    let rec = Recorder::new();
+    let c = RingClient::connect(cfg, rec.clone()).unwrap();
+    r.ignore_roster_gets(true);
+    (c, rec)
+}
+
+fn chain_frame(id: u64, rosters: Vec<String>) -> String {
+    RelayFrame::RosterChain {
+        id,
+        rosters,
+        more: false,
+    }
+    .encode()
+}
+
+#[test]
+fn connector_probe_answers_ok_then_quota() {
+    let r = quota_relay(8);
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    assert_eq!(c.probe_start().unwrap().wait(WAIT), Ok(()));
+    use_up_quota(&r, &ring);
+    match c.probe_start().unwrap().wait(WAIT) {
+        Err(RingError::Relay {
+            code: ErrorCode::Quota,
+            ..
+        }) => {}
+        other => panic!("expected a quota refusal, got {other:?}"),
+    }
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
+        .is_some());
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn connector_probe_when_not_connected_is_closed() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let mut cc = cfg(&r, &ring.chain, ring.desktop.clone());
+    cc.backoff_unit = Duration::from_secs(30);
+    let (c, rec) = start(cc);
+    assert!(rec.connected());
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.desktop.sign_key(), 1011));
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::State(LinkState::Waiting { .. })))
+        .is_some());
+    assert!(matches!(c.probe_start(), Err(RingError::Closed(_))));
+    c.stop(ByeReason::quit());
+}
+
+/// A `roster.chain` carrying another request's id leaves that request waiting, and an `ok`
+/// carrying a probe's id leaves the probe waiting: each takes only its own kind of answer.
+#[test]
+fn probe_answers_are_typed() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let (c, _rec) = deaf(&r, &ring);
+    let c = Arc::new(c);
+    let (rid, me) = (ring.ring_id(), ring.desktop.sign_key());
+    let probe = c.probe_start().unwrap();
+    let ok = RelayFrame::Ok { id: probe.id() }.encode();
+    assert!(r.inject(&rid, &me, &ok));
+    assert_eq!(
+        probe.wait(Duration::from_millis(600)),
+        Err(RingError::Timeout),
+        "an ok does not answer a probe"
+    );
+    // A roster.put the Relay leaves unanswered takes the next id.
+    r.ignore_roster_puts(true);
+    let next = c.probe_start().unwrap();
+    let put_id = next.id() + 1;
+    let v3 = ring.next(|x| x.add(member(&keys(), "d3", Role::Daemon)));
+    let c2 = c.clone();
+    let put = std::thread::spawn(move || c2.publish_roster(&v3));
+    std::thread::sleep(QUIET);
+    assert!(r.inject(&rid, &me, &chain_frame(put_id, Vec::new())));
+    assert_eq!(
+        put.join().unwrap(),
+        Err(RingError::Timeout),
+        "a chain does not answer a roster.put"
+    );
+    // The probe's own chain answers it.
+    assert!(r.inject(&rid, &me, &chain_frame(next.id(), Vec::new())));
+    assert_eq!(next.wait(WAIT), Ok(()));
+}
+
+/// A chain that fails verification still answers the probe (the Relay accepted the frame);
+/// the refusal is reported as before and the trusted head stands.
+#[test]
+fn probe_answered_by_a_rejected_chain_is_accepted_traffic() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = deaf(&r, &ring);
+    let forged = raw_next(ring.chain.head(), &*ring.mobile, |_| {});
+    let probe = c.probe_start().unwrap();
+    assert!(r.inject(
+        &ring.ring_id(),
+        &ring.desktop.sign_key(),
+        &chain_frame(probe.id(), vec![forged.token().to_string()]),
+    ));
+    assert_eq!(probe.wait(WAIT), Ok(()));
+    assert!(rec
+        .wait_for(WAIT, |e| matches!(e, Event::RosterRejected(_)))
+        .is_some());
+    assert_eq!(c.roster().version(), 2);
+}
+
+/// A chain with a gap answers the probe too; the client asks for the missing versions as
+/// before and trusts nothing it cannot verify.
+#[test]
+fn probe_answered_by_a_chain_with_a_gap_is_accepted_traffic() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = deaf(&r, &ring);
+    let v3 = ring
+        .chain
+        .head()
+        .next(&*ring.desktop, now(), |x| {
+            x.add(member(&keys(), "d3", Role::Daemon))
+        })
+        .unwrap();
+    let v4 = v3
+        .next(&*ring.desktop, now(), |x| {
+            x.add(member(&keys(), "d4", Role::Daemon))
+        })
+        .unwrap();
+    let probe = c.probe_start().unwrap();
+    assert!(r.inject(
+        &ring.ring_id(),
+        &ring.desktop.sign_key(),
+        &chain_frame(probe.id(), vec![v4.token().to_string()]),
+    ));
+    assert_eq!(probe.wait(WAIT), Ok(()));
+    assert_eq!(c.roster().version(), 2);
+    assert!(!rec
+        .events()
+        .iter()
+        .any(|e| matches!(e, Event::RosterRejected(_) | Event::Roster { .. })));
+}
+
+/// A Relay ahead of the client answers the probe with the newer versions: the probe is
+/// answered and the client trusts them, through the same path as any chain.
+#[test]
+fn probe_of_a_relay_that_is_ahead_brings_the_newer_head() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let (c, rec) = connect(&r.target(), &ring.chain, ring.desktop.clone());
+    // This socket misses the broadcast of v3.
+    assert!(r.fault(&ring.ring_id(), &ring.desktop.sign_key(), Fault::Mute));
+    let (other, _) = connect(&r.target(), &ring.chain, ring.desktop2.clone());
+    let v3 = ring.next(|x| x.add(member(&keys(), "d3", Role::Daemon)));
+    other.publish_roster(&v3).unwrap();
+    assert_eq!(r.head_version(&ring.ring_id()), Some(3));
+    std::thread::sleep(QUIET);
+    assert_eq!(c.roster().version(), 2, "the broadcast was withheld");
+    assert_eq!(c.probe_start().unwrap().wait(WAIT), Ok(()));
+    assert!(rec
+        .wait_for(WAIT, |e| matches!(e, Event::Roster { version: 3 }))
+        .is_some());
+    assert_eq!(c.roster().version(), 3);
+}
+
+/// An `ok` and a probe's `roster.chain` are reported as accepted frames, before the request
+/// gets its answer; a quota refusal is not.
+#[test]
+fn connector_reports_accepted_frames() {
+    let r = quota_relay(3);
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.desktop.clone()));
+    assert!(rec.connected());
+    let accepted = |rec: &Rec| {
+        rec.all()
+            .iter()
+            .filter(|e| matches!(e, Ev::Accepted))
+            .count()
+    };
+    rec.clear();
+    c.put_entitlement(&fake_entitlement(&ring.ring_id()))
+        .unwrap();
+    assert_eq!(accepted(&rec), 1, "the ok");
+    assert_eq!(c.probe_start().unwrap().wait(WAIT), Ok(()));
+    assert_eq!(accepted(&rec), 2, "the chain");
+    use_up_quota(&r, &ring);
+    assert!(c.probe_start().unwrap().wait(WAIT).is_err());
+    assert!(rec
+        .wait(WAIT, |e| matches!(e, Ev::Error(ErrorCode::Quota, None)))
+        .is_some());
+    assert_eq!(accepted(&rec), 2, "a refusal is not accepted");
     c.stop(ByeReason::quit());
 }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
@@ -20,6 +20,8 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     problem: null,
     problemDetail: null,
     members: [],
+    quotaResetAt: null,
+    relayHosted: true,
     local: "daemon",
     hosts: [],
     ...over,
@@ -58,6 +60,35 @@ describe("presence", () => {
     expect(fmt(roleKey("desktop"))).toBe("Desktop");
     expect(fmt(roleKey("mobile"))).toBe("Phone");
     for (const v of Object.values(S)) expect(v.toLowerCase()).not.toContain("daemon");
+  });
+});
+
+describe("quota notice (#42)", () => {
+  const now = Date.UTC(2026, 9, 10, 12, 0, 0);
+  const reset = Date.UTC(2026, 9, 11) / 1000;
+  const at = (t: number) => `at ${t}`;
+
+  it("names the hosted relay and the reset time", () => {
+    expect(quotaLine(status({ quotaResetAt: reset, relayHosted: true }), now, at))
+      .toBe(fmt("mobile.quota.hosted", { time: `at ${reset}` }));
+  });
+
+  it("says your own relay on a self-hosted relay", () => {
+    expect(quotaLine(status({ quotaResetAt: reset, relayHosted: false }), now, at))
+      .toBe(fmt("mobile.quota.ownRelay", { time: `at ${reset}` }));
+  });
+
+  it("is gone without a reset time, once it has passed, and in another window", () => {
+    expect(quotaLine(status({ quotaResetAt: null }), now, at)).toBeNull();
+    expect(quotaLine(status({ quotaResetAt: reset }), reset * 1000, at)).toBeNull();
+    expect(quotaLine(status({ quotaResetAt: reset }), reset * 1000 + 1, at)).toBeNull();
+    expect(quotaLine(status({ quotaResetAt: reset, connection: "other-window" }), now, at)).toBeNull();
+  });
+
+  it("shows the reset time in local time", () => {
+    const d = new Date(reset * 1000);
+    expect(formatResetTime(reset)).toBe(d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+    expect(quotaLine(status({ quotaResetAt: reset }), now)).toContain(formatResetTime(reset));
   });
 });
 

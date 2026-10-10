@@ -18,7 +18,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: true, ringId: "r", version: 2, relayUrl: "wss://r", hostedRelayUrl: "wss://r", connection: "connected",
     retryIn: null, connectionError: null, limited: false, move: null, problem: null, problemDetail: null,
-    members: [me, phone], local: "daemon", hosts: [], ...over,
+    members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], ...over,
   };
 }
 
@@ -124,5 +124,33 @@ describe("pairing and the connection", () => {
     await submitComputer(code, COMPUTER_IDLE, status({ connection: "connecting" }), pairComputer, dispatch);
     expect(pairComputer).toHaveBeenCalledWith("0123456789ABCDEF");
     expect(dispatch).toHaveBeenCalledWith({ type: "submit" });
+  });
+});
+
+describe("the quota notice (#42)", () => {
+  const view = (s: RingStatus) =>
+    renderToStaticMarkup(createElement(MobileSettingsView, {
+      s, onEnable: async () => {}, onSaveRelay: async () => {}, onClaimHost: async () => {},
+      onRemoveMember: async () => s,
+    }));
+  const html = (t: string) => t.replace(/&/g, "&amp;").replace(/'/g, "&#x27;");
+  const resetAt = Math.floor(Date.now() / 1000) + 3600;
+  const hosted = (time: string) => html(fmt("mobile.quota.hosted", { time }));
+  const time = new Date(resetAt * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  it("shows the quota notice while the Ring is quota-limited", () => {
+    const out = view(status({ quotaResetAt: resetAt }));
+    expect(out).toContain(hosted(time));
+    expect(out).toContain("host-row-note host-row-warn");
+  });
+
+  it("names your own relay on a self-hosted relay", () => {
+    expect(view(status({ quotaResetAt: resetAt, relayHosted: false }))).toContain(html(fmt("mobile.quota.ownRelay", { time })));
+  });
+
+  it("clears the quota notice", () => {
+    const out = view(status({ quotaResetAt: null }));
+    expect(out).not.toContain("daily message limit");
+    expect(view(status({ quotaResetAt: Math.floor(Date.now() / 1000) - 1 }))).not.toContain("daily message limit");
   });
 });

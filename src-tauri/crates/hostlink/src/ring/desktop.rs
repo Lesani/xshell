@@ -15,6 +15,21 @@
 //! transaction and checks against them. A view emission asked for under `commit` (the
 //! Connector reports a move synchronously from `set_chain` during an adoption) is deferred
 //! until the commit lock is released.
+//!
+//! **The daily quota (xshell#42).** When the Ring has used up its Relay's daily message quota,
+//! the Relay refuses its frames until the quota resets at the next UTC midnight. The traffic
+//! that uses the quota up is the Daemons' (envelopes to phones); this Desktop's own connection
+//! sends almost nothing counted. So the window that runs the connection probes it now and then
+//! with a `roster.get` ([`Connector::probe_start`]) while a phone is in the Roster: every
+//! [`DesktopRingConfig::quota_probe`], or every [`DesktopRingConfig::quota_probe_limited`]
+//! while the notice is shown. A quota refusal of any frame of this connection (a probe's
+//! included, through [`ConnectorEvents::error`]) shows the notice until the next UTC midnight;
+//! an accepted probe clears it, and so does the reconcile tick once the reset time has passed.
+//! A probe result applies only if the connection and the quota state are still the ones it was
+//! sent under; no probe is sent while this connection has had [`PROBE_STREAK_LIMIT`] refusals
+//! in a row, so the probes never make the Relay close the socket (4029); an accepted counted
+//! frame ([`ConnectorEvents::accepted`]), a new connection or the lapse of the notice ends the
+//! run. Reports of a retired Connector (an older [`Live::epoch`]) change nothing.
 
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
@@ -32,15 +47,16 @@ use xshell_protocol::ring::pairing::{
 use xshell_protocol::ring::relay::pair::{
     host_pairing, Cancel, HostRequest, PairOptions, PairPipe, PairingHost,
 };
+use xshell_protocol::ring::relay::wire::QUOTA_REFUSALS_BEFORE_CLOSE;
 use xshell_protocol::ring::relay::{
-    ByeReason, Connector, ConnectorConfig, ConnectorEvents, LinkState, MemberPresence, MoveJob,
-    MoveState, RingClientConfig, RingTimeouts,
+    ByeReason, Connector, ConnectorConfig, ConnectorEvents, ErrorCode, LinkState, MemberPresence,
+    MoveJob, MoveState, RingClientConfig, RingTimeouts,
 };
 use xshell_protocol::ring::roster::MAX_MEMBERS;
-use xshell_protocol::ring::url::RelayUrl;
+use xshell_protocol::ring::url::{normalize_origin, RelayUrl};
 use xshell_protocol::ring::{
-    member_name, verify_genesis, DeviceKeys, Member, NoiseKey, RingId, Role, Roster, RosterChain,
-    SignKey, SignedRoster,
+    member_name, verify_genesis, DeviceKeys, Member, NoiseKey, RingError, RingId, Role, Roster,
+    RosterChain, SignKey, SignedRoster,
 };
 
 /// The local Daemon's Ring identity, from its `ring.identity` answer.
@@ -292,6 +308,12 @@ pub struct DesktopRingConfig {
     /// ([`PairOptions::step`], 15 s by default), so the device hears the refusal rather than
     /// timing out; never past the pairing secret's time.
     pub pair_publish_wait: Duration,
+    /// How often the window running the connection probes the Relay's daily quota while a
+    /// phone is in the Roster and no quota notice is shown.
+    pub quota_probe: Duration,
+    /// The same while the quota notice is shown: rarely enough that a day of refusals stays
+    /// well under the Relay's close after 32 in a row.
+    pub quota_probe_limited: Duration,
 }
 
 impl DesktopRingConfig {
@@ -308,6 +330,8 @@ impl DesktopRingConfig {
             owner_retry: Duration::from_secs(2),
             pair_ttl: Duration::from_secs(xshell_protocol::ring::pairing::PAIR_TTL_SECS),
             pair_publish_wait: Duration::from_secs(10),
+            quota_probe: Duration::from_secs(10 * 60),
+            quota_probe_limited: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -451,6 +475,13 @@ pub struct RingView {
     pub problem: Option<String>,
     pub problem_detail: Option<String>,
     pub members: Vec<MemberView>,
+    /// While the Ring is over its Relay's daily message quota: when the quota resets (Unix
+    /// seconds, the next UTC midnight after the last refusal). Only in the window that runs the
+    /// connection.
+    pub quota_reset_at: Option<u64>,
+    /// The Ring's Relay is the Hosted one (same origin as `hosted_relay_url`, or a limited
+    /// session, which only the Hosted Relay gives), not the user's own.
+    pub relay_hosted: bool,
 }
 
 /// What the user must do before a moved-aside Ring is replaced by a new one.
@@ -458,6 +489,78 @@ pub const START_OVER_REQUIRED: &str =
     "the mobile access settings were unreadable; start over to make a new ring";
 /// A Relay change while the previous one is still being published on the old Relay.
 pub const MOVE_PENDING: &str = "the previous relay change is still reaching your paired devices";
+
+/// Quota refusals in a row on one connection past which no probe is sent, below the Relay's
+/// close after [`QUOTA_REFUSALS_BEFORE_CLOSE`] (other frames of the connection may be refused
+/// meanwhile).
+pub const PROBE_STREAK_LIMIT: u32 = 24;
+const _: () = assert!((PROBE_STREAK_LIMIT as usize) < QUOTA_REFUSALS_BEFORE_CLOSE);
+
+/// The end of the Relay's quota day that `now` (Unix seconds) is in: the next UTC midnight.
+fn next_utc_midnight(now: u64) -> u64 {
+    (now / 86_400 + 1) * 86_400
+}
+
+/// The reset time to show: `until` while it is still ahead.
+fn quota_notice(until: Option<u64>, now: u64) -> Option<u64> {
+    until.filter(|&u| now < u)
+}
+
+/// Whether the next probe is due at `at`, given the last one and whether the notice is shown.
+fn probe_due(last: Option<Instant>, limited: bool, at: Instant, cfg: &DesktopRingConfig) -> bool {
+    let every = if limited {
+        cfg.quota_probe_limited
+    } else {
+        cfg.quota_probe
+    };
+    last.is_none_or(|l| at.saturating_duration_since(l) >= every)
+}
+
+/// The Ring's daily quota as the window running the connection knows it.
+#[derive(Default)]
+struct Quota {
+    /// The reset time after the last refusal (Unix seconds); the notice shows until then.
+    until: Option<u64>,
+    /// Bumped by every refusal and every change of `until` by other means (an accepted probe,
+    /// the lapse, the Connector's retirement): a probe result applies only if it is unchanged
+    /// since the probe was sent.
+    rev: u64,
+    /// The probe in flight, by sequence number.
+    in_flight: Option<u64>,
+    seq: u64,
+    last_probe: Option<Instant>,
+    /// Quota refusals in a row on one connection (its [`Live::conn_epoch`]). An accepted
+    /// counted frame of that connection, a new connection or the lapse of the notice (the
+    /// Relay's day ended, so its next frame is accepted) ends the run.
+    streak: (u64, u32),
+}
+
+impl Quota {
+    /// The Connector is retired: nothing it reported, or a probe on it answers, counts any
+    /// more.
+    fn retire(&mut self) {
+        *self = Quota {
+            rev: self.rev + 1,
+            seq: self.seq,
+            ..Quota::default()
+        };
+    }
+}
+
+/// Test hook: sees a probe's answer before it is applied.
+#[cfg(test)]
+type ProbeHook = Box<dyn Fn(&Result<(), RingError>) + Send>;
+
+/// What a probe was sent under; its result applies only if all of it still holds.
+struct ProbeTag {
+    seq: u64,
+    rev: u64,
+    /// [`Live::epoch`] and [`Live::conn_epoch`] when it was sent.
+    epoch: u64,
+    conn_epoch: u64,
+    /// Unix seconds.
+    sent_at: u64,
+}
 
 #[derive(Default)]
 struct Live {
@@ -474,6 +577,13 @@ struct Live {
     /// The pairing in progress per flow (its cancel flag). Secrets live only in memory, on
     /// the pairing's thread: `ring.json` never holds one.
     pairing: Vec<(PairingFlow, Cancel)>,
+    quota: Quota,
+    /// Bumped for every Connector started: its [`Events`] carry it, and a report of a retired
+    /// one (an older epoch, or none running) changes nothing.
+    epoch: u64,
+    /// Bumped whenever the connection goes down or a new one comes up (every link report
+    /// but `Connected` after `Connected`).
+    conn_epoch: u64,
 }
 
 pub struct DesktopRing {
@@ -500,6 +610,12 @@ pub struct DesktopRing {
     /// The thread holding `commit`, for the lock-order test.
     #[cfg(test)]
     commit_owner: Mutex<Option<std::thread::ThreadId>>,
+    /// Test hook: runs on the probe's thread between its answer and applying it.
+    #[cfg(test)]
+    before_probe_apply: Mutex<Option<ProbeHook>>,
+    /// Every probe result so far: `true` applied, `false` fenced off.
+    #[cfg(test)]
+    probe_results: Mutex<Vec<bool>>,
 }
 
 thread_local! {
@@ -542,36 +658,68 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-struct Events(Weak<DesktopRing>);
+/// The Connector's reports, for the Connector started under `epoch`.
+struct Events {
+    ring: Weak<DesktopRing>,
+    epoch: u64,
+}
 
 impl ConnectorEvents for Events {
     fn state(&self, s: &LinkState) {
-        if let Some(r) = self.0.upgrade() {
-            r.lock().link = Some(s.clone());
+        if let Some(r) = self.ring.upgrade() {
+            {
+                let mut l = r.lock();
+                if l.epoch != self.epoch {
+                    // A retired Connector's late report.
+                    return;
+                }
+                let up = |s: Option<&LinkState>| matches!(s, Some(LinkState::Connected { .. }));
+                if !(up(l.link.as_ref()) && up(Some(s))) {
+                    l.conn_epoch += 1;
+                }
+                l.link = Some(s.clone());
+            }
             r.emit();
         }
     }
 
     fn roster(&self, chain: &RosterChain) {
-        if let Some(r) = self.0.upgrade() {
+        if let Some(r) = self.ring.upgrade() {
             r.persist_newer(chain);
             r.emit();
         }
     }
 
     fn presence(&self, _key: SignKey, _p: &MemberPresence) {
-        if let Some(r) = self.0.upgrade() {
+        if let Some(r) = self.ring.upgrade() {
             r.emit();
         }
     }
 
     fn moved(&self, m: &MoveState) {
-        if let Some(r) = self.0.upgrade() {
+        if let Some(r) = self.ring.upgrade() {
             if let MoveState::Done { job } = m {
                 r.clear_pending_move(job);
             }
             r.lock().moving = Some(m.clone());
             r.emit();
+        }
+    }
+
+    fn error(&self, code: &ErrorCode, _to: Option<SignKey>) {
+        if *code != ErrorCode::Quota {
+            return;
+        }
+        if let Some(r) = self.ring.upgrade() {
+            if r.quota_refused(self.epoch) {
+                r.emit();
+            }
+        }
+    }
+
+    fn accepted(&self) {
+        if let Some(r) = self.ring.upgrade() {
+            r.quota_accepted(self.epoch);
         }
     }
 }
@@ -598,6 +746,10 @@ impl DesktopRing {
             before_publish_wait: Mutex::new(None),
             #[cfg(test)]
             commit_owner: Mutex::new(None),
+            #[cfg(test)]
+            before_probe_apply: Mutex::new(None),
+            #[cfg(test)]
+            probe_results: Mutex::new(Vec::new()),
         });
         let mut seen = ring.store.signature();
         ring.reload();
@@ -621,6 +773,7 @@ impl DesktopRing {
                     r.reload();
                     r.emit();
                 }
+                r.quota_tick();
             });
         ring
     }
@@ -701,6 +854,7 @@ impl DesktopRing {
                         l.state = None;
                         l.moving = None;
                         l.link = None;
+                        l.quota.retire();
                         l.connector.take()
                     }
                     None => {
@@ -770,6 +924,7 @@ impl DesktopRing {
             if other_ring {
                 l.moving = None;
                 l.link = None;
+                l.quota.retire();
                 (l.connector.take(), None)
             } else if unchanged && l.connector.is_some() {
                 return true;
@@ -848,7 +1003,12 @@ impl DesktopRing {
         cfg.backoff_unit = self.cfg.backoff_unit;
         cfg.pending_move = s.pending_move.clone();
         cfg.move_attempts = self.cfg.move_attempts;
-        match Connector::start(cfg, Arc::new(Events(self.me.clone()))) {
+        l.epoch += 1;
+        let events = Events {
+            ring: self.me.clone(),
+            epoch: l.epoch,
+        };
+        match Connector::start(cfg, Arc::new(events)) {
             Ok(c) => l.connector = Some(Arc::new(c)),
             Err(e) => {
                 l.link = Some(LinkState::Stopped {
@@ -1505,7 +1665,7 @@ impl DesktopRing {
     }
 
     pub fn view(&self) -> RingView {
-        let (state, connector, link, moving, problem, other) = {
+        let (state, connector, link, moving, problem, other, quota_until) = {
             let l = self.lock();
             (
                 l.state.clone(),
@@ -1514,6 +1674,7 @@ impl DesktopRing {
                 l.moving.clone(),
                 l.problem.clone(),
                 l.other_window && l.connector.is_none(),
+                l.quota.until,
             )
         };
         let (problem, problem_detail) = match problem {
@@ -1534,6 +1695,8 @@ impl DesktopRing {
             problem,
             problem_detail,
             members: Vec::new(),
+            quota_reset_at: None,
+            relay_hosted: false,
         };
         // Recovery required (or the settings refused): nothing else counts until then.
         if v.problem.is_some() {
@@ -1563,6 +1726,13 @@ impl DesktopRing {
                 v.connection = "stopped";
                 v.connection_error = error;
             }
+        }
+        let origin = |u: &str| normalize_origin(u).ok();
+        v.relay_hosted = v.limited
+            || origin(&head.roster().relay_url)
+                .is_some_and(|o| Some(o) == origin(&self.cfg.hosted_relay_url));
+        if !other {
+            v.quota_reset_at = quota_notice(quota_until, now());
         }
         v.moving = s.pending_move.as_ref().map(|job| match moving {
             Some(MoveState::Failed { job: j, error }) if &j == job => MoveView {
@@ -1634,6 +1804,174 @@ impl DesktopRing {
         v
     }
 
+    /// A quota refusal on the current connection: the notice shows until the Relay's day
+    /// ends, and the refusal counts toward the streak of that connection. `true`: noted (a
+    /// retired Connector's late report, from an older `epoch`, is not).
+    fn quota_refused(&self, epoch: u64) -> bool {
+        let at = now();
+        let mut l = self.lock();
+        if l.epoch != epoch || l.connector.is_none() {
+            return false;
+        }
+        let conn = l.conn_epoch;
+        let q = &mut l.quota;
+        q.rev += 1;
+        q.until = Some(next_utc_midnight(at));
+        if q.streak.0 != conn {
+            q.streak = (conn, 0);
+        }
+        q.streak.1 += 1;
+        true
+    }
+
+    /// The Relay accepted a counted frame of the current connection: the run of refusals
+    /// there is over (the notice stays until a probe or the reset time clears it).
+    fn quota_accepted(&self, epoch: u64) {
+        let mut l = self.lock();
+        if l.epoch == epoch && l.connector.is_some() {
+            l.quota.streak = (l.conn_epoch, 0);
+        }
+    }
+
+    /// The reconcile tick: clears a notice whose reset time has passed, then probes the
+    /// quota if one is due.
+    fn quota_tick(&self) {
+        let lapsed = {
+            let mut l = self.lock();
+            let q = &mut l.quota;
+            if q.until.is_some() && quota_notice(q.until, now()).is_none() {
+                q.until = None;
+                q.rev += 1;
+                // The Relay's day ended: its next frame is accepted, which ends its run too.
+                q.streak.1 = 0;
+                true
+            } else {
+                false
+            }
+        };
+        if lapsed {
+            self.emit();
+        }
+        self.maybe_probe();
+    }
+
+    /// Sends a quota probe if this window runs the connection, it is up, a phone is in the
+    /// Roster, none is in flight, one is due, and the connection is not near the Relay's
+    /// close for refusals in a row. Its answer is waited for on a thread of its own.
+    fn maybe_probe(&self) {
+        let (c, tag) = {
+            let mut l = self.lock();
+            let phone = l.state.as_ref().is_some_and(|s| {
+                s.chain
+                    .head()
+                    .roster()
+                    .members
+                    .iter()
+                    .any(|m| m.role == Role::Mobile)
+            });
+            if l.quitting || !phone || !matches!(l.link, Some(LinkState::Connected { .. })) {
+                return;
+            }
+            let Some(c) = l.connector.clone() else {
+                return;
+            };
+            let at = Instant::now();
+            let shown = quota_notice(l.quota.until, now()).is_some();
+            let (epoch, conn) = (l.epoch, l.conn_epoch);
+            let q = &mut l.quota;
+            if q.in_flight.is_some()
+                || !probe_due(q.last_probe, shown, at, &self.cfg)
+                || (q.streak.0 == conn && q.streak.1 >= PROBE_STREAK_LIMIT)
+            {
+                return;
+            }
+            q.seq += 1;
+            q.in_flight = Some(q.seq);
+            q.last_probe = Some(at);
+            let tag = ProbeTag {
+                seq: q.seq,
+                rev: q.rev,
+                epoch,
+                conn_epoch: conn,
+                sent_at: now(),
+            };
+            (c, tag)
+        };
+        let seq = tag.seq;
+        let clear = |ring: &DesktopRing| {
+            let mut l = ring.lock();
+            if l.quota.in_flight == Some(seq) {
+                l.quota.in_flight = None;
+            }
+        };
+        let ticket = match c.probe_start() {
+            Ok(t) => t,
+            Err(_) => return clear(self),
+        };
+        let me = self.me.clone();
+        let wait = self.cfg.timeouts.request;
+        let spawned = std::thread::Builder::new()
+            .name("ring-quota-probe".into())
+            .spawn(move || {
+                let r = ticket.wait(wait);
+                if let Some(ring) = me.upgrade() {
+                    ring.probe_done(tag, r);
+                }
+            });
+        if spawned.is_err() {
+            clear(self);
+        }
+    }
+
+    /// A probe's answer, applied only if the Connector, its connection and the quota state are
+    /// the ones it was sent under, checked in the same critical section that applies it.
+    /// Called with no Ring lock held; emits with none held.
+    fn probe_done(&self, tag: ProbeTag, r: Result<(), RingError>) {
+        #[cfg(test)]
+        if let Some(h) = self.before_probe_apply.lock().unwrap().as_ref() {
+            h(&r);
+        }
+        let (applied, changed) = {
+            let mut l = self.lock();
+            let current = l.epoch == tag.epoch && l.connector.is_some();
+            let conn = l.conn_epoch;
+            let q = &mut l.quota;
+            if q.in_flight == Some(tag.seq) {
+                q.in_flight = None;
+            }
+            if !current || conn != tag.conn_epoch || q.rev != tag.rev {
+                (false, false)
+            } else {
+                match r {
+                    // The Relay accepts this Ring's traffic again.
+                    Ok(()) => {
+                        q.streak = (conn, 0);
+                        q.rev += 1;
+                        (true, q.until.take().is_some())
+                    }
+                    // Counted toward the streak where every refusal is, in `quota_refused`.
+                    Err(RingError::Relay {
+                        code: ErrorCode::Quota,
+                        ..
+                    }) => {
+                        let until = Some(next_utc_midnight(tag.sent_at));
+                        q.rev += 1;
+                        let changed = q.until != until;
+                        q.until = until;
+                        (true, changed)
+                    }
+                    Err(_) => (true, false),
+                }
+            }
+        };
+        #[cfg(test)]
+        self.probe_results.lock().unwrap().push(applied);
+        let _ = applied;
+        if changed {
+            self.emit();
+        }
+    }
+
     /// The app quits: say goodbye (`quit`), stop connecting, and hand the connection over
     /// (the owner lock is released after the goodbye).
     pub fn quit(&self) {
@@ -1642,6 +1980,7 @@ impl DesktopRing {
         let c = {
             let mut l = self.lock();
             l.quitting = true;
+            l.quota.retire();
             l.connector.take()
         };
         if let Some(c) = c {
@@ -3283,6 +3622,497 @@ mod tests {
         let last = views.last.lock().unwrap().clone().unwrap();
         assert!(last.members.iter().all(|m| m.sign_key != a.sign_key));
         assert!(last.moving.is_some());
+        ring.quit();
+    }
+
+    // ---- The daily quota (#42) ------------------------------------------------------------
+
+    use xshell_protocol::ring::relay::contract::RawConn;
+    use xshell_protocol::ring::relay::wire::ClientFrame;
+
+    fn quota_relay(limit: u64) -> Arc<TestRelay> {
+        Arc::new(TestRelay::start_with(TestRelayOptions {
+            auth_timeout: Duration::from_millis(500),
+            quota_frames_per_day: Some(limit),
+            ..TestRelayOptions::default()
+        }))
+    }
+
+    /// Probes every `every`, and every `limited` while the notice is shown.
+    fn probing(
+        dir: &std::path::Path,
+        r: &TestRelay,
+        every: u64,
+        limited: u64,
+    ) -> DesktopRingConfig {
+        let mut c = cfg(dir, &r.url());
+        c.quota_probe = Duration::from_millis(every);
+        c.quota_probe_limited = Duration::from_millis(limited);
+        c
+    }
+
+    /// A Ring opened with `c` on `r`, with a paired phone: the ring, its views, the phone's
+    /// keys and chain.
+    fn with_phone_cfg(
+        c: DesktopRingConfig,
+    ) -> (Arc<DesktopRing>, Arc<Views>, Arc<DeviceKeys>, RosterChain) {
+        let (ring, views) = open(c);
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let offer = ring.pair_phone(Arc::new(Pairings::default())).unwrap();
+        let phone = Arc::new(DeviceKeys::generate().unwrap());
+        let chain = scan(&offer.payload, &phone).unwrap();
+        (ring, views, phone, chain)
+    }
+
+    /// Uses up the Ring's quota for the day from the phone's own socket.
+    fn use_up_quota(r: &TestRelay, chain: &RosterChain, phone: &DeviceKeys) {
+        let mut m = RawConn::login(&r.target(), chain, phone);
+        let head = chain.head().version();
+        for id in 1..=1000 {
+            m.send(&ClientFrame::RosterGet { id, since: head }.encode())
+                .unwrap();
+            match m.frame(WAIT) {
+                Some(RelayFrame::RosterChain { .. }) => {}
+                Some(RelayFrame::Error {
+                    code: ErrorCode::Quota,
+                    ..
+                }) => return,
+                other => panic!("expected roster.chain or quota, got {other:?}"),
+            }
+        }
+        panic!("the quota was never reached");
+    }
+
+    /// Shows the notice until `until`, as a refusal would.
+    fn set_quota_until(ring: &DesktopRing, until: u64) {
+        {
+            let mut l = ring.lock();
+            l.quota.until = Some(until);
+            l.quota.rev += 1;
+        }
+        ring.emit();
+    }
+
+    /// Makes the next probe due at once.
+    fn probe_soon(ring: &DesktopRing) {
+        ring.lock().quota.last_probe = None;
+    }
+
+    fn probe_results(ring: &DesktopRing) -> Vec<bool> {
+        ring.probe_results.lock().unwrap().clone()
+    }
+
+    fn on_probe_result(ring: &DesktopRing, f: impl Fn(&Result<(), RingError>) + Send + 'static) {
+        *ring.before_probe_apply.lock().unwrap() = Some(Box::new(f));
+    }
+
+    fn this_app(ring: &DesktopRing) -> SignKey {
+        ring.view()
+            .members
+            .iter()
+            .find(|m| m.this_app)
+            .unwrap()
+            .sign_key
+    }
+
+    fn is_quota(r: &Result<(), RingError>) -> bool {
+        matches!(
+            r,
+            Err(RingError::Relay {
+                code: ErrorCode::Quota,
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn next_utc_midnight_is_the_relays_day_end() {
+        assert_eq!(next_utc_midnight(0), 86_400);
+        assert_eq!(next_utc_midnight(86_399), 86_400);
+        assert_eq!(next_utc_midnight(86_400), 172_800);
+    }
+
+    #[test]
+    fn quota_notice_lapses_at_reset() {
+        assert_eq!(quota_notice(None, 100), None);
+        assert_eq!(quota_notice(Some(101), 100), Some(101));
+        assert_eq!(quota_notice(Some(100), 100), None);
+        assert_eq!(quota_notice(Some(99), 100), None);
+    }
+
+    #[test]
+    fn probe_due_spacing() {
+        let c = DesktopRingConfig::new("/x".into(), "desk".into());
+        let at = Instant::now();
+        let min = Duration::from_secs(60);
+        assert!(probe_due(None, false, at, &c));
+        assert!(probe_due(None, true, at, &c));
+        assert!(!probe_due(Some(at), false, at + 9 * min, &c));
+        assert!(probe_due(Some(at), false, at + 10 * min, &c));
+        assert!(!probe_due(Some(at), true, at + 59 * min, &c));
+        assert!(probe_due(Some(at), true, at + 60 * min, &c));
+    }
+
+    #[test]
+    fn quota_refusal_reaches_the_ring_view() {
+        let r = quota_relay(60);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, views, phone, chain) =
+            with_phone_cfg(probing(t.path(), &r, 100, 60 * 60 * 1000));
+        assert_eq!(ring.view().quota_reset_at, None);
+        use_up_quota(&r, &chain, &phone);
+        let v = wait_view(&ring, "the quota notice", |v| v.quota_reset_at.is_some());
+        assert_eq!(v.quota_reset_at, Some(next_utc_midnight(now())));
+        assert!(v.relay_hosted, "the test's hosted URL is the relay's");
+        wait_until("the observer told", || {
+            views
+                .last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|v| v.quota_reset_at.is_some())
+        });
+        ring.quit();
+    }
+
+    #[test]
+    fn own_relay_is_not_hosted() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let mut c = cfg(t.path(), &r.url());
+        c.hosted_relay_url = "wss://relay.example.org".into();
+        let (ring, _) = open(c);
+        ring.enable(None, false).unwrap();
+        let v = wait_view(&ring, "connected", connected);
+        assert!(!v.limited);
+        assert!(!v.relay_hosted);
+        ring.quit();
+    }
+
+    #[test]
+    fn accepted_probe_clears_the_notice() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, views, _, _) = with_phone_cfg(probing(t.path(), &r, 60 * 60 * 1000, 100));
+        wait_until("the first probe", || !probe_results(&ring).is_empty());
+        set_quota_until(&ring, now() + 3600);
+        assert!(ring.view().quota_reset_at.is_some());
+        wait_view(&ring, "the notice cleared", |v| v.quota_reset_at.is_none());
+        wait_until("the observer told", || {
+            views
+                .last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|v| v.quota_reset_at.is_none())
+        });
+        ring.quit();
+    }
+
+    /// Every view the observer was told, in order.
+    #[derive(Default)]
+    struct History(Mutex<Vec<RingView>>);
+
+    impl RingObserver for History {
+        fn changed(&self, v: &RingView) {
+            self.0.lock().unwrap().push(v.clone());
+        }
+    }
+
+    /// The notice is first seen ahead of its reset time; once that passes, the observer is
+    /// told a view without it, with nothing else emitting (no phone, so no probes either).
+    #[test]
+    fn lapsed_notice_is_emitted_cleared() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let seen = Arc::new(History::default());
+        let ring = DesktopRing::open(cfg(t.path(), &r.url()), seen.clone());
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let until = now() + 2;
+        set_quota_until(&ring, until);
+        let shown = seen
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rposition(|v| v.quota_reset_at == Some(until))
+            .expect("the notice shown ahead of its reset time");
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let later = seen.0.lock().unwrap()[shown + 1..]
+                .iter()
+                .any(|v| v.connection == "connected" && v.quota_reset_at.is_none());
+            if later {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no view without the notice");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(now() >= until);
+        assert_eq!(ring.lock().quota.until, None);
+        ring.quit();
+    }
+
+    #[test]
+    fn other_window_shows_no_quota() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (a, _) = open(cfg(t.path(), &r.url()));
+        a.enable(None, false).unwrap();
+        wait_view(&a, "a connected", connected);
+        set_quota_until(&a, now() + 3600);
+        assert!(a.view().quota_reset_at.is_some());
+        let (b, _) = open(cfg(t.path(), &r.url()));
+        wait_view(&b, "b defers", |v| v.connection == "other-window");
+        set_quota_until(&b, now() + 3600);
+        assert_eq!(b.view().quota_reset_at, None);
+        a.quit();
+        b.quit();
+    }
+
+    #[test]
+    fn ring_view_serializes_quota_fields() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let json = serde_json::to_value(ring.view()).unwrap();
+        assert_eq!(json["quotaResetAt"], Value::Null);
+        assert_eq!(json["relayHosted"], true);
+        set_quota_until(&ring, 4_000_000_000);
+        let json = serde_json::to_value(ring.view()).unwrap();
+        assert_eq!(json["quotaResetAt"], 4_000_000_000u64);
+        ring.quit();
+    }
+
+    /// An accepted probe whose answer comes after a newer refusal leaves the notice standing.
+    #[test]
+    fn a_refusal_after_the_probe_was_sent_keeps_the_notice() {
+        let r = Arc::new(relay());
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let (ring, _, _, chain) = with_phone_cfg(probing(t.path(), &r, hour, hour));
+        wait_until("the first probe", || probe_results(&ring).len() == 1);
+        set_quota_until(&ring, now() + 3600);
+        let (rid, me) = (chain.ring_id().clone(), this_app(&ring));
+        let (weak, relay) = (Arc::downgrade(&ring), r.clone());
+        on_probe_result(&ring, move |res| {
+            assert_eq!(res, &Ok(()));
+            let ring = weak.upgrade().unwrap();
+            let rev = ring.lock().quota.rev;
+            let refusal = RelayFrame::Error {
+                code: ErrorCode::Quota,
+                id: None,
+                to: None,
+                detail: None,
+            };
+            assert!(relay.inject(&rid, &me, &refusal.encode()));
+            wait_until("the refusal noted", || ring.lock().quota.rev != rev);
+        });
+        probe_soon(&ring);
+        wait_until("the second probe", || probe_results(&ring).len() == 2);
+        assert!(ring.view().quota_reset_at.is_some(), "the notice stays");
+        assert_eq!(probe_results(&ring), vec![true, false], "fenced off");
+        ring.quit();
+    }
+
+    /// A probe's refusal that is applied after the app quit shows no notice.
+    #[test]
+    fn a_stale_refusal_after_quit_shows_no_notice() {
+        let r = quota_relay(60);
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let (ring, _, phone, chain) = with_phone_cfg(probing(t.path(), &r, hour, hour));
+        wait_until("the first probe", || probe_results(&ring).len() == 1);
+        use_up_quota(&r, &chain, &phone);
+        let weak = Arc::downgrade(&ring);
+        on_probe_result(&ring, move |res| {
+            assert!(is_quota(res), "{res:?}");
+            weak.upgrade().unwrap().quit();
+        });
+        probe_soon(&ring);
+        wait_until("the second probe", || probe_results(&ring).len() == 2);
+        assert_eq!(ring.view().quota_reset_at, None, "no notice");
+        assert_eq!(probe_results(&ring), vec![true, false], "fenced off");
+    }
+
+    /// A probe's refusal that is applied after the notice it caused has lapsed (the quota
+    /// recovered meanwhile) does not bring the notice back.
+    #[test]
+    fn a_stale_refusal_after_recovery_shows_no_notice() {
+        let r = quota_relay(60);
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let (ring, _, phone, chain) = with_phone_cfg(probing(t.path(), &r, hour, hour));
+        wait_until("the first probe", || probe_results(&ring).len() == 1);
+        use_up_quota(&r, &chain, &phone);
+        let weak = Arc::downgrade(&ring);
+        on_probe_result(&ring, move |res| {
+            assert!(is_quota(res), "{res:?}");
+            let ring = weak.upgrade().unwrap();
+            wait_until("the refusal noted", || ring.view().quota_reset_at.is_some());
+            // The reset time passes; the reconcile tick clears the notice.
+            ring.lock().quota.until = Some(now() - 1);
+            wait_until("the lapse", || ring.lock().quota.until.is_none());
+        });
+        probe_soon(&ring);
+        wait_until("the second probe", || probe_results(&ring).len() == 2);
+        assert_eq!(ring.view().quota_reset_at, None, "no notice");
+        assert_eq!(probe_results(&ring), vec![true, false], "fenced off");
+        ring.quit();
+    }
+
+    /// Refusals of other frames count toward the connection's streak: probing as fast as it
+    /// may, the Desktop stops before the Relay's close for 32 refusals in a row.
+    #[test]
+    fn mixed_traffic_does_not_probe_into_a_quota_close() {
+        let r = quota_relay(60);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, phone, chain) = with_phone_cfg(probing(t.path(), &r, 10, 10));
+        wait_until("the first probe", || !probe_results(&ring).is_empty());
+        let c = ring.lock().connector.clone().unwrap();
+        let conn = c.connection();
+        assert!(conn.is_some());
+        use_up_quota(&r, &chain, &phone);
+        let token = contract::fake_entitlement(chain.ring_id());
+        for _ in 0..10 {
+            let e = c.put_entitlement(&token).unwrap_err();
+            assert!(is_quota(&Err(e)));
+        }
+        wait_until("the probes stop", || {
+            ring.lock().quota.streak.1 >= PROBE_STREAK_LIMIT
+        });
+        // Long enough for the 32nd refusal at the probe rate (a tick every 50 ms).
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(c.connection(), conn, "the Relay never closed the socket");
+        let (streak, conn_epoch) = {
+            let l = ring.lock();
+            (l.quota.streak, l.conn_epoch)
+        };
+        assert_eq!(streak.0, conn_epoch);
+        assert!(
+            (streak.1 as usize) < QUOTA_REFUSALS_BEFORE_CLOSE,
+            "{streak:?}"
+        );
+        let v = ring.view();
+        assert_eq!(v.connection, "connected");
+        assert!(v.quota_reset_at.is_some());
+        ring.quit();
+    }
+
+    /// The probes stop at the streak limit on this connection.
+    fn at_streak_limit(ring: &DesktopRing) {
+        wait_until("no probe in flight", || {
+            ring.lock().quota.in_flight.is_none()
+        });
+        {
+            let mut l = ring.lock();
+            l.quota.streak = (l.conn_epoch, PROBE_STREAK_LIMIT);
+            l.quota.until = Some(now() + 3600);
+            l.quota.rev += 1;
+        }
+        wait_until("no probe in flight", || {
+            ring.lock().quota.in_flight.is_none()
+        });
+        let n = probe_results(ring).len();
+        std::thread::sleep(QUIET);
+        assert_eq!(probe_results(ring).len(), n, "no probe at the limit");
+    }
+
+    const QUIET: Duration = Duration::from_millis(300);
+
+    /// At the streak limit the probes stop; once the notice lapses (the Relay's day ended,
+    /// so its next frame is accepted), they resume on the same connection.
+    #[test]
+    fn probing_resumes_after_the_quota_resets() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, _, _) = with_phone_cfg(probing(t.path(), &r, 10, 10));
+        wait_until("the first probe", || !probe_results(&ring).is_empty());
+        at_streak_limit(&ring);
+        let n = probe_results(&ring).len();
+        ring.lock().quota.until = Some(now());
+        wait_until("probing resumed", || probe_results(&ring).len() > n);
+        wait_view(&ring, "no notice", |v| v.quota_reset_at.is_none());
+        ring.quit();
+    }
+
+    /// An accepted counted request of the connection (an `entitlement.put`, say) ends the run
+    /// of refusals, as it does on the Relay: the probes resume.
+    #[test]
+    fn an_accepted_request_ends_the_refusal_run() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, _, chain) = with_phone_cfg(probing(t.path(), &r, 10, 10));
+        wait_until("the first probe", || !probe_results(&ring).is_empty());
+        at_streak_limit(&ring);
+        let n = probe_results(&ring).len();
+        let c = ring.lock().connector.clone().unwrap();
+        c.put_entitlement(&contract::fake_entitlement(chain.ring_id()))
+            .unwrap();
+        wait_until("probing resumed", || probe_results(&ring).len() > n);
+        wait_view(&ring, "no notice", |v| v.quota_reset_at.is_none());
+        ring.quit();
+    }
+
+    /// A quota report of a Connector retired with its Ring (unreadable settings, started
+    /// over) that arrives after the replacement's Connector is up changes nothing there.
+    #[test]
+    fn a_retired_connectors_quota_report_changes_nothing() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let old = Events {
+            ring: Arc::downgrade(&ring),
+            epoch: ring.lock().epoch,
+        };
+        std::fs::write(t.path().join("ring").join("ring.json"), b"torn").unwrap();
+        let (_, id) = identity();
+        assert_eq!(ring.ensure_local_daemon(&id).unwrap(), None);
+        assert_eq!(ring.view().problem.as_deref(), Some("recovered"));
+        ring.enable(None, true).unwrap();
+        wait_view(&ring, "the new Ring connected", connected);
+        let conn_epoch = ring.lock().conn_epoch;
+        old.error(&ErrorCode::Quota, None);
+        old.state(&LinkState::Stopped { error: None });
+        let v = ring.view();
+        assert_eq!(v.quota_reset_at, None, "no notice on the new Ring");
+        assert_eq!(v.connection, "connected");
+        let l = ring.lock();
+        assert_eq!(l.quota.streak.1, 0);
+        assert_eq!(l.conn_epoch, conn_epoch);
+        drop(l);
+        ring.quit();
+    }
+
+    /// An accepted probe whose answer is applied after the connection changed (the Relay
+    /// dropped it and the Connector reconnected) clears nothing.
+    #[test]
+    fn a_probe_answer_applied_after_a_reconnect_is_fenced() {
+        let r = Arc::new(relay());
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let (ring, _, _, chain) = with_phone_cfg(probing(t.path(), &r, hour, hour));
+        wait_until("the first probe", || probe_results(&ring).len() == 1);
+        set_quota_until(&ring, now() + 3600);
+        let (rid, me) = (chain.ring_id().clone(), this_app(&ring));
+        let (weak, relay) = (Arc::downgrade(&ring), r.clone());
+        on_probe_result(&ring, move |res| {
+            assert_eq!(res, &Ok(()));
+            let ring = weak.upgrade().unwrap();
+            let before = ring.lock().conn_epoch;
+            assert!(relay.kick(&rid, &me, 1011));
+            wait_until("reconnected", || {
+                let l = ring.lock();
+                l.conn_epoch != before && matches!(l.link, Some(LinkState::Connected { .. }))
+            });
+        });
+        probe_soon(&ring);
+        wait_until("the second probe", || probe_results(&ring).len() == 2);
+        assert!(ring.view().quota_reset_at.is_some(), "the notice stays");
+        assert_eq!(probe_results(&ring), vec![true, false], "fenced off");
         ring.quit();
     }
 }

@@ -45,6 +45,22 @@ export function connectionLine(s: RingStatus): string | null {
   }
 }
 
+// The reset time of the daily quota, in local time (HH:MM), as the phone app shows it.
+export function formatResetTime(unixS: number): string {
+  return new Date(unixS * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// The notice while the Ring is over its Relay's daily message quota (#42); null when it is not,
+// once the reset time has passed, or in a window that does not run the connection.
+export function quotaLine(
+  s: Pick<RingStatus, "quotaResetAt" | "relayHosted" | "connection">,
+  nowMs: number,
+  fmtTime: (unixS: number) => string = formatResetTime,
+): string | null {
+  if (s.quotaResetAt == null || s.quotaResetAt * 1000 <= nowMs || s.connection === "other-window") return null;
+  return fmt(s.relayHosted ? "mobile.quota.hosted" : "mobile.quota.ownRelay", { time: fmtTime(s.quotaResetAt) });
+}
+
 // A Relay move still owed to the old Relay.
 export function moveLine(s: RingStatus): string | null {
   if (!s.move) return null;
