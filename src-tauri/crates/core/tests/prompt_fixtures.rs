@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use xshell_core::agent_status::HookAgent;
-use xshell_core::prompt::{extract, screen_tail, Found, ScreenModel};
+use xshell_core::prompt::{composer, extract, screen_tail, Found, ScreenModel};
 
 fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompts")
@@ -176,13 +176,14 @@ fn narrow_screen_joins_wrapped_labels() {
 
 #[test]
 fn unknown_screens_are_not_prompts() {
-    for name in ["claude-idle", "unknown-elicitation"] {
-        let fx = Fixture::load(name);
-        assert!(fx.expect().is_none());
+    let mut unknown = 0;
+    for fx in Fixture::all().into_iter().filter(|f| f.expect().is_none()) {
         for agent in [HookAgent::Claude, HookAgent::Codex] {
-            assert_eq!(extract(agent, &fx.screen()), None, "{name}");
+            assert_eq!(extract(agent, &fx.screen()), None, "{}", fx.name);
         }
+        unknown += 1;
     }
+    assert!(unknown >= 2);
     // Every prompt fixture is its own agent's only.
     for fx in Fixture::all().into_iter().filter(|f| f.expect().is_some()) {
         let other = match fx.agent {
@@ -217,4 +218,62 @@ fn screen_model_follows_resize() {
     m.feed(b"\x1b[2J\x1b[H");
     m.feed(&n.raw);
     assert_eq!(extract(n.agent, &m.rows()), n.found());
+}
+
+fn other(agent: HookAgent) -> HookAgent {
+    match agent {
+        HookAgent::Claude => HookAgent::Codex,
+        HookAgent::Codex => HookAgent::Claude,
+    }
+}
+
+/// Each fixture says whether its screen ends with the agent's chat composer: idle, working
+/// and with a draft it does; a Permission Prompt, a model picker, the bash mode and a form do
+/// not. Another agent's composer is never this one's.
+#[test]
+fn composer_is_recognised_only_where_marked() {
+    let mut yes = std::collections::HashMap::new();
+    for fx in Fixture::all() {
+        let want = fx.meta["composer"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("{}: composer?", fx.name));
+        let screen = fx.screen();
+        assert_eq!(
+            composer(fx.agent, &screen),
+            want,
+            "{}:\n{}",
+            fx.name,
+            screen.join("\n")
+        );
+        assert!(!composer(other(fx.agent), &screen), "{}", fx.name);
+        for n in [1, 7, 64] {
+            assert_eq!(
+                composer(fx.agent, &fx.screen_in_pieces(n)),
+                want,
+                "{}",
+                fx.name
+            );
+        }
+        // A composer and a Permission Prompt never show together.
+        if want {
+            assert_eq!(fx.found(), None, "{}", fx.name);
+            *yes.entry(format!("{:?}", fx.agent)).or_insert(0) += 1;
+        }
+    }
+    assert!(yes.values().all(|n| *n >= 3) && yes.len() == 2, "{yes:?}");
+}
+
+/// Every composer fixture turns bracketed paste on as the agents do; the screen model
+/// tracks it.
+#[test]
+fn bracketed_paste_follows_the_output() {
+    let fx = Fixture::load("claude-composer-idle");
+    let mut m = ScreenModel::new(fx.cols, fx.rows);
+    m.feed(&fx.raw);
+    assert!(!m.bracketed_paste());
+    m.feed(b"\x1b[?2004h");
+    assert!(m.bracketed_paste());
+    m.feed(&fx.raw);
+    assert!(m.bracketed_paste(), "drawing keeps it");
+    assert!(composer(fx.agent, &m.rows()));
 }

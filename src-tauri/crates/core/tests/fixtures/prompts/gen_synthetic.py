@@ -70,6 +70,17 @@ def claude_input_box(cols):
     ]
 
 
+def claude_composer(cols, lines=("",), mark="❯", footer="? for shortcuts"):
+    """Claude Code 2.x prompt input: its round box without sides (a rule above and below),
+    the prompt mark, continuation lines indented under the input, and the footer."""
+    rule = DIM + "─" * cols + RESET
+    out = [rule, mark + " " + lines[0]]
+    out.extend("  " + l for l in lines[1:])
+    out.append(rule)
+    out.append(DIM + "  " + footer + RESET)
+    return out
+
+
 def claude_options(cols, labels):
     """The Select: `❯ 1. label` focused, `  n. label` otherwise; labels wrap under themselves."""
     out = []
@@ -208,6 +219,33 @@ def claude_fixtures(cols):
     ]
     elic = claude_stream(cols, "file an issue", "I'll file the issue.", form)
     out["unknown-elicitation"] = (elic, None)
+    # The chat composer (term.submit): idle, while working, with a draft; and screens that
+    # are not it: the model picker and the bash mode.
+    hist = HIDE + "\r\n".join(claude_banner(cols)) + "\r\n"
+    hist += "> fix the bug\r\n\r\n⏺ Fixed the off-by-one in parse().\r\n\r\n"
+    out["claude-composer-idle"] = (hist + "\r\n".join(claude_composer(cols)), None)
+    working = [WARN + "✻ Thinking… " + RESET + DIM + "(esc to interrupt)" + RESET, ""] + claude_composer(cols)
+    out["claude-composer-working"] = (hist + "\r\n".join(working), None)
+    draft = claude_composer(cols, ("first line of a draft", "second line"))
+    out["claude-composer-draft"] = (hist + "\r\n".join(draft), None)
+    bash_mode = claude_composer(cols, ("ls",), mark="!", footer="! for shell mode")
+    out["claude-bash-mode"] = (hist + "\r\n".join(bash_mode), None)
+    picker = [DIM + "─" * cols + RESET, " " + BOLD + "Select model" + RESET]
+    picker += wrap("Switch between Claude models. Your pick becomes the default for new "
+                   "sessions. For other/previous model names, specify with --model.",
+                   cols - 1, " ", " ")
+    picker.append("")
+    picker += claude_options(cols, ["Default (recommended)", "Opus", "Sonnet", "Haiku"])
+    picker += ["", " " + DIM + "Enter to confirm · Esc to exit" + RESET]
+    frame = claude_composer(cols)
+    picked = hist + "\r\n".join(frame) + ink_erase(len(frame)) + "\r\n".join(picker)
+    out["claude-model-picker"] = (picked, None)
+    # Not the composer either: a command's question printed below it, and a custom status
+    # line the footer does not know.
+    asked = claude_composer(cols) + ["Continue? [y/N] "]
+    out["claude-composer-question"] = (hist + "\r\n".join(asked), None)
+    status = claude_composer(cols)[:-1] + [DIM + "  main • 3 files changed • $0.42" + RESET]
+    out["claude-composer-statusline"] = (hist + "\r\n".join(status), None)
     return out
 
 
@@ -275,8 +313,57 @@ def codex_stream(cols, prompt_text, dialog):
     return s
 
 
+def codex_composer(lines=("" + DIM + "Ask Codex to do anything" + RESET,), status=None):
+    """The bottom pane: an optional status row, the composer with its blank padding rows
+    and the prompt mark, then the footer."""
+    out = [""]
+    if status:
+        out += [status, ""]
+    out.append("› " + lines[0])
+    out.extend("  " + l for l in lines[1:])
+    out += ["", "  " + DIM + "? for shortcuts" + RESET + "                    100% context left"]
+    return out
+
+
+def codex_history(prompt_text):
+    s = HIDE + ESC + "[2J" + cup(1)
+    hist = [
+        BOLD + ">_ OpenAI Codex" + RESET + " (v" + CODEX_VERSION + ")",
+        "",
+        DIM + "model: " + RESET + "gpt-5-codex   " + DIM + "directory: " + RESET + "~/proj",
+        "",
+        "› " + prompt_text,
+        "",
+        "• Fixed the off-by-one in parse().",
+    ]
+    for i, l in enumerate(hist, 1):
+        s += cup(i) + l
+    return s
+
+
 def codex_fixtures(cols):
     out = {}
+    base = codex_history("fix the bug")
+    out["codex-composer-idle"] = (base + codex_viewport(cols, codex_composer()), None)
+    working = codex_composer(status="• Working (3s • esc to interrupt)")
+    out["codex-composer-working"] = (base + codex_viewport(cols, working), None)
+    draft = codex_composer(("first line of a draft", "second line"))
+    out["codex-composer-draft"] = (base + codex_viewport(cols, draft), None)
+    picker = ["", "  " + BOLD + "Select Model" + RESET,
+              "  " + DIM + "Pick a quick auto mode or browse all models." + RESET, ""]
+    picker += codex_options(cols, ["auto", "gpt-5-codex", "gpt-5"])
+    picker += ["", "  " + DIM + "Press enter to confirm or esc to go back" + RESET]
+    blank = [""] * len(picker)
+    picked = (base + codex_viewport(cols, codex_composer()) + codex_viewport(cols, blank)
+              + codex_viewport(cols, picker))
+    out["codex-model-picker"] = (picked, None)
+    # An unnumbered list with the composer's mark as its focus, and its own footer.
+    unnumbered = ["", "  " + BOLD + "Select Model" + RESET, "", "› auto", "  gpt-5-codex",
+                  "  gpt-5", "", "  " + DIM + "Press enter to confirm or esc to go back" + RESET]
+    blank = [""] * len(unnumbered)
+    listed = (base + codex_viewport(cols, codex_composer()) + codex_viewport(cols, blank)
+              + codex_viewport(cols, unnumbered))
+    out["codex-unnumbered-picker"] = (listed, None)
     exec_d = codex_dialog(
         cols, "Would you like to run the following command?",
         ["Reason: list the files in /tmp", "$ ls -la /tmp"],
@@ -308,21 +395,33 @@ def codex_fixtures(cols):
     return out
 
 
+# The screens that end with the agent's chat composer; every other one does not.
+COMPOSERS = {"claude-idle", "claude-composer-idle", "claude-composer-working",
+             "claude-composer-draft", "codex-composer-idle", "codex-composer-working",
+             "codex-composer-draft"}
+
+
 def main():
     dest = sys.argv[1]
     os.makedirs(dest, exist_ok=True)
     plan = [
         ("claude", CLAUDE_VERSION, 100, ["claude-bash", "claude-edit", "claude-webfetch-domain",
-                                         "claude-idle", "unknown-elicitation"]),
+                                         "claude-idle", "unknown-elicitation",
+                                         "claude-composer-idle", "claude-composer-working",
+                                         "claude-composer-draft", "claude-bash-mode",
+                                         "claude-model-picker", "claude-composer-question",
+                                         "claude-composer-statusline"]),
         ("claude", CLAUDE_VERSION, 50, ["claude-bash"]),
-        ("codex", CODEX_VERSION, 100, ["codex-exec", "codex-edits"]),
+        ("codex", CODEX_VERSION, 100, ["codex-exec", "codex-edits", "codex-composer-idle",
+                                       "codex-composer-working", "codex-composer-draft",
+                                       "codex-model-picker", "codex-unnumbered-picker"]),
         ("codex", CODEX_VERSION, 50, ["codex-exec"]),
     ]
     for agent, version, cols, names in plan:
         made = claude_fixtures(cols) if agent == "claude" else codex_fixtures(cols)
         for name in names:
             raw, expect = made[name]
-            base = name if name in ("claude-idle", "unknown-elicitation") else f"{name}-{cols}x{ROWS}"
+            base = name if expect is None else f"{name}-{cols}x{ROWS}"
             with open(os.path.join(dest, base + ".raw"), "wb") as f:
                 f.write(raw.encode("utf-8"))
             side = {
@@ -334,6 +433,8 @@ def main():
                 "source": "gen_synthetic.py: built from the CLI's strings and rendering, "
                           "not recorded (xshell-remote#8, D9)",
                 "expect": expect,
+                # Whether the screen ends with the agent's chat composer (term.submit).
+                "composer": name in COMPOSERS,
             }
             with open(os.path.join(dest, base + ".json"), "w") as f:
                 json.dump(side, f, indent=2, ensure_ascii=False)

@@ -1,10 +1,10 @@
 {
-  "agent": "claude",
-  "version": "2.1.296",
+  "agent": "codex",
+  "version": "0.154.0",
   "cols": 100,
   "rows": 30,
   "synthetic": true,
   "source": "gen_synthetic.py: built from the CLI's strings and rendering, not recorded (xshell-remote#8, D9)",
   "expect": null,
-  "composer": true
+  "composer": false
 }

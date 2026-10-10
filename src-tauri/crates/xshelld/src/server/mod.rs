@@ -14,7 +14,7 @@
 //! queues its results under the registry lock, like every publish: `Registry` → `Outbox`); the
 //! state file's lock (`Daemon.saves`) is taken after `Registry` or alone, last. No
 //! lock is held across a blocking PTY or
-//! socket write: writers own their sockets, input threads own PTY writers. The push
+//! socket write (a reply's writes hold `screen` → `prompt` → `status` but never block): writers own their sockets, input threads own PTY writers. The push
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
 
@@ -142,6 +142,11 @@ pub struct Config {
     /// Test hook: replaces the clock prompt ids are drawn from (Unix ms).
     #[doc(hidden)]
     pub prompt_clock: Option<PromptClock>,
+    /// The pause between a `term.submit` reply's paste and its Enter (50 ms), so the agent
+    /// reads them apart.
+    pub submit_enter_delay: Duration,
+    /// A reply whose PTY takes nothing of it for this long is ended (10 s).
+    pub submit_stall: Duration,
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
@@ -200,6 +205,23 @@ pub enum TestPoint {
     /// An answer was checked against the screen and is about to be queued, with this
     /// Terminal's screen and prompt locked: a hook may block, but must not touch the Terminal.
     AnswerChecked,
+    /// The input thread is about to check that the agent still accepts a `term.submit` reply
+    /// and then write (a piece of) its paste (no lock held).
+    SubmitPaste,
+    /// The paste was written and the pause is over: the input thread is about to check again
+    /// and then write Enter (no lock held).
+    SubmitEnter,
+    /// A reply's readiness was checked and its next write follows, with this Terminal's
+    /// screen, prompt and status locked: a hook may block, but must not touch the Terminal.
+    SubmitChecked,
+    /// A `term.submit` reply's outcome is known and about to be answered (no lock held).
+    Submitted,
+    /// A stopped reply's paste is about to be completed with its end marker (no lock held).
+    SubmitClose,
+    /// A Terminal's PTY is open and its input thread will get a descriptor for replies'
+    /// non-blocking writes (registry locked: do not block). Returning `true` leaves it
+    /// without one.
+    ReplyDescriptor,
 }
 
 /// Where a [`PushHooks::at`] hook runs: on a push thread, with no lock held.
@@ -341,6 +363,8 @@ impl Config {
             prompt_grace: Duration::from_secs(1),
             prompt_recheck: Duration::from_millis(1500),
             prompt_clock: None,
+            submit_enter_delay: Duration::from_millis(50),
+            submit_stall: terminal::SUBMIT_STALL,
             hide_capabilities: Vec::new(),
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
@@ -651,6 +675,14 @@ impl ServerHandle {
     pub fn screen_rev(&self, t: Uuid) -> Option<u64> {
         let reg = self.d.reg.lock().unwrap();
         reg.terminals.get(&t).map(|t| t.screen_rev())
+    }
+
+    /// Test hook: whether Terminal `t` would take a `term.submit` reply now, and the refusal
+    /// if not (its screen and status, not the text).
+    #[doc(hidden)]
+    pub fn reply_ready(&self, t: Uuid) -> Option<Result<(), String>> {
+        let t = self.d.reg.lock().unwrap().terminals.get(&t).cloned();
+        t.map(|t| t.check_reply())
     }
 
     /// Test hook: session subscriptions held, over all connections.

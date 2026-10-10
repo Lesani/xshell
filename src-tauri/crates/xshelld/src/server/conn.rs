@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{
-    decode_inbound, encode_res, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
+    decode_inbound, encode_res, submit_text, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
 };
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::ring::Member;
@@ -479,6 +479,23 @@ impl Conn {
                     .and_then(|t| t.answer(&d, prompt, option))
                     .map(|()| Value::Null);
                 reply(&self.ob, id, r);
+            }
+            // A reply from the Chat View. Not typing at the Terminal View: no size claim, no
+            // burst of output pacing, nothing to release on disconnect. Answered by the input
+            // thread once typed, unless refused here.
+            ClientMsg::TermSubmit { terminal, text } => {
+                let r = submit_text(&text)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        let ob = self.ob.clone();
+                        let done = Box::new(move |r: Result<(), String>| {
+                            reply(&ob, id, r.map(|()| Value::Null))
+                        });
+                        self.terminal(&terminal)?.submit(&d, &text, done)
+                    });
+                if let Err(e) = r {
+                    reply(&self.ob, id, Err(e));
+                }
             }
             // From agent hooks on this Host; role::check refuses it for a Mobile (#6).
             ClientMsg::TermEvent {

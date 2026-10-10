@@ -139,6 +139,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::SessionPage { .. } => "session.page",
         ClientMsg::SessionUnsubscribe { .. } => "session.unsubscribe",
         ClientMsg::TermAnswer { .. } => "term.answer",
+        ClientMsg::TermSubmit { .. } => "term.submit",
     }
 }
 

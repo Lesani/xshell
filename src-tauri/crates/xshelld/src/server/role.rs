@@ -218,8 +218,9 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::SessionSubscribe { .. }
         | ClientMsg::SessionPage { .. }
         | ClientMsg::SessionUnsubscribe { .. } => Ok(()),
-        // A Mobile answers the prompts of the agent Terminals it sees (`listed`).
-        ClientMsg::TermAnswer { .. } => Ok(()),
+        // A Mobile answers the prompts of the agent Terminals it sees (`listed`), and replies
+        // to their chats.
+        ClientMsg::TermAnswer { .. } | ClientMsg::TermSubmit { .. } => Ok(()),
     }
 }
 
@@ -796,6 +797,11 @@ pub(crate) mod tests {
                 terminal: t,
                 prompt: 1,
                 option: 0,
+            },
+            // Replies too.
+            ClientMsg::TermSubmit {
+                terminal: t,
+                text: "fix it".into(),
             },
         ] {
             assert_eq!(check(Role::Mobile, &ctx, &m), Ok(()));

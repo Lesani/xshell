@@ -18,10 +18,14 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::agent_status::{AgentStatus, HookAgent, TerminalHooks, Tracker};
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
-use xshell_core::prompt::{extract, screen_tail, ScreenModel};
+use xshell_core::prompt::{composer, extract, screen_tail, ScreenModel};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
-use xshell_protocol::msg::{encode_res, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED};
+use xshell_protocol::msg::{
+    encode_res, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED, SUBMIT_NEEDS_YOU,
+    SUBMIT_NOT_CHAT, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_STUCK, SUBMIT_UNCONFIRMED,
+    SUBMIT_UNSUPPORTED,
+};
 
 const READ_BUF: usize = 16 * 1024;
 const INPUT_BACKLOG: usize = 1024;
@@ -99,12 +103,319 @@ impl Screen {
 /// One lock, taken last and alone, so the two are read together.
 type Written = Mutex<(u64, u64)>;
 
+/// One item for a Terminal's input thread.
+pub(crate) enum Input {
+    /// Bytes written as they are.
+    Bytes(Vec<u8>),
+    /// A reply from the Chat View (`term.submit`).
+    Submit(Box<Submit>),
+}
+
+/// Which write of a reply the gate runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitStep {
+    /// A piece of the paste, after checking the agent still accepts the reply.
+    Paste,
+    /// Enter, after the pause, after checking again.
+    Enter,
+    /// The rest of a paste that was stopped: whatever completes the bracketed paste frame
+    /// (`ESC [201~`), written whatever the readiness, so the agent never stays inside a
+    /// paste that swallows the next key.
+    Close,
+}
+
+/// One write of a reply: what the PTY takes now, without blocking.
+pub(crate) type WriteNow<'a> = dyn FnMut() -> std::io::Result<usize> + 'a;
+/// Runs a write of a reply with the agent's readiness held (checked, except to
+/// [`SubmitStep::Close`]): the refusal, or the write's result.
+type SubmitGate =
+    Box<dyn FnMut(SubmitStep, &mut WriteNow<'_>) -> Result<std::io::Result<usize>, String> + Send>;
+type SubmitDone = Box<dyn FnOnce(Result<(), String>) + Send>;
+
+/// A paste is written in pieces of at most this many bytes, each under its own check.
+const SUBMIT_CHUNK: usize = 1024;
+/// How long the input thread waits (holding nothing) when the PTY takes no more input.
+const SUBMIT_WAIT: Duration = Duration::from_millis(10);
+/// A PTY that takes nothing of a reply for this long ends it (`Config::submit_stall`).
+pub(crate) const SUBMIT_STALL: Duration = Duration::from_secs(10);
+/// The end of a bracketed paste.
+const PASTE_END: &[u8] = b"\x1b[201~";
+/// The start of a bracketed paste.
+const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// A reply typed by the input thread: the paste, a pause, then Enter. Every write runs inside
+/// the gate, which holds the agent's readiness while it checks it and writes, so nothing the
+/// check did not see lands before the write. A paste stopped part way is completed with
+/// [`PASTE_END`] (never with more of the text, never with Enter); if even that cannot be
+/// written within `stall`, `stuck` is called. `done` gets the outcome exactly once: `Ok` once
+/// Enter was written; the refusal when nothing was written; [`SUBMIT_UNCONFIRMED`] when (part
+/// of) the paste was written but Enter was not (also when the Terminal ends with the reply
+/// half typed).
+pub(crate) struct Submit {
+    pub paste: Vec<u8>,
+    pub enter_after: Duration,
+    pub stall: Duration,
+    pub gate: SubmitGate,
+    done: Option<SubmitDone>,
+    stuck: Option<Box<dyn FnOnce() + Send>>,
+    /// Some of the paste was written.
+    pasted: bool,
+}
+
+impl Submit {
+    pub fn new(paste: Vec<u8>, enter_after: Duration, gate: SubmitGate, done: SubmitDone) -> Self {
+        Self {
+            paste,
+            enter_after,
+            stall: SUBMIT_STALL,
+            gate,
+            done: Some(done),
+            stuck: None,
+            pasted: false,
+        }
+    }
+
+    /// Call `stuck` when a stopped paste cannot be completed.
+    pub fn on_stuck(mut self, stuck: Box<dyn FnOnce() + Send>) -> Self {
+        self.stuck = Some(stuck);
+        self
+    }
+
+    fn finish(&mut self, r: Result<(), String>) {
+        if let Some(done) = self.done.take() {
+            done(r);
+        }
+    }
+
+    /// Nothing written yet: the refusal `e`; else the outcome is unknown.
+    fn stop(&mut self, e: String) {
+        let r = if self.pasted {
+            SUBMIT_UNCONFIRMED.to_string()
+        } else {
+            e
+        };
+        self.finish(Err(r));
+    }
+}
+
+impl Drop for Submit {
+    /// Never written to the end: the input thread stopped (the Terminal ended).
+    fn drop(&mut self) {
+        self.stop("terminal has exited".into());
+    }
+}
+
+/// The bracketed paste `text` is typed as.
+fn bracketed(text: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(text.len() + 12);
+    v.extend_from_slice(PASTE_START);
+    v.extend_from_slice(text.as_bytes());
+    v.extend_from_slice(PASTE_END);
+    v
+}
+
+/// What completes `paste` (a bracketed paste) once its first `off` bytes were written:
+/// the rest of its start marker, the rest of a character cut in two, and its end marker.
+fn paste_close(paste: &[u8], off: usize) -> Vec<u8> {
+    let end_at = paste.len() - PASTE_END.len();
+    if off >= end_at {
+        return paste[off..].to_vec();
+    }
+    let mut to = off.max(PASTE_START.len());
+    while to < end_at && (paste[to] & 0xC0) == 0x80 {
+        to += 1;
+    }
+    let mut v = paste[off..to].to_vec();
+    v.extend_from_slice(PASTE_END);
+    v
+}
+
+/// The PTY's input end, as the input thread writes it.
+pub(crate) trait PtyIn: Write {
+    /// Write what the PTY takes now, without blocking: `WouldBlock` when it takes nothing,
+    /// `Unsupported` when it cannot write without blocking (a reply is then never written).
+    fn write_now(&mut self, data: &[u8]) -> std::io::Result<usize>;
+}
+
+/// A Terminal's PTY writer. Unix: with its own descriptor of the PTY master for writes that
+/// must not block (`O_NONBLOCK` is set only for that one write; the reader, which shares the
+/// open file, retries a read that would block meanwhile).
+struct PtyWriter {
+    w: Box<dyn Write + Send>,
+    #[cfg(unix)]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl Write for PtyWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.w.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
+}
+
+impl PtyIn for PtyWriter {
+    fn write_now(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        if let Some(fd) = &self.fd {
+            use std::os::fd::AsRawFd;
+            return nonblocking_write(fd.as_raw_fd(), data);
+        }
+        // Never a blocking write in its place: it could block holding the agent's state.
+        let _ = data;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// One `write(2)` to `fd` with `O_NONBLOCK` set for it.
+#[cfg(unix)]
+fn nonblocking_write(fd: std::os::fd::RawFd, data: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `fd` is a descriptor this Terminal owns; `data` is valid for its length.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = libc::write(fd, data.as_ptr().cast(), data.len());
+        let err = std::io::Error::last_os_error();
+        libc::fcntl(fd, libc::F_SETFL, flags);
+        if n < 0 {
+            Err(err)
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+/// What one gated write of a reply came to.
+enum Step {
+    Wrote(usize),
+    /// The PTY took nothing.
+    Full,
+    Refused(String),
+}
+
+fn gated(
+    s: &mut Submit,
+    step: SubmitStep,
+    w: &mut dyn PtyIn,
+    data: &[u8],
+) -> std::io::Result<Step> {
+    match (s.gate)(step, &mut || w.write_now(data)) {
+        Err(e) => Ok(Step::Refused(e)),
+        Ok(Ok(0)) => Ok(Step::Full),
+        Ok(Ok(n)) => Ok(Step::Wrote(n)),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            Ok(Step::Refused(SUBMIT_NO_NONBLOCK.into()))
+        }
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(Step::Full)
+        }
+        Ok(Err(e)) => Err(e),
+    }
+}
+
+/// Complete a paste stopped after its first `off` bytes ([`paste_close`]), under the gate's
+/// locks but whatever the readiness, then report the unknown outcome. If the PTY takes
+/// nothing of it for `stall`, the Terminal's replies are stuck.
+fn close_paste(
+    mut s: Box<Submit>,
+    w: &mut dyn PtyIn,
+    off: usize,
+    sleep: &dyn Fn(Duration),
+) -> std::io::Result<()> {
+    let rest = paste_close(&s.paste, off);
+    let (mut done, mut waited) = (0, Duration::ZERO);
+    while done < rest.len() {
+        match gated(&mut s, SubmitStep::Close, w, &rest[done..])? {
+            Step::Wrote(n) => {
+                done += n;
+                waited = Duration::ZERO;
+            }
+            Step::Full if waited < s.stall => {
+                sleep(SUBMIT_WAIT);
+                waited += SUBMIT_WAIT;
+            }
+            Step::Full | Step::Refused(_) => {
+                if let Some(stuck) = s.stuck.take() {
+                    stuck();
+                }
+                break;
+            }
+        }
+    }
+    s.finish(Err(SUBMIT_UNCONFIRMED.into()));
+    Ok(())
+}
+
+/// Write one input item. A [`Submit`] is the paste, in pieces, and `enter_after` later
+/// (`sleep`) a separate `\r`: Enter must not arrive in the same read as the paste (the agent
+/// would take it as part of it), nor after the agent stopped accepting the reply (it would
+/// answer whatever took the composer's place). Each write runs in the gate, with readiness
+/// checked and held, and never blocks: when the PTY takes nothing the thread waits holding
+/// nothing and checks again. A paste stopped part way is completed ([`close_paste`]). An
+/// error stops the input thread.
+pub(crate) fn write_item(
+    w: &mut dyn PtyIn,
+    item: Input,
+    sleep: &dyn Fn(Duration),
+) -> std::io::Result<()> {
+    let mut s = match item {
+        Input::Bytes(data) => return w.write_all(&data).and_then(|_| w.flush()),
+        Input::Submit(s) => s,
+    };
+    let (mut off, mut waited) = (0, Duration::ZERO);
+    while off < s.paste.len() {
+        let piece = s.paste[off..s.paste.len().min(off + SUBMIT_CHUNK)].to_vec();
+        match gated(&mut s, SubmitStep::Paste, w, &piece)? {
+            Step::Wrote(n) => {
+                off += n;
+                s.pasted = true;
+                waited = Duration::ZERO;
+                continue;
+            }
+            Step::Full if waited < s.stall => {
+                sleep(SUBMIT_WAIT);
+                waited += SUBMIT_WAIT;
+                continue;
+            }
+            Step::Refused(e) if off == 0 => s.stop(e),
+            Step::Full if off == 0 => s.stop("input backlog full".into()),
+            Step::Refused(_) | Step::Full => return close_paste(s, w, off, sleep),
+        }
+        return Ok(());
+    }
+    sleep(s.enter_after);
+    let mut waited = Duration::ZERO;
+    loop {
+        match gated(&mut s, SubmitStep::Enter, w, b"\r")? {
+            Step::Wrote(_) => break,
+            Step::Full if waited < s.stall => {
+                sleep(SUBMIT_WAIT);
+                waited += SUBMIT_WAIT;
+            }
+            Step::Refused(_) | Step::Full => {
+                s.finish(Err(SUBMIT_UNCONFIRMED.into()));
+                return Ok(());
+            }
+        }
+    }
+    s.finish(Ok(()));
+    Ok(())
+}
+
 pub(crate) struct Terminal {
     pub id: Uuid,
     record: Mutex<Record>,
     io: Mutex<TermIo>,
     out: Mutex<TermOutput>,
-    input: Mutex<Option<SyncSender<Vec<u8>>>>,
+    input: Mutex<Option<SyncSender<Input>>>,
     /// The session leader; portable-pty runs it under `setsid`, so it is also the pgid.
     pid: Option<u32>,
     start_time: Option<u64>,
@@ -140,6 +451,10 @@ pub(crate) struct Terminal {
     written: Arc<Written>,
     /// The Daemon's pending SIGKILLs, which [`Terminal::kill`] adds to.
     escalations: Arc<super::orphans::Escalations>,
+    /// The input thread can write a reply without blocking (`term.submit` needs it).
+    reply_writes: bool,
+    /// A reply's stopped paste could not be completed: replies are refused from now on.
+    reply_stuck: AtomicBool,
     /// Windows: the kill-on-close Job Object the process runs in, with everything it
     /// starts. Closing it (the Terminal and its escalation dropped) ends them all.
     #[cfg(windows)]
@@ -379,11 +694,29 @@ pub(crate) fn spawn_with(
                 .map_err(|e| format!("failed to take PTY writer: {e}"))
         });
     let (reader, writer) = pty?;
+    let writer = PtyWriter {
+        w: writer,
+        // A descriptor of the master's open file, for replies' writes that must not block.
+        #[cfg(unix)]
+        fd: pty_master
+            .as_raw_fd()
+            .filter(|_| !d.test_point(id, TestPoint::ReplyDescriptor))
+            .and_then(|fd| {
+                // SAFETY: the master is open for as long as this borrow; the clone is owned.
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .ok()
+            }),
+    };
+    #[cfg(unix)]
+    let reply_writes = writer.fd.is_some();
+    #[cfg(windows)]
+    let reply_writes = false;
     #[cfg(windows)]
     let master = pair.into_master();
     #[cfg(unix)]
     let master = pair.master;
-    let (tx, rx) = sync_channel::<Vec<u8>>(INPUT_BACKLOG);
+    let (tx, rx) = sync_channel::<Input>(INPUT_BACKLOG);
     let t = Arc::new(Terminal {
         id,
         record: Mutex::new(Record {
@@ -424,6 +757,8 @@ pub(crate) fn spawn_with(
         status: Mutex::new(StatusCell::new(tracker, 0)),
         last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
+        reply_writes,
+        reply_stuck: AtomicBool::new(false),
         #[cfg(windows)]
         job: Some(job),
     });
@@ -489,12 +824,8 @@ pub(crate) fn spawn_with(
                 let (written, rev) = (t.written.clone(), t.screen_rev.clone());
                 move || {
                     let mut writer = writer;
-                    for data in rx {
-                        if writer
-                            .write_all(&data)
-                            .and_then(|_| writer.flush())
-                            .is_err()
-                        {
+                    for item in rx {
+                        if write_item(&mut writer, item, &std::thread::sleep).is_err() {
                             break;
                         }
                         let mut w = written.lock().unwrap();
@@ -531,7 +862,8 @@ impl Terminal {
                     let (out, answer) = startup.feed(&buf[..n]);
                     if answer {
                         if let Some(tx) = self.input.lock().unwrap().as_ref() {
-                            if tx.try_send(win::CURSOR_AT_ORIGIN.to_vec()).is_ok() {
+                            let reply = Input::Bytes(win::CURSOR_AT_ORIGIN.to_vec());
+                            if tx.try_send(reply).is_ok() {
                                 self.queued.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -543,6 +875,10 @@ impl Terminal {
                 #[cfg(not(windows))]
                 Ok(n) => self.on_output(d, &buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                // A reply's write set `O_NONBLOCK` on the shared open file for a moment.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
                 // EIO once every slave fd is closed.
                 Err(_) => break,
             }
@@ -708,7 +1044,7 @@ impl Terminal {
             d.test_point(self.id, super::TestPoint::AnswerChecked);
             let input = self.input.lock().unwrap();
             let tx = input.as_ref().ok_or("terminal has exited")?;
-            match tx.try_send(keys.clone()) {
+            match tx.try_send(Input::Bytes(keys.clone())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => return Err("input backlog full".into()),
                 Err(TrySendError::Disconnected(_)) => return Err("terminal has exited".into()),
@@ -721,6 +1057,183 @@ impl Terminal {
         self.note_input(d, &keys);
         self.publish_prompt(d);
         d.prompts.recheck(self.id);
+        Ok(())
+    }
+
+    /// Whether a reply may be typed now: the agent does not need you (no needs-you status,
+    /// no Permission Prompt current or on the screen), and its screen ends with its chat
+    /// composer with bracketed paste on. The caller holds `screen`, `prompt` and `status`.
+    fn reply_ready(screen: &Option<Screen>, p: &PromptCell, c: &StatusCell) -> Result<(), String> {
+        if p.is_current() || c.tracker.status() == Some(AgentStatus::NeedsYou) {
+            return Err(SUBMIT_NEEDS_YOU.into());
+        }
+        // An agent not run directly has no screen model: its composer cannot be seen.
+        let s = screen.as_ref().ok_or(SUBMIT_NOT_READY)?;
+        let rows = s.model.rows();
+        if extract(s.agent, &rows).is_some() {
+            return Err(SUBMIT_NEEDS_YOU.into());
+        }
+        if !s.model.bracketed_paste() || !composer(s.agent, &rows) {
+            return Err(SUBMIT_NOT_READY.into());
+        }
+        Ok(())
+    }
+
+    /// Whether the process may get a reply: not ended or ending, not being relaunched.
+    fn reply_life(&self) -> Result<(), String> {
+        let l = self.life.lock().unwrap();
+        if l.exited.is_some() || l.closing {
+            Err("terminal has exited".into())
+        } else if l.relaunching {
+            Err(SUBMIT_NOT_READY.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`Self::reply_ready`], after [`Self::reply_life`].
+    pub fn check_reply(&self) -> Result<(), String> {
+        self.reply_life()?;
+        let g = self.screen.lock().unwrap();
+        let p = self.prompt.lock().unwrap();
+        let c = self.status.lock().unwrap();
+        Self::reply_ready(&g, &p, &c)
+    }
+
+    /// One write of a reply (the input thread's [`write_item`]): check readiness and, if the
+    /// agent is ready, `write`, holding `screen`, `prompt` and `status` throughout. Output,
+    /// a hook's report or a prompt the check did not see therefore lands only after the
+    /// write (the write never blocks). Enter, once written, starts the turn it starts for a
+    /// Desktop's Enter (Codex), under the same locks: a report that comes after it is applied
+    /// after it, never overwritten by it.
+    fn write_if_ready(
+        &self,
+        d: &Daemon,
+        step: SubmitStep,
+        write: &mut WriteNow<'_>,
+    ) -> Result<std::io::Result<usize>, String> {
+        // Completing a stopped paste is written whatever the readiness: its end marker is
+        // what keeps the next key out of the paste.
+        let check = step != SubmitStep::Close;
+        if check {
+            self.reply_life()?;
+        }
+        let g = self.screen.lock().unwrap();
+        let mut p = self.prompt.lock().unwrap();
+        let mut c = self.status.lock().unwrap();
+        if check {
+            Self::reply_ready(&g, &p, &c)?;
+            d.test_point(self.id, TestPoint::SubmitChecked);
+        }
+        let r = write();
+        let mut changed = None;
+        if step == SubmitStep::Enter && matches!(r, Ok(n) if n > 0) {
+            let ch = c.tracker.on_input(b"\r");
+            if c.stamp(ch, now_ms()) {
+                changed = Some(c.listed().0);
+            }
+        }
+        drop(c);
+        // As `follow_status` does, with the prompt still held.
+        match changed {
+            Some(Some(AgentStatus::Ended)) => {
+                p.end();
+            }
+            Some(Some(AgentStatus::NeedsYou)) | None => {}
+            Some(_) => {
+                p.left_needs_you();
+            }
+        }
+        drop(p);
+        drop(g);
+        if changed.is_some() {
+            super::agent::changed(d, self);
+        }
+        Ok(r)
+    }
+
+    /// Reply `text` (already checked by `submit_text`) to the agent's chat
+    /// (`term.submit`): queue it as one bracketed paste and, after
+    /// `Config::submit_enter_delay`, Enter. It never touches the size. Refused now (`Err`,
+    /// `done` never called) unless this is a direct Claude Code or Codex chat whose reply
+    /// is ready ([`Self::reply_ready`], checked with the screen held until it is queued);
+    /// otherwise `done` gets the outcome from the input thread, which writes each piece of
+    /// the paste and Enter only with readiness checked and held ([`Self::write_if_ready`]).
+    pub fn submit(
+        self: &Arc<Self>,
+        d: &Arc<Daemon>,
+        text: &str,
+        done: Box<dyn FnOnce(Result<(), String>) + Send>,
+    ) -> Result<(), String> {
+        if cfg!(windows) {
+            return Err(SUBMIT_UNSUPPORTED.into());
+        }
+        let agent = self.status.lock().unwrap().tracker.agent();
+        if agent.is_none() || xshell_core::chat::chat_agent(&self.spec()).is_none() {
+            return Err(SUBMIT_NOT_CHAT.into());
+        }
+        self.reply_life()?;
+        if !self.reply_writes {
+            return Err(SUBMIT_NO_NONBLOCK.into());
+        }
+        if self.reply_stuck.load(Ordering::SeqCst) {
+            return Err(SUBMIT_STUCK.into());
+        }
+        let id = self.id;
+        let (weak, dg) = (Arc::downgrade(self), d.clone());
+        let gate: SubmitGate = Box::new(move |step, write| {
+            dg.test_point(
+                id,
+                match step {
+                    SubmitStep::Paste => TestPoint::SubmitPaste,
+                    SubmitStep::Enter => TestPoint::SubmitEnter,
+                    SubmitStep::Close => TestPoint::SubmitClose,
+                },
+            );
+            weak.upgrade()
+                .ok_or_else(|| "terminal has exited".to_string())?
+                .write_if_ready(&dg, step, write)
+        });
+        let dd = d.clone();
+        let done = Box::new(move |r: Result<(), String>| {
+            dd.test_point(id, TestPoint::Submitted);
+            done(r);
+        });
+        let g = self.screen.lock().unwrap();
+        let p = self.prompt.lock().unwrap();
+        {
+            let c = self.status.lock().unwrap();
+            Self::reply_ready(&g, &p, &c)?;
+        }
+        let input = self.input.lock().unwrap();
+        let tx = input.as_ref().ok_or("terminal has exited")?;
+        // Made only now: once made, its outcome is reported.
+        let weak = Arc::downgrade(self);
+        let stuck = Box::new(move || {
+            crate::log!(
+                "WARN",
+                "terminal {id}: a stopped reply's paste could not be completed; replies are refused"
+            );
+            if let Some(t) = weak.upgrade() {
+                t.reply_stuck.store(true, Ordering::SeqCst);
+            }
+        });
+        let mut item =
+            Submit::new(bracketed(text), d.cfg.submit_enter_delay, gate, done).on_stuck(stuck);
+        item.stall = d.cfg.submit_stall;
+        let refused = match tx.try_send(Input::Submit(Box::new(item))) {
+            Ok(()) => None,
+            Err(TrySendError::Full(i)) => Some((i, "input backlog full")),
+            Err(TrySendError::Disconnected(i)) => Some((i, "terminal has exited")),
+        };
+        if let Some((item, e)) = refused {
+            // Not queued: refused here, so its outcome is never reported.
+            if let Input::Submit(mut s) = item {
+                s.done = None;
+            }
+            return Err(e.into());
+        }
+        self.queued.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1146,7 +1659,7 @@ impl Terminal {
             let mut p = self.prompt.lock().unwrap();
             let g = self.input.lock().unwrap();
             let tx = g.as_ref().ok_or("terminal has exited")?;
-            match tx.try_send(data.into_bytes()) {
+            match tx.try_send(Input::Bytes(data.into_bytes())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => return Err("input backlog full".into()),
                 Err(TrySendError::Disconnected(_)) => return Err("terminal has exited".into()),
@@ -1506,6 +2019,8 @@ pub(crate) fn unresolved(d: &Arc<Daemon>, p: PersistedTerminal) -> Arc<Terminal>
         status: Mutex::new(status),
         last_line: Mutex::new(None),
         escalations: d.escalations.clone(),
+        reply_writes: false,
+        reply_stuck: AtomicBool::new(false),
         #[cfg(windows)]
         job: None,
     };
@@ -2023,5 +2538,342 @@ mod status_tests {
         let ended = shell.tracker.on_exit();
         assert!(!shell.stamp(ended, 1));
         assert_eq!(shell.listed(), (None, None));
+    }
+
+    /// A PTY that records each write, takes at most `take` bytes per write, answers
+    /// `WouldBlock` `full` times first, and fails on demand.
+    #[derive(Default)]
+    struct Recorder {
+        ops: Arc<Mutex<Vec<String>>>,
+        input: Vec<u8>,
+        take: Option<usize>,
+        full: usize,
+        fail_on: Option<&'static [u8]>,
+        /// Cannot write without blocking (no descriptor).
+        blocking_only: bool,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let s = String::from_utf8_lossy(b).into_owned();
+            self.ops.lock().unwrap().push(format!("write {s:?}"));
+            self.input.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.ops.lock().unwrap().push("flush".into());
+            Ok(())
+        }
+    }
+
+    impl PtyIn for Recorder {
+        fn write_now(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.fail_on == Some(b) {
+                return Err(std::io::Error::other("closed"));
+            }
+            if self.blocking_only {
+                return Err(std::io::ErrorKind::Unsupported.into());
+            }
+            if self.full > 0 {
+                self.full -= 1;
+                self.ops.lock().unwrap().push("full".into());
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let b = &b[..b.len().min(self.take.unwrap_or(usize::MAX))];
+            let s = String::from_utf8_lossy(b).into_owned();
+            self.ops.lock().unwrap().push(format!("write {s:?}"));
+            self.input.extend_from_slice(b);
+            Ok(b.len())
+        }
+    }
+
+    type Outcome = Arc<Mutex<Vec<Result<(), String>>>>;
+
+    /// A submit of `text` whose gate answers from `gates` (one per call, then `Ok`) and
+    /// records its steps and the outcomes in `ops` and `out`. The write runs inside the gate.
+    fn submit_of(
+        text: &str,
+        ops: &Arc<Mutex<Vec<String>>>,
+        out: &Outcome,
+        mut gates: Vec<Result<(), String>>,
+    ) -> Input {
+        let (o, r) = (ops.clone(), out.clone());
+        gates.reverse();
+        let gate: SubmitGate = Box::new(move |step, write| {
+            o.lock().unwrap().push(format!("gate {step:?}"));
+            gates.pop().unwrap_or(Ok(()))?;
+            Ok(write())
+        });
+        let done = Box::new(move |res| r.lock().unwrap().push(res));
+        Input::Submit(Box::new(Submit::new(
+            bracketed(text),
+            Duration::from_millis(50),
+            gate,
+            done,
+        )))
+    }
+
+    fn submit(
+        ops: &Arc<Mutex<Vec<String>>>,
+        out: &Outcome,
+        gates: Vec<Result<(), String>>,
+    ) -> Input {
+        submit_of("fix it\nplease", ops, out, gates)
+    }
+
+    fn sleeper(ops: &Arc<Mutex<Vec<String>>>) -> impl Fn(Duration) {
+        let o = ops.clone();
+        move |d| o.lock().unwrap().push(format!("sleep {}ms", d.as_millis()))
+    }
+
+    #[test]
+    fn submit_item_writes_paste_pause_enter() {
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = submit(&ops, &out, vec![]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(
+            *ops.lock().unwrap(),
+            [
+                "gate Paste",
+                "write \"\\u{1b}[200~fix it\\nplease\\u{1b}[201~\"",
+                "sleep 50ms",
+                "gate Enter",
+                "write \"\\r\"",
+            ]
+        );
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        // Plain bytes are written as they are.
+        ops.lock().unwrap().clear();
+        write_item(&mut w, Input::Bytes(b"ab".to_vec()), &sleeper(&ops)).unwrap();
+        assert_eq!(*ops.lock().unwrap(), ["write \"ab\"", "flush"]);
+    }
+
+    /// A long paste goes in pieces, a PTY that takes part of a piece gets the rest next, and
+    /// one that takes nothing is waited for holding nothing: every write is inside its gate.
+    #[test]
+    fn submit_item_writes_in_gated_pieces() {
+        let text = "x".repeat(SUBMIT_CHUNK * 2 + 10);
+        let mut w = Recorder {
+            take: Some(700),
+            full: 2,
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        write_item(&mut w, submit_of(&text, &ops, &out, vec![]), &sleeper(&ops)).unwrap();
+        let mut want = bracketed(&text);
+        want.push(b'\r');
+        assert_eq!(w.input, want);
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            if op.starts_with("write") || op == "full" {
+                assert!(ops[i - 1].starts_with("gate"), "{i}: {ops:?}");
+            }
+        }
+        assert_eq!(ops.iter().filter(|o| *o == "full").count(), 2);
+        assert!(ops.contains(&format!("sleep {}ms", SUBMIT_WAIT.as_millis())));
+        let pieces = ops.iter().filter(|o| *o == "gate Paste").count();
+        assert!(pieces >= 5, "{pieces}: {ops:?}");
+    }
+
+    #[test]
+    fn submit_item_stops_where_the_gate_refuses() {
+        let enter = "write \"\\r\"".to_string();
+        // Before the paste: nothing is written, and the refusal is the outcome.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = submit(&ops, &out, vec![Err(SUBMIT_NEEDS_YOU.into())]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        assert_eq!(*ops.lock().unwrap(), ["gate Paste"]);
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NEEDS_YOU.to_string())]);
+        // In the middle of the paste: unknown, and no Enter.
+        let mut w = Recorder {
+            take: Some(5),
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = submit(&ops, &out, vec![Ok(()), Err(SUBMIT_NOT_READY.into())]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        // The paste's frame is completed, nothing more of the text.
+        assert_eq!(w.input, b"\x1b[200~\x1b[201~");
+        assert!(!ops.lock().unwrap().contains(&enter));
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        // Before Enter: the paste is out, Enter is not; the outcome is unknown.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = submit(&ops, &out, vec![Ok(()), Err(SUBMIT_NEEDS_YOU.into())]);
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        let ops = ops.lock().unwrap();
+        assert_eq!(ops.last().unwrap(), "gate Enter");
+        assert!(!ops.contains(&enter), "{ops:?}");
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
+    #[test]
+    fn a_stopped_paste_is_closed() {
+        let p = bracketed("aé🦀b");
+        let n = p.len();
+        // Inside the start marker, inside the text, inside a character, inside the end.
+        assert_eq!(paste_close(&p, 3), b"00~\x1b[201~");
+        assert_eq!(paste_close(&p, 6), b"\x1b[201~");
+        assert_eq!(paste_close(&p, 7), b"\x1b[201~");
+        assert_eq!(
+            paste_close(&p, 8),
+            [&p[8..9], PASTE_END].concat(),
+            "é cut in two"
+        );
+        assert_eq!(
+            paste_close(&p, 10),
+            [&p[10..13], PASTE_END].concat(),
+            "🦀 cut"
+        );
+        assert_eq!(paste_close(&p, n - 3), &p[n - 3..]);
+        // Refused after the first piece of a long reply: the end marker, under the gate
+        // (a Close step), then nothing; the outcome is unknown.
+        let text = "y".repeat(SUBMIT_CHUNK * 2);
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let item = submit_of(
+            &text,
+            &ops,
+            &out,
+            vec![Ok(()), Err(SUBMIT_NEEDS_YOU.into())],
+        );
+        write_item(&mut w, item, &sleeper(&ops)).unwrap();
+        let mut want = PASTE_START.to_vec();
+        want.extend(std::iter::repeat_n(b'y', SUBMIT_CHUNK - PASTE_START.len()));
+        want.extend_from_slice(PASTE_END);
+        assert_eq!(w.input, want);
+        let ops = ops.lock().unwrap();
+        assert_eq!(
+            &ops[ops.len() - 2..],
+            ["gate Close", "write \"\\u{1b}[201~\""]
+        );
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
+    /// The end marker cannot be written in time: the Terminal's replies are stuck.
+    #[test]
+    fn an_unclosable_paste_is_stuck() {
+        let mut w = Recorder {
+            take: Some(10),
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let stuck = Arc::new(Mutex::new(0));
+        let st = stuck.clone();
+        let Input::Submit(s) = submit(&ops, &out, vec![Ok(())]) else {
+            unreachable!()
+        };
+        let mut s = s.on_stuck(Box::new(move || *st.lock().unwrap() += 1));
+        // The first piece goes through; then the PTY takes nothing, the end marker neither.
+        let mut inner = std::mem::replace(&mut s.gate, Box::new(|_, _| Ok(Ok(0))));
+        let mut gates = 0;
+        s.gate = Box::new(move |step, write| {
+            gates += 1;
+            if gates == 1 {
+                inner(step, write)
+            } else {
+                Ok(Err(std::io::ErrorKind::WouldBlock.into()))
+            }
+        });
+        write_item(&mut w, Input::Submit(Box::new(s)), &sleeper(&ops)).unwrap();
+        assert_eq!(*stuck.lock().unwrap(), 1);
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        assert_eq!(w.input.len(), 10);
+    }
+
+    /// No descriptor for writes that cannot block: a reply is refused, and nothing is
+    /// written in its place.
+    #[test]
+    fn a_reply_never_blocks() {
+        let mut w = Recorder {
+            blocking_only: true,
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        write_item(&mut w, submit(&ops, &out, vec![]), &sleeper(&ops)).unwrap();
+        assert!(w.input.is_empty());
+        assert_eq!(*ops.lock().unwrap(), ["gate Paste"]);
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NO_NONBLOCK.to_string())]);
+        // The PtyWriter without one refuses too, never writing through its blocking writer.
+        let rec = Recorder::default();
+        let rops = rec.ops.clone();
+        let mut pw = PtyWriter {
+            w: Box::new(rec),
+            #[cfg(unix)]
+            fd: None,
+        };
+        let e = pw.write_now(b"x").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+        assert!(rops.lock().unwrap().is_empty());
+    }
+
+    /// A PTY that takes nothing for `SUBMIT_STALL`: nothing written is a refusal, a paste
+    /// without its Enter is unknown.
+    #[test]
+    fn submit_item_gives_up_on_a_stalled_pty() {
+        let mut w = Recorder {
+            full: usize::MAX,
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        write_item(&mut w, submit(&ops, &out, vec![]), &sleeper(&ops)).unwrap();
+        assert!(w.input.is_empty());
+        assert_eq!(
+            *out.lock().unwrap(),
+            [Err("input backlog full".to_string())]
+        );
+        let waits = SUBMIT_STALL.as_millis() / SUBMIT_WAIT.as_millis();
+        let slept = ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.starts_with("sleep"))
+            .count();
+        assert_eq!(slept as u128, waits);
+    }
+
+    #[test]
+    fn submit_item_reports_once_whatever_ends_it() {
+        // The PTY fails at Enter: unknown, reported once, and the thread stops.
+        let mut w = Recorder {
+            fail_on: Some(b"\r"),
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        assert!(write_item(&mut w, submit(&ops, &out, vec![]), &sleeper(&ops)).is_err());
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        // It fails before any of the paste: nothing was written.
+        let mut w = Recorder {
+            fail_on: Some(b"\x1b[200~fix it\nplease\x1b[201~"),
+            ..Default::default()
+        };
+        let out = Outcome::default();
+        assert!(write_item(&mut w, submit(&ops, &out, vec![]), &sleeper(&ops)).is_err());
+        assert_eq!(
+            *out.lock().unwrap(),
+            [Err("terminal has exited".to_string())]
+        );
+        // Still queued when the input thread ends: nothing was written.
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let out = Outcome::default();
+        drop(submit(&ops, &out, vec![]));
+        assert_eq!(
+            *out.lock().unwrap(),
+            [Err("terminal has exited".to_string())]
+        );
+        assert!(ops.lock().unwrap().is_empty());
     }
 }

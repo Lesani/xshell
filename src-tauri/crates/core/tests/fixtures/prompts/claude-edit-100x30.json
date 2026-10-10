@@ -16,5 +16,6 @@
       "Yes, allow all edits during this session",
       "No, and tell Claude what to do differently"
     ]
-  }
+  },
+  "composer": false
 }

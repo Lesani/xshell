@@ -44,6 +44,8 @@ pub const CAPABILITIES: &[&str] = &[
     cap::AGENT_PROMPT,
     cap::TERM_FIRST_MESSAGE,
     cap::PROJECT_SESSIONS,
+    #[cfg(unix)]
+    cap::TERM_SUBMIT,
 ];
 
 /// The names in [`CAPABILITIES`], so peers gate on a constant instead of a string literal.
@@ -92,6 +94,13 @@ pub mod cap {
     /// `call get_project_sessions`: one Project's Claude Code and Codex sessions, newest
     /// first, paged (`msg::PastSessionsPage`).
     pub const PROJECT_SESSIONS: &str = "project.sessions";
+    /// `term.submit`: a reply from the Chat View, typed into the agent's chat composer as one
+    /// bracketed paste and Enter, never taking the Terminal's size; refused while the agent
+    /// needs you or its composer is not on screen (`msg::ClientMsg::TermSubmit`). Unix Hosts
+    /// only: a ConPTY re-renders the agent's output, so the Daemon cannot see whether the
+    /// agent turned bracketed paste on.
+    #[cfg(unix)]
+    pub const TERM_SUBMIT: &str = "term.submit";
 }
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -162,6 +171,19 @@ mod tests {
     fn capabilities_include_agent_prompt() {
         assert!(CAPABILITIES.contains(&"agent.prompt"));
         assert_eq!(cap::AGENT_PROMPT, "agent.prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capabilities_include_term_submit() {
+        assert!(CAPABILITIES.contains(&"term.submit"));
+        assert_eq!(cap::TERM_SUBMIT, "term.submit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capabilities_exclude_term_submit_on_windows() {
+        assert!(!CAPABILITIES.contains(&"term.submit"));
     }
 
     #[test]

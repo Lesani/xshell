@@ -163,6 +163,91 @@ pub enum ClientMsg {
         prompt: u64,
         option: u32,
     },
+    /// Reply to agent Terminal `terminal` from the Chat View: the Daemon types `text` (checked
+    /// and normalized by [`submit_text`]) into the agent's chat composer as one bracketed
+    /// paste, then Enter after a short pause. It never takes the Terminal's size. Only for a
+    /// direct Claude Code or Codex Terminal ([`SUBMIT_NOT_CHAT`]), and only while its screen
+    /// shows the agent's chat composer with bracketed paste on and no Permission Prompt is
+    /// current: refused with [`SUBMIT_NEEDS_YOU`] while the agent needs you or a prompt is on
+    /// screen, [`SUBMIT_NOT_READY`] when the composer is not recognised. Readiness is checked
+    /// again before every write of the paste and before Enter, and held through that write,
+    /// so the answer comes once the reply is typed: `null` when paste and Enter were written; a refusal above when nothing was;
+    /// [`SUBMIT_UNCONFIRMED`] when the paste may have been written but Enter was not.
+    /// Gated on the `term.submit` capability.
+    #[serde(rename = "term.submit")]
+    TermSubmit { terminal: Uuid, text: String },
+}
+
+/// The longest reply a `term.submit` carries, in bytes of UTF-8 after [`submit_text`]
+/// normalized it.
+pub const SUBMIT_MAX_BYTES: usize = 16 * 1024;
+/// The refusal of a `term.submit` while the agent needs you: its Agent Status is needs-you,
+/// a Permission Prompt is current, or one is on its screen. Nothing was typed; Enter would
+/// answer the prompt.
+pub const SUBMIT_NEEDS_YOU: &str = "agent needs you";
+/// The refusal of a `term.submit` when the agent's chat composer is not what its screen
+/// shows (starting up, another dialog or menu open, a draft in another mode) or the agent
+/// has not turned bracketed paste on. Nothing was typed.
+pub const SUBMIT_NOT_READY: &str = "agent does not accept pasted input yet";
+/// The refusal of a `term.submit` to a Terminal that is not a direct Claude Code or Codex
+/// chat (a shell, another agent).
+pub const SUBMIT_NOT_CHAT: &str = "not a chat terminal";
+/// The refusal of a `term.submit` by a Host that does not offer it (Windows: no
+/// `term.submit` capability). Nothing was typed.
+pub const SUBMIT_UNSUPPORTED: &str = "replies are not supported on this host";
+/// The refusal of a `term.submit` to a Terminal whose input cannot be written without
+/// blocking (the Daemon could not get a descriptor for that), so a reply would not be checked
+/// at the moment it is written. Nothing was typed; the Terminal View still works.
+pub const SUBMIT_NO_NONBLOCK: &str = "terminal input does not take replies";
+/// The refusal of a `term.submit` to a Terminal where an earlier reply was stopped and its
+/// bracketed paste could not be completed in time: the agent may still be reading a paste.
+/// Nothing was typed; the Terminal View still works.
+pub const SUBMIT_STUCK: &str = "terminal input is stuck";
+/// The answer of a `term.submit` whose outcome is unknown: the paste may have reached the
+/// agent but Enter was not typed (the agent stopped accepting the reply in between, or the
+/// Terminal ended). The text may be waiting in the agent's composer.
+pub const SUBMIT_UNCONFIRMED: &str = "reply pasted but not submitted";
+
+/// Why [`submit_text`] refused a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitTextError {
+    /// Empty or only whitespace.
+    Blank,
+    /// Over [`SUBMIT_MAX_BYTES`] once normalized.
+    TooLong,
+    /// A control character other than newline and tab (ESC, NUL, DEL, C1…).
+    Control,
+}
+
+impl fmt::Display for SubmitTextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SubmitTextError::Blank => "reply is blank",
+            SubmitTextError::TooLong => "reply is too long",
+            SubmitTextError::Control => "reply contains control characters",
+        })
+    }
+}
+
+/// A `term.submit` reply as it is typed: `\r\n` and lone `\r` become `\n`. Refused when it
+/// is blank, longer than [`SUBMIT_MAX_BYTES`], or contains a C0 control other than `\n` and
+/// `\t`, DEL or a C1 control, so no text can end the bracketed paste early (`ESC [201~`) or
+/// type a key. Both the Daemon and the Mobile apply it.
+pub fn submit_text(s: &str) -> Result<String, SubmitTextError> {
+    let text = s.replace("\r\n", "\n").replace('\r', "\n");
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(SubmitTextError::Control);
+    }
+    if text.trim().is_empty() {
+        return Err(SubmitTextError::Blank);
+    }
+    if text.len() > SUBMIT_MAX_BYTES {
+        return Err(SubmitTextError::TooLong);
+    }
+    Ok(text)
 }
 
 /// The refusal of a `term.answer` whose prompt is no longer the Terminal's current one: it
@@ -497,6 +582,7 @@ const CLIENT_TYPES: &[&str] = &[
     "session.page",
     "session.unsubscribe",
     "term.answer",
+    "term.submit",
 ];
 
 /// The longest `firstMessage` a `term.open` may carry, in bytes of UTF-8.
@@ -1757,6 +1843,74 @@ mod tests {
             let e = decode_inbound(raw.to_string().as_bytes()).unwrap_err();
             assert!(
                 matches!(&e, DecodeError::Invalid { id: Some(5), t, .. } if t == "term.answer"),
+                "{raw}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn submit_text_rules() {
+        use SubmitTextError::*;
+        let max = "x".repeat(SUBMIT_MAX_BYTES);
+        let over = "x".repeat(SUBMIT_MAX_BYTES + 1);
+        // `\r\n` counts as one byte once normalized: a reply at the limit with them fits.
+        let crlf_at_max = format!("{}\r\n", "x".repeat(SUBMIT_MAX_BYTES - 1));
+        for (input, want) in [
+            ("a\r\nb\rc", Ok("a\nb\nc")),
+            ("tab\there", Ok("tab\there")),
+            ("emoji 🦀 ünïcode", Ok("emoji 🦀 ünïcode")),
+            ("/compact", Ok("/compact")),
+            ("!ls", Ok("!ls")),
+            (max.as_str(), Ok(max.as_str())),
+            ("", Err(Blank)),
+            ("  \n ", Err(Blank)),
+            ("\r\n\t", Err(Blank)),
+            (over.as_str(), Err(TooLong)),
+            ("a\x1bb", Err(Control)),
+            // The end of a bracketed paste: never inside one.
+            ("x\x1b[201~\r", Err(Control)),
+            ("a\0b", Err(Control)),
+            ("a\x7fb", Err(Control)),
+            ("a\u{85}b", Err(Control)),
+            ("a\u{9b}201~", Err(Control)),
+            ("a\x03", Err(Control)),
+            ("a\x08", Err(Control)),
+        ] {
+            assert_eq!(
+                submit_text(input).as_deref().map_err(|e| *e),
+                want,
+                "{input:?}"
+            );
+        }
+        assert_eq!(submit_text(&crlf_at_max).unwrap().len(), SUBMIT_MAX_BYTES);
+        assert_eq!(Blank.to_string(), "reply is blank");
+    }
+
+    #[test]
+    fn term_submit_golden_roundtrip() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
+        let msg = ClientMsg::TermSubmit {
+            terminal: id,
+            text: "fix it\nplease 🦀".into(),
+        };
+        // The whole path: encoded as a frame, read back, decoded as a Host would.
+        let frame = encode_msg(&msg, Some(4)).unwrap();
+        let b = body(frame);
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":4,"t":"term.submit","terminal":"00000000-0000-0000-0000-000000000007","text":"fix it\nplease 🦀"}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(4), msg });
+        assert!(CLIENT_TYPES.contains(&"term.submit"));
+        // A missing field is answerable.
+        for raw in [
+            json!({"t":"term.submit","id":5,"terminal":id}),
+            json!({"t":"term.submit","id":5,"text":"x"}),
+            json!({"t":"term.submit","id":5,"terminal":id,"text":7}),
+        ] {
+            let e = decode_inbound(raw.to_string().as_bytes()).unwrap_err();
+            assert!(
+                matches!(&e, DecodeError::Invalid { id: Some(5), t, .. } if t == "term.submit"),
                 "{raw}: {e:?}"
             );
         }

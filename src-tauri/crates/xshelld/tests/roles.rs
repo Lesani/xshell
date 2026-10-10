@@ -15,7 +15,7 @@ use xshell_core::claude::encode_project_name;
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::frame::Frame;
 use xshell_protocol::msg::{
-    ClientMsg, Hello, OpenSpec, PastSessionsPage, ServerMsg, PROMPT_ANSWERED,
+    ClientMsg, Hello, OpenSpec, PastSessionsPage, ServerMsg, PROMPT_ANSWERED, SUBMIT_NOT_READY,
 };
 use xshelld::server::{ExitReason, Role, ServerHandle};
 
@@ -97,6 +97,10 @@ fn per_terminal(t: Uuid) -> Vec<ClientMsg> {
             rows: 30,
         },
         ClientMsg::TermDetach { terminal: t },
+        ClientMsg::TermSubmit {
+            terminal: t,
+            text: "reply".into(),
+        },
         ClientMsg::TermRelaunch {
             terminal: t,
             skip_permissions: true,
@@ -456,6 +460,20 @@ fn mobile_attach_input_resize_detach_close_agent() {
         Ok(Value::Null)
     );
     e.mob.terminals_where(|l| l.is_empty());
+}
+
+/// A Mobile may reply to the agent Terminals it sees: past the role checks, the Daemon
+/// judges the agent's screen (this fake shows no composer).
+#[test]
+fn mobile_may_submit() {
+    let mut e = env();
+    let t = e.desk_open(e.claude());
+    let submit = ClientMsg::TermSubmit {
+        terminal: t,
+        text: "reply".into(),
+    };
+    assert_eq!(e.mob.request(&submit), Err(SUBMIT_NOT_READY.into()));
+    assert_eq!(e.desk.request(&submit), Err(SUBMIT_NOT_READY.into()));
 }
 
 #[test]

@@ -133,6 +133,13 @@ impl PromptCell {
             .map(|c| c.prompt.clone())
     }
 
+    /// Whether a Permission Prompt is current: read off the screen and not yet answered,
+    /// typed at or seen gone by the worker, listed or still waiting for its id to be
+    /// persisted. A reply (`term.submit`) is refused meanwhile: its Enter would answer it.
+    pub fn is_current(&self) -> bool {
+        self.current.is_some()
+    }
+
     /// Whether the screen must be checked on output: a recognised prompt is listed.
     pub fn watching(&self) -> Option<u64> {
         self.current

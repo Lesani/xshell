@@ -15,5 +15,6 @@
       "Yes, and don't ask again for these files",
       "No, and tell Codex what to do differently"
     ]
-  }
+  },
+  "composer": false
 }

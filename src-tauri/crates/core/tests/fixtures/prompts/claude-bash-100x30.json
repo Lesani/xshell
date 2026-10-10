@@ -16,5 +16,6 @@
       "Yes, and don't ask again for ls commands in /home/dev/proj",
       "No, and tell Claude what to do differently"
     ]
-  }
+  },
+  "composer": false
 }

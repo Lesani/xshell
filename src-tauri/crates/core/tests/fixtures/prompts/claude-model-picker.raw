@@ -1,0 +1,24 @@
+[?25l╭──────────────────────────────────────────────────────────╮
+│ ✻ Welcome to Claude Code!                                │
+│                                                          │
+│   cwd: /home/dev/proj                                    │
+╰──────────────────────────────────────────────────────────╯
+
+> fix the bug
+
+⏺ Fixed the off-by-one in parse().
+
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+❯ 
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+[2m  ? for shortcuts[0m[2K[1A[2K[1A[2K[1A[2K[G[2m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+ [1mSelect model[0m
+ Switch between Claude models. Your pick becomes the default for new sessions. For other/previous
+ model names, specify with --model.
+
+[38;5;153m ❯ 1. Default (recommended)[0m
+   2. Opus
+   3. Sonnet
+   4. Haiku
+
+ [2mEnter to confirm · Esc to exit[0m

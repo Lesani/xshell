@@ -21,7 +21,7 @@ use xshell_core::launch::LaunchSpec;
 use xshell_hostlink::{
     CancelToken, Dialer, LocalDaemon, LocalDaemonConfig, LocalDialer, NamedPipeDialer,
 };
-use xshell_protocol::msg::{AgentStatus, ClientMsg, ServerMsg};
+use xshell_protocol::msg::{AgentStatus, ClientMsg, ServerMsg, SUBMIT_UNSUPPORTED};
 
 /// A unique word a fake agent prints, so a test matches its output and not argv text.
 fn nonce() -> String {
@@ -289,6 +289,32 @@ fn first_message_advertised_on_windows() {
         "{:?}",
         hello.capabilities
     );
+}
+
+/// Chat View replies are Unix only for now: not advertised, and a reply to a running direct
+/// agent Terminal is refused with its own reason.
+#[test]
+fn submit_not_offered_on_windows() {
+    let h = TestHome::new();
+    let word = nonce();
+    h.script("claude", &format!("echo {word}\n{SLEEP}"));
+    let _d = Daemon::start(&h);
+    let mut c = Client::connect(&h.pipe);
+    let (hello, _) = c.hello();
+    assert!(
+        !hello.capabilities.iter().any(|c| c == "term.submit"),
+        "{:?}",
+        hello.capabilities
+    );
+    let t = Uuid::new_v4();
+    c.open(t, claude_spec(&h.project("p")));
+    c.attach(t);
+    c.output_until(t, &word);
+    let r = c.request(&ClientMsg::TermSubmit {
+        terminal: t,
+        text: "hi".into(),
+    });
+    assert_eq!(r, Err(SUBMIT_UNSUPPORTED.to_string()));
 }
 
 /// Acceptance: the message reaches an npm-installed Claude Code as one argv word, byte for

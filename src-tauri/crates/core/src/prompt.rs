@@ -21,6 +21,10 @@
 //!    key-hint footer (`… to confirm …`) below.
 //!
 //! The answer key of option `n` is its index digit, as shown.
+//!
+//! [`composer`] recognises the agent's chat input (capability `term.submit`): a reply is
+//! typed only into a screen that ends with it, with the same strictness. See its
+//! documentation.
 
 use crate::agent_status::HookAgent;
 use xshell_protocol::msg::{PROMPT_OPTIONS_MAX, PROMPT_OPTION_MAX_CHARS, PROMPT_TEXT_MAX_CHARS};
@@ -58,6 +62,12 @@ impl ScreenModel {
     pub fn size(&self) -> (u16, u16) {
         let (rows, cols) = self.parser.screen().size();
         (cols, rows)
+    }
+
+    /// Whether the program turned bracketed paste on (`CSI ? 2004 h`, off again with
+    /// `CSI ? 2004 l` or a reset `ESC c`).
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
     }
 
     /// The visible rows, top first, trailing spaces trimmed.
@@ -528,6 +538,345 @@ fn evidence(
     }
 }
 
+/// Rows below a chat composer that may be its footer (key hints, mode, status line).
+pub const COMPOSER_FOOTER_MAX: usize = 4;
+/// The shortest rule (or box top) a Claude Code composer is framed by.
+const COMPOSER_RULE_MIN: usize = 20;
+
+/// The prompt mark a composer's first row starts with.
+fn is_composer_mark(agent: HookAgent, c: char) -> bool {
+    match agent {
+        HookAgent::Claude => matches!(c, '❯' | '>'),
+        HookAgent::Codex => c == '›',
+    }
+}
+
+/// A row made only of `─`, at least [`COMPOSER_RULE_MIN`] of them (leading spaces allowed).
+fn is_rule(row: &str) -> bool {
+    let t = row.trim();
+    t.chars().count() >= COMPOSER_RULE_MIN && t.chars().all(|c| c == '─')
+}
+
+/// A round box's top or bottom: `╭─…─╮` or `╰─…─╯`.
+fn is_box_edge(row: &str, top: bool) -> bool {
+    let (l, r) = if top { ('╭', '╮') } else { ('╰', '╯') };
+    let t = row.trim();
+    let mut c = t.chars();
+    c.next() == Some(l)
+        && c.next_back() == Some(r)
+        && t.chars().count() >= COMPOSER_RULE_MIN
+        && c.all(|c| c == '─')
+}
+
+/// The composer's first row: the agent's prompt mark at most two columns in, then a space
+/// or nothing (an empty input). Never an option row (`❯ 1. Yes` is a dialog's focus).
+fn is_composer_head(agent: HookAgent, row: &str) -> bool {
+    let lead = row.chars().take_while(|c| *c == ' ').count();
+    let rest: Vec<char> = row.chars().skip(lead).collect();
+    lead <= 2
+        && rest.first().is_some_and(|c| is_composer_mark(agent, *c))
+        && rest.get(1).is_none_or(|c| *c == ' ')
+        && parse_option(row).is_none()
+}
+
+/// A row continuing a multi-line or wrapped input: blank, or indented by at least two
+/// columns, and not an option row.
+fn is_composer_continuation(row: &str) -> bool {
+    row.trim().is_empty() || (row.starts_with("  ") && parse_option(row).is_none())
+}
+
+/// A composer footer row's parts: split at ` · ` and at runs of two or more spaces, cleaned
+/// and lowercased.
+fn footer_segments(row: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in row.split(" · ") {
+        let mut cur = String::new();
+        let mut spaces = 0;
+        for c in part.chars() {
+            if c == ' ' {
+                spaces += 1;
+                continue;
+            }
+            if spaces >= 2 && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            } else if spaces == 1 && !cur.is_empty() {
+                cur.push(' ');
+            }
+            spaces = 0;
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out.iter().map(|s| clean(s).to_lowercase()).collect()
+}
+
+/// `seg` is `<n>%<rest>` with a whole number `n` up to 100.
+fn percent_then(seg: &str, rest: &str) -> bool {
+    seg.strip_suffix(rest)
+        .and_then(|n| n.strip_suffix('%'))
+        .is_some_and(|n| {
+            !n.is_empty()
+                && n.len() <= 3
+                && n.chars().all(|c| c.is_ascii_digit())
+                && n.parse::<u32>().is_ok_and(|n| n <= 100)
+        })
+}
+
+/// One part of Claude Code's footer under its input (2.1.296): the shortcuts hint, the
+/// clear and exit hints, the permission mode, the context left.
+fn is_claude_footer_segment(seg: &str) -> bool {
+    const WHOLE: &[&str] = &[
+        "? for shortcuts",
+        "esc to clear",
+        "esc again to clear",
+        "press ctrl-c again to exit",
+        "press ctrl+c again to exit",
+        "run /compact to compact & continue",
+    ];
+    const MODES: &[&str] = &[
+        "accept edits on",
+        "plan mode on",
+        "auto mode on",
+        "bypass permissions on",
+    ];
+    if WHOLE.contains(&seg) {
+        return true;
+    }
+    // `⏵⏵ accept edits on (shift+tab to cycle)`: the mode's symbol, its name, the hint.
+    let mode = seg.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != ' ');
+    let mode = mode.trim_start();
+    let mode = mode.strip_suffix(" (shift+tab to cycle)").unwrap_or(mode);
+    if MODES.contains(&mode) {
+        return true;
+    }
+    if let Some(inner) = seg
+        .strip_prefix("context low (")
+        .and_then(|r| r.strip_suffix(" remaining)"))
+    {
+        return percent_then(inner, "");
+    }
+    percent_then(seg, " until auto-compact") || percent_then(seg, " context used")
+}
+
+/// One part of Codex's footer under its composer (0.154): `<key> <hint>` for its known
+/// hints (`? for shortcuts`, `tab to queue message`, `esc again to edit previous message`,
+/// `⏎ send`…), and the context left.
+fn is_codex_footer_segment(seg: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "?",
+        "tab",
+        "esc",
+        "esc esc",
+        "enter",
+        "⏎",
+        "/",
+        "!",
+        "@",
+        "ctrl + c",
+        "ctrl+c",
+        "⌃c",
+        "ctrl + j",
+        "ctrl+j",
+        "⌃j",
+        "ctrl + t",
+        "ctrl+t",
+        "⌃t",
+        "ctrl + g",
+        "ctrl+g",
+        "⌃g",
+        "shift + enter",
+        "shift+enter",
+        "shift + tab",
+        "shift+tab",
+    ];
+    const HINTS: &[&str] = &[
+        "for shortcuts",
+        "to edit previous message",
+        "to queue message",
+        "to queue",
+        "to submit message",
+        "to interrupt",
+        "for commands",
+        "for shell commands",
+        "for newline",
+        "for file paths",
+        "to edit in external editor",
+        "to view transcript",
+        "to change mode",
+        "to quit",
+        "send",
+        "newline",
+        "transcript",
+        "quit",
+    ];
+    if percent_then(seg, " context left") || percent_then(seg, " context used") {
+        return true;
+    }
+    HINTS.iter().any(|h| {
+        seg.strip_suffix(h)
+            .and_then(|k| k.strip_suffix(' '))
+            .map(|k| k.strip_suffix(" again").unwrap_or(k))
+            .is_some_and(|k| KEYS.contains(&k))
+    })
+}
+
+/// A whole row of `agent`'s composer footer: made only of its known parts. Anything else
+/// below the input (a dialog's hints, a question, a list, a command's output, a custom
+/// status line) means the screen is not just the composer.
+fn is_composer_footer(agent: HookAgent, row: &str) -> bool {
+    let segs = footer_segments(row);
+    !segs.is_empty()
+        && segs.iter().all(|s| match agent {
+            HookAgent::Claude => is_claude_footer_segment(s),
+            HookAgent::Codex => is_codex_footer_segment(s),
+        })
+}
+
+/// Whether `agent`'s chat composer is what the screen (a [`ScreenModel`]'s rows) ends with,
+/// so typed text and Enter reach the chat input and nothing else. Strict like [`extract`]:
+/// any screen it does not understand is not a composer.
+///
+/// - **Claude Code** (2.x): the input between two equal rules of `─` (its box without
+///   sides), or, as 1.x drew it, inside a round box `╭─╮ │ … │ ╰─╯`. The row right below the
+///   top edge starts with the prompt mark `❯` (or `>`), the rows down to the bottom edge
+///   continue it (blank or indented), and below the bottom edge come at most
+///   [`COMPOSER_FOOTER_MAX`] footer rows. A dialog has its title under its top edge, the
+///   bash mode shows `!` instead of the mark.
+/// - **Codex**: the lowest row starting with the prompt mark `›`, with the composer's blank
+///   padding row directly above it, continued by indented rows; below it only blank rows
+///   and one to [`COMPOSER_FOOTER_MAX`] footer rows, after a blank row. An approval or a
+///   selection list puts its focus (`› 1. …`) lowest, so it is never one.
+///
+/// A footer row must be made only of the agent's own footer parts (its shortcut and mode
+/// hints, the context left: see `is_claude_footer_segment` and `is_codex_footer_segment`);
+/// any other row below the input (a dialog's or picker's hints, a `[y/N]` question, a
+/// custom status line) refuses. Unknown is never the composer.
+///
+/// Neither accepts an option row anywhere in the input, or anything that is not on the
+/// screen's last rows.
+pub fn composer(agent: HookAgent, rows: &[String]) -> bool {
+    let r: Vec<&str> = rows.iter().map(|s| s.trim_end()).collect();
+    let Some(last) = r.iter().rposition(|s| !s.is_empty()) else {
+        return false;
+    };
+    match agent {
+        HookAgent::Claude => claude_composer(&r[..=last]),
+        HookAgent::Codex => codex_composer(&r[..=last]),
+    }
+}
+
+fn claude_composer(r: &[&str]) -> bool {
+    let agent = HookAgent::Claude;
+    // The bottom edge, past the footer.
+    let mut footer = 0;
+    let mut bottom = r.len();
+    loop {
+        if bottom == 0 {
+            return false;
+        }
+        bottom -= 1;
+        let row = r[bottom];
+        if is_rule(row) || is_box_edge(row, false) {
+            break;
+        }
+        if !row.is_empty() {
+            footer += 1;
+            if footer > COMPOSER_FOOTER_MAX || !is_composer_footer(agent, row) {
+                return false;
+            }
+        }
+    }
+    let boxed = is_box_edge(r[bottom], false);
+    // A boxed input's rows without their sides.
+    let inner = |row: &str| -> Option<String> {
+        if !boxed {
+            return Some(row.to_string());
+        }
+        let t = row.trim();
+        let t = t.strip_prefix('│')?.strip_suffix('│')?;
+        Some(t.trim_end().to_string())
+    };
+    // The top edge, up through the input's rows.
+    let mut top = bottom;
+    loop {
+        if top == 0 {
+            return false;
+        }
+        top -= 1;
+        let row = r[top];
+        let edge = if boxed {
+            is_box_edge(row, true)
+        } else {
+            is_rule(row)
+        };
+        if edge {
+            break;
+        }
+    }
+    if top + 1 >= bottom {
+        return false;
+    }
+    if !boxed && r[top].trim() != r[bottom].trim() {
+        return false;
+    }
+    if boxed && r[top].trim().chars().count() != r[bottom].trim().chars().count() {
+        return false;
+    }
+    let Some(head) = inner(r[top + 1]) else {
+        return false;
+    };
+    let head = if boxed {
+        head.trim_start_matches(' ').to_string()
+    } else {
+        head
+    };
+    if !is_composer_head(agent, &head) {
+        return false;
+    }
+    r[top + 2..bottom].iter().all(|row| {
+        inner(row).is_some_and(|s| {
+            let s = if boxed {
+                s.strip_prefix(' ').unwrap_or(&s).to_string()
+            } else {
+                s
+            };
+            is_composer_continuation(&s)
+        })
+    })
+}
+
+fn codex_composer(r: &[&str]) -> bool {
+    let agent = HookAgent::Codex;
+    let Some(head) = r.iter().rposition(|row| {
+        let t = row.trim_start();
+        t.chars().next().is_some_and(|c| is_composer_mark(agent, c))
+    }) else {
+        return false;
+    };
+    if !is_composer_head(agent, r[head]) {
+        return false;
+    }
+    // The composer's top padding.
+    if head == 0 || !r[head - 1].is_empty() {
+        return false;
+    }
+    // Its continuation rows, then a blank row and the footer.
+    let mut i = head + 1;
+    while i < r.len() && !r[i].is_empty() {
+        if !is_composer_continuation(r[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    // Codex's frame is weaker evidence than Claude Code's rules: its footer must be there.
+    let footer: Vec<&&str> = r[i..].iter().filter(|row| !row.is_empty()).collect();
+    !footer.is_empty()
+        && footer.len() <= COMPOSER_FOOTER_MAX
+        && footer.iter().all(|row| is_composer_footer(agent, row))
+}
+
 /// The text of a text-only prompt: the bottom [`TAIL_ROWS`] non-blank rows, box-drawing
 /// characters removed, whitespace collapsed, capped to [`PROMPT_TEXT_MAX_CHARS`] keeping
 /// the bottom.
@@ -907,6 +1256,165 @@ $ ";
         assert_eq!(t.chars().count(), PROMPT_TEXT_MAX_CHARS);
         assert!(t.starts_with('…'));
         assert_eq!(screen_tail(&rows("\u{7}\n \t \n")), "");
+    }
+
+    fn rule(n: usize) -> String {
+        "─".repeat(n)
+    }
+
+    #[test]
+    fn claude_composer_is_recognised() {
+        let r = rule(60);
+        let ok = [
+            format!("⏺ Done.\n\n{r}\n❯ \n{r}\n  ? for shortcuts"),
+            format!("⏺ Done.\n\n{r}\n❯\n{r}"),
+            format!("✻ Thinking… (esc to interrupt)\n\n{r}\n❯ \n{r}\n  ⏵⏵ accept edits on (shift+tab to cycle)\n  12% until auto-compact\n\n"),
+            format!("{r}\n❯ \n{r}\n  ⏸ plan mode on · Context low (8% remaining) · Run /compact to compact & continue"),
+            format!("{r}\n❯ x\n{r}\n  Esc again to clear                     30% context used"),
+            format!("{r}\n❯ a draft that wraps\n  onto a second row\n\n  and a third\n{r}\n  ? for shortcuts"),
+            format!("{r}\n> \n{r}"),
+            // Claude Code 1.x: a round box with sides.
+            format!("╭{r}╮\n│ > a draft{}│\n│   more   {}│\n╰{r}╯\n  ? for shortcuts", " ".repeat(51), " ".repeat(51)),
+        ];
+        for s in &ok {
+            assert!(composer(HookAgent::Claude, &rows(s)), "{s}");
+            assert!(!composer(HookAgent::Codex, &rows(s)), "{s}");
+        }
+        let no = [
+            // The permission dialog, the model picker: a top rule only, options, key hints.
+            CLAUDE.to_string(),
+            format!("{r}\n Select model\n Switch models.\n\n ❯ 1. Default\n   2. Opus\n\n Enter to confirm · Esc to exit"),
+            // An option list framed like the input.
+            format!("{r}\n❯ 1. Yes\n  2. No\n{r}"),
+            format!("{r}\n❯ Yes\n  2. No\n{r}"),
+            // A dialog's title under the top edge, the bash mode, another mark.
+            format!("{r}\n Do you want to proceed?\n❯ Yes\n{r}"),
+            format!("{r}\n! ls\n{r}\n  ! for shell mode"),
+            format!("{r}\n› \n{r}"),
+            format!("{r}\n❯x\n{r}"),
+            format!("{r}\n   ❯ \n{r}"),
+            // Unequal or short rules, a missing edge.
+            format!("{r}\n❯ \n{}", rule(59)),
+            format!("{}\n❯ \n{}", rule(10), rule(10)),
+            format!("❯ \n{r}"),
+            format!("{r}\n❯ "),
+            format!("{r}\n{r}"),
+            // Too much below it, a dialog's hint below it, an option row below it.
+            format!("{r}\n❯ \n{r}\n a\n b\n c\n d\n e"),
+            format!("{r}\n❯ \n{r}\n Esc to cancel"),
+            format!("{r}\n❯ \n{r}\n ❯ 1. build"),
+            // A continuation that is not indented: other output inside the edges.
+            format!("{r}\n❯ fix it\n⏺ Done.\n{r}"),
+            // A boxed dialog (Claude Code 1.x Edit, the welcome banner).
+            format!("╭{r}╮\n│ Edit file{}│\n╰{r}╯", " ".repeat(51)),
+            format!("╭{r}╮\n│ > x{}│\n╰{}╯", " ".repeat(57), rule(61)),
+            String::new(),
+            "> ".to_string(),
+            "$ ".to_string(),
+            // Unknown rows below the input: a question, a list, a command's prompt, a
+            // custom status line, another agent's or a dialog's hints, a hint inside text.
+            format!("{r}\n❯ \n{r}\nContinue? [y/N] "),
+            format!("{r}\n❯ \n{r}\n  ? for shortcuts\nContinue? [y/N] "),
+            format!("{r}\n❯ \n{r}\n› auto\n  gpt-5"),
+            format!("{r}\n❯ \n{r}\n  ❯ Opus\n    Sonnet"),
+            format!("{r}\n❯ \n{r}\n> "),
+            format!("{r}\n❯ \n{r}\n  main • 3 files changed"),
+            format!("{r}\n❯ \n{r}\n  ? for shortcuts    tab to queue message"),
+            format!("{r}\n❯ \n{r}\n  Enter to confirm · Esc to exit"),
+            format!("{r}\n❯ \n{r}\n  Press ? for shortcuts now"),
+            format!("{r}\n❯ \n{r}\n  ⏵⏵ accept edits on (shift+tab to cycle) and more"),
+            format!("{r}\n❯ \n{r}\n  101% until auto-compact"),
+            format!("{r}\n❯ \n{r}\n  x% context used"),
+        ];
+        for s in &no {
+            assert!(!composer(HookAgent::Claude, &rows(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn codex_composer_is_recognised() {
+        let ok = [
+            "› fix the bug\n\n• Fixed it.\n\n› Ask Codex to do anything\n\n  ? for shortcuts    100% context left",
+            "\n› \n\n  ? for shortcuts",
+            "• Working (3s • esc to interrupt)\n\n› a draft\n  second line\n\n  tab to queue message",
+            "\n›\n\n  esc again to edit previous message\n  ctrl + c again to quit\n\n",
+            "\n› x\n\n  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit",
+            "\n› \n\n  ? for shortcuts · 42% context left",
+        ];
+        for s in ok {
+            assert!(composer(HookAgent::Codex, &rows(s)), "{s}");
+            assert!(!composer(HookAgent::Claude, &rows(s)), "{s}");
+        }
+        let no = [
+            CODEX,
+            // A selection list: its focus is the lowest mark.
+            "\n› Ask Codex\n\n  Select Model\n\n› 1. auto\n  2. gpt-5\n\n  Press enter to confirm or esc to go back",
+            "\n› 1. auto\n  2. gpt-5",
+            // No padding row above it, or something else right below it.
+            "• Working\n› ",
+            "› ",
+            "\n› fix it\n• Fixed it.",
+            // Too much below it, a dialog's hint below it, a footer without the gap.
+            "\n› \n\n a\n b\n c\n d\n e",
+            "\n› \n\n  Press enter to confirm or esc to cancel",
+            "\n› x\n  ? for shortcuts\nmore",
+            "\n› \n\n  2. No",
+            "\n›x",
+            "\n   › ",
+            "",
+            // No footer: the frame alone is not enough.
+            "\n› ",
+            "\n›\n\n\n",
+            // An unnumbered picker with the `›` focus, its own footer or none.
+            "\n  Select Model\n  Pick a quick auto mode or browse all models.\n\n› auto\n  gpt-5\n\n  Press enter to confirm or esc to go back",
+            "  Select Model\n\n› auto\n  gpt-5\n  gpt-5-codex",
+            "\n› auto\n  gpt-5\n\n  Press enter to select or esc to cancel",
+            // A question, a command's prompt, unknown text or a status line below it.
+            "\n› \n\n  Continue? [y/N]",
+            "\n› \n\n  ? for shortcuts\n> ",
+            "\n› \n\n  main • 3 files changed",
+            "\n› \n\n  ? for shortcuts    Esc to cancel",
+            "\n› \n\n  ? for shortcuts later",
+            "\n› \n\n  maybe tab to queue message",
+            "\n› \n\n  ? for shortcuts\n  ? for shortcuts\n  ? for shortcuts\n  ? for shortcuts\n  ? for shortcuts",
+        ];
+        for s in no {
+            assert!(!composer(HookAgent::Codex, &rows(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_mode() {
+        let mut m = ScreenModel::new(20, 5);
+        assert!(!m.bracketed_paste());
+        m.feed(b"\x1b[?2004h");
+        assert!(m.bracketed_paste(), "on");
+        m.feed(b"\x1b[?2004l");
+        assert!(!m.bracketed_paste(), "off");
+        // Split across reads.
+        m.feed(b"\x1b[?20");
+        assert!(!m.bracketed_paste());
+        m.feed(b"04h");
+        assert!(m.bracketed_paste(), "split");
+        m.feed(b"\x1b[?2004l\x1b[?1049;2004h");
+        assert!(m.bracketed_paste(), "combined parameters");
+        // A reset turns it off.
+        m.feed(b"\x1bc");
+        assert!(!m.bracketed_paste(), "RIS");
+        // Other modes, and the non-private 2004, leave it alone.
+        m.feed(b"\x1b[?1049h\x1b[?25l\x1b[2004h\x1b[?2003h");
+        assert!(!m.bracketed_paste(), "other modes");
+        m.feed(b"\x1b[?2004h\x1b[?1049l\x1b[?25h");
+        assert!(m.bracketed_paste());
+        // Garbage keeps the parser's state bounded and recovers.
+        let junk: Vec<u8> = (0..200_000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        m.feed(&junk);
+        m.feed(b"\x18\x1b[?2004l");
+        assert!(!m.bracketed_paste(), "recovers after garbage");
+        // A resize keeps it.
+        m.feed(b"\x1b[?2004h");
+        m.resize(40, 10);
+        assert!(m.bracketed_paste());
     }
 
     #[test]
