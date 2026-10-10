@@ -15,14 +15,16 @@ use common::*;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::agent_status::AgentStatus;
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::msg::{
-    ClientMsg, OpenSpec, ServerMsg, SUBMIT_MAX_BYTES, SUBMIT_NEEDS_YOU, SUBMIT_NOT_CHAT,
-    SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_STUCK, SUBMIT_UNCONFIRMED,
+    ClientMsg, OpenSpec, ServerMsg, SUBMIT_MAX_BYTES, SUBMIT_MAX_FILES, SUBMIT_NEEDS_YOU,
+    SUBMIT_NOT_CHAT, SUBMIT_NOT_DROPPED, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_STUCK,
+    SUBMIT_TOO_MANY_FILES, SUBMIT_UNCONFIRMED,
 };
 use xshelld::server::{Config, Role, ServerHandle, TestHook, TestPoint};
 
@@ -310,6 +312,7 @@ fn submit(c: &mut Client, t: &Term, text: &str) -> Result<Value, String> {
     c.request(&ClientMsg::TermSubmit {
         terminal: t.id,
         text: text.into(),
+        files: vec![],
     })
 }
 
@@ -320,6 +323,7 @@ fn send_submit(c: &mut Client, t: &Term, text: &str) -> u64 {
         &ClientMsg::TermSubmit {
             terminal: t.id,
             text: text.into(),
+            files: vec![],
         },
         Some(id),
     );
@@ -663,11 +667,13 @@ fn submit_refused_for_shell_and_non_chat() {
     let r = m.request(&ClientMsg::TermSubmit {
         terminal: shell,
         text: "ls".into(),
+        files: vec![],
     });
     assert!(r.as_ref().unwrap_err().contains("forbidden"), "{r:?}");
     let r = e.desk.request(&ClientMsg::TermSubmit {
         terminal: shell,
         text: "ls".into(),
+        files: vec![],
     });
     assert_eq!(r, Err(SUBMIT_NOT_CHAT.into()));
     // An agent without a Chat View.
@@ -687,6 +693,7 @@ fn submit_refused_for_shell_and_non_chat() {
     let r = m.request(&ClientMsg::TermSubmit {
         terminal: Uuid::new_v4(),
         text: "hi".into(),
+        files: vec![],
     });
     assert!(r.unwrap_err().starts_with("unknown terminal"));
 }
@@ -967,4 +974,829 @@ fn an_unclosable_paste_makes_replies_stuck() {
         std::thread::sleep(ms(20));
     }
     assert_eq!(submit(&mut m, &t, "still"), Err(SUBMIT_STUCK.into()));
+}
+
+// ── Photos: `term.submit` with `files` (capability `term.submit-files`) ──────────────────
+
+/// A JPEG's first bytes, as a Mobile's photo upload starts.
+const JPEG_B64: &str = "/9j/4AAQSkZJRgABAQ==";
+
+/// Save a photo as a Mobile does; the path the Daemon answers.
+fn drop_photo(c: &mut Client, name: &str) -> String {
+    let p = c
+        .call(
+            "save_dropped_file",
+            serde_json::json!({ "bytesBase64": JPEG_B64, "name": name }),
+        )
+        .unwrap();
+    p.as_str().unwrap().to_string()
+}
+
+fn submit_files(c: &mut Client, t: &Term, text: &str, files: &[&str]) -> Result<Value, String> {
+    c.request(&ClientMsg::TermSubmit {
+        terminal: t.id,
+        text: text.into(),
+        files: files.iter().map(|f| f.to_string()).collect(),
+    })
+}
+
+fn send_files(c: &mut Client, t: &Term, text: &str, files: &[&str]) -> u64 {
+    let id = c.request_id();
+    c.send(
+        &ClientMsg::TermSubmit {
+            terminal: t.id,
+            text: text.into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        },
+        Some(id),
+    );
+    id
+}
+
+/// The bytes a path is typed as: its own bracketed paste, then a space.
+fn typed_file(path: &str) -> Vec<u8> {
+    let mut v = pasted(path);
+    v.push(b' ');
+    v
+}
+
+fn pasted(text: &str) -> Vec<u8> {
+    let mut v = b"\x1b[200~".to_vec();
+    v.extend_from_slice(text.as_bytes());
+    v.extend_from_slice(b"\x1b[201~");
+    v
+}
+
+fn canonical(p: &str) -> String {
+    fs::canonicalize(p).unwrap().to_string_lossy().into_owned()
+}
+
+/// What the fake agent reads from its tty.
+#[derive(Debug, Clone, PartialEq)]
+enum Ev {
+    Paste(String),
+    Key(char),
+    Enter,
+}
+
+/// The events in `buf`, and how much of it they take (a paste not yet ended waits).
+fn events(buf: &[u8]) -> (Vec<Ev>, usize) {
+    let (start, end) = (b"\x1b[200~", b"\x1b[201~");
+    let mut out = vec![];
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i..].starts_with(start) {
+            let Some(e) = buf[i + start.len()..]
+                .windows(end.len())
+                .position(|w| w == end)
+            else {
+                break;
+            };
+            let text = &buf[i + start.len()..i + start.len() + e];
+            out.push(Ev::Paste(String::from_utf8_lossy(text).into_owned()));
+            i += start.len() + e + end.len();
+        } else if start.starts_with(&buf[i..]) {
+            break;
+        } else if buf[i] == b'\r' {
+            out.push(Ev::Enter);
+            i += 1;
+        } else {
+            out.push(Ev::Key(buf[i] as char));
+            i += 1;
+        }
+    }
+    (out, i)
+}
+
+/// The agent's handling of input, as Claude Code 2.1.296 does it (`WXe` in its binary): a
+/// paste that is an image path (outer quotes and backslash escapes removed, an image
+/// extension) is read asynchronously; while it is read the footer says `Pasting…` and an
+/// Enter is held, and dropped when the image is applied. The image then shows as the chip
+/// `[Image #n]` in the input. Codex attaches at once (`attach`: zero).
+#[derive(Debug, Default)]
+struct Model {
+    attach: Duration,
+    input: String,
+    images: usize,
+    /// When the image being read is applied.
+    pending: Option<Instant>,
+    /// Whether an Enter came while it was read.
+    held_enter: bool,
+    submitted: Vec<String>,
+    dropped_enters: usize,
+}
+
+impl Model {
+    fn image_path(text: &str) -> bool {
+        let t = text.trim();
+        let t = t
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .unwrap_or(t);
+        let mut path = String::new();
+        let mut it = t.chars();
+        while let Some(c) = it.next() {
+            path.push(if c == '\\' { it.next().unwrap_or(c) } else { c });
+        }
+        let lower = path.to_ascii_lowercase();
+        [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+            .iter()
+            .any(|e| lower.ends_with(e))
+            && Path::new(&path).is_file()
+    }
+
+    /// Apply `ev` at `now`; whether the screen changes.
+    fn feed(&mut self, ev: Ev, now: Instant) -> bool {
+        match ev {
+            Ev::Paste(text) if Model::image_path(&text) => {
+                self.pending = Some(now + self.attach);
+            }
+            Ev::Paste(text) => self.input.push_str(&text),
+            // Ctrl+U: the input is cleared, attached images too.
+            Ev::Key('\u{15}') => {
+                self.input.clear();
+                self.images = 0;
+            }
+            Ev::Key(c) => self.input.push(c),
+            Ev::Enter if self.pending.is_some() => self.held_enter = true,
+            Ev::Enter => {
+                self.submitted.push(self.input.trim_end().to_string());
+                self.input.clear();
+                self.images = 0;
+            }
+        }
+        true
+    }
+
+    /// Apply a read image whose time came; whether the screen changes.
+    fn tick(&mut self, now: Instant) -> bool {
+        match self.pending {
+            Some(at) if now >= at => {
+                self.pending = None;
+                self.images += 1;
+                self.input.push_str(&format!("[Image #{}] ", self.images));
+                // The image handler resets the held Enter instead of replaying it.
+                if std::mem::take(&mut self.held_enter) {
+                    self.dropped_enters += 1;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `agent`'s composer fixture with `input` in it, `Pasting…` in the footer while an image is
+/// read (Claude Code).
+fn screen(agent: &str, input: &str, pasting: bool) -> Vec<u8> {
+    let s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+    if agent == "codex" {
+        let raw = s(&fs::read(fixture("codex-composer-idle")).unwrap());
+        let placeholder = "\x1b[2mAsk Codex to do anything\x1b[0m";
+        return if input.is_empty() {
+            raw
+        } else {
+            raw.replace(placeholder, input)
+        }
+        .into_bytes();
+    }
+    let mut raw = s(&fs::read(fixture("claude-composer-idle")).unwrap());
+    raw = raw.replace("\u{276f} \r\n", &format!("\u{276f} {input}\r\n"));
+    if pasting {
+        raw = raw.replace("? for shortcuts", "Pasting\u{2026}");
+    }
+    raw.into_bytes()
+}
+
+/// A fake agent that reads its input as [`Model`] does and draws its composer accordingly,
+/// run by the test over the fake's control files.
+struct PhotoAgent {
+    model: Arc<Mutex<Model>>,
+    /// The inputs drawn so far, in order (each drawn once the fake ran it).
+    drawn: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PhotoAgent {
+    fn start(t: &Term, attach: Duration) -> PhotoAgent {
+        let model = Arc::new(Mutex::new(Model {
+            attach,
+            ..Default::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let drawn = Arc::new(Mutex::new(Vec::new()));
+        let (m, st, t, dr) = (model.clone(), stop.clone(), t.clone(), drawn.clone());
+        let thread = std::thread::spawn(move || {
+            let mut done = 0;
+            let mut n = 0;
+            while !st.load(Ordering::SeqCst) {
+                let input = t.input();
+                let (evs, used) = events(&input[done..]);
+                done += used;
+                let now = Instant::now();
+                let mut redraw = false;
+                {
+                    let mut g = m.lock().unwrap();
+                    for ev in evs {
+                        redraw |= g.feed(ev, now);
+                    }
+                    redraw |= g.tick(now);
+                }
+                if redraw {
+                    let (input, pasting) = {
+                        let g = m.lock().unwrap();
+                        (g.input.clone(), g.pending.is_some())
+                    };
+                    let file = t.cwd.join(format!("screen.{n}.raw"));
+                    n += 1;
+                    fs::write(&file, screen(t.agent, &input, pasting)).unwrap();
+                    t.run(&format!("cat '{}'; printf '\\033[?2004h'", file.display()));
+                    dr.lock().unwrap().push(input);
+                }
+                std::thread::sleep(ms(10));
+            }
+        });
+        PhotoAgent {
+            model,
+            drawn,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Wait until the fake drew `input` as its latest screen, and the Daemon read it.
+    fn wait_drawn(&self, input: &str) {
+        let deadline = Instant::now() + T;
+        while self.drawn.lock().unwrap().last().map(String::as_str) != Some(input) {
+            assert!(
+                Instant::now() < deadline,
+                "{:?}",
+                self.drawn.lock().unwrap()
+            );
+            std::thread::sleep(ms(10));
+        }
+        std::thread::sleep(ms(200));
+    }
+
+    /// Wait until the agent submitted `want` (in order).
+    fn expect_submitted(&self, want: &[&str]) {
+        let deadline = Instant::now() + T;
+        loop {
+            let got = self.model.lock().unwrap().submitted.clone();
+            if got == want || Instant::now() >= deadline {
+                assert_eq!(got, want);
+                break;
+            }
+            std::thread::sleep(ms(20));
+        }
+        std::thread::sleep(ms(300));
+        let g = self.model.lock().unwrap();
+        assert_eq!(g.submitted, want);
+        assert_eq!(g.dropped_enters, 0, "an Enter came while an image was read");
+    }
+}
+
+impl Drop for PhotoAgent {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The model itself: typed all at once, as before the Daemon waited for the attachment, the
+/// Enter comes while the image is read and is dropped; nothing is submitted. Typed after the
+/// chip shows, it is submitted with the image.
+#[test]
+fn the_fake_drops_an_enter_while_an_image_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("p.jpg");
+    fs::write(&img, "x").unwrap();
+    let path = img.to_string_lossy().into_owned();
+    let t0 = Instant::now();
+    let mut m = Model {
+        attach: ms(100),
+        ..Default::default()
+    };
+    let mut all = typed_file(&path);
+    all.extend(typed("what is this"));
+    for ev in events(&all).0 {
+        m.feed(ev, t0);
+    }
+    m.tick(t0 + ms(200));
+    assert!(m.submitted.is_empty());
+    assert_eq!(m.dropped_enters, 1);
+    // Paste, wait for the chip, then the rest.
+    let mut m = Model {
+        attach: ms(100),
+        ..Default::default()
+    };
+    for ev in events(&pasted(&format!("\"{path}\""))).0 {
+        m.feed(ev, t0);
+    }
+    assert!(!m.tick(t0 + ms(50)));
+    assert!(m.tick(t0 + ms(100)));
+    let mut rest = b" ".to_vec();
+    rest.extend(typed("what is this"));
+    for ev in events(&rest).0 {
+        m.feed(ev, t0 + ms(150));
+    }
+    assert_eq!(m.submitted, ["[Image #1]  what is this"]);
+    assert_eq!(m.dropped_enters, 0);
+}
+
+/// Acceptance criterion 1, Daemon side: the photo lands in the Daemon's drop directory, and
+/// the agent gets its path as a paste of its own; the caption and Enter follow only once the
+/// image shows attached, so the agent submits the message with the image (Claude Code reads
+/// the image for a while; an Enter meanwhile would be lost).
+#[test]
+fn submit_with_dropped_file() {
+    let mut e = env();
+    let mut m = e.mobile();
+    for (agent, attach) in [("claude", ms(400)), ("codex", ms(0))] {
+        let t = e.ready(agent);
+        let fake = PhotoAgent::start(&t, attach);
+        let path = drop_photo(&mut m, "photo.jpg");
+        let drop_dir = e.h.paths().tmp.join("xshell-clipboard");
+        assert_eq!(Path::new(&path).parent().unwrap(), drop_dir);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            [0xff, 0xd8, 0xff, 0xe0, 0, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1]
+        );
+        let started = Instant::now();
+        assert_eq!(
+            submit_files(&mut m, &t, "what is this", &[&path]),
+            Ok(Value::Null)
+        );
+        assert!(started.elapsed() >= attach, "{agent}");
+        let mut want = typed_file(&canonical(&path));
+        want.extend(typed("what is this"));
+        t.expect_input(&want);
+        fake.expect_submitted(&["[Image #1]  what is this"]);
+    }
+}
+
+/// No caption: the path alone, then Enter. Up to four files, each its own paste, each waited
+/// for.
+#[test]
+fn submit_file_only_no_caption() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(150));
+    let path = drop_photo(&mut m, "photo.jpg");
+    assert_eq!(submit_files(&mut m, &t, " \r\n", &[&path]), Ok(Value::Null));
+    let mut want = typed_file(&canonical(&path));
+    want.push(b'\r');
+    t.expect_input(&want);
+    fake.expect_submitted(&["[Image #1]"]);
+    let four: Vec<String> = (0..SUBMIT_MAX_FILES)
+        .map(|i| drop_photo(&mut m, &format!("p{i}.png")))
+        .collect();
+    let refs: Vec<&str> = four.iter().map(String::as_str).collect();
+    assert_eq!(submit_files(&mut m, &t, "", &refs), Ok(Value::Null));
+    for f in &four {
+        want.extend(typed_file(&canonical(f)));
+    }
+    want.push(b'\r');
+    t.expect_input(&want);
+    fake.expect_submitted(&[
+        "[Image #1]",
+        "[Image #1]  [Image #2]  [Image #3]  [Image #4]",
+    ]);
+}
+
+/// The image never shows attached: nothing after the path's paste is typed, no Enter, and
+/// the outcome is unknown (the path may sit in the composer).
+#[test]
+fn an_image_never_attached_gets_no_enter() {
+    let mut e = env_with(|c| c.submit_attach_timeout = ms(500));
+    let mut m = e.mobile();
+    for agent in ["claude", "codex"] {
+        let t = e.ready(agent);
+        let path = drop_photo(&mut m, "photo.jpg");
+        let started = Instant::now();
+        assert_eq!(
+            submit_files(&mut m, &t, "caption", &[&path]),
+            Err(SUBMIT_UNCONFIRMED.into())
+        );
+        assert!(started.elapsed() >= ms(500));
+        t.expect_input(&pasted(&canonical(&path)));
+        // Still `Pasting…` (Claude Code): not the composer, waited for the same way.
+        if agent == "claude" {
+            fs::write(t.cwd.join("pasting.raw"), screen("claude", "", true)).unwrap();
+            t.run(&format!("cat '{}'", t.cwd.join("pasting.raw").display()));
+            e.wait_ready(&t, Err(SUBMIT_NOT_READY));
+        }
+    }
+}
+
+/// Needs-you while the reply waits for the image: nothing more is typed.
+#[test]
+fn needs_you_while_waiting_for_the_image_stops_the_reply() {
+    let nth = Nth::new(TestPoint::SubmitAttach, 1);
+    let hook = nth.hook();
+    let mut e = env_with(|c| c.test_hook = Some(hook));
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let path = drop_photo(&mut m, "photo.jpg");
+    let id = send_files(&mut m, &t, "caption", &[&path]);
+    nth.wait_held();
+    let first = pasted(&canonical(&path));
+    t.expect_input(&first);
+    e.status(&t, AgentStatus::NeedsYou);
+    nth.release();
+    assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
+    t.expect_input(&first);
+}
+
+/// A reply can only point at drops: anything else is refused before anything is typed.
+#[test]
+fn submit_refuses_foreign_paths() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let good = drop_photo(&mut m, "photo.jpg");
+    let drop_dir = e.h.paths().tmp.join("xshell-clipboard");
+    let in_project = t.cwd.join("shot.png");
+    fs::write(&in_project, "x").unwrap();
+    let link = drop_dir.join("link.png");
+    std::os::unix::fs::symlink(&in_project, &link).unwrap();
+    // A file the Daemon did not save, whose name would type ESC (and end the paste).
+    let esc = drop_dir.join("a\x1b[201~\rb.png");
+    fs::write(&esc, "x").unwrap();
+    let nl = drop_dir.join("a\nb.png");
+    fs::write(&nl, "x").unwrap();
+    let sub = drop_dir.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("c.png"), "x").unwrap();
+    let out_alias = drop_dir.join("out");
+    std::os::unix::fs::symlink(&t.cwd, &out_alias).unwrap();
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let name = Path::new(&good).file_name().unwrap().to_string_lossy();
+    for bad in [
+        "/etc/hosts".to_string(),
+        s(&in_project),
+        s(&link),
+        s(&esc),
+        s(&nl),
+        s(&sub),
+        s(&sub.join("c.png")),
+        s(&out_alias.join("shot.png")),
+        s(&drop_dir.join("missing.png")),
+        name.to_string(),
+        s(&drop_dir.join("../xshell-clipboard/../../../etc/hosts")),
+    ] {
+        assert_eq!(
+            submit_files(&mut m, &t, "look", &[&good, &bad]),
+            Err(SUBMIT_NOT_DROPPED.into()),
+            "{bad:?}"
+        );
+    }
+    let five = vec![good.as_str(); SUBMIT_MAX_FILES + 1];
+    assert_eq!(
+        submit_files(&mut m, &t, "look", &five),
+        Err(SUBMIT_TOO_MANY_FILES.into())
+    );
+    // The text is checked as before; a blank one needs a file.
+    assert_eq!(
+        submit_files(&mut m, &t, "a\x1b", &[&good]),
+        Err("reply contains control characters".into())
+    );
+    assert_eq!(
+        submit_files(&mut m, &t, "", &[]),
+        Err("reply is blank".into())
+    );
+    t.expect_input(b"");
+    // A Desktop is held to the same rule.
+    assert_eq!(
+        submit_files(&mut e.desk, &t, "look", &["/etc/hosts"]),
+        Err(SUBMIT_NOT_DROPPED.into())
+    );
+    t.expect_input(b"");
+}
+
+/// A path with whitespace or quotes is typed quoted, as both agents read a pasted path back
+/// (the fake reads it the way Claude Code does, and attaches each); a path through a
+/// symlinked alias of the drop directory is typed as its canonical path.
+#[test]
+fn submit_quotes_whitespace_path() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(100));
+    let spaced = drop_photo(&mut m, "my photo.jpg");
+    assert!(spaced.ends_with("-my photo.jpg"), "{spaced}");
+    let drop_dir = e.h.paths().tmp.join("xshell-clipboard");
+    let quoted = drop_dir.join(r#"it's "x" \ y.png"#);
+    fs::write(&quoted, "x").unwrap();
+    let alias = e.h.root().join("alias of drops");
+    std::os::unix::fs::symlink(&drop_dir, &alias).unwrap();
+    let via_alias = alias.join(Path::new(&spaced).file_name().unwrap());
+    let q = |p: &str| {
+        let mut v = b"\x1b[200~\"".to_vec();
+        v.extend_from_slice(p.replace('\\', r"\\").replace('"', r#"\""#).as_bytes());
+        v.extend_from_slice(b"\"\x1b[201~ ");
+        v
+    };
+    assert_eq!(
+        submit_files(
+            &mut m,
+            &t,
+            "both",
+            &[
+                &spaced,
+                &quoted.to_string_lossy(),
+                &via_alias.to_string_lossy()
+            ]
+        ),
+        Ok(Value::Null)
+    );
+    let mut want = q(&canonical(&spaced));
+    want.extend(q(&canonical(&quoted.to_string_lossy())));
+    want.extend(q(&canonical(&spaced)));
+    want.extend(typed("both"));
+    t.expect_input(&want);
+    assert!(String::from_utf8_lossy(&want).contains(r#"it's \"x\" \\ y.png"#));
+    fake.expect_submitted(&["[Image #1]  [Image #2]  [Image #3]  both"]);
+}
+
+/// Every refusal of a reply applies with files, and nothing of the reply is typed.
+#[test]
+fn submit_with_files_keeps_the_reply_rules() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let path = drop_photo(&mut m, "photo.jpg");
+    e.status(&t, AgentStatus::NeedsYou);
+    assert_eq!(
+        submit_files(&mut m, &t, "", &[&path]),
+        Err(SUBMIT_NEEDS_YOU.into())
+    );
+    e.status(&t, AgentStatus::Working);
+    t.show("claude-model-picker", true);
+    e.wait_ready(&t, Err(SUBMIT_NOT_READY));
+    assert_eq!(
+        submit_files(&mut m, &t, "x", &[&path]),
+        Err(SUBMIT_NOT_READY.into())
+    );
+    t.expect_input(b"");
+}
+
+/// Holds the `n`-th thread (from 1) that reaches `point`, until released.
+#[derive(Clone)]
+struct Nth(Arc<(Mutex<NthState>, Condvar)>);
+
+/// The point, which arrival to hold, the arrivals so far, and whether it was released.
+type NthState = (TestPoint, usize, usize, bool);
+
+impl Nth {
+    fn new(point: TestPoint, n: usize) -> Self {
+        Nth(Arc::new((Mutex::new((point, n, 0, false)), Condvar::new())))
+    }
+
+    fn hook(&self) -> TestHook {
+        let me = self.clone();
+        TestHook(Arc::new(move |_, p| {
+            let (m, cv) = &*me.0;
+            let mut g = m.lock().unwrap();
+            if g.0 == p {
+                g.2 += 1;
+                if g.2 == g.1 {
+                    cv.notify_all();
+                    let deadline = Instant::now() + T;
+                    while !g.3 && Instant::now() < deadline {
+                        g = cv.wait_timeout(g, ms(50)).unwrap().0;
+                    }
+                }
+            }
+            false
+        }))
+    }
+
+    fn wait_held(&self) {
+        let (m, cv) = &*self.0;
+        let deadline = Instant::now() + T;
+        let mut g = m.lock().unwrap();
+        while g.2 < g.1 {
+            assert!(Instant::now() < deadline, "nothing was held");
+            g = cv.wait_timeout(g, ms(50)).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        let (m, cv) = &*self.0;
+        m.lock().unwrap().3 = true;
+        cv.notify_all();
+    }
+}
+
+/// The agent starts needing you after the photo was attached, before the caption: the
+/// caption and Enter are never typed, and the outcome is unknown (the path may sit in the
+/// composer). One delivery, one readiness rule, for every paste.
+#[test]
+fn readiness_is_checked_again_between_the_pastes() {
+    // The path's paste, its space, then the caption's paste: hold before the third.
+    let nth = Nth::new(TestPoint::SubmitPaste, 3);
+    let hook = nth.hook();
+    let mut e = env_with(|c| c.test_hook = Some(hook));
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(50));
+    let path = drop_photo(&mut m, "photo.jpg");
+    let id = send_files(&mut m, &t, "caption", &[&path]);
+    nth.wait_held();
+    let first = typed_file(&canonical(&path));
+    t.expect_input(&first);
+    e.status(&t, AgentStatus::NeedsYou);
+    nth.release();
+    assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
+    t.expect_input(&first);
+    assert_eq!(e.info(&t).agent_status, Some(AgentStatus::NeedsYou));
+    fake.expect_submitted(&[]);
+}
+
+/// A photo reply never takes the size either, also with a size the Mobile recorded.
+#[test]
+fn submit_files_never_resizes() {
+    let mut e = env();
+    let t = e.ready("claude");
+    e.desk.resize(t.id, 100, 30);
+    e.desk.attach(t.id);
+    std::thread::sleep(ms(500));
+    let mut m = e.mobile();
+    m.attach(t.id);
+    m.resize(t.id, 40, 20);
+    std::thread::sleep(ms(300));
+    let fake = PhotoAgent::start(&t, ms(50));
+    let before = t.sizes();
+    let path = drop_photo(&mut m, "photo.jpg");
+    assert_eq!(submit_files(&mut m, &t, "this", &[&path]), Ok(Value::Null));
+    fake.expect_submitted(&["[Image #1]  this"]);
+    assert_eq!(t.sizes(), before);
+    assert!(
+        m.try_msg(ms(100), |msg| matches!(msg, ServerMsg::TermSize { .. }))
+            .is_none(),
+        "{:?}",
+        m.summary()
+    );
+    drop(fake);
+    t.run("stty size > now.size");
+    assert_eq!(t.file("now.size"), b"30 100\n");
+}
+
+/// Sets `p`'s modification time `age` ago.
+fn age(p: &Path, age: Duration) {
+    fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+/// The drop directory is swept while the Daemon runs, with no upload to trigger it: a file
+/// past the age goes, a newer one stays.
+#[test]
+fn drop_dir_is_swept_without_uploads() {
+    let e = env_with(|c| {
+        c.drop_sweep = ms(100);
+        c.drop_max_age = Duration::from_secs(60);
+    });
+    let drop_dir = e.h.paths().tmp.join("xshell-clipboard");
+    fs::create_dir_all(&drop_dir).unwrap();
+    let old = drop_dir.join("1-old.jpg");
+    let new = drop_dir.join("2-new.jpg");
+    fs::write(&old, "x").unwrap();
+    fs::write(&new, "x").unwrap();
+    age(&old, Duration::from_secs(120));
+    let deadline = Instant::now() + T;
+    while old.exists() {
+        assert!(Instant::now() < deadline, "not swept");
+        std::thread::sleep(ms(20));
+    }
+    std::thread::sleep(ms(300));
+    assert!(new.exists());
+}
+
+/// A file a reply accepted is not swept while the reply is delivered, nor for the grace
+/// after it; then it is.
+#[test]
+fn a_reply_keeps_its_file_from_the_sweep() {
+    let mut e = env_with(|c| {
+        c.drop_sweep = ms(50);
+        c.drop_max_age = Duration::from_secs(60);
+        c.drop_grace = Duration::from_secs(2);
+    });
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(50));
+    let path = drop_photo(&mut m, "photo.jpg");
+    e.hold.at(Some(TestPoint::SubmitEnter));
+    let id = send_files(&mut m, &t, "keep it", &[&path]);
+    e.hold.wait_held();
+    // Old enough to go, and several sweeps run.
+    age(Path::new(&path), Duration::from_secs(120));
+    std::thread::sleep(ms(400));
+    assert!(Path::new(&path).exists(), "swept during delivery");
+    e.hold.at(None);
+    assert_eq!(m.wait_res(id), Ok(Value::Null));
+    fake.expect_submitted(&["[Image #1]  keep it"]);
+    // In the grace period still.
+    assert!(Path::new(&path).exists(), "swept in the grace period");
+    let deadline = Instant::now() + T;
+    while Path::new(&path).exists() {
+        assert!(Instant::now() < deadline, "never swept");
+        std::thread::sleep(ms(20));
+    }
+}
+
+/// Two photo replies queued back to back: B is accepted while A's chip shows (A held before
+/// its Enter); A then submits and the composer clears before B's paste. B counts the images
+/// at its own paste, not at its admission, and submits with its image.
+#[test]
+fn a_queued_photo_reply_counts_images_at_its_paste() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(100));
+    let a = drop_photo(&mut m, "a.jpg");
+    let b = drop_photo(&mut m, "b.jpg");
+    e.hold.at(Some(TestPoint::SubmitEnter));
+    let ida = send_files(&mut m, &t, "first", &[&a]);
+    e.hold.wait_held();
+    fake.wait_drawn("[Image #1]  first");
+    let idb = send_files(&mut m, &t, "second", &[&b]);
+    // A's Enter goes; B is held before its first paste until the composer is clear.
+    e.hold.at(Some(TestPoint::SubmitPaste));
+    assert_eq!(m.wait_res(ida), Ok(Value::Null));
+    e.hold.wait_held();
+    fake.wait_drawn("");
+    e.hold.at(None);
+    assert_eq!(m.wait_res(idb), Ok(Value::Null));
+    fake.expect_submitted(&["[Image #1]  first", "[Image #1]  second"]);
+}
+
+/// An image already in the composer, removed by input queued ahead of the reply (a
+/// Desktop's Ctrl+U): the reply's file is counted from what is there at its paste.
+#[test]
+fn a_removed_chip_does_not_stall_a_later_photo() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let fake = PhotoAgent::start(&t, ms(100));
+    let a = drop_photo(&mut m, "a.jpg");
+    let b = drop_photo(&mut m, "b.jpg");
+    // A draft with an image (as a Desktop would paste one), not submitted.
+    e.desk
+        .request(&ClientMsg::TermInput {
+            terminal: t.id,
+            data: String::from_utf8(pasted(&canonical(&a))).unwrap(),
+        })
+        .unwrap();
+    fake.wait_drawn("[Image #1] ");
+    // Ctrl+U queued ahead of the reply; the reply is admitted while the image still shows
+    // (the fake redraws only after it read the key).
+    e.hold.at(Some(TestPoint::SubmitPaste));
+    e.desk
+        .request(&ClientMsg::TermInput {
+            terminal: t.id,
+            data: "\u{15}".into(),
+        })
+        .unwrap();
+    let id = send_files(&mut m, &t, "this one", &[&b]);
+    e.hold.wait_held();
+    fake.wait_drawn("");
+    e.hold.at(None);
+    assert_eq!(m.wait_res(id), Ok(Value::Null));
+    fake.expect_submitted(&["[Image #1]  this one"]);
+}
+
+/// An image goes away while the reply waits for its own (the composer was cleared): its
+/// chip cannot be told apart, so nothing more is typed and the outcome is unknown.
+#[test]
+fn a_chip_removed_while_waiting_stops_the_reply() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    let draw = |input: &str, name: &str| {
+        let f = t.cwd.join(name);
+        fs::write(&f, screen("claude", input, false)).unwrap();
+        t.run(&format!("cat '{}'; printf '\\033[?2004h'", f.display()));
+    };
+    draw("[Image #1] ", "one.raw");
+    e.wait_ready(&t, Ok(()));
+    std::thread::sleep(ms(200));
+    let path = drop_photo(&mut m, "photo.jpg");
+    e.hold.at(Some(TestPoint::SubmitAttach));
+    let id = send_files(&mut m, &t, "caption", &[&path]);
+    e.hold.wait_held();
+    draw("", "none.raw");
+    e.wait_ready(&t, Ok(()));
+    std::thread::sleep(ms(200));
+    e.hold.at(None);
+    assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
+    t.expect_input(&pasted(&canonical(&path)));
 }

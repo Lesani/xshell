@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use xshell_core::agent_status::HookAgent;
-use xshell_core::prompt::{composer, extract, screen_tail, Found, ScreenModel};
+use xshell_core::prompt::{composer, composer_images, extract, screen_tail, Found, ScreenModel};
 
 fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompts")
@@ -261,6 +261,28 @@ fn composer_is_recognised_only_where_marked() {
         }
     }
     assert!(yes.values().all(|n| *n >= 3) && yes.len() == 2, "{yes:?}");
+}
+
+/// The image chips counted in each composer's input (`term.submit` files wait for them),
+/// and none read from a screen that is not the composer: Claude Code reading a pasted
+/// image (`Pasting…`) is not.
+#[test]
+fn composer_images_are_counted_where_marked() {
+    let mut seen = 0;
+    for fx in Fixture::all() {
+        let want = fx.meta["images"].as_u64().map(|n| n as usize);
+        assert_eq!(composer_images(fx.agent, &fx.screen()), want, "{}", fx.name);
+        seen += usize::from(want.is_some_and(|n| n > 0));
+    }
+    assert_eq!(seen, 2);
+    let pasting = Fixture::load("claude-composer-pasting");
+    assert_eq!(composer_images(pasting.agent, &pasting.screen()), None);
+    // A chip in the conversation above the composer is not counted.
+    let idle = Fixture::load("claude-composer-idle");
+    let mut m = ScreenModel::new(idle.cols, idle.rows);
+    m.feed(b"> [Image #1] what is this\r\n");
+    m.feed(&idle.raw);
+    assert_eq!(composer_images(idle.agent, &m.rows()), Some(0));
 }
 
 /// Every composer fixture turns bracketed paste on as the agents do; the screen model

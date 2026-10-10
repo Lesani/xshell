@@ -10,15 +10,16 @@ use portable_pty::{native_pty_system, MasterPty, PtySize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_core::agent_status::{AgentStatus, HookAgent, TerminalHooks, Tracker};
 use xshell_core::launch::{relaunch_spec, LaunchSpec};
-use xshell_core::prompt::{composer, extract, screen_tail, ScreenModel};
+use xshell_core::prompt::{composer, composer_images, extract, screen_tail, ScreenModel};
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
 use xshell_protocol::msg::{
@@ -116,6 +117,10 @@ pub(crate) enum Input {
 pub(crate) enum SubmitStep {
     /// A piece of the paste, after checking the agent still accepts the reply.
     Paste,
+    /// The first piece of a file's paste: as [`SubmitStep::Paste`], and the images
+    /// attached in the composer are counted under the same check, as the baseline the file
+    /// must add one to.
+    PasteFile,
     /// Enter, after the pause, after checking again.
     Enter,
     /// The rest of a paste that was stopped: whatever completes the bracketed paste frame
@@ -131,6 +136,11 @@ pub(crate) type WriteNow<'a> = dyn FnMut() -> std::io::Result<usize> + 'a;
 type SubmitGate =
     Box<dyn FnMut(SubmitStep, &mut WriteNow<'_>) -> Result<std::io::Result<usize>, String> + Send>;
 type SubmitDone = Box<dyn FnOnce(Result<(), String>) + Send>;
+/// Whether a reply's `n`-th file (from 1) shows attached in the agent's composer: `Ok(false)`
+/// not yet, an `Err` when the reply must stop (the agent needs you, the Terminal ended).
+pub(crate) type SubmitAttach = Box<dyn FnMut(usize) -> Result<bool, String> + Send>;
+/// How long a reply waits for a file to show attached (`Config::submit_attach_timeout`).
+pub(crate) const SUBMIT_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A paste is written in pieces of at most this many bytes, each under its own check.
 const SUBMIT_CHUNK: usize = 1024;
@@ -152,7 +162,16 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 /// of) the paste was written but Enter was not (also when the Terminal ends with the reply
 /// half typed).
 pub(crate) struct Submit {
+    /// Everything typed before Enter: one or more bracketed pastes (`frames`), with a space
+    /// typed after each file's.
     pub paste: Vec<u8>,
+    frames: Vec<Range<usize>>,
+    /// Offsets in `paste` after which `attach` must answer `true` before more is typed.
+    waits: Vec<usize>,
+    /// Whether the `n`-th file (from 1) shows attached; an `Err` stops the reply. Called
+    /// with nothing held, every [`SUBMIT_WAIT`], for at most `attach_timeout`.
+    attach: Option<SubmitAttach>,
+    pub attach_timeout: Duration,
     pub enter_after: Duration,
     pub stall: Duration,
     pub gate: SubmitGate,
@@ -163,9 +182,13 @@ pub(crate) struct Submit {
 }
 
 impl Submit {
-    pub fn new(paste: Vec<u8>, enter_after: Duration, gate: SubmitGate, done: SubmitDone) -> Self {
+    pub fn new(typing: Typing, enter_after: Duration, gate: SubmitGate, done: SubmitDone) -> Self {
         Self {
-            paste,
+            paste: typing.bytes,
+            frames: typing.frames,
+            waits: typing.waits,
+            attach: None,
+            attach_timeout: SUBMIT_ATTACH_TIMEOUT,
             enter_after,
             stall: SUBMIT_STALL,
             gate,
@@ -173,6 +196,19 @@ impl Submit {
             stuck: None,
             pasted: false,
         }
+    }
+
+    /// Whether a file's paste starts at `off`.
+    fn file_starts_at(&self, off: usize) -> bool {
+        self.frames
+            .iter()
+            .any(|f| f.start == off && self.waits.contains(&f.end))
+    }
+
+    /// Wait at each file with `attach`.
+    pub fn on_attach(mut self, attach: SubmitAttach) -> Self {
+        self.attach = Some(attach);
+        self
     }
 
     /// Call `stuck` when a stopped paste cannot be completed.
@@ -205,6 +241,28 @@ impl Drop for Submit {
     }
 }
 
+impl Submit {
+    /// Where the next piece of the paste after its first `off` bytes ends: at most
+    /// [`SUBMIT_CHUNK`] on, and never across the start or end of a bracketed paste.
+    fn piece_end(&self, off: usize) -> usize {
+        self.frames
+            .iter()
+            .flat_map(|f| [f.start, f.end])
+            .filter(|&b| b > off)
+            .fold((off + SUBMIT_CHUNK).min(self.paste.len()), usize::min)
+    }
+
+    /// What completes the paste once its first `off` bytes were written: the bracketed
+    /// paste `off` is inside of completed ([`paste_close`]); nothing between two.
+    fn close_at(&self, off: usize) -> Vec<u8> {
+        self.frames
+            .iter()
+            .find(|f| f.start < off && off < f.end)
+            .map(|f| paste_close(&self.paste[f.clone()], off - f.start))
+            .unwrap_or_default()
+    }
+}
+
 /// The bracketed paste `text` is typed as.
 fn bracketed(text: &str) -> Vec<u8> {
     let mut v = Vec::with_capacity(text.len() + 12);
@@ -212,6 +270,77 @@ fn bracketed(text: &str) -> Vec<u8> {
     v.extend_from_slice(text.as_bytes());
     v.extend_from_slice(PASTE_END);
     v
+}
+
+/// What a reply types before Enter: `bytes`, made of the bracketed pastes at `frames` and
+/// what is typed between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Typing {
+    bytes: Vec<u8>,
+    frames: Vec<Range<usize>>,
+    /// Where a file's paste ends: nothing more is typed until the agent shows that file
+    /// attached.
+    waits: Vec<usize>,
+}
+
+impl Typing {
+    /// Each of `paths` (as [`typed_path`] gives them) as a bracketed paste of its own
+    /// followed by a space, then `text` as one if there is one. Codex attaches an image
+    /// only when a paste is exactly its path; Claude Code reads a pasted image path too, but
+    /// asynchronously, and drops an Enter that comes while it reads: after each path's
+    /// paste the reply waits until the image shows attached ([`SubmitAttach`]).
+    pub fn reply(paths: &[String], text: Option<&str>) -> Self {
+        let mut t = Typing {
+            bytes: Vec::new(),
+            frames: Vec::new(),
+            waits: Vec::new(),
+        };
+        let paste = |t: &mut Typing, s: &str| {
+            let start = t.bytes.len();
+            t.bytes.extend(bracketed(s));
+            t.frames.push(start..t.bytes.len());
+        };
+        for p in paths {
+            paste(&mut t, p);
+            t.waits.push(t.bytes.len());
+            t.bytes.push(b' ');
+        }
+        if let Some(text) = text {
+            paste(&mut t, text);
+        }
+        t
+    }
+
+    /// `text` alone.
+    #[cfg(test)]
+    pub fn text(text: &str) -> Self {
+        Self::reply(&[], Some(text))
+    }
+}
+
+/// How the path of a dropped file is typed: as it is when every character is one no agent
+/// reads specially (letters, digits, `/._-+,@:%=~`); otherwise in double quotes with `"` and
+/// `\` escaped by `\`. Claude Code strips the outer quotes and then the backslash escapes;
+/// Codex reads a pasted path as one shell word. `None` for a path with a control character
+/// (ESC, a newline…), which is never typed.
+pub(crate) fn typed_path(path: &str) -> Option<String> {
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    let plain = |c: char| c.is_alphanumeric() || "/._-+,@:%=~".contains(c);
+    if path.chars().all(plain) {
+        return Some(path.to_string());
+    }
+    let mut q = String::with_capacity(path.len() + 2);
+    q.push('"');
+    for c in path.chars() {
+        if c == '"' || c == '\\' {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    Some(q)
 }
 
 /// What completes `paste` (a bracketed paste) once its first `off` bytes were written:
@@ -330,7 +459,7 @@ fn close_paste(
     off: usize,
     sleep: &dyn Fn(Duration),
 ) -> std::io::Result<()> {
-    let rest = paste_close(&s.paste, off);
+    let rest = s.close_at(off);
     let (mut done, mut waited) = (0, Duration::ZERO);
     while done < rest.len() {
         match gated(&mut s, SubmitStep::Close, w, &rest[done..])? {
@@ -354,6 +483,27 @@ fn close_paste(
     Ok(())
 }
 
+/// Wait until the reply's `n`-th file shows attached: polled holding nothing, every
+/// [`SUBMIT_WAIT`], for at most `attach_timeout`. `false` when it did not, or the reply must
+/// stop.
+fn wait_attached(s: &mut Submit, n: usize, sleep: &dyn Fn(Duration)) -> bool {
+    let timeout = s.attach_timeout;
+    let Some(attach) = s.attach.as_mut() else {
+        return true;
+    };
+    let mut waited = Duration::ZERO;
+    loop {
+        match attach(n) {
+            Ok(true) => return true,
+            Ok(false) if waited < timeout => {
+                sleep(SUBMIT_WAIT);
+                waited += SUBMIT_WAIT;
+            }
+            Ok(false) | Err(_) => return false,
+        }
+    }
+}
+
 /// Write one input item. A [`Submit`] is the paste, in pieces, and `enter_after` later
 /// (`sleep`) a separate `\r`: Enter must not arrive in the same read as the paste (the agent
 /// would take it as part of it), nor after the agent stopped accepting the reply (it would
@@ -372,12 +522,23 @@ pub(crate) fn write_item(
     };
     let (mut off, mut waited) = (0, Duration::ZERO);
     while off < s.paste.len() {
-        let piece = s.paste[off..s.paste.len().min(off + SUBMIT_CHUNK)].to_vec();
-        match gated(&mut s, SubmitStep::Paste, w, &piece)? {
+        let piece = s.paste[off..s.piece_end(off)].to_vec();
+        let step = if s.file_starts_at(off) {
+            SubmitStep::PasteFile
+        } else {
+            SubmitStep::Paste
+        };
+        match gated(&mut s, step, w, &piece)? {
             Step::Wrote(n) => {
                 off += n;
                 s.pasted = true;
                 waited = Duration::ZERO;
+                if let Some(k) = s.waits.iter().position(|&w| w == off) {
+                    if !wait_attached(&mut s, k + 1, sleep) {
+                        // At the end of a paste: nothing to complete, nothing more typed.
+                        return close_paste(s, w, off, sleep);
+                    }
+                }
                 continue;
             }
             Step::Full if waited < s.stall => {
@@ -1118,6 +1279,33 @@ impl Terminal {
         }
     }
 
+    /// Whether the agent's composer shows at least `want` attached images (a reply's file
+    /// was taken), with the screen, prompt and status held. `Err` when the reply must stop:
+    /// the agent needs you or shows a prompt, or the Terminal ended.
+    fn images_attached(&self, base: usize) -> Result<bool, String> {
+        self.reply_life()?;
+        let g = self.screen.lock().unwrap();
+        let p = self.prompt.lock().unwrap();
+        let c = self.status.lock().unwrap();
+        if p.is_current() || c.tracker.status() == Some(AgentStatus::NeedsYou) {
+            return Err(SUBMIT_NEEDS_YOU.into());
+        }
+        let Some(s) = g.as_ref() else {
+            return Ok(false);
+        };
+        let rows = s.model.rows();
+        if extract(s.agent, &rows).is_some() {
+            return Err(SUBMIT_NEEDS_YOU.into());
+        }
+        match composer_images(s.agent, &rows) {
+            // An image went away (the composer was cleared or edited): the file's chip
+            // cannot be told apart any more.
+            Some(n) if n < base => Err(SUBMIT_NOT_READY.into()),
+            Some(n) => Ok(n > base),
+            None => Ok(false),
+        }
+    }
+
     /// [`Self::reply_ready`], after [`Self::reply_life`].
     pub fn check_reply(&self) -> Result<(), String> {
         self.reply_life()?;
@@ -1133,11 +1321,15 @@ impl Terminal {
     /// write (the write never blocks). Enter, once written, starts the turn it starts for a
     /// Desktop's Enter (Codex), under the same locks: a report that comes after it is applied
     /// after it, never overwritten by it.
+    ///
+    /// For a file's paste ([`SubmitStep::PasteFile`]), `images` gets the count of images
+    /// attached in the composer as the check saw it, right before the write.
     fn write_if_ready(
         &self,
         d: &Daemon,
         step: SubmitStep,
         write: &mut WriteNow<'_>,
+        images: &AtomicUsize,
     ) -> Result<std::io::Result<usize>, String> {
         // Completing a stopped paste is written whatever the readiness: its end marker is
         // what keeps the next key out of the paste.
@@ -1151,6 +1343,13 @@ impl Terminal {
         if check {
             Self::reply_ready(&g, &p, &c)?;
             d.test_point(self.id, TestPoint::SubmitChecked);
+        }
+        if step == SubmitStep::PasteFile {
+            let n = g
+                .as_ref()
+                .and_then(|s| composer_images(s.agent, &s.model.rows()))
+                .unwrap_or(0);
+            images.store(n, Ordering::SeqCst);
         }
         let r = write();
         let mut changed = None;
@@ -1179,9 +1378,10 @@ impl Terminal {
         Ok(r)
     }
 
-    /// Reply `text` (already checked by `submit_text`) to the agent's chat
-    /// (`term.submit`): queue it as one bracketed paste and, after
-    /// `Config::submit_enter_delay`, Enter. It never touches the size. Refused now (`Err`,
+    /// Reply `typing` (a checked text, and the checked paths of dropped files, as
+    /// [`Typing::reply`] makes them) to the agent's chat (`term.submit`): queue its bracketed
+    /// pastes and, after `Config::submit_enter_delay`, Enter, as one item. It never touches
+    /// the size. Refused now (`Err`,
     /// `done` never called) unless this is a direct Claude Code or Codex chat whose reply
     /// is ready ([`Self::reply_ready`], checked with the screen held until it is queued);
     /// otherwise `done` gets the outcome from the input thread, which writes each piece of
@@ -1189,7 +1389,7 @@ impl Terminal {
     pub fn submit(
         self: &Arc<Self>,
         d: &Arc<Daemon>,
-        text: &str,
+        typing: Typing,
         done: Box<dyn FnOnce(Result<(), String>) + Send>,
     ) -> Result<(), String> {
         if cfg!(windows) {
@@ -1207,19 +1407,22 @@ impl Terminal {
             return Err(SUBMIT_STUCK.into());
         }
         let id = self.id;
-        let (weak, dg) = (Arc::downgrade(self), d.clone());
+        // The images in the composer right before the current file's paste (delivery, not
+        // admission: input queued ahead of this reply may change the composer).
+        let images = Arc::new(AtomicUsize::new(0));
+        let (weak, dg, base) = (Arc::downgrade(self), d.clone(), images.clone());
         let gate: SubmitGate = Box::new(move |step, write| {
             dg.test_point(
                 id,
                 match step {
-                    SubmitStep::Paste => TestPoint::SubmitPaste,
+                    SubmitStep::Paste | SubmitStep::PasteFile => TestPoint::SubmitPaste,
                     SubmitStep::Enter => TestPoint::SubmitEnter,
                     SubmitStep::Close => TestPoint::SubmitClose,
                 },
             );
             weak.upgrade()
                 .ok_or_else(|| "terminal has exited".to_string())?
-                .write_if_ready(&dg, step, write)
+                .write_if_ready(&dg, step, write, &base)
         });
         let dd = d.clone();
         let done = Box::new(move |r: Result<(), String>| {
@@ -1232,6 +1435,14 @@ impl Terminal {
             let c = self.status.lock().unwrap();
             Self::reply_ready(&g, &p, &c)?;
         }
+        // Each file must add one image to the composer's count before its paste.
+        let (weak, da) = (Arc::downgrade(self), d.clone());
+        let attach: SubmitAttach = Box::new(move |_| {
+            da.test_point(id, TestPoint::SubmitAttach);
+            weak.upgrade()
+                .ok_or_else(|| "terminal has exited".to_string())?
+                .images_attached(images.load(Ordering::SeqCst))
+        });
         let input = self.input.lock().unwrap();
         let tx = input.as_ref().ok_or("terminal has exited")?;
         // Made only now: once made, its outcome is reported.
@@ -1245,9 +1456,11 @@ impl Terminal {
                 t.reply_stuck.store(true, Ordering::SeqCst);
             }
         });
-        let mut item =
-            Submit::new(bracketed(text), d.cfg.submit_enter_delay, gate, done).on_stuck(stuck);
+        let mut item = Submit::new(typing, d.cfg.submit_enter_delay, gate, done)
+            .on_stuck(stuck)
+            .on_attach(attach);
         item.stall = d.cfg.submit_stall;
+        item.attach_timeout = d.cfg.submit_attach_timeout;
         let refused = match tx.try_send(Input::Submit(Box::new(item))) {
             Ok(()) => None,
             Err(TrySendError::Full(i)) => Some((i, "input backlog full")),
@@ -2686,7 +2899,7 @@ mod status_tests {
         });
         let done = Box::new(move |res| r.lock().unwrap().push(res));
         Input::Submit(Box::new(Submit::new(
-            bracketed(text),
+            Typing::text(text),
             Duration::from_millis(50),
             gate,
             done,
@@ -2837,6 +3050,262 @@ mod status_tests {
             ["gate Close", "write \"\\u{1b}[201~\""]
         );
         assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+    }
+
+    /// A submit of `typing`, gated as [`submit_of`].
+    fn submit_typing(
+        typing: Typing,
+        ops: &Arc<Mutex<Vec<String>>>,
+        out: &Outcome,
+        mut gates: Vec<Result<(), String>>,
+    ) -> Input {
+        let (o, r) = (ops.clone(), out.clone());
+        gates.reverse();
+        let gate: SubmitGate = Box::new(move |step, write| {
+            o.lock().unwrap().push(format!("gate {step:?}"));
+            gates.pop().unwrap_or(Ok(()))?;
+            Ok(write())
+        });
+        let done = Box::new(move |res| r.lock().unwrap().push(res));
+        Input::Submit(Box::new(Submit::new(
+            typing,
+            Duration::from_millis(50),
+            gate,
+            done,
+        )))
+    }
+
+    #[test]
+    fn typed_paths_are_quoted_as_the_agents_read_them() {
+        for (p, want) in [
+            (
+                "/run/user/1000/xshell/tmp/xshell-clipboard/1-ab-photo.jpg",
+                Some("/run/user/1000/xshell/tmp/xshell-clipboard/1-ab-photo.jpg"),
+            ),
+            ("/home/é/x+y,z@h:1%=~.png", Some("/home/é/x+y,z@h:1%=~.png")),
+            ("/home/a b/p.jpg", Some(r#""/home/a b/p.jpg""#)),
+            (
+                r#"/home/it's "x"/p.jpg"#,
+                Some(r#""/home/it's \"x\"/p.jpg""#),
+            ),
+            (r"/home/a\b/p.jpg", Some(r#""/home/a\\b/p.jpg""#)),
+            (
+                "/home/$HOME/`x`;|&#*?[]<>(){}!/p.jpg",
+                Some("\"/home/$HOME/`x`;|&#*?[]<>(){}!/p.jpg\""),
+            ),
+            ("/home/a\x1b[201~/p.jpg", None),
+            ("/home/a\nb/p.jpg", None),
+            ("/home/a\rb/p.jpg", None),
+            ("/home/a\tb/p.jpg", None),
+            ("/home/a\u{9b}b/p.jpg", None),
+            ("/home/a\x7fb/p.jpg", None),
+        ] {
+            assert_eq!(typed_path(p).as_deref(), want, "{p:?}");
+        }
+        // What Claude Code does with a pasted path: outer quotes off, then `\x` → `x`
+        // (`\\` → `\`). Every quoted path comes back as it was.
+        let claude = |t: &str| {
+            let t = t
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(t);
+            let mut out = String::new();
+            let mut it = t.chars();
+            while let Some(c) = it.next() {
+                out.push(if c == '\\' { it.next().unwrap_or(c) } else { c });
+            }
+            out
+        };
+        for p in [
+            "/a b/c.jpg",
+            r#"/it's "x"/p.jpg"#,
+            r"/a\b\\c/p.jpg",
+            "/plain/p.png",
+        ] {
+            assert_eq!(claude(&typed_path(p).unwrap()), p);
+        }
+    }
+
+    #[test]
+    fn a_reply_with_files_types_each_path_as_its_own_paste() {
+        let typing = Typing::reply(
+            &["/d/1-a.jpg".into(), r#""/d d/2.png""#.into()],
+            Some("what is this"),
+        );
+        let mut want = b"\x1b[200~/d/1-a.jpg\x1b[201~ ".to_vec();
+        want.extend_from_slice(b"\x1b[200~\"/d d/2.png\"\x1b[201~ ");
+        want.extend_from_slice(b"\x1b[200~what is this\x1b[201~");
+        assert_eq!(typing.bytes, want);
+        assert_eq!(typing.frames.len(), 3);
+        for f in &typing.frames {
+            assert!(typing.bytes[f.clone()].starts_with(PASTE_START));
+            assert!(typing.bytes[f.clone()].ends_with(PASTE_END));
+        }
+        // No caption: the paths only.
+        let only = Typing::reply(&["/d/1-a.jpg".into()], None);
+        assert_eq!(only.bytes, b"\x1b[200~/d/1-a.jpg\x1b[201~ ");
+        // Written in one item: each paste a gated piece of its own, then Enter after the
+        // pause.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        write_item(
+            &mut w,
+            submit_typing(typing, &ops, &out, vec![]),
+            &sleeper(&ops),
+        )
+        .unwrap();
+        want.push(b'\r');
+        assert_eq!(w.input, want);
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        assert_eq!(
+            &ops[..],
+            [
+                "gate PasteFile",
+                "write \"\\u{1b}[200~/d/1-a.jpg\\u{1b}[201~\"",
+                "gate Paste",
+                "write \" \"",
+                "gate PasteFile",
+                "write \"\\u{1b}[200~\\\"/d d/2.png\\\"\\u{1b}[201~\"",
+                "gate Paste",
+                "write \" \"",
+                "gate Paste",
+                "write \"\\u{1b}[200~what is this\\u{1b}[201~\"",
+                "sleep 50ms",
+                "gate Enter",
+                "write \"\\r\"",
+            ]
+        );
+    }
+
+    /// After each file's paste the reply waits, holding nothing, until the file shows
+    /// attached, before its space; and stops with no more typed when it never does or the
+    /// agent needs you meanwhile.
+    #[test]
+    fn a_reply_waits_for_each_file_to_attach() {
+        let typing = || Typing::reply(&["/d/1.jpg".into(), "/d/2.jpg".into()], Some("cap"));
+        assert_eq!(typing().waits, [20, 41]);
+        // Attached after two checks, then at once.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let o = ops.clone();
+        let mut answers = vec![Ok(true), Ok(true), Ok(false), Ok(false)];
+        let attach: SubmitAttach = Box::new(move |n| {
+            o.lock().unwrap().push(format!("attach {n}"));
+            answers.pop().unwrap()
+        });
+        let Input::Submit(s) = submit_typing(typing(), &ops, &out, vec![]) else {
+            unreachable!()
+        };
+        let s = s.on_attach(attach);
+        write_item(&mut w, Input::Submit(Box::new(s)), &sleeper(&ops)).unwrap();
+        assert_eq!(*out.lock().unwrap(), [Ok(())]);
+        let ops = ops.lock().unwrap();
+        let first = ops.iter().position(|o| o == "attach 1").unwrap();
+        assert_eq!(
+            &ops[first - 1..first + 9],
+            [
+                "write \"\\u{1b}[200~/d/1.jpg\\u{1b}[201~\"",
+                "attach 1",
+                "sleep 10ms",
+                "attach 1",
+                "sleep 10ms",
+                "attach 1",
+                "gate Paste",
+                "write \" \"",
+                "gate PasteFile",
+                "write \"\\u{1b}[200~/d/2.jpg\\u{1b}[201~\"",
+            ]
+        );
+        assert_eq!(ops[first + 9], "attach 2");
+        assert_eq!(ops[first + 10], "gate Paste");
+        // Never attached within the timeout: no space, no caption, no Enter.
+        for answer in [Ok(false), Err(SUBMIT_NEEDS_YOU.to_string())] {
+            let mut w = Recorder::default();
+            let ops = w.ops.clone();
+            let out = Outcome::default();
+            let Input::Submit(s) = submit_typing(typing(), &ops, &out, vec![]) else {
+                unreachable!()
+            };
+            let a = answer.clone();
+            let mut s = s.on_attach(Box::new(move |_| a.clone()));
+            s.attach_timeout = Duration::from_millis(30);
+            write_item(&mut w, Input::Submit(Box::new(s)), &sleeper(&ops)).unwrap();
+            assert_eq!(w.input, b"\x1b[200~/d/1.jpg\x1b[201~", "{answer:?}");
+            assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+            let sleeps = ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| *o == "sleep 10ms")
+                .count();
+            assert_eq!(sleeps, if answer.is_ok() { 3 } else { 0 });
+        }
+    }
+
+    /// Stopped inside the second paste: that paste is closed, nothing else is typed (no
+    /// caption, no Enter), and the outcome is unknown. Stopped between two pastes: nothing
+    /// to close. Before the first: refused, nothing written.
+    #[test]
+    fn a_reply_with_files_stops_cleanly() {
+        let typing = || Typing::reply(&["/d/1.jpg".into(), "/d/2.jpg".into()], Some("cap"));
+        let first = b"\x1b[200~/d/1.jpg\x1b[201~ ".to_vec();
+        // Refused at the second paste's second piece (it takes 4 bytes at a time).
+        let mut w = Recorder {
+            take: Some(4),
+            ..Default::default()
+        };
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        // The first paste in 4-byte pieces, its space, one piece of the second.
+        let pieces = (first.len() - 1).div_ceil(4) + 2;
+        let mut gates = vec![Ok(()); pieces];
+        gates.push(Err(SUBMIT_NEEDS_YOU.into()));
+        write_item(
+            &mut w,
+            submit_typing(typing(), &ops, &out, gates),
+            &sleeper(&ops),
+        )
+        .unwrap();
+        let mut want = first.clone();
+        want.extend_from_slice(b"\x1b[20");
+        want.extend_from_slice(b"0~");
+        want.extend_from_slice(PASTE_END);
+        assert_eq!(
+            String::from_utf8_lossy(&w.input),
+            String::from_utf8_lossy(&want)
+        );
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        assert!(!ops.lock().unwrap().iter().any(|o| o.contains("\\r")));
+        // Refused right after the first path and its space: nothing to close.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let gates = vec![Ok(()), Ok(()), Err(SUBMIT_NOT_READY.into())];
+        write_item(
+            &mut w,
+            submit_typing(typing(), &ops, &out, gates),
+            &sleeper(&ops),
+        )
+        .unwrap();
+        assert_eq!(w.input, first);
+        assert_eq!(ops.lock().unwrap().last().unwrap(), "gate PasteFile");
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_UNCONFIRMED.to_string())]);
+        // Refused before anything: the refusal.
+        let mut w = Recorder::default();
+        let ops = w.ops.clone();
+        let out = Outcome::default();
+        let gates = vec![Err(SUBMIT_NEEDS_YOU.into())];
+        write_item(
+            &mut w,
+            submit_typing(typing(), &ops, &out, gates),
+            &sleeper(&ops),
+        )
+        .unwrap();
+        assert!(w.input.is_empty());
+        assert_eq!(*out.lock().unwrap(), [Err(SUBMIT_NEEDS_YOU.to_string())]);
     }
 
     /// The end marker cannot be written in time: the Terminal's replies are stuck.

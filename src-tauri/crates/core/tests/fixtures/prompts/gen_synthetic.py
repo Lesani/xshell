@@ -228,6 +228,12 @@ def claude_fixtures(cols):
     out["claude-composer-working"] = (hist + "\r\n".join(working), None)
     draft = claude_composer(cols, ("first line of a draft", "second line"))
     out["claude-composer-draft"] = (hist + "\r\n".join(draft), None)
+    # A pasted image path being read (`Pasting…` in place of the footer hints: not the
+    # composer), then attached as a chip in the input.
+    pasting = claude_composer(cols, footer="Pasting…")
+    out["claude-composer-pasting"] = (hist + "\r\n".join(pasting), None)
+    image = claude_composer(cols, ("[Image #1] ",))
+    out["claude-composer-image"] = (hist + "\r\n".join(image), None)
     bash_mode = claude_composer(cols, ("ls",), mark="!", footer="! for shell mode")
     out["claude-bash-mode"] = (hist + "\r\n".join(bash_mode), None)
     picker = [DIM + "─" * cols + RESET, " " + BOLD + "Select model" + RESET]
@@ -349,6 +355,8 @@ def codex_fixtures(cols):
     out["codex-composer-working"] = (base + codex_viewport(cols, working), None)
     draft = codex_composer(("first line of a draft", "second line"))
     out["codex-composer-draft"] = (base + codex_viewport(cols, draft), None)
+    image = codex_composer(("[Image #1] ",))
+    out["codex-composer-image"] = (base + codex_viewport(cols, image), None)
     picker = ["", "  " + BOLD + "Select Model" + RESET,
               "  " + DIM + "Pick a quick auto mode or browse all models." + RESET, ""]
     picker += codex_options(cols, ["auto", "gpt-5-codex", "gpt-5"])
@@ -398,7 +406,9 @@ def codex_fixtures(cols):
 # The screens that end with the agent's chat composer; every other one does not.
 COMPOSERS = {"claude-idle", "claude-composer-idle", "claude-composer-working",
              "claude-composer-draft", "codex-composer-idle", "codex-composer-working",
-             "codex-composer-draft"}
+             "codex-composer-draft", "claude-composer-image", "codex-composer-image"}
+# The composers with an attached image chip, and how many.
+IMAGES = {"claude-composer-image": 1, "codex-composer-image": 1}
 
 
 def main():
@@ -410,11 +420,13 @@ def main():
                                          "claude-composer-idle", "claude-composer-working",
                                          "claude-composer-draft", "claude-bash-mode",
                                          "claude-model-picker", "claude-composer-question",
-                                         "claude-composer-statusline"]),
+                                         "claude-composer-statusline",
+                                         "claude-composer-pasting", "claude-composer-image"]),
         ("claude", CLAUDE_VERSION, 50, ["claude-bash"]),
         ("codex", CODEX_VERSION, 100, ["codex-exec", "codex-edits", "codex-composer-idle",
                                        "codex-composer-working", "codex-composer-draft",
-                                       "codex-model-picker", "codex-unnumbered-picker"]),
+                                       "codex-model-picker", "codex-unnumbered-picker",
+                                       "codex-composer-image"]),
         ("codex", CODEX_VERSION, 50, ["codex-exec"]),
     ]
     for agent, version, cols, names in plan:
@@ -436,6 +448,9 @@ def main():
                 # Whether the screen ends with the agent's chat composer (term.submit).
                 "composer": name in COMPOSERS,
             }
+            if name in COMPOSERS:
+                # The image chips in its composer (term.submit files).
+                side["images"] = IMAGES.get(name, 0)
             with open(os.path.join(dest, base + ".json"), "w") as f:
                 json.dump(side, f, indent=2, ensure_ascii=False)
                 f.write("\n")

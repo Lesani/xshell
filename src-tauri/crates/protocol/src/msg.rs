@@ -180,9 +180,39 @@ pub enum ClientMsg {
     /// so the answer comes once the reply is typed: `null` when paste and Enter were written; a refusal above when nothing was;
     /// [`SUBMIT_UNCONFIRMED`] when the paste may have been written but Enter was not.
     /// Gated on the `term.submit` capability.
+    ///
+    /// `files` (capability `term.submit-files`; an older Daemon ignores the field) are paths
+    /// `save_dropped_file` returned on this Host, at most [`SUBMIT_MAX_FILES`]: each must be a
+    /// regular file directly in the Daemon's drop directory ([`SUBMIT_NOT_DROPPED`]). Before
+    /// the text, each is typed as a bracketed paste of its own (the path alone, quoted when it
+    /// has whitespace or quotes, as the agents read a pasted path), then, once the agent's
+    /// composer shows the image attached (`[Image #n]`), a space, in the same reply: one
+    /// readiness-held delivery, one Enter. A file not shown attached in time ends the reply
+    /// with [`SUBMIT_UNCONFIRMED`] and no Enter. With files, `text` may be blank
+    /// ([`submit_reply`]), and then only the paths are typed.
     #[serde(rename = "term.submit")]
-    TermSubmit { terminal: Uuid, text: String },
+    TermSubmit {
+        terminal: Uuid,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
 }
+
+/// The most files one `term.submit` carries.
+pub const SUBMIT_MAX_FILES: usize = 4;
+/// The refusal of a `term.submit` with more than [`SUBMIT_MAX_FILES`] files. Nothing was
+/// typed.
+pub const SUBMIT_TOO_MANY_FILES: &str = "too many files";
+/// The refusal of a `term.submit` whose file is not one `save_dropped_file` saved on this
+/// Host (not a regular file directly in its drop directory, gone, or a path that cannot be
+/// typed). Nothing was typed.
+pub const SUBMIT_NOT_DROPPED: &str = "not a dropped file";
+/// The largest file a Mobile may save with `save_dropped_file` (decoded), and only with an
+/// image name (`.jpg`, `.jpeg`, `.png`); a Desktop's limit is the core's 25 MiB.
+pub const MOBILE_DROP_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// The image name endings a Mobile's `save_dropped_file` accepts (ASCII case-insensitive).
+pub const MOBILE_DROP_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png"];
 
 /// The longest reply a `term.submit` carries, in bytes of UTF-8 after [`submit_text`]
 /// normalized it.
@@ -254,6 +284,16 @@ pub fn submit_text(s: &str) -> Result<String, SubmitTextError> {
         return Err(SubmitTextError::TooLong);
     }
     Ok(text)
+}
+
+/// A `term.submit`'s text when it carries `files` files: as [`submit_text`], except that
+/// with at least one file a blank text is no caption (`None`) rather than refused. Too many
+/// files is [`SUBMIT_TOO_MANY_FILES`], checked by the caller.
+pub fn submit_reply(s: &str, files: usize) -> Result<Option<String>, SubmitTextError> {
+    match submit_text(s) {
+        Err(SubmitTextError::Blank) if files > 0 => Ok(None),
+        r => r.map(Some),
+    }
 }
 
 /// The refusal of a `term.answer` whose prompt is no longer the Terminal's current one: it
@@ -1933,6 +1973,7 @@ mod tests {
         let msg = ClientMsg::TermSubmit {
             terminal: id,
             text: "fix it\nplease 🦀".into(),
+            files: vec![],
         };
         // The whole path: encoded as a frame, read back, decoded as a Host would.
         let frame = encode_msg(&msg, Some(4)).unwrap();
@@ -1955,5 +1996,47 @@ mod tests {
                 "{raw}: {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn term_submit_files_roundtrip_and_default() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
+        let msg = ClientMsg::TermSubmit {
+            terminal: id,
+            text: String::new(),
+            files: vec!["/run/user/1000/xshell/tmp/xshell-clipboard/1-a.jpg".into()],
+        };
+        let b = body(encode_msg(&msg, Some(4)).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"id":4,"t":"term.submit","terminal":"00000000-0000-0000-0000-000000000007","text":"","files":["/run/user/1000/xshell/tmp/xshell-clipboard/1-a.jpg"]}"#
+        );
+        assert_eq!(decode_inbound(&b).unwrap(), Inbound { id: Some(4), msg });
+        // A #4 Mobile's message has no files.
+        let old = json!({"t":"term.submit","id":5,"terminal":id,"text":"x"});
+        assert_eq!(
+            decode_inbound(old.to_string().as_bytes()).unwrap().msg,
+            ClientMsg::TermSubmit {
+                terminal: id,
+                text: "x".into(),
+                files: vec![]
+            }
+        );
+        let bad = json!({"t":"term.submit","id":5,"terminal":id,"text":"x","files":[1]});
+        assert!(decode_inbound(bad.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn submit_reply_allows_a_blank_caption_with_files() {
+        use SubmitTextError::*;
+        assert_eq!(submit_reply("", 1), Ok(None));
+        assert_eq!(submit_reply(" \r\n", 4), Ok(None));
+        assert_eq!(submit_reply("", 0), Err(Blank));
+        assert_eq!(submit_reply("a\r\nb", 1), Ok(Some("a\nb".into())));
+        assert_eq!(submit_reply("a\x1b", 1), Err(Control));
+        assert_eq!(
+            submit_reply(&"x".repeat(SUBMIT_MAX_BYTES + 1), 1),
+            Err(TooLong)
+        );
     }
 }

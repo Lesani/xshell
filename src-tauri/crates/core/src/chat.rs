@@ -403,7 +403,26 @@ fn codex_output(output: Option<&Value>) -> (String, bool) {
 
 fn codex_items(json: &Value) -> Vec<ChatItem> {
     if let Some((from, text)) = crate::codex::event_message(json) {
-        return text_item(from, text).into_iter().collect();
+        // A user message's images (inline `images`, attached files `local_images`) show
+        // as one `[image]` each after its text, as Claude's do.
+        let p = &json["payload"];
+        let images = match from {
+            Speaker::User => ["images", "local_images"]
+                .iter()
+                .filter_map(|k| p.get(k).and_then(Value::as_array))
+                .map(Vec::len)
+                .sum(),
+            Speaker::Agent => 0,
+        };
+        if images == 0 {
+            return text_item(from, text).into_iter().collect();
+        }
+        let parts: Vec<&str> = (!text.trim().is_empty())
+            .then_some(text)
+            .into_iter()
+            .chain(std::iter::repeat_n("[image]", images))
+            .collect();
+        return text_item(from, &parts.join("\n\n")).into_iter().collect();
     }
     if json.get("type").and_then(Value::as_str) != Some("response_item") {
         return vec![];
@@ -1109,6 +1128,33 @@ mod tests {
 
     fn rollout_item(payload: Value) -> Value {
         json!({"timestamp": "2026-01-01T10:00:01Z", "type": "response_item", "payload": payload})
+    }
+
+    #[test]
+    fn codex_user_images_marked() {
+        // Images in a user message: one marker each (inline, then attached files).
+        let img = |text: &str, images: Value, local: Value| {
+            json!({"timestamp": "2026-01-01T10:00:01Z", "type": "event_msg",
+                   "payload": {"type": "user_message", "message": text,
+                               "images": images, "local_images": local}})
+        };
+        assert_eq!(
+            codex(&img(
+                "look",
+                json!(["data:image/png;base64,AAAA"]),
+                json!(["/x.png"])
+            )),
+            vec![u("look\n\n[image]\n\n[image]")]
+        );
+        assert_eq!(
+            codex(&img("", json!([]), json!(["/x.png"]))),
+            vec![u("[image]")]
+        );
+        assert_eq!(
+            codex(&img("plain", json!([]), json!(null))),
+            vec![u("plain")]
+        );
+        assert_eq!(codex(&img(" ", json!(null), json!([]))), vec![]);
     }
 
     #[test]

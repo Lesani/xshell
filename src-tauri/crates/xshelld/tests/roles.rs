@@ -100,6 +100,7 @@ fn per_terminal(t: Uuid) -> Vec<ClientMsg> {
         ClientMsg::TermSubmit {
             terminal: t,
             text: "reply".into(),
+            files: vec![],
         },
         ClientMsg::TermRelaunch {
             terminal: t,
@@ -472,6 +473,7 @@ fn mobile_may_submit() {
     let submit = ClientMsg::TermSubmit {
         terminal: t,
         text: "reply".into(),
+        files: vec![],
     };
     assert_eq!(e.mob.request(&submit), Err(SUBMIT_NOT_READY.into()));
     assert_eq!(e.desk.request(&submit), Err(SUBMIT_NOT_READY.into()));
@@ -568,6 +570,50 @@ fn mobile_save_dropped_file_ok() {
     // A Desktop's name is sanitised as before.
     let d = e.desk.call("save_dropped_file", evil).unwrap();
     assert!(Path::new(d.as_str().unwrap()).starts_with(e.h.paths().tmp.join("xshell-clipboard")));
+}
+
+/// A Mobile saves photos only: an image name and at most `MOBILE_DROP_MAX_BYTES`; a
+/// Desktop's drops are as before (any name, up to the core's 25 MiB).
+#[test]
+fn mobile_save_dropped_file_limits() {
+    use xshell_protocol::msg::MOBILE_DROP_MAX_BYTES;
+    let mut e = env();
+    // The base64 of `n` zero bytes, padded.
+    let b64 = |n: usize| {
+        let pad = ["", "AA==", "AAA="][n % 3];
+        format!("{}{pad}", "A".repeat(n / 3 * 4))
+    };
+    let drop = |n: usize, name: &str| json!({ "bytesBase64": b64(n), "name": name });
+    // Exactly the limit, as a photo: saved.
+    let p = e
+        .mob
+        .call(
+            "save_dropped_file",
+            drop(MOBILE_DROP_MAX_BYTES, "photo.JPG"),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::metadata(p.as_str().unwrap()).unwrap().len(),
+        MOBILE_DROP_MAX_BYTES as u64
+    );
+    for (params, why) in [
+        (
+            drop(MOBILE_DROP_MAX_BYTES + 1024 * 1024, "photo.jpg"),
+            "size limit",
+        ),
+        (drop(10, "run.sh"), "image name"),
+        (drop(10, "photo"), "image name"),
+        (drop(10, ""), "image name"),
+    ] {
+        let r = e.mob.call("save_dropped_file", params.clone());
+        assert!(
+            r.as_ref().unwrap_err().starts_with("forbidden"),
+            "{params}: {r:?}"
+        );
+        assert!(r.unwrap_err().contains(why));
+        // A Desktop is not bound by them.
+        assert!(e.desk.call("save_dropped_file", params).is_ok());
+    }
 }
 
 #[test]

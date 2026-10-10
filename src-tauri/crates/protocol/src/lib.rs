@@ -46,6 +46,8 @@ pub const CAPABILITIES: &[&str] = &[
     cap::PROJECT_SESSIONS,
     #[cfg(unix)]
     cap::TERM_SUBMIT,
+    #[cfg(unix)]
+    cap::TERM_SUBMIT_FILES,
 ];
 
 /// The names in [`CAPABILITIES`], so peers gate on a constant instead of a string literal.
@@ -101,6 +103,13 @@ pub mod cap {
     /// agent turned bracketed paste on.
     #[cfg(unix)]
     pub const TERM_SUBMIT: &str = "term.submit";
+    /// `term.submit` takes `files`: photos a Mobile saved with `save_dropped_file` (at most
+    /// `msg::MOBILE_DROP_MAX_BYTES`, an image name), typed as their paths before the reply's
+    /// text, each its own bracketed paste; the text may then be blank. The drop directory is
+    /// private to the Daemon's user and swept of files older than three days. Unix Hosts
+    /// only, like [`TERM_SUBMIT`].
+    #[cfg(unix)]
+    pub const TERM_SUBMIT_FILES: &str = "term.submit-files";
 }
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
@@ -184,6 +193,14 @@ mod tests {
     #[test]
     fn capabilities_exclude_term_submit_on_windows() {
         assert!(!CAPABILITIES.contains(&"term.submit"));
+        assert!(!CAPABILITIES.contains(&"term.submit-files"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capabilities_include_term_submit_files() {
+        assert!(CAPABILITIES.contains(&"term.submit-files"));
+        assert_eq!(cap::TERM_SUBMIT_FILES, "term.submit-files");
     }
 
     #[test]

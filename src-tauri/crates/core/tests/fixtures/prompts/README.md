@@ -17,7 +17,8 @@ to read it:
     "textContains": ["…"],      // substrings of the prompt's text
     "options": ["…"]            // the labels, in order (key hints removed)
   },
-  "composer": false             // whether the screen ends with the agent's chat composer
+  "composer": false,            // whether the screen ends with the agent's chat composer
+  "images": 0                   // composers only: the `[Image #n]` chips in its input
 }
 ```
 
@@ -48,11 +49,14 @@ the installed CLIs contain, read from their binaries without running a session:
   composer: each agent's model picker (`Select model` / `Select Model`, a numbered list with
   its focus), Codex's list with an unnumbered `›` focus and its own footer, Claude Code's
   bash mode (`!`), a command's `[y/N]` question below the input, and a custom status line
-  (the composer's footer is recognised only from the agents' own hints).
+  (the composer's footer is recognised only from the agents' own hints). An attached image
+  (`term.submit` files): both agents put the chip `[Image #n]` in the input
+  (`claude-composer-image`, `codex-composer-image`); while Claude Code still reads a pasted
+  image its footer says `Pasting…` (`claude-composer-pasting`, not the composer).
 
 `claude-idle` (no prompt; the older round input box with sides), `unknown-elicitation` (an MCP
 form; text-only) and the composer and picker screens have `expect: null`; `composer` is true
-for `claude-idle` and the `*-composer-*` screens. Regenerate with `python3 -I gen_synthetic.py .` from this directory.
+for `claude-idle` and the `*-composer-*` screens except `claude-composer-pasting`. Regenerate with `python3 -I gen_synthetic.py .` from this directory.
 
 What synthetic fixtures cannot show is whether the real TUIs match. Until real recordings
 replace them, a composer the Daemon does not recognise refuses replies (`agent does not

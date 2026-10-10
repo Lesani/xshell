@@ -22,6 +22,7 @@ mod agent;
 mod calls;
 mod codex_link;
 mod conn;
+mod drops;
 mod last_line;
 mod orphans;
 pub use orphans::Cleanup;
@@ -51,7 +52,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 use xshell_core::terminal::state::Leader;
 use xshell_core::HostCtx;
@@ -148,6 +149,18 @@ pub struct Config {
     pub submit_enter_delay: Duration,
     /// A reply whose PTY takes nothing of it for this long is ended (10 s).
     pub submit_stall: Duration,
+    /// How often the drop directory (`save_dropped_file`) is swept of old files while the
+    /// Daemon runs (1 h), besides once at start: a Persistent Daemon may run for weeks, and
+    /// `$XDG_RUNTIME_DIR` is memory.
+    pub drop_sweep: Duration,
+    /// The age past which the sweep removes a dropped file (3 days).
+    pub drop_max_age: Duration,
+    /// How long after a `term.submit` reply's outcome its files stay out of the sweep
+    /// (10 min), for the agent to read them.
+    pub drop_grace: Duration,
+    /// How long a `term.submit` reply waits after a file's paste for the agent to show it
+    /// attached (10 s); past it, nothing more is typed.
+    pub submit_attach_timeout: Duration,
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
@@ -225,6 +238,9 @@ pub enum TestPoint {
     Submitted,
     /// A stopped reply's paste is about to be completed with its end marker (no lock held).
     SubmitClose,
+    /// The input thread is about to check whether a reply's file shows attached in the
+    /// agent's composer (after its paste; again every 10 ms until it does; no lock held).
+    SubmitAttach,
     /// A Terminal's PTY is open and its input thread will get a descriptor for replies'
     /// non-blocking writes (registry locked: do not block). Returning `true` leaves it
     /// without one.
@@ -372,6 +388,10 @@ impl Config {
             prompt_clock: None,
             submit_enter_delay: Duration::from_millis(50),
             submit_stall: terminal::SUBMIT_STALL,
+            drop_sweep: Duration::from_secs(60 * 60),
+            drop_max_age: xshell_core::files::DROPPED_FILE_MAX_AGE,
+            drop_grace: Duration::from_secs(10 * 60),
+            submit_attach_timeout: Duration::from_secs(10),
             hide_capabilities: Vec::new(),
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
@@ -493,7 +513,7 @@ impl Server {
         starting.socket = true;
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
-        xshell_core::files::cleanup_old_dropped_files(&ctx);
+        xshell_core::files::sweep_dropped_files(&ctx, cfg.drop_max_age, SystemTime::now());
         let hooks = agent::hooks(&cfg);
         let ring = ring::Ring::new(
             paths.ring_dir.clone(),
@@ -522,8 +542,10 @@ impl Server {
             cfg.max_session_requests,
             cfg.max_session_queue,
         );
+        let drops = drops::Drops::new(cfg.drop_grace);
         let d = Arc::new(Daemon {
             cfg,
+            drops,
             ctx: Arc::new(ctx),
             reg: Mutex::new(Registry::default()),
             exiting: AtomicBool::new(false),
@@ -568,6 +590,12 @@ impl Server {
                 std::thread::Builder::new()
                     .name("supervisor".into())
                     .spawn(move || ds.supervise())
+            })
+            .and_then(|_| {
+                let dw = d.clone();
+                std::thread::Builder::new()
+                    .name("drop-sweep".into())
+                    .spawn(move || dw.sweep_drops())
             });
         if let Err(e) = threads {
             d.exit(ExitReason::Shutdown);

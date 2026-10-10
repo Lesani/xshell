@@ -757,24 +757,44 @@ fn is_composer_footer(agent: HookAgent, row: &str) -> bool {
 /// Neither accepts an option row anywhere in the input, or anything that is not on the
 /// screen's last rows.
 pub fn composer(agent: HookAgent, rows: &[String]) -> bool {
+    composer_input(agent, rows).is_some()
+}
+
+/// The input rows of `agent`'s chat composer when [`composer`] recognises it (the prompt
+/// mark's row first, without a box's sides), else `None`.
+pub fn composer_input(agent: HookAgent, rows: &[String]) -> Option<Vec<String>> {
     let r: Vec<&str> = rows.iter().map(|s| s.trim_end()).collect();
-    let Some(last) = r.iter().rposition(|s| !s.is_empty()) else {
-        return false;
-    };
+    let last = r.iter().rposition(|s| !s.is_empty())?;
     match agent {
         HookAgent::Claude => claude_composer(&r[..=last]),
         HookAgent::Codex => codex_composer(&r[..=last]),
     }
 }
 
-fn claude_composer(r: &[&str]) -> bool {
+/// The attachment chip both agents put in their composer for an attached image:
+/// `[Image #n]`.
+pub const IMAGE_CHIP: &str = "[Image #";
+
+/// How many images are attached in `agent`'s chat composer: the [`IMAGE_CHIP`]s in its
+/// input rows. `None` when the screen does not end with the composer, such as while Claude
+/// Code still reads a pasted image (its footer then says `Pasting…`, no footer hint).
+pub fn composer_images(agent: HookAgent, rows: &[String]) -> Option<usize> {
+    composer_input(agent, rows).map(|input| {
+        input
+            .iter()
+            .map(|row| row.matches(IMAGE_CHIP).count())
+            .sum()
+    })
+}
+
+fn claude_composer(r: &[&str]) -> Option<Vec<String>> {
     let agent = HookAgent::Claude;
     // The bottom edge, past the footer.
     let mut footer = 0;
     let mut bottom = r.len();
     loop {
         if bottom == 0 {
-            return false;
+            return None;
         }
         bottom -= 1;
         let row = r[bottom];
@@ -784,7 +804,7 @@ fn claude_composer(r: &[&str]) -> bool {
         if !row.is_empty() {
             footer += 1;
             if footer > COMPOSER_FOOTER_MAX || !is_composer_footer(agent, row) {
-                return false;
+                return None;
             }
         }
     }
@@ -802,7 +822,7 @@ fn claude_composer(r: &[&str]) -> bool {
     let mut top = bottom;
     loop {
         if top == 0 {
-            return false;
+            return None;
         }
         top -= 1;
         let row = r[top];
@@ -816,65 +836,66 @@ fn claude_composer(r: &[&str]) -> bool {
         }
     }
     if top + 1 >= bottom {
-        return false;
+        return None;
     }
     if !boxed && r[top].trim() != r[bottom].trim() {
-        return false;
+        return None;
     }
     if boxed && r[top].trim().chars().count() != r[bottom].trim().chars().count() {
-        return false;
+        return None;
     }
-    let Some(head) = inner(r[top + 1]) else {
-        return false;
-    };
+    let head = inner(r[top + 1])?;
     let head = if boxed {
         head.trim_start_matches(' ').to_string()
     } else {
         head
     };
     if !is_composer_head(agent, &head) {
-        return false;
+        return None;
     }
-    r[top + 2..bottom].iter().all(|row| {
-        inner(row).is_some_and(|s| {
-            let s = if boxed {
-                s.strip_prefix(' ').unwrap_or(&s).to_string()
-            } else {
-                s
-            };
-            is_composer_continuation(&s)
-        })
-    })
+    let mut input = vec![head];
+    for row in &r[top + 2..bottom] {
+        let s = inner(row)?;
+        let s = if boxed {
+            s.strip_prefix(' ').unwrap_or(&s).to_string()
+        } else {
+            s
+        };
+        if !is_composer_continuation(&s) {
+            return None;
+        }
+        input.push(s);
+    }
+    Some(input)
 }
 
-fn codex_composer(r: &[&str]) -> bool {
+fn codex_composer(r: &[&str]) -> Option<Vec<String>> {
     let agent = HookAgent::Codex;
-    let Some(head) = r.iter().rposition(|row| {
+    let head = r.iter().rposition(|row| {
         let t = row.trim_start();
         t.chars().next().is_some_and(|c| is_composer_mark(agent, c))
-    }) else {
-        return false;
-    };
+    })?;
     if !is_composer_head(agent, r[head]) {
-        return false;
+        return None;
     }
     // The composer's top padding.
     if head == 0 || !r[head - 1].is_empty() {
-        return false;
+        return None;
     }
     // Its continuation rows, then a blank row and the footer.
     let mut i = head + 1;
     while i < r.len() && !r[i].is_empty() {
         if !is_composer_continuation(r[i]) {
-            return false;
+            return None;
         }
         i += 1;
     }
     // Codex's frame is weaker evidence than Claude Code's rules: its footer must be there.
     let footer: Vec<&&str> = r[i..].iter().filter(|row| !row.is_empty()).collect();
-    !footer.is_empty()
+    (!footer.is_empty()
         && footer.len() <= COMPOSER_FOOTER_MAX
-        && footer.iter().all(|row| is_composer_footer(agent, row))
+        && footer.iter().all(|row| is_composer_footer(agent, row)))
+    .then(|| r[head..i].iter().map(|row| row.to_string()).collect())
 }
 
 /// The text of a text-only prompt: the bottom [`TAIL_ROWS`] non-blank rows, box-drawing

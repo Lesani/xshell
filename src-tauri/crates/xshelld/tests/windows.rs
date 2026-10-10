@@ -313,6 +313,7 @@ fn submit_not_offered_on_windows() {
     let r = c.request(&ClientMsg::TermSubmit {
         terminal: t,
         text: "hi".into(),
+        files: vec![],
     });
     assert_eq!(r, Err(SUBMIT_UNSUPPORTED.to_string()));
 }

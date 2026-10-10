@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{
-    decode_inbound, encode_res, submit_text, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
+    decode_inbound, encode_res, submit_reply, ClientMsg, DecodeError, Hello, Inbound, ServerMsg,
 };
 use xshell_protocol::negotiate::negotiate;
 use xshell_protocol::ring::Member;
@@ -478,15 +478,27 @@ impl Conn {
             // A reply from the Chat View. Not typing at the Terminal View: no size claim, no
             // burst of output pacing, nothing to release on disconnect. Answered by the input
             // thread once typed, unless refused here.
-            ClientMsg::TermSubmit { terminal, text } => {
-                let r = submit_text(&text)
+            ClientMsg::TermSubmit {
+                terminal,
+                text,
+                files,
+            } => {
+                // Everything is checked before anything is queued: the text, the Terminal
+                // (visible to this connection), then the files.
+                let r = submit_reply(&text, files.len())
                     .map_err(|e| e.to_string())
                     .and_then(|text| {
+                        let t = self.terminal(&terminal)?;
+                        // Checked and held in one step: the sweep keeps them from now until
+                        // the grace after the outcome.
+                        let (paths, held) = d.drops.reserve(&d.ctx, &files)?;
+                        let typing = terminal::Typing::reply(&paths, text.as_deref());
                         let ob = self.ob.clone();
                         let done = Box::new(move |r: Result<(), String>| {
-                            reply(&ob, id, r.map(|()| Value::Null))
+                            reply(&ob, id, r.map(|()| Value::Null));
+                            drop(held);
                         });
-                        self.terminal(&terminal)?.submit(&d, &text, done)
+                        t.submit(&d, typing, done)
                     });
                 if let Err(e) = r {
                     reply(&self.ob, id, Err(e));

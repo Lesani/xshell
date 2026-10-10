@@ -26,7 +26,7 @@ use xshell_core::paths::stays_inside;
 use xshell_core::sessions::valid_session_id;
 use xshell_core::sessions::CodexProjectInfo;
 use xshell_core::{antigravity, claude, codex, cursor, opencode, HostCtx};
-use xshell_protocol::msg::ClientMsg;
+use xshell_protocol::msg::{ClientMsg, MOBILE_DROP_EXTENSIONS, MOBILE_DROP_MAX_BYTES};
 
 /// Who is on the other end of a connection. The local socket and `xshelld connect` (SSH)
 /// carry Desktops; the Relay will carry Mobiles (and Desktops), mapped from the Roster role.
@@ -224,6 +224,18 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
     }
 }
 
+/// The longest `bytesBase64` a Mobile's `save_dropped_file` may carry: the base64 of
+/// [`MOBILE_DROP_MAX_BYTES`] with room for padding and line breaks some encoders add.
+pub(crate) const MOBILE_DROP_MAX_BASE64: usize = MOBILE_DROP_MAX_BYTES.div_ceil(3) * 4 + 1024;
+
+/// Whether `name` ends in one of [`MOBILE_DROP_EXTENSIONS`] (ASCII case-insensitive).
+fn mobile_drop_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    MOBILE_DROP_EXTENSIONS
+        .iter()
+        .any(|e| n.ends_with(e) && n.len() > e.len())
+}
+
 /// A Mobile's `call`: the method must be in [`MOBILE_CALLS`], and every parameter that
 /// becomes a path must stay inside the agent's session storage or name a known Project.
 fn check_call(ctx: &HostCtx, method: &str, params: &Value) -> Result<(), String> {
@@ -274,12 +286,22 @@ fn check_call(ctx: &HostCtx, method: &str, params: &Value) -> Result<(), String>
             "" => Err(forbidden(format!("call {method} outside a known Project"))),
             _ => Ok(()),
         },
-        // Always written to the Daemon's drop directory; the name only ends the file name.
-        "save_dropped_file" => match arg("name")? {
-            "" => Ok(()),
-            n if single_component(n) => Ok(()),
-            _ => Err(forbidden(format!("call {method} with a path as name"))),
-        },
+        // Always written to the Daemon's drop directory; the name only ends the file name. A
+        // Mobile sends photos: an image name and at most `MOBILE_DROP_MAX_BYTES`, bounded on
+        // the base64 before anything is decoded.
+        "save_dropped_file" => {
+            let name = arg("name")?;
+            if !name.is_empty() && !single_component(name) {
+                return Err(forbidden(format!("call {method} with a path as name")));
+            }
+            if !mobile_drop_name(name) {
+                return Err(forbidden(format!("call {method} without an image name")));
+            }
+            if arg("bytesBase64")?.len() > MOBILE_DROP_MAX_BASE64 {
+                return Err(forbidden(format!("call {method} over the size limit")));
+            }
+            Ok(())
+        }
         _ => Err(refuse()),
     }
 }
@@ -480,6 +502,7 @@ pub(crate) mod tests {
         // A method in MOBILE_CALLS without its own arm falls through to a refusal.
         let ctx = HostCtx::with_home("/nonexistent-home", "/tmp");
         let p = json!({ "encodedName": "x", "sessionId": "s", "limit": 1, "name": "a.png",
+                        "bytesBase64": "",
                         "cwd": "", "currentSessionId": "s", "knownSessionIds": [] });
         for m in MOBILE_CALLS {
             let r = check_call(&ctx, m, &p);
@@ -673,10 +696,52 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(drop("shot.png"), Ok(()));
-        assert_eq!(drop(""), Ok(()));
         for n in ["../x", "/etc/x", "a\\b", "..", "."] {
             assert!(drop(n).is_err(), "{n}");
         }
+    }
+
+    /// A Mobile saves photos only: an image name, and at most `MOBILE_DROP_MAX_BYTES`,
+    /// bounded on the base64. (A Desktop's call is not checked here: `check` passes it.)
+    #[test]
+    fn mobile_save_dropped_file_limits() {
+        let ctx = HostCtx::with_home(std::env::temp_dir(), std::env::temp_dir());
+        let drop = |b64: &str, n: &str| {
+            check_call(
+                &ctx,
+                "save_dropped_file",
+                &json!({ "bytesBase64": b64, "name": n }),
+            )
+        };
+        for n in ["photo.jpg", "photo.JPEG", "shot.png", "a b.Png"] {
+            assert_eq!(drop("aGk=", n), Ok(()), "{n}");
+        }
+        for n in [
+            "",
+            "run.sh",
+            "photo.jpg.sh",
+            "photo",
+            ".jpg",
+            "x.gif",
+            "x.jpg/",
+        ] {
+            let e = drop("aGk=", n).unwrap_err();
+            assert!(e.starts_with(FORBIDDEN), "{n}: {e}");
+        }
+        // The largest base64 a 4 MiB file takes passes; anything longer does not.
+        let max = "A".repeat(MOBILE_DROP_MAX_BASE64);
+        assert_eq!(drop(&max, "photo.jpg"), Ok(()));
+        assert!(MOBILE_DROP_MAX_BASE64 >= MOBILE_DROP_MAX_BYTES.div_ceil(3) * 4);
+        let e = drop(&format!("{max}A"), "photo.jpg").unwrap_err();
+        assert!(e.contains("size limit"), "{e}");
+        assert!(drop("aGk=", "x.png").is_ok());
+        assert!(check_call(&ctx, "save_dropped_file", &json!({ "name": "x.png" })).is_err());
+        let desk = ClientMsg::Call {
+            method: "save_dropped_file".into(),
+            params: json!({ "bytesBase64": format!("{max}A"), "name": "run.sh" }),
+        };
+        assert_eq!(check(Role::Desktop, &ctx, &desk), Ok(()));
+        assert!(check(Role::Mobile, &ctx, &desk).is_err());
     }
 
     #[cfg(unix)]
@@ -802,6 +867,7 @@ pub(crate) mod tests {
             ClientMsg::TermSubmit {
                 terminal: t,
                 text: "fix it".into(),
+                files: vec![],
             },
         ] {
             assert_eq!(check(Role::Mobile, &ctx, &m), Ok(()));
@@ -813,6 +879,7 @@ pub(crate) mod tests {
         Arc::new(Daemon {
             cfg: Config::new(dir.into(), paths),
             ctx: Arc::new(HostCtx::with_home(dir, dir)),
+            drops: crate::server::drops::Drops::new(std::time::Duration::from_secs(600)),
             reg: Mutex::new(Registry::default()),
             exiting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),

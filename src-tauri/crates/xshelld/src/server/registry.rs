@@ -50,6 +50,8 @@ pub(crate) struct Daemon {
     pub snap_seq: AtomicU64,
     /// Streams agent Terminals' conversations to subscribed connections.
     pub session_streams: super::session_stream::SessionStreams,
+    /// The dropped files replies hold, kept out of the sweep.
+    pub drops: Arc<super::drops::Drops>,
 }
 
 /// A registered connection: its outbox and the role that decides what it is told.
@@ -444,6 +446,33 @@ impl Daemon {
                 self.exit(ExitReason::Idle);
                 return;
             }
+        }
+    }
+
+    /// Sweep the drop directory of files older than `Config::drop_max_age` every
+    /// `Config::drop_sweep` until the Daemon has exited, whether or not anything is dropped.
+    pub fn sweep_drops(self: Arc<Self>) {
+        let mut g = self.exit.lock().unwrap();
+        loop {
+            // Checked before every wait: the exit's notice may have come while sweeping.
+            let due = Instant::now() + self.cfg.drop_sweep;
+            while g.is_none() && !self.exiting.load(Ordering::SeqCst) && Instant::now() < due {
+                g = self
+                    .exit_cv
+                    .wait_timeout(g, due.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                    .0;
+            }
+            if g.is_some() || self.exiting.load(Ordering::SeqCst) {
+                return;
+            }
+            drop(g);
+            self.drops.sweep(
+                &self.ctx,
+                self.cfg.drop_max_age,
+                std::time::SystemTime::now(),
+            );
+            g = self.exit.lock().unwrap();
         }
     }
 
