@@ -144,7 +144,8 @@ mod tests {
         let drops = Drops::new(Duration::from_millis(200));
         let (typed, r) = drops.reserve(&ctx, std::slice::from_ref(&p)).unwrap();
         let canon = std::fs::canonicalize(&p).unwrap();
-        assert_eq!(typed, [canon.to_string_lossy()]);
+        // Typed as the agents read it (quoted on Windows, where the path has backslashes).
+        assert_eq!(typed, [typed_path(&canon.to_string_lossy()).unwrap()]);
         old(Path::new(&p));
         old(Path::new(&other));
         let max = Duration::from_secs(60);
