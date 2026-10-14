@@ -3,6 +3,7 @@ mod agent_events;
 mod hosts;
 mod local_migration;
 mod local_pty;
+mod open_copies;
 mod ring;
 mod transfer;
 
@@ -325,10 +326,10 @@ async fn relaunch_terminal(
 // thread; core itself is fully synchronous.
 
 // Commands that only make sense on the machine running the window, so a remote host never
-// serves them: project icons are local files, two open local apps, and the local migration
-// commands guard this machine's settings file, and the transfer pumps write local paths. The
-// tests
-// below check that these two lists plus `xshell_core::METHODS` cover every registered command.
+// serves them: project icons are local files, some open local apps, the local migration
+// commands guard this machine's settings file, the transfer pumps write local paths, and the
+// open-copies commands manage this machine's copies of opened files. The tests below check
+// that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "open_url",
@@ -354,6 +355,14 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "transfer_download",
     "transfer_upload_path",
     "transfer_cancel",
+    "open_local_path",
+    "open_copy_path",
+    "open_copy_stat",
+    "open_copy_meta",
+    "open_copy_snapshot",
+    "open_copy_install",
+    "open_copy_release",
+    "open_copies_pending",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -669,6 +678,7 @@ pub fn run() {
             use tauri::Manager as _;
             app.manage(hosts::Hosts::new(app.handle()));
             ring::setup(app.handle());
+            open_copies::sweep_in_background(app.handle());
             #[cfg(unix)]
             setup_agent_status(app);
             // The main window is built here, after the state its page calls into, rather than
@@ -737,6 +747,14 @@ pub fn run() {
             transfer::transfer_download,
             transfer::transfer_upload_path,
             transfer::transfer_cancel,
+            open_copies::open_local_path,
+            open_copies::open_copy_path,
+            open_copies::open_copy_stat,
+            open_copies::open_copy_meta,
+            open_copies::open_copy_snapshot,
+            open_copies::open_copy_install,
+            open_copies::open_copy_release,
+            open_copies::open_copies_pending,
             spawn_terminal,
             write_terminal,
             resize_terminal,
@@ -853,7 +871,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 87);
+        assert_eq!(registered.len(), 95);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

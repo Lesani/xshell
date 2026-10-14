@@ -39,6 +39,7 @@ import { AppNotice } from "./components/AppNotice";
 import { NO_MIGRATION, groupsToPersist, migrateLocalTabsOnce, migrationNotice, openTabsToPersist, renderedGroups, type MigrationOutcome } from "./hosts/localMigration";
 import { localMigrationDeps } from "./hosts/localMigrationDeps";
 import { applyFenced, singleFlight } from "./hosts/startup";
+import { restorePendingCopies } from "./files/syncBackDeps";
 import { fmt } from "./hosts/strings";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
@@ -330,6 +331,10 @@ export default function App() {
     document.addEventListener("contextmenu", onContextMenu);
     return () => document.removeEventListener("contextmenu", onContextMenu);
   }, []);
+
+  // Copies of Remote Host files opened in their default app whose saves were not uploaded
+  // before xshell quit: resume them (they show in the explorer of their Host).
+  useEffect(() => { restorePendingCopies(); }, []);
 
   // ── Initial load ──────────────────────────────────────────────────
   const [tabsRestored, setTabsRestored] = useState(false);

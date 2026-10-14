@@ -1,4 +1,5 @@
-// Every user-facing string of the Remote Hosts feature, keyed by the placeholder keys of the
+// Every user-facing string of the Remote Hosts feature (and of the file explorer's open with
+// sync-back, Lesani/xshell#46, from its binding copy table), keyed by the placeholder keys of the
 // slice-4 plan (section 5). Wording is the binding copy table, verbatim; the app has no i18n
 // system and this module does not introduce one. `{param}` placeholders are filled by fmt().
 
@@ -118,7 +119,29 @@ export const S = {
   "terminal.local.openFailed": "Couldn't start a terminal: {error}",
   "terminal.header.hostBadge": "Host: {host}",
   "tab.tooltip.onHost": "On {host}",
-  "explorer.row.tooltipRemote": "Drag into the terminal to insert this file's path on the host.",
+  "explorer.menu.open": "Open",
+  "explorer.menu.reveal": "Reveal in folder",
+  "explorer.menu.writePath": "Write path to terminal",
+  "explorer.row.tooltipFile": "{path} — click to open · drag to terminal to insert the path",
+  "explorer.row.tooltipRemote": "Click to open a local copy. Saves upload to {host}. Drag to terminal to insert the path on the host.",
+  "explorer.open.downloading": "Opening {name}… {pct}%",
+  "explorer.open.failed": "Couldn’t open {name}: {error}",
+  "explorer.sync.uploading": "Uploading changes to {name}…",
+  "explorer.sync.uploaded": "Uploaded changes to {name} on {host}.",
+  "explorer.sync.waiting": "Waiting for {host} to reconnect. Changes to {name} are kept here and will upload when it connects.",
+  "explorer.sync.failed": "Couldn’t upload changes to {name}: {error}",
+  "explorer.sync.retry": "Retry",
+  "explorer.sync.conflict": "Changes to {name} conflict with the version on {host}. Your local changes have been kept.",
+  "explorer.sync.overwrite": "Overwrite",
+  "explorer.sync.keepRemote": "Keep remote",
+  "explorer.sync.keepRemoteHint": "Replaces your local changes with the version from {host} and opens it again.",
+  "explorer.sync.restored": "Restored {n} files with pending changes. xshell will check {host} before uploading.",
+  "explorer.sync.checking": "Checking whether changes to {name} reached {host}…",
+  "explorer.sync.missing": "The local copy of {name} has been missing for 30 seconds. Download it again or close it. Nothing has been deleted on {host}.",
+  "explorer.sync.downloadAgain": "Download again",
+  "explorer.sync.close": "Close",
+  "explorer.sync.unknownOutcome": "Couldn’t confirm whether changes to {name} reached {host}. xshell will check when the host reconnects.",
+  "explorer.notice.dismiss": "Dismiss",
   "notice.newTerminal.offline": "Can't start a terminal on {host}: {status}. Wait for it to connect or choose Reconnect now in Settings → Hosts.",
   "notice.newTerminal.incompatible": "Can't start a terminal on {host}. Update xshell on this computer or upgrade xshell on the host.",
   "notice.unknownHost": "This host is no longer configured. Add it again in Settings → Hosts.",

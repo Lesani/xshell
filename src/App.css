@@ -845,6 +845,21 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .file-icon { flex-shrink: 0; width: 16px; height: 16px; display: block; pointer-events: none; }
 .file-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .file-row-sub { margin-left: 6px; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; color: var(--text-muted); font-size: 10px; }
+/* Sync-back badge of an opened file (Lesani/xshell#46): busy, waiting for the host, or needs
+   the user (conflict, failed, missing). */
+.file-row-sync { flex-shrink: 0; width: 6px; height: 6px; margin-left: auto; border-radius: 50%; }
+.file-row-sync-syncing { background: var(--accent-terracotta); animation: agentStatusPulse 1.2s ease-in-out infinite; }
+.file-row-sync-waiting { background: var(--text-muted); }
+.file-row-sync-attention { background: var(--error); }
+
+/* The explorer's notice stack, under the tree: copies syncing or needing a decision. */
+.explorer-notices { flex-shrink: 0; max-height: 40%; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-top: 1px solid var(--border-subtle); }
+.explorer-notice { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-elevated); border-left: 2px solid var(--border-strong); font-size: 11px; line-height: 1.4; color: var(--text-secondary); overflow-wrap: anywhere; }
+.explorer-notice-warn { border-left-color: var(--accent-terracotta); }
+.explorer-notice-error { border-left-color: var(--error); color: var(--text-primary); }
+.explorer-notice-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.explorer-notice-btn { padding: 2px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border-default); background: var(--bg-surface); color: var(--text-primary); font-size: 11px; cursor: pointer; transition: background 0.1s; }
+.explorer-notice-btn:hover { background: var(--bg-hover); }
 
 /* Smooth expand/collapse: the children stay mounted and the wrapper animates between a
    collapsed (0fr) and natural (1fr) grid row. `min-height: 0` lets the inner content be

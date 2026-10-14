@@ -1,6 +1,9 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { hostInvoke, rethrowHostCall } from "../hosts/hostInvoke";
 import { isHostError, type HostId } from "../hosts/types";
+import { joinPath } from "./paths";
+
+export { joinPath };
 
 // Chunked file transfers with a Host (the Local Host when `host` is undefined), over the Host
 // methods of src-tauri/crates/core/src/transfer.rs. Downloads and uploads of a local path run
@@ -272,14 +275,6 @@ async function walkEntry(entry: FileSystemEntry, parent: string[], out: UploadEn
     children.push(...batch);
   }
   for (const c of children) await walkEntry(c, rel, out);
-}
-
-// Join path components onto `base` with its own separator (a Windows Local Host's paths use
-// `\`).
-export function joinPath(base: string, ...parts: string[]): string {
-  const sep = base.includes("\\") && !base.includes("/") ? "\\" : "/";
-  const trimmed = base.endsWith(sep) ? base.slice(0, -1) : base;
-  return [trimmed, ...parts].join(sep);
 }
 
 export type ClashChoice = "replace" | "keep_both" | "skip";

@@ -1,9 +1,14 @@
-import { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { fmt } from "../hosts/strings";
+import { fmt, type StringKey } from "../hosts/strings";
 import { hostInvoke } from "../hosts/hostInvoke";
+import { registry } from "../hosts/registry";
 import type { HostId } from "../hosts/types";
-import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon } from "lucide-react";
+import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon, ExternalLink } from "lucide-react";
+import { baseName, isTransferPart, parentOf, styleOfOs } from "../files/paths";
+import type { SyncState, SyncView, SyncNotice } from "../files/syncBack";
+import { syncBack } from "../files/syncBackDeps";
+import { fitNotice } from "../files/noticeText";
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
 import { fileIconUrl, folderIconUrl } from "../lib/fileIcons";
@@ -26,22 +31,8 @@ export const DRAG_PATH_MIME = "application/x-xshell-path";
 // prompt (Windows paths routinely have spaces). A trailing space lets the user keep typing.
 function pathForTerminal(p: string): string { return /\s/.test(p) ? `"${p}" ` : `${p} `; }
 
-function baseName(p: string): string {
-  const t = p.replace(/[\\/]+$/, "");
-  const i = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"));
-  const b = i >= 0 ? t.slice(i + 1) : t;
-  return b || t; // "C:\" -> "C:"
-}
-
-// Parent directory, or null when already at a filesystem root (drive root on Windows, "/").
-function parentOf(p: string): string | null {
-  const t = p.replace(/[\\/]+$/, "");
-  const i = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"));
-  if (i < 0) return null;          // "C:" — no parent
-  if (i === 0) return "/";         // unix "/home" -> "/"
-  const parent = t.slice(0, i);
-  return /^[a-zA-Z]:$/.test(parent) ? parent + "\\" : parent; // "C:" -> "C:\"
-}
+// Listings without the hidden part files of uploads in progress.
+const listable = (items: DirItem[]) => items.filter((i) => !isTransferPart(i.name));
 
 // Directory portion of a search hit, relative to the search root — shown dimmed after the
 // name so the user can tell two same-named files apart. Empty for top-level hits.
@@ -65,16 +56,30 @@ interface RowProps {
   hideTt: () => void;
 }
 
-// True inside a Remote Host's explorer: files are not on this computer, so rows cannot be
-// revealed — drag (path typed into the remote terminal) is the only file action.
-const RemoteRows = createContext(false);
+// The Remote Host's name inside its explorer (null on the Local Host): files there open as
+// local copies whose saves upload back, and cannot be revealed.
+const RemoteRows = createContext<string | null>(null);
+
+// Sync-back state of the files of this explorer's Host that are open, by path.
+const SyncStates = createContext<ReadonlyMap<string, SyncState>>(new Map());
+
+// The row badge of an open copy: busy, waiting for the Host, or needing the user.
+function syncBadge(state: SyncState | undefined): "syncing" | "waiting" | "attention" | null {
+  switch (state) {
+    case "downloading": case "settling": case "hashing": case "uploading": return "syncing";
+    case "waitingHost": case "unknownOutcome": return "waiting";
+    case "conflict": case "failed": case "missing": return "attention";
+    default: return null;
+  }
+}
 
 // Single presentational row, shared by the tree and the flat search results.
 function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContext, showTt, hideTt }: RowProps) {
   const remote = useContext(RemoteRows);
+  const badge = syncBadge(useContext(SyncStates).get(item.path));
   const agent = agentForDir(item);
   const iconUrl = agent ? "" : item.is_dir ? folderIconUrl(item.name, !!expanded) : fileIconUrl(item.name);
-  const tip = item.is_dir ? item.path : remote ? fmt("explorer.row.tooltipRemote") : `${item.path} — click to reveal · drag to terminal`;
+  const tip = item.is_dir ? item.path : remote !== null ? fmt("explorer.row.tooltipRemote", { host: remote }) : fmt("explorer.row.tooltipFile", { path: item.path });
   const onDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
     e.dataTransfer.setData("text/plain", item.path);
@@ -95,6 +100,7 @@ function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContex
       {agent ? <AgentIcon agent={agent} size={16} className="file-icon" /> : <img className="file-icon" src={iconUrl} alt="" draggable={false} />}
       <span className="file-name">{item.name}</span>
       {subtitle && <span className="file-row-sub">{subtitle}</span>}
+      {badge && <span className={`file-row-sync file-row-sync-${badge}`} aria-hidden />}
     </div>
   );
 }
@@ -105,7 +111,7 @@ interface NodeProps {
   tick: number;
   host?: HostId;
   activePath: string | null;
-  onReveal: (path: string) => void;
+  onOpen: (path: string) => void;
   onContext: (x: number, y: number, item: DirItem) => void;
   showTt: (text: string, el: HTMLElement) => void;
   hideTt: () => void;
@@ -114,7 +120,7 @@ interface NodeProps {
 // One tree row + its lazily-loaded children. Children load on first expand and then stay
 // mounted (height-collapsed) so the open/close height transition is smooth and re-expanding
 // is instant. The grid-rows trick (0fr↔1fr) animates to the children's natural height.
-function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt, hideTt }: NodeProps) {
+function Node({ item, depth, tick, host, activePath, onOpen, onContext, showTt, hideTt }: NodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<DirItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -124,7 +130,7 @@ function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt
     let alive = true;
     setLoading(true);
     hostInvoke<DirItem[]>(host, "list_dir", { path: item.path })
-      .then((c) => { if (alive) setChildren(c); })
+      .then((c) => { if (alive) setChildren(listable(c)); })
       .catch(() => { if (alive) setChildren([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
@@ -135,11 +141,11 @@ function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt
   useEffect(() => {
     if (tick === 0 || !expanded || children === null) return;
     let alive = true;
-    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path }).then((c) => { if (alive) setChildren(c); }).catch(() => {});
+    hostInvoke<DirItem[]>(host, "list_dir", { path: item.path }).then((c) => { if (alive) setChildren(listable(c)); }).catch(() => {});
     return () => { alive = false; };
   }, [tick]);
 
-  const onActivate = () => { if (item.is_dir) setExpanded((v) => !v); else onReveal(item.path); };
+  const onActivate = () => { if (item.is_dir) setExpanded((v) => !v); else onOpen(item.path); };
   const childPad = 6 + (depth + 1) * 12 + 14;
 
   return (
@@ -152,7 +158,7 @@ function Node({ item, depth, tick, host, activePath, onReveal, onContext, showTt
               ? (loading && expanded ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Loading…</div> : null)
               : children.length === 0
                 ? <div className="file-row file-row-muted" style={{ paddingLeft: childPad }}>Empty</div>
-                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} host={host} activePath={activePath} onReveal={onReveal} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
+                : children.map((c) => <Node key={c.path} item={c} depth={depth + 1} tick={tick} host={host} activePath={activePath} onOpen={onOpen} onContext={onContext} showTt={showTt} hideTt={hideTt} />)}
           </div>
         </div>
       )}
@@ -193,7 +199,7 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
   const load = useCallback((silent = false) => {
     if (!silent) setRefreshing(true);
     hostInvoke<DirItem[]>(host, "list_dir", { path: cwd })
-      .then(setRoots)
+      .then((items) => setRoots(listable(items)))
       .catch(() => setRoots([]))
       .finally(() => { if (!silent) setRefreshing(false); });
   }, [cwd, host]);
@@ -223,7 +229,7 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
     setSearching(true);
     const t = window.setTimeout(() => {
       hostInvoke<DirItem[]>(host, "search_dir", { root: cwd, query: q, limit: 300 })
-        .then(setResults).catch(() => setResults([])).finally(() => setSearching(false));
+        .then((items) => setResults(listable(items))).catch(() => setResults([])).finally(() => setSearching(false));
     }, 220);
     return () => window.clearTimeout(t);
   }, [query, searchOpen, cwd, host]);
@@ -244,6 +250,15 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
   // Reveal is Local only; on a Remote Host it does nothing.
   const reveal = useCallback((path: string) => { if (host) return; invoke("reveal_in_explorer", { path }).catch(() => {}); }, [host]);
   const writePath = useCallback((path: string) => { onWritePath(pathForTerminal(path)); }, [onWritePath]);
+  // Open a file in its default app: the file itself on the Local Host, a local copy whose saves
+  // upload back on a Remote Host. This explorer owns the copies it opens; when it goes away,
+  // the clean ones are deleted.
+  const ownerRef = useRef<string>(crypto.randomUUID());
+  useEffect(() => { const owner = ownerRef.current; return () => syncBack.releaseOwner(owner); }, []);
+  const openFile = useCallback((path: string) => { void syncBack.open(host, path, ownerRef.current); }, [host]);
+  const sync = useSyncExternalStore(syncBack.subscribe, syncBack.getSnapshot);
+  const syncStates = useMemo(() => new Map(host ? sync.sessions.filter((v) => v.host === host).map((v) => [v.remotePath, v.state] as const) : []), [sync, host]);
+  const hostName = host ? registry.hostName(host) : null;
   const openContext = useCallback((x: number, y: number, item: DirItem) => setCtx({ x, y, item }), []);
 
   // Tooltip with a hover delay (tree/search rows). The timer is cleared on leave so it never
@@ -256,15 +271,18 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
   const hideTtNow = useCallback(() => { if (ttTimer.current) window.clearTimeout(ttTimer.current); hideTt(); }, [hideTt]);
   useEffect(() => () => { if (ttTimer.current) window.clearTimeout(ttTimer.current); }, []);
 
-  const parent = parentOf(cwd);
+  // The Host's path rules when its OS is known, else read from the path's form.
+  const pathRules = host ? styleOfOs(registry.getStatus(host)?.os) : undefined;
+  const parent = parentOf(cwd, pathRules);
   const activePath = ctx?.item.path ?? null;
   const showingSearch = searchOpen && query.trim().length > 0;
 
   return (
-    <RemoteRows.Provider value={!!host}>
+    <RemoteRows.Provider value={hostName}>
+    <SyncStates.Provider value={syncStates}>
       <div className="git-panel-header file-panel-header">
         <Folder size={13} className="file-panel-folder" />
-        <span className="file-panel-title" onMouseEnter={(e) => showTt(cwd, e.currentTarget)} onMouseLeave={hideTt}>{baseName(cwd)}</span>
+        <span className="file-panel-title" onMouseEnter={(e) => showTt(cwd, e.currentTarget)} onMouseLeave={hideTt}>{baseName(cwd, pathRules)}</span>
         <button className="git-panel-refresh" disabled={!parent} onClick={() => parent && setCwd(parent)} onMouseEnter={(e) => showTt(parent ? "Go to parent folder" : "At filesystem root", e.currentTarget)} onMouseLeave={hideTt}><ArrowUp size={12} /></button>
         <button className={`git-panel-refresh ${searchOpen ? "active" : ""}`} onClick={() => { setSearchOpen((v) => !v); if (searchOpen) setQuery(""); }} onMouseEnter={(e) => showTt("Search", e.currentTarget)} onMouseLeave={hideTt}><Search size={12} /></button>
         <button className={`git-panel-refresh ${refreshing ? "spinning" : ""}`} onClick={() => load()} onMouseEnter={(e) => showTt("Refresh", e.currentTarget)} onMouseLeave={hideTt}><RefreshCw size={11} /></button>
@@ -287,26 +305,109 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
           : results && results.length === 0 ? <div className="git-panel-empty">No matches</div>
           : (results || []).map((item) => {
               const sub = relDir(item.path, cwd, item.name);
-              const onActivate = () => { if (item.is_dir) { setCwd(item.path); setSearchOpen(false); setQuery(""); } else reveal(item.path); };
+              const onActivate = () => { if (item.is_dir) { setCwd(item.path); setSearchOpen(false); setQuery(""); } else openFile(item.path); };
               return <FileRow key={item.path} item={item} depth={0} active={activePath === item.path} subtitle={sub || undefined} onActivate={onActivate} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />;
             })
         ) : (
           <>
             {roots === null && <div className="git-panel-empty">Loading…</div>}
             {roots !== null && roots.length === 0 && <div className="git-panel-empty">Empty folder</div>}
-            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} host={host} activePath={activePath} onReveal={reveal} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
+            {roots?.map((item) => <Node key={item.path} item={item} depth={0} tick={tick} host={host} activePath={activePath} onOpen={openFile} onContext={openContext} showTt={showTtDelayed} hideTt={hideTtNow} />)}
           </>
         )}
       </div>
       {ctx && (
         <>
           <div className="file-ctx-backdrop" onClick={() => setCtx(null)} onContextMenu={(e) => { e.preventDefault(); setCtx(null); }} />
-          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 80) }}>
-            {!host && <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>Reveal in folder</span></button>}
-            <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>Write path to terminal</span></button>
+          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 110) }}>
+            {!ctx.item.is_dir && <button className="file-ctx-item" onClick={() => { openFile(ctx.item.path); setCtx(null); }}><ExternalLink size={13} /><span>{fmt("explorer.menu.open")}</span></button>}
+            {!host && <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>{fmt("explorer.menu.reveal")}</span></button>}
+            <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>{fmt("explorer.menu.writePath")}</span></button>
           </div>
         </>
       )}
+      <ExplorerNotices host={host} hostName={hostName} sync={sync} />
+    </SyncStates.Provider>
     </RemoteRows.Provider>
+  );
+}
+
+interface NoticeItem {
+  id: string;
+  text: string;
+  full: string;
+  tone: "info" | "warn" | "error";
+  actions: { label: string; title?: string; run: () => void }[];
+}
+
+function sessionNotice(v: SyncView, host: string): NoticeItem | null {
+  const make = (key: StringKey, tone: NoticeItem["tone"], actions: NoticeItem["actions"] = [], extra: Record<string, string | number> = {}): NoticeItem => {
+    // The full text names the whole remote path; the shown one fits the notice budget.
+    const { text } = fitNotice(key, { name: v.name, host, error: v.error ?? "", ...extra });
+    const { full } = fitNotice(key, { name: v.remotePath, host, error: v.error ?? "", ...extra });
+    return { id: v.key, text, full, tone, actions };
+  };
+  switch (v.state) {
+    case "downloading":
+      return make("explorer.open.downloading", "info", [], { pct: Math.round((v.progress ?? 0) * 100) });
+    case "hashing":
+    case "uploading":
+      return make(v.checking ? "explorer.sync.checking" : "explorer.sync.uploading", "info");
+    case "waitingHost":
+      return make(v.checking ? "explorer.sync.checking" : "explorer.sync.waiting", "warn");
+    case "unknownOutcome":
+      return make(v.checking ? "explorer.sync.checking" : "explorer.sync.unknownOutcome", "warn");
+    case "conflict":
+      return v.checking ? make("explorer.sync.checking", "error") : make("explorer.sync.conflict", "error", [
+        { label: fmt("explorer.sync.overwrite"), run: () => void syncBack.resolveConflict(v.key, "overwrite") },
+        { label: fmt("explorer.sync.keepRemote"), title: fmt("explorer.sync.keepRemoteHint", { host }), run: () => void syncBack.resolveConflict(v.key, "keepRemote") },
+      ]);
+    case "failed":
+      return make("explorer.sync.failed", "error", [{ label: fmt("explorer.sync.retry"), run: () => void syncBack.retry(v.key) }]);
+    case "missing":
+      return make("explorer.sync.missing", "error", [
+        { label: fmt("explorer.sync.downloadAgain"), run: () => void syncBack.downloadAgain(v.key) },
+        { label: fmt("explorer.sync.close"), run: () => void syncBack.close(v.key) },
+      ]);
+    default:
+      return null;
+  }
+}
+
+function transientNotice(n: SyncNotice, host: string): NoticeItem {
+  const dismiss = { label: fmt("explorer.notice.dismiss"), run: () => syncBack.dismiss(n.id) };
+  const id = `n${n.id}`;
+  switch (n.kind) {
+    case "uploaded":
+      return { id, ...fitNotice("explorer.sync.uploaded", { name: n.name, host }), tone: "info", actions: [] };
+    case "openFailed":
+      return { id, ...fitNotice("explorer.open.failed", { name: n.name, error: n.error }), tone: "error", actions: [dismiss] };
+    case "restored":
+      return { id, ...fitNotice("explorer.sync.restored", { n: n.n, host }), tone: "warn", actions: [dismiss] };
+  }
+}
+
+// The explorer's notice stack: copies of this Host's files that are syncing or need the user,
+// and short-lived results. Shown in every explorer of the Host, so a copy whose explorer
+// closed is still reachable.
+function ExplorerNotices({ host, hostName, sync }: { host?: HostId; hostName: string | null; sync: { sessions: SyncView[]; notices: SyncNotice[] } }) {
+  const name = hostName ?? "";
+  const items: NoticeItem[] = [];
+  if (host) for (const v of sync.sessions) if (v.host === host) { const n = sessionNotice(v, name); if (n) items.push(n); }
+  for (const n of sync.notices) if (n.host === host) items.push(transientNotice(n, name));
+  if (items.length === 0) return null;
+  return (
+    <div className="explorer-notices" role="status">
+      {items.map((n) => (
+        <div key={n.id} className={`explorer-notice explorer-notice-${n.tone}`} title={n.full}>
+          <span className="explorer-notice-text">{n.text}</span>
+          {n.actions.length > 0 && (
+            <span className="explorer-notice-actions">
+              {n.actions.map((a) => <button key={a.label} className="explorer-notice-btn" title={a.title} onClick={a.run}>{a.label}</button>)}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
