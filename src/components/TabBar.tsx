@@ -107,12 +107,14 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
 
   // Prefer opening rightward from the anchor (readable when anchor is far left).
   // Fall back to leftward anchoring only if the dropdown would overflow the viewport.
-  const dropdownWidth = 280; // matches .tab-dropdown min-width
+  const dropdownWidth = Math.min(280, window.innerWidth * 0.92); // matches .tab-dropdown min-width
   const top = anchorRect.bottom + 4;
   const canOpenRight = anchorRect.left + dropdownWidth + 4 <= window.innerWidth;
-  const positionStyle: React.CSSProperties = canOpenRight
-    ? { top, left: Math.max(4, anchorRect.left) }
-    : { top, right: Math.max(4, window.innerWidth - anchorRect.right) };
+  const maxLeft = Math.max(4, window.innerWidth - dropdownWidth - 4);
+  const positionStyle: React.CSSProperties = {
+    top, maxHeight: Math.max(80, window.innerHeight - top - 8),
+    ...(canOpenRight ? { left: Math.max(4, anchorRect.left) } : { left: Math.min(maxLeft, Math.max(4, anchorRect.right - dropdownWidth)) }),
+  };
 
   // A Remote Host offers its own OS's shells, never the Desktop's.
   const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();

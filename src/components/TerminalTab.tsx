@@ -209,8 +209,8 @@ function TerminalTooltip({ text, rect }: { text: string; rect: DOMRect }) {
 const MIN_PANEL = 200;
 const DEFAULT_PANEL = 280;
 // Leave room for the activity bar (32) + splitter (4) + a thin terminal sliver (~40) when the
-// panel is dragged to its widest, so it can cover almost the whole terminal but stay grabbable.
-const PANEL_EDGE_RESERVE = 76;
+// panel is dragged to its widest, so it can cover most of the terminal but stay usable.
+const PANEL_EDGE_RESERVE = 140; // = the CSS max-width reserve on .terminal-side-panel
 
 export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1036,7 +1036,8 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   const onSplitterDown = useCallback((e: React.PointerEvent) => {
     e.preventDefault();
     const startX = e.clientX;
-    const startWidth = gitPanelWidth;
+    const panelEl = e.currentTarget.nextElementSibling as HTMLElement | null;
+    const startWidth = panelEl?.getBoundingClientRect().width ?? gitPanelWidth; // rendered, may be CSS-clamped
     // Cap to the available body width so the panel can stretch across (almost) the whole terminal.
     const bodyWidth = e.currentTarget.parentElement?.clientWidth ?? window.innerWidth;
     const maxPanel = Math.max(MIN_PANEL, bodyWidth - PANEL_EDGE_RESERVE);
@@ -1711,8 +1712,9 @@ function BranchDropdown({ cwd, host, currentBranch, dirty, busy, panelWidth, anc
   // Width = max(default, current panel width) so a user who's resized the panel wide gets
   // a dropdown that lines up with it instead of looking thin and offset.
   const dropdownHeight = 360; // matches max-height in CSS
-  const dropdownWidth = Math.max(320, panelWidth);
-  const opensUp = anchorRect.bottom + dropdownHeight + 8 > window.innerHeight && anchorRect.top > dropdownHeight;
+  const dropdownWidth = Math.min(Math.max(320, panelWidth), window.innerWidth * 0.92);
+  const opensUp = anchorRect.bottom + dropdownHeight + 8 > window.innerHeight && anchorRect.top > window.innerHeight - anchorRect.bottom;
+  const maxHeight = Math.max(80, Math.min(dropdownHeight, (opensUp ? anchorRect.top : window.innerHeight - anchorRect.bottom) - 12));
   const right = Math.max(8, window.innerWidth - anchorRect.right);
   // Keep the dropdown fully on-screen if the chip is so close to the left edge that
   // right-anchoring would push it off-screen. In that case fall back to left-anchoring.
@@ -1722,7 +1724,7 @@ function BranchDropdown({ cwd, host, currentBranch, dirty, busy, panelWidth, anc
     : { right };
   const positionStyle: React.CSSProperties = {
     ...horizontal,
-    width: dropdownWidth,
+    width: dropdownWidth, maxHeight,
     ...(opensUp ? { bottom: window.innerHeight - anchorRect.top + 4 } : { top: anchorRect.bottom + 4 }),
   };
 
