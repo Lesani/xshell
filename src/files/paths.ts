@@ -64,3 +64,28 @@ export function styleOfOs(os: string | null | undefined): PathStyle | undefined 
 export function isTransferPart(name: string): boolean {
   return /^\..*\.xshell-part-[0-9a-f]{12}$/.test(name);
 }
+
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i;
+
+// Whether `name` can be one path component on a machine with `style` path rules: not empty,
+// `.` or `..`, no NUL or separator; on Windows also none of `\ / : * ? " < > |`, no control
+// character, no trailing dot or space, and not a reserved device name (CON, NUL, COM1…).
+// A Remote Host's name that fails this cannot be written here without changing its meaning.
+export function isLocalName(name: string, style: PathStyle): boolean {
+  if (!name || name === "." || name === ".." || name.includes("\0") || name.includes("/")) return false;
+  if (style === "posix") return true;
+  if (/[\\:*?"<>|\u0000-\u001f]/.test(name)) return false;
+  if (/[. ]$/.test(name)) return false;
+  return !WINDOWS_RESERVED.test(name);
+}
+
+// Whether `child` is strictly inside `root` (both by `style`'s rules, case-insensitive on
+// Windows).
+export function isInside(root: string, child: string, style: PathStyle): boolean {
+  const norm = (p: string) => (style === "windows" ? p.replace(/\//g, "\\").toLowerCase() : p);
+  const sep = style === "windows" ? "\\" : "/";
+  const r = norm(root).replace(style === "windows" ? /\\+$/ : /\/+$/, "");
+  const c = norm(child);
+  if (!c.startsWith(r + sep) || c.length <= r.length + 1) return false;
+  return !c.slice(r.length + 1).split(sep).some((part) => part === ".." || part === "." || part === "");
+}

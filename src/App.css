@@ -852,6 +852,33 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .file-row-sync-waiting { background: var(--text-muted); }
 .file-row-sync-attention { background: var(--error); }
 
+/* Drag-out grip at a file row's right edge (Lesani/xshell#46): shown on hover; a press and a
+   small move drag the file out to the OS. */
+.file-row-grip { flex-shrink: 0; margin-left: auto; display: inline-flex; align-items: center; justify-content: center; min-width: 14px; height: 16px; border-radius: var(--radius-sm); color: var(--text-muted); cursor: grab; opacity: 0; touch-action: none; transition: opacity 0.1s, color 0.1s; }
+.file-row-sync + .file-row-grip { margin-left: 4px; }
+.file-row:hover .file-row-grip, .file-row-grip-preparing, .file-row-grip-dragging { opacity: 1; }
+.file-row-grip:hover { color: var(--accent-terracotta); }
+.file-row-grip-disabled { cursor: not-allowed; }
+.file-row:hover .file-row-grip-disabled { opacity: 0.35; }
+.file-row-grip-disabled:hover { color: var(--text-muted); }
+.file-row-grip-pct { font-size: 9px; color: var(--accent-terracotta); }
+/* Drop-in uploads: the folder row under the pointer, or the whole tree for the current folder. */
+.file-row-drop { background: color-mix(in oklab, var(--accent-terracotta) 18%, transparent); color: var(--text-primary); outline: 1px dashed var(--accent-terracotta); outline-offset: -1px; }
+.file-tree-drop { background: color-mix(in oklab, var(--accent-terracotta) 8%, transparent); outline: 1px dashed var(--accent-terracotta); outline-offset: -2px; }
+.file-drop-hint { flex-shrink: 0; padding: 4px 8px; font-size: 11px; color: var(--text-primary); background: var(--bg-elevated); border-top: 1px solid var(--border-subtle); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Transfers in progress (uploads, downloads), each with Cancel. */
+.file-transfer-strip { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; padding: 6px; border-top: 1px solid var(--border-subtle); }
+.file-transfer { display: flex; flex-direction: column; gap: 4px; }
+.file-transfer-row { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); }
+.file-transfer-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-transfer-bar { height: 2px; border-radius: 1px; background: var(--border-subtle); overflow: hidden; }
+.file-transfer-fill { height: 100%; background: var(--accent-terracotta); transition: width 0.15s; }
+/* Name clash of a dropped file. */
+.file-clash-dialog { left: 50%; top: 30%; transform: translateX(-50%); width: 300px; max-width: 92vw; }
+.file-clash-dialog .file-ctx-confirm { max-width: none; }
+.file-clash-all { display: flex; align-items: center; gap: 6px; padding: 2px 10px 6px; font-size: 11px; color: var(--text-secondary); cursor: pointer; }
+.file-clash-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; padding: 0 8px 6px; }
+
 /* The explorer's notice stack, under the tree: copies syncing or needing a decision. */
 .explorer-notices { flex-shrink: 0; max-height: 40%; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-top: 1px solid var(--border-subtle); }
 .explorer-notice { display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-elevated); border-left: 2px solid var(--border-strong); font-size: 11px; line-height: 1.4; color: var(--text-secondary); overflow-wrap: anywhere; }

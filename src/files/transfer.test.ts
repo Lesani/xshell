@@ -19,6 +19,7 @@ import {
   CHUNK, FILE_CHANGED, FILE_EXISTS, UPLOAD_OUTCOME_UNKNOWN, UPLOAD_UNKNOWN, TRANSFER_CANCELLED,
   bytesToBase64, download, isFileChanged, isFileExists, isUploadOutcomeUnknown, joinPath, upload,
   uploadEntries, commitAgain, UploadPendingError, type UploadEntry,
+  entriesFromDrop, downloadTree, TreeTooLargeError, TransferAbortedError, TREE_MAX_ENTRIES,
 } from "./transfer";
 import { HostUnavailableError } from "../hosts/hostInvoke";
 
@@ -288,5 +289,248 @@ describe("helpers", () => {
     expect(joinPath("/d", "a", "b")).toBe("/d/a/b");
     expect(joinPath("/d/", "a")).toBe("/d/a");
     expect(joinPath("C:\\Users\\u", "a")).toBe("C:\\Users\\u\\a");
+  });
+});
+
+// ── Drop-in (S3b) ────────────────────────────────────────────────────
+
+// FileSystemEntry fakes: a directory's reader answers in the given batches, then empty.
+function fileEntry(name: string, size = 1): FileSystemFileEntry {
+  return { name, isFile: true, isDirectory: false, file: (ok: (f: File) => void) => ok(new File([new Uint8Array(size)], name)) } as unknown as FileSystemFileEntry;
+}
+function dirEntry(name: string, batches: FileSystemEntry[][]): FileSystemDirectoryEntry {
+  return {
+    name, isFile: false, isDirectory: true,
+    createReader: () => {
+      const queue = [...batches];
+      return { readEntries: (ok: (b: FileSystemEntry[]) => void) => ok(queue.shift() ?? []) };
+    },
+  } as unknown as FileSystemDirectoryEntry;
+}
+function dataTransfer(items: { entry?: FileSystemEntry | null; file?: File }[]): DataTransfer {
+  return {
+    items: items.map(it => ({ kind: "file", webkitGetAsEntry: () => it.entry ?? null, getAsFile: () => it.file ?? null })),
+  } as unknown as DataTransfer;
+}
+
+describe("entriesFromDrop", () => {
+  it("walks nested folders, parents first, reading every batch", async () => {
+    const tree = dirEntry("pics", [[fileEntry("a.png"), dirEntry("deep", [[fileEntry("b.png")], [fileEntry("c.png")]])], [fileEntry("d.png")]]);
+    const out = await entriesFromDrop(dataTransfer([{ entry: tree }, { entry: fileEntry("top.txt") }]));
+    expect(out.map(e => [e.rel.join("/"), !!e.file])).toEqual([
+      ["pics", false], ["pics/a.png", true], ["pics/deep", false], ["pics/deep/b.png", true], ["pics/deep/c.png", true], ["pics/d.png", true], ["top.txt", true],
+    ]);
+  });
+
+  it("falls back to the files when there is no entry", async () => {
+    const f = new File([new Uint8Array(2)], "loose.bin");
+    const out = await entriesFromDrop(dataTransfer([{ entry: null, file: f }]));
+    expect(out).toEqual([{ rel: ["loose.bin"], file: f }]);
+  });
+
+  it("counts what it finds and stops on a cancel", async () => {
+    const ac = new AbortController();
+    const found: number[] = [];
+    const tree = dirEntry("pics", [[fileEntry("a.png"), fileEntry("b.png")]]);
+    await entriesFromDrop(dataTransfer([{ entry: tree }]), { onFound: n => found.push(n) });
+    expect(found).toEqual([1, 2, 3]);
+    const stop = dirEntry("pics", [[fileEntry("a.png")]]);
+    const p = entriesFromDrop(dataTransfer([{ entry: stop }]), { signal: ac.signal, onFound: () => ac.abort() });
+    await expect(p).rejects.toBeInstanceOf(TransferAbortedError);
+  });
+
+  it("an unreadable folder rejects", async () => {
+    const bad = { name: "x", isFile: false, isDirectory: true, createReader: () => ({ readEntries: (_: unknown, fail: (e: Error) => void) => fail(new Error("denied")) }) } as unknown as FileSystemEntry;
+    await expect(entriesFromDrop(dataTransfer([{ entry: bad }]))).rejects.toThrow("denied");
+  });
+});
+
+describe("uploadEntries batches", () => {
+  const file = (name: string, n = 1) => new File([new Uint8Array(n)], name);
+
+  it("joins names with the Host's separator", async () => {
+    fakeHost();
+    await uploadEntries(H, "C:\\work", [{ rel: ["pics"] }, { rel: ["pics", "a.png"], file: file("a.png") }], { resolveClash: async () => "skip" });
+    const seq = invoke.mock.calls.map(c => [methodOf(c), argsOf(c).path ?? argsOf(c).dir]).filter(([m]) => m === "make_dir" || m === "upload_begin");
+    expect(seq).toEqual([["make_dir", "C:\\work\\pics"], ["upload_begin", "C:\\work\\pics"]]);
+  });
+
+  it("reports file i of n with its own progress", async () => {
+    fakeHost();
+    const at: unknown[] = [];
+    await uploadEntries(H, "/d", [{ rel: ["a"], file: file("a", 2) }, { rel: ["b"], file: file("b", 3) }], { resolveClash: async () => "skip" }, (_d, _t, cur, a) => at.push([cur, a]));
+    expect(at).toContainEqual(["/d/a", { i: 1, n: 2, fileSize: 2, fileDone: 2 }]);
+    expect(at[at.length - 1]).toEqual(["/d/b", { i: 2, n: 2, fileSize: 3, fileDone: 3 }]);
+  });
+
+  it("an existing folder merges; a file in the way skips its subtree", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "make_dir") { if (p.path === "/d/blocked") throw { code: "remote", message: `${FILE_EXISTS}: /d/blocked` }; return null; }
+      if (m === "upload_begin") return { upload_id: `u-${p.name}`, final_path: "" };
+      if (m === "upload_commit") return { ...done, path: p.uploadId };
+      return null;
+    });
+    const r = await uploadEntries(H, "/d", [
+      { rel: ["blocked"] }, { rel: ["blocked", "in"] }, { rel: ["blocked", "in", "x"], file: file("x") },
+      { rel: ["merged"] }, { rel: ["merged", "y"], file: file("y") },
+    ], { resolveClash: async () => "skip" });
+    expect(r.skipped).toEqual(["/d/blocked", "/d/blocked/in/x"]);
+    expect(r.uploaded.map(t => t.path)).toEqual(["u-y"]);
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "make_dir").map(c => argsOf(c).path)).toEqual(["/d/blocked", "/d/merged"]);
+  });
+
+  it("a failing file is counted and the batch goes on", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "upload_begin") { if (p.name === "bad") throw { code: "remote", message: "Permission denied" }; return { upload_id: `u-${p.name}`, final_path: "" }; }
+      if (m === "upload_commit") return { ...done, path: p.uploadId };
+      return null;
+    });
+    const r = await uploadEntries(H, "/d", [{ rel: ["bad"], file: file("bad") }, { rel: ["ok"], file: file("ok") }], { resolveClash: async () => "skip" });
+    expect(r.failed).toEqual([{ path: "/d/bad", error: "Permission denied" }]);
+    expect(r.uploaded.map(t => t.path)).toEqual(["u-ok"]);
+  });
+
+  it("an offline Host stops the batch; the rest counts as failed", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "upload_begin") { if (p.name === "b") throw { code: "offline", message: "down" }; return { upload_id: `u-${p.name}`, final_path: "" }; }
+      if (m === "upload_commit") return { ...done, path: p.uploadId };
+      return null;
+    });
+    const r = await uploadEntries(H, "/d", [{ rel: ["a"], file: file("a") }, { rel: ["b"], file: file("b") }, { rel: ["c"], file: file("c") }], { resolveClash: async () => "skip" });
+    expect(r.uploaded.map(t => t.path)).toEqual(["u-a"]);
+    expect(r.failed.map(f => f.path)).toEqual(["/d/b", "/d/c"]);
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "upload_begin").map(c => argsOf(c).name)).toEqual(["a", "b"]);
+  });
+
+  it("cancel aborts the current upload, stops the queue and counts what finished", async () => {
+    const ac = new AbortController();
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "upload_begin") return { upload_id: `u-${p.name}`, final_path: "" };
+      if (m === "upload_chunk" && p.uploadId === "u-b") ac.abort();
+      if (m === "upload_commit") return { ...done, path: p.uploadId };
+      return null;
+    });
+    const e = await uploadEntries(H, "/d", [{ rel: ["a"], file: file("a") }, { rel: ["b"], file: file("b") }, { rel: ["c"], file: file("c") }], { resolveClash: async () => "skip" }, undefined, ac.signal).catch(x => x);
+    expect(e).toBeInstanceOf(TransferAbortedError);
+    expect(e.completed).toBe(1);
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "upload_abort").map(c => argsOf(c).uploadId)).toEqual(["u-b"]);
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "upload_begin").map(c => argsOf(c).name)).toEqual(["a", "b"]);
+  });
+});
+
+describe("downloadTree", () => {
+  it("lists first, then creates folders and downloads files, with per-file progress", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "list_dir") return p.path === "/srv/src" ? [{ name: "a", path: "/srv/src/a", is_dir: false }, { name: "sub", path: "/srv/src/sub", is_dir: true }] : [{ name: "b", path: "/srv/src/sub/b", is_dir: false }];
+      if (cmd === "transfer_download") { (a.onProgress as InstanceType<typeof FakeChannel>).emit({ done: 1, total: 2 }); return done; }
+      return null;
+    });
+    const progress: unknown[] = [];
+    const listing: number[] = [];
+    const r = await downloadTree(H, "/srv/src", "/home/u/src (2)", (...x) => progress.push(x), undefined, n => listing.push(n));
+    expect(r).toEqual({ files: 2, skipped: [] });
+    expect(listing).toEqual([1, 2, 3]);
+    // The root was reserved by the caller: only sub-folders are made, after the listing.
+    const order = invoke.mock.calls.map(c => methodOf(c)).filter(m => m === "list_dir" || m === "make_dir");
+    expect(order).toEqual(["list_dir", "list_dir", "make_dir"]);
+    expect(invoke.mock.calls.filter(c => c[0] === "make_dir").map(c => (c[1] as { path: string }).path)).toEqual(["/home/u/src (2)/sub"]);
+    expect(calls("transfer_download").map(c => [c[1].remotePath, c[1].localPath])).toEqual([["/srv/src/a", "/home/u/src (2)/a"], ["/srv/src/sub/b", "/home/u/src (2)/sub/b"]]);
+    expect(progress).toContainEqual([0, 2, "/srv/src/a", 0.5]);
+    expect(progress[progress.length - 1]).toEqual([2, 2, "", 1]);
+  });
+
+  it("names a Windows destination cannot hold are skipped, never written outside it", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const m = methodOf([cmd, a]);
+      const p = argsOf([cmd, a]);
+      if (m === "list_dir") {
+        return p.path === "/srv/src"
+          ? [{ name: "..\\notes.txt", path: "/srv/src/..\\notes.txt", is_dir: false }, { name: "a:b", path: "/srv/src/a:b", is_dir: true }, { name: "ok.txt", path: "/srv/src/ok.txt", is_dir: false }, { name: "..", path: "/srv/src/..", is_dir: true }]
+          : [];
+      }
+      if (cmd === "transfer_download") return done;
+      return null;
+    });
+    const r = await downloadTree(H, "/srv/src", "C:\\Downloads\\src", undefined);
+    expect(r).toEqual({ files: 1, skipped: ["/srv/src/..\\notes.txt", "/srv/src/a:b", "/srv/src/.."] });
+    expect(calls("transfer_download").map(c => c[1].localPath)).toEqual(["C:\\Downloads\\src\\ok.txt"]);
+    // A skipped folder is not listed.
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "list_dir").length).toBe(1);
+  });
+
+  it("../x from a POSIX Host into a POSIX destination is skipped", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) =>
+      methodOf([cmd, a]) === "list_dir" ? [{ name: "../x", path: "/srv/src/../x", is_dir: false }, { name: "..", path: "/srv", is_dir: true }] : null);
+    const r = await downloadTree(H, "/srv/src", "/home/u/src", undefined);
+    expect(r).toEqual({ files: 0, skipped: ["/srv/src/../x", "/srv"] });
+    expect(calls("transfer_download")).toEqual([]);
+  });
+
+  it("refuses too many files before creating or downloading anything", async () => {
+    const many = Array.from({ length: TREE_MAX_ENTRIES + 1 }, (_, i) => ({ name: `f${i}`, path: `/srv/big/f${i}`, is_dir: false }));
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => (methodOf([cmd, a]) === "list_dir" ? many : null));
+    const e = await downloadTree(H, "/srv/big", "/home/u/big").catch(x => x);
+    expect(e).toBeInstanceOf(TreeTooLargeError);
+    expect(e.max).toBe(TREE_MAX_ENTRIES);
+    expect(calls("transfer_download")).toEqual([]);
+    expect(calls("make_dir")).toEqual([]);
+  });
+
+  it("folders count against the entry budget too", async () => {
+    const dirs = Array.from({ length: TREE_MAX_ENTRIES + 1 }, (_, i) => ({ name: `d${i}`, path: `/srv/wide/d${i}`, is_dir: true }));
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      if (methodOf([cmd, a]) !== "list_dir") return null;
+      return argsOf([cmd, a]).path === "/srv/wide" ? dirs : [];
+    });
+    const e = await downloadTree(H, "/srv/wide", "/home/u/wide").catch(x => x);
+    expect(e).toBeInstanceOf(TreeTooLargeError);
+    expect(e.limit).toBe("entries");
+    expect(calls("make_dir")).toEqual([]);
+  });
+
+  it("refuses a folder deeper than the cap (symlink loops)", async () => {
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      const p = argsOf([cmd, a]);
+      return methodOf([cmd, a]) === "list_dir" ? [{ name: "loop", path: `${p.path}/loop`, is_dir: true }] : null;
+    });
+    await expect(downloadTree(H, "/srv/l", "/home/u/l")).rejects.toMatchObject({ name: "TreeTooLargeError", limit: "depth" });
+    expect(calls("make_dir")).toEqual([]);
+  });
+
+  it("a cancel during the listing stops it", async () => {
+    const ac = new AbortController();
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      if (methodOf([cmd, a]) !== "list_dir") return null;
+      ac.abort();
+      return [{ name: "a", path: "/s/a", is_dir: true }];
+    });
+    const e = await downloadTree(H, "/s", "/l", undefined, ac.signal).catch(x => x);
+    expect(e).toBeInstanceOf(TransferAbortedError);
+    expect(invoke.mock.calls.filter(c => methodOf(c) === "list_dir").length).toBe(1);
+  });
+
+  it("a cancel counts the files done", async () => {
+    const ac = new AbortController();
+    invoke.mockImplementation(async (cmd: string, a: Record<string, unknown>) => {
+      if (methodOf([cmd, a]) === "list_dir") return [{ name: "a", path: "/s/a", is_dir: false }, { name: "b", path: "/s/b", is_dir: false }];
+      if (cmd === "transfer_download") {
+        if (a.remotePath === "/s/b") { ac.abort(); throw { code: "remote", message: TRANSFER_CANCELLED }; }
+        return done;
+      }
+      return null;
+    });
+    const e = await downloadTree(H, "/s", "/l", undefined, ac.signal).catch(x => x);
+    expect(e).toBeInstanceOf(TransferAbortedError);
+    expect(e.completed).toBe(1);
   });
 });

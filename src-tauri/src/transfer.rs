@@ -286,6 +286,27 @@ pub fn transfer_cancel(transfers: State<'_, Transfers>, transfer_id: String) {
     transfers.cancel(&transfer_id);
 }
 
+/// Create `path` as a new folder of this machine for a folder download, never merging into
+/// what is there: `Ok(false)` when anything exists at `path` (a folder, a file, a link).
+pub fn reserve_dir(path: &Path) -> Result<bool, String> {
+    if !path.is_absolute() {
+        return Err(format!("{}: is not absolute", path.display()));
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("Failed to create {}: {e}", path.display())),
+    }
+}
+
+/// [`reserve_dir`] for "Download to…" of a folder.
+#[tauri::command]
+pub async fn transfer_reserve_dir(path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || reserve_dir(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +412,27 @@ mod tests {
             assert!(max > 1, "{h}: the pumps ran side by side");
         }
         assert!(t.inner.reads.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reserve_dir_creates_only_new_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("src");
+        assert_eq!(reserve_dir(&d), Ok(true));
+        assert!(d.is_dir());
+        // A second reservation of the same name fails over to the caller's next suffix.
+        assert_eq!(reserve_dir(&d), Ok(false));
+        let f = tmp.path().join("file");
+        std::fs::write(&f, "x").unwrap();
+        assert_eq!(reserve_dir(&f), Ok(false));
+        #[cfg(unix)]
+        {
+            let l = tmp.path().join("link");
+            std::os::unix::fs::symlink(tmp.path().join("missing"), &l).unwrap();
+            assert_eq!(reserve_dir(&l), Ok(false));
+            assert!(!tmp.path().join("missing").exists());
+        }
+        assert!(reserve_dir(Path::new("relative")).is_err());
+        assert!(reserve_dir(&tmp.path().join("no").join("parent")).is_err());
     }
 }

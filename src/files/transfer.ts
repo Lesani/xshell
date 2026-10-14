@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { hostInvoke, rethrowHostCall } from "../hosts/hostInvoke";
+import { HostUnavailableError, hostInvoke, rethrowHostCall } from "../hosts/hostInvoke";
 import { isHostError, type HostId } from "../hosts/types";
-import { joinPath } from "./paths";
+import { isInside, isLocalName, joinPath, pathStyle } from "./paths";
 
 export { joinPath };
 
@@ -40,7 +40,7 @@ export interface Transferred {
 
 export type OnProgress = (done: number, total: number) => void;
 
-function messageOf(e: unknown): string {
+export function messageOf(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return "";
@@ -54,9 +54,12 @@ export const isFileExists = (e: unknown) => messageOf(e).startsWith(FILE_EXISTS)
 export const isUploadOutcomeUnknown = (e: unknown) => messageOf(e).startsWith(UPLOAD_OUTCOME_UNKNOWN);
 
 export class TransferAbortedError extends Error {
-  constructor() {
+  // Items a batch finished before it was cancelled (uploadEntries, downloadTree).
+  readonly completed: number;
+  constructor(completed = 0) {
     super(TRANSFER_CANCELLED);
     this.name = "AbortError";
+    this.completed = completed;
   }
 }
 
@@ -238,7 +241,8 @@ export interface UploadEntry {
 
 // The items of an OS drop, folders walked recursively. Call it synchronously in the drop
 // handler: the DataTransfer's items are readable only then (the walk itself is async).
-export function entriesFromDrop(dt: DataTransfer): Promise<UploadEntry[]> {
+// `onFound` counts the items found; an abort stops the walk (TransferAbortedError).
+export function entriesFromDrop(dt: DataTransfer, opts?: { signal?: AbortSignal; onFound?: (n: number) => void }): Promise<UploadEntry[]> {
   const roots: FileSystemEntry[] = [];
   const loose: File[] = [];
   for (const item of Array.from(dt.items)) {
@@ -252,88 +256,175 @@ export function entriesFromDrop(dt: DataTransfer): Promise<UploadEntry[]> {
   }
   return (async () => {
     const out: UploadEntry[] = loose.map(file => ({ rel: [file.name], file }));
-    for (const r of roots) await walkEntry(r, [], out);
+    const walker: Walker = { out, signal: opts?.signal, onFound: opts?.onFound };
+    for (const r of roots) await walkEntry(r, [], walker);
     return out;
   })();
 }
 
-async function walkEntry(entry: FileSystemEntry, parent: string[], out: UploadEntry[]): Promise<void> {
+interface Walker {
+  out: UploadEntry[];
+  signal?: AbortSignal;
+  onFound?: (n: number) => void;
+}
+
+async function walkEntry(entry: FileSystemEntry, parent: string[], w: Walker): Promise<void> {
+  if (w.signal?.aborted) throw new TransferAbortedError();
   const rel = [...parent, entry.name];
   if (entry.isFile) {
     const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
-    out.push({ rel, file });
+    w.out.push({ rel, file });
+    w.onFound?.(w.out.length);
     return;
   }
   if (!entry.isDirectory) return;
-  out.push({ rel });
+  w.out.push({ rel });
+  w.onFound?.(w.out.length);
   const reader = (entry as FileSystemDirectoryEntry).createReader();
   const children: FileSystemEntry[] = [];
   // readEntries answers in batches until an empty one.
   for (;;) {
+    if (w.signal?.aborted) throw new TransferAbortedError();
     const batch = await new Promise<FileSystemEntry[]>((res, rej) => reader.readEntries(res, rej));
     if (batch.length === 0) break;
     children.push(...batch);
   }
-  for (const c of children) await walkEntry(c, rel, out);
+  for (const c of children) await walkEntry(c, rel, w);
 }
 
 export type ClashChoice = "replace" | "keep_both" | "skip";
 
 export interface UploadEntriesResult {
   uploaded: Transferred[];
+  // Files skipped at a clash, and folders that could not be created (a file is in the way)
+  // with everything below them.
   skipped: string[];
+  // Items that failed for another reason; the rest of the batch still ran.
+  failed: { path: string; error: string }[];
 }
+
+// Where a batch is: file `i` of `n` (1-based), and how far that file is.
+export interface UploadProgress {
+  i: number;
+  n: number;
+  fileDone: number;
+  fileSize: number;
+}
+
+const isBelow = (rel: string[], dir: string[]) => dir.length < rel.length && dir.every((c, k) => rel[k] === c);
 
 // Upload dropped entries into `dir`: directories are created (merged into existing ones),
 // files uploaded with onClash "fail"; on a clash `resolveClash` decides (it owns "apply to
-// all"). Progress counts bytes over all files; `current` is the file being sent.
+// all"). A folder that cannot be created (a file is in the way) is skipped with what is
+// below it; a file that fails is counted and the batch goes on. When the Host becomes
+// unavailable, the batch stops and the files not sent count as failed. Progress counts
+// bytes over all files; `current` is the file being sent. A cancel rejects with
+// TransferAbortedError, its `completed` set to the files uploaded so far.
 export async function uploadEntries(
   host: HostId | undefined,
   dir: string,
   entries: UploadEntry[],
   opts: { resolveClash: (path: string) => Promise<ClashChoice> },
-  onProgress?: (done: number, total: number, current: string) => void,
+  onProgress?: (done: number, total: number, current: string, at?: UploadProgress) => void,
   signal?: AbortSignal,
 ): Promise<UploadEntriesResult> {
   const total = entries.reduce((n, e) => n + (e.file?.size ?? 0), 0);
-  const result: UploadEntriesResult = { uploaded: [], skipped: [] };
+  const count = entries.filter(e => e.file).length;
+  const result: UploadEntriesResult = { uploaded: [], skipped: [], failed: [] };
+  const blocked: string[][] = [];
+  const aborted = (e: unknown) => !!signal?.aborted || e instanceof TransferAbortedError;
   let base = 0;
-  for (const e of entries) {
-    if (signal?.aborted) throw new TransferAbortedError();
-    const path = joinPath(dir, ...e.rel);
-    if (!e.file) {
-      await makeDir(host, path);
-      continue;
-    }
-    const parent = joinPath(dir, ...e.rel.slice(0, -1));
-    const name = e.rel[e.rel.length - 1];
-    const prog: OnProgress = d => onProgress?.(base + d, total, path);
-    let done: Transferred | null = null;
-    try {
-      done = await upload(host, parent, e.file, { name, onClash: "fail" }, prog, signal);
-    } catch (err) {
-      if (!isFileExists(err)) throw err;
-      const choice = await opts.resolveClash(path);
-      if (err instanceof UploadPendingError) {
-        // It appeared while uploading: the bytes are on the Host already.
-        // The user may have cancelled while being asked: nothing is published then.
-        if (choice === "skip" || signal?.aborted) await abortUpload(host, err.uploadId);
-        if (signal?.aborted) throw new TransferAbortedError();
-        if (choice !== "skip") done = await commitAgain(host, err.uploadId, { onClash: choice });
-      } else if (choice !== "skip") {
-        done = await upload(host, parent, e.file, { name, onClash: choice }, prog, signal);
+  let i = 0;
+  let k = 0;
+  try {
+    for (; k < entries.length; k++) {
+      const e = entries[k];
+      if (signal?.aborted) throw new TransferAbortedError();
+      const path = joinPath(dir, ...e.rel);
+      if (blocked.some(b => isBelow(e.rel, b))) {
+        if (e.file) {
+          i++;
+          base += e.file.size;
+          result.skipped.push(path);
+        }
+        continue;
       }
+      if (!e.file) {
+        try {
+          await makeDir(host, path);
+        } catch (err) {
+          if (aborted(err)) throw err;
+          if (err instanceof HostUnavailableError) return stopped(result, entries, k, dir, err);
+          blocked.push(e.rel);
+          if (isFileExists(err)) result.skipped.push(path);
+          else result.failed.push({ path, error: messageOf(err) });
+        }
+        continue;
+      }
+      i++;
+      const file = e.file;
+      const parent = joinPath(dir, ...e.rel.slice(0, -1));
+      const name = e.rel[e.rel.length - 1];
+      const at = { i, n: count, fileSize: file.size };
+      const prog: OnProgress = d => onProgress?.(base + d, total, path, { ...at, fileDone: d });
+      let done: Transferred | null = null;
+      try {
+        try {
+          done = await upload(host, parent, file, { name, onClash: "fail" }, prog, signal);
+        } catch (err) {
+          if (!isFileExists(err)) throw err;
+          const choice = await opts.resolveClash(path);
+          if (err instanceof UploadPendingError) {
+            // It appeared while uploading: the bytes are on the Host already.
+            // The user may have cancelled while being asked: nothing is published then.
+            if (choice === "skip" || signal?.aborted) await abortUpload(host, err.uploadId);
+            if (signal?.aborted) throw new TransferAbortedError();
+            if (choice !== "skip") done = await commitAgain(host, err.uploadId, { onClash: choice });
+          } else if (choice !== "skip") {
+            done = await upload(host, parent, file, { name, onClash: choice }, prog, signal);
+          }
+        }
+        if (done) result.uploaded.push(done);
+        else result.skipped.push(path);
+      } catch (err) {
+        if (aborted(err)) throw err;
+        if (err instanceof HostUnavailableError) return stopped(result, entries, k, dir, err);
+        result.failed.push({ path, error: messageOf(err) });
+      }
+      base += file.size;
+      onProgress?.(base, total, path, { ...at, fileDone: file.size });
     }
-    if (done) result.uploaded.push(done);
-    else result.skipped.push(path);
-    base += e.file.size;
-    onProgress?.(base, total, path);
+  } catch (err) {
+    if (aborted(err)) throw new TransferAbortedError(result.uploaded.length);
+    throw err;
   }
   return result;
 }
 
-const TREE_MAX_DEPTH = 32;
-const TREE_MAX_FILES = 10_000;
+// The batch stopped at entry `k`: it and the files after it count as failed.
+function stopped(result: UploadEntriesResult, entries: UploadEntry[], k: number, dir: string, err: unknown): UploadEntriesResult {
+  const error = messageOf(err);
+  entries.slice(k).forEach((e, j) => {
+    if (e.file || j === 0) result.failed.push({ path: joinPath(dir, ...e.rel), error });
+  });
+  return result;
+}
+
+export const TREE_MAX_DEPTH = 32;
+// Folders and files together.
+export const TREE_MAX_ENTRIES = 10_000;
+
+// A folder download refused before anything was copied: deeper than TREE_MAX_DEPTH or with
+// more than TREE_MAX_ENTRIES folders and files.
+export class TreeTooLargeError extends Error {
+  readonly max: number;
+  constructor(readonly limit: "depth" | "entries", path: string) {
+    const max = limit === "depth" ? TREE_MAX_DEPTH : TREE_MAX_ENTRIES;
+    super(limit === "depth" ? `folder too deep: ${path}` : `more than ${max} items: ${path}`);
+    this.name = "TreeTooLargeError";
+    this.max = max;
+  }
+}
 
 interface DirItem {
   name: string;
@@ -341,38 +432,70 @@ interface DirItem {
   is_dir: boolean;
 }
 
-// Download the folder `remoteDir` into `localDir` (created, merged into an existing one).
-// `list_dir` follows symlinked folders, so the walk is capped (depth 32, 10 000 files).
-// Progress counts files.
+export interface TreeResult {
+  files: number;
+  // Host paths whose names cannot be written here (`..`, `a:b` on Windows, …), not copied.
+  skipped: string[];
+}
+
+// Download the folder `remoteDir` into `localDir`, which the caller has created (reserved)
+// already. The Host's folder is listed first: every name must be a valid name under this
+// machine's path rules and stay inside `localDir` (others are skipped and returned), and
+// the walk is capped (TreeTooLargeError: `list_dir` follows symlinked folders) before
+// anything is created. Then the folders are created and the files downloaded one by one.
+// `onListing` counts the items found while listing; progress counts files, `fileFraction`
+// is how far the current one is. A cancel rejects with TransferAbortedError, its `completed`
+// set to the files downloaded so far.
 export async function downloadTree(
   host: HostId | undefined,
   remoteDir: string,
   localDir: string,
-  onProgress?: (done: number, total: number, current: string) => void,
+  onProgress?: (done: number, total: number, current: string, fileFraction?: number) => void,
   signal?: AbortSignal,
-): Promise<{ files: number }> {
+  onListing?: (found: number) => void,
+): Promise<TreeResult> {
+  const style = pathStyle(localDir);
+  const dirs: string[] = [];
   const files: { remote: string; local: string }[] = [];
+  const skipped: string[] = [];
+  let found = 0;
+  let n = 0;
   const walk = async (remote: string, local: string, depth: number): Promise<void> => {
-    if (depth > TREE_MAX_DEPTH) throw new Error(`folder too deep: ${remote}`);
     if (signal?.aborted) throw new TransferAbortedError();
-    await hostInvoke<null>(undefined, "make_dir", { path: local });
     const items = await hostInvoke<DirItem[]>(host, "list_dir", { path: remote });
     for (const it of items) {
+      if (signal?.aborted) throw new TransferAbortedError();
       const l = joinPath(local, it.name);
-      if (it.is_dir) await walk(it.path, l, depth + 1);
-      else {
-        if (files.length >= TREE_MAX_FILES) throw new Error(`more than ${TREE_MAX_FILES} files: ${remoteDir}`);
+      if (!isLocalName(it.name, style) || !isInside(localDir, l, style)) {
+        skipped.push(it.path);
+        continue;
+      }
+      if (++found > TREE_MAX_ENTRIES) throw new TreeTooLargeError("entries", remoteDir);
+      onListing?.(found);
+      if (it.is_dir) {
+        if (depth + 1 > TREE_MAX_DEPTH) throw new TreeTooLargeError("depth", it.path);
+        dirs.push(l);
+        await walk(it.path, l, depth + 1);
+      } else {
         files.push({ remote: it.path, local: l });
       }
     }
   };
-  await walk(remoteDir, localDir, 0);
-  let n = 0;
-  for (const f of files) {
-    onProgress?.(n, files.length, f.remote);
-    await download(host, f.remote, f.local, undefined, signal);
-    n++;
+  try {
+    await walk(remoteDir, localDir, 0);
+    for (const d of dirs) {
+      if (signal?.aborted) throw new TransferAbortedError();
+      await hostInvoke<null>(undefined, "make_dir", { path: d });
+    }
+    for (const f of files) {
+      onProgress?.(n, files.length, f.remote, 0);
+      await download(host, f.remote, f.local, (d, t) => onProgress?.(n, files.length, f.remote, t > 0 ? d / t : 0), signal);
+      n++;
+    }
+  } catch (e) {
+    if (signal?.aborted || e instanceof TransferAbortedError) throw new TransferAbortedError(n);
+    throw e;
   }
-  onProgress?.(n, files.length, "");
-  return { files: n };
+  onProgress?.(n, files.length, "", 1);
+  return { files: n, skipped };
 }

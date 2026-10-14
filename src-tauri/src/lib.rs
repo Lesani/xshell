@@ -1,5 +1,6 @@
 #[cfg(unix)]
 mod agent_events;
+mod drag_out;
 mod hosts;
 mod local_migration;
 mod local_pty;
@@ -328,7 +329,8 @@ async fn relaunch_terminal(
 // Commands that only make sense on the machine running the window, so a remote host never
 // serves them: project icons are local files, some open local apps, the local migration
 // commands guard this machine's settings file, the transfer pumps write local paths, and the
-// open-copies commands manage this machine's copies of opened files. The tests below check
+// open-copies and drag commands manage this machine's copies of opened and dragged files and
+// its native drags. The tests below check
 // that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
@@ -355,6 +357,7 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "transfer_download",
     "transfer_upload_path",
     "transfer_cancel",
+    "transfer_reserve_dir",
     "open_local_path",
     "open_copy_path",
     "open_copy_stat",
@@ -363,6 +366,9 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "open_copy_install",
     "open_copy_release",
     "open_copies_pending",
+    "drag_copy_path",
+    "drag_copy_release",
+    "drag_out_start",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -747,6 +753,7 @@ pub fn run() {
             transfer::transfer_download,
             transfer::transfer_upload_path,
             transfer::transfer_cancel,
+            transfer::transfer_reserve_dir,
             open_copies::open_local_path,
             open_copies::open_copy_path,
             open_copies::open_copy_stat,
@@ -755,6 +762,9 @@ pub fn run() {
             open_copies::open_copy_install,
             open_copies::open_copy_release,
             open_copies::open_copies_pending,
+            open_copies::drag_copy_path,
+            open_copies::drag_copy_release,
+            drag_out::drag_out_start,
             spawn_terminal,
             write_terminal,
             resize_terminal,
@@ -871,7 +881,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 95);
+        assert_eq!(registered.len(), 99);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

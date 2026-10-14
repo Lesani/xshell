@@ -172,12 +172,74 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
 
 /// The canonical root `<cache>/open`, created private.
 pub fn root_in(cache: &Path) -> Result<PathBuf, String> {
+    area_in(cache, OPEN_DIR)
+}
+
+/// The canonical private folder `<cache>/<name>`.
+fn area_in(cache: &Path, name: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(cache).map_err(|e| err(cache, e))?;
     // dunce: a plain `C:\...` path on Windows, not a `\\?\` one the default apps may not take.
     let cache = dunce::canonicalize(cache).map_err(|e| err(cache, e))?;
-    let root = cache.join(OPEN_DIR);
+    let root = cache.join(name);
     ensure_private_dir(&root)?;
     Ok(root)
+}
+
+// ── The drag area ─────────────────────────────────────────────────────
+//
+// A Remote Host file dragged out to the OS (D3) is first downloaded to
+// `<app cache>/drag/<key>/<basename>`, `<key>` as for open copies. The folders are private
+// and created here like the open copies' (no symlinks or reparse points); the file itself
+// keeps the default mode, as the file manager copies it with its permissions. The webview
+// keeps a prepared copy for 10 minutes and then releases it; the startup sweep removes
+// what is older than [`SCRATCH_MAX_AGE`].
+
+/// The drag area's folder name inside the app cache directory.
+pub const DRAG_DIR: &str = "drag";
+
+/// The canonical drag area `<cache>/drag`, created private.
+pub fn drag_root_in(cache: &Path) -> Result<PathBuf, String> {
+    area_in(cache, DRAG_DIR)
+}
+
+/// The local path a drag of `remote_path` on `host` is prepared at; its folder is created.
+pub fn drag_copy_path_in(root: &Path, host: &str, remote_path: &str) -> Result<String, String> {
+    let name = copy_basename(remote_path)?;
+    let dir = root.join(copy_key(host, remote_path));
+    ensure_private_dir(&dir)?;
+    Ok(dir.join(name).to_string_lossy().into_owned())
+}
+
+/// Remove a prepared drag copy: `p` is its folder or the file in it.
+pub fn drag_release(root: &Path, p: &Path) -> Result<(), String> {
+    let parts = inside(root, p)?;
+    let dir = match parts.len() {
+        1 => p,
+        2 => p.parent().unwrap_or(p),
+        _ => return Err(err(p, "is not a drag copy")),
+    };
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(err(dir, e)),
+    }
+}
+
+/// Startup cleanup of the drag area: remove the copies idle for [`SCRATCH_MAX_AGE`].
+pub fn sweep_drag(root: &Path, now: SystemTime) {
+    for dir in copy_dirs(root) {
+        let mut youngest = fs::symlink_metadata(&dir).map_or(Duration::ZERO, |m| age(&m, now));
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if let Ok(m) = fs::symlink_metadata(e.path()) {
+                    youngest = youngest.min(age(&m, now));
+                }
+            }
+        }
+        if youngest > SCRATCH_MAX_AGE {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// The copy folder of `remote_path` on `host` and its sub-folders, created private.
@@ -907,14 +969,40 @@ pub async fn open_copies_pending(app: tauri::AppHandle) -> Result<Vec<Value>, St
     blocking(move || Ok(pending(&root(&app)?))).await
 }
 
-/// Run [`sweep`] on the app's copies, off the startup path.
+fn drag_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    use tauri::Manager as _;
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    drag_root_in(&cache)
+}
+
+/// Where a drag of a Remote Host file is prepared (see the drag area above).
+#[tauri::command]
+pub async fn drag_copy_path(
+    app: tauri::AppHandle,
+    host: String,
+    remote_path: String,
+) -> Result<String, String> {
+    blocking(move || drag_copy_path_in(&drag_root(&app)?, &host, &remote_path)).await
+}
+
+#[tauri::command]
+pub async fn drag_copy_release(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    blocking(move || drag_release(&drag_root(&app)?, Path::new(&path))).await
+}
+
+/// Run [`sweep`] on the app's copies and [`sweep_drag`] on the drag area, off the startup
+/// path.
 pub fn sweep_in_background(app: &tauri::AppHandle) {
     let app = app.clone();
     let _ = std::thread::Builder::new()
         .name("open-copies-sweep".into())
         .spawn(move || {
+            let now = SystemTime::now();
             if let Ok(r) = root(&app) {
-                sweep(&r, SystemTime::now());
+                sweep(&r, now);
+            }
+            if let Ok(r) = drag_root(&app) {
+                sweep_drag(&r, now);
             }
         });
 }
@@ -1509,5 +1597,86 @@ mod tests {
         let p = tmp.path().join("there.txt");
         fs::write(&p, "x").unwrap();
         assert_eq!(check_openable(&p.to_string_lossy()).unwrap(), p);
+    }
+
+    #[test]
+    fn drag_copies_are_private_confined_and_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = drag_root_in(&tmp.path().join("cache")).unwrap();
+        assert_eq!(root.file_name().unwrap(), DRAG_DIR);
+        let p = PathBuf::from(drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/a b.txt").unwrap());
+        assert_eq!(p.file_name().unwrap(), "a b.txt");
+        assert_eq!(p.parent().unwrap().parent().unwrap(), root);
+        // Stable per (Host, path), distinct across Hosts.
+        assert_eq!(
+            drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/a b.txt").unwrap(),
+            p.to_string_lossy()
+        );
+        assert_ne!(
+            drag_copy_path_in(&root, "h_bbbbbbbb", "/srv/a b.txt").unwrap(),
+            p.to_string_lossy()
+        );
+        assert!(drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/..").is_err());
+        assert!(drag_copy_path_in(&root, "h_aaaaaaaa", "/").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [&root, &p.parent().unwrap().to_path_buf()] {
+                let mode = fs::metadata(d).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{}", d.display());
+            }
+        }
+        fs::write(&p, "x").unwrap();
+        // Outside the area, the area itself, and deeper paths are refused.
+        let outside = tmp.path().join("other.txt");
+        fs::write(&outside, "x").unwrap();
+        assert!(drag_release(&root, &outside).is_err());
+        assert!(drag_release(&root, &root).is_err());
+        assert!(drag_release(&root, &p.join("deeper")).is_err());
+        assert!(drag_release(&root, Path::new("relative")).is_err());
+        assert!(outside.exists());
+        drag_release(&root, &p).unwrap();
+        assert!(!p.parent().unwrap().exists());
+        // Already gone: fine.
+        drag_release(&root, &p).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drag_area_refuses_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = drag_root_in(&tmp.path().join("cache")).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep.txt"), "x").unwrap();
+        // A symlinked copy folder is never created through nor released.
+        let key = copy_key("h_aaaaaaaa", "/srv/keep.txt");
+        std::os::unix::fs::symlink(&elsewhere, root.join(&key)).unwrap();
+        assert!(drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/keep.txt").is_err());
+        assert!(drag_release(&root, &root.join(&key)).is_err());
+        assert!(drag_release(&root, &root.join(&key).join("keep.txt")).is_err());
+        assert!(elsewhere.join("keep.txt").exists());
+        // A symlinked drag area is refused.
+        let cache2 = tmp.path().join("cache2");
+        fs::create_dir(&cache2).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cache2.join(DRAG_DIR)).unwrap();
+        assert!(drag_root_in(&cache2).is_err());
+    }
+
+    #[test]
+    fn drag_sweep_removes_only_old_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = drag_root_in(&tmp.path().join("cache")).unwrap();
+        let old = PathBuf::from(drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/old.txt").unwrap());
+        let fresh = PathBuf::from(drag_copy_path_in(&root, "h_aaaaaaaa", "/srv/new.txt").unwrap());
+        fs::write(&old, "x").unwrap();
+        fs::write(&fresh, "x").unwrap();
+        let now = SystemTime::now();
+        let long_ago = now - SCRATCH_MAX_AGE - Duration::from_secs(60);
+        set_mtime(&old, long_ago);
+        set_mtime(old.parent().unwrap(), long_ago);
+        sweep_drag(&root, now);
+        assert!(!old.parent().unwrap().exists());
+        assert!(fresh.exists());
     }
 }

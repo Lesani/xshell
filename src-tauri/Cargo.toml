@@ -56,6 +56,9 @@ qrcode = { version = "=0.14.1", default-features = false }
 open = { version = "=5.4.4", features = ["shellexecute-on-windows"] }
 # Already in the tree (tauri): canonical paths without the `\\?\` prefix on Windows.
 dunce = "=1.0.5"
+# Native drag of explorer files out to the OS (Lesani/xshell#46). Vendored and patched: see
+# vendor/drag/XSHELL-PATCH.md. New in the tree on Windows: windows 0.52, windows-core 0.58.
+drag = "=2.1.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -73,6 +76,8 @@ base64 = "=0.22.1"
 # The ConPTY input pipe for replies' writes that must not block (Lesani/xshell#40).
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
+# Drops that GTK reported as done but that never landed (drag-rs#84), panics on runtime paths.
+drag = { path = "vendor/drag" }
 
 [profile.dev]
 incremental = true

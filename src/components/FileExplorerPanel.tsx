@@ -1,14 +1,21 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { fmt, type StringKey } from "../hosts/strings";
 import { hostInvoke } from "../hosts/hostInvoke";
 import { registry } from "../hosts/registry";
 import type { HostId } from "../hosts/types";
-import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon, ExternalLink } from "lucide-react";
+import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon, ExternalLink, Download, GripVertical } from "lucide-react";
 import { baseName, isTransferPart, parentOf, styleOfOs } from "../files/paths";
 import type { SyncState, SyncView, SyncNotice } from "../files/syncBack";
 import { syncBack } from "../files/syncBackDeps";
 import { fitNotice } from "../files/noticeText";
+import { DRAG_PATH_MIME, acceptsDrop, resolveDropTarget, rowData } from "../files/dropTarget";
+import { clashResolver, uploadSummary, type ClashAnswer } from "../files/clash";
+import { downloadTo, type DownloadToDeps } from "../files/downloadTo";
+import { DRAG_OUT_MAX_BYTES, type DragOutError } from "../files/dragOut";
+import { dragOut } from "../files/dragOutDeps";
+import * as transfer from "../files/transfer";
 import type { DirItem } from "../types";
 import { AgentIcon, type AgentId } from "../agents";
 import { fileIconUrl, folderIconUrl } from "../lib/fileIcons";
@@ -23,9 +30,8 @@ function agentForDir(item: DirItem): AgentId | null { return item.is_dir ? (AGEN
 // row (that's noisy when scanning a folder). Header action buttons keep an instant tooltip.
 const TOOLTIP_DELAY_MS = 1000;
 
-// Dnd mime carrying an item's absolute path. The terminal body listens for a drop of this
-// type and writes the path into the active PTY — see TerminalTab's onDrop handler.
-export const DRAG_PATH_MIME = "application/x-xshell-path";
+// Dnd mime carrying an item's absolute path (row → terminal); see files/dropTarget.ts.
+export { DRAG_PATH_MIME };
 
 // Wrap paths containing whitespace in double quotes so they survive being typed at a shell
 // prompt (Windows paths routinely have spaces). A trailing space lets the user keep typing.
@@ -60,6 +66,12 @@ interface RowProps {
 // local copies whose saves upload back, and cannot be revealed.
 const RemoteRows = createContext<string | null>(null);
 
+// This explorer's Host (undefined: the Local Host) and where its grips report problems.
+const GripEnv = createContext<{ host?: HostId; onError: (e: DragOutError) => void }>({ onError: () => {} });
+
+// The folder an OS drag over the explorer would upload into (a folder row is highlighted).
+const DropPath = createContext<string | null>(null);
+
 // Sync-back state of the files of this explorer's Host that are open, by path.
 const SyncStates = createContext<ReadonlyMap<string, SyncState>>(new Map());
 
@@ -77,18 +89,23 @@ function syncBadge(state: SyncState | undefined): "syncing" | "waiting" | "atten
 function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContext, showTt, hideTt }: RowProps) {
   const remote = useContext(RemoteRows);
   const badge = syncBadge(useContext(SyncStates).get(item.path));
+  const dropHere = useContext(DropPath) === item.path && item.is_dir;
   const agent = agentForDir(item);
   const iconUrl = agent ? "" : item.is_dir ? folderIconUrl(item.name, !!expanded) : fileIconUrl(item.name);
   const tip = item.is_dir ? item.path : remote !== null ? fmt("explorer.row.tooltipRemote", { host: remote }) : fmt("explorer.row.tooltipFile", { path: item.path });
   const onDragStart = (e: React.DragEvent) => {
+    // The grip holds the press for a native drag-out: no in-app drag then.
+    if (dragOut.held) { e.preventDefault(); return; }
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
     e.dataTransfer.setData("text/plain", item.path);
     e.dataTransfer.effectAllowed = "copy";
   };
   return (
     <div
-      className={`file-row ${active ? "file-row-active" : ""}`}
+      className={`file-row ${active ? "file-row-active" : ""} ${dropHere ? "file-row-drop" : ""}`}
       style={{ paddingLeft: 6 + depth * 12 }}
+      data-path={item.path}
+      data-dir={item.is_dir ? "1" : "0"}
       draggable
       onClick={onActivate}
       onDragStart={onDragStart}
@@ -101,7 +118,48 @@ function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContex
       <span className="file-name">{item.name}</span>
       {subtitle && <span className="file-row-sub">{subtitle}</span>}
       {badge && <span className={`file-row-sync file-row-sync-${badge}`} aria-hidden />}
+      <Grip item={item} showTt={showTt} hideTt={hideTt} />
     </div>
+  );
+}
+
+const MAX_DRAG_LABEL = `${DRAG_OUT_MAX_BYTES / (1024 * 1024)} MB`;
+
+// The drag handle at a row's right edge: a press, a small move with the button still held,
+// and the file (a prepared copy on a Remote Host) is dragged out to the OS. The rest of the
+// row keeps its in-app drag to the terminal.
+function Grip({ item, showTt, hideTt }: { item: DirItem; showTt: (text: string, el: HTMLElement) => void; hideTt: () => void }) {
+  const { host, onError } = useContext(GripEnv);
+  useSyncExternalStore(dragOut.subscribe, dragOut.getSnapshot);
+  const st = dragOut.grip(host, item.path, item.is_dir);
+  const tip = st.kind === "disabled"
+    ? (st.reason === "tooLarge" ? fmt("explorer.grip.tooLarge", { max: MAX_DRAG_LABEL }) : fmt("explorer.grip.folderRemote"))
+    : st.kind === "preparing" ? fmt("explorer.grip.preparing", { name: item.name, pct: st.pct }) : fmt("explorer.grip.tooltip");
+  return (
+    <span
+      className={`file-row-grip file-row-grip-${st.kind}`}
+      draggable={false}
+      aria-label={tip}
+      aria-disabled={st.kind === "disabled"}
+      onMouseEnter={(e) => { e.stopPropagation(); showTt(tip, e.currentTarget); void dragOut.probe(host, item.path, item.is_dir); }}
+      onMouseLeave={hideTt}
+      onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        hideTt();
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* not capturable: moves still arrive over the grip */ }
+        dragOut.down(host, item.path, item.is_dir, e.clientX, e.clientY, onError);
+      }}
+      onPointerMove={(e) => dragOut.move(e.clientX, e.clientY)}
+      onPointerUp={() => dragOut.up()}
+      onPointerCancel={() => dragOut.up()}
+      onLostPointerCapture={() => dragOut.up()}
+    >
+      {st.kind === "preparing" ? <span className="file-row-grip-pct">{st.pct}%</span> : <GripVertical size={12} />}
+    </span>
   );
 }
 
@@ -274,11 +332,172 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
   // The Host's path rules when its OS is known, else read from the path's form.
   const pathRules = host ? styleOfOs(registry.getStatus(host)?.os) : undefined;
   const parent = parentOf(cwd, pathRules);
+
+  // ── Transfers: drop-in uploads (D4), Download to… (D3), drag-out errors ──
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [notices, setNotices] = useState<NoticeItem[]>([]);
+  const [clash, setClash] = useState<ClashPrompt | null>(null);
+  const clashChain = useRef<Promise<unknown>>(Promise.resolve());
+  const alive = useRef(true);
+  // Every transfer of this explorer: closing it (the Tab) cancels them, which also answers a
+  // waiting clash question and drops an upload the Host still holds.
+  const controllers = useRef(new Set<AbortController>());
+  useEffect(() => {
+    alive.current = true;
+    const live = controllers.current;
+    return () => { alive.current = false; for (const c of live) c.abort(); live.clear(); };
+  }, []);
+  const newController = useCallback(() => { const ac = new AbortController(); controllers.current.add(ac); return ac; }, []);
+  const noticeTimers = useRef<number[]>([]);
+  useEffect(() => () => { for (const t of noticeTimers.current) window.clearTimeout(t); }, []);
+  const dismissNotice = useCallback((id: string) => setNotices((ns) => ns.filter((n) => n.id !== id)), []);
+  const pushNotice = useCallback((key: StringKey, params: Record<string, string | number>, tone: NoticeItem["tone"], full?: string) => {
+    if (!alive.current) return;
+    const id = `t${crypto.randomUUID()}`;
+    const fit = fitNotice(key, params);
+    setNotices((ns) => [...ns, { id, text: fit.text, full: full ?? fit.full, tone, actions: [{ label: fmt("explorer.notice.dismiss"), run: () => dismissNotice(id) }] }]);
+    if (tone === "info") noticeTimers.current.push(window.setTimeout(() => dismissNotice(id), NOTICE_INFO_MS));
+  }, [dismissNotice]);
+  const setJob = useCallback((id: string, patch: Partial<Job> & { cancel?: () => void }) => {
+    if (!alive.current) return;
+    setJobs((js) => js.some((j) => j.id === id) ? js.map((j) => (j.id === id ? { ...j, ...patch } : j)) : [...js, { id, text: "", pct: 0, cancel: () => {}, ...patch }]);
+  }, []);
+  const endJob = useCallback((id: string) => { if (alive.current) setJobs((js) => js.filter((j) => j.id !== id)); }, []);
+
+  // One clash dialog at a time; a cancelled batch's question answers "skip".
+  const askClash = useCallback((path: string, folderOf: string, signal: AbortSignal): Promise<ClashAnswer> => {
+    const next = clashChain.current.then(() => new Promise<ClashAnswer>((resolve) => {
+      if (signal.aborted || !alive.current) { resolve({ choice: "skip", applyAll: false }); return; }
+      const done = (a: ClashAnswer) => { signal.removeEventListener("abort", onAbort); if (alive.current) setClash(null); resolve(a); };
+      const onAbort = () => done({ choice: "skip", applyAll: false });
+      signal.addEventListener("abort", onAbort, { once: true });
+      setClash({ name: baseName(path, pathRules), folder: folderOf, answer: done });
+    }));
+    clashChain.current = next.catch(() => {});
+    return next;
+  }, [pathRules]);
+
+  // Upload what an OS drop holds: its job (with Cancel) shows while the dropped folders are
+  // still being read.
+  const runUpload = useCallback(async (target: string, dt: DataTransfer) => {
+    const id = crypto.randomUUID();
+    const ac = newController();
+    const folder = baseName(target, pathRules);
+    const listing = (found: number) => setJob(id, { text: fmt("explorer.transfer.listing", { name: folder, n: found }), pct: 0 });
+    setJob(id, { text: fmt("explorer.transfer.listing", { name: folder, n: 0 }), pct: 0, cancel: () => ac.abort() });
+    // The items are readable only now, synchronously; the folder walk itself is async.
+    let read: Promise<transfer.UploadEntry[]>;
+    try { read = transfer.entriesFromDrop(dt, { signal: ac.signal, onFound: listing }); } catch (err) { read = Promise.reject(err); }
+    try {
+      let entries: transfer.UploadEntry[];
+      try {
+        entries = await read;
+      } catch (e) {
+        if (e instanceof transfer.TransferAbortedError || ac.signal.aborted) throw new transfer.TransferAbortedError(0);
+        pushNotice("explorer.drop.folderUnsupported", {}, "error");
+        return;
+      }
+      if (entries.length === 0) return;
+      const files = entries.filter((e) => e.file);
+      const first = files[0]?.rel ?? entries[0].rel;
+      setJob(id, { text: fmt("explorer.drop.uploading", { i: files.length ? 1 : 0, n: files.length, name: first[first.length - 1], pct: 0 }), pct: 0 });
+      const resolveClash = clashResolver((p) => askClash(p, folder, ac.signal));
+      const r = await transfer.uploadEntries(host, target, entries, { resolveClash }, (_d, _t, current, at) => {
+        if (!at) return;
+        const pct = at.fileSize > 0 ? Math.round((at.fileDone / at.fileSize) * 100) : 100;
+        setJob(id, { text: fmt("explorer.drop.uploading", { i: at.i, n: at.n, name: baseName(current, pathRules), pct }), pct });
+      }, ac.signal);
+      const sum = uploadSummary(r, folder);
+      const details = [...r.skipped.map((p) => `${p}: skipped`), ...r.failed.map((f) => `${f.path}: ${f.error}`)].join("\n");
+      pushNotice(sum.key, sum.params, sum.tone, details ? `${fitNotice(sum.key, sum.params).full}\n${details}` : undefined);
+    } catch (e) {
+      if (e instanceof transfer.TransferAbortedError) pushNotice("explorer.transfer.cancelled", { n: e.completed }, "info");
+      else pushNotice("explorer.drop.partial", { n: 0, skipped: 0, failed: 1 }, "error", transfer.messageOf(e));
+    } finally {
+      controllers.current.delete(ac);
+      endJob(id);
+      // Re-list the folder and every expanded one (a tick re-pulls them all).
+      if (alive.current) setTick((t) => t + 1);
+    }
+  }, [host, pathRules, setJob, endJob, pushNotice, askClash, newController]);
+
+  const runDownload = useCallback(async (item: DirItem) => {
+    const id = crypto.randomUUID();
+    const ac = newController();
+    const cancel = () => ac.abort();
+    const deps: DownloadToDeps = {
+      saveDialog: (name) => saveDialog({ defaultPath: name }),
+      folderDialog: async () => { const r = await openDialog({ directory: true, multiple: false }); return typeof r === "string" ? r : null; },
+      reserveDir: (path) => invoke<boolean>("transfer_reserve_dir", { path }),
+      downloadFile: (remote, local, onProgress, signal) => transfer.download(host, remote, local, onProgress, signal),
+      downloadTree: (remote, local, onProgress, signal, onListing) => transfer.downloadTree(host, remote, local, onProgress, signal, onListing),
+    };
+    try {
+      const r = await downloadTo({ path: item.path, name: item.name, isDir: item.is_dir }, deps, {
+        progress: (i, n, name, pct) => setJob(id, { text: fmt("explorer.download.progress", { i, n, name, pct }), pct, cancel }),
+        listing: (name, n) => setJob(id, { text: fmt("explorer.transfer.listing", { name, n }), pct: 0, cancel }),
+      }, ac.signal);
+      if (r && r.skipped.length > 0) {
+        const full = `${fitNotice("explorer.download.partial", { n: r.files, path: r.path, skipped: r.skipped.length }).full}\n${r.skipped.join("\n")}`;
+        pushNotice("explorer.download.partial", { n: r.files, path: r.path, skipped: r.skipped.length }, "warn", full);
+      } else if (r) pushNotice("explorer.download.done", { path: r.path }, "info");
+    } catch (e) {
+      if (e instanceof transfer.TransferAbortedError) pushNotice("explorer.transfer.cancelled", { n: e.completed }, "info");
+      else if (e instanceof transfer.TreeTooLargeError) pushNotice("explorer.download.tooMany", { max: e.max }, "error", e.message);
+      else pushNotice("explorer.download.failed", { name: item.name, error: transfer.messageOf(e) }, "error");
+    } finally {
+      controllers.current.delete(ac);
+      endJob(id);
+    }
+  }, [host, setJob, endJob, pushNotice, newController]);
+
+  // Drag-out problems of this explorer's grips surface here.
+  const onDragOutError = useCallback((e: DragOutError) => {
+    if (e.kind === "start") pushNotice("explorer.drag.unsupported", {}, "error", `${fmt("explorer.drag.unsupported")}\n${transfer.messageOf(e.error)}`);
+    else pushNotice("explorer.download.failed", { name: baseName(e.path, pathRules), error: transfer.messageOf(e.error) }, "error");
+  }, [pushNotice, pathRules]);
+
+  const gripEnv = useMemo(() => ({ host, onError: onDragOutError }), [host, onDragOutError]);
+
+  // OS drags over the tree: highlight where they would go; drop to upload. An enter/leave
+  // count keeps the highlight steady while the pointer crosses rows.
+  const [dropPath, setDropPath] = useState<string | null>(null);
+  const dragDepth = useRef(0);
+  const dropHandlers = {
+    onDragEnter: (e: React.DragEvent) => {
+      if (!acceptsDrop(e.dataTransfer?.types, dragOut.active)) return;
+      e.preventDefault();
+      dragDepth.current++;
+      setDropPath(resolveDropTarget(rowData(e.target as Element), cwd));
+    },
+    onDragOver: (e: React.DragEvent) => {
+      if (!acceptsDrop(e.dataTransfer?.types, dragOut.active)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      const t = resolveDropTarget(rowData(e.target as Element), cwd);
+      setDropPath((cur) => (cur === t ? cur : t));
+    },
+    onDragLeave: (e: React.DragEvent) => {
+      if (!acceptsDrop(e.dataTransfer?.types, dragOut.active)) return;
+      dragDepth.current = Math.max(0, dragDepth.current - 1);
+      if (dragDepth.current === 0) setDropPath(null);
+    },
+    onDrop: (e: React.DragEvent) => {
+      dragDepth.current = 0;
+      setDropPath(null);
+      if (!acceptsDrop(e.dataTransfer?.types, dragOut.active)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void runUpload(resolveDropTarget(rowData(e.target as Element), cwd), e.dataTransfer);
+    },
+  };
   const activePath = ctx?.item.path ?? null;
   const showingSearch = searchOpen && query.trim().length > 0;
 
   return (
     <RemoteRows.Provider value={hostName}>
+    <GripEnv.Provider value={gripEnv}>
+    <DropPath.Provider value={dropPath}>
     <SyncStates.Provider value={syncStates}>
       <div className="git-panel-header file-panel-header">
         <Folder size={13} className="file-panel-folder" />
@@ -299,7 +518,7 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
           </div>
         </div>
       </div>
-      <div className="file-tree-scroll">
+      <div className={`file-tree-scroll ${dropPath !== null && dropPath === cwd ? "file-tree-drop" : ""}`} {...dropHandlers}>
         {showingSearch ? (
           searching && results === null ? <div className="file-searching"><span className="file-search-spinner" /><span>Searching…</span></div>
           : results && results.length === 0 ? <div className="git-panel-empty">No matches</div>
@@ -316,18 +535,24 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
           </>
         )}
       </div>
+      {dropPath !== null && <div className="file-drop-hint">{fitNotice("explorer.drop.here", { folder: baseName(dropPath, pathRules) }, 60).text}</div>}
+      <TransferStrip jobs={jobs} />
       {ctx && (
         <>
           <div className="file-ctx-backdrop" onClick={() => setCtx(null)} onContextMenu={(e) => { e.preventDefault(); setCtx(null); }} />
-          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 110) }}>
+          <div className="file-ctx-menu" style={{ left: Math.min(ctx.x, window.innerWidth - 220), top: Math.min(ctx.y, window.innerHeight - 145) }}>
             {!ctx.item.is_dir && <button className="file-ctx-item" onClick={() => { openFile(ctx.item.path); setCtx(null); }}><ExternalLink size={13} /><span>{fmt("explorer.menu.open")}</span></button>}
+            <button className="file-ctx-item" onClick={() => { const item = ctx.item; setCtx(null); void runDownload(item); }}><Download size={13} /><span>{fmt("explorer.menu.downloadTo")}</span></button>
             {!host && <button className="file-ctx-item" onClick={() => { reveal(ctx.item.path); setCtx(null); }}><FolderOpen size={13} /><span>{fmt("explorer.menu.reveal")}</span></button>}
             <button className="file-ctx-item" onClick={() => { writePath(ctx.item.path); setCtx(null); }}><TerminalIcon size={13} /><span>{fmt("explorer.menu.writePath")}</span></button>
           </div>
         </>
       )}
-      <ExplorerNotices host={host} hostName={hostName} sync={sync} />
+      {clash && <ClashDialog prompt={clash} />}
+      <ExplorerNotices host={host} hostName={hostName} sync={sync} extra={notices} />
     </SyncStates.Provider>
+    </DropPath.Provider>
+    </GripEnv.Provider>
     </RemoteRows.Provider>
   );
 }
@@ -390,11 +615,12 @@ function transientNotice(n: SyncNotice, host: string): NoticeItem {
 // The explorer's notice stack: copies of this Host's files that are syncing or need the user,
 // and short-lived results. Shown in every explorer of the Host, so a copy whose explorer
 // closed is still reachable.
-function ExplorerNotices({ host, hostName, sync }: { host?: HostId; hostName: string | null; sync: { sessions: SyncView[]; notices: SyncNotice[] } }) {
+function ExplorerNotices({ host, hostName, sync, extra }: { host?: HostId; hostName: string | null; sync: { sessions: SyncView[]; notices: SyncNotice[] }; extra: NoticeItem[] }) {
   const name = hostName ?? "";
   const items: NoticeItem[] = [];
   if (host) for (const v of sync.sessions) if (v.host === host) { const n = sessionNotice(v, name); if (n) items.push(n); }
   for (const n of sync.notices) if (n.host === host) items.push(transientNotice(n, name));
+  items.push(...extra);
   if (items.length === 0) return null;
   return (
     <div className="explorer-notices" role="status">
@@ -409,5 +635,67 @@ function ExplorerNotices({ host, hostName, sync }: { host?: HostId; hostName: st
         </div>
       ))}
     </div>
+  );
+}
+
+// An explorer transfer in progress: an upload batch or a download.
+interface Job {
+  id: string;
+  text: string;
+  pct: number;
+  cancel: () => void;
+}
+
+// Info notices of transfers go away by themselves after this; errors stay until dismissed.
+const NOTICE_INFO_MS = 8000;
+
+// The transfers of this explorer, at the bottom of the panel, each with its Cancel.
+function TransferStrip({ jobs }: { jobs: Job[] }) {
+  if (jobs.length === 0) return null;
+  return (
+    <div className="file-transfer-strip" role="status">
+      {jobs.map((j) => (
+        <div key={j.id} className="file-transfer">
+          <div className="file-transfer-row">
+            <span className="file-transfer-text" title={j.text}>{j.text}</span>
+            <button className="explorer-notice-btn" onClick={j.cancel}>{fmt("explorer.transfer.cancel")}</button>
+          </div>
+          <div className="file-transfer-bar"><div className="file-transfer-fill" style={{ width: `${Math.max(0, Math.min(100, j.pct))}%` }} /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface ClashPrompt {
+  name: string;
+  folder: string;
+  answer: (a: ClashAnswer) => void;
+}
+
+// A dropped file's name is taken in the target folder: Replace, Keep both or Skip; "Apply to
+// all" answers the rest of this batch.
+function ClashDialog({ prompt }: { prompt: ClashPrompt }) {
+  const [all, setAll] = useState(false);
+  const answer = (choice: ClashAnswer["choice"]) => prompt.answer({ choice, applyAll: all });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); prompt.answer({ choice: "skip", applyAll: false }); } };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [prompt]);
+  return (
+    <>
+      <div className="file-ctx-backdrop" />
+      <div className="file-ctx-menu file-clash-dialog" role="dialog" aria-label={fmt("explorer.clash.title", { name: prompt.name })}>
+        <div className="skip-perms-confirm-title" title={prompt.name}>{fitNotice("explorer.clash.title", { name: prompt.name }, 60).text}</div>
+        <div className="file-ctx-confirm">{fitNotice("explorer.clash.body", { name: prompt.name, folder: prompt.folder }).text}</div>
+        <label className="file-clash-all"><input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} />{fmt("explorer.clash.applyAll")}</label>
+        <div className="file-clash-actions">
+          <button className="explorer-notice-btn" onClick={() => answer("replace")}>{fmt("explorer.clash.replace")}</button>
+          <button className="explorer-notice-btn" onClick={() => answer("keep_both")}>{fmt("explorer.clash.keepBoth")}</button>
+          <button className="explorer-notice-btn" onClick={() => answer("skip")}>{fmt("explorer.clash.skip")}</button>
+        </div>
+      </div>
+    </>
   );
 }

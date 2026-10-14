@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { baseName, hostSep, isTransferPart, joinPath, parentOf, pathStyle, styleOfOs } from "./paths";
+import { baseName, hostSep, isInside, isLocalName, isTransferPart, joinPath, parentOf, pathStyle, styleOfOs } from "./paths";
 
 describe("paths", () => {
   it("keeps the Host's separator", () => {
@@ -71,5 +71,28 @@ describe("Windows Remote Host paths", () => {
     expect(styleOfOs("linux")).toBe("posix");
     expect(styleOfOs("macos")).toBe("posix");
     expect(styleOfOs(null)).toBeUndefined();
+  });
+});
+
+describe("local names", () => {
+  it("POSIX refuses only traversal, NUL and /", () => {
+    for (const ok of ["a", "a\\b", "CON", "x.", "a:b"]) expect(isLocalName(ok, "posix")).toBe(true);
+    for (const bad of ["", ".", "..", "a/b", "a\0b"]) expect(isLocalName(bad, "posix")).toBe(false);
+  });
+
+  it("Windows also refuses its reserved characters and names", () => {
+    expect(isLocalName("notes.txt", "windows")).toBe(true);
+    for (const bad of ["..\\notes.txt", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b", "a\u0001b", "x.", "x ", "CON", "nul.txt", "COM1", "lpt9.log", ".."]) {
+      expect(isLocalName(bad, "windows")).toBe(false);
+    }
+  });
+
+  it("isInside checks containment by the destination's rules", () => {
+    expect(isInside("C:\\Downloads\\src", "C:\\Downloads\\src\\a.txt", "windows")).toBe(true);
+    expect(isInside("C:\\Downloads\\src", "C:\\Downloads\\src\\..\\notes.txt", "windows")).toBe(false);
+    expect(isInside("C:\\Downloads\\src", "C:\\Downloads\\srcx\\a", "windows")).toBe(false);
+    expect(isInside("/d/src", "/d/src/a/b", "posix")).toBe(true);
+    expect(isInside("/d/src", "/d/src/../x", "posix")).toBe(false);
+    expect(isInside("/d/src", "/d/src", "posix")).toBe(false);
   });
 });
