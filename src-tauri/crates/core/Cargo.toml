@@ -17,6 +17,9 @@ uuid = { workspace = true }
 # The headless screen model Permission Prompts are read from (exact pin: its rendering is
 # part of what the extractor relies on).
 vt100 = "=0.16.2"
+# File transfers: content versions and strict chunk decoding (the pins xshell-protocol uses).
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
 
 [target.'cfg(unix)'.dependencies]
 # The hook client's deadline-bound socket (non-blocking connect and poll).

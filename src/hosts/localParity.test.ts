@@ -40,6 +40,13 @@ describe("local parity: Host-side calls", () => {
     ["get_claude_cost_summary", undefined],
     ["get_codex_usage", undefined],
     ["list_codex_projects", undefined],
+    ["file_stat", { path: "/home/u/p/a.txt", version: true }],
+    ["file_read", { path: "/home/u/p/a.txt", offset: 0, len: 1048576 }],
+    ["make_dir", { path: "/home/u/p/new" }],
+    ["upload_begin", { dir: "/home/u/p", name: "a.txt", size: 3, onClash: "keep_both" }],
+    ["upload_chunk", { uploadId: "u1", offset: 0, bytesBase64: "YWJj" }],
+    ["upload_commit", { uploadId: "u1", ifVersion: null, onClash: "replace" }],
+    ["upload_abort", { uploadId: "u1" }],
   ];
   for (const [cmd, args] of cases) {
     it(`${cmd} → invoke(${cmd}${args ? ", args" : ""})`, async () => {

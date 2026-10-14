@@ -6021,6 +6021,7 @@ dependencies = [
 name = "xshell"
 version = "1.5.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "libc",
  "portable-pty",
@@ -6048,6 +6049,7 @@ dependencies = [
 name = "xshell-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "libc",
  "md5",
@@ -6055,6 +6057,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "uuid",

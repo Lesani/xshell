@@ -61,19 +61,26 @@ async function remoteCall<T>(host: HostId, cmd: HostMethod, args: Record<string,
     }
     return { value, stale: false, at: Date.now() };
   } catch (e) {
-    if (isHostError(e)) {
-      if (e.code === "remote") throw e.message;
-      if (allowCache && cacheable && FALLBACK_CODES.has(e.code)) {
-        const hit = cache.get(host, cmd, args);
-        if (hit) {
-          setStale(sk, true);
-          return { value: hit.v as T, stale: true, at: hit.at };
-        }
+    if (isHostError(e) && e.code !== "remote" && allowCache && cacheable && FALLBACK_CODES.has(e.code)) {
+      const hit = cache.get(host, cmd, args);
+      if (hit) {
+        setStale(sk, true);
+        return { value: hit.v as T, stale: true, at: hit.at };
       }
-      throw new HostUnavailableError(host, e.code, e.message);
     }
-    throw e;
+    return rethrowHostCall(host, e);
   }
+}
+
+// How a failed Host call rejects, without the cache: a Daemon-side failure (`remote`) as its
+// message string, like a local command's error; a connection problem as HostUnavailableError.
+// Also for Desktop commands that return a HostError themselves (the transfer pumps).
+export function rethrowHostCall(host: HostId | undefined, e: unknown): never {
+  if (isHostError(e)) {
+    if (e.code === "remote") throw e.message;
+    throw new HostUnavailableError(host ?? "", e.code, e.message);
+  }
+  throw e;
 }
 
 export async function hostInvoke<T>(host: HostId | undefined, cmd: HostMethod, args?: Record<string, unknown>): Promise<T> {

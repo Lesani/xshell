@@ -15,7 +15,7 @@ use xshell_hostlink::config::validate_one;
 use xshell_hostlink::{HostConfig, HostError, HostHandle, HostSnapshot, HostTestResult};
 use xshell_protocol::msg::OpenSpec;
 
-fn handle(state: &Hosts, host: &str) -> Result<Arc<HostHandle>, HostError> {
+pub(crate) fn handle(state: &Hosts, host: &str) -> Result<Arc<HostHandle>, HostError> {
     state
         .manager
         .host(host)

@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use xshell_core::transfer::UPLOAD_OUTCOME_UNKNOWN;
 use xshell_protocol::msg::{ClientMsg, JoinExpect, OpenReply, OpenSpec, TerminalInfo};
 
 /// Where one Tab's output goes.
@@ -735,12 +736,28 @@ impl HostHandle {
     }
 
     fn request(&self, msg: ClientMsg, timeout: Duration, w: Waiter) {
+        self.request_mapped(msg, timeout, w, |e| e)
+    }
+
+    /// [`Self::request`], with `in_flight` applied to the errors of a request that was sent
+    /// (its timeout, a lost connection); one that never left keeps its error.
+    fn request_mapped(
+        &self,
+        msg: ClientMsg,
+        timeout: Duration,
+        w: Waiter,
+        in_flight: fn(HostError) -> HostError,
+    ) {
         let once = Once::new(w);
         let sent = {
             let st = self.sh.lock();
             Shared::usable_link(&st).and_then(|(l, _)| {
                 let o = once.clone();
-                l.request(msg, timeout, Box::new(move |r| o.call(r)))
+                l.request(
+                    msg,
+                    timeout,
+                    Box::new(move |r| o.call(r.map_err(in_flight))),
+                )
             })
         };
         if let Err(e) = sent {
@@ -749,12 +766,25 @@ impl HostHandle {
     }
 
     pub fn call(&self, method: String, params: Value, w: Waiter) {
-        let timeout = if method == "save_dropped_file" {
-            SAVE_FILE_TIMEOUT
-        } else {
-            self.sh.mc.call_timeout
+        let timeout = match method.as_str() {
+            "save_dropped_file" => SAVE_FILE_TIMEOUT,
+            "upload_commit" | "file_stat" => self.sh.mc.long_call_timeout,
+            _ => self.sh.mc.call_timeout,
         };
-        self.request(ClientMsg::Call { method, params }, timeout, w);
+        // A commit sent without an answer (timed out, connection lost) may have published
+        // the file or not: say so, so the client checks the target instead of retrying.
+        let in_flight: fn(HostError) -> HostError = if method == "upload_commit" {
+            |e| match e.code {
+                HostErrorCode::Timeout | HostErrorCode::Offline => HostError::new(
+                    HostErrorCode::Indeterminate,
+                    format!("{UPLOAD_OUTCOME_UNKNOWN}: {}", e.message),
+                ),
+                _ => e,
+            }
+        } else {
+            |e| e
+        };
+        self.request_mapped(ClientMsg::Call { method, params }, timeout, w, in_flight);
     }
 
     /// `term.open`, then `term.attach` with `sink` installed first. Answers the open's reply.
@@ -1551,6 +1581,85 @@ pub(crate) mod tests {
         peer.write(&out_frame(t, b"x"));
         assert_eq!(peer.expect("term.detach")["terminal"], json!(t));
         assert!(sh.lock().atts.is_empty());
+    }
+
+    #[test]
+    fn upload_commit_timeout_is_outcome_unknown() {
+        let sh = shared_with(|mc| mc.long_call_timeout = Duration::from_millis(100));
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
+        let id = peer.expect("call")["id"].as_u64().unwrap();
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Indeterminate);
+        assert!(e.message.starts_with(UPLOAD_OUTCOME_UNKNOWN), "{e:?}");
+        // The commit's late answer reaches nobody; the link still serves calls.
+        peer.reply(
+            id,
+            Ok(json!({"path": "/p", "size": 1, "version": "sha256:00"})),
+        );
+        let (w, rx) = slot();
+        h.call("file_stat".into(), json!({"path": "/p"}), w);
+        let id = peer.expect("call")["id"].as_u64().unwrap();
+        peer.reply(id, Ok(json!({"size": 1})));
+        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"size": 1})));
+        // Another call's timeout stays a timeout.
+        let sh = shared_with(|mc| mc.call_timeout = Duration::from_millis(100));
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_chunk".into(), json!({}), w);
+        peer.expect("call");
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Timeout);
+    }
+
+    #[test]
+    fn upload_commit_lost_connection_is_outcome_unknown() {
+        // Never sent (no link): the ordinary error.
+        let sh = shared();
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        // Sent, the Daemon published, then the connection dropped before the answer.
+        let sh = shared();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
+        peer.expect("call");
+        drop(peer);
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Indeterminate);
+        assert!(e.message.starts_with(UPLOAD_OUTCOME_UNKNOWN), "{e:?}");
+        // Other calls keep a plain offline.
+        let sh = shared();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_chunk".into(), json!({}), w);
+        peer.expect("call");
+        drop(peer);
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(e.code, HostErrorCode::Offline);
+        // The Daemon's own refusal is not ambiguous.
+        let sh = shared();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        let (w, rx) = slot();
+        h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
+        let id = peer.expect("call")["id"].as_u64().unwrap();
+        peer.reply(id, Err("file exists: /p".into()));
+        let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+        assert_eq!(
+            (e.code, e.message.as_str()),
+            (HostErrorCode::Remote, "file exists: /p")
+        );
     }
 
     #[test]

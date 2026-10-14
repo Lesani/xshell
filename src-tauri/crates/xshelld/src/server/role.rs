@@ -64,8 +64,8 @@ pub(crate) const MOBILE_CALLS: &[&str] = &[
     "get_project_sessions",
 ];
 
-/// Every core method a Mobile may not call: files, git, files read at a client-chosen path
-/// (skills, memories, agent contexts) and host probes.
+/// Every core method a Mobile may not call: files (including transfers), git, files read at a
+/// client-chosen path (skills, memories, agent contexts) and host probes.
 #[cfg(test)]
 pub(crate) const MOBILE_REFUSED_CALLS: &[&str] = &[
     "read_text_file",
@@ -88,6 +88,13 @@ pub(crate) const MOBILE_REFUSED_CALLS: &[&str] = &[
     "get_username",
     "get_home_dir",
     "detect_agent_binary",
+    "file_stat",
+    "file_read",
+    "make_dir",
+    "upload_begin",
+    "upload_chunk",
+    "upload_commit",
+    "upload_abort",
 ];
 
 /// Whether `cwd` is a Project the Host knows from any agent's session history. Paths compare
@@ -495,6 +502,28 @@ pub(crate) mod tests {
         let classified: HashSet<_> = allowed.union(&refused).copied().collect();
         assert_eq!(classified, all);
         assert_eq!(MOBILE_CALLS.len() + MOBILE_REFUSED_CALLS.len(), all.len());
+    }
+
+    #[test]
+    fn transfer_methods_refused_for_mobile() {
+        let ctx = HostCtx::with_home("/nonexistent-home", "/tmp");
+        let p = json!({ "path": "/tmp/x", "dir": "/tmp", "name": "x", "size": 1,
+                        "onClash": "replace", "uploadId": "x", "offset": 0, "len": 1,
+                        "bytesBase64": "" });
+        for m in [
+            "file_stat",
+            "file_read",
+            "make_dir",
+            "upload_begin",
+            "upload_chunk",
+            "upload_commit",
+            "upload_abort",
+        ] {
+            assert_eq!(
+                check_call(&ctx, m, &p),
+                Err(format!("forbidden for mobile: call {m}"))
+            );
+        }
     }
 
     #[test]

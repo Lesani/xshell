@@ -38,6 +38,8 @@ pub struct ManagerConfig {
     pub stable_after: Duration,
     pub hello_timeout: Duration,
     pub call_timeout: Duration,
+    /// `upload_commit` and `file_stat`, which may hash a large file on the Host.
+    pub long_call_timeout: Duration,
     /// After `daemon.upgrade` is acknowledged, the old Daemon must close the link by then;
     /// otherwise it gets a SIGTERM through its pidfile.
     pub upgrade_close_timeout: Duration,
@@ -63,6 +65,7 @@ impl ManagerConfig {
             stable_after: Duration::from_secs(10),
             hello_timeout: Duration::from_secs(30),
             call_timeout: Duration::from_secs(60),
+            long_call_timeout: Duration::from_secs(300),
             upgrade_close_timeout: Duration::from_secs(15),
             term_timeout: Duration::from_secs(30),
             link_limits: LinkLimits::default(),

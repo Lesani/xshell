@@ -29,6 +29,7 @@ pub mod skills;
 pub mod stats;
 pub mod terminal;
 pub mod time;
+pub mod transfer;
 
 #[cfg(test)]
 pub(crate) mod testutil;

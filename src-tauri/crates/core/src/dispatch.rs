@@ -4,7 +4,7 @@
 use crate::ctx::HostCtx;
 use crate::{
     agents, antigravity, claude, codex, cursor, files, git, memories, opencode, sessions, skills,
-    stats,
+    stats, transfer,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,13 @@ pub const METHODS: &[&str] = &[
     "get_claude_cost_summary",
     "get_codex_usage",
     "get_project_sessions",
+    "file_stat",
+    "file_read",
+    "make_dir",
+    "upload_begin",
+    "upload_chunk",
+    "upload_commit",
+    "upload_abort",
 ];
 
 // Parameter shapes. Keys are camelCase like Tauri's argument mapping; missing `Option`
@@ -157,6 +164,52 @@ struct ProjectSessions {
 #[serde(rename_all = "camelCase")]
 struct Binary {
     binary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileStatArgs {
+    path: String,
+    version: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileReadArgs {
+    path: String,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadBegin {
+    dir: String,
+    name: String,
+    size: u64,
+    on_clash: transfer::OnClash,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadChunk {
+    upload_id: String,
+    offset: u64,
+    bytes_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadCommit {
+    upload_id: String,
+    if_version: Option<String>,
+    on_clash: Option<transfer::OnClash>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadId {
+    upload_id: String,
 }
 
 /// Run `method` with JSON `params` (`null` counts as `{}`) and return its JSON result.
@@ -294,6 +347,43 @@ pub fn dispatch(ctx: &HostCtx, method: &str, params: Value) -> Result<Value, Str
                 a.limit,
                 a.before.as_ref(),
             ))
+        }
+        "file_stat" => {
+            let a: FileStatArgs = p.parse()?;
+            out(transfer::file_stat(&a.path, a.version.unwrap_or(false))?)
+        }
+        "file_read" => {
+            let a: FileReadArgs = p.parse()?;
+            out(transfer::file_read(&a.path, a.offset, a.len)?)
+        }
+        "make_dir" => {
+            let a: PathArg = p.parse()?;
+            out(transfer::make_dir(&a.path)?)
+        }
+        "upload_begin" => {
+            let a: UploadBegin = p.parse()?;
+            out(transfer::upload_begin(&a.dir, &a.name, a.size, a.on_clash)?)
+        }
+        "upload_chunk" => {
+            let a: UploadChunk = p.parse()?;
+            out(transfer::upload_chunk(
+                &a.upload_id,
+                a.offset,
+                &a.bytes_base64,
+            )?)
+        }
+        "upload_commit" => {
+            let a: UploadCommit = p.parse()?;
+            out(transfer::upload_commit(
+                &a.upload_id,
+                a.if_version,
+                a.on_clash,
+            )?)
+        }
+        "upload_abort" => {
+            let a: UploadId = p.parse()?;
+            transfer::upload_abort(&a.upload_id);
+            out(())
         }
         _ => Err(format!("unknown method `{method}`")),
     }

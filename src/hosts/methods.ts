@@ -39,6 +39,14 @@ export const HOST_METHODS = [
   "get_claude_cost_summary",
   "get_codex_usage",
   "get_project_sessions",
+  // File transfers (src/files/transfer.ts); none is cacheable.
+  "file_stat",
+  "file_read",
+  "make_dir",
+  "upload_begin",
+  "upload_chunk",
+  "upload_commit",
+  "upload_abort",
 ] as const;
 
 export type HostMethod = typeof HOST_METHODS[number];

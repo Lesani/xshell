@@ -114,3 +114,17 @@ describe("per-result provenance (amendment 24)", () => {
     expect(isStale(undefined, "get_sessions", { encodedName: "x" })).toBe(false);
   });
 });
+
+describe("rethrowHostCall", () => {
+  it("throws a remote error's message, and HostUnavailableError otherwise", async () => {
+    const { rethrowHostCall } = await import("./hostInvoke");
+    const caught = (e: unknown) => { try { rethrowHostCall(H, e); } catch (x) { return x; } };
+    expect(caught({ code: "remote", message: "boom" })).toBe("boom");
+    const off = caught({ code: "offline", message: "down" }) as HostUnavailableError;
+    expect(off).toBeInstanceOf(HostUnavailableError);
+    expect([off.code, off.host, off.message]).toEqual(["offline", H, "down"]);
+    const plain = new Error("x");
+    expect(caught(plain)).toBe(plain);
+    expect(caught("str")).toBe("str");
+  });
+});

@@ -56,6 +56,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Already in the tree (xshell-protocol, xshell-core): a fake Host's chunks in tests.
+base64 = "=0.22.1"
 
 # Dev profile: fast incremental rebuilds, light optimization for deps
 # The ConPTY input pipe for replies' writes that must not block (Lesani/xshell#40).

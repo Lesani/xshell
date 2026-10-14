@@ -4,6 +4,7 @@ mod hosts;
 mod local_migration;
 mod local_pty;
 mod ring;
+mod transfer;
 
 use local_pty::LocalPtys;
 use std::fs;
@@ -22,6 +23,7 @@ use xshell_core::opencode::OpencodeContext;
 use xshell_core::sessions::{CodexProjectInfo, MessagePreview, ProjectInfo, SessionInfo};
 use xshell_core::skills::ProjectSkills;
 use xshell_core::stats::{ClaudeCostSummary, GlobalRateLimits, StatuslineProbe};
+use xshell_core::transfer::{Begun, FileStat, OnClash, ReadChunk, Transferred, Written};
 use xshell_core::{HostCtx, LaunchSpec};
 
 pub struct AppState {
@@ -324,7 +326,8 @@ async fn relaunch_terminal(
 
 // Commands that only make sense on the machine running the window, so a remote host never
 // serves them: project icons are local files, two open local apps, and the local migration
-// commands guard this machine's settings file. The tests
+// commands guard this machine's settings file, and the transfer pumps write local paths. The
+// tests
 // below check that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
@@ -348,6 +351,9 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "ring_pair_phone_cancel",
     "ring_pair_computer",
     "ring_pair_cancel",
+    "transfer_download",
+    "transfer_upload_path",
+    "transfer_cancel",
 ];
 // The Remote Host connection commands (`hosts::commands`).
 #[cfg(test)]
@@ -578,6 +584,69 @@ fn get_codex_usage() -> CodexUsage {
     xshell_core::codex::get_codex_usage(&ctx())
 }
 
+// File transfers (`xshell_core::transfer`). Core is synchronous and a hash or read can take
+// long: each runs on a blocking thread, off the main thread and the runtime's workers.
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn file_stat(path: String, version: Option<bool>) -> Result<FileStat, String> {
+    blocking(move || xshell_core::transfer::file_stat(&path, version.unwrap_or(false))).await
+}
+
+#[tauri::command]
+async fn file_read(path: String, offset: u64, len: u64) -> Result<ReadChunk, String> {
+    blocking(move || xshell_core::transfer::file_read(&path, offset, len)).await
+}
+
+#[tauri::command]
+async fn make_dir(path: String) -> Result<(), String> {
+    blocking(move || xshell_core::transfer::make_dir(&path)).await
+}
+
+#[tauri::command]
+async fn upload_begin(
+    dir: String,
+    name: String,
+    size: u64,
+    on_clash: OnClash,
+) -> Result<Begun, String> {
+    blocking(move || xshell_core::transfer::upload_begin(&dir, &name, size, on_clash)).await
+}
+
+#[tauri::command]
+async fn upload_chunk(
+    upload_id: String,
+    offset: u64,
+    bytes_base64: String,
+) -> Result<Written, String> {
+    blocking(move || xshell_core::transfer::upload_chunk(&upload_id, offset, &bytes_base64)).await
+}
+
+#[tauri::command]
+async fn upload_commit(
+    upload_id: String,
+    if_version: Option<String>,
+    on_clash: Option<OnClash>,
+) -> Result<Transferred, String> {
+    blocking(move || xshell_core::transfer::upload_commit(&upload_id, if_version, on_clash)).await
+}
+
+#[tauri::command]
+async fn upload_abort(upload_id: String) -> Result<(), String> {
+    blocking(move || {
+        xshell_core::transfer::upload_abort(&upload_id);
+        Ok(())
+    })
+    .await
+}
+
 pub fn run() {
     xshell_core::files::cleanup_old_dropped_files(&ctx());
     tauri::Builder::default()
@@ -590,6 +659,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(local_migration::MigrationLock::default())
+        .manage(transfer::Transfers::default())
         .manage(AppState {
             ptys: Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
                 xshell_core::plan_command_with(&ctx(), spec, hooks)
@@ -657,6 +727,16 @@ pub fn run() {
             get_claude_cost_summary,
             get_codex_usage,
             get_project_sessions,
+            file_stat,
+            file_read,
+            make_dir,
+            upload_begin,
+            upload_chunk,
+            upload_commit,
+            upload_abort,
+            transfer::transfer_download,
+            transfer::transfer_upload_path,
+            transfer::transfer_cancel,
             spawn_terminal,
             write_terminal,
             resize_terminal,
@@ -773,7 +853,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 77);
+        assert_eq!(registered.len(), 87);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

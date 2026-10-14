@@ -137,10 +137,10 @@ fn unknown_method_is_rejected() {
 }
 
 #[test]
-fn methods_list_has_no_duplicates_and_36_entries() {
+fn methods_list_has_no_duplicates_and_43_entries() {
     let set: HashSet<&str> = METHODS.iter().copied().collect();
-    assert_eq!(METHODS.len(), 36);
-    assert_eq!(set.len(), 36);
+    assert_eq!(METHODS.len(), 43);
+    assert_eq!(set.len(), 43);
 }
 
 #[test]
@@ -617,4 +617,53 @@ fn save_dropped_file_round_trip() {
         .to_string_lossy()
         .ends_with("-ab.png"));
     assert_eq!(fs::read(&path).unwrap(), b"hello");
+}
+
+#[test]
+fn transfer_methods_dispatch_camel_case_params() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx();
+    let dir = fx.dir.path().join("d");
+    let d = dir.to_string_lossy().into_owned();
+    let call = |m: &str, p: Value| dispatch(&ctx, m, p);
+    assert_eq!(call("make_dir", json!({ "path": d })), Ok(Value::Null));
+    let b = call(
+        "upload_begin",
+        json!({ "dir": d, "name": "a.txt", "size": 2, "onClash": "keep_both" }),
+    )
+    .unwrap();
+    let id = b["upload_id"].as_str().unwrap().to_string();
+    assert_eq!(b["final_path"], json!(dir.join("a.txt").to_string_lossy()));
+    let w = call(
+        "upload_chunk",
+        json!({ "uploadId": id, "offset": 0, "bytesBase64": "aGk=" }),
+    );
+    assert_eq!(w, Ok(json!({ "written": 2 })));
+    let c = call(
+        "upload_commit",
+        json!({ "uploadId": id, "ifVersion": null, "onClash": "fail" }),
+    )
+    .unwrap();
+    let path = c["path"].as_str().unwrap().to_string();
+    assert_eq!(c["size"], json!(2));
+    let st = call("file_stat", json!({ "path": path, "version": true })).unwrap();
+    assert_eq!(st["version"], c["version"]);
+    assert!(st["mtime_ms"].is_u64());
+    assert_eq!(st["is_symlink"], json!(false));
+    // `version` may be left out: no hash.
+    let st = call("file_stat", json!({ "path": path })).unwrap();
+    assert_eq!(st["version"], Value::Null);
+    let r = call("file_read", json!({ "path": path, "offset": 1, "len": 9 }));
+    assert_eq!(r, Ok(json!({ "bytes_base64": "aQ==", "eof": true })));
+    assert_eq!(
+        call("upload_abort", json!({ "uploadId": id })),
+        Ok(Value::Null)
+    );
+    let e = call(
+        "upload_begin",
+        json!({ "dir": d, "name": "x", "size": 1, "onClash": "nope" }),
+    );
+    assert!(e
+        .unwrap_err()
+        .starts_with("invalid args for command `upload_begin`"));
 }

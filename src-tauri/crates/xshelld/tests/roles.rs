@@ -271,6 +271,50 @@ fn mobile_refuses_file_git_and_probe_calls() {
 }
 
 #[test]
+fn mobile_refuses_transfer_calls() {
+    let mut e = env();
+    let dir = e.cwd.to_string_lossy().into_owned();
+    let file = e.cwd.join("t.txt");
+    fs::write(&file, "x").unwrap();
+    let path = file.to_string_lossy().into_owned();
+    let made = e.cwd.join("made");
+    let calls = [
+        ("file_stat", json!({ "path": path, "version": true })),
+        ("file_read", json!({ "path": path, "offset": 0, "len": 1 })),
+        ("make_dir", json!({ "path": made })),
+        (
+            "upload_begin",
+            json!({ "dir": dir, "name": "up.txt", "size": 1, "onClash": "replace" }),
+        ),
+        (
+            "upload_chunk",
+            json!({ "uploadId": "bogus", "offset": 0, "bytesBase64": "eA==" }),
+        ),
+        ("upload_commit", json!({ "uploadId": "bogus" })),
+        ("upload_abort", json!({ "uploadId": "bogus" })),
+    ];
+    for (m, p) in calls {
+        assert_eq!(e.mob.call(m, p), Err(format!("{FORBIDDEN}: call {m}")));
+    }
+    assert!(!made.exists());
+    let parts = fs::read_dir(&e.cwd)
+        .unwrap()
+        .flatten()
+        .any(|f| f.file_name().to_string_lossy().contains(".xshell-part-"));
+    assert!(!parts, "a refused begin created nothing");
+    assert!(!e.cwd.join("up.txt").exists());
+    // A Desktop gets through to the method itself.
+    let d = e
+        .desk
+        .call(
+            "upload_chunk",
+            json!({ "uploadId": "bogus", "offset": 0, "bytesBase64": "eA==" }),
+        )
+        .unwrap_err();
+    assert_eq!(d, "unknown upload: bogus");
+}
+
+#[test]
 fn mobile_unknown_call_forbidden() {
     let mut e = env();
     assert_eq!(

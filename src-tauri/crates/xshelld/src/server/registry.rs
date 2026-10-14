@@ -476,8 +476,9 @@ impl Daemon {
         }
     }
 
-    /// Sweep the drop directory of files older than `Config::drop_max_age` every
-    /// `Config::drop_sweep` until the Daemon has exited, whether or not anything is dropped.
+    /// Sweep the drop directory of files older than `Config::drop_max_age`, and idle uploads
+    /// with their part files, every `Config::drop_sweep` until the Daemon has exited, whether
+    /// or not anything is dropped.
     pub fn sweep_drops(self: Arc<Self>) {
         let mut g = self.exit.lock().unwrap();
         loop {
@@ -499,6 +500,7 @@ impl Daemon {
                 self.cfg.drop_max_age,
                 std::time::SystemTime::now(),
             );
+            xshell_core::transfer::sweep_idle(Instant::now());
             g = self.exit.lock().unwrap();
         }
     }
@@ -561,6 +563,8 @@ impl Daemon {
         for ob in &conns {
             ob.wait_done(deadline);
         }
+        // No connection is left to finish an upload; its part files go now.
+        xshell_core::transfer::abort_all();
         let _ = transport::remove_endpoint(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
         if let Some(h) = bye {
