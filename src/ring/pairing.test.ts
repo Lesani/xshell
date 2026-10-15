@@ -3,7 +3,7 @@ import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, comput
 import { fmt, S, type StringKey } from "./strings";
 import type { PhoneStart } from "./types";
 
-const HOSTED = "wss://relay.xshell.app";
+const HOSTED = "wss://xshell-relay-hosted.m-roither.workers.dev";
 const OFFER: PhoneStart = { payload: "xsp1.abc", qr: { size: 2, rows: ["10", "01"] }, expiresAt: 1000 };
 
 describe("countdown", () => {

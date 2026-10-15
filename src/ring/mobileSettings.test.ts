@@ -3,7 +3,7 @@ import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTim
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
-const HOSTED = "wss://relay.xshell.app";
+const HOSTED = "wss://xshell-relay-hosted.m-roither.workers.dev";
 
 function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
