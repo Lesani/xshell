@@ -7,9 +7,36 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The build identity (Lesani/xshell#49) of every binary this release builds: the commit
+  # being released. The jobs below pass it to the build scripts as XSHELL_BUILD_* overrides,
+  # so the Desktop, its sidecar and every xshelld asset carry the same identity, and each
+  # binary is checked against it before it is published.
+  stamp:
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.id.outputs.commit }}
+      time: ${{ steps.id.outputs.time }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build identity
+        id: id
+        run: |
+          commit="$(git rev-parse HEAD | cut -c1-12)"
+          time="$(git log -1 --format=%ct HEAD)"
+          echo "build $commit, commit time $time"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "time=$time" >> "$GITHUB_OUTPUT"
+
   publish-tauri:
+    needs: stamp
     permissions:
       contents: write
+    env:
+      XSHELL_BUILD_COMMIT: ${{ needs.stamp.outputs.commit }}
+      XSHELL_BUILD_TIME: ${{ needs.stamp.outputs.time }}
+      XSHELL_BUILD_DIRTY: ""
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +98,9 @@ jobs:
           if [ "${{ matrix.platform }}" = macos-latest ]; then
             for t in aarch64-apple-darwin x86_64-apple-darwin; do
               cargo build -p xshelld --profile release-daemon --locked --target "$t"
+              # Each half carries the release's identity before they are joined.
+              cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+                "target/$t/release-daemon/xshelld" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
             done
             lipo -create -output binaries/xshelld-universal-apple-darwin \
               target/aarch64-apple-darwin/release-daemon/xshelld \
@@ -84,6 +114,57 @@ jobs:
               cp target/release-daemon/xshelld "binaries/xshelld-$triple"
             fi
           fi
+
+      # The sidecar must carry the release's build identity, found in its bytes (in every
+      # slice of the universal binary) and reported by `--version`.
+      - name: Check the sidecar's build identity
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          want="\"build\":{\"commit\":\"$XSHELL_BUILD_COMMIT\",\"dirty\":null,\"time\":$XSHELL_BUILD_TIME}}"
+          for f in binaries/xshelld-*; do
+            cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+              "$f" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+            v="$("./$f" --version)"
+            echo "$v"
+            [[ "$v" == *"$want"* ]] || { echo "$f --version: expected $want" >&2; exit 1; }
+          done
+
+      # The Desktop is built and checked before anything is uploaded: the publish step below
+      # runs the same `tauri build` with the same overrides, so cargo finds every crate fresh and
+      # bundles these checked executables.
+      - name: Build the Desktop (no upload)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- ${{ matrix.args }}
+
+      # Every executable the bundles carry: on macOS the app's Contents/MacOS (the Desktop and
+      # its sidecar, every slice; also the thin halves where tauri left them); elsewhere the
+      # Desktop's executable (the sidecar was checked above).
+      - name: Check the Desktop's build identity
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          if [ "${{ matrix.platform }}" = macos-latest ]; then
+            files=$(find target -path '*/bundle/macos/*.app/Contents/MacOS/*' -type f)
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              if [ -f "target/$t/release/xshell" ]; then files="$files target/$t/release/xshell"; fi
+            done
+            if ! [[ "$files " =~ /Contents/MacOS/xshell[[:space:]] ]]; then
+              echo "no executable in the xshell app bundle" >&2
+              exit 1
+            fi
+          elif [ "${{ matrix.platform }}" = windows-latest ]; then
+            files=target/release/xshell.exe
+          else
+            files=target/release/xshell
+          fi
+          for f in $files; do
+            cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+              "$f" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          done
 
       - name: Build and publish (Tauri)
         uses: tauri-apps/tauri-action@v0
@@ -132,12 +213,16 @@ jobs:
   # The Desktop downloads xshelld-<triple> and its .sha256 from the release of its own
   # version (src-tauri/src/hosts/binaries.rs). The sidecar is a sha256sum line.
   xshelld-assets:
-    needs: publish-tauri
+    needs: [stamp, publish-tauri]
     # On a tag the assets go into the draft release, so the desktop job must have created it.
     # Branch dry runs (workflow_dispatch) build the daemon even if desktop publishing fails.
-    if: ${{ !cancelled() && (needs.publish-tauri.result == 'success' || !startsWith(github.ref, 'refs/tags/v')) }}
+    if: ${{ !cancelled() && needs.stamp.result == 'success' && (needs.publish-tauri.result == 'success' || !startsWith(github.ref, 'refs/tags/v')) }}
     permissions:
       contents: write
+    env:
+      XSHELL_BUILD_COMMIT: ${{ needs.stamp.outputs.commit }}
+      XSHELL_BUILD_TIME: ${{ needs.stamp.outputs.time }}
+      XSHELL_BUILD_DIRTY: ""
     strategy:
       fail-fast: false
       matrix:
@@ -195,6 +280,18 @@ jobs:
           if [[ "${{ matrix.target }}" == *linux-musl ]]; then
             file "$name"
             file "$name" | grep -Eq 'statically linked|static-pie linked'
+          fi
+          # The release's build identity, before any checksum or upload: in the bytes, and
+          # from `--version` where this runner can run the binary.
+          cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+            "$name" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          arch="$(uname -m)"
+          if [ "$arch" = arm64 ]; then arch=aarch64; fi
+          if [[ "${{ matrix.target }}" == "$arch"-* ]]; then
+            want="\"build\":{\"commit\":\"$XSHELL_BUILD_COMMIT\",\"dirty\":null,\"time\":$XSHELL_BUILD_TIME}}"
+            v="$("./$name" --version)"
+            echo "$v"
+            [[ "$v" == *"$want"* ]] || { echo "$name --version: expected $want" >&2; exit 1; }
           fi
           if command -v sha256sum >/dev/null; then
             sha256sum "$name" > "$name.sha256"

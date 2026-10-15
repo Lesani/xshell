@@ -864,6 +864,7 @@ mod tests {
                             protocol: ProtocolRange { min: 1, max: 1 },
                             version: VERSION.into(),
                             capabilities: caps,
+                            build: None,
                         });
                         let list = ServerMsg::Terminals {
                             list: Vec::<TerminalInfo>::new(),

@@ -1086,6 +1086,7 @@ fn backpressure_defers_not_drops() {
         protocol: range(1, 1),
         version: "t".into(),
         capabilities: vec![],
+        build: None,
     });
     w.write_all(&encode_msg(&hello, None).unwrap()).unwrap();
     let sub = ClientMsg::SessionSubscribe {

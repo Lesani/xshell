@@ -817,6 +817,7 @@ impl Client {
                 protocol: r,
                 version: "test".into(),
                 capabilities: vec!["call".into(), "term".into()],
+                build: None,
             }),
             None,
         );
@@ -1085,6 +1086,7 @@ impl RawClient {
                 protocol: range(1, 1),
                 version: "test".into(),
                 capabilities: vec![],
+                build: None,
             }),
             None,
         );

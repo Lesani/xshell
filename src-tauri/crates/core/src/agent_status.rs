@@ -828,6 +828,7 @@ fn exchange(
         protocol: PROTOCOL,
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: vec![],
+        build: None,
     });
     let ev = ClientMsg::TermEvent {
         terminal,
@@ -896,6 +897,7 @@ pub fn serve_event_conn(
         protocol: PROTOCOL,
         version: version.into(),
         capabilities: vec!["agent.status".into()],
+        build: None,
     });
     let Ok(f) = encode_msg(&hello, None) else {
         return;
@@ -1489,6 +1491,7 @@ mod tests {
                 protocol: PROTOCOL,
                 version: "x".into(),
                 capabilities: vec![],
+                build: None,
             });
             let other = ServerMsg::Terminals { list: vec![] };
             if s.write_all(&encode_msg(&hello, None).unwrap()).is_err() {
@@ -1697,6 +1700,7 @@ mod tests {
                 protocol: PROTOCOL,
                 version: "x".into(),
                 capabilities: vec![],
+                build: None,
             });
             if s.write_all(&encode_msg(&hello, None).unwrap()).is_err() {
                 return;

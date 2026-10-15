@@ -301,6 +301,7 @@ fn request(paths: &Paths, msg: &ClientMsg) -> Result<Option<Value>, String> {
         protocol: PROTOCOL,
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: Vec::new(),
+        build: None,
     });
     let send = |w: &mut UnixStream, m: &ClientMsg, id: Option<u64>| -> Result<(), String> {
         let bytes = encode_msg(m, id).map_err(|e| e.to_string())?;

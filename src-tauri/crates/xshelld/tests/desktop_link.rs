@@ -974,6 +974,7 @@ fn fake_old_daemon_process() {
             protocol: ProtocolRange { min: 0, max: 0 },
             version: "0.9.0".into(),
             capabilities: vec![],
+            build: None,
         }),
         None,
     )

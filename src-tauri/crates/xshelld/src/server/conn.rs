@@ -107,6 +107,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
             .filter(|c| offered(&d.cfg, c))
             .map(|s| s.to_string())
             .collect(),
+        build: crate::build_id::BUILD.clone(),
     })) {
         ob.push_control(f);
     }

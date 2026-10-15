@@ -118,10 +118,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
-      - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --all-targets --locked -- -D warnings
+      - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --all-targets --locked -- -D warnings
       # On Windows the reply probes (#40) log what ConPTY does as facts, and the ConPTY
       # renderings of the prompt fixtures are kept as an artifact.
-      - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink --locked --no-fail-fast
+      - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --locked --no-fail-fast
         # The backpressure probes (#40) stall a console on purpose; each ends itself after
         # 90 s, and this bounds the whole step.
         timeout-minutes: 45

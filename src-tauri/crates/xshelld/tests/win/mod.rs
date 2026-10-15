@@ -460,6 +460,7 @@ impl Client {
                 protocol: ProtocolRange { min: 1, max: 1 },
                 version: "test".into(),
                 capabilities: vec!["call".into(), "term".into()],
+                build: None,
             }),
             None,
         );

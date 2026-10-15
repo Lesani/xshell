@@ -57,9 +57,10 @@ impl Default for LinkLimits {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkError {
-    /// The Daemon's hello shares no protocol version with ours.
+    /// The Daemon's hello shares no protocol version with ours. Boxed: a `Hello` (with its
+    /// build, #49) would make every `Result<_, LinkError>` large.
     Incompatible {
-        hello: Hello,
+        hello: Box<Hello>,
         message: String,
     },
     Failed(String),
@@ -192,6 +193,7 @@ impl Link {
             protocol: ours,
             version: version.into(),
             capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
+            build: None,
         });
         let frame = encode_msg(&hello, None).map_err(|e| LinkError::Failed(e.to_string()))?;
         link.enqueue(frame)
@@ -493,7 +495,7 @@ impl Link {
                             let message = crate::version::incompatible_message(ours, &h);
                             if let Some(tx) = handshake.take() {
                                 let _ = tx.send(Err(LinkError::Incompatible {
-                                    hello: h,
+                                    hello: Box::new(h),
                                     message: message.clone(),
                                 }));
                             }
@@ -598,6 +600,7 @@ pub(crate) mod testpeer {
                 protocol: ProtocolRange { min, max },
                 version: version.into(),
                 capabilities: vec![],
+                build: None,
             }),
             None,
         )

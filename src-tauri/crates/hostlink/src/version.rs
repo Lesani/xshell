@@ -67,6 +67,7 @@ mod tests {
             protocol: ProtocolRange { min, max },
             version: v.into(),
             capabilities: vec![],
+            build: None,
         }
     }
     const R11: ProtocolRange = ProtocolRange { min: 1, max: 1 };

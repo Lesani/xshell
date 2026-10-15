@@ -1071,6 +1071,7 @@ fn mobile_second_hello_keeps_role() {
         protocol: range(1, 1),
         version: "t".into(),
         capabilities: vec![],
+        build: None,
     }));
     assert_eq!(r, Err("already said hello".into()));
     let shell = e.shell();

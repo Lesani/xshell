@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink"]
+members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink", "crates/buildinfo"]
 # Vendored, patched crates (see each one's XSHELL-PATCH.md): not workspace members.
 exclude = ["vendor"]
 resolver = "2"
@@ -28,6 +28,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+xshell-buildinfo = { path = "crates/buildinfo" }
 
 [dependencies]
 tauri = { version = "2", features = [] }

@@ -1,6 +1,7 @@
 //! Kind-0 JSON messages. Every message is an object with a string `"t"` (its type); fields are
 //! camelCase and unknown fields are ignored, so protocol changes stay additive.
 
+use crate::build::BuildId;
 use crate::frame::{encode_json, FrameError};
 use crate::launch::LaunchSpec;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,10 @@ pub struct Hello {
     pub version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Which build of `version` the sender is (Lesani/xshell#49); `None` when unknown or from
+    /// a peer before #49. Not sent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildId>,
 }
 
 /// A Desktop → Host message. `id` lives on the envelope: when present the Host answers with
@@ -960,12 +965,39 @@ mod tests {
             protocol: ProtocolRange { min: 1, max: 1 },
             version: "x".into(),
             capabilities: vec!["call".into()],
+            build: None,
         });
         let b = body(encode_msg(&h, None).unwrap());
         assert_eq!(
             String::from_utf8(b).unwrap(),
             r#"{"t":"hello","protocol":{"min":1,"max":1},"version":"x","capabilities":["call"]}"#
         );
+    }
+
+    #[test]
+    fn hello_build_is_additive() {
+        // A peer before #49 sends no build: unknown.
+        let old = br#"{"t":"hello","protocol":{"min":1,"max":1},"version":"x","capabilities":[]}"#;
+        let ServerMsg::Hello(h) = decode_server(old).unwrap() else {
+            panic!()
+        };
+        assert_eq!(h.build, None);
+        let h = ServerMsg::Hello(Hello {
+            protocol: ProtocolRange { min: 1, max: 1 },
+            version: "x".into(),
+            capabilities: vec![],
+            build: Some(BuildId {
+                commit: "85ee920a1b2c".into(),
+                dirty: None,
+                time: 1760000000,
+            }),
+        });
+        let b = body(encode_msg(&h, None).unwrap());
+        assert_eq!(
+            String::from_utf8(b.clone()).unwrap(),
+            r#"{"t":"hello","protocol":{"min":1,"max":1},"version":"x","capabilities":[],"build":{"commit":"85ee920a1b2c","dirty":null,"time":1760000000}}"#
+        );
+        assert_eq!(decode_server(&b).unwrap(), h);
     }
 
     #[test]

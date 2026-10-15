@@ -3,6 +3,7 @@
 //! pipe. On Windows only xshell starts it (`serve --gui-bound`, ADR-0005); Persistent
 //! `serve` and `connect` are Unix only.
 
+pub mod build_id;
 pub mod cli;
 pub mod connect;
 pub mod console_mode;

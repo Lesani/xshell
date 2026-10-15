@@ -1,0 +1,11 @@
+[package]
+name = "xshell-buildinfo"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Build identity (commit, uncommitted-changes digest, commit time) for the build scripts of xshell and xshelld."
+
+[dependencies]
+# Already in the tree (xshell-protocol): the uncommitted-changes digest.
+sha2 = "=0.10.9"

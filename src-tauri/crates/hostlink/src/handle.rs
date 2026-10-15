@@ -1399,6 +1399,7 @@ pub(crate) mod tests {
             protocol: ProtocolRange { min: 1, max: 1 },
             version: "1.5.0".into(),
             capabilities: caps.clone(),
+            build: None,
         }));
         b.extend(terminals_frame(list));
         peer.write(&b);

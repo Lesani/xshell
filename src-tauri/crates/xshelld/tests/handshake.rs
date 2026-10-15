@@ -36,6 +36,21 @@ fn hello_advertises_agent_status() {
 }
 
 #[test]
+fn hello_names_the_build_that_version_reports() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::connect(&srv.socket);
+    let (hello, _) = c.hello(range(1, 1));
+    let out = std::process::Command::new(bin())
+        .arg("--version")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(serde_json::json!(hello.build), v["build"]);
+    assert_eq!(hello.build, *xshelld::build_id::BUILD);
+}
+
+#[test]
 fn hello_no_overlap_rejected() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
@@ -45,6 +60,7 @@ fn hello_no_overlap_rejected() {
             protocol: range(2, 3),
             version: "future".into(),
             capabilities: vec![],
+            build: None,
         }),
         None,
     );
@@ -83,6 +99,7 @@ fn hello_uses_configured_range() {
             protocol: range(1, 1),
             version: "old".into(),
             capabilities: vec![],
+            build: None,
         }),
         None,
     );

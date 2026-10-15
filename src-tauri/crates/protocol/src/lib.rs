@@ -4,6 +4,7 @@
 //! keys, the Roster and the Relay protocol; `relay-client` adds the Relay client.
 
 pub mod backoff;
+pub mod build;
 pub mod correlate;
 pub mod frame;
 pub mod launch;

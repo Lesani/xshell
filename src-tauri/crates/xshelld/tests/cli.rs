@@ -24,12 +24,21 @@ fn version_is_machine_readable() {
         "macos" => "Darwin",
         other => other,
     };
+    let build = xshell_protocol::build::parse_stamp(env!("XSHELL_BUILDINFO_STAMP")).unwrap();
     assert_eq!(
         v,
         json!({"name": "xshelld", "version": env!("CARGO_PKG_VERSION"),
                "protocol": {"min": 1, "max": 1},
-               "os": os, "arch": std::env::consts::ARCH})
+               "os": os, "arch": std::env::consts::ARCH, "build": build})
     );
+    assert!(
+        s.trim_end()
+            .ends_with(&format!(r#","build":{}}}"#, json!(build))),
+        "build is the last key: {s}"
+    );
+    // The binary carries exactly that stamp, findable without running it.
+    let bytes = fs::read(bin()).unwrap();
+    assert_eq!(xshell_protocol::build::scan_stamp(&bytes), Ok(build));
 }
 
 #[test]

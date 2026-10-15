@@ -1,5 +1,6 @@
 #[cfg(unix)]
 mod agent_events;
+mod build_id;
 mod drag_out;
 mod hosts;
 mod local_migration;
@@ -194,6 +195,21 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// What Settings → About shows: this Desktop's version and build (Lesani/xshell#49).
+#[derive(serde::Serialize)]
+struct AppBuild {
+    version: &'static str,
+    build: Option<xshell_protocol::build::BuildId>,
+}
+
+#[tauri::command]
+fn app_build() -> AppBuild {
+    AppBuild {
+        version: env!("CARGO_PKG_VERSION"),
+        build: build_id::BUILD.clone(),
+    }
+}
+
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     use std::process::Command;
@@ -334,6 +350,7 @@ async fn relaunch_terminal(
 // that these two lists plus `xshell_core::METHODS` cover every registered command.
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
+    "app_build",
     "open_url",
     "reveal_in_explorer",
     "read_image_base64",
@@ -704,6 +721,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_build,
             list_claude_projects,
             get_sessions,
             get_all_recent_sessions,
@@ -881,7 +899,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 99);
+        assert_eq!(registered.len(), 100);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)
@@ -889,6 +907,17 @@ mod tests {
         {
             assert!(registered.contains(*c), "{c} is not registered");
         }
+    }
+
+    #[test]
+    fn app_build_is_the_stamped_build() {
+        let a = serde_json::to_value(app_build()).unwrap();
+        assert_eq!(a["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(a["build"], serde_json::json!(*build_id::BUILD));
+        assert_eq!(
+            xshell_protocol::build::parse_stamp(build_id::STAMP),
+            Ok(build_id::BUILD.clone())
+        );
     }
 
     // The Desktop installs the xshelld of its own version on Remote Hosts.

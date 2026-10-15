@@ -92,16 +92,18 @@ pair options:
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
 /// use `uname -s` / `uname -m` spelling, so a Desktop that can only run `<cmd> --version`
-/// (a Daemon command behind a restricted ssh) still learns the platform.
+/// (a Daemon command behind a restricted ssh) still learns the platform. `build` (last, added
+/// in #49) is this binary's build identity, `null` when unknown.
 pub fn version_json() -> String {
     // Written by hand to keep this exact key order (serde_json sorts object keys).
     format!(
-        r#"{{"name":"xshelld","version":{},"protocol":{{"min":{},"max":{}}},"os":{},"arch":{}}}"#,
+        r#"{{"name":"xshelld","version":{},"protocol":{{"min":{},"max":{}}},"os":{},"arch":{},"build":{}}}"#,
         serde_json::Value::from(env!("CARGO_PKG_VERSION")),
         xshell_protocol::PROTOCOL_MIN,
         xshell_protocol::PROTOCOL_MAX,
         serde_json::Value::from(uname_os()),
         serde_json::Value::from(std::env::consts::ARCH),
+        serde_json::to_string(&*crate::build_id::BUILD).expect("a BuildId serializes"),
     )
 }
 
@@ -498,10 +500,11 @@ mod tests {
 
     #[test]
     fn version_json_shape() {
+        let build = serde_json::to_string(&*crate::build_id::BUILD).unwrap();
         assert_eq!(
             version_json(),
             format!(
-                r#"{{"name":"xshelld","version":"{}","protocol":{{"min":1,"max":1}},"os":"{}","arch":"{}"}}"#,
+                r#"{{"name":"xshelld","version":"{}","protocol":{{"min":1,"max":1}},"os":"{}","arch":"{}","build":{build}}}"#,
                 env!("CARGO_PKG_VERSION"),
                 uname_os(),
                 std::env::consts::ARCH
@@ -511,7 +514,11 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({"name":"xshelld","version":env!("CARGO_PKG_VERSION"),
-                "protocol":{"min":1,"max":1},"os":uname_os(),"arch":std::env::consts::ARCH})
+                "protocol":{"min":1,"max":1},"os":uname_os(),"arch":std::env::consts::ARCH,
+                "build":*crate::build_id::BUILD})
         );
+        // Older Desktops read only these keys; `build` must not disturb them.
+        let old = xshell_hostlink::install::parse_version_json(&version_json()).unwrap();
+        assert_eq!(old.version, env!("CARGO_PKG_VERSION"));
     }
 }

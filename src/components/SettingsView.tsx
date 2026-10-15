@@ -16,6 +16,7 @@ import { DARK_TERM_BG, LIGHT_TERM_BG } from "./TerminalTab";
 import type { UpdateInfo, ReleaseEntry } from "../hooks/useUpdateCheck";
 import { useInstaller } from "../hooks/useInstaller";
 import { renderMarkdown } from "../markdown";
+import { versionWithBuild, type AppBuild } from "../buildId";
 
 export type ThemeMode = "dark" | "light";
 
@@ -194,6 +195,15 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
   const [expandedAgents, setExpandedAgents] = useState<Record<AgentId, boolean>>(() => Object.fromEntries(AGENT_IDS.map(id => [id, false])) as Record<AgentId, boolean>);
   const toggleAgent = (id: AgentId) => setExpandedAgents(prev => ({ ...prev, [id]: !prev[id] }));
   const installer = useInstaller(updateInfo.update);
+  // This Desktop's build (Lesani/xshell#49); `undefined` until (unless) `app_build` answers.
+  const [appBuild, setAppBuild] = useState<AppBuild | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<AppBuild>("app_build")
+      .then(b => { if (!cancelled) setAppBuild(b); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
   const shells = getAvailableShells();
   const { tt, Tooltip } = useTooltip();
 
@@ -455,8 +465,8 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
           {active === "about" && (
             <>
             <Section title="Version" description="xshell ships via GitHub Releases. The check below queries GitHub for the latest tagged release.">
-              <SettingRow title="Installed version" description="The version of xshell currently running. Comes from the bundled tauri.conf.json — restart the app after updating.">
-                <span className="settings-version-current">{updateInfo.currentVersion || "—"}</span>
+              <SettingRow title="Installed version" description="The version and build running now. A +d. suffix identifies uncommitted source changes.">
+                <span className="settings-version-current">{updateInfo.currentVersion ? (appBuild ? versionWithBuild(updateInfo.currentVersion, appBuild.build) : updateInfo.currentVersion) : "—"}</span>
               </SettingRow>
               <SettingRow title="Latest release" description={updateInfo.error ? `Couldn't reach GitHub: ${updateInfo.error}` : updateInfo.loading ? "Checking GitHub Releases…" : updateInfo.publishedAt ? `Published ${new Date(updateInfo.publishedAt).toLocaleDateString()}` : "Latest tagged release on GitHub."}>
                 <div className="settings-version-row">

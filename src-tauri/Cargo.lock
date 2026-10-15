@@ -6268,9 +6268,17 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
+ "xshell-buildinfo",
  "xshell-core",
  "xshell-hostlink",
  "xshell-protocol",
+]
+
+[[package]]
+name = "xshell-buildinfo"
+version = "0.0.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]
@@ -6347,6 +6355,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "uuid",
  "windows-sys 0.61.2",
+ "xshell-buildinfo",
  "xshell-core",
  "xshell-hostlink",
  "xshell-protocol",
