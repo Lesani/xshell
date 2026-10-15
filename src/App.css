@@ -1895,7 +1895,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .host-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; padding: 2px 8px; border-radius: 10px; background: var(--bg-active); color: var(--text-secondary); white-space: nowrap; }
 .host-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
 .host-chip-connected .host-chip-dot { background: var(--success); }
-.host-chip-upgrade-pending .host-chip-dot, .host-chip-reconnecting .host-chip-dot { background: #c9a042; }
+.host-chip-upgrade-pending .host-chip-dot, .host-chip-build-differs .host-chip-dot, .host-chip-reconnecting .host-chip-dot { background: #c9a042; }
 .host-chip-offline .host-chip-dot, .host-chip-incompatible .host-chip-dot { background: #b53333; }
 .host-row-note { font-size: 11px; color: var(--text-secondary); }
 .host-row-warn { color: #d97757; }

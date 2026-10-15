@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     fn status(host: &str, kind: StatusKind, caps: &[&str], link_gen: u64) -> HostStatus {
-        let mut s = HostStatus::initial(host, VERSION, 1);
+        let mut s = HostStatus::initial(host, VERSION, None, 1);
         s.set_kind(kind);
         s.daemon_capabilities = caps.iter().map(|c| c.to_string()).collect();
         s.link_generation = link_gen;

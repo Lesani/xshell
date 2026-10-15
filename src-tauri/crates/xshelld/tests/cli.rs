@@ -593,3 +593,105 @@ mod pair {
         assert!(stored(&h).is_none());
     }
 }
+
+/// A home whose `selected` record names `server/<name>/xshelld`: a wrapper that logs its
+/// arguments to `marker`, then runs the real binary.
+fn select_wrapper(h: &TestHome, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = h.home().join(".xshell/server");
+    let dir = root.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    for d in [h.home().join(".xshell"), root.clone(), dir.clone()] {
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = h.root().join("marker");
+    let wrapper = dir.join("xshelld");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            marker.display(),
+            bin()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let record = root.join("selected");
+    fs::write(&record, format!("{name}\n")).unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    (wrapper, marker)
+}
+
+/// Run `connect` once and return the binary its spawned `serve` started from (the log line).
+fn connect_started(h: &TestHome) -> String {
+    let _guard = DaemonGuard::new(h);
+    let mut p = ConnectProc::start(h);
+    p.client.hello(range(1, 1));
+    assert!(p.finish().success());
+    let log = fs::read_to_string(h.home().join(".xshell/log/xshelld.log")).unwrap();
+    log.lines()
+        .find_map(|l| l.strip_prefix("connect: starting "))
+        .unwrap_or_else(|| panic!("no start line in {log}"))
+        .to_string()
+}
+
+/// `connect` starts the build the `selected` record names (#49).
+#[test]
+fn connect_starts_selected_build() {
+    let h = TestHome::new();
+    let name = format!("{}+85ee920a1b2c", env!("CARGO_PKG_VERSION"));
+    let (wrapper, marker) = select_wrapper(&h, &name);
+    assert_eq!(connect_started(&h), wrapper.display().to_string());
+    let args = fs::read_to_string(&marker).unwrap();
+    assert!(args.starts_with("serve"), "{args}");
+}
+
+type Breaker = Box<dyn Fn(&std::path::Path)>;
+
+/// Anything wrong with the record or the install: `connect` starts itself.
+#[test]
+fn connect_ignores_invalid_selection() {
+    let v = env!("CARGO_PKG_VERSION");
+    let good = format!("{v}+85ee920a1b2c");
+    let cases: Vec<(&str, Breaker)> = vec![
+        (
+            "bad name",
+            Box::new(|r| fs::write(r.join("selected"), "../evil\n").unwrap()),
+        ),
+        (
+            "missing binary",
+            Box::new(|r| fs::write(r.join("selected"), "9.9.9+000000000000\n").unwrap()),
+        ),
+        (
+            "group-writable binary",
+            Box::new(|r| {
+                let name = fs::read_to_string(r.join("selected")).unwrap();
+                let f = r.join(name.trim()).join("xshelld");
+                fs::set_permissions(&f, fs::Permissions::from_mode(0o720)).unwrap();
+            }),
+        ),
+        (
+            "symlinked binary",
+            Box::new(|r| {
+                let name = fs::read_to_string(r.join("selected")).unwrap();
+                let f = r.join(name.trim()).join("xshelld");
+                fs::rename(&f, r.join("elsewhere")).unwrap();
+                std::os::unix::fs::symlink(r.join("elsewhere"), &f).unwrap();
+            }),
+        ),
+        (
+            "older version (S2)",
+            Box::new(|r| {
+                let name = fs::read_to_string(r.join("selected")).unwrap();
+                fs::rename(r.join(name.trim()), r.join("0.0.1+85ee920a1b2c")).unwrap();
+                fs::write(r.join("selected"), "0.0.1+85ee920a1b2c\n").unwrap();
+            }),
+        ),
+    ];
+    for (what, break_it) in cases {
+        let h = TestHome::new();
+        let (_, marker) = select_wrapper(&h, &good);
+        break_it(&h.home().join(".xshell/server"));
+        assert_eq!(connect_started(&h), bin(), "{what}");
+        assert!(!marker.exists(), "{what}: the selected build ran");
+    }
+}

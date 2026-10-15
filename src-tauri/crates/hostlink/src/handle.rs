@@ -213,7 +213,12 @@ enum Done<'a> {
 
 impl Shared {
     pub(crate) fn new(cfg: HostConfig, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
-        let status = HostStatus::initial(&cfg.id, &mc.desktop_version, config_generation);
+        let status = HostStatus::initial(
+            &cfg.id,
+            &mc.desktop_version,
+            mc.desktop_build.clone(),
+            config_generation,
+        );
         let down = HostError::offline(format!("{} is reconnecting", cfg.name));
         Self {
             id: cfg.id.clone(),
@@ -703,8 +708,12 @@ impl HostHandle {
                 a.attached_gen = 0;
                 a.inflight.clear();
             }
-            st.status =
-                HostStatus::initial(&self.sh.id, &self.sh.mc.desktop_version, config_generation);
+            st.status = HostStatus::initial(
+                &self.sh.id,
+                &self.sh.mc.desktop_version,
+                self.sh.mc.desktop_build.clone(),
+                config_generation,
+            );
             self.sh.snap.lock().unwrap().terminals = None;
             self.sh.publish(&mut st);
             link
@@ -1117,9 +1126,13 @@ impl HostHandle {
         );
     }
 
-    /// Connected: `daemon.upgrade`, then the supervisor waits for the old Daemon to close
-    /// the link before reconnecting. Incompatible: SIGTERM the Daemon through its pidfile,
-    /// then reconnect.
+    /// "Upgrade now" and "Replace with this Desktop's build" (ADR-0003, #49). First, while
+    /// the old Daemon still runs, this Desktop's build is installed (its identity checked)
+    /// and recorded as the Host's `selected` build, so a refusal touches no Terminal. Then:
+    /// connected, `daemon.upgrade`, and the supervisor waits for the old Daemon to close the
+    /// link before reconnecting; incompatible, SIGTERM the Daemon through its pidfile (a
+    /// direct Host: its dialer's own stop), then reconnect. The supervisor's check after the
+    /// switch decides whether it worked.
     pub fn upgrade(&self, w: Waiter) {
         let once = Once::new(w);
         enum Plan {
@@ -1143,111 +1156,79 @@ impl HostHandle {
             }
             (plan, cfg)
         };
-        match plan {
-            Plan::Refuse(e) => once.call(Err(e)),
-            Plan::Request(link) => {
-                let sh = Arc::downgrade(&self.sh);
-                let o = once.clone();
-                let w: Waiter = Box::new(move |r| {
-                    if let Some(sh) = sh.upgrade() {
-                        let mut st = sh.lock();
-                        match &r {
-                            Ok(_) => {
-                                st.upgrade_deadline =
-                                    Some(Instant::now() + sh.mc.upgrade_close_timeout);
-                            }
-                            Err(_) => {
-                                st.upgrading = false;
-                                st.upgrade_expect = false;
-                                st.status.phase = None;
-                                sh.publish(&mut st);
-                            }
-                        }
-                        sh.cv.notify_all();
-                    }
-                    o.call(r);
-                });
-                let timeout = self.sh.mc.term_timeout;
-                if let Err(e) = link.request(ClientMsg::DaemonUpgrade, timeout, w) {
-                    let mut st = self.sh.lock();
-                    st.upgrading = false;
-                    st.upgrade_expect = false;
-                    st.status.phase = None;
-                    self.sh.publish(&mut st);
-                    drop(st);
-                    once.call(Err(e));
-                }
-            }
-            // The configuration the plan was made under decides. A direct Host (a local
-            // socket) has no transport to run the script through; its dialer may stop the
-            // Daemon itself (the Local Host's Persistent Daemon), otherwise it is refused.
-            Plan::Kill if cfg.daemon_override().is_none() => {
-                match self.sh.mc.transports.direct(&cfg) {
-                    Some(d) if d.upgradable() => self.stop_direct(d, once),
-                    Some(_) => {
-                        self.end_upgrade();
-                        once.call(Err(HostError::new(
-                            crate::errors::HostErrorCode::Incompatible,
-                            "this Daemon cannot be upgraded from here: restart it in a compatible version",
-                        )));
-                    }
-                    None => self.kill_over_transport(cfg, once),
-                }
-            }
-            Plan::Kill => {
+        // The configuration the plan was made under decides. A direct Host (a local socket)
+        // has no transport to run scripts through; its dialer may select a build and stop
+        // the Daemon itself (the Local Host's Persistent Daemon).
+        let direct = self.sh.mc.transports.direct(&cfg);
+        let stop = match plan {
+            Plan::Refuse(e) => return once.call(Err(e)),
+            Plan::Request(link) => Stop::Request(link),
+            Plan::Kill if cfg.daemon_override().is_some() => {
                 // A Daemon command means the user manages the binary, and such hosts often
                 // allow only `<cmd> connect` / `<cmd> --version` over ssh: send no script.
-                once.call(Err(HostError::new(
+                self.end_upgrade();
+                return once.call(Err(HostError::new(
                     crate::errors::HostErrorCode::Incompatible,
                     "this host runs xshelld through a Daemon command: replace that binary with a compatible xshelld and restart its Daemon on the host",
                 )));
             }
-        }
-    }
-
-    /// The SIGTERM pidfile script over the Host's transport, then reconnect.
-    fn kill_over_transport(&self, cfg: HostConfig, once: Arc<Once<Reply>>) {
-        let sh = self.sh.clone();
-        let o = once.clone();
-        let cancel = self.cancel_token();
-        let spawned = std::thread::Builder::new()
-            .name("host-upgrade".into())
-            .spawn(move || {
-                let t = sh.mc.transports.for_host(&cfg);
-                let r = crate::supervisor::kill_daemon(&*t, &cancel);
-                sh.kick.store(true, Ordering::SeqCst);
-                o.call(r.map(|_| Value::Null));
-            });
-        if spawned.is_err() {
-            once.call(Err(HostError::offline("cannot start the upgrade")));
-        }
-    }
-
-    /// A direct Host's own stop of its incompatible Daemon, then reconnect.
-    fn stop_direct(&self, d: Box<dyn crate::dial::Dialer>, once: Arc<Once<Reply>>) {
-        let sh = self.sh.clone();
-        let o = once.clone();
-        let cancel = self.cancel_token();
-        let spawned = std::thread::Builder::new()
-            .name("host-upgrade".into())
-            .spawn(move || {
-                let r = match d.stop_incompatible(&cancel) {
-                    Some(Ok(())) => Ok(Value::Null),
-                    Some(Err(e)) => Err(e),
-                    None => Err(HostError::new(
+            Plan::Kill => match &direct {
+                Some(d) if d.upgradable() => Stop::Direct,
+                Some(_) => {
+                    self.end_upgrade();
+                    return once.call(Err(HostError::new(
                         crate::errors::HostErrorCode::Incompatible,
-                        "this Daemon cannot be upgraded from here",
-                    )),
-                };
-                if r.is_err() {
+                        "this Daemon cannot be upgraded from here: restart it in a compatible version",
+                    )));
+                }
+                None => Stop::Script,
+            },
+        };
+        let sh = self.sh.clone();
+        let o = once.clone();
+        let cancel = self.cancel_token();
+        let spawned = std::thread::Builder::new()
+            .name("host-upgrade".into())
+            .spawn(move || {
+                if let Err(e) = prepare_switch(&sh, &cfg, direct.as_deref(), &cancel) {
                     let mut st = sh.lock();
                     st.upgrading = false;
                     st.upgrade_expect = false;
                     st.status.phase = None;
+                    st.status.last_error = Some(e.message.clone());
                     sh.publish(&mut st);
+                    drop(st);
+                    return o.call(Err(e));
                 }
-                sh.kick.store(true, Ordering::SeqCst);
-                o.call(r);
+                match stop {
+                    Stop::Request(link) => request_upgrade(&sh, &link, o),
+                    Stop::Script => {
+                        let t = sh.mc.transports.for_host(&cfg);
+                        let r = crate::supervisor::kill_daemon(&*t, &cancel);
+                        sh.kick.store(true, Ordering::SeqCst);
+                        o.call(r.map(|_| Value::Null));
+                    }
+                    Stop::Direct => {
+                        let stopped = direct.as_deref().and_then(|d| d.stop_incompatible(&cancel));
+                        let r = match stopped {
+                            Some(Ok(())) => Ok(Value::Null),
+                            Some(Err(e)) => Err(e),
+                            None => Err(HostError::new(
+                                crate::errors::HostErrorCode::Incompatible,
+                                "this Daemon cannot be upgraded from here",
+                            )),
+                        };
+                        if r.is_err() {
+                            let mut st = sh.lock();
+                            st.upgrading = false;
+                            st.upgrade_expect = false;
+                            st.status.phase = None;
+                            sh.publish(&mut st);
+                        }
+                        sh.kick.store(true, Ordering::SeqCst);
+                        o.call(r);
+                    }
+                }
             });
         if spawned.is_err() {
             self.end_upgrade();
@@ -1275,6 +1256,91 @@ impl HostHandle {
         if let Ok(_st) = self.sh.st.try_lock() {
             self.sh.cv.notify_all();
         }
+    }
+}
+
+/// How [`HostHandle::upgrade`] ends the old Daemon once the new build is selected.
+enum Stop {
+    /// `daemon.upgrade` over the usable link.
+    Request(Arc<Link>),
+    /// The pidfile SIGTERM script over the Host's transport.
+    Script,
+    /// The direct dialer's own stop.
+    Direct,
+}
+
+/// Install this Desktop's build where the Daemon runs, check it, and record it as the Host's
+/// `selected` build (#49, C1). A Daemon command override is the user's to manage: nothing.
+/// A direct dialer that cannot select (a GUI-bound Local Daemon) selects nothing either.
+fn prepare_switch(
+    sh: &Shared,
+    cfg: &HostConfig,
+    direct: Option<&dyn crate::dial::Dialer>,
+    cancel: &CancelToken,
+) -> Result<(), HostError> {
+    if cfg.daemon_override().is_some() {
+        return Ok(());
+    }
+    let mc = &sh.mc;
+    let dir = mc.install_dir();
+    if let Some(d) = direct {
+        return match d.select_build(&dir) {
+            None | Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(HostError::offline(e)),
+        };
+    }
+    let t = mc.transports.for_host(cfg);
+    let failed = |e: crate::install::InstallError| {
+        if e.cancelled {
+            HostError::offline("the upgrade was cancelled")
+        } else {
+            HostError::offline(e.message)
+        }
+    };
+    crate::install::ensure_installed(
+        &*t,
+        &*mc.binaries,
+        &mc.desktop_version,
+        mc.desktop_build.as_ref(),
+        mc.ours,
+        cancel,
+        &|| {},
+    )
+    .map_err(failed)?;
+    crate::install::select_remote(&*t, &dir, cancel).map_err(failed)
+}
+
+/// Send `daemon.upgrade`; once it is acknowledged the old Daemon must close the link within
+/// `upgrade_close_timeout` (the supervisor SIGTERMs it otherwise).
+fn request_upgrade(sh: &Arc<Shared>, link: &Arc<Link>, once: Arc<Once<Reply>>) {
+    let weak = Arc::downgrade(sh);
+    let o = once.clone();
+    let w: Waiter = Box::new(move |r| {
+        if let Some(sh) = weak.upgrade() {
+            let mut st = sh.lock();
+            match &r {
+                Ok(_) => {
+                    st.upgrade_deadline = Some(Instant::now() + sh.mc.upgrade_close_timeout);
+                }
+                Err(_) => {
+                    st.upgrading = false;
+                    st.upgrade_expect = false;
+                    st.status.phase = None;
+                    sh.publish(&mut st);
+                }
+            }
+            sh.cv.notify_all();
+        }
+        o.call(r);
+    });
+    if let Err(e) = link.request(ClientMsg::DaemonUpgrade, sh.mc.term_timeout, w) {
+        let mut st = sh.lock();
+        st.upgrading = false;
+        st.upgrade_expect = false;
+        st.status.phase = None;
+        sh.publish(&mut st);
+        drop(st);
+        once.call(Err(e));
     }
 }
 
@@ -1408,6 +1474,7 @@ pub(crate) mod tests {
             io,
             ProtocolRange { min: 1, max: 1 },
             "1.5.0",
+            None,
             sh.events(gen),
             Duration::from_secs(5),
             limits,

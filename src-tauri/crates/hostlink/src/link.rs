@@ -158,16 +158,26 @@ impl Link {
         ev: Arc<dyn LinkEvents>,
         hello_timeout: Duration,
     ) -> Result<(Arc<Link>, Hello, Option<String>), LinkError> {
-        Self::establish_with(io, ours, version, ev, hello_timeout, LinkLimits::default())
+        Self::establish_with(
+            io,
+            ours,
+            version,
+            None,
+            ev,
+            hello_timeout,
+            LinkLimits::default(),
+        )
     }
 
     /// Send our hello, find theirs (skipping shell noise), check the protocol ranges, and
     /// wait for the first message after it: `terminals` (delivered before this returns) or
-    /// an `error`, whose text becomes the failure.
+    /// an `error`, whose text becomes the failure. `build` is this Desktop's (#49), sent in
+    /// its hello.
     pub fn establish_with(
         io: LinkIo,
         ours: ProtocolRange,
         version: &str,
+        build: Option<xshell_protocol::build::BuildId>,
         ev: Arc<dyn LinkEvents>,
         hello_timeout: Duration,
         limits: LinkLimits,
@@ -193,7 +203,7 @@ impl Link {
             protocol: ours,
             version: version.into(),
             capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect(),
-            build: None,
+            build,
         });
         let frame = encode_msg(&hello, None).map_err(|e| LinkError::Failed(e.to_string()))?;
         link.enqueue(frame)
@@ -1066,7 +1076,8 @@ mod tests {
             queue_bytes: 3 * frame_len,
             max_pending: 2,
         };
-        let (link, _, _) = Link::establish_with(io, R11, "1.5.0", Rec::new(), T5, limits).unwrap();
+        let (link, _, _) =
+            Link::establish_with(io, R11, "1.5.0", None, Rec::new(), T5, limits).unwrap();
         // The writer took the hello and is blocked writing it: the queue is empty.
         erx.recv_timeout(T5).unwrap();
         let start = Instant::now();

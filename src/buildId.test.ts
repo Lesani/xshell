@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBuild, sameBuild, versionWithBuild, type BuildId } from "./buildId";
+import { buildText, formatBuild, sameBuild, versionWithBuild, type BuildId } from "./buildId";
 
 const clean: BuildId = { commit: "85ee920a1b2c", dirty: null, time: 1760000000 };
 const dirty: BuildId = { commit: "85ee920a1b2c", dirty: "3f9a01c2b4e5", time: 1760000000 };
@@ -22,5 +22,11 @@ describe("buildId", () => {
     expect(versionWithBuild("1.5.0", clean)).toBe("1.5.0 (85ee920a1b2c)");
     expect(versionWithBuild("1.5.0", dirty)).toBe("1.5.0 (85ee920a1b2c+d.3f9a01c2b4e5)");
     expect(versionWithBuild("1.5.0", null)).toBe("1.5.0 (unknown build)");
+  });
+
+  it("names an unknown build without another prefix", () => {
+    expect(buildText(dirty)).toBe("85ee920a1b2c+d.3f9a01c2b4e5");
+    expect(buildText(null)).toBe("unknown build");
+    expect(buildText(undefined)).toBe("unknown build");
   });
 });

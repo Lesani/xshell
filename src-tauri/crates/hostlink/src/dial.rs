@@ -74,6 +74,14 @@ pub trait Dialer: Send + Sync {
     ) -> Option<Result<(), crate::errors::HostError>> {
         None
     }
+
+    /// Before an upgrade or a replacement stops the Daemon this reaches (#49): install this
+    /// Desktop's build into install directory `dir`, check it, and record it as the machine's
+    /// `selected` build. `None`: this dialer does not manage the Daemon's binary, and nothing
+    /// is selected. `Some(Err)` ends the upgrade with that message before anything stops.
+    fn select_build(&self, _dir: &str) -> Option<Result<(), String>> {
+        None
+    }
 }
 
 /// What carries a link: the transport child, or a socket. Dropping it ends it too.

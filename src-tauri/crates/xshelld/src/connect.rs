@@ -143,9 +143,20 @@ mod unix {
         }
     }
 
+    /// The binary `serve` starts from: the build the Host's `selected` record names, when it
+    /// is a valid install and not of an older version than this one (#49); else this binary.
+    fn serve_binary(paths: &Paths) -> io::Result<std::path::PathBuf> {
+        match xshell_core::server::resolve_selected(&paths.server_root, env!("CARGO_PKG_VERSION")) {
+            Some(p) => Ok(p),
+            None => std::env::current_exe(),
+        }
+    }
+
     fn spawn_detached_serve(paths: &Paths, opts: &Opts) -> io::Result<Child> {
-        let log = crate::log::open_log(&paths.log)?;
-        let mut cmd = Command::new(std::env::current_exe()?);
+        let mut log = crate::log::open_log(&paths.log)?;
+        let exe = serve_binary(paths)?;
+        let _ = writeln!(log, "connect: starting {}", exe.display());
+        let mut cmd = Command::new(exe);
         cmd.arg("serve");
         if let Some(h) = &opts.home {
             cmd.arg("--home").arg(h);

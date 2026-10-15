@@ -28,6 +28,8 @@ pub struct Paths {
     pub mode: PathBuf,
     /// `home/.xshell/log/xshelld.log`.
     pub log: PathBuf,
+    /// `home/.xshell/server`: the installed builds and the `selected` record (#49).
+    pub server_root: PathBuf,
     /// `home/.xshell/daemon/ring`: this Host's Ring keys and Roster chain (0700).
     pub ring_dir: PathBuf,
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
@@ -96,6 +98,7 @@ fn with_home(home: &Path, socket: PathBuf, lock_dir: &Path, tmp: PathBuf) -> Pat
             .join("claude-hooks.json"),
         mode: home.join(".xshell").join("daemon").join("mode"),
         log: home.join(".xshell").join("log").join("xshelld.log"),
+        server_root: xshell_core::server::server_root(home),
         ring_dir: home.join(".xshell").join("daemon").join("ring"),
         tmp,
     }

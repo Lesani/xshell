@@ -9,7 +9,7 @@ export type TerminalHostState = null | "waiting" | "reconnecting" | "offline" | 
 // Terminal ever started in this mount.
 export function terminalHostState(status: HostStatus | undefined, live: TerminalInfo[] | null | undefined, started: boolean): TerminalHostState {
   const st = status?.status;
-  if (st === "connected" || st === "upgrade-pending") return null;
+  if (st === "connected" || st === "upgrade-pending" || st === "build-differs") return null;
   if (st === "incompatible") return "incompatible";
   if (st === "offline") return "offline";
   return live == null || !started ? "waiting" : "reconnecting";

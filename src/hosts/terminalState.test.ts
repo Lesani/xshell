@@ -8,6 +8,7 @@ describe("terminal Host state", () => {
   it("is null while usable, otherwise waiting/reconnecting/offline/incompatible", () => {
     expect(terminalHostState(st("connected"), [], true)).toBeNull();
     expect(terminalHostState(st("upgrade-pending"), [], true)).toBeNull();
+    expect(terminalHostState(st("build-differs"), [], true)).toBeNull();
     expect(terminalHostState(undefined, null, false)).toBe("waiting");
     expect(terminalHostState(st("reconnecting"), [], false)).toBe("waiting");
     expect(terminalHostState(st("reconnecting"), [], true)).toBe("reconnecting");

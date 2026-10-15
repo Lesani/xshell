@@ -1,3 +1,5 @@
+import { fmt } from "./hosts/strings";
+
 // Build identity (Lesani/xshell#49): which build of a version a Desktop or Daemon is. The Rust
 // side is `xshell_protocol::build::BuildId`; `null` means unknown (built without git, or a
 // Daemon from before #49).
@@ -20,9 +22,14 @@ export function sameBuild(a: BuildId | null | undefined, b: BuildId | null | und
   return !!a && !!b && a.commit === b.commit && (a.dirty ?? null) === (b.dirty ?? null);
 }
 
+// `85ee920a1b2c+d.3f9a01c2b4e5` as is, or `unknown build`.
+export function buildText(b: BuildId | null | undefined): string {
+  return b ? formatBuild(b) : fmt("hosts.build.unknown");
+}
+
 // `1.5.0 (85ee920a1b2c)`, `1.5.0 (85ee920a1b2c+d.3f9a01c2b4e5)`, or `1.5.0 (unknown build)`.
 export function versionWithBuild(version: string, b: BuildId | null): string {
-  return `${version} (${b ? formatBuild(b) : "unknown build"})`;
+  return `${version} (${buildText(b)})`;
 }
 
 // The `app_build` command.

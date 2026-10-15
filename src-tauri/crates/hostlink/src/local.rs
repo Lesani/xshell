@@ -2,7 +2,9 @@
 //! `xshelld serve --gui-bound` as its own child when none answers on this user's socket, and
 //! reaches it like any Daemon on this machine. With the Persistent Daemon setting on (#25) it
 //! starts `serve --interactive-env` instead: detached, from the copy installed under
-//! `~/.xshell/server/<version>`, so the Terminals outlive the Desktop.
+//! `~/.xshell/server/<version>+<build>` (or the build the machine's `selected` record names,
+//! #49), so the Terminals outlive the Desktop. Before starting either, the app's `xshelld`
+//! must report this Desktop's build.
 //!
 //! A Daemon that already runs for this user is used instead (ADR-0003) and never signalled by
 //! the Desktop, except by a switch or an upgrade the user confirmed.
@@ -16,7 +18,6 @@ use crate::cancel::CancelToken;
 use crate::dial::{connect_local, DialError, Dialed, Dialer, LocalStream, CONNECT_TIMEOUT};
 pub use crate::errors::SwitchError;
 use crate::handle::HostHandle;
-use crate::status::StatusKind;
 use std::ffi::OsString;
 use std::io;
 #[cfg(unix)]
@@ -28,6 +29,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+use xshell_protocol::build::{install_dir_name, BuildId};
 
 /// A started Daemon may need this long to listen: its login shell alone may take 5 s.
 pub const SPAWN_WAIT: Duration = Duration::from_secs(15);
@@ -124,8 +126,11 @@ pub struct LocalDaemonConfig {
     pub env: Vec<(OsString, OsString)>,
     pub home: PathBuf,
     pub socket: PathBuf,
-    /// The Desktop's version: a Persistent Daemon runs from `~/.xshell/server/<version>`.
+    /// The Desktop's version: a Persistent Daemon runs from `~/.xshell/server/<dir>`.
     pub version: String,
+    /// The Desktop's build (#49): `bin` must report it before any Daemon starts from it, and
+    /// it keys the Persistent Daemon's install directory. `None`: unknown, nothing checked.
+    pub build: Option<BuildId>,
 }
 
 /// The Daemon this Desktop starts for the Local Host, at most one at a time, in the mode the
@@ -143,6 +148,9 @@ pub struct LocalDaemon {
     /// Where a Persistent Daemon is installed (Unix only).
     #[cfg_attr(windows, allow(dead_code))]
     version: String,
+    build: Option<BuildId>,
+    /// The last `bin --version` check: the file it ran (path, length, mtime) and the result.
+    checked: Mutex<Option<(BinStamp, Result<(), String>)>>,
     /// The mode new Daemons start in: the setting.
     persistent: AtomicBool,
     keeper: Mutex<mpsc::Sender<(Command, SpawnReply)>>,
@@ -183,6 +191,8 @@ impl LocalDaemon {
             home: cfg.home,
             socket: cfg.socket,
             version: cfg.version,
+            build: cfg.build,
+            checked: Mutex::new(None),
             persistent: AtomicBool::new(false),
             keeper: Mutex::new(tx),
             child: Mutex::new(None),
@@ -218,8 +228,55 @@ impl LocalDaemon {
         read_local_mode(&local_mode_path(&self.home))
     }
 
+    /// The install directory of this Desktop's build under `~/.xshell/server`.
+    pub fn install_dir(&self) -> String {
+        install_dir_name(&self.version, self.build.as_ref())
+    }
+
+    /// The app's `xshelld` must be this Desktop's build (#49, R5): a stale development
+    /// sidecar or `XSHELL_DAEMON_BIN` is refused before anything starts from it. Runs
+    /// `bin --version`, cached while the file is unchanged. A Daemon that already runs is
+    /// never checked (ADR-0003).
+    pub fn check_bin(&self) -> io::Result<()> {
+        let Some(expected) = &self.build else {
+            return Ok(());
+        };
+        let id = BinStamp::of(&self.bin)?;
+        let mut cache = self.checked.lock().unwrap();
+        if let Some((seen, r)) = cache.as_ref() {
+            if *seen == id {
+                return r.clone().map_err(io::Error::other);
+            }
+        }
+        let r = match bin_build(&self.bin) {
+            Ok(found) if found.as_ref().is_some_and(|b| b.same(expected)) => Ok(()),
+            Ok(found) => Err(format!(
+                "the bundled xshelld at {} reports {}; this Desktop expects {}; rebuild it: cargo build -p xshelld",
+                self.bin.display(),
+                crate::install::build_text(found.as_ref()),
+                expected.display()
+            )),
+            // Not cached: it may work next time.
+            Err(e) => return Err(e),
+        };
+        *cache = Some((id, r.clone()));
+        r.map_err(io::Error::other)
+    }
+
+    /// Before an upgrade or a replacement stops the running Persistent Daemon (#49, C1):
+    /// check the app's `xshelld`, install it into its build's directory, and record that
+    /// directory as this machine's `selected` build.
+    #[cfg(unix)]
+    pub fn select_own(&self) -> io::Result<()> {
+        self.check_bin()?;
+        let dir = self.install_dir();
+        crate::install::install_local(&self.bin, &self.home, &dir)?;
+        xshell_core::server::write_selected(&self.home, &dir)
+    }
+
     /// The pid of our running child, starting one in the current mode if there is none.
-    /// Refused after [`LocalDaemon::hang_up`].
+    /// Refused after [`LocalDaemon::hang_up`], and when the app's `xshelld` is another build
+    /// ([`LocalDaemon::check_bin`]).
     pub fn ensure_spawned(&self) -> io::Result<u32> {
         let mut slot = self.child.lock().unwrap();
         if self.quitting.load(Ordering::SeqCst) {
@@ -230,9 +287,11 @@ impl LocalDaemon {
                 return Ok(s.child.id());
             }
         }
+        let checked = self.check_bin();
         let (kind, child) = if self.persistent() {
-            (Kind::Persistent, self.spawn_persistent()?)
+            (Kind::Persistent, self.spawn_persistent(checked)?)
         } else {
+            checked?;
             (Kind::GuiBound, self.spawn_gui_bound()?)
         };
         let pid = child.id();
@@ -273,19 +332,37 @@ impl LocalDaemon {
             .map_err(|_| io::Error::other("the keeper thread is gone"))?
     }
 
-    /// Install this Desktop's `xshelld` under `~/.xshell/server/<version>` and start it there
-    /// in a new session, its output to the Daemon log, as `xshelld connect` would.
+    /// Install this Desktop's `xshelld` under `~/.xshell/server/<dir>` and start, in a new
+    /// session with its output to the Daemon log, the build the machine's `selected` record
+    /// names (when valid and not older), else that copy: as `xshelld connect` would.
     #[cfg(windows)]
-    fn spawn_persistent(&self) -> io::Result<Child> {
+    fn spawn_persistent(&self, _checked: io::Result<()>) -> io::Result<Child> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "a Persistent Daemon is not available on Windows",
         ))
     }
 
+    ///
+    /// `checked`: whether the app's `xshelld` is this build ([`LocalDaemon::check_bin`]). When
+    /// it is not, this build's installed copy still serves (a rollback to Persistent), and a
+    /// stale sidecar is never copied.
     #[cfg(unix)]
-    fn spawn_persistent(&self) -> io::Result<Child> {
-        let exe = crate::install::install_local(&self.bin, &self.home, &self.version)?;
+    fn spawn_persistent(&self, checked: io::Result<()>) -> io::Result<Child> {
+        let own = match checked {
+            Ok(()) => crate::install::install_local(&self.bin, &self.home, &self.install_dir())?,
+            Err(e) => xshell_core::server::valid_install(
+                &xshell_core::server::server_root(&self.home),
+                &self.install_dir(),
+            )
+            .filter(|_| self.build.is_some())
+            .ok_or(e)?,
+        };
+        let exe = xshell_core::server::resolve_selected(
+            &xshell_core::server::server_root(&self.home),
+            &self.version,
+        )
+        .unwrap_or(own);
         let log = open_log(&self.log)?;
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
@@ -535,6 +612,12 @@ impl LocalDaemon {
             self.set_persistent(prev);
             return Err(SwitchError::OtherApp);
         }
+        // The Daemon that will run must be startable before anything stops (#49): this
+        // build's `xshelld`, installed for Persistent.
+        if let Err(e) = self.preflight(persistent) {
+            self.set_persistent(prev);
+            return Err(SwitchError::Failed(e.to_string()));
+        }
         let gen = if usable(host) {
             host.link_generation()
         } else {
@@ -597,6 +680,19 @@ impl LocalDaemon {
             self.undo_off(host, gen);
         }
         Err(err)
+    }
+
+    /// Whether a Daemon of the target mode can start from this app: its `xshelld` is this
+    /// build, and for Persistent it is installed in its build's directory.
+    fn preflight(&self, persistent: bool) -> io::Result<()> {
+        self.check_bin()?;
+        #[cfg(unix)]
+        if persistent {
+            crate::install::install_local(&self.bin, &self.home, &self.install_dir())?;
+        }
+        #[cfg(windows)]
+        let _ = persistent;
+        Ok(())
     }
 
     /// Wait until a link newer than `gen` is usable, the marker says the target mode and (for
@@ -672,10 +768,7 @@ impl LocalDaemon {
 }
 
 fn usable(host: &HostHandle) -> bool {
-    matches!(
-        host.status().status,
-        StatusKind::Connected | StatusKind::UpgradePending
-    )
+    host.status().usable()
 }
 
 /// The live Terminal list allows the restart the user confirmed: a usable connection's
@@ -946,6 +1039,80 @@ fn start_time(pid: i32) -> Option<(u64, u64)> {
     (n == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
+/// A file's identity for the `--version` cache: path, length and modification time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinStamp(PathBuf, u64, Option<std::time::SystemTime>);
+
+impl BinStamp {
+    fn of(p: &Path) -> io::Result<BinStamp> {
+        let m = std::fs::metadata(p)?;
+        Ok(BinStamp(p.to_path_buf(), m.len(), m.modified().ok()))
+    }
+}
+
+/// Spawn `cmd`; a file just written may still be open for writing in a fork elsewhere
+/// (ETXTBSY), so that is retried briefly.
+#[cfg(unix)]
+fn spawn_retrying(cmd: &mut Command) -> io::Result<Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_retrying(cmd: &mut Command) -> io::Result<Child> {
+    cmd.spawn()
+}
+
+/// How long `xshelld --version` may take.
+const VERSION_WAIT: Duration = Duration::from_secs(10);
+
+/// The build `bin --version` reports (`None`: unknown, or not an xshelld's answer).
+fn bin_build(bin: &Path) -> io::Result<Option<BuildId>> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // `CREATE_NO_WINDOW`.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let mut child = spawn_retrying(&mut cmd)?;
+    let mut out = child.stdout.take().expect("piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = io::Read::read_to_string(&mut out, &mut s);
+        s
+    });
+    let deadline = Instant::now() + VERSION_WAIT;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{} --version did not answer", bin.display()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = reader.join().unwrap_or_default();
+    Ok(text
+        .lines()
+        .find_map(crate::install::parse_version_json)
+        .and_then(|d| d.build))
+}
+
 /// The Local Host's [`Dialer`]: the user's Daemon socket, starting [`LocalDaemon`] only when
 /// nothing listens there (the socket is missing or refuses).
 pub struct LocalDialer {
@@ -1023,6 +1190,18 @@ impl Dialer for LocalDialer {
         self.daemon.persistent()
     }
 
+    /// The Persistent Daemon's binary is this Desktop's to select (#49).
+    #[cfg(unix)]
+    fn select_build(&self, dir: &str) -> Option<Result<(), String>> {
+        if !self.daemon.persistent() {
+            return None;
+        }
+        if dir != self.daemon.install_dir() {
+            return Some(Err(format!("unexpected install directory {dir:?}")));
+        }
+        Some(self.daemon.select_own().map_err(|e| e.to_string()))
+    }
+
     fn stop_incompatible(&self, _cancel: &CancelToken) -> Option<Result<(), crate::HostError>> {
         self.daemon.persistent().then(|| {
             self.daemon.stop_verified(STOP_WAIT).map_err(|e| match e {
@@ -1096,6 +1275,7 @@ mod tests {
                 home,
                 socket: dir.join("s.sock"),
                 version: "1.5.0".into(),
+                build: None,
             })
             .unwrap(),
         )
@@ -1517,6 +1697,7 @@ while True:\n    conns.append(s.accept()[0])\n";
                         home,
                         socket,
                         version: "1.5.0".into(),
+                        build: None,
                     })
                     .unwrap(),
                 ),
@@ -1563,5 +1744,189 @@ while True:\n    conns.append(s.accept()[0])\n";
         assert!(matches!(r, Err(DialError::Cancelled)), "{:?}", r.err());
         assert!(starts(dir.path()).is_empty());
         drop(l);
+    }
+
+    fn build(commit: &str) -> BuildId {
+        BuildId {
+            commit: commit.into(),
+            dirty: None,
+            time: 1,
+        }
+    }
+
+    /// A fake `xshelld` of `build` (`--version` answers with it); any other call logs its
+    /// arguments to `log`, then runs `body`.
+    fn fake_build_bin(path: &Path, build: Option<&BuildId>, log: &Path, body: &str) {
+        let json = build.map_or("null".to_string(), |b| serde_json::to_string(b).unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{{\"name\":\"xshelld\",\"version\":\"1.5.0\",\"protocol\":{{\"min\":1,\"max\":1}},\"build\":{json}}}'; exit 0; fi\necho \"$@\" >> '{}'\n{body}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn daemon_of(dir: &Path, bin: PathBuf, build: Option<BuildId>) -> Arc<LocalDaemon> {
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        Arc::new(
+            LocalDaemon::new(LocalDaemonConfig {
+                bin,
+                env: vec![],
+                home,
+                socket: dir.join("s.sock"),
+                version: "1.5.0".into(),
+                build,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The app's `xshelld` (or `XSHELL_DAEMON_BIN`) of another build starts nothing, in
+    /// either mode, and says how to rebuild it.
+    #[test]
+    fn stale_sidecar_starts_nothing() {
+        for persistent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("xshelld");
+            let log = dir.path().join("starts");
+            fake_build_bin(&bin, Some(&build("000000000000")), &log, "exec sleep 30");
+            let d = daemon_of(dir.path(), bin.clone(), Some(build("85ee920a1b2c")));
+            d.set_persistent(persistent);
+            let e = d.ensure_spawned().unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "the bundled xshelld at {} reports 000000000000; this Desktop expects 85ee920a1b2c; rebuild it: cargo build -p xshelld",
+                    bin.display()
+                )
+            );
+            assert!(!log.exists(), "something started");
+            assert!(!dir.path().join("home/.xshell/server").exists());
+            // A rebuilt binary is checked again (the cache follows the file).
+            std::thread::sleep(Duration::from_millis(20));
+            fake_build_bin(&bin, Some(&build("85ee920a1b2c")), &log, "exec sleep 30");
+            let pid = d.ensure_spawned().unwrap();
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            // An unknown own build checks nothing.
+            let d = daemon_of(dir.path(), bin.clone(), None);
+            fake_build_bin(&bin, None, &log, "exec sleep 30");
+            let pid = d.ensure_spawned().unwrap();
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    /// A Persistent Daemon installs this build into its own directory, and starts the build
+    /// the machine's `selected` record names.
+    #[test]
+    fn spawn_persistent_starts_the_selected_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = build("85ee920a1b2c");
+        let bin = dir.path().join("xshelld");
+        let log = dir.path().join("starts");
+        fake_build_bin(&bin, Some(&ours), &log, "exec sleep 30");
+        let d = daemon_of(dir.path(), bin, Some(ours));
+        d.set_persistent(true);
+        let home = dir.path().join("home");
+        // Another build of this version, selected by another Desktop's replace.
+        let other_log = dir.path().join("other-starts");
+        fake_build_bin(
+            &home.join(".xshell/server/1.5.0+000000000000/xshelld"),
+            Some(&build("000000000000")),
+            &other_log,
+            "exec sleep 30",
+        );
+        for p in [
+            home.join(".xshell"),
+            home.join(".xshell/server"),
+            home.join(".xshell/server/1.5.0+000000000000"),
+        ] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        xshell_core::server::write_selected(&home, "1.5.0+000000000000").unwrap();
+        let pid = d.ensure_spawned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !other_log.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the selected build did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        assert!(!dir.path().join("starts").exists());
+        // This build was installed into its own directory all the same.
+        assert!(home
+            .join(".xshell/server/1.5.0+85ee920a1b2c/xshelld")
+            .is_file());
+        // Replace (C1): select this build, which the next start uses.
+        let dialer = LocalDialer { daemon: d.clone() };
+        assert_eq!(dialer.select_build("1.5.0+85ee920a1b2c"), Some(Ok(())));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".xshell/server/selected")).unwrap(),
+            "1.5.0+85ee920a1b2c\n"
+        );
+        let pid = d.ensure_spawned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log.exists() {
+            assert!(Instant::now() < deadline, "this build did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // GUI-bound: nothing to select.
+        d.set_persistent(false);
+        assert_eq!(dialer.select_build("1.5.0+85ee920a1b2c"), None);
+    }
+
+    /// Back to Persistent (a rollback) with a stale sidecar: this build's installed copy
+    /// still starts, and the stale bytes are never copied. Without that copy: refused.
+    #[test]
+    fn persistent_start_uses_the_installed_build_when_the_sidecar_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = build("85ee920a1b2c");
+        let bin = dir.path().join("xshelld");
+        let log = dir.path().join("starts");
+        fake_build_bin(&bin, Some(&build("000000000000")), &log, "exec sleep 30");
+        let d = daemon_of(dir.path(), bin.clone(), Some(ours.clone()));
+        d.set_persistent(true);
+        assert!(d
+            .ensure_spawned()
+            .unwrap_err()
+            .to_string()
+            .contains("rebuild it"));
+        let home = dir.path().join("home");
+        let installed = home.join(".xshell/server/1.5.0+85ee920a1b2c/xshelld");
+        let installed_log = dir.path().join("installed-starts");
+        fake_build_bin(&installed, Some(&ours), &installed_log, "exec sleep 30");
+        for p in [
+            home.join(".xshell"),
+            home.join(".xshell/server"),
+            home.join(".xshell/server/1.5.0+85ee920a1b2c"),
+        ] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let before = std::fs::read(&installed).unwrap();
+        let pid = d.ensure_spawned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !installed_log.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the installed build did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        assert_eq!(std::fs::read(&installed).unwrap(), before);
+        assert!(!log.exists());
+        while d.take_exit().is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // GUI-bound starts from the sidecar only: still refused.
+        d.set_persistent(false);
+        assert!(d.ensure_spawned().is_err());
     }
 }

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::Notify;
-use xshell_hostlink::{BinarySource, CancelToken, ChainSource, DirSource};
+use xshell_hostlink::{BinarySource, CancelToken, ChainSource, DirSource, Fetched, Origin, Wanted};
+use xshell_protocol::build::{install_dir_name, scan_stamp};
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 
@@ -74,7 +75,9 @@ async fn cancellable<F: Future>(f: F, cancel: Arc<Notify>) -> Option<F::Output> 
 }
 
 /// Downloads the release asset and its required `.sha256` sidecar, caching verified
-/// binaries under `cache_dir/xshelld/<version>/`.
+/// binaries under `cache_dir/xshelld/<source>/<version>+<build>/` (the release source's
+/// digest, then the install directory name). The URL names the plain version; the build the
+/// binary carries is the release's (its stamp), checked by the installer.
 pub struct HttpReleaseSource {
     pub cache_dir: PathBuf,
     pub base: String,
@@ -92,11 +95,21 @@ impl HttpReleaseSource {
         }
     }
 
-    fn cached(&self, version: &str, triple: &str) -> PathBuf {
+    /// Keyed by the release source, the version, the expected build and the target (R5).
+    fn cached(&self, want: &Wanted) -> PathBuf {
         self.cache_dir
             .join("xshelld")
-            .join(version)
-            .join(format!("xshelld-{triple}"))
+            .join(&sha256_hex(self.base.as_bytes())[..12])
+            .join(install_dir_name(&want.version, want.build.as_ref()))
+            .join(format!("xshelld-{}", want.triple))
+    }
+
+    /// Whether `bytes` carry the build `want` expects (anything, when it expects none).
+    fn stamp_matches(bytes: &[u8], want: &Wanted) -> bool {
+        match &want.build {
+            None => true,
+            Some(b) => scan_stamp(bytes).ok().flatten().is_some_and(|f| f.same(b)),
+        }
     }
 
     async fn download(&self, version: &str, triple: &str) -> Result<Vec<u8>, String> {
@@ -141,14 +154,19 @@ impl HttpReleaseSource {
         Ok(bytes)
     }
 
-    /// The cached binary, only if it matches the digest stored next to it. Anything else
-    /// (missing digest, mismatch) is deleted, so the caller downloads again.
-    fn read_cached(&self, path: &Path) -> Option<Vec<u8>> {
+    /// The cached binary, only if it matches the digest stored next to it and carries the
+    /// expected build. Anything else (missing digest, mismatch) is deleted, so the caller
+    /// downloads again.
+    fn read_cached(&self, path: &Path, want: &Wanted) -> Option<Vec<u8>> {
         let digest = digest_path(path);
         let bytes = std::fs::read(path).ok();
         let sidecar = std::fs::read_to_string(&digest).ok();
         match (bytes, sidecar) {
-            (Some(b), Some(d)) if verify_sha256(&b, &d).is_ok() => Some(b),
+            (Some(b), Some(d))
+                if verify_sha256(&b, &d).is_ok() && Self::stamp_matches(&b, want) =>
+            {
+                Some(b)
+            }
             (None, None) => None,
             _ => {
                 let _ = std::fs::remove_file(path);
@@ -173,19 +191,26 @@ impl HttpReleaseSource {
 }
 
 impl BinarySource for HttpReleaseSource {
-    fn fetch(&self, triple: &str, version: &str, cancel: &CancelToken) -> Result<Vec<u8>, String> {
-        let path = self.cached(version, triple);
-        if let Some(b) = self.read_cached(&path) {
-            return Ok(b);
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String> {
+        let origin = Origin::Release(asset_url(&self.base, &want.version, &want.triple));
+        let path = self.cached(want);
+        if let Some(bytes) = self.read_cached(&path, want) {
+            return Ok(Fetched { bytes, origin });
         }
         let stop = Arc::new(Notify::new());
         let s = stop.clone();
         let _hook = cancel.on_cancel(move || s.notify_one());
         // The supervisor thread is not a runtime worker, so blocking here is allowed.
-        let r = tauri::async_runtime::block_on(cancellable(self.download(version, triple), stop))
-            .unwrap_or_else(|| Err("cancelled".into()))?;
-        self.store(&path, &r);
-        Ok(r)
+        let bytes = tauri::async_runtime::block_on(cancellable(
+            self.download(&want.version, &want.triple),
+            stop,
+        ))
+        .unwrap_or_else(|| Err("cancelled".into()))?;
+        // Another build than expected is never cached; the installer refuses it.
+        if Self::stamp_matches(&bytes, want) {
+            self.store(&path, &bytes);
+        }
+        Ok(Fetched { bytes, origin })
     }
 }
 
@@ -236,27 +261,37 @@ pub fn own_triple() -> Option<&'static str> {
 }
 
 impl CargoArtifactSource {
-    fn candidates(&self, triple: &str) -> Vec<PathBuf> {
-        let mut v = vec![self.0.join(triple).join("release-daemon").join("xshelld")];
+    /// Each path with the `--target` it was built with (`None`: a plain build).
+    fn candidates(&self, triple: &str) -> Vec<(PathBuf, Option<String>)> {
+        let mut v = vec![(
+            self.0.join(triple).join("release-daemon").join("xshelld"),
+            Some(triple.to_string()),
+        )];
         if own_triple() == Some(triple) {
-            v.push(self.0.join("release-daemon").join("xshelld"));
+            v.push((self.0.join("release-daemon").join("xshelld"), None));
         }
         v
     }
 }
 
 impl BinarySource for CargoArtifactSource {
-    fn fetch(&self, triple: &str, _v: &str, _c: &CancelToken) -> Result<Vec<u8>, String> {
-        let c = self.candidates(triple);
-        for p in &c {
-            if let Ok(b) = std::fs::read(p) {
-                return Ok(b);
+    fn fetch(&self, want: &Wanted, _c: &CancelToken) -> Result<Fetched, String> {
+        let c = self.candidates(&want.triple);
+        for (p, target) in &c {
+            if let Ok(bytes) = std::fs::read(p) {
+                return Ok(Fetched {
+                    bytes,
+                    origin: Origin::DevBuild {
+                        path: p.clone(),
+                        target: target.clone(),
+                    },
+                });
             }
         }
         Err(format!(
             "no dev build at {}",
             c.iter()
-                .map(|p| p.display().to_string())
+                .map(|(p, _)| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(" or ")
         ))
@@ -283,6 +318,7 @@ pub fn production_source(exe_dir: Option<PathBuf>, cache_dir: PathBuf) -> ChainS
 mod tests {
     use super::*;
     use std::time::Instant;
+    use xshell_protocol::build::BuildId;
 
     #[test]
     fn release_asset_urls() {
@@ -325,9 +361,17 @@ mod tests {
         std::fs::write(cross.join("xshelld"), b"CROSS").unwrap();
         let s = CargoArtifactSource(t.path().into());
         let c = CancelToken::new();
-        assert_eq!(s.fetch(triple, "1", &c).unwrap(), b"CROSS");
+        let got = s.fetch(&want(triple, "1"), &c).unwrap();
+        assert_eq!(got.bytes, b"CROSS");
+        assert_eq!(
+            got.origin,
+            Origin::DevBuild {
+                path: cross.join("xshelld"),
+                target: Some(triple.into())
+            }
+        );
         assert!(
-            s.fetch("x86_64-apple-darwin", "1", &c).is_err()
+            s.fetch(&want("x86_64-apple-darwin", "1"), &c).is_err()
                 || own_triple() == Some("x86_64-apple-darwin")
         );
         // A plain build serves only this machine's own triple.
@@ -335,13 +379,21 @@ mod tests {
         std::fs::create_dir_all(&native).unwrap();
         std::fs::write(native.join("xshelld"), b"NATIVE").unwrap();
         if let Some(own) = own_triple().filter(|o| *o != triple) {
-            assert_eq!(s.fetch(own, "1", &c).unwrap(), b"NATIVE");
+            let got = s.fetch(&want(own, "1"), &c).unwrap();
+            assert_eq!(got.bytes, b"NATIVE");
+            assert_eq!(
+                got.origin,
+                Origin::DevBuild {
+                    path: native.join("xshelld"),
+                    target: None
+                }
+            );
         }
         let other = ["x86_64-unknown-linux-musl", "x86_64-apple-darwin"]
             .into_iter()
             .find(|t| Some(*t) != own_triple())
             .unwrap();
-        assert!(s.fetch(other, "1", &c).is_err());
+        assert!(s.fetch(&want(other, "1"), &c).is_err());
     }
 
     #[test]
@@ -351,10 +403,16 @@ mod tests {
         s.base = "http://127.0.0.1:9".into(); // nothing listens on discard
         let triple = "x86_64-unknown-linux-musl";
         let c = CancelToken::new();
-        let p = s.cached("1.5.0", triple);
+        let w = want(triple, "1.5.0");
+        let p = s.cached(&w);
         // A verified download is served from the cache.
         s.store(&p, b"CACHED");
-        assert_eq!(s.fetch(triple, "1.5.0", &c).unwrap(), b"CACHED");
+        let got = s.fetch(&w, &c).unwrap();
+        assert_eq!(got.bytes, b"CACHED");
+        assert_eq!(
+            got.origin,
+            Origin::Release(asset_url(&s.base, "1.5.0", triple))
+        );
         let leftovers: Vec<_> = std::fs::read_dir(p.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -363,11 +421,123 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
         // Tampered bytes, or bytes without a digest, are deleted and fetched again.
         std::fs::write(&p, b"EVIL").unwrap();
-        assert!(s.fetch(triple, "1.5.0", &c).is_err());
+        assert!(s.fetch(&w, &c).is_err());
         assert!(!p.exists() && !digest_path(&p).exists());
         std::fs::write(&p, b"NO DIGEST").unwrap();
-        assert!(s.fetch(triple, "1.5.0", &c).is_err());
+        assert!(s.fetch(&w, &c).is_err());
         assert!(!p.exists());
+    }
+
+    fn want(triple: &str, version: &str) -> Wanted {
+        Wanted {
+            triple: triple.into(),
+            version: version.into(),
+            build: None,
+        }
+    }
+
+    fn build(commit: &str) -> BuildId {
+        BuildId {
+            commit: commit.into(),
+            dirty: None,
+            time: 1,
+        }
+    }
+
+    /// The cache is keyed by (release source, version, build, triple), and a cached binary
+    /// must carry the expected build.
+    #[test]
+    fn cache_key_and_stamp() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = HttpReleaseSource::new(t.path().into());
+        s.base = "http://127.0.0.1:9".into();
+        let ours = build("85ee920a1b2c");
+        let w = Wanted {
+            build: Some(ours.clone()),
+            ..want("x86_64-unknown-linux-musl", "1.5.0")
+        };
+        let p = s.cached(&w);
+        let src = sha256_hex(b"http://127.0.0.1:9")[..12].to_string();
+        assert_eq!(
+            p,
+            t.path()
+                .join("xshelld")
+                .join(&src)
+                .join("1.5.0+85ee920a1b2c")
+                .join("xshelld-x86_64-unknown-linux-musl")
+        );
+        // Every part of the key changes the path.
+        let other = |w2: Wanted| assert_ne!(s.cached(&w2), p);
+        other(Wanted {
+            build: None,
+            ..w.clone()
+        });
+        other(Wanted {
+            build: Some(build("000000000000")),
+            ..w.clone()
+        });
+        other(Wanted {
+            version: "1.5.1".into(),
+            ..w.clone()
+        });
+        other(Wanted {
+            triple: "aarch64-unknown-linux-musl".into(),
+            ..w.clone()
+        });
+        let mut s2 = HttpReleaseSource::new(t.path().into());
+        s2.base = "http://127.0.0.1:10".into();
+        assert_ne!(s2.cached(&w), p);
+        // A verified file of another build is not served (and is dropped).
+        let stamped = |b: &BuildId| {
+            format!("x @@XSHELL-BUILD-V1:{}:{}@@ y", b.display(), b.time).into_bytes()
+        };
+        s.store(&p, &stamped(&build("000000000000")));
+        assert!(s.read_cached(&p, &w).is_none());
+        assert!(!p.exists());
+        s.store(&p, &stamped(&ours));
+        assert_eq!(
+            s.fetch(&w, &CancelToken::new()).unwrap().bytes,
+            stamped(&ours)
+        );
+    }
+
+    /// A stale workspace build is refused with the rebuild command, never replaced by a
+    /// download (the chain does not fall through on the build).
+    #[cfg(unix)]
+    #[test]
+    fn stale_dev_build_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let native = t.path().join("release-daemon");
+        std::fs::create_dir_all(&native).unwrap();
+        let Some(own) = own_triple() else { return };
+        std::fs::write(
+            native.join("xshelld"),
+            b"@@XSHELL-BUILD-V1:000000000000:1@@",
+        )
+        .unwrap();
+        let w = Wanted {
+            build: Some(build("85ee920a1b2c")),
+            ..want(own, "1.5.0")
+        };
+        let f = CargoArtifactSource(t.path().into())
+            .fetch(&w, &CancelToken::new())
+            .unwrap();
+        let e = xshell_hostlink::install::check_fetched(&f, &w).unwrap_err();
+        assert_eq!(
+            e,
+            format!(
+                "the bundled xshelld at {} reports 000000000000; this Desktop expects 85ee920a1b2c; rebuild it: cargo build -p xshelld --profile release-daemon",
+                native.join("xshelld").display()
+            )
+        );
+        let r = Fetched {
+            bytes: f.bytes,
+            origin: Origin::Release("u".into()),
+        };
+        assert_eq!(
+            xshell_hostlink::install::check_fetched(&r, &w).unwrap_err(),
+            "the v1.5.0 release’s xshelld reports 000000000000; this Desktop expects 85ee920a1b2c"
+        );
     }
 
     #[test]
@@ -380,7 +550,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let triple = if i % 2 == 0 { "a-triple" } else { "b-triple" };
                     let bytes = vec![i % 2; 256 * 1024];
-                    let p = s.cached("1.5.0", triple);
+                    let p = s.cached(&want(triple, "1.5.0"));
                     for _ in 0..10 {
                         s.store(&p, &bytes);
                     }
@@ -391,7 +561,8 @@ mod tests {
             j.join().unwrap();
         }
         for (triple, byte) in [("a-triple", 0u8), ("b-triple", 1u8)] {
-            let b = s.read_cached(&s.cached("1.5.0", triple)).expect("verified");
+            let w = want(triple, "1.5.0");
+            let b = s.read_cached(&s.cached(&w), &w).expect("verified");
             assert!(b.len() == 256 * 1024 && b.iter().all(|x| *x == byte));
         }
     }
@@ -427,7 +598,7 @@ mod tests {
         });
         let start = Instant::now();
         let e = s
-            .fetch("x86_64-unknown-linux-musl", "1.5.0", &cancel)
+            .fetch(&want("x86_64-unknown-linux-musl", "1.5.0"), &cancel)
             .unwrap_err();
         assert_eq!(e, "cancelled");
         assert!(start.elapsed() < Duration::from_secs(3));

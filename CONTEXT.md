@@ -21,7 +21,7 @@ The **Host** the **Desktop** runs on, served by that **Desktop**'s **GUI-bound D
 Any **Host** other than the **Local Host**, reached through its **Daemon**.
 
 **Host Status**:
-A **Desktop**'s view of whether it can reach a **Host**: connected, reconnecting, offline, upgrade pending, xshell closed (its **Daemon** said goodbye to the **Relay** on a clean exit), unreachable (the **Relay** connection dropped without a goodbye), or needs update.
+A **Desktop**'s view of whether it can reach a **Host**: connected, reconnecting, offline, upgrade pending, build differs (the **Daemon** runs this version from another build, or from an unknown one; usable, and the user may replace it with this **Desktop**'s build), xshell closed (its **Daemon** said goodbye to the **Relay** on a clean exit), unreachable (the **Relay** connection dropped without a goodbye), or needs update.
 
 **Daemon**:
 The headless `xshelld` process that serves one **Host**'s **Terminals** to any number of **Desktops**.

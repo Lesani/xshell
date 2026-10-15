@@ -81,6 +81,7 @@ fn helper_gui_parent() {
                 home: env("XSHELLD_HOME").into(),
                 socket: env("XSHELLD_SOCKET").into(),
                 version: "1.5.0".into(),
+                build: None,
             })
             .unwrap();
             let pid = d.ensure_spawned().unwrap();
@@ -985,6 +986,7 @@ fn local_dialer_spawns_gui_bound_and_second_desktop_sees_terminal() {
             home: h.home(),
             socket: h.pipe.clone(),
             version: "1.5.0".into(),
+            build: None,
         })
         .unwrap(),
     );

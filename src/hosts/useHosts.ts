@@ -41,6 +41,7 @@ export function statusLabel(s: HostStatus | undefined): string {
     "reconnecting": fmt("hosts.status.reconnecting"),
     "offline": fmt("hosts.status.offline"),
     "upgrade-pending": fmt("hosts.status.upgradePending"),
+    "build-differs": fmt("hosts.status.buildDiffers"),
     "incompatible": fmt("hosts.status.incompatible"),
   }[s.status];
   return base;

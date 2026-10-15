@@ -1,14 +1,20 @@
 //! Managed install: probe the Host (`uname` and the installed `xshelld --version`), and when
-//! the Desktop's version is missing, upload the matching binary over the same transport. The
+//! the Desktop's build is missing, upload the matching binary over the same transport. The
 //! Host needs no internet. Probes are marker-based, so login-shell noise cannot confuse them.
+//!
+//! Each build has its own directory, `~/.xshell/server/<version>+<build>` (plain `<version>`
+//! when the Desktop's build is unknown; `xshell_protocol::build::install_dir_name`). Every
+//! binary is checked against the build this Desktop expects: its embedded stamp before the
+//! upload, its `--version` after it.
 
 use crate::cancel::CancelToken;
 use crate::errors::{classify_ssh_failure, HostErrorHint};
 use crate::process::{run_script, ProcError};
-use crate::transport::{sh_wrap, Transport};
+use crate::transport::{sh_quote, sh_wrap, Transport};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
+use xshell_protocol::build::{install_dir_name, scan_stamp, BuildId};
 use xshell_protocol::msg::ProtocolRange;
 use xshell_protocol::negotiate::negotiate;
 
@@ -20,6 +26,9 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct DaemonVersion {
     pub version: String,
     pub protocol: ProtocolRange,
+    /// The `build` key of `--version` (#49); `None` when null, missing (older Daemons) or
+    /// malformed.
+    pub build: Option<BuildId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,15 +81,22 @@ pub fn valid_version(v: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
 }
 
-fn server_dir(version: &str) -> String {
-    format!("\"$HOME/.xshell/server/{version}\"")
+/// How a build shows in messages: its display form, or `unknown build`.
+pub fn build_text(b: Option<&BuildId>) -> String {
+    b.map_or_else(|| "unknown build".into(), BuildId::display)
 }
 
-/// `uname -sm`, the marker, then the installed binary's `--version` line (if any).
-pub fn probe_script(version: &str) -> String {
+/// `dir` is an install directory name ([`valid_version`] checked by the callers).
+fn server_dir(dir: &str) -> String {
+    format!("\"$HOME/.xshell/server/{dir}\"")
+}
+
+/// `uname -sm`, the marker, then the `--version` line (if any) of the binary installed in
+/// directory `dir`.
+pub fn probe_script(dir: &str) -> String {
     format!(
         "uname -sm; echo {MARKER}; f={}/xshelld; [ -x \"$f\" ] && \"$f\" --version 2>/dev/null; exit 0",
-        server_dir(version)
+        server_dir(dir)
     )
 }
 
@@ -145,13 +161,29 @@ pub fn probe_override(
     })
 }
 
-/// Write stdin to a temp file and move it into place, then print its `--version`.
-pub fn upload_script(version: &str) -> String {
+/// Write stdin to a temp file and move it into directory `dir`, then print its `--version`.
+pub fn upload_script(dir: &str) -> String {
     format!(
         "set -e; umask 077; d={}; mkdir -p \"$d\"; t=\"$d/.xshelld.$$.tmp\"; \
          trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod 700 \"$t\"; mv -f \"$t\" \"$d/xshelld\"; \
          \"$d/xshelld\" --version",
-        server_dir(version)
+        server_dir(dir)
+    )
+}
+
+/// The refusal when the build to select is not installed.
+pub const BUILD_NOT_INSTALLED: &str = "this Desktop’s xshelld is not installed on the host";
+
+/// Record directory `dir` as the Host's `selected` build (`xshell_core::server`): a temp
+/// file renamed over `~/.xshell/server/selected`, only if `dir` holds an executable
+/// `xshelld`. `dir` passed [`valid_version`]; it is quoted anyway.
+pub fn select_script(dir: &str) -> String {
+    let q = sh_quote(dir);
+    format!(
+        "set -e; umask 077; r=\"$HOME/.xshell/server\"; d=\"$r/\"{q}; \
+         [ -x \"$d/xshelld\" ] || {{ echo \"{BUILD_NOT_INSTALLED}\" >&2; exit 1; }}; \
+         t=\"$r/.selected.$$.tmp\"; trap 'rm -f \"$t\"' EXIT; printf '%s\\n' {q} > \"$t\"; \
+         mv -f \"$t\" \"$r/selected\""
     )
 }
 
@@ -175,6 +207,7 @@ pub fn parse_version_json(line: &str) -> Option<DaemonVersion> {
     Some(DaemonVersion {
         version: v["version"].as_str()?.to_string(),
         protocol: serde_json::from_value(v["protocol"].clone()).ok()?,
+        build: serde_json::from_value(v["build"].clone()).ok().flatten(),
     })
 }
 
@@ -220,25 +253,70 @@ pub fn os_name(uname_s: &str) -> Option<&'static str> {
     }
 }
 
-pub fn needs_upload(p: &Probe, desktop_version: &str, ours: ProtocolRange) -> bool {
+/// Whether the binary in the probed directory must be (re)uploaded: missing, another
+/// version, no common protocol, or (when this Desktop's build is known) another build.
+pub fn needs_upload(
+    p: &Probe,
+    desktop_version: &str,
+    build: Option<&BuildId>,
+    ours: ProtocolRange,
+) -> bool {
     match &p.installed {
         None => true,
-        Some(d) => d.version != desktop_version || negotiate(ours, d.protocol).is_err(),
+        Some(d) => {
+            d.version != desktop_version
+                || negotiate(ours, d.protocol).is_err()
+                || build.is_some_and(|b| !crate::version::same_build(d.build.as_ref(), b))
+        }
     }
 }
 
+/// What a [`BinarySource`] is asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    pub triple: String,
+    pub version: String,
+    /// The build this Desktop expects; `None` when its own is unknown (no check then).
+    pub build: Option<BuildId>,
+}
+
+/// Where a fetched binary came from, for the message when its build is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// Shipped with (or copied next to) the Desktop, or a test file.
+    Bundled(PathBuf),
+    /// A daemon built in this workspace (debug Desktops); `target` when cross-built.
+    DevBuild {
+        path: PathBuf,
+        target: Option<String>,
+    },
+    /// A release download (its URL).
+    Release(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub bytes: Vec<u8>,
+    pub origin: Origin,
+}
+
 pub trait BinarySource: Send + Sync {
-    /// The `xshelld` binary for `triple` at `version`. Long fetches watch `cancel`.
-    fn fetch(&self, triple: &str, version: &str, cancel: &CancelToken) -> Result<Vec<u8>, String>;
+    /// The `xshelld` binary for `want`. Long fetches watch `cancel`. The build is checked by
+    /// the caller ([`ensure_installed`]), so a source never falls through on it.
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String>;
 }
 
 /// `<dir>/xshelld-<triple>`: binaries shipped next to the Desktop executable.
 pub struct DirSource(pub PathBuf);
 
 impl BinarySource for DirSource {
-    fn fetch(&self, triple: &str, _v: &str, _c: &CancelToken) -> Result<Vec<u8>, String> {
-        let p = self.0.join(format!("xshelld-{triple}"));
-        std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))
+    fn fetch(&self, want: &Wanted, _c: &CancelToken) -> Result<Fetched, String> {
+        let p = self.0.join(format!("xshelld-{}", want.triple));
+        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        Ok(Fetched {
+            bytes,
+            origin: Origin::Bundled(p),
+        })
     }
 }
 
@@ -246,8 +324,12 @@ impl BinarySource for DirSource {
 pub struct FileSource(pub PathBuf);
 
 impl BinarySource for FileSource {
-    fn fetch(&self, _t: &str, _v: &str, _c: &CancelToken) -> Result<Vec<u8>, String> {
-        std::fs::read(&self.0).map_err(|e| format!("{}: {e}", self.0.display()))
+    fn fetch(&self, _w: &Wanted, _c: &CancelToken) -> Result<Fetched, String> {
+        let bytes = std::fs::read(&self.0).map_err(|e| format!("{}: {e}", self.0.display()))?;
+        Ok(Fetched {
+            bytes,
+            origin: Origin::Bundled(self.0.clone()),
+        })
     }
 }
 
@@ -255,13 +337,13 @@ impl BinarySource for FileSource {
 pub struct ChainSource(pub Vec<Box<dyn BinarySource>>);
 
 impl BinarySource for ChainSource {
-    fn fetch(&self, triple: &str, version: &str, cancel: &CancelToken) -> Result<Vec<u8>, String> {
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String> {
         let mut errs = Vec::new();
         for s in &self.0 {
             if cancel.is_cancelled() {
                 return Err("cancelled".into());
             }
-            match s.fetch(triple, version, cancel) {
+            match s.fetch(want, cancel) {
                 Ok(b) => return Ok(b),
                 Err(e) => errs.push(e),
             }
@@ -315,23 +397,77 @@ pub fn run_probe(
     }
 }
 
-/// Make sure `~/.xshell/server/<version>/xshelld` is this Desktop's build. `on_upload` runs
-/// just before an upload starts (the status moves to "installing").
+/// The refusal for a binary whose stamp names another build than `expected`.
+pub fn stamp_mismatch(
+    origin: &Origin,
+    triple: &str,
+    version: &str,
+    found: &str,
+    expected: &str,
+) -> String {
+    match origin {
+        Origin::Release(_) => format!(
+            "the v{version} release’s xshelld reports {found}; this Desktop expects {expected}"
+        ),
+        Origin::Bundled(path) => stale_bundled(path, found, expected, Some(triple)),
+        Origin::DevBuild { path, target } => {
+            stale_bundled(path, found, expected, target.as_deref())
+        }
+    }
+}
+
+fn stale_bundled(
+    path: &std::path::Path,
+    found: &str,
+    expected: &str,
+    target: Option<&str>,
+) -> String {
+    let target_arg = target.map(|t| format!(" --target {t}")).unwrap_or_default();
+    format!(
+        "the bundled xshelld at {} reports {found}; this Desktop expects {expected}; rebuild it: cargo build -p xshelld --profile release-daemon{target_arg}",
+        path.display()
+    )
+}
+
+/// Check the build stamped into `f` against `want.build` (when known), without running it:
+/// it may be for another platform.
+pub fn check_fetched(f: &Fetched, want: &Wanted) -> Result<(), String> {
+    let Some(expected) = &want.build else {
+        return Ok(());
+    };
+    let found = scan_stamp(&f.bytes).ok().flatten();
+    if found.as_ref().is_some_and(|b| b.same(expected)) {
+        return Ok(());
+    }
+    Err(stamp_mismatch(
+        &f.origin,
+        &want.triple,
+        &want.version,
+        &build_text(found.as_ref()),
+        &expected.display(),
+    ))
+}
+
+/// Make sure `~/.xshell/server/<dir>/xshelld` is this Desktop's build, where `<dir>` is
+/// `install_dir_name(version, build)`. `on_upload` runs just before an upload starts (the
+/// status moves to "installing"). Never touches the `selected` record.
 pub fn ensure_installed(
     t: &dyn Transport,
     src: &dyn BinarySource,
     version: &str,
+    build: Option<&BuildId>,
     ours: ProtocolRange,
     cancel: &CancelToken,
     on_upload: &dyn Fn(),
 ) -> Result<Installed, InstallError> {
-    if !valid_version(version) {
+    let dir = install_dir_name(version, build);
+    if !valid_version(&dir) {
         return Err(InstallError::new(
             None,
-            format!("invalid version string {version:?}"),
+            format!("invalid version string {dir:?}"),
         ));
     }
-    let p = run_probe(t, &probe_script(version), cancel)?;
+    let p = run_probe(t, &probe_script(&dir), cancel)?;
     let triple = target_triple(&p.os, &p.arch)
         .map_err(|e| InstallError::new(Some(HostErrorHint::UnsupportedPlatform), e))?;
     let mut done = Installed {
@@ -340,10 +476,15 @@ pub fn ensure_installed(
         triple: triple.to_string(),
         uploaded: false,
     };
-    if !needs_upload(&p, version, ours) {
+    if !needs_upload(&p, version, build, ours) {
         return Ok(done);
     }
-    let bin = src.fetch(triple, version, cancel).map_err(|e| {
+    let want = Wanted {
+        triple: triple.to_string(),
+        version: version.to_string(),
+        build: build.cloned(),
+    };
+    let fetched = src.fetch(&want, cancel).map_err(|e| {
         if cancel.is_cancelled() {
             InstallError::cancelled()
         } else {
@@ -353,28 +494,40 @@ pub fn ensure_installed(
             )
         }
     })?;
+    check_fetched(&fetched, &want)
+        .map_err(|e| InstallError::new(Some(HostErrorHint::BinaryUnavailable), e))?;
     if cancel.is_cancelled() {
         return Err(InstallError::cancelled());
     }
     on_upload();
     let out = run_script(
         t,
-        &sh_wrap(&upload_script(version)),
-        Some(bin),
+        &sh_wrap(&upload_script(&dir)),
+        Some(fetched.bytes),
         UPLOAD_TIMEOUT,
         cancel,
     )
     .map_err(|e| proc_failure(e, "the upload"))?;
     let reported = out.stdout.lines().rev().find_map(parse_version_json);
     match reported {
-        Some(d) if d.version == version => {
-            done.uploaded = true;
-            Ok(done)
-        }
-        Some(d) => Err(InstallError::new(
+        Some(d) if d.version != version => Err(InstallError::new(
             None,
             format!("installed xshelld reports version {}", d.version),
         )),
+        Some(d) if build.is_some_and(|b| !crate::version::same_build(d.build.as_ref(), b)) => {
+            Err(InstallError::new(
+                None,
+                format!(
+                    "installed xshelld reports {}; expected {}",
+                    build_text(d.build.as_ref()),
+                    build_text(build)
+                ),
+            ))
+        }
+        Some(_) => {
+            done.uploaded = true;
+            Ok(done)
+        }
         None => Err(InstallError::new(
             classify_ssh_failure(&out.stderr, None, out.code),
             if out.stderr.is_empty() {
@@ -386,17 +539,50 @@ pub fn ensure_installed(
     }
 }
 
-/// `home/.xshell/server/<version>/xshelld`: where a Daemon that outlives the app runs from,
-/// the same place managed install puts it on a Remote Host.
-pub fn local_server_bin(home: &std::path::Path, version: &str) -> PathBuf {
-    home.join(".xshell")
-        .join("server")
-        .join(version)
+/// Record directory `dir` as the Host's `selected` build over the transport ([`select_script`]).
+pub fn select_remote(
+    t: &dyn Transport,
+    dir: &str,
+    cancel: &CancelToken,
+) -> Result<(), InstallError> {
+    if !valid_version(dir) {
+        return Err(InstallError::new(
+            None,
+            format!("invalid version string {dir:?}"),
+        ));
+    }
+    let out = run_script(
+        t,
+        &sh_wrap(&select_script(dir)),
+        None,
+        PROBE_TIMEOUT,
+        cancel,
+    )
+    .map_err(|e| proc_failure(e, "selecting the build"))?;
+    if out.code == Some(0) {
+        return Ok(());
+    }
+    let stderr = out.stderr.trim();
+    Err(InstallError::new(
+        classify_ssh_failure(&out.stderr, None, out.code),
+        if stderr.is_empty() {
+            format!("selecting the build failed (exit {:?})", out.code)
+        } else {
+            stderr.to_string()
+        },
+    ))
+}
+
+/// `home/.xshell/server/<dir>/xshelld`: where a Daemon that outlives the app runs from, the
+/// same place managed install puts it on a Remote Host. `dir` is an install directory name.
+pub fn local_server_bin(home: &std::path::Path, dir: &str) -> PathBuf {
+    xshell_core::server::server_root(home)
+        .join(dir)
         .join("xshelld")
 }
 
 /// Copy the app's `xshelld` (`src`) to [`local_server_bin`] unless an identical private copy
-/// is already there. A Persistent Daemon must not run from inside the app: an AppImage's
+/// is already there. Never touches the `selected` record. A Persistent Daemon must not run from inside the app: an AppImage's
 /// mount ends with the app, and agent hooks call the Daemon's own path.
 ///
 /// Every directory on the way is created 0700 and must be a real directory owned by this
@@ -407,20 +593,20 @@ pub fn local_server_bin(home: &std::path::Path, version: &str) -> PathBuf {
 pub fn install_local(
     src: &std::path::Path,
     home: &std::path::Path,
-    version: &str,
+    dir_name: &str,
 ) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-    if !valid_version(version) {
+    if !valid_version(dir_name) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("invalid version string {version:?}"),
+            format!("invalid version string {dir_name:?}"),
         ));
     }
-    let dest = local_server_bin(home, version);
+    let dest = local_server_bin(home, dir_name);
     let uid = unsafe { libc::getuid() };
     let mut dir = home.to_path_buf();
-    for part in [".xshell", "server", version] {
+    for part in [".xshell", "server", dir_name] {
         dir.push(part);
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
@@ -495,33 +681,57 @@ pub(crate) mod testutil {
     pub struct Counting<S>(pub S, pub Arc<AtomicUsize>);
 
     impl<S: BinarySource> BinarySource for Counting<S> {
-        fn fetch(&self, t: &str, v: &str, c: &CancelToken) -> Result<Vec<u8>, String> {
+        fn fetch(&self, w: &Wanted, c: &CancelToken) -> Result<Fetched, String> {
             self.1.fetch_add(1, Ordering::SeqCst);
-            self.0.fetch(t, v, c)
+            self.0.fetch(w, c)
         }
     }
 
     pub struct Fails(pub &'static str);
 
     impl BinarySource for Fails {
-        fn fetch(&self, _: &str, _: &str, _: &CancelToken) -> Result<Vec<u8>, String> {
+        fn fetch(&self, _: &Wanted, _: &CancelToken) -> Result<Fetched, String> {
             Err(self.0.into())
         }
     }
 
     /// A fake `xshelld` that only answers `--version`.
     pub fn fake_daemon(version: &str) -> Vec<u8> {
+        fake_daemon_build(version, None)
+    }
+
+    /// A fake `xshelld` of `build` that answers `--version` with it and carries its stamp
+    /// (in a comment), as a real binary does.
+    pub fn fake_daemon_build(version: &str, build: Option<&BuildId>) -> Vec<u8> {
+        let (json, stamp) = match build {
+            Some(b) => (
+                format!(",\"build\":{}", serde_json::to_string(b).unwrap()),
+                format!("# @@XSHELL-BUILD-V1:{}:{}@@\n", b.display(), b.time),
+            ),
+            None => (String::new(), String::new()),
+        };
         format!(
-            "#!/bin/sh\n[ \"$1\" = --version ] && echo '{{\"name\":\"xshelld\",\"version\":\"{version}\",\"protocol\":{{\"min\":1,\"max\":1}}}}'\n"
+            "#!/bin/sh\n{stamp}[ \"$1\" = --version ] && echo '{{\"name\":\"xshelld\",\"version\":\"{version}\",\"protocol\":{{\"min\":1,\"max\":1}}{json}}}'\n"
         )
         .into_bytes()
+    }
+
+    pub fn build(commit: &str) -> BuildId {
+        BuildId {
+            commit: commit.into(),
+            dirty: None,
+            time: 1_760_000_000,
+        }
     }
 
     pub struct Bytes(pub Vec<u8>);
 
     impl BinarySource for Bytes {
-        fn fetch(&self, _: &str, _: &str, _: &CancelToken) -> Result<Vec<u8>, String> {
-            Ok(self.0.clone())
+        fn fetch(&self, _: &Wanted, _: &CancelToken) -> Result<Fetched, String> {
+            Ok(Fetched {
+                bytes: self.0.clone(),
+                origin: Origin::Bundled("test-bytes".into()),
+            })
         }
     }
 }
@@ -546,9 +756,24 @@ mod tests {
             p.installed,
             Some(DaemonVersion {
                 version: "1.5.0".into(),
-                protocol: R11
+                protocol: R11,
+                build: None,
             })
         );
+        // The trailing `build` key of a #49 Daemon.
+        let with = r#"{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"os":"Linux","arch":"x86_64","build":{"commit":"85ee920a1b2c","dirty":null,"time":5}}"#;
+        assert_eq!(
+            parse_version_json(with).unwrap().build,
+            Some(BuildId {
+                time: 5,
+                ..build("85ee920a1b2c")
+            })
+        );
+        let null =
+            r#"{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"build":null}"#;
+        assert_eq!(parse_version_json(null).unwrap().build, None);
+        let junk = r#"{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"build":7}"#;
+        assert_eq!(parse_version_json(junk).unwrap().build, None);
     }
 
     #[test]
@@ -592,14 +817,107 @@ mod tests {
             installed: Some(DaemonVersion {
                 version: v.into(),
                 protocol: ProtocolRange { min, max },
+                build: None,
             }),
         };
-        assert!(!needs_upload(&p("1.5.0", 1, 1), "1.5.0", R11));
-        assert!(needs_upload(&p("1.4.0", 1, 1), "1.5.0", R11));
-        assert!(needs_upload(&p("1.5.0", 2, 2), "1.5.0", R11));
+        assert!(!needs_upload(&p("1.5.0", 1, 1), "1.5.0", None, R11));
+        assert!(needs_upload(&p("1.4.0", 1, 1), "1.5.0", None, R11));
+        assert!(needs_upload(&p("1.5.0", 2, 2), "1.5.0", None, R11));
         let mut none = p("1.5.0", 1, 1);
         none.installed = None;
-        assert!(needs_upload(&none, "1.5.0", R11));
+        assert!(needs_upload(&none, "1.5.0", None, R11));
+        // With this Desktop's build known, the installed build must be it.
+        let ours = build("85ee920a1b2c");
+        let with = |b: Option<BuildId>| {
+            let mut x = p("1.5.0", 1, 1);
+            x.installed.as_mut().unwrap().build = b;
+            x
+        };
+        assert!(!needs_upload(
+            &with(Some(BuildId {
+                time: 9,
+                ..ours.clone()
+            })),
+            "1.5.0",
+            Some(&ours),
+            R11
+        ));
+        assert!(needs_upload(
+            &with(Some(build("000000000000"))),
+            "1.5.0",
+            Some(&ours),
+            R11
+        ));
+        assert!(needs_upload(&with(None), "1.5.0", Some(&ours), R11));
+        // An unknown own build checks nothing more.
+        assert!(!needs_upload(
+            &with(Some(build("000000000000"))),
+            "1.5.0",
+            None,
+            R11
+        ));
+    }
+
+    #[test]
+    fn scripts_use_the_build_directory() {
+        let dir = install_dir_name("1.5.0", Some(&build("85ee920a1b2c")));
+        assert_eq!(dir, "1.5.0+85ee920a1b2c");
+        assert!(probe_script(&dir).contains("\"$HOME/.xshell/server/1.5.0+85ee920a1b2c\"/xshelld"));
+        assert!(upload_script(&dir).contains("d=\"$HOME/.xshell/server/1.5.0+85ee920a1b2c\";"));
+        assert!(select_script(&dir).contains("d=\"$r/\"'1.5.0+85ee920a1b2c'"));
+    }
+
+    #[test]
+    fn stamp_check_messages() {
+        let ours = build("85ee920a1b2c");
+        let want = Wanted {
+            triple: "aarch64-unknown-linux-musl".into(),
+            version: "1.5.0".into(),
+            build: Some(ours.clone()),
+        };
+        let other = build("000000000000");
+        let f = |origin, b: Option<&BuildId>| Fetched {
+            bytes: fake_daemon_build("1.5.0", b),
+            origin,
+        };
+        // The expected build passes; no expectation passes anything.
+        check_fetched(&f(Origin::Release("u".into()), Some(&ours)), &want).unwrap();
+        let unknown = Wanted {
+            build: None,
+            ..want.clone()
+        };
+        check_fetched(&f(Origin::Release("u".into()), None), &unknown).unwrap();
+        assert_eq!(
+            check_fetched(&f(Origin::Release("u".into()), Some(&other)), &want).unwrap_err(),
+            "the v1.5.0 release’s xshelld reports 000000000000; this Desktop expects 85ee920a1b2c"
+        );
+        // A binary from before #49 has no stamp: unknown build.
+        assert_eq!(
+            check_fetched(
+                &f(
+                    Origin::DevBuild {
+                        path: "/t/release-daemon/xshelld".into(),
+                        target: None
+                    },
+                    None
+                ),
+                &want
+            )
+            .unwrap_err(),
+            "the bundled xshelld at /t/release-daemon/xshelld reports unknown build; this Desktop expects 85ee920a1b2c; rebuild it: cargo build -p xshelld --profile release-daemon"
+        );
+        let e = check_fetched(
+            &f(
+                Origin::DevBuild {
+                    path: "/t/x/release-daemon/xshelld".into(),
+                    target: Some("aarch64-unknown-linux-musl".into()),
+                },
+                Some(&other),
+            ),
+            &want,
+        )
+        .unwrap_err();
+        assert!(e.ends_with("rebuild it: cargo build -p xshelld --profile release-daemon --target aarch64-unknown-linux-musl"), "{e}");
     }
 
     #[test]
@@ -766,8 +1084,16 @@ mod tests {
         {
             let home = tempfile::tempdir().unwrap();
             let t = local(home.path(), None);
-            let e = ensure_installed(&t, &Fails("404"), "1.5.0", R11, &CancelToken::new(), &|| {})
-                .unwrap_err();
+            let e = ensure_installed(
+                &t,
+                &Fails("404"),
+                "1.5.0",
+                None,
+                R11,
+                &CancelToken::new(),
+                &|| {},
+            )
+            .unwrap_err();
             assert_eq!(e.hint, Some(HostErrorHint::BinaryUnavailable));
             assert!(e.message.contains("404"), "{}", e.message);
         }
@@ -784,12 +1110,22 @@ mod tests {
             Box::new(DirSource(b.path().into())),
         ]);
         let c = CancelToken::new();
+        let w = |triple: &str| Wanted {
+            triple: triple.into(),
+            version: "1".into(),
+            build: None,
+        };
+        let got = chain.fetch(&w("x86_64-unknown-linux-musl"), &c).unwrap();
+        assert_eq!(got.bytes, b"B");
         assert_eq!(
-            chain.fetch("x86_64-unknown-linux-musl", "1", &c).unwrap(),
-            b"B"
+            got.origin,
+            Origin::Bundled(b.path().join("xshelld-x86_64-unknown-linux-musl"))
         );
-        assert_eq!(chain.fetch("aarch64-apple-darwin", "1", &c).unwrap(), b"A");
-        let e = chain.fetch("x86_64-apple-darwin", "1", &c).unwrap_err();
+        assert_eq!(
+            chain.fetch(&w("aarch64-apple-darwin"), &c).unwrap().bytes,
+            b"A"
+        );
+        let e = chain.fetch(&w("x86_64-apple-darwin"), &c).unwrap_err();
         assert_eq!(e.matches("xshelld-x86_64-apple-darwin").count(), 2, "{e}");
         assert!(e.contains("; "), "{e}");
     }
@@ -824,7 +1160,7 @@ mod tests {
             uploads.fetch_add(1, Ordering::SeqCst);
         };
         let c = CancelToken::new();
-        let i = ensure_installed(&t, &src, "1.5.0", R11, &c, &on_upload).unwrap();
+        let i = ensure_installed(&t, &src, "1.5.0", None, R11, &c, &on_upload).unwrap();
         assert!(i.uploaded);
         assert_eq!(uploads.load(Ordering::SeqCst), 1);
         let dir = home.path().join(".xshell/server/1.5.0");
@@ -837,7 +1173,7 @@ mod tests {
             .filter(|n| n.starts_with(".xshelld."))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        let again = ensure_installed(&t, &src, "1.5.0", R11, &c, &on_upload).unwrap();
+        let again = ensure_installed(&t, &src, "1.5.0", None, R11, &c, &on_upload).unwrap();
         assert!(!again.uploaded);
         assert_eq!(n.load(Ordering::SeqCst), 1);
         assert_eq!(uploads.load(Ordering::SeqCst), 1);
@@ -852,6 +1188,7 @@ mod tests {
             &t,
             &Bytes(fake_daemon("9.9.9")),
             "1.5.0",
+            None,
             R11,
             &CancelToken::new(),
             &|| {},
@@ -875,6 +1212,7 @@ mod tests {
             &t,
             &Bytes(fake_daemon("1.5.0")),
             "1.5.0",
+            None,
             R11,
             &CancelToken::new(),
             &|| {},
@@ -900,5 +1238,148 @@ mod tests {
         let e = run_probe(&Broken, "true", &CancelToken::new()).unwrap_err();
         assert_eq!(e.hint, Some(HostErrorHint::PermissionDenied));
         assert!(e.message.contains("Permission denied"), "{}", e.message);
+    }
+
+    /// With its build known, the Desktop installs into `<version>+<build>`, and only once.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_installed_keyed_by_build() {
+        let home = tempfile::tempdir().unwrap();
+        let t = local(home.path(), None);
+        let ours = build("85ee920a1b2c");
+        let n = Arc::new(AtomicUsize::new(0));
+        let src = Counting(Bytes(fake_daemon_build("1.5.0", Some(&ours))), n.clone());
+        // A plain-version install of another build is left alone.
+        let plain = home.path().join(".xshell/server/1.5.0");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("xshelld"), "old").unwrap();
+        let c = CancelToken::new();
+        let i = ensure_installed(&t, &src, "1.5.0", Some(&ours), R11, &c, &|| {}).unwrap();
+        assert!(i.uploaded);
+        assert!(home
+            .path()
+            .join(".xshell/server/1.5.0+85ee920a1b2c/xshelld")
+            .is_file());
+        assert_eq!(std::fs::read(plain.join("xshelld")).unwrap(), b"old");
+        assert!(!home.path().join(".xshell/server/selected").exists());
+        let again = ensure_installed(&t, &src, "1.5.0", Some(&ours), R11, &c, &|| {}).unwrap();
+        assert!(!again.uploaded);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    /// A binary whose stamp names another build is never uploaded.
+    #[cfg(unix)]
+    #[test]
+    fn stale_binary_is_not_uploaded() {
+        let home = tempfile::tempdir().unwrap();
+        let t = local(home.path(), None);
+        let ours = build("85ee920a1b2c");
+        let uploads = AtomicUsize::new(0);
+        let e = ensure_installed(
+            &t,
+            &Bytes(fake_daemon_build("1.5.0", Some(&build("000000000000")))),
+            "1.5.0",
+            Some(&ours),
+            R11,
+            &CancelToken::new(),
+            &|| {
+                uploads.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.hint, Some(HostErrorHint::BinaryUnavailable));
+        assert!(
+            e.message
+                .contains("reports 000000000000; this Desktop expects 85ee920a1b2c; rebuild it"),
+            "{}",
+            e.message
+        );
+        assert_eq!(uploads.load(Ordering::SeqCst), 0);
+        assert!(!home
+            .path()
+            .join(".xshell/server/1.5.0+85ee920a1b2c")
+            .exists());
+    }
+
+    /// The stamp may match while `--version` reports another build: refused after upload.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_wrong_reported_build() {
+        let home = tempfile::tempdir().unwrap();
+        let t = local(home.path(), None);
+        let ours = build("85ee920a1b2c");
+        let mut bytes = fake_daemon_build("1.5.0", Some(&build("000000000000")));
+        bytes.extend(format!("# @@XSHELL-BUILD-V1:{}:1@@\n", ours.display()).into_bytes());
+        // Two disagreeing stamps are no stamp at all.
+        let e = ensure_installed(
+            &t,
+            &Bytes(bytes),
+            "1.5.0",
+            Some(&ours),
+            R11,
+            &CancelToken::new(),
+            &|| {},
+        )
+        .unwrap_err();
+        assert!(e.message.contains("unknown build"), "{}", e.message);
+        // A matching stamp but another reported build.
+        let script = format!(
+            "#!/bin/sh\n# @@XSHELL-BUILD-V1:{}:1@@\necho '{{\"name\":\"xshelld\",\"version\":\"1.5.0\",\"protocol\":{{\"min\":1,\"max\":1}},\"build\":null}}'\n",
+            ours.display()
+        );
+        let e = ensure_installed(
+            &t,
+            &Bytes(script.into_bytes()),
+            "1.5.0",
+            Some(&ours),
+            R11,
+            &CancelToken::new(),
+            &|| {},
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.message,
+            "installed xshelld reports unknown build; expected 85ee920a1b2c"
+        );
+    }
+
+    /// The select script writes the record only for an installed build, atomically.
+    #[cfg(unix)]
+    #[test]
+    fn select_script_against_temp_home() {
+        let home = tempfile::tempdir().unwrap();
+        let t = local(home.path(), None);
+        let c = CancelToken::new();
+        let e = select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap_err();
+        assert_eq!(e.message, BUILD_NOT_INSTALLED);
+        let ours = build("85ee920a1b2c");
+        ensure_installed(
+            &t,
+            &Bytes(fake_daemon_build("1.5.0", Some(&ours))),
+            "1.5.0",
+            Some(&ours),
+            R11,
+            &c,
+            &|| {},
+        )
+        .unwrap();
+        select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap();
+        let root = home.path().join(".xshell/server");
+        assert_eq!(
+            std::fs::read_to_string(root.join("selected")).unwrap(),
+            "1.5.0+85ee920a1b2c\n"
+        );
+        // What xshelld reads back.
+        assert_eq!(
+            xshell_core::server::resolve_selected(&root, "1.5.0"),
+            Some(root.join("1.5.0+85ee920a1b2c/xshelld"))
+        );
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(select_remote(&t, "1;rm", &c).is_err());
     }
 }

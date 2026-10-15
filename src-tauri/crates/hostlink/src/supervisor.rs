@@ -6,7 +6,7 @@ use crate::dial::{CommandDialer, Connection, DialError, Dialer};
 use crate::errors::HostError;
 use crate::errors::HostErrorHint;
 use crate::handle::Shared;
-use crate::install::{ensure_installed, kill_daemon_script, os_name};
+use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name};
 use crate::link::{Link, LinkError};
 use crate::process::run_script;
 use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind};
@@ -15,6 +15,7 @@ use crate::version::{self, classify, Classified};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use xshell_protocol::build::BuildId;
 
 const FIRST_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const OFFLINE_AFTER: u32 = 3;
@@ -46,7 +47,8 @@ pub(crate) fn kill_daemon(t: &dyn Transport, cancel: &CancelToken) -> Result<(),
 struct Failure {
     message: String,
     hint: Option<HostErrorHint>,
-    incompatible: Option<(IncompatibleReason, String)>,
+    /// The reason, the Daemon's version and its build.
+    incompatible: Option<(IncompatibleReason, String, Option<BuildId>)>,
     /// The installed binary looks missing: probe again next time.
     reinstall: bool,
 }
@@ -101,7 +103,7 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let dialer = direct.unwrap_or_else(|| {
         Box::new(CommandDialer {
             transport: transport.clone(),
-            remote_cmd: connect_command(override_, &sh.mc.desktop_version),
+            remote_cmd: connect_command(override_, &sh.mc.install_dir()),
         })
     });
     let mut s = Sup {
@@ -230,11 +232,12 @@ impl Sup {
         let mut delay = self.backoff.failed(self.unit());
         let mut st = self.sh.lock();
         match f.incompatible {
-            Some((reason, version)) => {
+            Some((reason, version, build)) => {
                 delay = backoff(u32::MAX, self.unit());
                 st.status.set_kind(StatusKind::Incompatible);
                 st.status.incompatible_reason = Some(reason);
                 st.status.daemon_version = Some(version);
+                st.status.daemon_build = build;
             }
             None => {
                 st.status
@@ -342,6 +345,7 @@ impl Sup {
                 &*self.transport,
                 &*mc.binaries,
                 &version,
+                mc.desktop_build.as_ref(),
                 mc.ours,
                 &self.cancel,
                 &on_upload,
@@ -385,6 +389,7 @@ impl Sup {
             dialed.io,
             mc.ours,
             &version,
+            mc.desktop_build.clone(),
             self.sh.events(gen),
             mc.hello_timeout,
             mc.link_limits,
@@ -402,21 +407,24 @@ impl Sup {
             );
         }
         let upgradable = self.upgradable();
-        let (negotiated, upgrade_pending) = match classify(&version, mc.ours, &hello, upgradable) {
-            Classified::Compatible {
-                negotiated,
-                upgrade_pending,
-            } => (negotiated, upgrade_pending),
-            Classified::Incompatible { reason, message } => {
-                link.close();
-                return Attempt::Failed(Failure {
-                    message,
-                    hint: None,
-                    incompatible: Some((reason_json(reason), hello.version)),
-                    reinstall: false,
-                });
-            }
-        };
+        let ours_build = mc.desktop_build.as_ref();
+        let (negotiated, upgrade_pending, build_differs) =
+            match classify(&version, ours_build, mc.ours, &hello, upgradable) {
+                Classified::Compatible {
+                    negotiated,
+                    upgrade_pending,
+                    build_differs,
+                } => (negotiated, upgrade_pending, build_differs),
+                Classified::Incompatible { reason, message } => {
+                    link.close();
+                    return Attempt::Failed(Failure {
+                        message,
+                        hint: None,
+                        incompatible: Some((reason_json(reason), hello.version, hello.build)),
+                        reinstall: false,
+                    });
+                }
+            };
         if !self.sh.wait_first_list(gen, FIRST_LIST_TIMEOUT) {
             link.close();
             if self.cancel.is_cancelled() {
@@ -430,22 +438,39 @@ impl Sup {
             });
         }
         let adopted = self.sh.adopt(gen, &link, |st| {
-            let mismatch = upgradable && st.upgrade_expect && hello.version != version;
-            st.status.set_kind(if upgrade_pending || mismatch {
+            // After an upgrade or a replacement (R7, C4): the Daemon must be this Desktop's
+            // version and build. Another Desktop's connector may have won the restart.
+            let expect = upgradable && st.upgrade_expect;
+            let ver_mismatch = expect && hello.version != version;
+            let build_mismatch = expect
+                && ours_build.is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
+            st.status.set_kind(if upgrade_pending || ver_mismatch {
                 StatusKind::UpgradePending
+            } else if build_differs || build_mismatch {
+                StatusKind::BuildDiffers
             } else {
                 StatusKind::Connected
             });
             st.status.phase = None;
             st.status.daemon_version = Some(hello.version.clone());
+            st.status.daemon_build = hello.build.clone();
             st.status.protocol = Some(negotiated);
             st.status.daemon_capabilities = hello.capabilities.clone();
-            st.status.last_error = mismatch.then(|| {
-                format!(
+            st.status.last_error = if ver_mismatch {
+                Some(format!(
                     "xshelld {} is still running after the upgrade to {version}",
                     hello.version
-                )
-            });
+                ))
+            } else if build_mismatch {
+                Some(format!(
+                    "xshelld {} ({}) is still running after replacement; expected {version} ({}). Try Replace again. If this repeats, quit other xshell apps using this host.",
+                    hello.version,
+                    build_text(hello.build.as_ref()),
+                    build_text(ours_build)
+                ))
+            } else {
+                None
+            };
             st.status.error_hint = None;
             st.status.incompatible_reason = None;
             st.status.next_retry_at = None;
@@ -485,6 +510,7 @@ impl Sup {
             LinkError::Incompatible { hello, message } => {
                 let reason = match version::classify(
                     &self.sh.mc.desktop_version,
+                    self.sh.mc.desktop_build.as_ref(),
                     self.sh.mc.ours,
                     &hello,
                     self.upgradable(),
@@ -496,7 +522,7 @@ impl Sup {
                 Failure {
                     message,
                     hint: None,
-                    incompatible: Some((reason_json(reason), hello.version)),
+                    incompatible: Some((reason_json(reason), hello.version, hello.build)),
                     reinstall: false,
                 }
             }

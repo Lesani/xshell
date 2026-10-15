@@ -11,14 +11,14 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use xshell_hostlink::{BinarySource, CancelToken, FileSource};
+use xshell_hostlink::{BinarySource, CancelToken, Fetched, FileSource, Wanted};
 
 struct Counting(FileSource, Arc<AtomicUsize>);
 
 impl BinarySource for Counting {
-    fn fetch(&self, t: &str, v: &str, c: &CancelToken) -> Result<Vec<u8>, String> {
+    fn fetch(&self, w: &Wanted, c: &CancelToken) -> Result<Fetched, String> {
         self.1.fetch_add(1, Ordering::SeqCst);
-        self.0.fetch(t, v, c)
+        self.0.fetch(w, c)
     }
 }
 
@@ -43,16 +43,24 @@ fn installed(home: &TestHome) -> std::path::PathBuf {
 }
 
 fn start(seed: impl FnOnce(&TestHome)) -> Ix {
+    start_with(seed, None)
+}
+
+fn start_with(
+    seed: impl FnOnce(&TestHome),
+    desktop_build: Option<xshell_protocol::build::BuildId>,
+) -> Ix {
     let home = TestHome::new();
     seed(&home);
     let guard = DaemonGuard::new(&home);
     let fetches = Arc::new(AtomicUsize::new(0));
     let rec = Recorder::new();
-    let cfg = manager_config(
+    let mut cfg = manager_config(
         local_factory(&home),
         Arc::new(Counting(FileSource(bin().into()), fetches.clone())),
         rec.clone(),
     );
+    cfg.desktop_build = desktop_build;
     let d = Desk::new(cfg, rec, host_config(None));
     Ix {
         d,
@@ -127,4 +135,28 @@ fn corrupt_install_replaced() {
         std::fs::metadata(installed(&ix.home)).unwrap().len(),
         std::fs::metadata(bin()).unwrap().len()
     );
+}
+
+/// With the Desktop's build known (#49), the install goes to `<version>+<build>`, the
+/// Daemon reports that build, and nothing is selected.
+#[test]
+fn keyed_by_build() {
+    let Some(ours) = xshelld::build_id::BUILD.clone() else {
+        return;
+    };
+    let ix = start_with(|_| {}, Some(ours.clone()));
+    let s = ix.d.wait_usable();
+    assert_eq!(s.status, xshell_hostlink::StatusKind::Connected);
+    assert_eq!(s.daemon_build.as_ref(), Some(&ours));
+    let dir = xshell_protocol::build::install_dir_name(VERSION, Some(&ours));
+    let p = ix
+        .home
+        .home()
+        .join(".xshell/server")
+        .join(dir)
+        .join("xshelld");
+    assert_eq!(mode(&p), 0o700);
+    assert!(!installed(&ix.home).exists());
+    assert!(!ix.home.home().join(".xshell/server/selected").exists());
+    assert_eq!(ix.fetches.load(Ordering::SeqCst), 1);
 }

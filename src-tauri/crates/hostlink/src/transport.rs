@@ -117,12 +117,13 @@ pub fn sh_wrap(script: &str) -> String {
     format!("sh -c {}", sh_quote(script))
 }
 
-/// The remote command that bridges to the Daemon. The override is the user's own shell text
-/// (`~/bin/xd`, a path with variables…), so it is not quoted.
-pub fn connect_command(override_: Option<&str>, version: &str) -> String {
+/// The remote command that bridges to the Daemon: the managed binary in install directory
+/// `dir` (`xshell_protocol::build::install_dir_name`, safe in a shell word). The override is
+/// the user's own shell text (`~/bin/xd`, a path with variables…), so it is not quoted.
+pub fn connect_command(override_: Option<&str>, dir: &str) -> String {
     match override_ {
         Some(cmd) => format!("{cmd} connect"),
-        None => format!("sh -c 'exec \"$HOME/.xshell/server/{version}/xshelld\" connect'"),
+        None => format!("sh -c 'exec \"$HOME/.xshell/server/{dir}/xshelld\" connect'"),
     }
 }
 
@@ -164,6 +165,10 @@ mod tests {
         assert_eq!(
             connect_command(Some("~/bin/xd"), "1.5.0"),
             "~/bin/xd connect"
+        );
+        assert_eq!(
+            connect_command(None, "1.5.0+85ee920a1b2c+d.3f9a01c2b4e5"),
+            r#"sh -c 'exec "$HOME/.xshell/server/1.5.0+85ee920a1b2c+d.3f9a01c2b4e5/xshelld" connect'"#
         );
     }
 

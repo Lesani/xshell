@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUpCircle } from "lucide-react";
+import { ArrowUpCircle, RefreshCcw } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { fmt } from "../hosts/strings";
 import { LOCAL_HOST, type LocalHostInfo, type LocalPersistentInfo } from "../hosts/localHost";
-import { confirmAgainCount, controls, errorCode, initialState, localDaemonLine, persistentVisible, reduce, startsSwitch, startsUpgrade, switchErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
+import { confirmAgainCount, controls, effectivePersistent, errorCode, initialState, localDaemonLine, localDaemonVisible, otherBuildNote, reduce, startsSwitch, startsUpgrade, statusErrorText, switchErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
+import { buildText } from "../buildId";
 import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
 
@@ -34,16 +35,18 @@ export function LocalDaemonView({ persistent, status, live, state, dispatch }: V
   const c = controls(state, persistent, status, live);
   const line = localDaemonLine(status, persistent.running);
   const n = live?.length ?? 0;
-  const pending = status?.status === "upgrade-pending" || status?.status === "incompatible";
+  const pending = status?.status === "upgrade-pending" || status?.status === "build-differs" || status?.status === "incompatible";
+  const other = otherBuildNote(status, persistent.running);
+  const backendError = statusErrorText(status, state.error);
   const phase = state.phase;
   return (
     <div className="settings-section">
       <div className="settings-section-head">
         <div className="settings-section-title">{fmt("local.section.title")}</div>
-        <div className="settings-section-desc">{fmt("local.section.desc")}</div>
+        {persistent.supported && <div className="settings-section-desc">{fmt("local.section.desc")}</div>}
       </div>
       <div className="settings-section-body">
-        <div className="settings-row">
+        {persistent.supported && <div className="settings-row">
           <div className="settings-row-text">
             <div className="settings-row-title">{fmt("local.persistent.title")}</div>
             <div className="settings-row-desc">{fmt("local.persistent.desc")}</div>
@@ -51,20 +54,34 @@ export function LocalDaemonView({ persistent, status, live, state, dispatch }: V
           <div className="settings-row-control">
             <PersistentToggle checked={c.checked} disabled={c.disabled} onChange={(target) => dispatch({ type: "toggle", target, terminals: n })} />
           </div>
-        </div>
-        {c.hint && <div className="host-row-note">{c.hint}</div>}
+        </div>}
+        {persistent.supported && c.hint && <div className="host-row-note">{c.hint}</div>}
         {state.error && <div className="host-row-error"><span className="host-row-error-text">{state.error}</span></div>}
+        {backendError && (
+          <div className="host-row-error">
+            <span className="host-row-error-label">{fmt("hosts.row.lastError")}</span>
+            <span className="host-row-error-text">{backendError}</span>
+          </div>
+        )}
         {(line || (pending && persistent.enabled)) && (
           <div className="host-row-info">
             {line && <span>{line}</span>}
             {pending && persistent.enabled && <span className={`host-chip host-chip-${status!.status}`}><span className="host-chip-dot" />{statusLabel(status)}</span>}
           </div>
         )}
-        {c.showUpgrade && (
+        {other && <div className="host-row-note host-row-warn">{other}</div>}
+        {(c.showUpgrade || c.showReplace) && (
           <div className="host-row-actions">
-            <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "upgrade", terminals: n })}>
-              <ArrowUpCircle size={11} /> {c.upgradeBusy ? fmt("hosts.row.upgrading") : fmt("hosts.row.upgrade")}
-            </button>
+            {c.showUpgrade && (
+              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "upgrade", terminals: n })}>
+                <ArrowUpCircle size={11} /> {c.upgradeBusy ? fmt("hosts.row.upgrading") : fmt("hosts.row.upgrade")}
+              </button>
+            )}
+            {c.showReplace && (
+              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "replace", terminals: n, build: buildText(status?.desktopBuild) })}>
+                <RefreshCcw size={11} /> {c.replaceBusy ? fmt("hosts.row.replacing") : fmt("hosts.row.replaceBuild")}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -73,6 +90,13 @@ export function LocalDaemonView({ persistent, status, live, state, dispatch }: V
       )}
     </div>
   );
+}
+
+// What the settings page renders for the backend's `local_host_info`: nothing without a
+// Local Daemon; its build and notes everywhere; persistence only where supported.
+export function LocalDaemonSection({ info, ...rest }: Omit<ViewProps, "persistent"> & { info: LocalHostInfo | null }) {
+  if (!localDaemonVisible(info)) return null;
+  return <LocalDaemonView persistent={effectivePersistent(info)} {...rest} />;
 }
 
 export function LocalDaemonSettings() {
@@ -115,6 +139,5 @@ export function LocalDaemonSettings() {
     }
   }, [info, refresh]);
 
-  if (!persistentVisible(info)) return null;
-  return <LocalDaemonView persistent={info.persistent} status={status} live={live} state={state} dispatch={dispatch} />;
+  return <LocalDaemonSection info={info} status={status} live={live} state={state} dispatch={dispatch} />;
 }

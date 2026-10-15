@@ -99,12 +99,13 @@ impl Hosts {
         let factory = SshFactory {
             local: local_daemon.clone(),
         };
-        let cfg = ManagerConfig::new(
+        let mut cfg = ManagerConfig::new(
             version,
             Arc::new(factory),
             Arc::new(binaries::production_source(exe_dir, cache_dir)),
             Arc::new(TauriObserver(app.clone())),
         );
+        cfg.desktop_build = crate::build_id::BUILD.clone();
         let manager = Arc::new(Manager::new(cfg));
         if local_daemon.is_some() {
             manager.set_local(HostConfig {
@@ -135,6 +136,7 @@ impl Hosts {
                         h.status().status,
                         xshell_hostlink::StatusKind::Connected
                             | xshell_hostlink::StatusKind::UpgradePending
+                            | xshell_hostlink::StatusKind::BuildDiffers
                     )
                 });
                 local::PersistentInfo {
@@ -186,6 +188,7 @@ fn local_daemon(
         home,
         socket,
         version: version.into(),
+        build: crate::build_id::BUILD.clone(),
     })
     .map(Arc::new)
     .map_err(|e| format!("cannot set up the Local Host's Daemon: {e}"))

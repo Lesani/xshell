@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { StrictMode, createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { confirmAgainCount, controls, errorCode, initialState, trackMounted, localDaemonLine, persistentVisible, reduce, startsSwitch, startsUpgrade, switchConfirm, switchErrorText, upgradeConfirm, type Action, type State } from "./localDaemon";
+import { confirmAgainCount, controls, errorCode, initialState, trackMounted, localDaemonLine, otherBuildNote, persistentVisible, reduce, replaceConfirm, startsSwitch, startsUpgrade, switchConfirm, switchErrorText, upgradeConfirm, type Action, type State } from "./localDaemon";
+import type { BuildId } from "../buildId";
 import type { LocalPersistentInfo } from "./localHost";
-import { LocalDaemonView } from "../components/LocalDaemonSettings";
+import { LocalDaemonSection, LocalDaemonView } from "../components/LocalDaemonSettings";
 import { S } from "./strings";
 import type { HostStatus, TerminalInfo } from "./types";
 
@@ -15,6 +16,9 @@ const status = (patch: Partial<HostStatus> = {}): HostStatus => ({
   daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1, daemonCapabilities: [], configGeneration: 0,
   incompatibleReason: null, os: null, arch: null, ...patch,
 } as HostStatus);
+
+const ours: BuildId = { commit: "85ee920a1b2c", dirty: null, time: 1760000000 };
+const other: BuildId = { commit: "000000000000", dirty: null, time: 1760000000 };
 
 const term = (): TerminalInfo => ({ terminal: crypto.randomUUID() } as unknown as TerminalInfo);
 
@@ -63,6 +67,55 @@ describe("localDaemon", () => {
     expect(localDaemonLine(status({ status: "upgrade-pending", daemonVersion: "1.4.0" }), "persistent")).toBe("Terminal setup 1.4.0 · keeps running");
     expect(localDaemonLine(status(), null)).toBeNull();
     expect(localDaemonLine(undefined, "persistent")).toBeNull();
+    // With the build, once the backend reports it (#49).
+    expect(localDaemonLine(status({ daemonBuild: ours }), "persistent")).toBe("Terminal setup 1.5.0 (85ee920a1b2c) · keeps running");
+    expect(localDaemonLine(status({ daemonBuild: null }), "gui-bound")).toBe("Terminal setup 1.5.0 (unknown build) · ends with xshell");
+  });
+
+  it("replace (#49): offered for a Persistent Daemon of another build, through the upgrade phases", () => {
+    const differs = status({ status: "build-differs", daemonBuild: null, desktopBuild: ours });
+    expect(controls(initialState, on, differs, []).showReplace).toBe(true);
+    expect(controls(initialState, on, differs, []).showUpgrade).toBe(false);
+    expect(controls(initialState, off, differs, []).showReplace).toBe(false);
+    // A GUI-bound Daemon of another build: no action, only the note.
+    expect(controls(initialState, { ...on, running: "gui-bound" }, differs, []).showReplace).toBe(false);
+    expect(controls(initialState, on, status(), []).showReplace).toBe(false);
+    const asked = run([{ type: "replace", terminals: 2, build: "85ee920a1b2c" }]);
+    expect(asked.phase).toEqual({ kind: "confirm-upgrade", confirm: replaceConfirm(2, "85ee920a1b2c"), replace: true });
+    expect(reduce(asked, { type: "cancel" }).phase.kind).toBe("idle");
+    const up = reduce(asked, { type: "confirm" });
+    expect(up.phase).toEqual({ kind: "upgrading", replace: true });
+    expect(startsUpgrade(asked, up)).toBe(true);
+    const c = controls(up, on, differs, []);
+    expect(c.replaceBusy).toBe(true);
+    expect(c.upgradeBusy).toBe(false);
+    expect(c.showUpgrade).toBe(false);
+    expect(c.disabled).toBe(true);
+    expect(reduce(up, { type: "upgraded" }).phase.kind).toBe("idle");
+    expect(reduce(up, { type: "failed", error: "e" })).toEqual({ phase: { kind: "idle" }, error: "e" });
+    // The Host's replacement in progress keeps the button busy.
+    expect(controls(initialState, on, { ...differs, phase: "upgrading" }, []).replaceBusy).toBe(true);
+    // Busy elsewhere: ignored.
+    expect(reduce(up, { type: "replace", terminals: 0, build: "x" })).toBe(up);
+  });
+
+  it("replace confirmation names this computer and the build", () => {
+    const c = replaceConfirm(3, "85ee920a1b2c");
+    expect(c.title).toBe("Replace host setup?");
+    expect(c.body).toBe("Replacing xshell on this computer with build 85ee920a1b2c restarts all 3 terminals there, including those used by other Desktops. Agent sessions resume; shells start fresh in the same directory. Desktops on other builds will offer to switch back.");
+    expect(c.confirm).toBe("Replace");
+  });
+
+  it("another app's GUI-bound Daemon of another build: the quit note only", () => {
+    const st = (p: Partial<HostStatus>) => status({ desktopBuild: ours, ...p });
+    expect(otherBuildNote(st({ daemonBuild: other }), "gui-bound")).toBe("Another xshell app using 000000000000 runs this computer’s terminals. Quit that xshell app to use this Desktop’s build.");
+    expect(otherBuildNote(st({ daemonBuild: null }), "gui-bound")).toBe("Another xshell app using unknown build runs this computer’s terminals. Quit that xshell app to use this Desktop’s build.");
+    expect(otherBuildNote(st({ daemonBuild: { ...ours, time: 1 } }), "gui-bound")).toBeNull();
+    expect(otherBuildNote(st({ daemonBuild: other }), "persistent")).toBeNull();
+    expect(otherBuildNote(st({ daemonBuild: other, status: "offline" }), "gui-bound")).toBeNull();
+    // Unknown own build, or a backend that reports no builds: nothing to compare.
+    expect(otherBuildNote(st({ daemonBuild: other, desktopBuild: null }), "gui-bound")).toBeNull();
+    expect(otherBuildNote(status(), "gui-bound")).toBeNull();
   });
 
   it("toggle with terminals asks first; cancel changes nothing", () => {
@@ -220,6 +273,59 @@ describe("LocalDaemonView", () => {
     const html = render(run([{ type: "toggle", target: true, terminals: 0 }, { type: "failed", error: switchErrorText("other-app", null) }]));
     expect(html).toContain("Another xshell window controls these terminals.");
     expect(html).not.toContain("Switching…");
+  });
+
+  it("build differs: the chip, the build in the line, and Replace (#49)", () => {
+    const html = render(initialState, on, status({ status: "build-differs", daemonBuild: null, desktopBuild: ours }));
+    expect(html).toContain("Different build");
+    expect(html).toContain("Terminal setup 1.5.0 (unknown build) · keeps running");
+    expect(html).toContain("Replace with Desktop’s build");
+    expect(html).not.toContain("Upgrade now");
+    const busy = render({ phase: { kind: "upgrading", replace: true }, error: null }, on, status({ status: "build-differs", daemonBuild: null, desktopBuild: ours }));
+    expect(busy).toContain("Replacing…");
+  });
+
+  it("another app on another build: the note, no action", () => {
+    const html = render(initialState, { ...on, enabled: false, running: "gui-bound" }, status({ daemonBuild: other, desktopBuild: ours }));
+    expect(html).toContain("Another xshell app using 000000000000 runs this computer’s terminals.");
+    expect(html).not.toContain("Replace with");
+  });
+
+  it("C4: the command succeeded, then the status names why the replacement did not take", () => {
+    const c4 = "xshelld 1.5.0 (unknown build) is still running after replacement; expected 1.5.0 (85ee920a1b2c). Try Replace again. If this repeats, quit other xshell apps using this host.";
+    const st = status({ status: "build-differs", daemonBuild: null, desktopBuild: ours, lastError: c4 });
+    const html = render(run([{ type: "replace", terminals: 0, build: "85ee920a1b2c" }, { type: "confirm" }, { type: "upgraded" }]), on, st);
+    expect(html).toContain("Last error");
+    expect(html).toContain("still running after replacement");
+    expect(html).toContain("Replace with Desktop’s build");
+    // Shown once when the section's own error already says it.
+    const both = render({ phase: { kind: "idle" }, error: `Couldn’t change terminal settings: ${c4}` }, on, st);
+    expect(both.split("still running after replacement").length - 1).toBe(1);
+    // Not for a plainly connected Host.
+    expect(render(initialState, on, status({ lastError: "old" }))).not.toContain("Last error");
+  });
+
+  it("without persistence (Windows): build and the other-app note, no toggle or Replace", () => {
+    const section = (info: Parameters<typeof LocalDaemonSection>[0]["info"], st: HostStatus) =>
+      renderToStaticMarkup(createElement(LocalDaemonSection, { info, status: st, live: [term()], state: initialState, dispatch: () => {} }));
+    const unsupported = { mode: "daemon" as const, reason: null, persistent: { supported: false, enabled: false, running: null, log: null } };
+    const html = section(unsupported, status({ status: "connected", daemonBuild: other, desktopBuild: ours }));
+    expect(html).toContain("This computer");
+    expect(html).toContain("Terminal setup 1.5.0 (000000000000) · ends with xshell");
+    expect(html).toContain("Another xshell app using 000000000000 runs this computer’s terminals.");
+    expect(html).not.toContain("Keep terminals running after quit");
+    expect(html).not.toContain("<input");
+    expect(html).not.toContain("Replace with");
+    expect(html).not.toContain("Choose what happens");
+    // A backend without the persistence info at all, and the same build: just the line.
+    const same = section({ mode: "daemon", reason: null }, status({ daemonBuild: ours, desktopBuild: ours }));
+    expect(same).toContain("Terminal setup 1.5.0 (85ee920a1b2c) · ends with xshell");
+    expect(same).not.toContain("Another xshell app");
+    // In-process local Tabs: nothing.
+    expect(section({ mode: "in-process", reason: "r" }, status())).toBe("");
+    expect(section(null, status())).toBe("");
+    // Supported: the toggle is there.
+    expect(section({ mode: "daemon", reason: null, persistent: on }, status())).toContain("Keep terminals running after quit");
   });
 
   it("upgrade pending: the chip and Upgrade now", () => {

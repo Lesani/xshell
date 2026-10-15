@@ -7,7 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name: string, h: Handler) => { handlers[name] = h; return () => { delete handlers[name]; }; }) }));
 vi.mock("@tauri-apps/plugin-store", () => ({ load: vi.fn() }));
 
-import { HostRegistry } from "./registry";
+import { HostRegistry, isUsableStatus } from "./registry";
 import type { HostConfig, HostStatus, HostSnapshot } from "./types";
 
 const H = "h_ab12cd34";
@@ -105,6 +105,19 @@ describe("registry", () => {
     const w3 = r.waitUsable(H);
     await r.configure([]);
     await expect(w3).rejects.toMatchObject({ code: "unknown-host" });
+    r._dispose();
+  });
+
+  it("a Host on another build is usable (#49)", async () => {
+    invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: true } : undefined));
+    expect(isUsableStatus(status("build-differs"))).toBe(true);
+    expect(isUsableStatus(status("offline"))).toBe(false);
+    const r = new HostRegistry();
+    await r.init([cfg]);
+    const w = r.waitUsable(H);
+    handlers["hosts:status"]({ payload: status("build-differs") });
+    await expect(w).resolves.toBeUndefined();
+    expect(r.isUsable(H)).toBe(true);
     r._dispose();
   });
 

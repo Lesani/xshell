@@ -119,7 +119,10 @@ impl Observer for Recorder {
 }
 
 pub fn usable(s: &HostStatus) -> bool {
-    matches!(s.status, StatusKind::Connected | StatusKind::UpgradePending)
+    matches!(
+        s.status,
+        StatusKind::Connected | StatusKind::UpgradePending | StatusKind::BuildDiffers
+    )
 }
 
 // ── Sinks ─────────────────────────────────────────────────────────────────
@@ -735,6 +738,10 @@ pub struct LocalDesk {
 pub struct LocalOpts {
     pub persistent: bool,
     pub version: String,
+    /// This Desktop's build (#49): checked against the sidecar, keys the install directory.
+    pub build: Option<xshell_protocol::build::BuildId>,
+    /// The app's `xshelld` (default: the workspace build).
+    pub bin: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub tweak: Box<dyn FnOnce(&mut ManagerConfig)>,
 }
@@ -744,6 +751,8 @@ impl Default for LocalOpts {
         Self {
             persistent: false,
             version: VERSION.into(),
+            build: None,
+            bin: None,
             env: vec![],
             tweak: Box::new(|_| {}),
         }
@@ -776,11 +785,12 @@ impl LocalDesk {
         let socket = xshell_hostlink::local::local_socket_path(&h.home(), Some(&h.run()));
         let daemon = Arc::new(
             xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
-                bin: bin().into(),
+                bin: o.bin.clone().unwrap_or_else(|| bin().into()),
                 env,
                 home: h.home(),
                 socket,
                 version: o.version.clone(),
+                build: o.build.clone(),
             })
             .unwrap(),
         );
@@ -791,6 +801,7 @@ impl LocalDesk {
         });
         let mut cfg = manager_config(factory, Arc::new(FileSource(bin().into())), rec.clone());
         cfg.desktop_version = o.version;
+        cfg.desktop_build = o.build;
         (o.tweak)(&mut cfg);
         let m = Manager::new(cfg);
         m.set_local(HostConfig {

@@ -1,6 +1,8 @@
 // TS mirror of the Desktop ↔ Remote Host contract (Rust serde camelCase; enum values
 // kebab-case). The Rust side lives in src-tauri/crates/hostlink and src-tauri/src/hosts.
 
+import type { BuildId } from "../buildId";
+
 // ^h_[a-z0-9]{8}$ for Remote Hosts. "local" (`LOCAL_HOST`) names the Local Host on the wire
 // only (its Terminals through the Daemon this Desktop runs); it is never configured and never a
 // Tab's or Project's `host`.
@@ -17,7 +19,9 @@ export interface HostConfig {
   launchPrefixes?: Partial<Record<string, string>>;
 }
 
-export type HostStatusKind = "reconnecting" | "connected" | "upgrade-pending" | "offline" | "incompatible";
+// "build-differs" (#49): the Daemon runs this version from another (or an unknown) build. It
+// is usable, like "upgrade-pending"; "Replace with Desktop's build" is offered.
+export type HostStatusKind = "reconnecting" | "connected" | "upgrade-pending" | "build-differs" | "offline" | "incompatible";
 
 export type HostErrorHint =
   | "host-key"
@@ -52,6 +56,10 @@ export interface HostStatus {
   // The connected Daemon's hello capabilities; empty while not connected. Optional so an
   // older Rust side is still accepted.
   daemonCapabilities?: string[];
+  // The Daemon's and this Desktop's builds (#49); null when unknown. Optional so an older
+  // Rust side is still accepted.
+  daemonBuild?: BuildId | null;
+  desktopBuild?: BuildId | null;
 }
 
 export interface LaunchSpec {

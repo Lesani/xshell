@@ -23,7 +23,7 @@ export interface RegistrySnapshot {
 }
 
 export const isUsableStatus = (s: HostStatus | undefined): boolean =>
-  !!s && (s.status === "connected" || s.status === "upgrade-pending");
+  !!s && (s.status === "connected" || s.status === "upgrade-pending" || s.status === "build-differs");
 
 export class HostUnknownError extends Error {
   readonly code = "unknown-host";

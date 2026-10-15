@@ -28,6 +28,9 @@ pub trait Observer: Send + Sync {
 
 pub struct ManagerConfig {
     pub desktop_version: String,
+    /// This Desktop's build (#49); `None` when unknown. It keys the install directory, is
+    /// sent in the Desktop's hello, and decides "build differs".
+    pub desktop_build: Option<xshell_protocol::build::BuildId>,
     pub ours: ProtocolRange,
     pub transports: Arc<dyn TransportFactory>,
     pub binaries: Arc<dyn BinarySource>,
@@ -57,6 +60,7 @@ impl ManagerConfig {
     ) -> Self {
         Self {
             desktop_version: desktop_version.into(),
+            desktop_build: None,
             ours: xshell_protocol::PROTOCOL,
             transports,
             binaries,
@@ -70,6 +74,11 @@ impl ManagerConfig {
             term_timeout: Duration::from_secs(30),
             link_limits: LinkLimits::default(),
         }
+    }
+
+    /// The directory this Desktop's Daemon build is installed in under `~/.xshell/server`.
+    pub fn install_dir(&self) -> String {
+        xshell_protocol::build::install_dir_name(&self.desktop_version, self.desktop_build.as_ref())
     }
 }
 
@@ -270,7 +279,7 @@ impl Manager {
             }
             return r;
         }
-        let script = probe_script(&self.mc.desktop_version);
+        let script = probe_script(&self.mc.install_dir());
         match run_probe(&*t, &script, &self.cancel) {
             Ok(p) => {
                 r.installed_version = p.installed.map(|d| d.version);
@@ -1138,5 +1147,203 @@ pub(crate) mod tests {
         // Nothing starts it again.
         m.set_local(local_host());
         assert!(m.host("local").is_none());
+    }
+
+    /// A direct Host whose Daemon (a socket peer) runs this version from an unknown build:
+    /// every connection greets without a build; a `daemon.upgrade` is recorded, then the
+    /// connection drops as the old Daemon would. The dialer records `select_build`.
+    #[cfg(unix)]
+    struct ReplacePeer {
+        path: std::path::PathBuf,
+        events: Arc<Mutex<Vec<String>>>,
+        select: Arc<Mutex<Result<(), String>>>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    fn replace_peer() -> ReplacePeer {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                let _ = s.write_all(&greeting(1, 1));
+                let ev = ev.clone();
+                std::thread::spawn(move || {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    const ASK: &[u8] = br#","t":"daemon.upgrade"}"#;
+                    while let Ok(n @ 1..) = s.read(&mut buf) {
+                        seen.extend_from_slice(&buf[..n]);
+                        let Some(end) = seen.windows(ASK.len()).position(|w| w == ASK) else {
+                            continue;
+                        };
+                        // `{"id":N,"t":"daemon.upgrade"}`: acknowledge, then exit.
+                        let start = seen[..end].iter().rposition(|b| *b == b':').unwrap() + 1;
+                        let id: u64 = std::str::from_utf8(&seen[start..end])
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        ev.lock().unwrap().push("upgrade".to_string());
+                        let _ = s.write_all(&crate::link::testpeer::res_frame(
+                            id,
+                            Ok(serde_json::Value::Null),
+                        ));
+                        std::thread::sleep(Duration::from_millis(20));
+                        return;
+                    }
+                });
+            }
+        });
+        ReplacePeer {
+            path,
+            events,
+            select: Arc::new(Mutex::new(Ok(()))),
+            _dir: dir,
+        }
+    }
+
+    #[cfg(unix)]
+    struct SelectingDialer {
+        path: std::path::PathBuf,
+        events: Arc<Mutex<Vec<String>>>,
+        select: Arc<Mutex<Result<(), String>>>,
+    }
+
+    #[cfg(unix)]
+    impl crate::dial::Dialer for SelectingDialer {
+        fn dial(&self, c: &crate::CancelToken) -> Result<crate::Dialed, crate::DialError> {
+            crate::dial::UnixSocketDialer {
+                path: self.path.clone(),
+            }
+            .dial(c)
+        }
+        fn describe(&self) -> String {
+            "selecting".into()
+        }
+        fn upgradable(&self) -> bool {
+            true
+        }
+        fn select_build(&self, dir: &str) -> Option<Result<(), String>> {
+            self.events.lock().unwrap().push(format!("select {dir}"));
+            Some(self.select.lock().unwrap().clone())
+        }
+    }
+
+    #[cfg(unix)]
+    struct SelectingFactory(
+        std::path::PathBuf,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Result<(), String>>>,
+    );
+
+    #[cfg(unix)]
+    impl TransportFactory for SelectingFactory {
+        fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+            Box::new(LocalShellTransport::default())
+        }
+        fn direct(&self, _: &HostConfig) -> Option<Box<dyn crate::dial::Dialer>> {
+            Some(Box::new(SelectingDialer {
+                path: self.0.clone(),
+                events: self.1.clone(),
+                select: self.2.clone(),
+            }))
+        }
+    }
+
+    #[cfg(unix)]
+    fn replace_manager(peer: &ReplacePeer, rec: Arc<Recorder>) -> Manager {
+        let mut mc = test_config(rec);
+        mc.desktop_build = Some(xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 1,
+        });
+        mc.transports = Arc::new(SelectingFactory(
+            peer.path.clone(),
+            peer.events.clone(),
+            peer.select.clone(),
+        ));
+        mc.stable_after = Duration::ZERO;
+        let m = Manager::new(mc);
+        m.configure(vec![test_host("h_aaaaaaaa", "sock")]).unwrap();
+        m
+    }
+
+    /// Replace selects this Desktop's build before it asks the Daemon to exit (C1). When the
+    /// Daemon that comes back still runs another build (another Desktop's connector won the
+    /// restart), the Host stays "build differs" with the reason, and Replace can be repeated
+    /// (C4).
+    #[cfg(unix)]
+    #[test]
+    fn replace_selects_first_and_reports_a_lost_race() {
+        let peer = replace_peer();
+        let rec = Recorder::new();
+        let m = replace_manager(&peer, rec.clone());
+        let s = rec.wait_status(|s| s.status == StatusKind::BuildDiffers);
+        assert!(s.usable());
+        assert_eq!(s.daemon_build, None);
+        assert!(s.last_error.is_none());
+        let from = rec.statuses().len();
+        let (w, rx) = crate::link::testpeer::slot();
+        m.host("h_aaaaaaaa").unwrap().upgrade(w);
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let after = loop {
+            let got = rec.statuses()[from..]
+                .iter()
+                .find(|s| s.status == StatusKind::BuildDiffers && s.last_error.is_some())
+                .cloned();
+            if let Some(s) = got {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "{:#?}", &rec.statuses()[from..]);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            *peer.events.lock().unwrap(),
+            ["select 1.5.0+85ee920a1b2c", "upgrade"]
+        );
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some("xshelld 1.5.0 (unknown build) is still running after replacement; expected 1.5.0 (85ee920a1b2c). Try Replace again. If this repeats, quit other xshell apps using this host.")
+        );
+        assert_eq!(after.phase, None);
+        // Retryable.
+        let (w, rx) = crate::link::testpeer::slot();
+        m.host("h_aaaaaaaa").unwrap().upgrade(w);
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(peer.events.lock().unwrap().len(), 4);
+        m.shutdown();
+    }
+
+    /// A refused selection (a stale bundled xshelld, say) ends Replace before the Daemon is
+    /// asked to exit, and the reason shows on the still usable Host.
+    #[cfg(unix)]
+    #[test]
+    fn refused_selection_stops_nothing() {
+        let peer = replace_peer();
+        *peer.select.lock().unwrap() = Err("the bundled xshelld is stale".into());
+        let rec = Recorder::new();
+        let m = replace_manager(&peer, rec.clone());
+        rec.wait_status(|s| s.status == StatusKind::BuildDiffers);
+        let (w, rx) = crate::link::testpeer::slot();
+        m.host("h_aaaaaaaa").unwrap().upgrade(w);
+        let e = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e.message, "the bundled xshelld is stale");
+        let s =
+            rec.wait_status(|s| s.last_error.as_deref() == Some("the bundled xshelld is stale"));
+        assert_eq!(s.status, StatusKind::BuildDiffers, "{:#?}", rec.statuses());
+        assert_eq!(s.phase, None);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(*peer.events.lock().unwrap(), ["select 1.5.0+85ee920a1b2c"]);
+        m.shutdown();
     }
 }

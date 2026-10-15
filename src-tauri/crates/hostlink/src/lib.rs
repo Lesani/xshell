@@ -28,7 +28,7 @@ pub use dial::UnixSocketDialer;
 pub use dial::{connect_local, Connection, DialError, Dialed, Dialer, LocalStream};
 pub use errors::{HostError, HostErrorCode, HostErrorHint, SwitchError};
 pub use handle::{HostHandle, TermSink};
-pub use install::{BinarySource, ChainSource, DirSource, FileSource};
+pub use install::{BinarySource, ChainSource, DirSource, Fetched, FileSource, Origin, Wanted};
 pub use link::Waiter;
 pub use local::{LocalDaemon, LocalDaemonConfig, LocalDialer};
 pub use manager::{Manager, ManagerConfig, Observer};
