@@ -52,6 +52,16 @@ const LAUNCH_PREFIX_CAPABILITY: &str = "launch.prefix";
 /// The hello capability of Daemons that resume an agent session at most once: a `term.open`
 /// may set `adoptExisting` and is answered with the Terminal that already runs it.
 const OPEN_EXISTING_CAPABILITY: &str = xshell_protocol::cap::TERM_OPEN_EXISTING;
+/// The `call` methods a Daemon serves only with capability `file.transfer`.
+const FILE_TRANSFER_METHODS: &[&str] = &[
+    "file_stat",
+    "file_read",
+    "make_dir",
+    "upload_begin",
+    "upload_chunk",
+    "upload_commit",
+    "upload_abort",
+];
 
 pub(crate) struct SinkSlot {
     sink: Arc<dyn TermSink>,
@@ -766,6 +776,24 @@ impl HostHandle {
     }
 
     pub fn call(&self, method: String, params: Value, w: Waiter) {
+        // An older Daemon would answer "unknown method": refuse with the remedy instead.
+        if FILE_TRANSFER_METHODS.contains(&method.as_str()) {
+            let lacking = {
+                let st = self.sh.lock();
+                Shared::usable_link(&st).is_ok()
+                    && !st
+                        .status
+                        .daemon_capabilities
+                        .iter()
+                        .any(|c| c == xshell_protocol::cap::FILE_TRANSFER)
+            };
+            if lacking {
+                w(Err(HostError::invalid(
+                    "this Host's xshelld cannot transfer files; upgrade it first",
+                )));
+                return;
+            }
+        }
         let timeout = match method.as_str() {
             "save_dropped_file" => SAVE_FILE_TIMEOUT,
             "upload_commit" | "file_stat" => self.sh.mc.long_call_timeout,
@@ -1344,6 +1372,17 @@ pub(crate) mod tests {
     }
 
     /// [`connect`] to a Daemon advertising `caps`, adopted the way the supervisor does.
+    /// [`connect`] to a Daemon that serves the file-transfer methods.
+    fn connect_files(sh: &Arc<Shared>) -> (Peer, Arc<Link>, u64) {
+        let (p, l, g, _) = connect_full(
+            sh,
+            vec![],
+            crate::link::LinkLimits::default(),
+            &[xshell_protocol::cap::FILE_TRANSFER],
+        );
+        (p, l, g)
+    }
+
     fn connect_capable(sh: &Arc<Shared>, list: Vec<TerminalInfo>, caps: &[&str]) -> Peer {
         connect_full(sh, list, crate::link::LinkLimits::default(), caps).0
     }
@@ -1586,7 +1625,7 @@ pub(crate) mod tests {
     #[test]
     fn upload_commit_timeout_is_outcome_unknown() {
         let sh = shared_with(|mc| mc.long_call_timeout = Duration::from_millis(100));
-        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let (mut peer, _link, _) = connect_files(&sh);
         let h = handle(&sh);
         let (w, rx) = slot();
         h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
@@ -1606,7 +1645,7 @@ pub(crate) mod tests {
         assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!({"size": 1})));
         // Another call's timeout stays a timeout.
         let sh = shared_with(|mc| mc.call_timeout = Duration::from_millis(100));
-        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let (mut peer, _link, _) = connect_files(&sh);
         let h = handle(&sh);
         let (w, rx) = slot();
         h.call("upload_chunk".into(), json!({}), w);
@@ -1628,7 +1667,7 @@ pub(crate) mod tests {
         );
         // Sent, the Daemon published, then the connection dropped before the answer.
         let sh = shared();
-        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let (mut peer, _link, _) = connect_files(&sh);
         let h = handle(&sh);
         let (w, rx) = slot();
         h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
@@ -1639,7 +1678,7 @@ pub(crate) mod tests {
         assert!(e.message.starts_with(UPLOAD_OUTCOME_UNKNOWN), "{e:?}");
         // Other calls keep a plain offline.
         let sh = shared();
-        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let (mut peer, _link, _) = connect_files(&sh);
         let h = handle(&sh);
         let (w, rx) = slot();
         h.call("upload_chunk".into(), json!({}), w);
@@ -1649,7 +1688,7 @@ pub(crate) mod tests {
         assert_eq!(e.code, HostErrorCode::Offline);
         // The Daemon's own refusal is not ambiguous.
         let sh = shared();
-        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let (mut peer, _link, _) = connect_files(&sh);
         let h = handle(&sh);
         let (w, rx) = slot();
         h.call("upload_commit".into(), json!({"uploadId": "u"}), w);
@@ -1660,6 +1699,26 @@ pub(crate) mod tests {
             (e.code, e.message.as_str()),
             (HostErrorCode::Remote, "file exists: /p")
         );
+    }
+
+    #[test]
+    fn transfer_calls_to_a_daemon_without_the_capability_are_refused_unsent() {
+        let sh = shared();
+        let (mut peer, _link, _) = connect(&sh, vec![]);
+        let h = handle(&sh);
+        for m in FILE_TRANSFER_METHODS {
+            let (w, rx) = slot();
+            h.call(m.to_string(), json!({}), w);
+            let e = rx.recv_timeout(T5).unwrap().unwrap_err();
+            assert_eq!(e.code, HostErrorCode::Invalid, "{m}");
+            assert!(e.message.contains("upgrade it first"), "{e:?}");
+        }
+        // Other calls still go out.
+        let (w, rx) = slot();
+        h.call("get_home_dir".into(), json!({}), w);
+        let id = peer.expect("call")["id"].as_u64().unwrap();
+        peer.reply(id, Ok(json!("/home/x")));
+        assert_eq!(rx.recv_timeout(T5).unwrap(), Ok(json!("/home/x")));
     }
 
     #[test]

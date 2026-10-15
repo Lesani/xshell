@@ -10,7 +10,7 @@ import { baseName, isTransferPart, parentOf, styleOfOs } from "../files/paths";
 import type { SyncState, SyncView, SyncNotice } from "../files/syncBack";
 import { syncBack } from "../files/syncBackDeps";
 import { fitNotice } from "../files/noticeText";
-import { DRAG_PATH_MIME, acceptsDrop, resolveDropTarget, rowData } from "../files/dropTarget";
+import { DRAG_PATH_MIME, acceptsDrop, fileUri, resolveDropTarget, rowData } from "../files/dropTarget";
 import { clashResolver, uploadSummary, type ClashAnswer } from "../files/clash";
 import { downloadTo, type DownloadToDeps } from "../files/downloadTo";
 import { DRAG_OUT_MAX_BYTES, type DragOutError } from "../files/dragOut";
@@ -97,7 +97,9 @@ function FileRow({ item, depth, expanded, active, subtitle, onActivate, onContex
     // The grip holds the press for a native drag-out: no in-app drag then.
     if (dragOut.held) { e.preventDefault(); return; }
     e.dataTransfer.setData(DRAG_PATH_MIME, item.path);
-    e.dataTransfer.setData("text/plain", item.path);
+    // No text/plain: a file manager would save the path as a text file. A Local row carries
+    // the file itself, so it can also be dropped outside xshell.
+    if (remote === null) e.dataTransfer.setData("text/uri-list", fileUri(item.path));
     e.dataTransfer.effectAllowed = "copy";
   };
   return (

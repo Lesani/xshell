@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DRAG_PATH_MIME, acceptsDrop, resolveDropTarget, rowData } from "./dropTarget";
+import { DRAG_PATH_MIME, acceptsDrop, fileUri, resolveDropTarget, rowData } from "./dropTarget";
 
 // A stand-in for an element inside a row: `closest` finds the row's attributes.
 const inRow = (attrs: Record<string, string> | null) => ({
@@ -37,5 +37,16 @@ describe("acceptsDrop", () => {
 
   it("rejects everything while this window's drag-out runs", () => {
     expect(acceptsDrop(["Files"], true)).toBe(false);
+  });
+});
+
+describe("fileUri", () => {
+  it("encodes POSIX and Windows paths", () => {
+    expect(fileUri("/home/me/a b#.txt")).toBe("file:///home/me/a%20b%23.txt");
+    expect(fileUri("C:\\Users\\me\\a b.txt")).toBe("file:///C:/Users/me/a%20b.txt");
+    expect(fileUri("\\\\srv\\share\\a b.txt")).toBe("file://srv/share/a%20b.txt");
+    expect(fileUri("\\\\?\\C:\\x\\y.txt")).toBe("file:///C:/x/y.txt");
+    expect(fileUri("\\\\?\\UNC\\srv\\share\\y.txt")).toBe("file://srv/share/y.txt");
+    expect(fileUri("/srv/a\\b.txt")).toBe("file:///srv/a%5Cb.txt");
   });
 });

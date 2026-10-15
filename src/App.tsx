@@ -296,6 +296,20 @@ export default function App() {
   // Project waiting on an agent choice — set when a new chat needs the picker dialog.
   const [agentPickerProject, setAgentPickerProject] = useState<ProjectInfo | null>(null);
 
+  // A file dropped where no handler takes it would navigate the webview to the file: cancel
+  // every drag-over and drop that no element handled.
+  useEffect(() => {
+    const over = (e: DragEvent) => {
+      if (e.defaultPrevented || !e.dataTransfer?.types.includes("Files")) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "none";
+    };
+    const drop = (e: DragEvent) => { if (!e.defaultPrevented) e.preventDefault(); };
+    window.addEventListener("dragover", over);
+    window.addEventListener("drop", drop);
+    return () => { window.removeEventListener("dragover", over); window.removeEventListener("drop", drop); };
+  }, []);
+
   useEffect(() => {
     AGENT_IDS.forEach(id => {
       hostInvoke<{ installed: boolean }>(undefined, "detect_agent_binary", { binary: AGENTS[id].binary })

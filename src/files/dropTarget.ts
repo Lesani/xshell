@@ -36,3 +36,17 @@ export function acceptsDrop(types: ArrayLike<string> | Iterable<string> | null |
   const list = Array.from(types as ArrayLike<string>);
   return list.includes("Files") && !list.includes(DRAG_PATH_MIME);
 }
+
+// A local path as a file:// URI: POSIX `/a b` → `file:///a%20b`; Windows `C:\x` →
+// `file:///C:/x`, UNC `\\srv\share\x` → `file://srv/share/x`, and `\\?\` long paths
+// as their plain form. A POSIX backslash stays part of the name.
+export function fileUri(path: string): string {
+  const enc = (p: string) => p.split("/").map(encodeURIComponent).join("/");
+  let p = path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\(?=[a-zA-Z]:)/, "");
+  if (/^[a-zA-Z]:[\\/]/.test(p)) {
+    p = p.replace(/\\/g, "/");
+    return "file:///" + p.slice(0, 2) + enc(p.slice(2));
+  }
+  if (p.startsWith("\\\\")) return "file://" + enc(p.slice(2).replace(/\\/g, "/"));
+  return "file://" + enc(p);
+}

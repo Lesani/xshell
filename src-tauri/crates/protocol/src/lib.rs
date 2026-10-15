@@ -45,6 +45,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::TERM_FIRST_MESSAGE,
     cap::PROJECT_SESSIONS,
     cap::TERM_OPEN_EXISTING,
+    cap::FILE_TRANSFER,
     #[cfg(unix)]
     cap::TERM_SUBMIT,
     #[cfg(unix)]
@@ -118,6 +119,9 @@ pub mod cap {
     /// only, like [`TERM_SUBMIT`].
     #[cfg(unix)]
     pub const TERM_SUBMIT_FILES: &str = "term.submit-files";
+    /// The file-transfer `call` methods: `file_stat`, `file_read`, `make_dir` and
+    /// `upload_begin`/`upload_chunk`/`upload_commit`/`upload_abort` (Desktop only).
+    pub const FILE_TRANSFER: &str = "file.transfer";
 }
 
 /// `xshelld connect`'s exit code when the Daemon on that machine is run by xshell there (it
