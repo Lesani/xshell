@@ -1152,6 +1152,43 @@ pub fn ring_moves_to_new_relay_with_full_chain(old: &RelayTarget, new: &RelayTar
     assert_eq!(d.chain(), r.chain);
 }
 
+/// A Desktop that moved its Ring away from `t` tells `t` in one step (a farewell,
+/// ADR-0012): it authenticates there with the whole chain staged, newer versions whose
+/// `relayUrl` names another Relay included. The Relay commits them as ordinary versions,
+/// broadcasts each to the devices still connected, oldest first, and a device that comes
+/// back later pages them down; a further upload naming the other Relay is ordinary too. The
+/// other Relay (`.invalid`) is never dialed.
+pub fn old_relay_hands_a_move_to_a_lagging_device(t: &RelayTarget) {
+    const MOVED_TO: &str = "wss://relay.xshell.invalid";
+    let mut r = TestRing::new(&t.url);
+    let lagging = r.chain.clone();
+    let (_d, rec_d) = connect(t, &r.chain, signer(&r.daemon));
+    r.next(|d| d.relay_url = MOVED_TO.into());
+    r.next(|_| {});
+    let mut cfg = config(t, &r.chain, signer(&r.desktop));
+    cfg.dial = Some(t.url.clone());
+    let a = RingClient::connect(cfg, Recorder::new()).expect("authenticate with the chain staged");
+    assert_eq!(a.chain(), r.chain);
+    assert_eq!(relay_version(t, &r.ring_id()), 4);
+    assert!(rec_d
+        .wait_for(WAIT, |e| e == &Event::Roster { version: 4 })
+        .is_some());
+    let heard: Vec<u64> = rec_d
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Event::Roster { version } => Some(*version),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(heard, [3, 4], "each version, oldest first");
+    let (m, _) = connect(t, &lagging, signer(&r.mobile));
+    assert_eq!(m.chain(), r.chain);
+    let v5 = r.next(|_| {});
+    a.publish_roster(&v5).expect("an ordinary version");
+    assert_eq!(relay_version(t, &r.ring_id()), 5);
+}
+
 pub fn entitlement_slot_round_trips(t: &RelayTarget) {
     let r = TestRing::new(&t.url);
     let (a, _) = connect(t, &r.chain, signer(&r.desktop));
@@ -2566,6 +2603,10 @@ pub type Scenario = fn(&RelayTarget);
 /// Every single-Relay scenario, by name.
 pub const SCENARIOS: &[(&str, Scenario)] = &[
     ("member_auth_succeeds", member_auth_succeeds),
+    (
+        "old_relay_hands_a_move_to_a_lagging_device",
+        old_relay_hands_a_move_to_a_lagging_device,
+    ),
     ("non_member_auth_fails", non_member_auth_fails),
     ("forged_auth_signature_fails", forged_auth_signature_fails),
     ("failing_signer_fails_auth", failing_signer_fails_auth),

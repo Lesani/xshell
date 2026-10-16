@@ -177,6 +177,17 @@ non-canonical `noiseKey`) makes the token `malformed`, not `invalid`.
 Moving a Ring to another Relay is an ordinary new version with a new `relayUrl`. A chain is
 at most 4096 versions long.
 
+**Relay moves.** A Relay stores, serves and broadcasts a version whose `relayUrl` names
+another Relay like any other; it never refuses one for that and does not look at `relayUrl`
+at all. Devices follow the head: a device that receives a head naming another Relay first
+fetches the rest of what its Relay holds (`roster.get`, section 11) and only then dials the
+Relay the newest head names. A Desktop that moved the Ring moves its own connection at once
+and owes each old Relay that held the Ring a **farewell** (ADR-0012): a short connection that
+authenticates there with the whole chain staged (`auth.chain`, section 7), so the old Relay
+commits up to the newest head in one step and the devices still on it go straight to the
+newest Relay, never to one in between. A farewell is retried in the background until the old
+Relay took it; nothing waits for it.
+
 **Accepting into a stored chain** (devices and Relays alike): a version byte-identical to a
 stored one is skipped. A stored version number with different bytes is refused: `prev_mismatch`
 at the head (a fork), `stale` below it. Anything newer must be a valid successor of the head.
@@ -291,7 +302,8 @@ Relay  -> {"t":"welcome","you":"<signKey>","rosterVersion":N,"presence":[…],"e
 `rosterVersion` sends the versions the Relay lacks, oldest first, in as many `auth.chain`
 frames as needed (each frame at most 1 MiB). For a Relay with no Roster that is the whole
 chain from version 1. Whole chains, not only a creator-signed version 1, are accepted so
-that a Ring can move to a new Relay. The Relay keeps the tokens as an uncommitted
+that a Ring can move to a new Relay, and so that a Desktop's farewell (section 4.3) brings an
+old Relay up to the newest head at once. The Relay keeps the tokens as an uncommitted
 **candidate**. Each token must parse (else `error{code:"roster_invalid",detail}`, close 4003).
 The candidate holds at most 4096 versions and 16 MiB of tokens in all (else
 `roster_invalid` with detail `too_large`, close 4003).
@@ -335,8 +347,10 @@ The candidate holds at most 4096 versions and 16 MiB of tokens in all (else
 3. **Signature.** `sig` must verify over the message above, with the Relay's origin, else
    `error{code:"bad_signature"}`, close 4001.
 4. **Commit.** Only now does the Relay store the candidate's new versions. It then
-   broadcasts each new version as `{"t":"roster",…}` to the other connected members and
-   disconnects members the new head no longer lists (section 11).
+   broadcasts each new version as `{"t":"roster",…}`, oldest first, to the other connected
+   members and disconnects members the new head no longer lists (section 11). (A device
+   that sees an intermediate version name another Relay fetches the rest before it follows,
+   section 4.3.)
 5. **Replace.** An existing socket of the same `signKey` gets `error{code:"replaced"}` and
    close 4009. That is not a goodbye, and its later close or error does not change presence
    (section 8).
@@ -833,7 +847,10 @@ foreground_lease }`. This repository runs them against the test
 Relay. `xshell-remote` runs the same functions against the Worker on workerd, which makes them
 the definition of a conforming Relay. Every scenario uses fresh random keys, so it needs no
 reset. `contract::SCENARIOS` lists the single-Relay scenarios.
-`ring_moves_to_new_relay_with_full_chain` takes two Relays. `entitlement_slot_round_trips`
+`ring_moves_to_new_relay_with_full_chain` takes two Relays. `SCENARIOS` includes
+`old_relay_hands_a_move_to_a_lagging_device` (a farewell staged at `auth` whose versions name
+another Relay: committed at once, broadcast to a connected device version by version, paged
+down by a device that comes back, and followed by an ordinary upload). `entitlement_slot_round_trips`
 assumes a Relay without the gateway key. `contract::HOSTED_SCENARIOS` run against a Hosted
 Relay; their target's `gateway` holds the gateway signing key the Relay trusts, so they can
 mint tokens (`hosted_routing_ends_when_the_last_token_expires` is the routing cutoff test).

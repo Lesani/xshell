@@ -73,6 +73,10 @@ pub struct RingClientConfig {
     pub tls: Option<Arc<ClientConfig>>,
     pub timeouts: RingTimeouts,
     pub limits: RingLimits,
+    /// Dial this Relay instead of the one the head names (and sign its origin): a Desktop
+    /// telling an old Relay where the Ring went, with the whole chain staged. `None`: the
+    /// head's Relay.
+    pub dial: Option<String>,
 }
 
 impl RingClientConfig {
@@ -83,6 +87,7 @@ impl RingClientConfig {
             tls: None,
             timeouts: RingTimeouts::default(),
             limits: RingLimits::default(),
+            dial: None,
         }
     }
 }
@@ -596,9 +601,10 @@ impl RingClient {
         Ok(chain)
     }
 
-    /// Dials the Relay named by the trusted head, authenticates, and syncs the Roster: a
-    /// Relay behind gets the missing versions staged before `auth`, a Relay ahead is asked
-    /// for its newer versions, each verified before it is trusted.
+    /// Dials the Relay named by the trusted head (or [`RingClientConfig::dial`]),
+    /// authenticates, and syncs the Roster: a Relay behind gets the missing versions staged
+    /// before `auth`, so it commits them all at once, a Relay ahead is asked for its newer
+    /// versions, each verified before it is trusted.
     pub fn connect(
         cfg: RingClientConfig,
         events: Arc<dyn RingEvents>,
@@ -611,8 +617,11 @@ impl RingClient {
                 "this device is not in its Roster".into(),
             ));
         }
-        let url = RelayUrl::parse(&chain.head().roster().relay_url)
-            .map_err(|e| RingError::Invalid(e.to_string()))?;
+        let dial = cfg
+            .dial
+            .as_deref()
+            .unwrap_or(&chain.head().roster().relay_url);
+        let url = RelayUrl::parse(dial).map_err(|e| RingError::Invalid(e.to_string()))?;
         let ring = chain.ring_id().clone();
         let mut early = Early::default();
         let stage = |relay_version: u64| -> Vec<String> {
@@ -954,6 +963,16 @@ impl RingClient {
         match rx.recv_timeout(self.timeouts.bye + Duration::from_millis(500)) {
             Ok(r) => r,
             Err(_) => Err(RingError::Timeout),
+        }
+    }
+}
+
+impl RingClient {
+    /// Drops the connection now, without a goodbye, from any thread: a request waiting on
+    /// it ends with `Closed`.
+    pub(crate) fn shutdown(&self) {
+        if !self.outbox.is_closed() {
+            self.outbox.shutdown();
         }
     }
 }

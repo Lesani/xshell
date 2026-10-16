@@ -24,7 +24,8 @@ use super::super::noise::{
     Sealer, Sid,
 };
 use super::super::{DeviceKeys, Member, RingError, Role, SignKey, SignedRoster};
-use super::connector::{Connector, ConnectorEvents, LinkState, MoveState};
+use super::connector::{Connector, ConnectorEvents, LinkState};
+use super::farewell::FarewellState;
 use super::wire::{ErrorCode, MemberPresence};
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -833,9 +834,15 @@ impl ConnectorEvents for SessionEvents {
         }
     }
 
-    fn moved(&self, m: &MoveState) {
+    fn farewell(&self, s: &FarewellState) {
         if let Some(n) = &self.next {
-            n.moved(m);
+            n.farewell(s);
+        }
+    }
+
+    fn held(&self, relay: &str, version: u64) {
+        if let Some(n) = &self.next {
+            n.held(relay, version);
         }
     }
 

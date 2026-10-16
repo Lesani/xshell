@@ -11,6 +11,14 @@ pub fn backoff(n: u32, unit: Duration) -> Duration {
     unit * BACKOFF[(n as usize).min(BACKOFF.len() - 1)] as u32
 }
 
+/// The wait before retry `n` (0-based) on a schedule that doubles from `unit` up to `max`
+/// and stays there: for retries that may go on for days, such as a farewell owed to a Relay
+/// that is gone.
+pub fn capped(n: u32, unit: Duration, max: Duration) -> Duration {
+    let factor = 1u32.checked_shl(n.min(31)).unwrap_or(u32::MAX);
+    unit.saturating_mul(factor).min(max)
+}
+
 /// Consecutive failures, reset only by a connection that stayed up long enough.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
@@ -50,6 +58,19 @@ mod tests {
         assert_eq!(
             backoff(u32::MAX, Duration::from_millis(10)),
             Duration::from_millis(600)
+        );
+    }
+
+    #[test]
+    fn capped_backoff_doubles_up_to_the_cap() {
+        let unit = Duration::from_secs(5);
+        let max = Duration::from_secs(15 * 60);
+        let s: Vec<u64> = (0..10).map(|n| capped(n, unit, max).as_secs()).collect();
+        assert_eq!(s, [5, 10, 20, 40, 80, 160, 320, 640, 900, 900]);
+        assert_eq!(capped(u32::MAX, unit, max), max);
+        assert_eq!(
+            capped(40, Duration::from_secs(u64::MAX / 2), Duration::MAX),
+            Duration::MAX
         );
     }
 

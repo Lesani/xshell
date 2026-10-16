@@ -2633,6 +2633,145 @@ impl Drop for TrickleProxy {
     }
 }
 
+/// A TCP proxy that can stand for a Relay that is gone: while closed it cuts every
+/// connection through it and closes each new one at once; while open it forwards both ways.
+/// [`GateProxy::hold_next`] holds the next connection's client bytes (its `auth`, say) until
+/// [`GateProxy::release`]. It counts every connection it accepted.
+pub struct GateProxy {
+    addr: SocketAddr,
+    shared: Arc<GateShared>,
+}
+
+#[derive(Default)]
+struct GateShared {
+    stop: AtomicBool,
+    open: AtomicBool,
+    accepted: std::sync::atomic::AtomicUsize,
+    /// Both sides of every connection forwarded, to cut them on close.
+    live: Mutex<Vec<(TcpStream, TcpStream)>>,
+    hold_next: AtomicBool,
+    /// `true` once the held connections may go on.
+    released: Mutex<bool>,
+    released_cv: std::sync::Condvar,
+}
+
+impl GateProxy {
+    /// A proxy in front of `upstream`, open.
+    pub fn start(upstream: SocketAddr) -> GateProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy address");
+        listener.set_nonblocking(true).expect("nonblocking proxy");
+        let shared = Arc::new(GateShared::default());
+        shared.open.store(true, Ordering::Release);
+        let sh = shared.clone();
+        thread::spawn(move || {
+            while !sh.stop.load(Ordering::Acquire) {
+                let Ok((client, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                sh.accepted.fetch_add(1, Ordering::AcqRel);
+                if !sh.open.load(Ordering::Acquire) {
+                    let _ = client.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                let _ = client.set_nonblocking(false);
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                let (Ok(c2), Ok(s2), Ok(c3), Ok(s3)) = (
+                    client.try_clone(),
+                    server.try_clone(),
+                    client.try_clone(),
+                    server.try_clone(),
+                ) else {
+                    continue;
+                };
+                sh.live
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((c3, s3));
+                let held = sh.hold_next.swap(false, Ordering::AcqRel);
+                if held {
+                    *sh.released.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                }
+                let gate = sh.clone();
+                thread::spawn(move || {
+                    if held {
+                        let mut r = gate.released.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*r && !gate.stop.load(Ordering::Acquire) {
+                            r = gate
+                                .released_cv
+                                .wait_timeout(r, Duration::from_millis(50))
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0;
+                        }
+                    }
+                    pipe(client, server, usize::MAX, Duration::ZERO)
+                });
+                thread::spawn(move || pipe(s2, c2, usize::MAX, Duration::ZERO));
+            }
+        });
+        GateProxy { addr, shared }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The `ws://` URL that reaches the upstream Relay through this proxy.
+    pub fn url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// Opens or closes the gate. Closing cuts every connection through it.
+    pub fn set_open(&self, open: bool) {
+        self.shared.open.store(open, Ordering::Release);
+        if !open {
+            for (c, s) in self
+                .shared
+                .live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                let _ = c.shutdown(std::net::Shutdown::Both);
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Every connection accepted so far, those closed at once included.
+    pub fn connections(&self) -> usize {
+        self.shared.accepted.load(Ordering::Acquire)
+    }
+
+    /// Holds the bytes the next connection's client sends until [`GateProxy::release`]; the
+    /// Relay's bytes go through.
+    pub fn hold_next(&self) {
+        self.shared.hold_next.store(true, Ordering::Release);
+    }
+
+    /// Lets held connections go on.
+    pub fn release(&self) {
+        *self
+            .shared
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        self.shared.released_cv.notify_all();
+    }
+}
+
+impl Drop for GateProxy {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.set_open(false);
+    }
+}
+
 /// Forwards `from` to `to`, `chunk` bytes per `every`. The pace is kept against a schedule,
 /// not by sleeping `every` after each piece: a sleep can last several times longer than asked
 /// (macOS runners under load stretch a 15 ms sleep to 65 ms), and per-piece sleeps would add

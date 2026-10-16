@@ -470,7 +470,7 @@ impl Persist {
         let trusted = saved.trusted;
         if &trusted != chain {
             if let Some(c) = connector {
-                c.set_chain(trusted.clone(), None);
+                c.set_chain(trusted.clone());
             }
         }
         sessions.sweep(trusted.head());
@@ -807,7 +807,7 @@ impl Ring {
         match life.joined.as_ref() {
             Some(j) if same_ring => {
                 if moved {
-                    j.connector.set_chain(trusted.clone(), None);
+                    j.connector.set_chain(trusted.clone());
                 } else {
                     j.connector.kick();
                 }

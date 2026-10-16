@@ -7,6 +7,8 @@ mod client;
 #[cfg(feature = "relay-client")]
 pub mod connector;
 #[cfg(feature = "relay-client")]
+mod farewell;
+#[cfg(feature = "relay-client")]
 mod io;
 #[cfg(feature = "relay-client")]
 pub mod pair;
@@ -28,5 +30,7 @@ pub use client::{
     RingTimeouts, Ticket,
 };
 #[cfg(feature = "relay-client")]
-pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState};
+pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState};
+#[cfg(feature = "relay-client")]
+pub use farewell::{Farewell, FarewellState};
 pub use wire::{ByeReason, CloseReason, ErrorCode, MemberPresence, Presence};
