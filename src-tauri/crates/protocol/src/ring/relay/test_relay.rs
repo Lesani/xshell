@@ -365,6 +365,12 @@ struct Shared {
     ignore_puts: AtomicBool,
     /// Drop every `roster.get` without an answer (see `ignore_roster_gets`).
     ignore_gets: AtomicBool,
+    /// Broadcast only the first version of a commit at `auth` (see `split_commits`).
+    split_commits: AtomicBool,
+    /// What the next `roster.get` gets instead of its answer (see `fail_next_roster_get`).
+    get_fault: Mutex<Option<GetFault>>,
+    /// `roster.get`s received after `welcome`.
+    gets: std::sync::atomic::AtomicUsize,
     /// `roster.put`s answered `roster_stale` (see `stale_roster_puts`).
     stale_puts: std::sync::atomic::AtomicUsize,
     /// Envelope rewriters by (Ring, addressee).
@@ -601,6 +607,9 @@ impl TestRelay {
             refuse_puts: AtomicBool::new(false),
             ignore_puts: AtomicBool::new(false),
             ignore_gets: AtomicBool::new(false),
+            split_commits: AtomicBool::new(false),
+            get_fault: Mutex::new(None),
+            gets: std::sync::atomic::AtomicUsize::new(0),
             stale_puts: std::sync::atomic::AtomicUsize::new(0),
             tampers: Mutex::new(HashMap::new()),
             recording: AtomicBool::new(false),
@@ -787,6 +796,26 @@ impl TestRelay {
     /// toward the quota); frames injected for a socket are its only answers.
     pub fn ignore_roster_gets(&self, on: bool) {
         self.shared.ignore_gets.store(on, Ordering::Release);
+    }
+
+    /// While on, a commit at `auth` of several versions (a staged move) broadcasts only the
+    /// first of them; a connected member gets the rest only by asking (`roster.get`).
+    pub fn split_commits(&self, on: bool) {
+        self.shared.split_commits.store(on, Ordering::Release);
+    }
+
+    /// The next `roster.get` after `welcome`, from anyone, is answered by `fault` instead.
+    pub fn fail_next_roster_get(&self, fault: GetFault) {
+        *self
+            .shared
+            .get_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(fault);
+    }
+
+    /// How many `roster.get`s after `welcome` the Relay received so far.
+    pub fn roster_gets(&self) -> usize {
+        self.shared.gets.load(Ordering::Acquire)
     }
 
     /// How many `roster.put`s were answered `roster_stale` so far.
@@ -1797,7 +1826,12 @@ impl Conn {
         });
         state.chain = chain;
         if existed {
-            state.announce(&added, &removed, Some(&key));
+            let shown = if self.shared.split_commits.load(Ordering::Acquire) {
+                &added[..added.len().min(1)]
+            } else {
+                &added[..]
+            };
+            state.announce(shown, &removed, Some(&key));
         }
         let gen = {
             let g = state.gens.entry(key).or_insert(0);
@@ -2008,8 +2042,24 @@ impl Conn {
                 }
             }
             ClientFrame::RosterGet { id, since } => {
+                self.shared.gets.fetch_add(1, Ordering::AcqRel);
                 if self.shared.ignore_gets.load(Ordering::Acquire) {
                     return;
+                }
+                let fault = self
+                    .shared
+                    .get_fault
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                match fault {
+                    Some(GetFault::Ignore) => return,
+                    Some(GetFault::Refuse) => {
+                        self.error(ErrorCode::Quota, Some(id), None, None);
+                        return;
+                    }
+                    Some(GetFault::Close) => return self.close(1011),
+                    None => {}
                 }
                 let tokens: Vec<String> = match self.rings().get(&ring) {
                     Some(s) => s
@@ -2631,6 +2681,17 @@ impl Drop for TrickleProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
     }
+}
+
+/// What [`TestRelay::fail_next_roster_get`] does to the next `roster.get`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetFault {
+    /// Leaves it unanswered.
+    Ignore,
+    /// Refuses it (`error{code:"quota"}` with its id).
+    Refuse,
+    /// Closes the socket (1011).
+    Close,
 }
 
 /// A TCP proxy that can stand for a Relay that is gone: while closed it cuts every

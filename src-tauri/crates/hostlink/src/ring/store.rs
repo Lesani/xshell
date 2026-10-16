@@ -672,13 +672,18 @@ mod tests {
     fn a_farewell_owed_to_the_placeholder_is_dropped_on_load() {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("ring");
-        let placeholder = super::super::LEGACY_PLACEHOLDER_RELAY_URL;
-        let hosted = xshell_protocol::ring::url::HOSTED_RELAY_URL;
-        write_legacy(
-            &dir,
-            &moved(&[placeholder, hosted]),
-            Some(("wss://RELAY.xshell.app:443/", 1, 2)),
+        // The placeholder in another spelling of its origin, the same in the chain and the
+        // move, so the farewell is otherwise owed: only the origin check drops it.
+        let placeholder = "wss://RELAY.xshell.app:443/";
+        assert_eq!(
+            normalize_origin(placeholder).unwrap(),
+            normalize_origin(super::super::LEGACY_PLACEHOLDER_RELAY_URL).unwrap()
         );
+        let hosted = xshell_protocol::ring::url::HOSTED_RELAY_URL;
+        let st = moved(&[placeholder, hosted]);
+        let owed = Farewell::new(&st.chain, 1).unwrap();
+        assert!(owed.still_owed(&st.chain));
+        write_legacy(&dir, &st, Some((placeholder, 1, 2)));
         let got = Store::new(dir).load().unwrap().0.unwrap();
         assert!(got.farewells.is_empty(), "{:?}", got.farewells);
         assert_eq!(got.held_relays, [hosted.to_string()].into());

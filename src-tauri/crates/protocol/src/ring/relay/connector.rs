@@ -15,7 +15,13 @@
 //! from the Relay that names another Relay is followed, but first the rest of what this
 //! Relay holds is fetched (`roster.get` until nothing new comes): a Relay that commits several
 //! versions at once broadcasts each of them, and a device must not dial an intermediate
-//! Relay when the newest head names a later one.
+//! Relay when the newest head names a later one. That fetch can fail (the connection drops,
+//! the Relay refuses or does not answer), so the Relay a move came from stays a **fallback**:
+//! while the head's Relay keeps failing, every other attempt dials the fallback instead, with
+//! the chain this device has, and follows a newer head it holds. Those attempts report
+//! nothing but the normal `Waiting` (with the head's Relay's error). The fallback is dropped
+//! once the head's Relay is connected, and when the owner sets a chain
+//! ([`Connector::set_chain`]).
 //!
 //! **Farewells** (ADR-0012). A Desktop that changes the Relay URL owes each old Relay a
 //! [`Farewell`], or the devices still connected there never learn of the move. The Connector
@@ -153,6 +159,10 @@ pub(super) struct St {
     /// The current connection's Relay sent a head naming another Relay: fetch the rest of
     /// what it holds before following.
     follow: bool,
+    /// The Relay the head was last followed from, until the head's Relay is connected.
+    fallback: Option<String>,
+    /// The next attempt dials the fallback (the last one at the head's Relay failed).
+    try_fallback: bool,
     kick: bool,
     /// Limited state changed (entitlement); the worker re-reports `Connected`.
     refresh: bool,
@@ -313,9 +323,11 @@ impl RingEvents for Attempt {
             st.chain = m.clone();
             st.fw_dirty = true;
             if moved {
-                // The Ring moved: follow it, once the rest of what this Relay holds is in.
+                // The Ring moved: follow it, once the rest of what this Relay holds is in,
+                // and keep this Relay to fall back on.
                 st.dirty = true;
                 st.follow = true;
+                st.fallback = Some(self.dialed.clone());
             }
             inner.cv.notify_all();
             (m, Inner::prune_farewells(&mut st))
@@ -518,18 +530,48 @@ impl Inner {
 
     /// Fetches what the Relay `c` is connected to holds beyond `c`'s head, until it sends
     /// nothing new, bounded by the request timeout. Each version comes through the attempt's
-    /// `chain` callback.
-    fn catch_up(&self, c: &RingClient) {
+    /// `chain` callback. `true`: complete; `false`: the Relay refused, did not answer or
+    /// closed first, so it may hold more (the fallback asks again).
+    fn catch_up(&self, c: &RingClient) -> bool {
         let until = Instant::now() + self.base.timeouts.request;
         loop {
             let before = c.chain().head().version();
             let r = c
                 .probe_start()
                 .and_then(|t| t.wait_until(until, || lock(&self.st).stop.is_some()));
-            if r.is_err() || c.chain().head().version() == before {
-                return;
+            if r.is_err() {
+                return false;
+            }
+            if c.chain().head().version() == before {
+                return true;
             }
         }
+    }
+
+    /// One attempt at the fallback `source` with `chain` (attempt `gen`): what it holds
+    /// beyond `chain` comes through the attempt's `chain` callback, and the connection is
+    /// dropped. `Ok(true)`: the head now names another Relay than before; `Err`: stopped.
+    fn fall_back(self: &Arc<Self>, chain: RosterChain, source: &str, gen: u64) -> Result<bool, ()> {
+        let before = chain.head().roster().relay_url.clone();
+        let mut cfg = self.base.clone();
+        cfg.chain = chain;
+        cfg.dial = Some(source.to_string());
+        let events = Arc::new(Attempt {
+            inner: Arc::downgrade(self),
+            gen,
+            dialed: source.to_string(),
+        });
+        let r = RingClient::connect(cfg, events);
+        let mut st = lock(&self.st);
+        // Fenced off: nothing of this connection counts any more.
+        st.gen += 1;
+        if st.stop.is_some() {
+            drop(st);
+            drop(r);
+            self.finish(None);
+            return Err(());
+        }
+        Ok(r.is_ok() && st.chain.head().roster().relay_url != before)
     }
 
     /// The stop request: says goodbye on `c` if there is one.
@@ -547,9 +589,11 @@ impl Inner {
 
     fn run(self: Arc<Self>) {
         let mut backoff = Backoff::default();
+        // The head's Relay's last error, for `Waiting` after a fallback attempt.
+        let mut head_error = String::new();
         'attempt: loop {
             // One attempt: what to dial, under a new generation.
-            let (target, gen) = {
+            let (target, gen, via) = {
                 let mut st = lock(&self.st);
                 if st.stop.is_some() {
                     break;
@@ -560,8 +604,31 @@ impl Inner {
                 st.closed = None;
                 st.refresh = false;
                 st.gen += 1;
-                (st.chain.clone(), st.gen)
+                let head = st.chain.head().roster().relay_url.clone();
+                if st.fallback.as_deref() == Some(head.as_str()) {
+                    st.fallback = None;
+                }
+                let via = if std::mem::take(&mut st.try_fallback) {
+                    st.fallback.clone()
+                } else {
+                    None
+                };
+                (st.chain.clone(), st.gen, via)
             };
+            if let Some(source) = via {
+                match self.fall_back(target, &source, gen) {
+                    Err(()) => break,
+                    // The fallback knew a newer head: dial its Relay at once.
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        let retry_in = backoff.failed(self.backoff_unit);
+                        if self.backoff_wait(retry_in, head_error.clone()) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             self.set_link(LinkState::Connecting {
                 attempt: backoff.failures,
             });
@@ -623,6 +690,11 @@ impl Inner {
                         self.report_held(gen, &dialed, dialed_version);
                         self.report_quota(gen, &dialed);
                     }
+                    {
+                        let mut st = lock(&self.st);
+                        st.try_fallback = st.fallback.is_some();
+                    }
+                    head_error = e.to_string();
                     let retry_in = backoff.failed(self.backoff_unit);
                     if self.backoff_wait(retry_in, e.to_string()) {
                         break;
@@ -631,6 +703,13 @@ impl Inner {
                 }
             };
             let up_at = Instant::now();
+            {
+                // On the head's Relay: nothing to fall back on any more.
+                let mut st = lock(&self.st);
+                if st.chain.head().roster().relay_url == dialed {
+                    st.fallback = None;
+                }
+            }
 
             // Versions set while the connect ran.
             if c.chain().head().version() < lock(&self.st).chain.head().version() {
@@ -649,7 +728,9 @@ impl Inner {
                     Woke::Kick | Woke::Timeout => {}
                     Woke::Dirty => {
                         if std::mem::take(&mut lock(&self.st).follow) {
-                            self.catch_up(&c);
+                            // Complete or not, the fallback (set with `follow`) covers the
+                            // rest.
+                            let _complete = self.catch_up(&c);
                         }
                         if !self.sync(&c, &dialed) {
                             // Another Ring or another Relay: dial again, at once.
@@ -750,6 +831,8 @@ impl Connector {
                 link: LinkState::Connecting { attempt: 0 },
                 dirty: false,
                 follow: false,
+                fallback: None,
+                try_fallback: false,
                 kick: false,
                 refresh: false,
                 stop: None,
@@ -819,6 +902,9 @@ impl Connector {
                 st.farewells.clear();
             }
             st.chain = chain;
+            // The owner's chain: no Relay of an earlier move to fall back on.
+            st.fallback = None;
+            st.try_fallback = false;
             st.dirty = true;
             st.fw_dirty = true;
             self.inner.cv.notify_all();
