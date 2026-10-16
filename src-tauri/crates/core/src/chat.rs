@@ -574,6 +574,78 @@ fn fit_line(es: &mut Vec<ChatEntry>, budget: usize) {
     }
 }
 
+/// A line of Claude's conversation tree: it has a `uuid` and is not a subagent's. Claude's
+/// session file is append-only: a rewind appends the new prompt with `parentUuid` naming the
+/// line before the message rewound to, and the abandoned lines stay in the file before it.
+struct Link {
+    uuid: String,
+    /// The `parentUuid` of a prompt (a user message that is not a tool result); `None` for
+    /// every other line. `Some(None)`: a prompt with no parent, the start of a conversation.
+    prompt: Option<Option<String>>,
+}
+
+fn claude_link(json: &Value) -> Option<Link> {
+    let uuid = json.get("uuid")?.as_str()?.to_string();
+    // Progress records (older Claude versions gave them uuids) are not part of the tree:
+    // Claude does not parent the next line on them.
+    if json.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || json.get("type").and_then(Value::as_str) == Some("progress")
+    {
+        return None;
+    }
+    let content = json.get("message").and_then(|m| m.get("content"));
+    let is_prompt = json.get("type").and_then(Value::as_str) == Some("user")
+        && json.get("isMeta").and_then(Value::as_bool) != Some(true)
+        && match content {
+            Some(Value::String(_)) => true,
+            Some(Value::Array(parts)) => !parts
+                .iter()
+                .any(|p| p.get("type").and_then(Value::as_str) == Some("tool_result")),
+            _ => false,
+        };
+    let prompt = is_prompt.then(|| {
+        json.get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    Some(Link { uuid, prompt })
+}
+
+/// Where a backwards read stands on Claude's conversation tree, carried from one page to the
+/// next with its cursor. A page shows only the branch the conversation is on: the prompt it
+/// last took must follow its parent, else the lines in between are an abandoned branch and are
+/// skipped back to that parent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Back {
+    #[default]
+    Free,
+    /// A prompt was taken: the next older line of the tree must be this parent (`None`: the
+    /// prompt started the conversation).
+    Expect(Option<String>),
+    /// On an abandoned branch: every line is skipped up to the one with this uuid (`None`: to
+    /// the start of the file).
+    Skip(Option<String>),
+}
+
+impl Back {
+    /// The state after line `link` (older than every line read so far), and whether the line
+    /// is shown.
+    fn step(&self, link: Option<&Link>) -> (Back, bool) {
+        let Some(l) = link else {
+            return (self.clone(), !matches!(self, Back::Skip(_)));
+        };
+        match self {
+            Back::Expect(p) | Back::Skip(p) if p.as_deref() != Some(l.uuid.as_str()) => {
+                (Back::Skip(p.clone()), false)
+            }
+            _ => match &l.prompt {
+                Some(parent) => (Back::Expect(parent.clone()), true),
+                None => (Back::Free, true),
+            },
+        }
+    }
+}
+
 /// Collects whole lines' entries up to an item count and a byte budget.
 struct Collect {
     agent: ChatAgent,
@@ -607,11 +679,8 @@ impl Collect {
         }
     }
 
-    fn take(&mut self, start: u64, line: &[u8]) -> Took {
-        let Ok(json) = serde_json::from_slice::<Value>(line) else {
-            return Took::Nothing;
-        };
-        let mut es = items_from_line(self.agent, &json, self.gen, start);
+    fn take(&mut self, start: u64, json: &Value) -> Took {
+        let mut es = items_from_line(self.agent, json, self.gen, start);
         if es.is_empty() {
             return Took::Nothing;
         }
@@ -764,18 +833,35 @@ fn mid_line(f: &mut File, at: u64) -> bool {
     at > 0 && read_at(f, at - 1, 1).as_deref() != Some(&b"\n"[..])
 }
 
+/// What a page read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// Oldest first.
+    pub items: Vec<ChatEntry>,
+    /// Where the next older page ends; `None` at the start of the file.
+    pub before: Option<u64>,
+    /// Where the read stands on the conversation tree at `before`: the next older page goes
+    /// on from it.
+    pub back: Back,
+    /// The uuid of the newest line of the tree that was read (Claude only), for
+    /// [`read_forward`] going on from `upper`.
+    pub newest: Option<String>,
+}
+
 /// The newest entries before `upper` (a line boundary: [`complete_end`] or an earlier
 /// page's cursor), oldest first: at most `limit` of them (more only when one line has more)
-/// within the byte budget, whole lines only. The cursor is where the next older page ends;
-/// `None` at the start of the file.
+/// within the byte budget, whole lines only, and of a Claude session only the branch it is on
+/// (see [`Back`]; `back` is [`Page::back`] of the page that handed out `upper`, or
+/// [`Back::Free`] at the end of the file).
 pub fn page(
     f: &mut File,
     agent: ChatAgent,
     gen: u64,
     upper: u64,
     limit: usize,
-) -> (Vec<ChatEntry>, Option<u64>) {
-    page_with(f, agent, gen, upper, limit, BOUNDS)
+    back: Back,
+) -> Page {
+    page_with(f, agent, gen, upper, limit, back, BOUNDS)
 }
 
 pub(crate) fn page_with(
@@ -784,9 +870,14 @@ pub(crate) fn page_with(
     gen: u64,
     upper: u64,
     limit: usize,
+    mut back: Back,
     b: Bounds,
-) -> (Vec<ChatEntry>, Option<u64>) {
+) -> Page {
     let mut c = Collect::new(agent, gen, limit, b.bytes);
+    let mut newest: Option<String> = None;
+    // The newest line of the tree is found, or a line that could not be read came first (its
+    // uuid unknown: `newest` stays `None`).
+    let mut newest_done = false;
     // Above a cursor inside a line (an oversized one's), the bytes up to it are only part of
     // that line: skipped like it, never decoded.
     let fragment = mid_line(f, upper);
@@ -816,21 +907,57 @@ pub(crate) fn page_with(
                 }
                 break;
             }
-            Rev::Line(start, None) => before = start,
-            Rev::Line(start, Some(line)) => match c.take(start, &line) {
-                Took::Full => break,
-                Took::Nothing => before = start,
-                Took::Taken => {
+            // Unreadable or too long to read: not shown. It may be the parent looked for, so
+            // the branch is taken to go on here (showing too much, never hiding the branch).
+            Rev::Line(start, None) => {
+                back = Back::Free;
+                newest_done = true;
+                before = start;
+            }
+            // The end of the file, or of what an earlier page read: nothing.
+            Rev::Line(start, Some(line)) if line.trim_ascii().is_empty() => before = start,
+            Rev::Line(start, Some(line)) => {
+                let Ok(json) = serde_json::from_slice::<Value>(&line) else {
+                    back = Back::Free;
+                    newest_done = true;
                     before = start;
-                    if c.full() {
-                        break;
+                    continue;
+                };
+                let link = (agent == ChatAgent::Claude)
+                    .then(|| claude_link(&json))
+                    .flatten();
+                let (next, shown) = back.step(link.as_ref());
+                if !shown {
+                    back = next;
+                    before = start;
+                    continue;
+                }
+                match c.take(start, &json) {
+                    Took::Full => break,
+                    Took::Nothing | Took::Taken => {
+                        if !newest_done {
+                            if let Some(l) = link {
+                                newest = Some(l.uuid);
+                                newest_done = true;
+                            }
+                        }
+                        back = next;
+                        before = start;
+                        if c.full() {
+                            break;
+                        }
                     }
                 }
-            },
+            }
         }
     }
     let items = c.lines.into_iter().rev().flatten().collect();
-    (items, (before > 0).then_some(before))
+    Page {
+        items,
+        before: (before > 0).then_some(before),
+        back,
+        newest,
+    }
 }
 
 /// What a forward read found.
@@ -841,12 +968,21 @@ pub struct Forward {
     pub next: u64,
     /// Stopped early (count, bytes or scan budget): read again from `next`.
     pub more: bool,
+    /// Stopped at a Claude prompt that does not follow the line before it: the conversation
+    /// was rewound and the lines read so far may be an abandoned branch. `next` is the
+    /// prompt's start; the subscription starts over from the end of the file.
+    pub fork: bool,
+    /// The uuid of the newest line of the tree before `next` (Claude only), `None` when it is
+    /// not known: the `last` of the next read.
+    pub last: Option<String>,
 }
 
 /// The entries of the complete lines between `from` and `len`, in order, at most `limit`
 /// (more only when one line has more) within the byte budget, whole lines only. A partial
 /// last line is left for the next read; an oversized one is skipped, also when that leaves
-/// `next` inside it.
+/// `next` inside it. `last` is the uuid of the newest line of a Claude session's tree before
+/// `from` ([`Page::newest`] or [`Forward::last`]); a prompt whose parent is not it stops the
+/// read ([`Forward::fork`]).
 pub fn read_forward(
     f: &mut File,
     agent: ChatAgent,
@@ -854,10 +990,12 @@ pub fn read_forward(
     from: u64,
     len: u64,
     limit: usize,
+    last: Option<String>,
 ) -> Forward {
-    read_forward_with(f, agent, gen, from, len, limit, BOUNDS)
+    read_forward_with(f, agent, gen, from, len, limit, last, BOUNDS)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_forward_with(
     f: &mut File,
     agent: ChatAgent,
@@ -865,6 +1003,7 @@ pub(crate) fn read_forward_with(
     from: u64,
     len: u64,
     limit: usize,
+    mut last: Option<String>,
     b: Bounds,
 ) -> Forward {
     let mut c = Collect::new(agent, gen, limit, b.bytes);
@@ -877,10 +1016,12 @@ pub(crate) fn read_forward_with(
     let mut skipping = mid_line(f, from);
     let mut read_pos = from;
     let mut scanned = 0u64;
-    let done = |c: Collect, next: u64, more: bool| Forward {
+    let done = |c: Collect, next: u64, more: bool, last: Option<String>| Forward {
         items: c.lines.into_iter().flatten().collect(),
         next,
         more,
+        fork: false,
+        last,
     };
     loop {
         let mut cut = 0;
@@ -891,18 +1032,43 @@ pub(crate) fn read_forward_with(
             cut = e + 1;
             if skipping {
                 skipping = false;
+                last = None;
                 next = end;
                 continue;
             }
-            if e - s <= b.max_line {
-                match c.take(start, &buf[s..e]) {
-                    Took::Full => return done(c, next, true),
-                    Took::Nothing | Took::Taken => {}
+            let blank = buf[s..e].trim_ascii().is_empty();
+            let json = (e - s <= b.max_line)
+                .then(|| serde_json::from_slice::<Value>(&buf[s..e]).ok())
+                .flatten();
+            match &json {
+                Some(json) => {
+                    let link = (agent == ChatAgent::Claude)
+                        .then(|| claude_link(json))
+                        .flatten();
+                    if let Some(l) = &link {
+                        if let (Some(parent), Some(prev)) = (&l.prompt, &last) {
+                            if parent.as_deref() != Some(prev.as_str()) {
+                                let mut fwd = done(c, start, true, last);
+                                fwd.fork = true;
+                                return fwd;
+                            }
+                        }
+                    }
+                    match c.take(start, json) {
+                        Took::Full => return done(c, next, true, last),
+                        Took::Nothing | Took::Taken => {}
+                    }
+                    if let Some(l) = link {
+                        last = Some(l.uuid);
+                    }
                 }
+                None if blank => {}
+                // Unreadable or too long to read: the next prompt's parent cannot be checked.
+                None => last = None,
             }
             next = end;
             if c.full() {
-                return done(c, next, next < len);
+                return done(c, next, next < len, last);
             }
         }
         buf.drain(..cut);
@@ -910,19 +1076,20 @@ pub(crate) fn read_forward_with(
         if buf.len() > b.max_line {
             // A line too long to hold: skip to its end, moving the cursor inside it.
             skipping = true;
+            last = None;
             buf_pos += buf.len() as u64;
             buf.clear();
             next = buf_pos;
         }
         if read_pos >= len {
-            return done(c, next, false);
+            return done(c, next, false, last);
         }
         if scanned >= b.forward_scan {
-            return done(c, next, true);
+            return done(c, next, true, last);
         }
         let n = b.chunk.min((len - read_pos) as usize);
         let Some(chunk) = read_at(f, read_pos, n).filter(|c| !c.is_empty()) else {
-            return done(c, next, false);
+            return done(c, next, false, last);
         };
         read_pos += chunk.len() as u64;
         scanned += chunk.len() as u64;
@@ -1312,7 +1479,9 @@ mod tests {
         let mut upper = end;
         let mut sizes = Vec::new();
         loop {
-            let (es, before) = page(&mut f, ChatAgent::Claude, 1, upper, 50);
+            let Page {
+                items: es, before, ..
+            } = page(&mut f, ChatAgent::Claude, 1, upper, 50, Back::Free);
             sizes.push(es.len());
             let mut t = texts(&es);
             t.extend(seen);
@@ -1340,13 +1509,33 @@ mod tests {
             .collect();
         let (_, mut f) = file_of(&fx, "a", &lines);
         let end = len(&f);
-        let (es, before) = page(&mut f, ChatAgent::Claude, 1, end, CHAT_PAGE_MAX as usize);
+        let Page {
+            items: es, before, ..
+        } = page(
+            &mut f,
+            ChatAgent::Claude,
+            1,
+            end,
+            CHAT_PAGE_MAX as usize,
+            Back::Free,
+        );
         assert!(es.len() < 150 && es.len() > 10, "{}", es.len());
         assert!(entries_size(&es) <= BOUNDS.bytes);
         let mut got = es.len();
         let mut upper = before.unwrap();
         loop {
-            let (es, b) = page(&mut f, ChatAgent::Claude, 1, upper, CHAT_PAGE_MAX as usize);
+            let Page {
+                items: es,
+                before: b,
+                ..
+            } = page(
+                &mut f,
+                ChatAgent::Claude,
+                1,
+                upper,
+                CHAT_PAGE_MAX as usize,
+                Back::Free,
+            );
             assert!(entries_size(&es) <= BOUNDS.bytes);
             got += es.len();
             match b {
@@ -1370,7 +1559,9 @@ mod tests {
         let mut rounds = 0;
         let found = loop {
             rounds += 1;
-            let (es, before) = page_with(&mut f, ChatAgent::Claude, 1, upper, 50, b);
+            let Page {
+                items: es, before, ..
+            } = page_with(&mut f, ChatAgent::Claude, 1, upper, 50, Back::Free, b);
             if !es.is_empty() {
                 break texts(&es);
             }
@@ -1393,13 +1584,16 @@ mod tests {
         let (_, mut f) = file_of(&fx, "a", &lines);
         // Count boundary: 3 does not fit two lines of two; the older line waits.
         let n = len(&f);
-        let (es, before) = page(&mut f, ChatAgent::Claude, 1, n, 3);
+        let Page {
+            items: es, before, ..
+        } = page(&mut f, ChatAgent::Claude, 1, n, 3, Back::Free);
         assert_eq!(texts(&es), ["t4", "call cmd4"]);
-        let (es2, _) = page(&mut f, ChatAgent::Claude, 1, before.unwrap(), 4);
+        let Page { items: es2, .. } =
+            page(&mut f, ChatAgent::Claude, 1, before.unwrap(), 4, Back::Free);
         assert_eq!(texts(&es2), ["t2", "call cmd2", "t3", "call cmd3"]);
         // A single line with more items than the limit goes out whole.
         let n = len(&f);
-        let (es, _) = page(&mut f, ChatAgent::Claude, 1, n, 1);
+        let Page { items: es, .. } = page(&mut f, ChatAgent::Claude, 1, n, 1, Back::Free);
         assert_eq!(es.len(), 2);
         // Byte boundary: a budget for one line and a bit.
         let one = entries_size(&items_from_line(
@@ -1413,10 +1607,12 @@ mod tests {
             ..BOUNDS
         };
         let n = len(&f);
-        let (es, before) = page_with(&mut f, ChatAgent::Claude, 1, n, 50, b);
+        let Page {
+            items: es, before, ..
+        } = page_with(&mut f, ChatAgent::Claude, 1, n, 50, Back::Free, b);
         assert_eq!(texts(&es), ["t4", "call cmd4"]);
         let n = len(&f);
-        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, b);
+        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, None, b);
         assert_eq!(texts(&fwd.items), ["t0", "call cmd0"]);
         assert!(fwd.more);
         assert!(before.is_some());
@@ -1431,7 +1627,9 @@ mod tests {
             ..BOUNDS
         };
         let n = len(&f);
-        let (es, before) = page_with(&mut f, ChatAgent::Claude, 1, n, 50, b);
+        let Page {
+            items: es, before, ..
+        } = page_with(&mut f, ChatAgent::Claude, 1, n, 50, Back::Free, b);
         assert_eq!(es.len(), 3);
         assert!(entries_size(&es) <= 64 * 1024, "{}", entries_size(&es));
         assert!(matches!(
@@ -1443,7 +1641,7 @@ mod tests {
         ));
         assert_eq!(before, None);
         let n = len(&f);
-        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, b);
+        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, None, b);
         assert_eq!(fwd.items, es);
     }
 
@@ -1455,10 +1653,12 @@ mod tests {
         let lines = [agent("before"), big, agent("after")];
         let (_, mut f) = file_of(&fx, "a", &lines);
         let end = len(&f);
-        let (es, before) = page(&mut f, ChatAgent::Claude, 1, end, 50);
+        let Page {
+            items: es, before, ..
+        } = page(&mut f, ChatAgent::Claude, 1, end, 50, Back::Free);
         assert_eq!(texts(&es), ["before", "after"]);
         assert_eq!(before, None);
-        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, end, 50);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, end, 50, None);
         assert_eq!(texts(&fwd.items), ["before", "after"]);
         assert_eq!((fwd.next, fwd.more), (end, false));
         // With a smaller scan budget the long line takes several reads, each moving on.
@@ -1469,7 +1669,7 @@ mod tests {
         };
         let (mut at, mut got, mut reads) = (0, Vec::new(), 0);
         loop {
-            let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, at, end, 50, b);
+            let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, at, end, 50, None, b);
             assert!(fwd.next > at || !fwd.more);
             got.extend(texts(&fwd.items));
             at = fwd.next;
@@ -1493,13 +1693,13 @@ mod tests {
         .unwrap();
         let mut f = File::open(&p).unwrap();
         let n = len(&f);
-        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50, None);
         assert_eq!(texts(&fwd.items), ["one"]);
         assert!(fwd.next > MAX_LINE as u64 && fwd.next <= len(&f));
         writeln!(w, "\"}}").unwrap();
         writeln!(w, "{}", agent("two")).unwrap();
         let n = len(&f);
-        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, fwd.next, n, 50);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, fwd.next, n, 50, None);
         assert_eq!(texts(&fwd.items), ["two"]);
         // The page's end ignores the long partial line it cannot look through.
         let n = len(&f);
@@ -1536,7 +1736,7 @@ mod tests {
         let end = len(&f);
         let (mut at, mut got, mut reads) = (0, Vec::new(), 0);
         loop {
-            let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, at, end, 50, SMALL);
+            let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, at, end, 50, None, SMALL);
             got.extend(texts(&fwd.items));
             at = fwd.next;
             reads += 1;
@@ -1555,7 +1755,9 @@ mod tests {
         let mut f = File::open(&p).unwrap();
         let (mut upper, mut got, mut pages) = (len(&f), Vec::new(), 0);
         loop {
-            let (es, before) = page_with(&mut f, ChatAgent::Claude, 1, upper, 50, SMALL);
+            let Page {
+                items: es, before, ..
+            } = page_with(&mut f, ChatAgent::Claude, 1, upper, 50, Back::Free, SMALL);
             let mut t = texts(&es);
             t.extend(got);
             got = t;
@@ -1577,7 +1779,7 @@ mod tests {
         writeln!(w, "{}", user("hidden")).unwrap();
         writeln!(w, "{}", agent("after")).unwrap();
         let n = len(&f);
-        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, cursor, n, 50, SMALL);
+        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, cursor, n, 50, None, SMALL);
         assert_eq!(texts(&fwd.items), ["after"]);
     }
 
@@ -1594,21 +1796,21 @@ mod tests {
         let end = complete_end(&mut f, n);
         assert_eq!(end, (user("asked").to_string().len() + 1) as u64);
         let n = len(&f);
-        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50, None);
         assert_eq!(texts(&fwd.items), ["asked"]);
         assert_eq!((fwd.next, fwd.more), (end, false));
         // Read again before it is finished: nothing.
         let n = len(&f);
-        let again = read_forward(&mut f, ChatAgent::Claude, 1, fwd.next, n, 50);
+        let again = read_forward(&mut f, ChatAgent::Claude, 1, fwd.next, n, 50, None);
         assert!(again.items.is_empty());
         assert_eq!(again.next, end);
         writeln!(w, "{}", &half[10..]).unwrap();
         let n = len(&f);
-        let done = read_forward(&mut f, ChatAgent::Claude, 1, again.next, n, 50);
+        let done = read_forward(&mut f, ChatAgent::Claude, 1, again.next, n, 50, None);
         assert_eq!(texts(&done.items), ["answer"]);
         assert_eq!(done.next, len(&f));
         let n = len(&f);
-        let none = read_forward(&mut f, ChatAgent::Claude, 1, done.next, n, 50);
+        let none = read_forward(&mut f, ChatAgent::Claude, 1, done.next, n, 50, None);
         assert!(none.items.is_empty());
         // No newline at all yet: the end of complete lines is 0.
         let p2 = fx.write("q.jsonl", "{\"type\":");
@@ -1640,7 +1842,11 @@ mod tests {
         let mut paged = Vec::new();
         let mut upper = end;
         loop {
-            let (es, b) = page(&mut f, ChatAgent::Claude, 4, upper, 7);
+            let Page {
+                items: es,
+                before: b,
+                ..
+            } = page(&mut f, ChatAgent::Claude, 4, upper, 7, Back::Free);
             let mut es = es;
             es.extend(paged);
             paged = es;
@@ -1652,7 +1858,7 @@ mod tests {
         let mut forward = Vec::new();
         let mut at = 0;
         loop {
-            let fwd = read_forward(&mut f, ChatAgent::Claude, 4, at, end, 5);
+            let fwd = read_forward(&mut f, ChatAgent::Claude, 4, at, end, 5, None);
             forward.extend(fwd.items);
             at = fwd.next;
             if !fwd.more {
@@ -1800,5 +2006,399 @@ mod tests {
         assert!(open(&sf).is_none());
         crate::last_line::BEFORE_OPEN.with(|h| *h.borrow_mut() = None);
         assert!(real.is_symlink());
+    }
+
+    // ── Rewinds: only the branch the conversation is on ──
+
+    /// `v` as a line of Claude's tree.
+    fn node(mut v: Value, uuid: &str, parent: Option<&str>) -> Value {
+        v["uuid"] = json!(uuid);
+        v["parentUuid"] = json!(parent);
+        v
+    }
+
+    fn turn_end(uuid: &str, parent: &str) -> Value {
+        node(
+            json!({"type": "system", "subtype": "turn_duration"}),
+            uuid,
+            Some(parent),
+        )
+    }
+
+    fn interrupted(uuid: &str, parent: &str) -> Value {
+        let v = json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": "[Request interrupted by user]"}]}});
+        node(v, uuid, Some(parent))
+    }
+
+    fn snapshot_line() -> Value {
+        json!({"type": "file-history-snapshot", "messageId": "m"})
+    }
+
+    /// A turn, then one that was interrupted and rewound: the prompt `C` has the parent of `B`
+    /// (the shape of a real rewind: the abandoned lines stay before it).
+    fn rewound() -> Vec<Value> {
+        vec![
+            node(user("A"), "s0", None),
+            node(agent("a"), "a0", Some("s0")),
+            turn_end("t0", "a0"),
+            snapshot_line(),
+            node(user("B"), "p1", Some("t0")),
+            node(agent("b"), "a1", Some("p1")),
+            interrupted("i1", "a1"),
+            snapshot_line(),
+            node(user("C"), "p2", Some("t0")),
+            node(agent("c"), "a2", Some("p2")),
+        ]
+    }
+
+    /// Every page from the end of `f`, carrying [`Page::back`] (or not), oldest first.
+    fn all_pages(f: &mut File, limit: usize, carry: bool, b: Bounds) -> Vec<String> {
+        let n = len(f);
+        let mut upper = complete_end(f, n);
+        let mut back = Back::Free;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let pg = page_with(f, ChatAgent::Claude, 1, upper, limit, back.clone(), b);
+            let mut t = texts(&pg.items);
+            t.extend(seen);
+            seen = t;
+            match pg.before {
+                Some(at) => {
+                    assert!(at < upper);
+                    upper = at;
+                }
+                None => return seen,
+            }
+            back = if carry { pg.back } else { Back::Free };
+        }
+    }
+
+    #[test]
+    fn a_rewind_shows_only_the_new_branch() {
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &rewound());
+        let n = len(&f);
+        let end = complete_end(&mut f, n);
+        let pg = page(&mut f, ChatAgent::Claude, 1, end, 50, Back::Free);
+        assert_eq!(texts(&pg.items), ["A", "a", "C", "c"]);
+        assert_eq!(pg.before, None);
+        assert_eq!(pg.newest.as_deref(), Some("a2"));
+    }
+
+    #[test]
+    fn rewinds_to_the_same_message_twice_show_the_newest_branch() {
+        let mut lines = rewound();
+        lines.push(interrupted("i2", "a2"));
+        lines.push(node(user("D"), "p3", Some("t0")));
+        lines.push(node(agent("d"), "a3", Some("p3")));
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        assert_eq!(all_pages(&mut f, 50, true, BOUNDS), ["A", "a", "D", "d"]);
+    }
+
+    #[test]
+    fn a_rewind_to_the_first_prompt_hides_everything_before_it() {
+        let mut lines = rewound();
+        lines.push(node(user("Z"), "z0", None));
+        lines.push(node(agent("z"), "z1", Some("z0")));
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        assert_eq!(all_pages(&mut f, 50, true, BOUNDS), ["Z", "z"]);
+    }
+
+    #[test]
+    fn parallel_tool_calls_sharing_a_parent_are_not_a_rewind() {
+        // Claude writes each tool_use of one message as its own line; a result can share its
+        // parent with the next call.
+        let lines = vec![
+            node(user("go"), "s0", None),
+            node(
+                tool_use("t1", "Read", json!({"file_path": "/x"})),
+                "c1",
+                Some("s0"),
+            ),
+            node(
+                tool_use("t2", "Read", json!({"file_path": "/y"})),
+                "c2",
+                Some("c1"),
+            ),
+            node(result("t1", json!("one"), false), "r1", Some("c1")),
+            node(result("t2", json!("two"), false), "r2", Some("c2")),
+            node(agent("done"), "a1", Some("r2")),
+            turn_end("e1", "a1"),
+            node(user("next"), "s1", Some("e1")),
+        ];
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        let want = [
+            "go",
+            "call /x",
+            "call /y",
+            "result one",
+            "result two",
+            "done",
+            "next",
+        ];
+        assert_eq!(all_pages(&mut f, 50, true, BOUNDS), want);
+        let n = len(&f);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50, None);
+        assert!(!fwd.fork);
+        assert_eq!(texts(&fwd.items), want);
+        assert_eq!(fwd.last.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn a_page_ending_at_the_new_prompt_hands_the_skip_to_the_next_page() {
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &rewound());
+        // Two items: `c` and `C`, then the page is full.
+        let n = len(&f);
+        let end = complete_end(&mut f, n);
+        let pg = page(&mut f, ChatAgent::Claude, 1, end, 2, Back::Free);
+        assert_eq!(texts(&pg.items), ["C", "c"]);
+        assert_eq!(pg.back, Back::Expect(Some("t0".into())));
+        assert_eq!(all_pages(&mut f, 2, true, BOUNDS), ["A", "a", "C", "c"]);
+        // Without the state the next page would show the abandoned branch.
+        let shown = all_pages(&mut f, 2, false, BOUNDS);
+        assert!(shown.contains(&"B".to_string()), "{shown:?}");
+    }
+
+    #[test]
+    fn a_skip_longer_than_the_scan_budget_goes_on_in_the_next_page() {
+        let mut lines = vec![
+            node(user("A"), "s0", None),
+            node(agent("a"), "a0", Some("s0")),
+            node(user("B"), "p1", Some("a0")),
+        ];
+        let mut parent = "p1".to_string();
+        for i in 0..200 {
+            let id = format!("x{i}");
+            lines.push(node(
+                agent(&format!("abandoned {i} {}", "y".repeat(100))),
+                &id,
+                Some(&parent),
+            ));
+            parent = id;
+        }
+        lines.push(node(user("C"), "p2", Some("a0")));
+        let tiny = Bounds {
+            chunk: 1024,
+            max_line: 4096,
+            page_scan: 8192,
+            forward_scan: 8192,
+            bytes: BOUNDS.bytes,
+        };
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        assert!(len(&f) > 4 * tiny.page_scan);
+        assert_eq!(all_pages(&mut f, 50, true, tiny), ["A", "a", "C"]);
+    }
+
+    #[test]
+    fn a_forward_read_stops_at_a_rewound_prompt() {
+        let lines = rewound();
+        let fx = Fixture::new();
+        let (p, mut f) = file_of(&fx, "r", &lines[..3]);
+        let n = len(&f);
+        let end = complete_end(&mut f, n);
+        let pg = page(&mut f, ChatAgent::Claude, 1, end, 50, Back::Free);
+        assert_eq!(pg.newest.as_deref(), Some("t0"));
+        let mut w = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        for l in &lines[3..7] {
+            writeln!(w, "{l}").unwrap();
+        }
+        let n = len(&f);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, end, n, 50, pg.newest);
+        assert!(!fwd.fork);
+        assert_eq!(
+            texts(&fwd.items),
+            ["B", "b", "[Request interrupted by user]"]
+        );
+        assert_eq!(fwd.last.as_deref(), Some("i1"));
+        for l in &lines[7..] {
+            writeln!(w, "{l}").unwrap();
+        }
+        let fork_at = n + format!("{}\n", lines[7]).len() as u64;
+        let m = len(&f);
+        let fwd2 = read_forward(
+            &mut f,
+            ChatAgent::Claude,
+            1,
+            fwd.next,
+            m,
+            50,
+            fwd.last.clone(),
+        );
+        assert!(fwd2.fork);
+        assert_eq!(fwd2.next, fork_at);
+        assert!(fwd2.items.is_empty());
+        // The parent unknown (a line that could not be read): no rewind is assumed.
+        let blind = read_forward(&mut f, ChatAgent::Claude, 1, fwd.next, m, 50, None);
+        assert!(!blind.fork);
+        assert_eq!(texts(&blind.items), ["C", "c"]);
+    }
+
+    #[test]
+    fn codex_lines_are_never_a_rewind() {
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &rewound());
+        let n = len(&f);
+        let fwd = read_forward(&mut f, ChatAgent::Codex, 1, 0, n, 50, Some("zz".into()));
+        assert!(!fwd.fork);
+        assert_eq!(fwd.last.as_deref(), Some("zz"));
+    }
+
+    #[test]
+    fn progress_records_with_a_uuid_are_not_the_parent_a_prompt_follows() {
+        let lines = vec![
+            node(user("A"), "s0", None),
+            node(agent("a"), "a0", Some("s0")),
+            node(json!({"type": "progress", "data": {}}), "g0", Some("a0")),
+            node(user("B"), "p1", Some("a0")),
+        ];
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        let n = len(&f);
+        let fwd = read_forward(&mut f, ChatAgent::Claude, 1, 0, n, 50, None);
+        assert!(!fwd.fork);
+        assert_eq!(texts(&fwd.items), ["A", "a", "B"]);
+        assert_eq!(all_pages(&mut f, 50, true, BOUNDS), ["A", "a", "B"]);
+    }
+
+    #[test]
+    fn an_unreadable_parent_never_hides_the_conversation() {
+        let tiny = Bounds {
+            chunk: 1024,
+            max_line: 4096,
+            page_scan: 64 * 1024,
+            forward_scan: 64 * 1024,
+            bytes: BOUNDS.bytes,
+        };
+        let huge = node(
+            result("t1", json!("z".repeat(8000)), false),
+            "r1",
+            Some("c1"),
+        );
+        let lines = vec![
+            node(user("A"), "s0", None),
+            node(
+                tool_use("t1", "Read", json!({"file_path": "/x"})),
+                "c1",
+                Some("s0"),
+            ),
+            huge,
+            node(user("B"), "p1", Some("r1")),
+        ];
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        assert_eq!(all_pages(&mut f, 50, true, tiny), ["A", "call /x", "B"]);
+        let n = len(&f);
+        let fwd = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, None, tiny);
+        assert!(!fwd.fork);
+        assert_eq!(texts(&fwd.items), ["A", "call /x", "B"]);
+    }
+
+    #[test]
+    fn a_prompt_left_for_the_next_read_by_the_byte_budget_is_not_a_rewind() {
+        let lines = vec![
+            node(agent(&"a".repeat(3000)), "a0", None),
+            node(user(&"B".repeat(3000)), "p1", Some("a0")),
+        ];
+        let small = Bounds {
+            bytes: 4000,
+            ..BOUNDS
+        };
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        let n = len(&f);
+        let one = read_forward_with(&mut f, ChatAgent::Claude, 1, 0, n, 50, None, small);
+        assert!(one.more && !one.fork);
+        assert_eq!(one.items.len(), 1);
+        assert_eq!(one.last.as_deref(), Some("a0"));
+        let two = read_forward_with(
+            &mut f,
+            ChatAgent::Claude,
+            1,
+            one.next,
+            n,
+            50,
+            one.last,
+            small,
+        );
+        assert!(!two.fork);
+        assert_eq!(two.items.len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_newest_line_leaves_the_newest_uuid_unknown() {
+        let tiny = Bounds {
+            chunk: 1024,
+            max_line: 4096,
+            page_scan: 64 * 1024,
+            forward_scan: 64 * 1024,
+            bytes: BOUNDS.bytes,
+        };
+        let huge = node(
+            result("t1", json!("z".repeat(8000)), false),
+            "r1",
+            Some("c1"),
+        );
+        {
+            let last = huge;
+            let lines = vec![
+                node(user("A"), "s0", None),
+                node(
+                    tool_use("t1", "Read", json!({"file_path": "/x"})),
+                    "c1",
+                    Some("s0"),
+                ),
+                last,
+            ];
+            let fx = Fixture::new();
+            let (_, mut f) = file_of(&fx, "r", &lines);
+            let n = len(&f);
+            let end = complete_end(&mut f, n);
+            let pg = page_with(&mut f, ChatAgent::Claude, 1, end, 50, Back::Free, tiny);
+            assert_eq!(pg.newest, None);
+        }
+        // A malformed line: no uuid either.
+        let fx = Fixture::new();
+        let p = fx.write_jsonl("s/m.jsonl", &[node(user("A"), "s0", None)]);
+        let mut w = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(w, "{{broken").unwrap();
+        let mut f = File::open(&p).unwrap();
+        let n = len(&f);
+        let pg = page(&mut f, ChatAgent::Claude, 1, n, 50, Back::Free);
+        assert_eq!(pg.newest, None);
+        assert_eq!(texts(&pg.items), ["A"]);
+    }
+
+    #[test]
+    fn a_parent_prompt_left_by_the_byte_budget_keeps_the_state() {
+        // `C` follows prompt `B` directly (B's turn produced nothing), and `B` does not fit.
+        let lines = vec![
+            node(user("A"), "s0", None),
+            node(user(&"B".repeat(3000)), "p1", Some("s0")),
+            node(user(&"C".repeat(3000)), "p2", Some("p1")),
+        ];
+        let small = Bounds {
+            bytes: 4000,
+            ..BOUNDS
+        };
+        let fx = Fixture::new();
+        let (_, mut f) = file_of(&fx, "r", &lines);
+        let n = len(&f);
+        let end = complete_end(&mut f, n);
+        let pg = page_with(&mut f, ChatAgent::Claude, 1, end, 50, Back::Free, small);
+        assert_eq!(pg.items.len(), 1);
+        assert_eq!(pg.back, Back::Expect(Some("p1".into())));
+        let at = pg.before.unwrap();
+        let pg2 = page_with(&mut f, ChatAgent::Claude, 1, at, 50, pg.back, small);
+        let t = texts(&pg2.items);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(t[0], "A");
+        assert!(t[1].starts_with('B'));
+        assert_eq!(pg2.before, None);
     }
 }

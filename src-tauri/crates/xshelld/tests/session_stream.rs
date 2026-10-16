@@ -594,6 +594,71 @@ fn codex_rollout_appearing_later_resets() {
     assert_eq!(texts(&a.items), ["u:late"]);
 }
 
+/// `v` as a line of Claude's conversation tree.
+fn node(mut v: Value, uuid: &str, parent: Option<&str>) -> Value {
+    v["uuid"] = json!(uuid);
+    v["parentUuid"] = json!(parent);
+    v
+}
+
+#[test]
+fn a_rewind_resets_to_the_new_branch_and_pages_stay_on_it() {
+    let mut e = env_with(|c| c.session_poll = Duration::from_secs(3600));
+    let f = e.claude_file(SID);
+    append(&f, &node(user("A"), "s0", None));
+    append(&f, &node(agent("a"), "a0", Some("s0")));
+    append(
+        &f,
+        &node(
+            json!({"type": "system", "subtype": "turn_duration"}),
+            "t0",
+            Some("a0"),
+        ),
+    );
+    append(&f, &node(user("B"), "p1", Some("t0")));
+    append(&f, &node(agent("b"), "a1", Some("p1")));
+    let t = e.open("claude", Some(SID));
+    let mut m = e.mobile();
+    let page = subscribe(&mut m, t).unwrap();
+    assert_eq!(texts(&page.items), ["u:A", "a:a", "u:B", "a:b"]);
+    // Interrupted and rewound to `B`: the new prompt follows `B`'s parent. 49 replies after it
+    // fill the reset's page (50) right up to the prompt, so the next older page must go on
+    // from the prompt's parent, past the abandoned branch.
+    let interrupted = json!({"type": "user", "message": {"role": "user", "content": [
+        {"type": "text", "text": "[Request interrupted by user]"}]}});
+    append(&f, &node(interrupted, "i1", Some("a1")));
+    append(
+        &f,
+        &json!({"type": "file-history-snapshot", "messageId": "x"}),
+    );
+    append(&f, &node(user("C"), "p2", Some("t0")));
+    let mut parent = "p2".to_string();
+    for i in 0..49 {
+        let id = format!("c{i}");
+        append(&f, &node(agent(&format!("c{i}")), &id, Some(&parent)));
+        parent = id;
+    }
+    e.report(t, AgentStatus::Working);
+    let a = next_append(&mut m, t);
+    assert!(a.reset && a.gen > page.gen, "{a:?}");
+    let mut want = vec!["u:C".to_string()];
+    want.extend((0..49).map(|i| format!("a:c{i}")));
+    assert_eq!(texts(&a.items), want);
+    let before = a.before.expect("an older page");
+    let p = older(&mut m, t, a.gen, before).unwrap();
+    assert_eq!(texts(&p.items), ["u:A", "a:a"]);
+    assert_eq!(p.before, None);
+    // Asked again with the same cursor: the same answer.
+    let again = older(&mut m, t, a.gen, before).unwrap();
+    assert_eq!(texts(&again.items), ["u:A", "a:a"]);
+    // A normal next prompt on the new branch is an append, not another reset.
+    append(&f, &node(user("D"), "p3", Some("c48")));
+    e.report(t, AgentStatus::Finished);
+    let d = next_append(&mut m, t);
+    assert!(!d.reset && d.gen == a.gen, "{d:?}");
+    assert_eq!(texts(&d.items), ["u:D"]);
+}
+
 #[test]
 fn replaced_or_truncated_file_resets() {
     let mut e = env_with(|c| c.session_poll = Duration::from_secs(3600));

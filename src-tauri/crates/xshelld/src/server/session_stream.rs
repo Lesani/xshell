@@ -36,13 +36,13 @@ use super::role::{self, Role};
 use super::terminal::Terminal;
 use super::{ConnId, TestPoint};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use xshell_core::chat::{self, ChatAgent, SessionFile};
+use xshell_core::chat::{self, Back, ChatAgent, SessionFile};
 use xshell_core::launch::LaunchSpec;
 use xshell_protocol::msg::{
     encode_res, ChatEntry, ServerMsg, SessionPage, CHAT_PAGE_DEFAULT, CHAT_PAGE_MAX,
@@ -57,6 +57,8 @@ const CODEX_WALK_MAX: usize = 100_000;
 const RESOLVE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Attempts of a subscribe whose Terminal changes while it is read.
 const SUBSCRIBE_ATTEMPTS: usize = 3;
+/// The most page cursors a subscription remembers a [`Back`] for.
+const BACKS_MAX: usize = 1024;
 
 pub(crate) const TOO_MANY_SUBS: &str = "too many session subscriptions";
 pub(crate) const TOO_MANY_REQUESTS: &str = "too many session requests";
@@ -315,6 +317,39 @@ struct Opened {
     cursor: u64,
     /// The bytes before `cursor` when it was set, to notice the file rewritten in place.
     mark: Vec<u8>,
+    /// The uuid of the newest line of a Claude session's tree before `cursor`, if known.
+    last: Option<String>,
+}
+
+/// Where each page cursor handed out in this generation stands on a Claude session's tree
+/// ([`Back`]): a page ending inside an abandoned branch (or right after a prompt) goes on from
+/// it. Only states other than [`Back::Free`] are kept, at most [`BACKS_MAX`]; pages go
+/// backwards, so the newest cursors (the smallest) are kept.
+#[derive(Default)]
+struct Backs(BTreeMap<u64, Back>);
+
+impl Backs {
+    fn of(before: Option<u64>, back: Back) -> Backs {
+        let mut b = Backs::default();
+        b.set(before, back);
+        b
+    }
+
+    fn set(&mut self, before: Option<u64>, back: Back) {
+        let Some(at) = before else { return };
+        if back == Back::Free {
+            self.0.remove(&at);
+            return;
+        }
+        self.0.insert(at, back);
+        if self.0.len() > BACKS_MAX {
+            self.0.pop_last();
+        }
+    }
+
+    fn get(&self, at: u64) -> Back {
+        self.0.get(&at).cloned().unwrap_or_default()
+    }
 }
 
 struct Sub {
@@ -327,6 +362,7 @@ struct Sub {
     resolve_at: Instant,
     backoff: Duration,
     opened: Option<Opened>,
+    backs: Backs,
 }
 
 /// A subscription's state read fresh: its newest page and where reading goes on.
@@ -337,6 +373,7 @@ struct Snapshot {
     opened: Option<Opened>,
     items: Vec<ChatEntry>,
     before: Option<u64>,
+    back: Back,
     resolve_at: Instant,
     backoff: Duration,
 }
@@ -606,6 +643,7 @@ impl Worker {
                     resolve_at: snap.resolve_at,
                     backoff: snap.backoff,
                     opened: snap.opened,
+                    backs: Backs::of(snap.before, snap.back),
                 },
             );
             self.set_count();
@@ -640,6 +678,7 @@ impl Worker {
             return Some(Err("invalid cursor".into()));
         }
         let (want_id, key, cursor, mark) = (op.id, sub.key.clone(), op.cursor, op.mark.clone());
+        let back = sub.backs.get(before);
         let t = match Self::lookup(d, r.conn, ob, r.role, &r.terminal)? {
             Err(e) => return Some(Err(e)),
             Ok(t) => t,
@@ -658,7 +697,7 @@ impl Worker {
             self.wake_self(r.terminal);
             return changed();
         }
-        let (items, before) = chat::page(&mut f, sf.agent, gen, before, limit);
+        let pg = chat::page(&mut f, sf.agent, gen, before, limit, back);
         d.test_point(r.terminal, TestPoint::SessionRead);
         if !intact(&mut f, cursor, &mark) {
             self.wake_self(r.terminal);
@@ -670,11 +709,14 @@ impl Worker {
             Check::Refused(e) => Some(Err(e)),
             Check::Changed => changed(),
             Check::Ok => {
+                if let Some(sub) = self.subs.get_mut(&(r.conn, r.terminal)) {
+                    sub.backs.set(pg.before, pg.back);
+                }
                 let page = SessionPage {
                     gen,
                     session: key.session,
-                    items,
-                    before,
+                    items: pg.items,
+                    before: pg.before,
                 };
                 // Answered under the lock, like every publish.
                 reply_page(ob, r.id, page);
@@ -716,6 +758,7 @@ impl Worker {
             opened: None,
             items: Vec::new(),
             before: None,
+            back: Back::Free,
             resolve_at: now,
             backoff: self.inner.poll,
         };
@@ -724,33 +767,31 @@ impl Worker {
             snap.backoff = (snap.backoff * 2).min(RESOLVE_BACKOFF_MAX);
             return snap;
         };
-        if let Some((items, before, opened)) = Self::read_page(&sf, gen, limit) {
-            snap.items = items;
-            snap.before = before;
+        if let Some((pg, opened)) = Self::read_page(&sf, gen, limit) {
+            snap.items = pg.items;
+            snap.before = pg.before;
+            snap.back = pg.back;
             snap.opened = Some(opened);
         }
         snap.file = Some(sf);
         snap
     }
 
-    fn read_page(
-        sf: &SessionFile,
-        gen: u64,
-        limit: usize,
-    ) -> Option<(Vec<ChatEntry>, Option<u64>, Opened)> {
+    fn read_page(sf: &SessionFile, gen: u64, limit: usize) -> Option<(chat::Page, Opened)> {
         let mut f = chat::open(sf)?;
         let id = chat::identity(&f)?;
         let len = f.metadata().ok()?.len();
         let end = chat::complete_end(&mut f, len);
-        let (items, before) = chat::page(&mut f, sf.agent, gen, end, limit);
+        let mut pg = chat::page(&mut f, sf.agent, gen, end, limit, Back::Free);
         let mark = chat::tail_mark(&mut f, end)?;
+        let last = pg.newest.take();
         Some((
-            items,
-            before,
+            pg,
             Opened {
                 id,
                 cursor: end,
                 mark,
+                last,
             },
         ))
     }
@@ -823,8 +864,20 @@ impl Worker {
         if len == op.cursor || ob.queued_bytes() > APPEND_QUEUE_GATE {
             return false;
         }
-        let (gen, cursor, file_id) = (sub.gen, op.cursor, op.id);
-        let fwd = chat::read_forward(&mut f, sf.agent, gen, cursor, len, CHAT_PAGE_MAX as usize);
+        let (gen, cursor, file_id, last) = (sub.gen, op.cursor, op.id, op.last.clone());
+        let fwd = chat::read_forward(
+            &mut f,
+            sf.agent,
+            gen,
+            cursor,
+            len,
+            CHAT_PAGE_MAX as usize,
+            last,
+        );
+        if fwd.fork {
+            // Rewound: what is shown may be an abandoned branch. Start over from the end.
+            return self.reset(d, k, &ob, &t, &spec, Some(sf));
+        }
         let mark = chat::tail_mark(&mut f, fwd.next);
         d.test_point(k.1, TestPoint::SessionRead);
         let reg = d.reg.lock().unwrap();
@@ -854,6 +907,7 @@ impl Worker {
             id: file_id,
             cursor: fwd.next,
             mark,
+            last: fwd.last,
         });
         fwd.more
     }
@@ -905,7 +959,37 @@ impl Worker {
             sub.resolve_at = snap.resolve_at;
             sub.backoff = snap.backoff;
             sub.opened = snap.opened;
+            sub.backs = Backs::of(snap.before, snap.back);
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backs_keep_every_cursor_state_up_to_the_bound() {
+        let mut b = Backs::of(Some(9000), Back::Expect(Some("p".into())));
+        for at in (1..=8u64).rev() {
+            b.set(Some(at * 100), Back::Skip(Some(format!("u{at}"))));
+        }
+        assert_eq!(b.get(9000), Back::Expect(Some("p".into())));
+        for at in 1..=8u64 {
+            assert_eq!(b.get(at * 100), Back::Skip(Some(format!("u{at}"))));
+        }
+        // Free is not stored, and replaces what was.
+        b.set(Some(100), Back::Free);
+        assert_eq!(b.get(100), Back::Free);
+        b.set(None, Back::Skip(None));
+        // The bound drops the oldest pages' cursors (the largest offsets).
+        let mut big = Backs::default();
+        for at in (1..=(BACKS_MAX as u64 + 10)).rev() {
+            big.set(Some(at), Back::Skip(None));
+        }
+        assert_eq!(big.0.len(), BACKS_MAX);
+        assert_eq!(big.get(1), Back::Skip(None));
+        assert_eq!(big.get(BACKS_MAX as u64 + 10), Back::Free);
     }
 }
