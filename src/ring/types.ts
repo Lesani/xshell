@@ -31,8 +31,8 @@ export interface RingStatus {
   retryIn: number | null;
   connectionError: string | null;
   limited: boolean;
-  // A Relay move still owed to the old Relay.
-  move: { state: "moving" | "failed"; error?: string } | null;
+  // Old Relays that still owe a farewell: devices there are told about the current Relay.
+  farewells: FarewellView[];
   problem: "recovered" | "unreadable" | null;
   problemDetail: string | null;
   members: MemberView[];
@@ -50,6 +50,14 @@ export interface RingStatus {
 
 // `other-ring`: paired with another Desktop's devices; `ring_claim_host` pairs it here.
 export type HostRingKind = "too-old" | "other-ring" | "full" | "failed";
+
+export interface FarewellView {
+  relayUrl: string;
+  state: "pending" | "sending" | "waiting";
+  error?: string;
+  retryIn?: number;
+  failures: number;
+}
 
 export interface HostRingState {
   host: string;

@@ -33,12 +33,20 @@ export function roleKey(role: MemberRole): StringKey {
   return role === "desktop" ? "mobile.role.desktop" : role === "daemon" ? "mobile.role.daemon" : "mobile.role.mobile";
 }
 
+// A Relay URL as the copy names it: the host, with the port if any, never the full URL.
+export function relayHost(url: string | null | undefined): string {
+  if (!url) return "";
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(url.trim());
+  return m ? m[1].replace(/^[^@]*@/, "") : url;
+}
+
 // The connection line under the Relay settings; null while Mobile access is off.
 export function connectionLine(s: RingStatus): string | null {
+  const relay = relayHost(s.relayUrl);
   switch (s.connection) {
-    case "connected": return fmt(s.limited ? "mobile.conn.limited" : "mobile.conn.connected");
-    case "connecting": return fmt("mobile.conn.connecting");
-    case "waiting": return fmt("mobile.conn.retrying", { s: Math.max(1, s.retryIn ?? 1) });
+    case "connected": return s.limited ? fmt("mobile.conn.limited") : fmt("mobile.conn.connected", { relay });
+    case "connecting": return fmt("mobile.conn.connecting", { relay });
+    case "waiting": return fmt("mobile.conn.retrying", { relay, s: Math.max(1, s.retryIn ?? 1) });
     case "stopped": return fmt("mobile.conn.stopped");
     case "other-window": return fmt("mobile.conn.otherWindow");
     default: return null;
@@ -61,10 +69,13 @@ export function quotaLine(
   return fmt(s.relayHosted ? "mobile.quota.hosted" : "mobile.quota.ownRelay", { time: fmtTime(s.quotaResetAt) });
 }
 
-// A Relay move still owed to the old Relay.
-export function moveLine(s: RingStatus): string | null {
-  if (!s.move) return null;
-  return fmt(s.move.state === "failed" ? "mobile.conn.moveFailed" : "mobile.conn.moving");
+// One line per old Relay that still owes a farewell (ADR-0012); it never changes the
+// connection line, which is about the current Relay.
+export function farewellLines(s: Pick<RingStatus, "farewells">): { text: string; warn: boolean }[] {
+  return s.farewells.map(f => ({
+    text: fmt(f.state === "sending" ? "mobile.farewell.sending" : "mobile.farewell.owed", { relay: relayHost(f.relayUrl) }),
+    warn: f.state === "waiting" && f.failures > 0,
+  }));
 }
 
 export function localLine(s: Pick<RingStatus, "local">): string | null {
@@ -271,9 +282,9 @@ export function isDirty(f: RelayForm, s: Pick<RingStatus, "relayUrl" | "hostedRe
   return targetUrl(f, s) !== (s.relayUrl ?? "");
 }
 
-// Saving waits while a previous relay change is still reaching the paired devices.
-export function canSave(f: RelayForm, s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl" | "move">, busy: boolean): boolean {
-  if (busy || s.move || !isDirty(f, s)) return false;
+// Saving never waits for a farewell: a relay change takes effect at once.
+export function canSave(f: RelayForm, s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">, busy: boolean): boolean {
+  if (busy || !isDirty(f, s)) return false;
   return f.choice === "hosted" || validRelayUrl(f.url);
 }
 
