@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useReducer, useState } from "react";
 import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, localLine, moveLine, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, qrRects } from "../ring/pairing";
+import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects } from "../ring/pairing";
 import { useRing, type PairingEvents } from "../ring/useRing";
 import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
@@ -44,8 +44,18 @@ export function PairingNote({ s, offerShown = false }: { s: RingStatus; offerSho
   return <div className={`host-row-note ${key === "mobile.pair.connecting" ? "" : "host-row-warn"}`}>{fmt(key)}</div>;
 }
 
-function PhonePanel({ s, p }: { s: RingStatus; p: Pairing }) {
-  const [st, dispatch] = useReducer(phoneReducer, PHONE_IDLE);
+// "Cancel pairing": ends the offer on the Desktop and returns the panel to "Pair a phone".
+export async function cancelPhonePairing(cancelPhone: () => Promise<void>, dispatch: (a: PhoneAction) => void): Promise<void> {
+  dispatch({ type: "cancel" });
+  try {
+    await cancelPhone();
+  } catch {
+    // The offer ends by itself when it expires.
+  }
+}
+
+export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: Pairing; initial?: PhoneState }) {
+  const [st, dispatch] = useReducer(phoneReducer, initial);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { if (p.events.phone) dispatch({ type: "event", event: p.events.phone }); }, [p.events.phone]);
   const waiting = st.state === "waiting";
@@ -91,6 +101,11 @@ function PhonePanel({ s, p }: { s: RingStatus; p: Pairing }) {
         {st.state === "waiting" ? (
           <button className="btn btn-ghost settings-action-btn" onClick={() => { navigator.clipboard?.writeText(st.offer.payload).catch(() => {}); }}>
             {fmt("mobile.pair.phone.copy")}
+          </button>
+        ) : null}
+        {st.state === "waiting" ? (
+          <button className="btn btn-ghost settings-action-btn" onClick={() => { cancelPhonePairing(p.cancelPhone, dispatch); }}>
+            {fmt("mobile.pair.phone.cancel")}
           </button>
         ) : (
           <button className="btn btn-primary settings-action-btn" disabled={busy || blocked} onClick={() => { if (!blocked) start(); }}>
@@ -250,7 +265,7 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
         <input type="radio" name="mobile-relay" checked={form.choice === "hosted"} onChange={() => setForm({ ...form, choice: "hosted" })} />
         <div className="settings-row-text">
           <div className="settings-row-title">{fmt("mobile.relay.hosted")}</div>
-          <div className="settings-row-desc">{fmt("mobile.relay.hosted.desc")}</div>
+          <div className="settings-row-desc">{fmt("mobile.relay.hosted.desc", { relay: relayHost(s.hostedRelayUrl) })}</div>
         </div>
       </label>
       <label className="settings-row">
@@ -304,7 +319,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
   };
   const conn = connectionLine(s);
   const quota = quotaLine(s, Date.now());
-  const move = moveLine(s);
+  const farewells = farewellLines(s);
   const local = localLine(s);
   const problem = problemLine(s);
   return (
@@ -327,7 +342,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
             <RelaySettings s={s} onSave={onSaveRelay} />
             {conn && <div className="host-row-note">{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
-            {move && <div className={`host-row-note ${s.move?.state === "failed" ? "host-row-warn" : ""}`}>{move}</div>}
+            {farewells.map((f, i) => <div key={i} className={`host-row-note ${f.warn ? "host-row-warn" : ""}`}>{f.text}</div>)}
             <MembersSection s={s} removal={removal} onRemove={m => dispatchRemoval({ type: "ask", member: m })} onClaimHost={onClaimHost} />
             {confirm && <ConfirmDialog title={confirm.title} body={confirm.body} confirm={confirm.confirm} onConfirm={remove} onCancel={() => dispatchRemoval({ type: "cancel" })} />}
             {pairing && s.connection !== "other-window" && (

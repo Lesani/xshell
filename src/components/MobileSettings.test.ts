@@ -1,8 +1,8 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { MembersSection, MobileSettingsView, PairingNote, submitComputer, type Pairing } from "./MobileSettings";
-import { COMPUTER_IDLE } from "../ring/pairing";
+import { cancelPhonePairing, MembersSection, MobileSettingsView, PairingNote, PhonePanel, submitComputer, type Pairing } from "./MobileSettings";
+import { COMPUTER_IDLE, PHONE_IDLE, phoneReducer } from "../ring/pairing";
 import { fmt } from "../ring/strings";
 import { REMOVAL_IDLE, removalReducer, type Removal } from "../ring/mobileSettings";
 import type { MemberView, RingStatus } from "../ring/types";
@@ -17,7 +17,7 @@ const phone = member({ name: "Pixel", role: "mobile", signKey: "p", removable: t
 function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: true, ringId: "r", version: 2, relayUrl: "wss://r", hostedRelayUrl: "wss://r", connection: "connected",
-    retryIn: null, connectionError: null, limited: false, move: null, problem: null, problemDetail: null,
+    retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
     members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], ...over,
   };
 }
@@ -152,5 +152,55 @@ describe("the quota notice (#42)", () => {
     const out = view(status({ quotaResetAt: null }));
     expect(out).not.toContain("daily message limit");
     expect(view(status({ quotaResetAt: Math.floor(Date.now() / 1000) - 1 }))).not.toContain("daily message limit");
+  });
+});
+
+describe("farewell lines in the view", () => {
+  const view = (s: RingStatus) => renderToStaticMarkup(createElement(MobileSettingsView, {
+    s, onEnable: async () => {}, onSaveRelay: async () => {}, onClaimHost: async () => {}, onRemoveMember: async () => s,
+  }));
+
+  it("shows a note per old relay, warning once a retry failed", () => {
+    const html = view(status({ farewells: [
+      { relayUrl: "wss://a.example", state: "pending", failures: 0 },
+      { relayUrl: "wss://b.example", state: "waiting", failures: 2 },
+    ] }));
+    expect(html).toContain(fmt("mobile.farewell.owed", { relay: "a.example" }));
+    expect(html).toContain(`host-row-warn">${fmt("mobile.farewell.owed", { relay: "b.example" })}`);
+    expect(html).not.toContain(`host-row-warn">${fmt("mobile.farewell.owed", { relay: "a.example" })}`);
+  });
+
+  it("names the hosted relay under the Hosted option", () => {
+    expect(view(status({ hostedRelayUrl: "wss://hosted.example" }))).toContain("hosted.example");
+  });
+});
+
+describe("Cancel pairing", () => {
+  const offer = { payload: "p", expiresAt: Date.now() + 600_000, qr: { size: 1, rows: ["1"] } } as never;
+  const pairing = (cancelPhone = vi.fn(async () => {})): Pairing => ({
+    events: { phone: null, computer: null },
+    startPhone: async () => offer,
+    cancelPhone,
+    pairComputer: async () => {},
+    cancelComputer: async () => {},
+  });
+  const panel = (initial: Parameters<typeof PhonePanel>[0]["initial"]) =>
+    renderToStaticMarkup(createElement(PhonePanel, { s: status(), p: pairing(), initial }));
+
+  it("is offered with the QR code, not before", () => {
+    expect(panel({ state: "waiting", offer })).toContain(fmt("mobile.pair.phone.cancel"));
+    expect(panel(PHONE_IDLE)).not.toContain(fmt("mobile.pair.phone.cancel"));
+  });
+
+  it("calls the cancel and the view returns to Pair a phone", async () => {
+    const cancel = vi.fn(async () => {});
+    let st = phoneReducer(phoneReducer(PHONE_IDLE, { type: "start" }), { type: "started", offer });
+    expect(st.state).toBe("waiting");
+    await cancelPhonePairing(cancel, a => { st = phoneReducer(st, a); });
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(st).toEqual(PHONE_IDLE);
+    const html = panel(st);
+    expect(html).toContain(">Pair a phone<");
+    expect(html).not.toContain(fmt("mobile.pair.phone.cancel"));
   });
 });

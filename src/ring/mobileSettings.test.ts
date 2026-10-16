@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, localLine, moveLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, farewellLines, localLine, relayHost, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
@@ -16,7 +16,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     retryIn: null,
     connectionError: null,
     limited: false,
-    move: null,
+    farewells: [],
     problem: null,
     problemDetail: null,
     members: [],
@@ -94,20 +94,46 @@ describe("quota notice (#42)", () => {
 
 describe("connection line", () => {
   it("says how the Relay connection stands", () => {
-    expect(connectionLine(status())).toBe("Connected to the relay");
+    expect(connectionLine(status())).toBe("Connected to xshell-relay-hosted.m-roither.workers.dev");
     expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
-    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to the relay…");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach the relay. Retrying in 4s");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach the relay. Retrying in 1s");
+    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to xshell-relay-hosted.m-roither.workers.dev…");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach xshell-relay-hosted.m-roither.workers.dev. Retrying in 4s");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach xshell-relay-hosted.m-roither.workers.dev. Retrying in 1s");
     expect(connectionLine(status({ connection: "stopped" }))).toBe(fmt("mobile.conn.stopped"));
     expect(connectionLine(status({ connection: "off", enabled: false }))).toBeNull();
     expect(connectionLine(status({ connection: "other-window" }))).toBe("Another xshell window manages the connection to your devices.");
   });
 
-  it("reports a pending or failed move, local limits and recovery", () => {
-    expect(moveLine(status())).toBeNull();
-    expect(moveLine(status({ move: { state: "moving" } }))).toBe(fmt("mobile.conn.moving"));
-    expect(moveLine(status({ move: { state: "failed", error: "x" } }))).toBe(fmt("mobile.conn.moveFailed"));
+  it("names the host of the current relay, with the port, never the full URL", () => {
+    const s = status({ relayUrl: "wss://mine.example:8443/path?x=1" });
+    expect(relayHost(s.relayUrl)).toBe("mine.example:8443");
+    expect(connectionLine(s)).toBe("Connected to mine.example:8443");
+    expect(connectionLine(status({ ...s, connection: "connecting" }))).toBe("Connecting to mine.example:8443…");
+    expect(connectionLine(status({ ...s, connection: "waiting", retryIn: 3 }))).toBe("Can't reach mine.example:8443. Retrying in 3s");
+    expect(connectionLine(status({ ...s, limited: true }))).toBe(fmt("mobile.conn.limited"));
+  });
+
+  it("farewellLines names each old relay", () => {
+    expect(farewellLines(status())).toEqual([]);
+    const lines = farewellLines(status({ farewells: [
+      { relayUrl: "wss://old.example/x", state: "pending", failures: 0 },
+      { relayUrl: "wss://older.example:9000", state: "sending", failures: 1 },
+      { relayUrl: "wss://dead.example", state: "waiting", failures: 2, retryIn: 30 },
+    ] }));
+    expect(lines).toEqual([
+      { text: fmt("mobile.farewell.owed", { relay: "old.example" }), warn: false },
+      { text: fmt("mobile.farewell.sending", { relay: "older.example:9000" }), warn: false },
+      { text: fmt("mobile.farewell.owed", { relay: "dead.example" }), warn: true },
+    ]);
+    expect(lines[0].text).not.toContain("wss://");
+  });
+
+  it("a farewell does not change the connection line", () => {
+    const farewells = [{ relayUrl: "wss://old.example", state: "waiting" as const, failures: 3, retryIn: 5 }];
+    expect(connectionLine(status({ farewells }))).toBe(connectionLine(status()));
+  });
+
+  it("reports local limits and recovery", () => {
     expect(localLine(status())).toBeNull();
     expect(localLine(status({ local: "in-process" }))).toBe(fmt("mobile.local.inProcess"));
     expect(localLine(status({ local: "too-old" }))).toBe(fmt("mobile.local.tooOld"));
@@ -192,10 +218,10 @@ describe("relay form", () => {
     expect(targetUrl({ choice: "hosted", url: "wss://x" }, custom)).toBe(HOSTED);
   });
 
-  it("waits for a pending relay change before another", () => {
-    const s = status({ move: { state: "moving" } });
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, s, false)).toBe(false);
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, status({ move: { state: "failed" } }), false)).toBe(false);
+  it("canSave never waits for a farewell", () => {
+    const farewells = [{ relayUrl: "wss://old.example", state: "waiting" as const, failures: 4 }];
+    expect(canSave({ choice: "custom", url: "wss://mine.example" }, status({ farewells }), false)).toBe(true);
+    expect(canSave({ choice: "custom", url: "wss://mine.example" }, status({ farewells: [{ relayUrl: "wss://old.example", state: "sending", failures: 0 }] }), false)).toBe(true);
   });
 
   it("starts over only explicitly, after a recovery", () => {
