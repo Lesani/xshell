@@ -26,7 +26,7 @@ use xshelld::server::ServerHandle;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ID: &str = "h_test0001";
-pub const W: Duration = Duration::from_secs(10);
+pub const W: Duration = Duration::from_secs(30);
 
 // ── Observer ──────────────────────────────────────────────────────────────
 

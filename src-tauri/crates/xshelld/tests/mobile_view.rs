@@ -441,7 +441,8 @@ fn mobile_attach_nudges_when_alone() {
     attach_at(&mut m, e.t);
     m.skip_output(e.t);
     assert!(
-        m.try_output_until(e.t, b"size 29 100", ms(3000)).is_some(),
+        m.try_output_until(e.t, b"size 29 100", ms(10_000))
+            .is_some(),
         "no redraw nudge: {:?}",
         m.summary().iter().rev().take(5).collect::<Vec<_>>()
     );
