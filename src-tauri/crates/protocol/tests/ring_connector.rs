@@ -1640,24 +1640,21 @@ fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
     m.desk.stop(ByeReason::quit());
 }
 
-/// A fetch in flight whose job is removed (the owner's head names its Relay) counts for
-/// nothing when its answer comes after all.
+/// An owner that hands back an older prefix of the chain held (its persisted report of v2,
+/// arriving after a fetch brought v4) changes nothing: no rewind, no redial.
 #[test]
-fn a_removed_fetch_job_in_flight_changes_nothing() {
-    // The catch-up goes unanswered (2 s): the fetch job starts after it.
-    let m = split_move(Some(GetFault::Ignore), false, false);
+fn an_older_prefix_from_the_owner_is_an_echo() {
+    let m = split_move(Some(GetFault::Close), true, false);
     let key = m.ring.daemon.sign_key();
-    let before = m.ga.connections();
-    m.ga.hold_next();
-    wait_long("the fetch held", || m.ga.connections() > before);
-    // The owner's chain names A again; A refuses new connections, so only the held fetch
-    // could bring C.
-    m.ga.refuse_new(true);
+    wait_long("the Daemon on C", || online(&m.c, &m.ring, &key));
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    m.mrec.clear();
     m.dmn.set_chain(m.ring.up_to(2));
-    m.ga.release();
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(m.dmn.chain().head().version(), 2);
-    assert!(!online(&m.c, &m.ring, &key));
+    m.dmn.set_chain(m.ring.up_to(4));
+    std::thread::sleep(QUIET);
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(link_states(&m.mrec).is_empty(), "{:?}", m.mrec.all());
+    assert!(online(&m.c, &m.ring, &key));
     m.dmn.stop(ByeReason::quit());
     m.desk.stop(ByeReason::quit());
 }

@@ -845,15 +845,20 @@ impl Connector {
     /// Trust `chain` from now on (it replaces the one held). Versions the Relay lacks are
     /// published; a head naming another Relay, or another Ring, makes the Connector dial
     /// again at once. A farewell the chain no longer owes is dropped, and so is a fetch job
-    /// at the Relay the head names (another Ring drops them all). A chain with the head held
-    /// already (the owner persisting what the Connector reported) changes nothing. Never
+    /// at the Relay the head names (another Ring drops them all). A chain held already, or an
+    /// older prefix of it (the owner persisting what the Connector reported), changes nothing.
+    /// Never
     /// blocks, and reports nothing itself.
     pub fn set_chain(&self, chain: RosterChain) {
         let cut = {
             let mut st = lock(&self.inner.st);
-            if st.chain.ring_id() == chain.ring_id()
-                && st.chain.head().token() == chain.head().token()
-            {
+            // The chain held already, or an older prefix of it: an echo (the owner persisting
+            // what it was told, perhaps after a newer version came in).
+            let held = st
+                .chain
+                .get(chain.head().version())
+                .is_some_and(|r| r.token() == chain.head().token());
+            if st.chain.ring_id() == chain.ring_id() && held {
                 return;
             }
             if st.chain.ring_id() != chain.ring_id() {
