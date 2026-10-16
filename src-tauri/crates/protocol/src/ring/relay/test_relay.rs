@@ -2713,6 +2713,9 @@ struct GateShared {
     /// Both sides of every connection forwarded, to cut them on close.
     live: Mutex<Vec<(TcpStream, TcpStream)>>,
     hold_next: AtomicBool,
+    /// Connections past this many accepted are held, or refused (see `hold_after`).
+    hold_after: std::sync::atomic::AtomicUsize,
+    refuse_after: std::sync::atomic::AtomicUsize,
     /// `true` once the held connections may go on.
     released: Mutex<bool>,
     released_cv: std::sync::Condvar,
@@ -2725,6 +2728,8 @@ impl GateProxy {
         let addr = listener.local_addr().expect("proxy address");
         listener.set_nonblocking(true).expect("nonblocking proxy");
         let shared = Arc::new(GateShared::default());
+        shared.hold_after.store(usize::MAX, Ordering::Release);
+        shared.refuse_after.store(usize::MAX, Ordering::Release);
         shared.open.store(true, Ordering::Release);
         let sh = shared.clone();
         thread::spawn(move || {
@@ -2733,8 +2738,11 @@ impl GateProxy {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                sh.accepted.fetch_add(1, Ordering::AcqRel);
-                if !sh.open.load(Ordering::Acquire) || sh.refuse_new.load(Ordering::Acquire) {
+                let n = sh.accepted.fetch_add(1, Ordering::AcqRel) + 1;
+                if !sh.open.load(Ordering::Acquire)
+                    || sh.refuse_new.load(Ordering::Acquire)
+                    || n > sh.refuse_after.load(Ordering::Acquire)
+                {
                     let _ = client.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
@@ -2760,6 +2768,7 @@ impl GateProxy {
                 if held {
                     *sh.released.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 }
+                let held = held || n > sh.hold_after.load(Ordering::Acquire);
                 let gate = sh.clone();
                 thread::spawn(move || {
                     if held {
@@ -2821,6 +2830,23 @@ impl GateProxy {
     /// Relay's bytes go through.
     pub fn hold_next(&self) {
         self.shared.hold_next.store(true, Ordering::Release);
+    }
+
+    /// Holds (as [`GateProxy::hold_next`]) every connection after the first `n` accepted,
+    /// until [`GateProxy::release`]; those after the release go on.
+    pub fn hold_after(&self, n: usize) {
+        *self
+            .shared
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        self.shared.hold_after.store(n, Ordering::Release);
+    }
+
+    /// Closes every connection after the first `n` accepted at once (an upstream gone for
+    /// them), leaving earlier ones alone.
+    pub fn refuse_after(&self, n: usize) {
+        self.shared.refuse_after.store(n, Ordering::Release);
     }
 
     /// Lets held connections go on.

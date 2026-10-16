@@ -155,8 +155,8 @@ impl RingEvents for FarewellEvents {
     fn presence(&self, _key: SignKey, _presence: MemberPresence) {}
     fn roster(&self, _roster: &SignedRoster) {}
 
-    /// The old Relay knew versions this device had not seen: trusted like any verified
-    /// chain, and followed when its head names another Relay.
+    /// The Relay knew versions this device had not seen: trusted like any verified chain, then
+    /// published on the main connection's Relay, or followed when the head names another.
     fn chain(&self, chain: &RosterChain) {
         let Some(inner) = self.inner.upgrade() else {
             return;
@@ -169,9 +169,10 @@ impl RingEvents for FarewellEvents {
             let Some(m) = merge(&st.chain, chain) else {
                 return;
             };
-            if m.head().roster().relay_url != st.chain.head().roster().relay_url {
-                st.dirty = true;
-            }
+            // The main connection syncs (it publishes what its Relay lacks) or, for a head
+            // naming another Relay, follows; nothing of this came from its Relay, so no
+            // `follow`.
+            st.dirty = true;
             st.chain = m.clone();
             st.fw_dirty = true;
             inner.cv.notify_all();

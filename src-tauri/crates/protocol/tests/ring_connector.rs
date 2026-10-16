@@ -1491,12 +1491,35 @@ impl ConnectorEvents for Echo {
     }
 }
 
-/// A Daemon connected to A, and A → B → C told to A in one farewell whose broadcast stops
-/// after B (the test Relay's `split_commits`): the Daemon gets C only by asking. `fault` is
-/// what its first `roster.get` there gets; B's gate is open or not as `b_open`; with `echo`
-/// the Daemon's events hand each chain back to its Connector.
+/// What the versions after v3 (which names B) do in [`split_move`].
+#[derive(Clone, Copy, PartialEq)]
+enum Then {
+    /// v4 names C.
+    ToC,
+    /// v4 keeps B and removes the phone.
+    KeepB,
+    /// v4 names A again, v5 names C.
+    BackToAThenC,
+}
+
+/// What the Daemon's background connections to A meet in [`split_move`].
+#[derive(Clone, Copy, PartialEq)]
+enum Fetches {
+    Open,
+    /// Held at their `auth` until A's gate is released.
+    Held,
+    /// Closed at once: A is gone for them.
+    Refused,
+}
+
+/// A Daemon connected to A, and a Desktop that tells A of B and `then` in one step (its
+/// whole chain staged at `auth`, as a farewell does), while A broadcasts only the first new
+/// version (the test Relay's `split_commits`): the Daemon gets the rest only by asking.
+/// `fault` is what its first `roster.get` there gets; B's gate is open or not as `b_open`;
+/// `fetches` gates every later connection to A; with `echo` the Daemon's events hand each
+/// chain back to its Connector.
 struct SplitMove {
-    _a: TestRelay,
+    a: TestRelay,
     ga: GateProxy,
     b: TestRelay,
     gb: GateProxy,
@@ -1504,10 +1527,18 @@ struct SplitMove {
     ring: TestRing,
     dmn: Arc<Connector>,
     mrec: Arc<Rec>,
-    desk: Connector,
+    _desk: RingClient,
+    /// Connections through A's gate up to the Desktop's: later ones are the Daemon's.
+    n: usize,
 }
 
-fn split_move(fault: Option<GetFault>, b_open: bool, echo: bool) -> SplitMove {
+fn split_move(
+    fault: Option<GetFault>,
+    b_open: bool,
+    echo: bool,
+    then: Then,
+    fetches: Fetches,
+) -> SplitMove {
     let (a, b, c) = (relay(), relay(), relay());
     let (ga, gb) = (gated(&a), gated(&b));
     gb.set_open(b_open);
@@ -1531,19 +1562,40 @@ fn split_move(fault: Option<GetFault>, b_open: bool, echo: bool) -> SplitMove {
     }
     let gets = a.roster_gets();
     ring.next(|d| d.relay_url = gb.url());
-    ring.next(|d| d.relay_url = c.url());
-    let mut cc = desk_cfg(&c, &ring, &ring.chain);
-    cc.farewells = vec![Farewell {
-        source: ga.url(),
-        from: 2,
-        target: 4,
-    }];
-    let (desk, rec) = start(cc);
-    assert!(rec.wait(WAIT, |e| is_done(e, &ga.url())).is_some());
+    match then {
+        Then::ToC => {
+            ring.next(|d| d.relay_url = c.url());
+        }
+        Then::KeepB => {
+            let phone = ring.mobile.sign_key();
+            ring.next(|d| {
+                d.remove(&phone);
+            });
+        }
+        Then::BackToAThenC => {
+            ring.next(|d| d.relay_url = ga.url());
+            ring.next(|d| d.relay_url = c.url());
+        }
+    }
+    // The Desktop's connection is the next one through A's gate; the Daemon's background
+    // ones come after it.
+    let n = ga.connections() + 1;
+    match fetches {
+        Fetches::Open => {}
+        Fetches::Held => ga.hold_after(n),
+        Fetches::Refused => ga.refuse_after(n),
+    }
+    let mut dcfg = config(&a.target(), &ring.chain, ring.desktop.clone());
+    dcfg.dial = Some(ga.url());
+    let desk = RingClient::connect(dcfg, Recorder::new()).expect("the Desktop tells A");
+    assert_eq!(
+        a.head_version(&ring.ring_id()),
+        Some(ring.chain.head().version())
+    );
     assert!(mrec.wait(WAIT, |e| matches!(e, Ev::Chain(3))).is_some());
     wait_until("the Daemon's catch-up request", || a.roster_gets() > gets);
     SplitMove {
-        _a: a,
+        a,
         ga,
         b,
         gb,
@@ -1551,7 +1603,8 @@ fn split_move(fault: Option<GetFault>, b_open: bool, echo: bool) -> SplitMove {
         ring,
         dmn,
         mrec,
-        desk,
+        _desk: desk,
+        n,
     }
 }
 
@@ -1563,39 +1616,37 @@ fn wait_long(what: &str, f: impl Fn() -> bool) {
     }
 }
 
-fn seen(r: &TestRelay, ring: &TestRing, key: &SignKey) -> bool {
-    r.presence(&ring.ring_id(), key)
-        .is_some_and(|p| p.online || p.last_seen.is_some())
-}
-
 /// A1: the old Relay commits A → B → C in one step but the Daemon hears only B; it fetches
 /// the rest before it follows, so it goes to C and never dials B.
 #[test]
 fn a_device_on_the_old_relay_never_dials_an_intermediate_relay() {
-    let m = split_move(None, false, false);
+    let m = split_move(None, false, false, Then::ToC, Fetches::Open);
     let key = m.ring.daemon.sign_key();
     wait_until("the Daemon on C", || online(&m.c, &m.ring, &key));
     assert!(m.mrec.wait(WAIT, |e| matches!(e, Ev::Chain(4))).is_some());
     assert_eq!(m.gb.connections(), 0, "never dialed the intermediate Relay");
     m.dmn.stop(ByeReason::quit());
-    m.desk.stop(ByeReason::quit());
 }
 
 /// The catch-up after B fails (here the connection drops) and B is reachable: the Daemon
-/// follows B, and the fetch job asks A again, which brings C. With and without a persisting
-/// owner that hands every chain back (`set_chain` of the chain held changes nothing).
+/// follows B, and the fetch job (held until the Daemon is on B) asks A again, which brings
+/// C. With and without a persisting owner that hands every chain back (`set_chain` of the
+/// chain held changes nothing).
 #[test]
 fn an_unfinished_catch_up_reaches_the_newest_relay_through_a_reachable_one() {
     for echo in [false, true] {
-        let m = split_move(Some(GetFault::Close), true, echo);
+        let m = split_move(Some(GetFault::Close), true, echo, Then::ToC, Fetches::Held);
         let key = m.ring.daemon.sign_key();
+        wait_long(&format!("the Daemon on B (echo {echo})"), || {
+            online(&m.b, &m.ring, &key)
+        });
+        assert_eq!(m.dmn.chain().head().version(), 3);
+        m.ga.release();
         wait_long(&format!("the Daemon on C (echo {echo})"), || {
             online(&m.c, &m.ring, &key)
         });
-        assert!(seen(&m.b, &m.ring, &key), "on B first (echo {echo})");
         assert_eq!(m.dmn.chain().head().version(), 4);
         m.dmn.stop(ByeReason::quit());
-        m.desk.stop(ByeReason::quit());
     }
 }
 
@@ -1604,7 +1655,7 @@ fn an_unfinished_catch_up_reaches_the_newest_relay_through_a_reachable_one() {
 #[test]
 fn an_unfinished_catch_up_past_a_dead_relay_reaches_the_newest_one() {
     for fault in [GetFault::Close, GetFault::Refuse, GetFault::Ignore] {
-        let m = split_move(Some(fault), false, false);
+        let m = split_move(Some(fault), false, false, Then::ToC, Fetches::Open);
         let key = m.ring.daemon.sign_key();
         wait_long(&format!("the Daemon on C after {fault:?}"), || {
             online(&m.c, &m.ring, &key)
@@ -1617,18 +1668,24 @@ fn an_unfinished_catch_up_past_a_dead_relay_reaches_the_newest_one() {
             "{fault:?}"
         );
         m.dmn.stop(ByeReason::quit());
-        m.desk.stop(ByeReason::quit());
     }
 }
 
-/// A gone for good and B alive: the Daemon stays on B while the fetch job keeps asking A,
-/// without disturbing the link.
+/// A gone for good (for every connection after the Desktop's) and B alive: the Daemon stays
+/// on B while the fetch job keeps asking A, without disturbing the link.
 #[test]
 fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
-    let m = split_move(Some(GetFault::Ignore), true, false);
-    m.ga.set_open(false);
+    let m = split_move(
+        Some(GetFault::Close),
+        true,
+        false,
+        Then::ToC,
+        Fetches::Refused,
+    );
     let key = m.ring.daemon.sign_key();
-    wait_long("the Daemon on B", || online(&m.b, &m.ring, &key));
+    wait_long("the Daemon on B", || {
+        online(&m.b, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
     let tries = m.ga.connections();
     m.mrec.clear();
     wait_long("the fetch job retried", || m.ga.connections() >= tries + 2);
@@ -1637,14 +1694,13 @@ fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
     assert_eq!(m.dmn.state(), LinkState::Connected { limited: false });
     assert!(link_states(&m.mrec).is_empty(), "{:?}", m.mrec.all());
     m.dmn.stop(ByeReason::quit());
-    m.desk.stop(ByeReason::quit());
 }
 
 /// An owner that hands back an older prefix of the chain held (its persisted report of v2,
 /// arriving after a fetch brought v4) changes nothing: no rewind, no redial.
 #[test]
 fn an_older_prefix_from_the_owner_is_an_echo() {
-    let m = split_move(Some(GetFault::Close), true, false);
+    let m = split_move(Some(GetFault::Close), true, false, Then::ToC, Fetches::Open);
     let key = m.ring.daemon.sign_key();
     wait_long("the Daemon on C", || online(&m.c, &m.ring, &key));
     assert_eq!(m.dmn.chain().head().version(), 4);
@@ -1656,7 +1712,61 @@ fn an_older_prefix_from_the_owner_is_an_echo() {
     assert!(link_states(&m.mrec).is_empty(), "{:?}", m.mrec.all());
     assert!(online(&m.c, &m.ring, &key));
     m.dmn.stop(ByeReason::quit());
-    m.desk.stop(ByeReason::quit());
+}
+
+/// A version the fetch job brings that keeps the Relay (here a removal) reaches that Relay
+/// through the main connection, which stays up.
+#[test]
+fn a_fetched_version_for_the_same_relay_is_published_there() {
+    let m = split_move(
+        Some(GetFault::Close),
+        true,
+        false,
+        Then::KeepB,
+        Fetches::Held,
+    );
+    let key = m.ring.daemon.sign_key();
+    wait_long("the Daemon on B", || {
+        online(&m.b, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
+    assert_eq!(m.b.head_version(&m.ring.ring_id()), Some(3));
+    m.mrec.clear();
+    m.ga.release();
+    wait_until("v4 on B", || m.b.head_version(&m.ring.ring_id()) == Some(4));
+    std::thread::sleep(QUIET);
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(
+        link_states(&m.mrec).is_empty(),
+        "no reconnect: {:?}",
+        m.mrec.all()
+    );
+    assert!(online(&m.b, &m.ring, &key));
+    m.dmn.stop(ByeReason::quit());
+}
+
+/// A fetch in flight whose job the owner removes (a newer chain whose head names the fetch's
+/// Relay again) counts for nothing when its answer comes after all, though it would extend
+/// that chain.
+#[test]
+fn a_cancelled_fetch_in_flight_changes_nothing() {
+    let m = split_move(
+        Some(GetFault::Close),
+        false,
+        false,
+        Then::BackToAThenC,
+        Fetches::Held,
+    );
+    let key = m.ring.daemon.sign_key();
+    wait_long("the fetch held", || m.ga.connections() > m.n);
+    // A refuses everything new, so only the held fetch could bring v5.
+    m.ga.refuse_new(true);
+    m.dmn.set_chain(m.ring.up_to(4));
+    m.ga.release();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(m.a.head_version(&m.ring.ring_id()), Some(5));
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(!online(&m.c, &m.ring, &key));
+    m.dmn.stop(ByeReason::quit());
 }
 
 #[test]
