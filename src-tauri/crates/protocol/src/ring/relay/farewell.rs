@@ -8,6 +8,11 @@
 //! for as long as the Connector runs; one that is no longer owed (the head names its Relay
 //! again) is dropped, and an attempt at it in flight is cut without a goodbye.
 //!
+//! The same worker runs **fetch jobs**: a catch-up the main connection could not finish
+//! (see the Connector's docs) is asked again here, on a connection to that Relay with the
+//! chain this device has, until it answers (with something newer or not). Fetch jobs retry
+//! on the same backoff, report nothing, and are dropped once the head names their Relay.
+//!
 //! [`ConnectorConfig::farewell_backoff_max`]: super::ConnectorConfig::farewell_backoff_max
 
 use super::super::chain::RosterChain;
@@ -100,6 +105,34 @@ impl FwJob {
     }
 }
 
+/// A worker job, by Relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Job {
+    Farewell(String),
+    Fetch(String),
+}
+
+/// A catch-up to ask a Relay again, with its schedule.
+pub(super) struct FetchJob {
+    failures: u32,
+    next_at: Instant,
+}
+
+impl FetchJob {
+    pub(super) fn new() -> FetchJob {
+        FetchJob {
+            failures: 0,
+            next_at: Instant::now(),
+        }
+    }
+}
+
+/// What the worker picked.
+enum Picked {
+    Farewell(Farewell),
+    Fetch(String),
+}
+
 /// How one attempt ended.
 enum Sent {
     /// The old Relay holds the trusted head, this version.
@@ -157,8 +190,15 @@ impl Inner {
     /// until the Connector stops.
     pub(super) fn run_farewells(self: Arc<Self>) {
         loop {
-            let Some((farewell, gen, chain)) = self.next_farewell() else {
+            let Some((picked, gen, chain)) = self.next_job() else {
                 return;
+            };
+            let farewell = match picked {
+                Picked::Farewell(f) => f,
+                Picked::Fetch(source) => {
+                    self.fetch(&source, gen, chain);
+                    continue;
+                }
             };
             self.events.farewell(&FarewellState::Sending {
                 farewell: farewell.clone(),
@@ -177,33 +217,42 @@ impl Inner {
         }
     }
 
-    /// Waits for a farewell that is due and marks it in flight under a new generation.
-    /// `None`: stopped.
-    fn next_farewell(&self) -> Option<(Farewell, u64, RosterChain)> {
+    /// Waits for a job that is due (a farewell or a fetch, the earliest first) and marks it in
+    /// flight under a new generation. `None`: stopped.
+    fn next_job(&self) -> Option<(Picked, u64, RosterChain)> {
         let mut st = lock(&self.st);
         loop {
             if st.stop.is_some() {
                 return None;
             }
             st.fw_dirty = false;
+            let _ = Inner::prune_farewells(&mut st);
             let chain = st.chain.clone();
-            st.farewells.retain(|_, j| j.farewell.still_owed(&chain));
             let next = st
                 .farewells
                 .values()
-                .min_by_key(|j| j.next_at)
-                .map(|j| (j.farewell.source.clone(), j.next_at));
+                .map(|j| (Job::Farewell(j.farewell.source.clone()), j.next_at))
+                .chain(
+                    st.fetches
+                        .iter()
+                        .map(|(s, j)| (Job::Fetch(s.clone()), j.next_at)),
+                )
+                .min_by_key(|(_, at)| *at);
             let now = Instant::now();
             match next {
-                Some((source, at)) if at <= now => {
+                Some((job, at)) if at <= now => {
                     st.fw_gen += 1;
                     let gen = st.fw_gen;
-                    st.fw_inflight = Some(source.clone());
+                    st.fw_inflight = Some(job.clone());
+                    let source = match job {
+                        Job::Fetch(source) => return Some((Picked::Fetch(source), gen, chain)),
+                        Job::Farewell(source) => source,
+                    };
                     let job = st.farewells.get_mut(&source).expect("picked");
                     job.state = Some(FarewellState::Sending {
                         farewell: job.farewell.clone(),
                     });
-                    return Some((job.farewell.clone(), gen, chain));
+                    return Some((Picked::Farewell(job.farewell.clone()), gen, chain));
                 }
                 Some((_, at)) => st = self.wait_fw(st, Some(at - now)),
                 None => st = self.wait_fw(st, None),
@@ -321,6 +370,38 @@ impl Inner {
         }
     }
 
+    /// One fetch job's attempt: connect to `source` with `chain` (whatever it holds beyond
+    /// it comes through [`FarewellEvents::chain`], fenced by `gen`), then drop the connection.
+    fn fetch(self: &Arc<Self>, source: &str, gen: u64, chain: RosterChain) {
+        let mut cfg = self.base.clone();
+        cfg.chain = chain;
+        cfg.dial = Some(source.to_string());
+        let events = Arc::new(FarewellEvents {
+            inner: Arc::downgrade(self),
+            gen,
+        });
+        let r = RingClient::connect(cfg, events);
+        let mut st = lock(&self.st);
+        if st.fw_gen != gen {
+            // Removed meanwhile (or stopped): nothing of it counts.
+            return;
+        }
+        st.fw_inflight = None;
+        st.fw_client = None;
+        match r {
+            Ok(_) => {
+                st.fetches.remove(source);
+            }
+            Err(_) => {
+                let (unit, max) = (self.farewell_unit, self.farewell_max);
+                if let Some(j) = st.fetches.get_mut(source) {
+                    j.failures += 1;
+                    j.next_at = Instant::now() + capped(j.failures - 1, unit, max);
+                }
+            }
+        }
+    }
+
     fn farewell_failed(&self, farewell: &Farewell, gen: u64, e: RingError) {
         let state = {
             let mut st = lock(&self.st);
@@ -358,11 +439,12 @@ impl Inner {
     pub(super) fn prune_farewells(st: &mut St) -> Option<Arc<RingClient>> {
         let chain = st.chain.clone();
         st.farewells.retain(|_, j| j.farewell.still_owed(&chain));
-        let source = st.fw_inflight.as_ref()?;
-        let owed = st
-            .farewells
-            .get(source)
-            .is_some_and(|j| j.farewell.still_owed(&st.chain));
+        let head = chain.head().roster().relay_url.clone();
+        st.fetches.retain(|source, _| *source != head);
+        let owed = match st.fw_inflight.as_ref()? {
+            Job::Farewell(source) => st.farewells.contains_key(source),
+            Job::Fetch(source) => st.fetches.contains_key(source),
+        };
         if owed {
             return None;
         }

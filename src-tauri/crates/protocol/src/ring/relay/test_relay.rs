@@ -2707,6 +2707,8 @@ pub struct GateProxy {
 struct GateShared {
     stop: AtomicBool,
     open: AtomicBool,
+    /// Close new connections at once, leaving those through already alone.
+    refuse_new: AtomicBool,
     accepted: std::sync::atomic::AtomicUsize,
     /// Both sides of every connection forwarded, to cut them on close.
     live: Mutex<Vec<(TcpStream, TcpStream)>>,
@@ -2732,7 +2734,7 @@ impl GateProxy {
                     continue;
                 };
                 sh.accepted.fetch_add(1, Ordering::AcqRel);
-                if !sh.open.load(Ordering::Acquire) {
+                if !sh.open.load(Ordering::Acquire) || sh.refuse_new.load(Ordering::Acquire) {
                     let _ = client.shutdown(std::net::Shutdown::Both);
                     continue;
                 }
@@ -2802,6 +2804,12 @@ impl GateProxy {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
         }
+    }
+
+    /// While on, new connections are closed at once; those through already (held ones
+    /// included) go on.
+    pub fn refuse_new(&self, on: bool) {
+        self.shared.refuse_new.store(on, Ordering::Release);
     }
 
     /// Every connection accepted so far, those closed at once included.

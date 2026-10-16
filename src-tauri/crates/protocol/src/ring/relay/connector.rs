@@ -15,13 +15,13 @@
 //! from the Relay that names another Relay is followed, but first the rest of what this
 //! Relay holds is fetched (`roster.get` until nothing new comes): a Relay that commits several
 //! versions at once broadcasts each of them, and a device must not dial an intermediate
-//! Relay when the newest head names a later one. That fetch can fail (the connection drops,
-//! the Relay refuses or does not answer), so the Relay a move came from stays a **fallback**:
-//! while the head's Relay keeps failing, every other attempt dials the fallback instead, with
-//! the chain this device has, and follows a newer head it holds. Those attempts report
-//! nothing but the normal `Waiting` (with the head's Relay's error). The fallback is dropped
-//! once the head's Relay is connected, and when the owner sets a chain
-//! ([`Connector::set_chain`]).
+//! Relay when the newest head names a later one. When that fetch does not finish (the
+//! connection drops, the Relay refuses or does not answer), the Connector follows the head it
+//! has, and the rest becomes a **fetch job** for the same background worker as the farewells:
+//! a short connection to that Relay that asks for what it holds beyond this device's head,
+//! retried with the farewell backoff until it succeeds (also with nothing newer) or the head
+//! names that Relay again. A newer head it brings is followed like any other. Fetch jobs live
+//! in memory only, and report nothing: no link state, quota or held Relay.
 //!
 //! **Farewells** (ADR-0012). A Desktop that changes the Relay URL owes each old Relay a
 //! [`Farewell`], or the devices still connected there never learn of the move. The Connector
@@ -35,7 +35,7 @@
 use super::super::chain::RosterChain;
 use super::super::{RingError, RosterError, SignKey, SignedRoster};
 use super::client::{MemberStatus, PushRequest, RingClient, RingClientConfig, RingEvents, Ticket};
-use super::farewell::{Farewell, FarewellState, FwJob};
+use super::farewell::{Farewell, FarewellState, FetchJob, FwJob, Job};
 use super::wire::{close, ByeReason, CloseReason, ErrorCode, MemberPresence};
 use crate::backoff::Backoff;
 use std::collections::BTreeMap;
@@ -159,10 +159,6 @@ pub(super) struct St {
     /// The current connection's Relay sent a head naming another Relay: fetch the rest of
     /// what it holds before following.
     follow: bool,
-    /// The Relay the head was last followed from, until the head's Relay is connected.
-    fallback: Option<String>,
-    /// The next attempt dials the fallback (the last one at the head's Relay failed).
-    try_fallback: bool,
     kick: bool,
     /// Limited state changed (entitlement); the worker re-reports `Connected`.
     refresh: bool,
@@ -173,11 +169,13 @@ pub(super) struct St {
     pub(super) farewells: BTreeMap<String, FwJob>,
     /// The farewells or the chain changed since the farewell worker last looked.
     pub(super) fw_dirty: bool,
-    /// The farewell attempt's generation, apart from `gen`: bumped for every attempt and
-    /// when one is cut, so its callbacks are ignored.
+    /// Unfinished catch-ups, by the Relay to ask again.
+    pub(super) fetches: BTreeMap<String, FetchJob>,
+    /// The worker attempt's generation, apart from `gen`: bumped for every attempt and when a
+    /// job is removed, so the callbacks of its attempt in flight are ignored.
     pub(super) fw_gen: u64,
-    /// The old Relay of the farewell attempt in flight.
-    pub(super) fw_inflight: Option<String>,
+    /// The job of the worker attempt in flight.
+    pub(super) fw_inflight: Option<Job>,
     /// That attempt's connection, once it is up.
     pub(super) fw_client: Option<Arc<RingClient>>,
 }
@@ -191,6 +189,8 @@ pub(super) struct Inner {
     stable_after: Duration,
     pub(super) farewell_unit: Duration,
     pub(super) farewell_max: Duration,
+    /// The farewell and fetch worker, started with its first job.
+    worker: Mutex<Option<JoinHandle<()>>>,
     /// Test hook: runs on the worker right before a quota report's fence.
     #[cfg(test)]
     before_quota: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -200,8 +200,6 @@ pub(super) struct Inner {
 pub struct Connector {
     inner: Arc<Inner>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// The farewell worker, started with the first farewell.
-    farewell_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 pub(super) fn lock(m: &Mutex<St>) -> MutexGuard<'_, St> {
@@ -323,11 +321,9 @@ impl RingEvents for Attempt {
             st.chain = m.clone();
             st.fw_dirty = true;
             if moved {
-                // The Ring moved: follow it, once the rest of what this Relay holds is in,
-                // and keep this Relay to fall back on.
+                // The Ring moved: follow it, once the rest of what this Relay holds is in.
                 st.dirty = true;
                 st.follow = true;
-                st.fallback = Some(self.dialed.clone());
             }
             inner.cv.notify_all();
             (m, Inner::prune_farewells(&mut st))
@@ -530,8 +526,8 @@ impl Inner {
 
     /// Fetches what the Relay `c` is connected to holds beyond `c`'s head, until it sends
     /// nothing new, bounded by the request timeout. Each version comes through the attempt's
-    /// `chain` callback. `true`: complete; `false`: the Relay refused, did not answer or
-    /// closed first, so it may hold more (the fallback asks again).
+    /// `chain` callback.
+    /// `true`: complete; `false`: the Relay refused, did not answer or closed first.
     fn catch_up(&self, c: &RingClient) -> bool {
         let until = Instant::now() + self.base.timeouts.request;
         loop {
@@ -548,30 +544,26 @@ impl Inner {
         }
     }
 
-    /// One attempt at the fallback `source` with `chain` (attempt `gen`): what it holds
-    /// beyond `chain` comes through the attempt's `chain` callback, and the connection is
-    /// dropped. `Ok(true)`: the head now names another Relay than before; `Err`: stopped.
-    fn fall_back(self: &Arc<Self>, chain: RosterChain, source: &str, gen: u64) -> Result<bool, ()> {
-        let before = chain.head().roster().relay_url.clone();
-        let mut cfg = self.base.clone();
-        cfg.chain = chain;
-        cfg.dial = Some(source.to_string());
-        let events = Arc::new(Attempt {
-            inner: Arc::downgrade(self),
-            gen,
-            dialed: source.to_string(),
-        });
-        let r = RingClient::connect(cfg, events);
-        let mut st = lock(&self.st);
-        // Fenced off: nothing of this connection counts any more.
-        st.gen += 1;
-        if st.stop.is_some() {
-            drop(st);
-            drop(r);
-            self.finish(None);
-            return Err(());
+    /// Starts the worker for farewells and fetch jobs once one is owed (and the Connector
+    /// runs).
+    pub(super) fn start_worker(self: &Arc<Self>) -> std::io::Result<()> {
+        let mut t = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let st = lock(&self.st);
+            if t.is_some()
+                || st.stop.is_some()
+                || (st.farewells.is_empty() && st.fetches.is_empty())
+            {
+                return Ok(());
+            }
         }
-        Ok(r.is_ok() && st.chain.head().roster().relay_url != before)
+        let i = self.clone();
+        *t = Some(
+            std::thread::Builder::new()
+                .name("ring-farewell".into())
+                .spawn(move || i.run_farewells())?,
+        );
+        Ok(())
     }
 
     /// The stop request: says goodbye on `c` if there is one.
@@ -589,11 +581,9 @@ impl Inner {
 
     fn run(self: Arc<Self>) {
         let mut backoff = Backoff::default();
-        // The head's Relay's last error, for `Waiting` after a fallback attempt.
-        let mut head_error = String::new();
         'attempt: loop {
             // One attempt: what to dial, under a new generation.
-            let (target, gen, via) = {
+            let (target, gen) = {
                 let mut st = lock(&self.st);
                 if st.stop.is_some() {
                     break;
@@ -604,31 +594,8 @@ impl Inner {
                 st.closed = None;
                 st.refresh = false;
                 st.gen += 1;
-                let head = st.chain.head().roster().relay_url.clone();
-                if st.fallback.as_deref() == Some(head.as_str()) {
-                    st.fallback = None;
-                }
-                let via = if std::mem::take(&mut st.try_fallback) {
-                    st.fallback.clone()
-                } else {
-                    None
-                };
-                (st.chain.clone(), st.gen, via)
+                (st.chain.clone(), st.gen)
             };
-            if let Some(source) = via {
-                match self.fall_back(target, &source, gen) {
-                    Err(()) => break,
-                    // The fallback knew a newer head: dial its Relay at once.
-                    Ok(true) => continue,
-                    Ok(false) => {
-                        let retry_in = backoff.failed(self.backoff_unit);
-                        if self.backoff_wait(retry_in, head_error.clone()) {
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            }
             self.set_link(LinkState::Connecting {
                 attempt: backoff.failures,
             });
@@ -690,11 +657,6 @@ impl Inner {
                         self.report_held(gen, &dialed, dialed_version);
                         self.report_quota(gen, &dialed);
                     }
-                    {
-                        let mut st = lock(&self.st);
-                        st.try_fallback = st.fallback.is_some();
-                    }
-                    head_error = e.to_string();
                     let retry_in = backoff.failed(self.backoff_unit);
                     if self.backoff_wait(retry_in, e.to_string()) {
                         break;
@@ -703,13 +665,6 @@ impl Inner {
                 }
             };
             let up_at = Instant::now();
-            {
-                // On the head's Relay: nothing to fall back on any more.
-                let mut st = lock(&self.st);
-                if st.chain.head().roster().relay_url == dialed {
-                    st.fallback = None;
-                }
-            }
 
             // Versions set while the connect ran.
             if c.chain().head().version() < lock(&self.st).chain.head().version() {
@@ -727,10 +682,9 @@ impl Inner {
                     Woke::Refresh => self.connected(&c, gen),
                     Woke::Kick | Woke::Timeout => {}
                     Woke::Dirty => {
-                        if std::mem::take(&mut lock(&self.st).follow) {
-                            // Complete or not, the fallback (set with `follow`) covers the
-                            // rest.
-                            let _complete = self.catch_up(&c);
+                        if std::mem::take(&mut lock(&self.st).follow) && !self.catch_up(&c) {
+                            // Follow what this device has; the rest comes later.
+                            self.owe_fetch(&dialed);
                         }
                         if !self.sync(&c, &dialed) {
                             // Another Ring or another Relay: dial again, at once.
@@ -793,6 +747,25 @@ impl Inner {
         true
     }
 
+    /// `relay` may hold more than this device has: a fetch job asks it again, unless the head
+    /// names it (the link covers it then).
+    fn owe_fetch(self: &Arc<Self>, relay: &str) {
+        {
+            let mut st = lock(&self.st);
+            if st.stop.is_some() || st.chain.head().roster().relay_url == relay {
+                return;
+            }
+            st.fetches
+                .entry(relay.to_string())
+                .or_insert_with(FetchJob::new);
+            st.fw_dirty = true;
+            self.cv.notify_all();
+        }
+        if let Err(e) = self.start_worker() {
+            eprintln!("xshell: cannot start the farewell worker: {e}");
+        }
+    }
+
     /// Reports `Waiting` and waits out `retry_in`. `true`: stopped.
     fn backoff_wait(&self, retry_in: Duration, error: String) -> bool {
         self.set_link(LinkState::Waiting { retry_in, error });
@@ -831,13 +804,12 @@ impl Connector {
                 link: LinkState::Connecting { attempt: 0 },
                 dirty: false,
                 follow: false,
-                fallback: None,
-                try_fallback: false,
                 kick: false,
                 refresh: false,
                 stop: None,
                 foreground: None,
                 farewells,
+                fetches: BTreeMap::new(),
                 fw_dirty: false,
                 fw_gen: 0,
                 fw_inflight: None,
@@ -850,6 +822,7 @@ impl Connector {
             stable_after: cfg.stable_after,
             farewell_unit: cfg.farewell_backoff_unit,
             farewell_max: cfg.farewell_backoff_max,
+            worker: Mutex::new(None),
             #[cfg(test)]
             before_quota: Mutex::new(None),
         }
@@ -864,47 +837,30 @@ impl Connector {
         let c = Connector {
             inner,
             thread: Mutex::new(Some(thread)),
-            farewell_thread: Mutex::new(None),
         };
-        c.start_farewells()?;
+        c.inner.start_worker()?;
         Ok(c)
-    }
-
-    /// Starts the farewell worker once a farewell is owed (and the Connector runs).
-    fn start_farewells(&self) -> std::io::Result<()> {
-        let mut t = self
-            .farewell_thread
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        {
-            let st = lock(&self.inner.st);
-            if t.is_some() || st.stop.is_some() || st.farewells.is_empty() {
-                return Ok(());
-            }
-        }
-        let i = self.inner.clone();
-        *t = Some(
-            std::thread::Builder::new()
-                .name("ring-farewell".into())
-                .spawn(move || i.run_farewells())?,
-        );
-        Ok(())
     }
 
     /// Trust `chain` from now on (it replaces the one held). Versions the Relay lacks are
     /// published; a head naming another Relay, or another Ring, makes the Connector dial
-    /// again at once. A farewell the chain no longer owes is dropped (another Ring drops
-    /// them all). Never blocks, and reports nothing itself.
+    /// again at once. A farewell the chain no longer owes is dropped, and so is a fetch job
+    /// at the Relay the head names (another Ring drops them all). A chain with the head held
+    /// already (the owner persisting what the Connector reported) changes nothing. Never
+    /// blocks, and reports nothing itself.
     pub fn set_chain(&self, chain: RosterChain) {
         let cut = {
             let mut st = lock(&self.inner.st);
+            if st.chain.ring_id() == chain.ring_id()
+                && st.chain.head().token() == chain.head().token()
+            {
+                return;
+            }
             if st.chain.ring_id() != chain.ring_id() {
                 st.farewells.clear();
+                st.fetches.clear();
             }
             st.chain = chain;
-            // The owner's chain: no Relay of an earlier move to fall back on.
-            st.fallback = None;
-            st.try_fallback = false;
             st.dirty = true;
             st.fw_dirty = true;
             self.inner.cv.notify_all();
@@ -947,7 +903,7 @@ impl Connector {
         if let Some(c) = cut {
             c.shutdown();
         }
-        if let Err(e) = self.start_farewells() {
+        if let Err(e) = self.inner.start_worker() {
             // Retried with the next set; the link itself is unaffected.
             eprintln!("xshell: cannot start the farewell worker: {e}");
         }
@@ -1211,7 +1167,7 @@ impl Connector {
             }
             self.inner.cv.notify_all();
         }
-        let handles: Vec<JoinHandle<()>> = [&self.thread, &self.farewell_thread]
+        let handles: Vec<JoinHandle<()>> = [&self.thread, &self.inner.worker]
             .into_iter()
             .filter_map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).take())
             .collect();
