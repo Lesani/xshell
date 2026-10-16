@@ -4,12 +4,15 @@
 //! ```json
 //! {"v":1,"signSeed":"b64u","noiseSeed":"b64u","rosters":["xro1…",…],
 //!  "localMember":"<signKey>"|null,
-//!  "pendingMove":{"source":"wss://old","from":N,"target":M}|null,
+//!  "farewells":[{"source":"wss://old","from":N,"target":M},…],
+//!  "heldRelays":["wss://…",…],
 //!  "hostMembers":{"<hostId>":{"signKey":"<signKey>","target":"…"},…}}
 //! ```
 //!
-//! `hostMembers` (the Remote Hosts' Daemons as last added to the Roster) is written only
-//! when not empty, so a Ring without Remote Hosts keeps the earlier shape.
+//! `hostMembers` (the Remote Hosts' Daemons as last added to the Roster) and `farewells`
+//! (ADR-0012) are written only when not empty. Earlier builds wrote `pendingMove` (one move
+//! owed, or `null`) and no `heldRelays`: such a file is read once more and rewritten in this
+//! shape. An earlier build refuses this shape (it moves the file aside).
 //!
 //! Every change is a transaction ([`Store::transact`]): an in-process mutex and an exclusive
 //! lock on `ring.lock` (so a second app instance waits), the state reloaded from disk, the
@@ -24,13 +27,14 @@
 //! that is a symlink or another user's is refused, and broader modes are tightened.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use xshell_protocol::ring::relay::MoveJob;
+use xshell_protocol::ring::relay::Farewell;
+use xshell_protocol::ring::url::normalize_origin;
 use xshell_protocol::ring::{DeviceKeys, RosterChain, SecretSeed, SignKey};
 use zeroize::Zeroizing;
 
@@ -41,8 +45,10 @@ pub struct RingState {
     pub chain: RosterChain,
     /// The sign key of the Daemon on this computer, as last added to the Roster.
     pub local_member: Option<SignKey>,
-    /// A Relay move still owed to the old Relay (see `Connector`).
-    pub pending_move: Option<MoveJob>,
+    /// The farewells owed to old Relays (ADR-0012), at most one per Relay, by Relay.
+    pub farewells: Vec<Farewell>,
+    /// The Relays known to have held this Ring: no farewell is owed to any other.
+    pub held_relays: BTreeSet<String>,
     /// Per configured Remote Host (by id): the sign key of its Daemon, as last added to the
     /// Roster.
     pub host_members: BTreeMap<String, HostMember>,
@@ -61,10 +67,30 @@ pub struct HostMember {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct PendingFile {
+struct FarewellFile {
     source: String,
     from: u64,
     target: u64,
+}
+
+impl From<&Farewell> for FarewellFile {
+    fn from(f: &Farewell) -> Self {
+        FarewellFile {
+            source: f.source.clone(),
+            from: f.from,
+            target: f.target,
+        }
+    }
+}
+
+impl From<&FarewellFile> for Farewell {
+    fn from(f: &FarewellFile) -> Self {
+        Farewell {
+            source: f.source.clone(),
+            from: f.from,
+            target: f.target,
+        }
+    }
 }
 
 /// The file as stored. The seeds decode straight into wiping storage, so every path, a
@@ -77,7 +103,14 @@ struct File {
     noise_seed: SecretSeed,
     rosters: Vec<String>,
     local_member: Option<SignKey>,
-    pending_move: Option<PendingFile>,
+    /// Earlier builds' one move owed: read, never written.
+    #[serde(default, skip_serializing)]
+    pending_move: Option<FarewellFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    farewells: Vec<FarewellFile>,
+    /// `None` in an earlier build's file.
+    #[serde(default)]
+    held_relays: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     host_members: BTreeMap<String, HostMember>,
 }
@@ -269,11 +302,9 @@ impl Store {
                 .map(|r| r.token().to_string())
                 .collect(),
             local_member: s.local_member,
-            pending_move: s.pending_move.as_ref().map(|j| PendingFile {
-                source: j.source.clone(),
-                from: j.from,
-                target: j.target,
-            }),
+            pending_move: None,
+            farewells: s.farewells.iter().map(FarewellFile::from).collect(),
+            held_relays: Some(s.held_relays.clone()),
             host_members: s.host_members.clone(),
         };
         let json = encode(&f)?;
@@ -287,7 +318,15 @@ fn capacity(f: &File) -> usize {
     let esc = |s: &str| 6 * s.len() + 2;
     // The keys, the seeds, `localMember`, the numbers and the punctuation.
     1024 + f.rosters.iter().map(|t| t.len() + 3).sum::<usize>()
-        + f.pending_move.as_ref().map_or(0, |p| esc(&p.source))
+        + f.farewells
+            .iter()
+            .map(|p| esc(&p.source) + 64)
+            .sum::<usize>()
+        + f.held_relays
+            .iter()
+            .flatten()
+            .map(|r| esc(r) + 1)
+            .sum::<usize>()
         + f.host_members
             .iter()
             .map(|(id, m)| esc(id) + esc(&m.target) + 96)
@@ -309,17 +348,62 @@ fn parse(bytes: &[u8]) -> Result<RingState, String> {
     }
     let keys = DeviceKeys::from_seeds(&f.sign_seed.0, &f.noise_seed.0);
     let chain = RosterChain::from_tokens(&f.rosters).map_err(|e| e.to_string())?;
+    let placeholder = normalize_origin(super::LEGACY_PLACEHOLDER_RELAY_URL).ok();
+    let is_placeholder =
+        |url: &str| placeholder.is_some() && normalize_origin(url).ok() == placeholder;
+    // An earlier build's move owed becomes a farewell, one per Relay.
+    let mut by_source: BTreeMap<String, Farewell> = BTreeMap::new();
+    for p in f.pending_move.iter().chain(&f.farewells) {
+        by_source.insert(p.source.clone(), Farewell::from(p));
+    }
+    // Without the record, every Relay the chain names held the Ring, but the placeholder,
+    // which never existed.
+    let held_relays = f.held_relays.clone().unwrap_or_else(|| {
+        chain
+            .versions()
+            .iter()
+            .map(|r| r.roster().relay_url.clone())
+            .filter(|u| !is_placeholder(u))
+            .collect()
+    });
+    let farewells = by_source
+        .into_values()
+        .filter(|w| !is_placeholder(&w.source) && w.still_owed(&chain))
+        .collect();
     Ok(RingState {
         keys: Arc::new(keys),
         chain,
         local_member: f.local_member,
-        pending_move: f.pending_move.as_ref().map(|p| MoveJob {
-            source: p.source.clone(),
-            from: p.from,
-            target: p.target,
-        }),
+        farewells,
+        held_relays,
         host_members: f.host_members.clone(),
     })
+}
+
+impl RingState {
+    /// After a new version: every farewell now delivers the head, and one the chain no longer
+    /// owes (to the Relay the head names, say) is dropped.
+    pub fn retarget_farewells(&mut self) {
+        let head = self.chain.head().version();
+        for f in &mut self.farewells {
+            f.target = head;
+        }
+        let chain = &self.chain;
+        self.farewells.retain(|f| f.still_owed(chain));
+    }
+
+    /// The farewell owed to `source` for leaving it after version `from`, unless one is owed
+    /// already or the chain owes none.
+    pub fn owe_farewell(&mut self, from: u64) {
+        let Some(f) = Farewell::new(&self.chain, from) else {
+            return;
+        };
+        if !f.still_owed(&self.chain) || self.farewells.iter().any(|x| x.source == f.source) {
+            return;
+        }
+        self.farewells.push(f);
+        self.farewells.sort_by(|a, b| a.source.cmp(&b.source));
+    }
 }
 
 #[cfg(unix)]
@@ -503,13 +587,168 @@ mod tests {
             chain: RosterChain::from_chain(vec![g]).unwrap(),
             keys,
             local_member: None,
-            pending_move: Some(MoveJob {
-                source: "wss://old.example".into(),
-                from: 1,
-                target: 2,
-            }),
+            farewells: Vec::new(),
+            held_relays: ["wss://r.example".to_string()].into(),
             host_members: BTreeMap::new(),
         }
+    }
+
+    /// A chain from `urls`: version n names `urls[n - 1]`.
+    fn moved(urls: &[&str]) -> RingState {
+        let mut st = state();
+        let keys = st.keys.clone();
+        let g = SignedRoster::genesis(&*keys, keys.noise_key(), "desk", urls[0], 1).unwrap();
+        st.chain = RosterChain::from_chain(vec![g]).unwrap();
+        for u in &urls[1..] {
+            let n = st
+                .chain
+                .head()
+                .next(&*keys, 1, |d| d.relay_url = u.to_string())
+                .unwrap();
+            st.chain.accept(std::slice::from_ref(&n)).unwrap();
+        }
+        st
+    }
+
+    /// Writes `st` as an earlier build did: `pendingMove` (here `pending`), no `heldRelays`,
+    /// no `farewells`.
+    fn write_legacy(dir: &Path, st: &RingState, pending: Option<(&str, u64, u64)>) {
+        let (sign, noise) = st.keys.seeds();
+        let f = File {
+            v: 1,
+            sign_seed: SecretSeed::new(&sign),
+            noise_seed: SecretSeed::new(&noise),
+            rosters: st
+                .chain
+                .versions()
+                .iter()
+                .map(|r| r.token().to_string())
+                .collect(),
+            local_member: None,
+            pending_move: None,
+            farewells: Vec::new(),
+            held_relays: None,
+            host_members: BTreeMap::new(),
+        };
+        let mut v = serde_json::to_value(&f).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("heldRelays");
+        o.insert(
+            "pendingMove".into(),
+            match pending {
+                Some((source, from, target)) => {
+                    serde_json::json!({"source": source, "from": from, "target": target})
+                }
+                None => serde_json::Value::Null,
+            },
+        );
+        ensure_private_dir(dir).unwrap();
+        fs::write(dir.join("ring.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    const OLD: &str = "wss://old.example";
+    const NEW: &str = "wss://new.example";
+
+    #[test]
+    fn legacy_pending_move_becomes_a_farewell() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        write_legacy(&dir, &moved(&[OLD, NEW]), Some((OLD, 1, 2)));
+        let got = Store::new(dir).load().unwrap().0.unwrap();
+        assert_eq!(
+            got.farewells,
+            [Farewell {
+                source: OLD.into(),
+                from: 1,
+                target: 2
+            }]
+        );
+        assert_eq!(got.held_relays, [OLD.to_string(), NEW.to_string()].into());
+    }
+
+    /// Mario's case: a Ring made on the placeholder, then moved to the Hosted Relay by a build
+    /// that waited for the placeholder.
+    #[test]
+    fn a_farewell_owed_to_the_placeholder_is_dropped_on_load() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let placeholder = super::super::LEGACY_PLACEHOLDER_RELAY_URL;
+        let hosted = xshell_protocol::ring::url::HOSTED_RELAY_URL;
+        write_legacy(
+            &dir,
+            &moved(&[placeholder, hosted]),
+            Some(("wss://RELAY.xshell.app:443/", 1, 2)),
+        );
+        let got = Store::new(dir).load().unwrap().0.unwrap();
+        assert!(got.farewells.is_empty(), "{:?}", got.farewells);
+        assert_eq!(got.held_relays, [hosted.to_string()].into());
+    }
+
+    #[test]
+    fn legacy_state_counts_every_named_relay_but_the_placeholder_as_held() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        let placeholder = super::super::LEGACY_PLACEHOLDER_RELAY_URL;
+        write_legacy(&dir, &moved(&[placeholder, OLD, NEW, OLD]), None);
+        let got = Store::new(dir).load().unwrap().0.unwrap();
+        assert_eq!(got.held_relays, [OLD.to_string(), NEW.to_string()].into());
+        assert!(got.farewells.is_empty());
+    }
+
+    #[test]
+    fn farewells_and_held_relays_round_trip() {
+        let t = tempfile::tempdir().unwrap();
+        let s = Store::new(t.path().join("ring"));
+        let mut st = moved(&[OLD, "wss://mid.example", NEW]);
+        st.held_relays = [OLD.to_string(), NEW.to_string()].into();
+        st.owe_farewell(2);
+        st.owe_farewell(1);
+        assert_eq!(
+            st.farewells
+                .iter()
+                .map(|f| f.source.as_str())
+                .collect::<Vec<_>>(),
+            ["wss://mid.example", OLD],
+            "one per Relay, by Relay"
+        );
+        s.transact(|_, _| Ok((Some(st.clone()), ()))).unwrap();
+        let got = s.load().unwrap().0.unwrap();
+        assert_eq!(got.farewells, st.farewells);
+        assert_eq!(got.held_relays, st.held_relays);
+        // A farewell the chain no longer owes is dropped on load.
+        let mut back = st.clone();
+        let n = back
+            .chain
+            .head()
+            .next(&*back.keys, 1, |d| d.relay_url = OLD.into())
+            .unwrap();
+        back.chain.accept(std::slice::from_ref(&n)).unwrap();
+        s.transact(|_, _| Ok((Some(back), ()))).unwrap();
+        let got = s.load().unwrap().0.unwrap();
+        assert_eq!(
+            got.farewells
+                .iter()
+                .map(|f| f.source.as_str())
+                .collect::<Vec<_>>(),
+            ["wss://mid.example"]
+        );
+    }
+
+    #[test]
+    fn pending_move_is_never_written() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("ring");
+        write_legacy(&dir, &moved(&[OLD, NEW]), Some((OLD, 1, 2)));
+        let s = Store::new(dir.clone());
+        s.transact(|cur, _| Ok((cur, ()))).unwrap();
+        let text = fs::read_to_string(dir.join("ring.json")).unwrap();
+        assert!(!text.contains("pendingMove"), "{text}");
+        assert!(
+            text.contains("\"farewells\":[{\"source\":\"wss://old.example\""),
+            "{text}"
+        );
+        assert!(text.contains("\"heldRelays\":["), "{text}");
+        assert_eq!(s.load().unwrap().0.unwrap().farewells.len(), 1);
     }
 
     fn key() -> SignKey {
@@ -522,16 +761,17 @@ mod tests {
         let dir = t.path().join("ring");
         let s = Store::new(dir.clone());
         s.transact(|_, _| Ok((Some(state()), ()))).unwrap();
-        // #8's shape, exactly: no `hostMembers` key.
+        // #8's shape, but `heldRelays` for `pendingMove` (ADR-0012): no `hostMembers` key,
+        // no `farewells` while none is owed.
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("ring.json")).unwrap()).unwrap();
         let keys: Vec<_> = raw.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             keys,
             [
+                "heldRelays",
                 "localMember",
                 "noiseSeed",
-                "pendingMove",
                 "rosters",
                 "signSeed",
                 "v"
@@ -615,7 +855,15 @@ mod tests {
                 },
             );
         }
-        st.pending_move.as_mut().unwrap().source = "\u{3}".repeat(200);
+        for i in 0..8 {
+            st.farewells.push(Farewell {
+                source: format!("{i}{}", "\u{3}".repeat(200)),
+                from: u64::MAX,
+                target: u64::MAX,
+            });
+            st.held_relays
+                .insert(format!("{i}{}", "\u{4}\"".repeat(100)));
+        }
         let (sign, noise) = st.keys.seeds();
         let f = File {
             v: 1,
@@ -628,11 +876,9 @@ mod tests {
                 .map(|r| r.token().to_string())
                 .collect(),
             local_member: Some(key()),
-            pending_move: st.pending_move.as_ref().map(|j| PendingFile {
-                source: j.source.clone(),
-                from: j.from,
-                target: j.target,
-            }),
+            pending_move: None,
+            farewells: st.farewells.iter().map(FarewellFile::from).collect(),
+            held_relays: Some(st.held_relays.clone()),
             host_members: st.host_members.clone(),
         };
         let cap = capacity(&f);
@@ -650,7 +896,8 @@ mod tests {
         s.transact(|_, _| Ok((Some(st.clone()), ()))).unwrap();
         let (got, l) = s.load().unwrap();
         let got = got.unwrap();
-        assert_eq!(got.pending_move, st.pending_move);
+        assert_eq!(got.farewells, st.farewells);
+        assert_eq!(got.held_relays, st.held_relays);
         assert_eq!(got.keys.sign_key(), st.keys.sign_key());
         assert_eq!(got.keys.noise_key(), st.keys.noise_key());
         assert_eq!(got.chain, st.chain);

@@ -1240,7 +1240,8 @@ mod tests {
                 keys,
                 chain: chain.clone(),
                 local_member: None,
-                pending_move: None,
+                farewells: Vec::new(),
+                held_relays: Default::default(),
                 host_members: Default::default(),
             };
             crate::ring::store::Store::new(dir.clone())

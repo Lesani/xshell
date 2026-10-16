@@ -12,9 +12,17 @@
 //! may take the Hosts manager's lock or read the settings file. It is only ever called with
 //! no `DesktopRing` lock held (neither `commit` nor `live`): [`DesktopRing::view`] calls it on
 //! a copy of the state, and [`DesktopRing::remove_member`] takes its answers before its
-//! transaction and checks against them. A view emission asked for under `commit` (the
-//! Connector reports a move synchronously from `set_chain` during an adoption) is deferred
-//! until the commit lock is released.
+//! transaction and checks against them. A view emission asked for under `commit` is deferred
+//! until the commit lock is released. (The Connector never reports from `set_chain` or
+//! `set_farewells` themselves, so an adoption reports nothing synchronously.)
+//!
+//! **Relay changes (ADR-0012).** A change of the Relay URL takes effect at once: the
+//! Connector moves to the new Relay whatever the old one's state. Each old Relay that held
+//! the Ring ([`RingState::held_relays`], from [`ConnectorEvents::held`]) is owed a farewell
+//! ([`RingState::farewells`]), kept on disk across restarts, always carrying the newest head,
+//! sent and retried by the Connector, and dropped once that Relay took it. A further change is
+//! never refused for a farewell owed. Only the window that runs the connection sends
+//! farewells and records held Relays.
 //!
 //! **The daily quota (xshell#42).** When the Ring has used up its Relay's daily message quota,
 //! the Relay refuses its frames until the quota resets at the next UTC midnight. The traffic
@@ -32,8 +40,8 @@
 //! run. Reports of a retired Connector (an older [`Live::epoch`]) change nothing. The
 //! Connector also reports a connect the Relay refused for quota and a close for quota
 //! (xshell#43), so the notice shows while the link is waiting too. When the Ring's Relay
-//! changes, the notice is the old Relay's and is cleared; no probe is sent while a move is
-//! still owed to the old Relay, and the Connector reports nothing about its quota.
+//! changes, the notice is the old Relay's and is cleared; the Connector reports nothing about
+//! an old Relay's quota (a farewell's refusals are its own).
 
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
@@ -53,8 +61,8 @@ use xshell_protocol::ring::relay::pair::{
 };
 use xshell_protocol::ring::relay::wire::QUOTA_REFUSALS_BEFORE_CLOSE;
 use xshell_protocol::ring::relay::{
-    ByeReason, Connector, ConnectorConfig, ConnectorEvents, ErrorCode, LinkState, MemberPresence,
-    MoveJob, MoveState, RingClientConfig, RingTimeouts,
+    ByeReason, Connector, ConnectorConfig, ConnectorEvents, ErrorCode, Farewell, FarewellState,
+    LinkState, MemberPresence, RingClientConfig, RingTimeouts,
 };
 use xshell_protocol::ring::roster::MAX_MEMBERS;
 use xshell_protocol::ring::url::{normalize_origin, RelayUrl};
@@ -300,8 +308,9 @@ pub struct DesktopRingConfig {
     pub default_relay_url: String,
     pub timeouts: RingTimeouts,
     pub backoff_unit: Duration,
-    /// Attempts at the old Relay per batch before a Relay move is reported failed.
-    pub move_attempts: u32,
+    /// The first wait after a failed farewell; it doubles up to `farewell_backoff_max`.
+    pub farewell_backoff_unit: Duration,
+    pub farewell_backoff_max: Duration,
     /// How often an instance that does not own the connection re-reads the state and tries
     /// to take the connection over.
     pub owner_retry: Duration,
@@ -330,7 +339,8 @@ impl DesktopRingConfig {
             hosted_relay_url: hosted,
             timeouts: RingTimeouts::default(),
             backoff_unit: Duration::from_secs(1),
-            move_attempts: 5,
+            farewell_backoff_unit: Duration::from_secs(5),
+            farewell_backoff_max: Duration::from_secs(15 * 60),
             owner_retry: Duration::from_secs(2),
             pair_ttl: Duration::from_secs(xshell_protocol::ring::pairing::PAIR_TTL_SECS),
             pair_publish_wait: Duration::from_secs(10),
@@ -446,14 +456,22 @@ pub struct MemberView {
     pub presence: PresenceView,
 }
 
-/// A Relay move still owed to the old Relay.
+/// A farewell still owed to an old Relay (ADR-0012).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MoveView {
-    /// `moving`, or `failed` (a batch of attempts failed; retried until acknowledged).
+pub struct FarewellView {
+    /// The old Relay.
+    pub relay_url: String,
+    /// `pending` (no report yet: another window runs the connection, or it just started),
+    /// `sending`, or `waiting` (the last attempt failed; retried after `retry_in`).
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// While `waiting`: seconds until the next attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_in: Option<u64>,
+    /// Failed attempts in a row.
+    pub failures: u32,
 }
 
 /// What Settings → Mobile shows (the `ring:status` event and the commands' answer).
@@ -472,8 +490,8 @@ pub struct RingView {
     pub retry_in: Option<u64>,
     pub connection_error: Option<String>,
     pub limited: bool,
-    #[serde(rename = "move")]
-    pub moving: Option<MoveView>,
+    /// The farewells owed to old Relays, by Relay.
+    pub farewells: Vec<FarewellView>,
     /// The stored state could not be used: `recovered` (an unreadable file was moved aside;
     /// Mobile access starts over) or `unreadable` (refused, left in place).
     pub problem: Option<String>,
@@ -491,8 +509,6 @@ pub struct RingView {
 /// What the user must do before a moved-aside Ring is replaced by a new one.
 pub const START_OVER_REQUIRED: &str =
     "the mobile access settings were unreadable; start over to make a new ring";
-/// A Relay change while the previous one is still being published on the old Relay.
-pub const MOVE_PENDING: &str = "the previous relay change is still reaching your paired devices";
 
 /// Quota refusals in a row on one connection past which no probe is sent, below the Relay's
 /// close after [`QUOTA_REFUSALS_BEFORE_CLOSE`] (other frames of the connection may be refused
@@ -555,6 +571,10 @@ impl Quota {
 #[cfg(test)]
 type ProbeHook = Box<dyn Fn(&Result<(), RingError>) + Send>;
 
+/// Test hook: sees a `held` report's Relay before it is applied.
+#[cfg(test)]
+type HeldHook = Box<dyn Fn(&str) + Send>;
+
 /// What a probe was sent under; its result applies only if all of it still holds.
 struct ProbeTag {
     seq: u64,
@@ -575,7 +595,8 @@ struct Live {
     /// Another instance holds the owner lock: this one shows the state from disk.
     other_window: bool,
     link: Option<LinkState>,
-    moving: Option<MoveState>,
+    /// The Connector's last report per farewell, by old Relay.
+    farewells: BTreeMap<String, FarewellState>,
     problem: Option<(String, String)>,
     quitting: bool,
     /// The pairing in progress per flow (its cancel flag). Secrets live only in memory, on
@@ -602,12 +623,15 @@ pub struct DesktopRing {
     /// Which Host ids are still configured; every one until set. Called without any other
     /// `DesktopRing` lock held (see the module docs).
     configured: Mutex<ConfiguredHosts>,
-    /// A view emission asked for while this thread held `commit` (the Connector reports a
-    /// move synchronously from `set_chain`): made once the commit scope ends.
+    /// A view emission asked for while this thread held `commit`: made once the commit scope
+    /// ends.
     deferred_emit: AtomicBool,
     /// Test hook: runs between a commit and the adoption of its result.
     #[cfg(test)]
     after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Test hook: runs before a `held` report is applied.
+    #[cfg(test)]
+    before_held: Mutex<Option<HeldHook>>,
     /// Test hook: runs when a pairing starts waiting for the Relay to hold its version.
     #[cfg(test)]
     before_publish_wait: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -700,13 +724,28 @@ impl ConnectorEvents for Events {
         }
     }
 
-    fn moved(&self, m: &MoveState) {
-        if let Some(r) = self.ring.upgrade() {
-            if let MoveState::Done { job } = m {
-                r.clear_pending_move(job);
+    fn farewell(&self, f: &FarewellState) {
+        let Some(r) = self.ring.upgrade() else {
+            return;
+        };
+        match f {
+            FarewellState::Done { farewell } => r.clear_farewell(self.epoch, farewell),
+            FarewellState::Sending { farewell } | FarewellState::Waiting { farewell, .. } => {
+                let mut l = r.lock();
+                if l.epoch != self.epoch {
+                    return;
+                }
+                l.farewells.insert(farewell.source.clone(), f.clone());
             }
-            r.lock().moving = Some(m.clone());
-            r.emit();
+        }
+        r.emit();
+    }
+
+    fn held(&self, relay: &str, version: u64) {
+        if let Some(r) = self.ring.upgrade() {
+            if r.note_held(self.epoch, relay, version) {
+                r.emit();
+            }
         }
     }
 
@@ -743,6 +782,8 @@ impl DesktopRing {
             deferred_emit: AtomicBool::new(false),
             #[cfg(test)]
             after_commit: Mutex::new(None),
+            #[cfg(test)]
+            before_held: Mutex::new(None),
             #[cfg(test)]
             before_publish_wait: Mutex::new(None),
             #[cfg(test)]
@@ -853,7 +894,7 @@ impl DesktopRing {
                     Some(p) => {
                         l.problem = Some(("recovered".to_string(), p.display().to_string()));
                         l.state = None;
-                        l.moving = None;
+                        l.farewells.clear();
                         l.link = None;
                         l.quota.retire();
                         l.connector.take()
@@ -901,7 +942,8 @@ impl DesktopRing {
 
     /// Adopts a committed state (this instance's or another's) into `live` and the
     /// Connector. Under the commit lock; a state older than the one held (same Ring, lower
-    /// version) is refused as stale, and an unchanged one is not handed to the Connector.
+    /// version) is refused as stale, and an unchanged one (the held Relays aside) is not
+    /// handed to the Connector.
     fn adopt(&self, s: RingState) -> bool {
         let (retire, connector) = {
             let mut l = self.lock();
@@ -912,8 +954,9 @@ impl DesktopRing {
                 {
                     return false;
                 }
+                // The held Relays are not the Connector's business.
                 unchanged = cur.chain == s.chain
-                    && cur.pending_move == s.pending_move
+                    && cur.farewells == s.farewells
                     && cur.local_member == s.local_member
                     && cur.host_members == s.host_members;
             }
@@ -925,12 +968,15 @@ impl DesktopRing {
                 c.chain.head().roster().relay_url != s.chain.head().roster().relay_url
             });
             l.state = Some(s.clone());
+            // Reports about farewells no longer owed are of no use.
+            l.farewells
+                .retain(|source, _| s.farewells.iter().any(|f| &f.source == source));
             if other_relay && !other_ring {
                 // The quota notice was the old Relay's.
                 l.quota.retire();
             }
             if other_ring {
-                l.moving = None;
+                l.farewells.clear();
                 l.link = None;
                 l.quota.retire();
                 (l.connector.take(), None)
@@ -948,7 +994,11 @@ impl DesktopRing {
                 .spawn(move || old.stop(ByeReason::quit()));
         }
         match connector {
-            Some(c) => c.set_chain(s.chain.clone(), s.pending_move.clone()),
+            Some(c) => {
+                // The chain first: the Connector keeps only the farewells it still owes.
+                c.set_chain(s.chain.clone());
+                c.set_farewells(s.farewells.clone());
+            }
             None => self.ensure_connector(),
         }
         true
@@ -1009,8 +1059,9 @@ impl DesktopRing {
         client.timeouts = self.cfg.timeouts;
         let mut cfg = ConnectorConfig::new(client);
         cfg.backoff_unit = self.cfg.backoff_unit;
-        cfg.pending_move = s.pending_move.clone();
-        cfg.move_attempts = self.cfg.move_attempts;
+        cfg.farewells = s.farewells.clone();
+        cfg.farewell_backoff_unit = self.cfg.farewell_backoff_unit;
+        cfg.farewell_backoff_max = self.cfg.farewell_backoff_max;
         l.epoch += 1;
         let events = Events {
             ring: self.me.clone(),
@@ -1041,6 +1092,7 @@ impl DesktopRing {
             match s.chain.extended(chain.since(s.chain.head().version())) {
                 Ok((c, _)) => {
                     s.chain = c;
+                    s.retarget_farewells();
                     Ok((Some(s.clone()), Some(s)))
                 }
                 Err(_) => Ok((None, None)),
@@ -1056,22 +1108,91 @@ impl DesktopRing {
         }
     }
 
-    /// The old Relay acknowledged `job`: that obligation, and only that one, is cleared.
-    fn clear_pending_move(&self, job: &MoveJob) {
+    /// The old Relay `done.source` took the chain up to `done.target`: the farewell owed to it
+    /// is dropped unless it asks for a newer head (then the Connector gets it again), and the
+    /// Relay is recorded as held. Only for the Connector of `epoch`.
+    fn clear_farewell(&self, epoch: u64, done: &Farewell) {
         let _c = self.lock_commit();
-        let r = self.tx(|cur, _| match cur {
-            Some(mut s) if s.pending_move.as_ref() == Some(job) => {
-                s.pending_move = None;
-                Ok((Some(s.clone()), Some(s)))
+        {
+            let mut l = self.lock();
+            if l.epoch != epoch || l.connector.is_none() {
+                return;
             }
-            _ => Ok((None, None)),
+            l.farewells.remove(&done.source);
+        }
+        let r = self.tx(|cur, _| {
+            let Some(mut s) = cur else {
+                return Ok((None, None));
+            };
+            let before = (s.farewells.clone(), s.held_relays.clone());
+            s.farewells
+                .retain(|f| !(f.source == done.source && f.target <= done.target));
+            s.held_relays.insert(done.source.clone());
+            if (s.farewells.clone(), s.held_relays.clone()) == before {
+                return Ok((None, None));
+            }
+            Ok((Some(s.clone()), Some(s)))
         });
         match r {
             Ok(Some(s)) => {
-                self.lock().state = Some(s);
+                self.hook();
+                self.adopt(s);
             }
             Ok(None) => {}
             Err(e) => eprintln!("xshell: cannot save the Ring state: {e}"),
+        }
+    }
+
+    /// `relay` holds the Ring, at least up to `version`: recorded (only for the Connector of
+    /// `epoch`). A Relay recorded only now that the head no longer names is owed a farewell
+    /// from the newest version up to `version` that names it: the report came late, after the
+    /// Relay change that would have owed it. `true`: changed.
+    fn note_held(&self, epoch: u64, relay: &str, version: u64) -> bool {
+        #[cfg(test)]
+        if let Some(h) = self.before_held.lock().unwrap().as_ref() {
+            h(relay);
+        }
+        let _c = self.lock_commit();
+        {
+            let l = self.lock();
+            let known = l
+                .state
+                .as_ref()
+                .is_some_and(|s| s.held_relays.contains(relay));
+            if l.epoch != epoch || l.connector.is_none() || known {
+                return false;
+            }
+        }
+        let r = self.tx(|cur, _| {
+            let Some(mut s) = cur else {
+                return Ok((None, None));
+            };
+            if !s.held_relays.insert(relay.to_string()) {
+                return Ok((None, None));
+            }
+            let head = s.chain.head();
+            if head.roster().relay_url != relay && version < head.version() {
+                let from = (1..=version).rev().find(|v| {
+                    s.chain
+                        .get(*v)
+                        .is_some_and(|r| r.roster().relay_url == relay)
+                });
+                if let Some(from) = from {
+                    s.owe_farewell(from);
+                }
+            }
+            Ok((Some(s.clone()), Some(s)))
+        });
+        match r {
+            Ok(Some(s)) => {
+                self.hook();
+                self.adopt(s)
+            }
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!("xshell: cannot save the Ring state: {e}");
+                false
+            }
         }
     }
 
@@ -1138,14 +1259,16 @@ impl DesktopRing {
             keys,
             chain: RosterChain::from_chain(vec![genesis]).map_err(|e| e.to_string())?,
             local_member: local.map(|d| d.sign_key),
-            pending_move: None,
+            farewells: Vec::new(),
+            held_relays: BTreeSet::new(),
             host_members: BTreeMap::new(),
         })
     }
 
-    /// Moves the Ring to `url`: a new Roster version, owed to the old Relay until it
-    /// acknowledged it (see `Connector`). Refused while a previous move is still owed.
-    /// Returns the new chain, for the local Daemon. The same URL is a no-op.
+    /// Moves the Ring to `url`: a new Roster version, which the Connector follows at once. The
+    /// old Relay is owed a farewell if it held the Ring, and every farewell owed now carries
+    /// the new head; a farewell owed never holds a change up. Returns the new chain, for the
+    /// local Daemon. The same URL is a no-op.
     pub fn set_relay_url(&self, url: &str) -> Result<RosterChain, String> {
         let url = url.trim();
         RelayUrl::parse(url).map_err(|e| e.to_string())?;
@@ -1153,9 +1276,6 @@ impl DesktopRing {
             let _c = self.lock_commit();
             let (s, changed) = self.tx(|cur, _| {
                 let mut s = cur.ok_or("mobile access is not enabled")?;
-                if s.pending_move.is_some() {
-                    return Err(MOVE_PENDING.to_string());
-                }
                 if s.chain.head().roster().relay_url == url {
                     return Ok((None, (s, false)));
                 }
@@ -1168,7 +1288,11 @@ impl DesktopRing {
                 s.chain
                     .accept(std::slice::from_ref(&next))
                     .map_err(|e| e.to_string())?;
-                s.pending_move = MoveJob::new(&s.chain, old);
+                s.retarget_farewells();
+                let left = &s.chain.get(old).expect("the old head").roster().relay_url;
+                if s.held_relays.contains(left) {
+                    s.owe_farewell(old);
+                }
                 Ok((Some(s.clone()), (s, true)))
             })?;
             self.hook();
@@ -1267,6 +1391,7 @@ impl DesktopRing {
                     s.chain
                         .accept(std::slice::from_ref(&next))
                         .map_err(|e| e.to_string())?;
+                    s.retarget_farewells();
                     dirty = true;
                 }
                 s.local_member = p.after.get(LOCAL_HOST_ID).map(|(k, _)| *k);
@@ -1548,6 +1673,7 @@ impl DesktopRing {
                 s.chain
                     .accept(std::slice::from_ref(&next))
                     .map_err(|e| e.to_string())?;
+                s.retarget_farewells();
                 Ok((Some(s.clone()), Ok((s, Some(next)))))
             });
             let (s, next) = match r {
@@ -1592,9 +1718,9 @@ impl DesktopRing {
     /// pairing, it needs this instance to run the connection. Refused for this app
     /// ([`REMOVE_SELF`]), this computer's Daemon and the Daemon of a Host still configured
     /// ([`REMOVE_IN_USE`]: the Host worker would add it back). Every Host entry mapped to the
-    /// key goes with it. A key the head does not list is a no-op. During a Relay move the
-    /// move's obligation grows to the new version, so the old Relay learns of the removal
-    /// too before the Connector leaves it. Returns the chain, for the Daemons.
+    /// key goes with it. A key the head does not list is a no-op. Every farewell owed grows to
+    /// the new version, so the old Relays learn of the removal too. Returns the chain, for the
+    /// Daemons.
     pub fn remove_member(&self, key: &SignKey) -> Result<RosterChain, String> {
         // The configured-Hosts answers, taken before any Ring lock (see the module docs). A
         // Host id mapped to the key that was not asked about counts as configured.
@@ -1643,17 +1769,9 @@ impl DesktopRing {
                     .accept(std::slice::from_ref(&next))
                     .map_err(|e| e.to_string())?;
                 s.host_members.retain(|_, h| h.sign_key != *key);
-                // A move still owed to the old Relay now owes it this version too: the
-                // devices still there must learn of the removal. The Connector and
-                // `clear_pending_move` clear only the job they acknowledged, so the old job's
-                // acknowledgement leaves this one standing.
-                if let Some(job) = &s.pending_move {
-                    if let Some(j) =
-                        MoveJob::new(&s.chain, job.from).filter(|j| j.source == job.source)
-                    {
-                        s.pending_move = Some(j);
-                    }
-                }
+                // The devices still on an old Relay must learn of the removal too. A farewell
+                // acknowledged for an older head leaves the grown one standing.
+                s.retarget_farewells();
                 Ok((Some(s.clone()), (s, true)))
             })?;
             if !changed {
@@ -1673,13 +1791,13 @@ impl DesktopRing {
     }
 
     pub fn view(&self) -> RingView {
-        let (state, connector, link, moving, problem, other, quota_until) = {
+        let (state, connector, link, farewells, problem, other, quota_until) = {
             let l = self.lock();
             (
                 l.state.clone(),
                 l.connector.clone(),
                 l.link.clone(),
-                l.moving.clone(),
+                l.farewells.clone(),
                 l.problem.clone(),
                 l.other_window && l.connector.is_none(),
                 l.quota.until,
@@ -1699,7 +1817,7 @@ impl DesktopRing {
             retry_in: None,
             connection_error: None,
             limited: false,
-            moving: None,
+            farewells: Vec::new(),
             problem,
             problem_detail,
             members: Vec::new(),
@@ -1742,20 +1860,36 @@ impl DesktopRing {
         if !other {
             v.quota_reset_at = quota_notice(quota_until, now());
         }
-        v.moving = s.pending_move.as_ref().map(|job| match moving {
-            Some(MoveState::Failed { job: j, error }) if &j == job => MoveView {
-                state: "failed",
-                error: Some(error),
-            },
-            Some(MoveState::Moving { job: j, error, .. }) if &j == job => MoveView {
-                state: "moving",
-                error,
-            },
-            _ => MoveView {
-                state: "moving",
-                error: None,
-            },
-        });
+        v.farewells = s
+            .farewells
+            .iter()
+            .map(|f| {
+                let mut fv = FarewellView {
+                    relay_url: f.source.clone(),
+                    state: "pending",
+                    error: None,
+                    retry_in: None,
+                    failures: 0,
+                };
+                match farewells.get(&f.source) {
+                    _ if other => {}
+                    Some(FarewellState::Sending { .. }) => fv.state = "sending",
+                    Some(FarewellState::Waiting {
+                        failures,
+                        error,
+                        retry_in,
+                        ..
+                    }) => {
+                        fv.state = "waiting";
+                        fv.error = Some(error.clone());
+                        fv.retry_in = Some(retry_in.as_secs_f64().ceil() as u64);
+                        fv.failures = *failures;
+                    }
+                    Some(FarewellState::Done { .. }) | None => {}
+                }
+                fv
+            })
+            .collect();
         let me = s.keys.sign_key();
         // Asked here, on a copy of the state, with no Ring lock held.
         let configured = self.configured();
@@ -1870,8 +2004,8 @@ impl DesktopRing {
     }
 
     /// Sends a quota probe if this window runs the connection, it is up, a phone is in the
-    /// Roster, no Relay move is owed, none is in flight, one is due, and the connection is not near the Relay's
-    /// close for refusals in a row. Its answer is waited for on a thread of its own.
+    /// Roster, none is in flight, one is due, and the connection is not near the Relay's close
+    /// for refusals in a row. Its answer is waited for on a thread of its own.
     fn maybe_probe(&self) {
         let (c, tag) = {
             let mut l = self.lock();
@@ -1883,14 +2017,7 @@ impl DesktopRing {
                     .iter()
                     .any(|m| m.role == Role::Mobile)
             });
-            // While a move is owed, the connection is the old Relay's: its quota is not the
-            // Ring's any more.
-            let moving = l.state.as_ref().is_some_and(|s| s.pending_move.is_some());
-            if l.quitting
-                || !phone
-                || moving
-                || !matches!(l.link, Some(LinkState::Connected { .. }))
-            {
+            if l.quitting || !phone || !matches!(l.link, Some(LinkState::Connected { .. })) {
                 return;
             }
             let Some(c) = l.connector.clone() else {
@@ -2086,6 +2213,8 @@ mod tests {
         c.default_relay_url = url.into();
         c.hosted_relay_url = url.into();
         c.backoff_unit = Duration::from_millis(10);
+        c.farewell_backoff_unit = Duration::from_millis(10);
+        c.farewell_backoff_max = Duration::from_millis(200);
         c.timeouts = RingTimeouts {
             connect: Duration::from_secs(3),
             ping_interval: Duration::from_millis(300),
@@ -2199,6 +2328,73 @@ mod tests {
         b.quit();
     }
 
+    fn online(r: &TestRelay, rid: &RingId, key: &SignKey) -> bool {
+        r.presence(rid, key).is_some_and(|p| p.online)
+    }
+
+    // ---- Relay changes and farewells (#51, ADR-0012) --------------------------------------
+
+    use xshell_protocol::ring::relay::test_relay::GateProxy;
+
+    /// A Relay behind a gate: the Ring names the gate, and the Relay knows itself by its origin.
+    fn gated(r: &TestRelay) -> GateProxy {
+        let g = GateProxy::start(r.addr());
+        r.set_origin(&g.url());
+        g
+    }
+
+    /// A Relay no device can reach: the name does not resolve.
+    const DEAD: &str = "wss://relay.xshell.invalid";
+
+    /// Writes a Ring whose versions name `urls` as an earlier build left it after moving off
+    /// the first one: `pendingMove` from version 1, no `heldRelays`.
+    fn write_legacy_moved(dir: &std::path::Path, urls: &[&str]) -> RingId {
+        let keys = Arc::new(DeviceKeys::generate().unwrap());
+        let g = SignedRoster::genesis(&*keys, keys.noise_key(), "desk", urls[0], now()).unwrap();
+        let mut chain = RosterChain::from_chain(vec![g]).unwrap();
+        for u in &urls[1..] {
+            let n = chain
+                .head()
+                .next(&*keys, now(), |d| d.relay_url = u.to_string())
+                .unwrap();
+            chain.accept(std::slice::from_ref(&n)).unwrap();
+        }
+        let rid = chain.ring_id().clone();
+        let st = RingState {
+            keys,
+            chain,
+            local_member: None,
+            farewells: Vec::new(),
+            held_relays: BTreeSet::new(),
+            host_members: BTreeMap::new(),
+        };
+        Store::new(dir.to_path_buf())
+            .transact(|_, _| Ok((Some(st), ())))
+            .unwrap();
+        let p = dir.join("ring.json");
+        let mut v: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("heldRelays");
+        o.insert(
+            "pendingMove".into(),
+            serde_json::json!({"source": urls[0], "from": 1, "target": urls.len()}),
+        );
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        rid
+    }
+
+    fn farewell_relays(v: &RingView) -> Vec<&str> {
+        v.farewells.iter().map(|f| f.relay_url.as_str()).collect()
+    }
+
+    fn stored_farewells(t: &tempfile::TempDir) -> Vec<(String, u64, u64)> {
+        stored(t)
+            .farewells
+            .iter()
+            .map(|f| (f.source.clone(), f.from, f.target))
+            .collect()
+    }
+
     #[test]
     fn set_relay_url_bumps_version() {
         let (one, two) = (relay(), relay());
@@ -2207,6 +2403,9 @@ mod tests {
         let v = ring.enable(None, false).unwrap();
         let rid = v.ring_id.unwrap();
         wait_view(&ring, "connected", connected);
+        wait_until("the relay held", || {
+            stored(&t).held_relays.contains(&one.url())
+        });
         assert!(ring.set_relay_url("http://x").is_err());
         assert!(
             ring.set_relay_url("ws://example.com").is_err(),
@@ -2218,74 +2417,416 @@ mod tests {
         let c = ring.set_relay_url(&two.url()).unwrap();
         assert_eq!(c.head().version(), 2);
         assert_eq!(c.head().roster().relay_url, two.url());
-        // The old Relay was told before the move, and the new one has the chain.
-        wait_view(&ring, "connected to the new relay", |v| {
-            connected(v) && v.moving.is_none()
+        // The new Relay has the chain, and the old one was told.
+        wait_until("the new relay has version 2", || {
+            two.head_version(&rid) == Some(2)
         });
-        assert_eq!(one.head_version(&rid), Some(2));
-        // "Connected" can still be the old link's state for a moment: wait for the new
-        // Relay to hold the chain.
-        let deadline = Instant::now() + WAIT;
-        while two.head_version(&rid) != Some(2) {
-            assert!(Instant::now() < deadline, "the new relay has version 2");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let (s, _) = Store::new(t.path().join("ring")).load().unwrap();
-        assert_eq!(s.unwrap().pending_move, None);
+        wait_until("the farewell went out", || {
+            one.head_version(&rid) == Some(2) && stored(&t).farewells.is_empty()
+        });
+        wait_view(&ring, "connected, nothing owed", |v| {
+            connected(v) && v.farewells.is_empty()
+        });
+        assert_eq!(
+            stored(&t).held_relays,
+            [one.url(), two.url()].into_iter().collect()
+        );
         ring.quit();
     }
 
-    fn online(r: &TestRelay, rid: &RingId, key: &SignKey) -> bool {
-        r.presence(rid, key).is_some_and(|p| p.online)
+    /// Mario's case (2026-10-16): an earlier build made the Ring on the placeholder that never
+    /// existed and kept waiting for it after the move to the Hosted Relay. This build connects
+    /// to the head's Relay at once and owes the placeholder nothing (it is never dialed).
+    #[test]
+    fn upgrade_from_a_move_owed_to_the_placeholder_connects_to_the_head_at_once() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let rid = write_legacy_moved(
+            &t.path().join("ring"),
+            &[super::super::LEGACY_PLACEHOLDER_RELAY_URL, &r.url()],
+        );
+        let start = Instant::now();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        let v = wait_view(&ring, "connected", connected);
+        assert!(start.elapsed() < Duration::from_secs(2), "at once");
+        assert!(v.farewells.is_empty(), "{:?}", v.farewells);
+        assert_eq!(r.head_version(&rid), Some(2));
+        assert!(stored(&t).farewells.is_empty());
+        ring.quit();
     }
 
-    /// The first change's publication is held up; a second change is refused meanwhile, the
-    /// app stays reachable on the old relay, and moves only after the acknowledgement, which
-    /// clears exactly that job.
     #[test]
-    fn a_relay_change_waits_for_the_old_relay_and_blocks_another_change() {
-        let (one, two, three) = (relay(), relay(), relay());
+    fn upgrade_with_a_move_owed_to_a_dead_relay_keeps_the_farewell() {
+        let r = relay();
         let t = tempfile::tempdir().unwrap();
-        let mut c = cfg(t.path(), &one.url());
-        c.move_attempts = 2;
-        let (ring, _) = open(c.clone());
+        write_legacy_moved(&t.path().join("ring"), &[DEAD, &r.url()]);
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        wait_view(&ring, "connected", connected);
+        let v = wait_view(&ring, "the farewell retried", |v| {
+            v.farewells.len() == 1
+                && v.farewells[0].state == "waiting"
+                && v.farewells[0].failures > 0
+        });
+        assert_eq!(farewell_relays(&v), [DEAD]);
+        assert!(v.farewells[0].error.is_some());
+        assert_eq!(stored_farewells(&t), [(DEAD.to_string(), 1, 2)]);
+        assert!(connected(&ring.view()), "the link never cared");
+        ring.quit();
+    }
+
+    #[test]
+    fn a_move_off_a_dead_relay_connects_to_the_new_one_at_once() {
+        let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &g1.url()));
         let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
         let me = ring.view().members[0].sign_key;
         wait_view(&ring, "connected", connected);
-        one.refuse_roster_puts(true);
+        wait_until("the relay held", || {
+            stored(&t).held_relays.contains(&g1.url())
+        });
+        g1.set_open(false);
+        wait_view(&ring, "the old relay gone", |v| v.connection == "waiting");
         ring.set_relay_url(&two.url()).unwrap();
-        let v = wait_view(&ring, "the move failed", |v| {
-            v.moving.as_ref().is_some_and(|m| m.state == "failed")
+        wait_view(&ring, "connected to the new relay", connected);
+        wait_until("on the new relay", || online(&two, &rid, &me));
+        let v = wait_view(&ring, "the farewell owed", |v| {
+            v.farewells.first().is_some_and(|f| f.state == "waiting")
         });
-        assert!(v.moving.unwrap().error.is_some());
-        assert_eq!(ring.set_relay_url(&three.url()).unwrap_err(), MOVE_PENDING);
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(online(&one, &rid, &me), "reachable on the old relay");
-        assert!(!online(&two, &rid, &me), "not moved before the ack");
-        assert_eq!(one.head_version(&rid), Some(1));
-        let store = Store::new(t.path().join("ring"));
-        let job = store.load().unwrap().0.unwrap().pending_move.unwrap();
-        assert_eq!(
-            (job.source.as_str(), job.from, job.target),
-            (one.url().as_str(), 1, 2)
-        );
-        // An acknowledgement of another job clears nothing.
-        ring.clear_pending_move(&MoveJob {
-            source: three.url(),
-            ..job.clone()
-        });
-        assert_eq!(store.load().unwrap().0.unwrap().pending_move, Some(job));
+        assert_eq!(farewell_relays(&v), [g1.url().as_str()]);
+        ring.quit();
+    }
 
-        one.refuse_roster_puts(false);
-        wait_view(&ring, "moved", |v| connected(v) && v.moving.is_none());
-        assert_eq!(one.head_version(&rid), Some(2));
-        let deadline = Instant::now() + WAIT;
-        while !online(&two, &rid, &me) || store.load().unwrap().0.unwrap().pending_move.is_some() {
-            assert!(Instant::now() < deadline, "moved and cleared");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // Now a further change is allowed.
+    #[test]
+    fn no_farewell_to_a_relay_that_never_held_the_ring() {
+        let two = relay();
+        let t = tempfile::tempdir().unwrap();
+        // A Ring made on a Relay that was never reached.
+        let (ring, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "waiting", |v| v.connection == "waiting");
+        ring.set_relay_url(&two.url()).unwrap();
+        wait_view(&ring, "connected to the new relay", connected);
+        wait_until("the new relay held", || {
+            stored(&t).held_relays.contains(&two.url())
+        });
+        assert!(ring.view().farewells.is_empty());
+        assert!(stored(&t).farewells.is_empty());
+        assert!(!stored(&t).held_relays.contains("ws://127.0.0.1:9"));
+        ring.quit();
+    }
+
+    /// one → two → three while one is gone: each change takes effect at once, neither waits
+    /// for one, and one gets the newest head straight away once it is back.
+    #[test]
+    fn a_relay_change_takes_effect_at_once_and_never_blocks_another() {
+        let (one, two, three) = (relay(), relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &g1.url()));
+        let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
+        let me = ring.view().members[0].sign_key;
+        wait_view(&ring, "connected", connected);
+        wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+        g1.set_open(false);
+        ring.set_relay_url(&two.url()).unwrap();
+        wait_until("on two", || online(&two, &rid, &me));
+        wait_until("two held", || stored(&t).held_relays.contains(&two.url()));
         ring.set_relay_url(&three.url()).unwrap();
+        wait_until("on three", || online(&three, &rid, &me));
+        // two took its farewell; one's carries the newest head.
+        wait_until("two told", || two.head_version(&rid) == Some(3));
+        wait_until("only one owed", || {
+            stored_farewells(&t) == [(g1.url(), 1, 3)]
+        });
+        assert_eq!(one.head_version(&rid), Some(1));
+        g1.set_open(true);
+        wait_until("one told", || {
+            one.head_version(&rid) == Some(3) && stored(&t).farewells.is_empty()
+        });
+        wait_view(&ring, "nothing owed", |v| {
+            connected(v) && v.farewells.is_empty()
+        });
+        ring.quit();
+    }
+
+    #[test]
+    fn a_farewell_survives_a_restart() {
+        let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &g1.url()));
+        let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
+        wait_view(&ring, "connected", connected);
+        wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+        g1.set_open(false);
+        ring.set_relay_url(&two.url()).unwrap();
+        wait_view(&ring, "connected to two", connected);
+        ring.quit();
+        drop(ring);
+        assert_eq!(stored_farewells(&t), [(g1.url(), 1, 2)]);
+
+        let (ring, _) = open(cfg(t.path(), &two.url()));
+        let v = wait_view(&ring, "connected after the restart", connected);
+        assert_eq!(farewell_relays(&v), [g1.url().as_str()]);
+        g1.set_open(true);
+        wait_until("one told", || {
+            one.head_version(&rid) == Some(2) && stored(&t).farewells.is_empty()
+        });
+        ring.quit();
+    }
+
+    /// A phone that only knew the old Relay, offline while the Ring moved, follows the move
+    /// once that Relay is reachable again.
+    #[test]
+    fn a_device_left_on_the_old_relay_follows_once_it_comes_back() {
+        let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, phone, chain) = with_phone_cfg(cfg(t.path(), &g1.url()));
+        let rid = chain.ring_id().clone();
+        wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+        g1.set_open(false);
+        ring.set_relay_url(&two.url()).unwrap();
+        wait_view(&ring, "connected to two", connected);
+        let mut pc = ConnectorConfig::new(RingClientConfig::new(chain, phone.clone()));
+        pc.backoff_unit = Duration::from_millis(10);
+        pc.client.timeouts = ring.cfg.timeouts;
+        let p = Connector::start(pc, Arc::new(NoEvents)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!online(&two, &rid, &phone.sign_key()));
+        g1.set_open(true);
+        wait_until("the phone on two", || online(&two, &rid, &phone.sign_key()));
+        assert_eq!(p.chain().head().version(), 3);
+        p.stop(ByeReason::quit());
+        ring.quit();
+    }
+
+    struct NoEvents;
+    impl ConnectorEvents for NoEvents {}
+
+    #[test]
+    fn a_host_added_while_a_farewell_is_owed_reaches_the_new_relay() {
+        let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &g1.url()));
+        let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
+        wait_view(&ring, "connected", connected);
+        wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+        g1.set_open(false);
+        ring.set_relay_url(&two.url()).unwrap();
+        let (_, a) = identity();
+        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a)]);
+        assert_eq!(c.head().version(), 3);
+        assert_eq!(stored_farewells(&t), [(g1.url(), 1, 3)]);
+        wait_until("v3 on the new relay", || two.head_version(&rid) == Some(3));
+        g1.set_open(true);
+        wait_until("v3 on the old relay", || one.head_version(&rid) == Some(3));
+        ring.quit();
+    }
+
+    /// A removal while a farewell is owed reaches the old Relay too: the old Relay refuses the
+    /// removed phone even when the new Relay is down. Here the farewell is in flight (held at
+    /// its `auth`, which stages the move) when the removal comes: it follows as an upload, and
+    /// the farewell is cleared only once the old Relay holds it.
+    #[test]
+    fn removal_while_a_farewell_is_owed_reaches_both_relays() {
+        for dest_up in [true, false] {
+            let (one, two) = (TestRelay::start(), relay());
+            let g1 = gated(&one);
+            let dest = if dest_up {
+                two.url()
+            } else {
+                "ws://127.0.0.1:9".to_string()
+            };
+            let t = tempfile::tempdir().unwrap();
+            let (ring, _, phone, chain) = with_phone_cfg(cfg(t.path(), &g1.url()));
+            let rid = chain.ring_id().clone();
+            wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+            let (_pc, prec) = contract::connect(&one.target(), &chain, phone.clone());
+            let held_at = g1.connections();
+            g1.hold_next();
+            ring.set_relay_url(&dest).unwrap();
+            assert_eq!(stored_farewells(&t), [(g1.url(), 2, 3)]);
+            wait_until("the farewell held", || g1.connections() > held_at);
+            let c = ring.remove_member(&phone.sign_key()).unwrap();
+            assert_eq!(c.head().version(), 4);
+            assert_eq!(
+                stored_farewells(&t),
+                [(g1.url(), 2, 4)],
+                "dest_up {dest_up}"
+            );
+            g1.release();
+            wait_until("v4 on the old relay", || one.head_version(&rid) == Some(4));
+            assert!(
+                prec.closed(WAIT).is_some(),
+                "the phone was cut on the old relay"
+            );
+            let mut target = one.target();
+            target.url = g1.url();
+            let mut c = contract::RawConn::open(&target, &rid).unwrap();
+            let (nonce, _) = c.challenge();
+            c.auth(&*phone, &g1.url(), &rid, &nonce);
+            assert_eq!(
+                c.error(WAIT).map(|e| e.0),
+                Some(ErrorCodeOf::NotMember),
+                "dest_up {dest_up}"
+            );
+            wait_until("the farewell cleared", || stored(&t).farewells.is_empty());
+            if dest_up {
+                wait_until("v4 on the new relay", || two.head_version(&rid) == Some(4));
+                assert_eq!(
+                    login_error(&two, &rid, &phone),
+                    Some(ErrorCodeOf::NotMember)
+                );
+            }
+            ring.quit();
+        }
+    }
+
+    /// A window that does not own the connection changes the Relay: the owner picks the
+    /// commit up from disk, moves, and says farewell to the old Relay.
+    #[test]
+    fn the_owner_says_farewell_for_a_move_committed_by_another_window() {
+        let (one, two) = (relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        // B is open before the Ring exists.
+        let (b, _) = open(cfg(t.path(), &one.url()));
+        let (a, _) = open(cfg(t.path(), &one.url()));
+        let rid = a.enable(None, false).unwrap().ring_id.unwrap();
+        let me = a.view().members[0].sign_key;
+        // Either window may win the connection (B re-reads the state and may take the lock
+        // first): the owner is the one connected, the other one defers.
+        let deadline = Instant::now() + WAIT;
+        let (owner, other) = loop {
+            let (va, vb) = (a.view(), b.view());
+            if connected(&va)
+                && vb.ring_id.as_ref() == Some(&rid)
+                && vb.connection == "other-window"
+            {
+                break (&a, &b);
+            }
+            if connected(&vb) && va.connection == "other-window" {
+                break (&b, &a);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one owns, one defers: {va:?} {vb:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        wait_until("one held", || stored(&t).held_relays.contains(&one.url()));
+        other.set_relay_url(&two.url()).unwrap();
+        let v = other.view();
+        assert_eq!(farewell_relays(&v), [one.url().as_str()]);
+        assert_eq!(v.farewells[0].state, "pending", "another window sends it");
+        wait_view(owner, "the owner adopted the move", |v| {
+            v.version == Some(2)
+        });
+        wait_until("the owner told one and moved", || {
+            one.head_version(&rid) == Some(2) && online(&two, &rid, &me)
+        });
+        wait_until("the farewell cleared", || stored(&t).farewells.is_empty());
+        a.quit();
+        b.quit();
+    }
+
+    /// Held Relays come only from the Connector's `held` reports, never from a `Connected`
+    /// link report, which can be the old Relay's for a moment after a change.
+    #[test]
+    fn a_stale_connected_report_never_records_the_new_relay_as_held() {
+        let (one, two) = (relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &one.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        wait_until("one held", || stored(&t).held_relays.contains(&one.url()));
+        ring.set_relay_url(DEAD).unwrap();
+        let epoch = ring.lock().epoch;
+        let events = Events {
+            ring: Arc::downgrade(&ring),
+            epoch,
+        };
+        events.state(&LinkState::Connected { limited: false });
+        // A retired Connector's report counts for nothing either.
+        Events {
+            ring: Arc::downgrade(&ring),
+            epoch: epoch - 1,
+        }
+        .held(DEAD, 2);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!stored(&t).held_relays.contains(DEAD));
+        ring.set_relay_url(&two.url()).unwrap();
+        let owed: Vec<String> = stored(&t).farewells.into_iter().map(|f| f.source).collect();
+        assert!(!owed.contains(&DEAD.to_string()), "{owed:?}");
+        ring.quit();
+    }
+
+    /// A2: a `held` report that comes after the change it should have owed a farewell for
+    /// creates that farewell then, and the devices on that Relay follow.
+    #[test]
+    fn a_late_held_report_owes_the_farewell() {
+        let (one, two, three) = (relay(), relay(), relay());
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _, phone, _) = with_phone_cfg(cfg(t.path(), &one.url()));
+        wait_until("one held", || stored(&t).held_relays.contains(&one.url()));
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (at_tx, at_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let two_url = two.url();
+        *ring.before_held.lock().unwrap() = Some(Box::new(move |relay: &str| {
+            if relay == two_url {
+                let _ = at_tx.send(());
+                let _ = go_rx.lock().unwrap().recv_timeout(WAIT);
+            }
+        }));
+        let c2 = ring.set_relay_url(&two.url()).unwrap();
+        let rid = c2.ring_id().clone();
+        at_rx.recv_timeout(WAIT).expect("two's held report");
+        // The phone follows to two.
+        let mut pc = ConnectorConfig::new(RingClientConfig::new(c2, phone.clone()));
+        pc.backoff_unit = Duration::from_millis(10);
+        pc.client.timeouts = ring.cfg.timeouts;
+        let p = Connector::start(pc, Arc::new(NoEvents)).unwrap();
+        wait_until("the phone on two", || online(&two, &rid, &phone.sign_key()));
+        ring.set_relay_url(&three.url()).unwrap();
+        assert!(
+            !stored_farewells(&t).iter().any(|f| f.0 == two.url()),
+            "two not known to hold the Ring yet"
+        );
+        go_tx.send(()).unwrap();
+        wait_until("two owed", || stored(&t).held_relays.contains(&two.url()));
+        wait_until("the phone on three", || {
+            online(&three, &rid, &phone.sign_key())
+        });
+        assert_eq!(two.head_version(&rid), Some(4));
+        p.stop(ByeReason::quit());
+        ring.quit();
+    }
+
+    /// The quota probe is the new Relay's business and goes on while a farewell is owed.
+    #[test]
+    fn quota_probe_runs_while_a_farewell_is_owed() {
+        let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
+        let t = tempfile::tempdir().unwrap();
+        let mut c = probing(t.path(), &one, 10, 10);
+        c.default_relay_url = g1.url();
+        c.hosted_relay_url = g1.url();
+        let (ring, _, _, _) = with_phone_cfg(c);
+        wait_until("one held", || stored(&t).held_relays.contains(&g1.url()));
+        g1.set_open(false);
+        ring.set_relay_url(&two.url()).unwrap();
+        wait_view(&ring, "connected to two, a farewell owed", |v| {
+            connected(v) && v.farewells.len() == 1
+        });
+        let n = probe_results(&ring).len();
+        wait_until("a probe applied", || {
+            probe_results(&ring)[n..].iter().any(|applied| *applied)
+        });
+        assert_eq!(ring.view().farewells.len(), 1);
         ring.quit();
     }
 
@@ -2458,6 +2999,10 @@ mod tests {
         let dir = t.path().join("ring");
         let (ring, _) = open(cfg(t.path(), &r.url()));
         let first = ring.enable(None, false).unwrap().ring_id.unwrap();
+        // The connection's own commit (the Relay recorded as held) is behind us.
+        wait_until("the relay held", || {
+            stored_in(&dir).held_relays.contains(&r.url())
+        });
         std::fs::write(dir.join("ring.json"), b"torn").unwrap();
         let (_, id) = identity();
         assert_eq!(ring.ensure_local_daemon(&id).unwrap(), None);
@@ -2471,58 +3016,6 @@ mod tests {
         ring.quit();
     }
 
-    /// A window that does not own the connection changes the Relay: the owner picks the
-    /// commit up from disk and publishes the move on the old Relay.
-    #[test]
-    fn the_owner_publishes_a_move_committed_by_another_window() {
-        let (one, two) = (relay(), relay());
-        let t = tempfile::tempdir().unwrap();
-        // B is open before the Ring exists.
-        let (b, _) = open(cfg(t.path(), &one.url()));
-        let (a, _) = open(cfg(t.path(), &one.url()));
-        let rid = a.enable(None, false).unwrap().ring_id.unwrap();
-        let me = a.view().members[0].sign_key;
-        // Either window may win the connection (B re-reads the state and may take the lock
-        // first): the owner is the one connected, the other one defers.
-        let deadline = Instant::now() + WAIT;
-        let (owner, other) = loop {
-            let (va, vb) = (a.view(), b.view());
-            if connected(&va)
-                && vb.ring_id.as_ref() == Some(&rid)
-                && vb.connection == "other-window"
-            {
-                break (&a, &b);
-            }
-            if connected(&vb) && va.connection == "other-window" {
-                break (&b, &a);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "one owns, one defers: {va:?} {vb:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        other.set_relay_url(&two.url()).unwrap();
-        wait_view(owner, "the owner adopted the move", |v| {
-            v.version == Some(2)
-        });
-        let deadline = Instant::now() + WAIT;
-        while one.head_version(&rid) != Some(2) || !online(&two, &rid, &me) {
-            assert!(
-                Instant::now() < deadline,
-                "the owner published on the old relay and moved"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let store = Store::new(t.path().join("ring"));
-        while store.load().unwrap().0.unwrap().pending_move.is_some() {
-            assert!(Instant::now() < deadline, "the job cleared");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        a.quit();
-        b.quit();
-    }
-
     /// A failing mutation still reports what loading found, and the view is in the
     /// recovery-required state whatever was held in memory.
     #[test]
@@ -2533,6 +3026,10 @@ mod tests {
         let (ring, _) = open(cfg(t.path(), &r.url()));
         ring.enable(None, false).unwrap();
         wait_view(&ring, "connected", connected);
+        // The connection's own commit (the Relay recorded as held) is behind us.
+        wait_until("the relay held", || {
+            stored_in(&dir).held_relays.contains(&r.url())
+        });
         std::fs::write(dir.join("ring.json"), b"torn").unwrap();
         // The first thing after the corruption is a mutation that fails.
         assert!(ring.set_relay_url(&relay().url()).is_err());
@@ -2576,7 +3073,11 @@ mod tests {
     }
 
     fn stored(t: &tempfile::TempDir) -> RingState {
-        Store::new(t.path().join("ring")).load().unwrap().0.unwrap()
+        stored_in(&t.path().join("ring"))
+    }
+
+    fn stored_in(dir: &std::path::Path) -> RingState {
+        Store::new(dir.to_path_buf()).load().unwrap().0.unwrap()
     }
 
     #[test]
@@ -2937,29 +3438,6 @@ mod tests {
         assert!(of(&l.sign_key).this_computer);
         let json = serde_json::to_value(of(&a.sign_key)).unwrap();
         assert_eq!(json["hostId"], "h_aaaaaaaa");
-        ring.quit();
-    }
-
-    /// A Host added while a Relay move is still owed reaches the new Relay too.
-    #[test]
-    fn a_host_added_during_a_pending_move_reaches_the_new_relay() {
-        let (one, two) = (relay(), relay());
-        let t = tempfile::tempdir().unwrap();
-        let (ring, _) = open(cfg(t.path(), &one.url()));
-        let rid = ring.enable(None, false).unwrap().ring_id.unwrap();
-        wait_view(&ring, "connected", connected);
-        one.refuse_roster_puts(true);
-        ring.set_relay_url(&two.url()).unwrap();
-        let (_, a) = identity();
-        let (c, _) = ensure(&ring, &[(href("h_aaaaaaaa", "A", "a|"), a)]);
-        assert_eq!(c.head().version(), 3);
-        assert!(ring.view().moving.is_some());
-        one.refuse_roster_puts(false);
-        let deadline = Instant::now() + WAIT;
-        while two.head_version(&rid) != Some(3) {
-            assert!(Instant::now() < deadline, "v3 on the new relay");
-            std::thread::sleep(Duration::from_millis(10));
-        }
         ring.quit();
     }
 
@@ -3548,70 +4026,16 @@ mod tests {
         ring.quit();
     }
 
-    /// A removal while a Relay move is still owed reaches the old Relay too, before the
-    /// Connector leaves it: the old Relay refuses the removed phone even when the new Relay
-    /// is down. The move's older acknowledgement does not clear the grown obligation.
-    #[test]
-    fn removal_during_a_pending_move_reaches_both_relays() {
-        for dest_up in [true, false] {
-            let one = relay();
-            let two = relay();
-            let dest = if dest_up {
-                two.url()
-            } else {
-                "ws://127.0.0.1:9".to_string()
-            };
-            let t = tempfile::tempdir().unwrap();
-            let (ring, phone, chain) = with_phone(&t, &one);
-            let rid = chain.ring_id().clone();
-            let (_pc, prec) = contract::connect(&one.target(), &chain, phone.clone());
-            one.refuse_roster_puts(true);
-            ring.set_relay_url(&dest).unwrap();
-            let moved = stored(&t).pending_move.unwrap();
-            assert_eq!((moved.from, moved.target), (2, 3));
-            let c = ring.remove_member(&phone.sign_key()).unwrap();
-            assert_eq!(c.head().version(), 4);
-            let grown = stored(&t).pending_move.unwrap();
-            assert_eq!(
-                (grown.source.as_str(), grown.from, grown.target),
-                (one.url().as_str(), 2, 4),
-                "dest_up {dest_up}"
-            );
-            // The first job's acknowledgement leaves the grown one standing.
-            ring.clear_pending_move(&moved);
-            assert_eq!(stored(&t).pending_move, Some(grown.clone()));
-            one.refuse_roster_puts(false);
-            wait_until("v4 on the old relay", || one.head_version(&rid) == Some(4));
-            assert!(
-                prec.closed(WAIT).is_some(),
-                "the phone was cut on the old relay"
-            );
-            assert_eq!(
-                login_error(&one, &rid, &phone),
-                Some(ErrorCodeOf::NotMember),
-                "dest_up {dest_up}"
-            );
-            wait_until("the move cleared", || stored(&t).pending_move.is_none());
-            if dest_up {
-                wait_until("v4 on the new relay", || two.head_version(&rid) == Some(4));
-                assert_eq!(
-                    login_error(&two, &rid, &phone),
-                    Some(ErrorCodeOf::NotMember)
-                );
-            }
-            ring.quit();
-        }
-    }
-
     /// The configured-Hosts predicate may take the Hosts manager's lock: it never runs while
-    /// this thread holds the commit lock, also when the Connector reports a pending move
-    /// synchronously from the adoption of a removal.
+    /// this thread holds the commit lock, also when a removal's adoption hands the Connector
+    /// a farewell owed (`set_farewells` never reports synchronously).
     #[test]
     fn the_configured_predicate_never_runs_under_the_commit_lock() {
         use std::sync::atomic::AtomicUsize;
         let (one, two) = (relay(), relay());
+        let g1 = gated(&one);
         let t = tempfile::tempdir().unwrap();
-        let (ring, views) = open(cfg(t.path(), &one.url()));
+        let (ring, views) = open(cfg(t.path(), &g1.url()));
         ring.enable(None, false).unwrap();
         wait_view(&ring, "connected", connected);
         let (_, a) = identity();
@@ -3629,7 +4053,10 @@ mod tests {
             }
             false
         }));
-        one.refuse_roster_puts(true);
+        wait_until("the old relay held", || {
+            stored(&t).held_relays.contains(&g1.url())
+        });
+        g1.set_open(false);
         ring.set_relay_url(&two.url()).unwrap();
         let before = calls.load(Ordering::SeqCst);
         ring.remove_member(&a.sign_key).unwrap();
@@ -3642,7 +4069,7 @@ mod tests {
         // The deferred emission still reached the observer, with the removal in it.
         let last = views.last.lock().unwrap().clone().unwrap();
         assert!(last.members.iter().all(|m| m.sign_key != a.sign_key));
-        assert!(last.moving.is_some());
+        assert_eq!(last.farewells.len(), 1, "{:?}", last.farewells);
         ring.quit();
     }
 
@@ -4085,6 +4512,10 @@ mod tests {
         let (ring, _) = open(cfg(t.path(), &r.url()));
         ring.enable(None, false).unwrap();
         wait_view(&ring, "connected", connected);
+        // The connection's own commit (the Relay recorded as held) is behind us.
+        wait_until("the relay held", || {
+            stored(&t).held_relays.contains(&r.url())
+        });
         let old = Events {
             ring: Arc::downgrade(&ring),
             epoch: ring.lock().epoch,
@@ -4190,8 +4621,55 @@ mod tests {
         ring.quit();
     }
 
+    /// A4: a Relay that refuses the Ring for quota at connect holds it (only a Relay that
+    /// holds a Ring counts its traffic): moving off it owes it a farewell.
+    #[test]
+    fn a_relay_that_refused_the_ring_for_quota_is_owed_a_farewell() {
+        let (r, two) = (quota_relay(60), relay());
+        let t = tempfile::tempdir().unwrap();
+        let hour = 60 * 60 * 1000;
+        let c = probing(t.path(), &r, hour, hour);
+        let (ring, _, phone, _) = with_phone_cfg(c.clone());
+        let (keys, mut chain) = {
+            let l = ring.lock();
+            let s = l.state.as_ref().unwrap();
+            (s.keys.clone(), s.chain.clone())
+        };
+        ring.quit();
+        let next = chain
+            .head()
+            .next(&*keys, now(), |d| d.relay_url = r.url())
+            .unwrap();
+        let (other, _) = contract::connect(&r.target(), &chain, keys.clone());
+        other.publish_roster(&next).unwrap();
+        drop(other);
+        chain.accept(std::slice::from_ref(&next)).unwrap();
+        use_up_quota(&r, &chain, &phone);
+        // As if this Desktop had never connected there.
+        Store::new(t.path().join("ring"))
+            .transact(|cur, _| {
+                let mut s = cur.unwrap();
+                s.held_relays.clear();
+                Ok((Some(s), ()))
+            })
+            .unwrap();
+
+        let (ring, _) = open(c);
+        wait_view(&ring, "refused for quota", |v| v.connection == "waiting");
+        wait_until("held", || stored(&t).held_relays.contains(&r.url()));
+        ring.set_relay_url(&two.url()).unwrap();
+        assert_eq!(
+            farewell_relays(&ring.view()),
+            [r.url().as_str()],
+            "{:?}",
+            stored(&t).farewells
+        );
+        ring.quit();
+    }
+
     /// The Ring's Relay changes while the old one is over quota: the old Relay's notice is
-    /// cleared, and while the move is owed to it, nothing of its quota shows again.
+    /// cleared, and nothing of its quota shows again. (Its farewell reaches it all the same:
+    /// what is staged at `auth` costs no quota.)
     #[test]
     fn a_relay_change_clears_the_old_relays_notice() {
         let (a, b) = (quota_relay(60), relay());
@@ -4205,14 +4683,15 @@ mod tests {
         let v = ring.view();
         assert_eq!(v.relay_url.as_deref(), Some(b.url().as_str()));
         assert_eq!(v.quota_reset_at, None, "cleared with the change");
-        // The old Relay refuses the move's publication for quota, again and again.
-        wait_view(&ring, "the move failed", |v| {
-            v.moving.as_ref().is_some_and(|m| m.state == "failed")
+        wait_until("the old Relay told", || {
+            a.head_version(chain.ring_id()) == Some(3) && stored(&t).farewells.is_empty()
         });
         std::thread::sleep(Duration::from_millis(500));
-        let v = ring.view();
-        assert!(v.moving.is_some(), "still owed to the old Relay");
-        assert_eq!(v.quota_reset_at, None, "no notice for the new Relay");
+        assert_eq!(
+            ring.view().quota_reset_at,
+            None,
+            "no notice for the new Relay"
+        );
         ring.quit();
     }
 

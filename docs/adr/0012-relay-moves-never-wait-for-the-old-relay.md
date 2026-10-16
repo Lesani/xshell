@@ -33,7 +33,9 @@ Decision (Mario, 2026-10-16):
   it will move once it is reachable again; no generic "Can't reach the relay".
 
 Consequences: a device that only knew the old Relay and stays offline until that Relay is
-gone for good must be paired again; that is the price of never being stuck. The Daemon and the
+gone for good must be paired again; that is the price of never being stuck. An older build
+that reads the state this build wrote (`farewells`, `heldRelays`) cannot parse it and moves it
+aside, so going back to it means starting Mobile access over. The Daemon and the
 Mobile are unchanged: they follow the head they receive. This supersedes the "Relay moves"
 paragraph of `xshell-protocol`'s Connector docs and the move rules in RELAY.md that depend on
 it.
