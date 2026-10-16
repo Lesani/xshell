@@ -36,7 +36,7 @@ export const S = {
   "mobile.status.unknown": "Unknown",
   "mobile.local.inProcess": "Terminals on this computer run inside the app and aren't reachable from your phone.",
   "mobile.local.tooOld": "Local terminal setup doesn't support mobile access. Update xshell on this computer, then reopen it.",
-  "mobile.farewell.owed": "Devices still using {relay} will move to the current relay once xshell reaches it. xshell keeps trying in the background.",
+  "mobile.farewell.owed": "xshell keeps trying to reach {relay} in the background so devices on that relay can move to the current relay. If {relay} is gone for good, pair those devices again.",
   "mobile.farewell.sending": "Telling {relay} about the new relay…",
   "mobile.conn.otherWindow": "Another xshell window manages the connection to your devices.",
   "mobile.quota.hosted": "Your devices have reached the daily message limit on the hosted relay. The limit resets at {time}; replies and agent output won't reach your phone until then.",
