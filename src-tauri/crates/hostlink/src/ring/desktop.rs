@@ -2427,10 +2427,10 @@ mod tests {
         wait_view(&ring, "connected, nothing owed", |v| {
             connected(v) && v.farewells.is_empty()
         });
-        assert_eq!(
-            stored(&t).held_relays,
-            [one.url(), two.url()].into_iter().collect()
-        );
+        // `held` for the new Relay is recorded after its connect, in a transaction of its own.
+        wait_until("both relays held", || {
+            stored(&t).held_relays == [one.url(), two.url()].into_iter().collect()
+        });
         ring.quit();
     }
 

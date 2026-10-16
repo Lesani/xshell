@@ -643,7 +643,8 @@ mod tests {
             },
         );
         ensure_private_dir(dir).unwrap();
-        fs::write(dir.join("ring.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        // Private, as the Store writes it: on Windows it refuses a file it doesn't own alone.
+        write_private(&dir.join("ring.json"), &serde_json::to_vec(&v).unwrap()).unwrap();
     }
 
     const OLD: &str = "wss://old.example";
