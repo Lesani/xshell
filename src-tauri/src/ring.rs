@@ -202,7 +202,10 @@ pub async fn ring_enable(app: AppHandle, start_over: Option<bool>) -> Result<Rin
     .await
 }
 
-/// Moves the Ring to `url`: a new Roster version; every connected Daemon follows.
+/// Moves the Ring to `url` at once (ADR-0012): a new Roster version, and the connection and
+/// every connected Daemon follow without waiting for the old Relay. Devices still on an
+/// unreachable old Relay are owed a farewell, which runs in the background (`farewells` in
+/// the status).
 #[tauri::command]
 pub async fn ring_set_relay_url(app: AppHandle, url: String) -> Result<RingStatus, String> {
     let w = worker(&app)?;

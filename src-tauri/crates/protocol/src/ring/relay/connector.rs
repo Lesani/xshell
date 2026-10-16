@@ -1,7 +1,7 @@
 //! The Connector: keeps one device connected to its Ring's Relay. [`RingClient`] dials once
 //! and stops at the first loss; the Connector dials again with the shared backoff
-//! ([`crate::backoff`]), follows the Roster when a new head names another Relay, finishes a
-//! Relay move it owes the old Relay, and says goodbye when it stops. The Daemon and the
+//! ([`crate::backoff`]), follows the Roster when a new head names another Relay, says
+//! farewell to the old Relays it left, and says goodbye when it stops. The Daemon and the
 //! Desktop use it as is; the Mobile can use it through UniFFI later.
 //!
 //! **One attempt at a time.** One thread owns the lifecycle and makes every connect attempt
@@ -11,19 +11,34 @@
 //! timeout) and then says goodbye on it if it authenticated, so a successor never connects
 //! while an older socket could still come up.
 //!
-//! **Relay moves.** A Desktop that changes the Relay URL owes the old Relay the new
-//! version, or the devices still connected there never learn of the move. Until the old
-//! Relay acknowledged it ([`MoveJob`]), the Connector stays on the old Relay, publishes the
-//! versions it lacks, and only then moves. It retries in batches of
-//! [`ConnectorConfig::move_attempts`] with the backoff in between, for as long as it runs,
-//! and reports [`MoveState::Failed`] after each failed batch; it never moves without the
-//! acknowledgement. The owner keeps the job on disk and passes it again at its next start.
+//! **Following a move.** The connection is always to the Relay the trusted head names. A head
+//! from the Relay that names another Relay is followed, but first the rest of what this
+//! Relay holds is fetched (`roster.get` until nothing new comes): a Relay that commits several
+//! versions at once broadcasts each of them, and a device must not dial an intermediate
+//! Relay when the newest head names a later one. When that fetch does not finish (the
+//! connection drops, the Relay refuses or does not answer), the Connector follows the head it
+//! has, and the rest becomes a **fetch job** for the same background worker as the farewells:
+//! a short connection to that Relay that asks for what it holds beyond this device's head,
+//! retried with the farewell backoff until it succeeds (also with nothing newer) or the head
+//! names that Relay again. A newer head it brings is followed like any other. Fetch jobs live
+//! in memory only, and report nothing: no link state, quota or held Relay.
+//!
+//! **Farewells** (ADR-0012). A Desktop that changes the Relay URL owes each old Relay a
+//! [`Farewell`], or the devices still connected there never learn of the move. The Connector
+//! never waits for one: the link moves at once, and a worker of its own sends the farewells
+//! in the background (see `farewell.rs`), each with the newest head, retried with a backoff
+//! for as long as the Connector runs. The owner keeps them on disk, passes them in
+//! [`ConnectorConfig::farewells`] and [`Connector::set_farewells`], and drops one when its
+//! [`FarewellState::Done`] comes. [`ConnectorEvents::held`] tells the owner which Relays hold
+//! the Ring: no farewell is owed to one that never did.
 
 use super::super::chain::RosterChain;
 use super::super::{RingError, RosterError, SignKey, SignedRoster};
 use super::client::{MemberStatus, PushRequest, RingClient, RingClientConfig, RingEvents, Ticket};
+use super::farewell::{Farewell, FarewellState, FetchJob, FwJob, Job};
 use super::wire::{close, ByeReason, CloseReason, ErrorCode, MemberPresence};
 use crate::backoff::Backoff;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
@@ -38,10 +53,14 @@ pub struct ConnectorConfig {
     pub backoff_unit: Duration,
     /// A connection up this long resets the backoff.
     pub stable_after: Duration,
-    /// A Relay move still owed to the old Relay. `None`: nothing owed.
-    pub pending_move: Option<MoveJob>,
-    /// Attempts at the old Relay per batch; [`MoveState::Failed`] after each failed batch.
-    pub move_attempts: u32,
+    /// The farewells owed to old Relays (at most one per Relay counts); those the chain no
+    /// longer owes are dropped.
+    pub farewells: Vec<Farewell>,
+    /// The first wait after a failed farewell (5 s in production); it doubles with each
+    /// further failure …
+    pub farewell_backoff_unit: Duration,
+    /// … up to this (15 min in production), and stays there.
+    pub farewell_backoff_max: Duration,
 }
 
 impl ConnectorConfig {
@@ -50,8 +69,9 @@ impl ConnectorConfig {
             client,
             backoff_unit: Duration::from_secs(1),
             stable_after: Duration::from_secs(10),
-            pending_move: None,
-            move_attempts: 5,
+            farewells: Vec::new(),
+            farewell_backoff_unit: Duration::from_secs(5),
+            farewell_backoff_max: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -71,57 +91,6 @@ pub enum LinkState {
     Stopped { error: Option<String> },
 }
 
-/// A Relay move owed to the old Relay, keyed by that Relay and the version it must get:
-/// the versions after `from` up to `target` are published on `source` (the Relay that
-/// version `from` names).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MoveJob {
-    pub source: String,
-    pub from: u64,
-    pub target: u64,
-}
-
-impl MoveJob {
-    /// The job for moving off the Relay that version `from` of `chain` names, to its head.
-    pub fn new(chain: &RosterChain, from: u64) -> Option<MoveJob> {
-        let old = chain.get(from)?;
-        Some(MoveJob {
-            source: old.roster().relay_url.clone(),
-            from,
-            target: chain.head().version(),
-        })
-    }
-
-    /// Whether this job still means something for `chain`: version `from` names `source`,
-    /// `target` is in the chain and newer, and names another Relay.
-    fn live(&self, chain: &RosterChain) -> bool {
-        match (chain.get(self.from), chain.get(self.target)) {
-            (Some(old), Some(new)) => {
-                old.roster().relay_url == self.source
-                    && self.target > self.from
-                    && new.roster().relay_url != self.source
-            }
-            _ => false,
-        }
-    }
-}
-
-/// A Relay move owed to the old Relay.
-#[derive(Debug, Clone, PartialEq)]
-pub enum MoveState {
-    /// Publishing on the old Relay; `failures` in this batch so far.
-    Moving {
-        job: MoveJob,
-        failures: u32,
-        error: Option<String>,
-    },
-    /// The old Relay acknowledged `job`; the owner clears that job (and only that one).
-    Done { job: MoveJob },
-    /// A whole batch of attempts failed. The Connector stays on (or keeps dialing) the old
-    /// Relay and tries again after the backoff.
-    Failed { job: MoveJob, error: String },
-}
-
 /// What a Connector reports. Called on the Connector's or the client's threads, never under
 /// a Connector lock, and only for the current attempt.
 pub trait ConnectorEvents: Send + Sync {
@@ -130,7 +99,15 @@ pub trait ConnectorEvents: Send + Sync {
     /// all of it.
     fn roster(&self, _chain: &RosterChain) {}
     fn presence(&self, _key: SignKey, _presence: &MemberPresence) {}
-    fn moved(&self, _state: &MoveState) {}
+    /// A farewell's new state (see [`FarewellState`]). Never called from
+    /// [`Connector::set_farewells`] or [`Connector::set_chain`] themselves.
+    fn farewell(&self, _state: &FarewellState) {}
+    /// `relay` holds this Ring, at least up to `version`: the main connection authenticated
+    /// there (`version` is then the newest the Relay holds that names `relay`), a farewell was
+    /// acknowledged there, or it refused this Ring for quota (only a Relay that holds a Ring
+    /// counts its traffic). A report can cross a change of the chain: the owner fences it
+    /// by its own state.
+    fn held(&self, _relay: &str, _version: u64) {}
     /// An envelope from a member of the trusted head (its `from` is the Relay's word until a
     /// Noise session authenticates it).
     fn envelope(&self, _from: SignKey, _payload: Vec<u8>) {}
@@ -144,8 +121,8 @@ pub trait ConnectorEvents: Send + Sync {
     /// A `quota` refusal on a connection to `relay` (the Relay the attempt dialed), `to` as
     /// for [`ConnectorEvents::error`]. A connect the Relay refused for quota and a close for
     /// quota ([`close::QUOTA`]) come here as `to: None`. Reported only while `relay` is the
-    /// one the trusted head names: nothing comes from an attempt at the old Relay of a move
-    /// owed, whose quota is no longer the Ring's. A report can still cross a change of the
+    /// one the trusted head names: nothing comes from a farewell to an old Relay, whose quota
+    /// is no longer the Ring's. A report can still cross a change of the
     /// Relay, so an owner that keeps quota state checks `relay` against its own head when it
     /// applies the report. By default: [`ConnectorEvents::error`] with [`ErrorCode::Quota`].
     fn quota(&self, _relay: &str, to: Option<SignKey>) {
@@ -163,19 +140,13 @@ pub trait ConnectorEvents: Send + Sync {
     fn entitlement(&self, _token: Option<&str>) {}
 }
 
-struct Stop {
+pub(super) struct Stop {
     /// `None`: drop the connection without a goodbye.
-    reason: Option<ByeReason>,
+    pub(super) reason: Option<ByeReason>,
 }
 
-struct St {
-    chain: RosterChain,
-    pending_move: Option<MoveJob>,
-    move_state: Option<MoveState>,
-    /// Failed attempts at the old Relay for the move owed now.
-    move_failures: u32,
-    /// Whether a batch of that move failed already (Failed stays reported until Done).
-    move_failed_batch: bool,
+pub(super) struct St {
+    pub(super) chain: RosterChain,
     /// The current attempt's generation. Bumped for every attempt and when an attempt is
     /// abandoned, so the callbacks of older ones are ignored.
     gen: u64,
@@ -183,24 +154,43 @@ struct St {
     /// The current attempt's connection ended.
     closed: Option<CloseReason>,
     link: LinkState,
-    /// `set_chain` since the worker last looked.
-    dirty: bool,
+    /// `set_chain` (or a head naming another Relay) since the worker last looked.
+    pub(super) dirty: bool,
+    /// The current connection's Relay sent a head naming another Relay: fetch the rest of
+    /// what it holds before following.
+    follow: bool,
     kick: bool,
     /// Limited state changed (entitlement); the worker re-reports `Connected`.
     refresh: bool,
-    stop: Option<Stop>,
+    pub(super) stop: Option<Stop>,
     /// The foreground state a Mobile last set: sent again on every new connection.
     foreground: Option<bool>,
+    /// The farewells owed, by old Relay.
+    pub(super) farewells: BTreeMap<String, FwJob>,
+    /// The farewells or the chain changed since the farewell worker last looked.
+    pub(super) fw_dirty: bool,
+    /// Unfinished catch-ups, by the Relay to ask again.
+    pub(super) fetches: BTreeMap<String, FetchJob>,
+    /// The worker attempt's generation, apart from `gen`: bumped for every attempt and when a
+    /// job is removed, so the callbacks of its attempt in flight are ignored.
+    pub(super) fw_gen: u64,
+    /// The job of the worker attempt in flight.
+    pub(super) fw_inflight: Option<Job>,
+    /// That attempt's connection, once it is up.
+    pub(super) fw_client: Option<Arc<RingClient>>,
 }
 
-struct Inner {
-    st: Mutex<St>,
-    cv: Condvar,
-    events: Arc<dyn ConnectorEvents>,
-    base: RingClientConfig,
+pub(super) struct Inner {
+    pub(super) st: Mutex<St>,
+    pub(super) cv: Condvar,
+    pub(super) events: Arc<dyn ConnectorEvents>,
+    pub(super) base: RingClientConfig,
     backoff_unit: Duration,
     stable_after: Duration,
-    move_attempts: u32,
+    pub(super) farewell_unit: Duration,
+    pub(super) farewell_max: Duration,
+    /// The farewell and fetch worker, started with its first job.
+    worker: Mutex<Option<JoinHandle<()>>>,
     /// Test hook: runs on the worker right before a quota report's fence.
     #[cfg(test)]
     before_quota: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -212,12 +202,12 @@ pub struct Connector {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-fn lock(m: &Mutex<St>) -> MutexGuard<'_, St> {
+pub(super) fn lock(m: &Mutex<St>) -> MutexGuard<'_, St> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The chain `theirs` makes of `ours` if it is newer and extends it.
-fn merge(ours: &RosterChain, theirs: &RosterChain) -> Option<RosterChain> {
+pub(super) fn merge(ours: &RosterChain, theirs: &RosterChain) -> Option<RosterChain> {
     if theirs.ring_id() != ours.ring_id() || theirs.head().version() <= ours.head().version() {
         return None;
     }
@@ -227,16 +217,14 @@ fn merge(ours: &RosterChain, theirs: &RosterChain) -> Option<RosterChain> {
     }
 }
 
-/// The first `version` versions of `chain`.
-fn truncated(chain: &RosterChain, version: u64) -> Option<RosterChain> {
-    let n = usize::try_from(version).ok()?;
-    let v = chain.versions().get(..n)?;
-    RosterChain::from_chain(v.to_vec()).ok()
-}
-
-/// The pending move, if it still means something for `chain`.
-fn live_move(chain: &RosterChain, pending: Option<&MoveJob>) -> Option<MoveJob> {
-    pending.filter(|j| j.live(chain)).cloned()
+/// The newest version of `chain` that names `relay`.
+fn named_by(chain: &RosterChain, relay: &str) -> Option<u64> {
+    chain
+        .versions()
+        .iter()
+        .rev()
+        .find(|r| r.roster().relay_url == relay)
+        .map(|r| r.version())
 }
 
 /// Whether the Relay said this device is no longer in the Ring: no point in dialing again.
@@ -271,7 +259,7 @@ fn quota_close(why: &CloseReason) -> bool {
 }
 
 /// Whether a connect failed because the Ring is over its Relay's daily quota.
-fn quota_error(e: &RingError) -> bool {
+pub(super) fn quota_error(e: &RingError) -> bool {
     match e {
         RingError::Relay { code, .. } => *code == ErrorCode::Quota,
         RingError::Closed(why) => quota_close(why),
@@ -292,7 +280,7 @@ struct Attempt {
     inner: Weak<Inner>,
     gen: u64,
     /// The Relay this attempt dialed. Nothing about the quota is reported once the trusted
-    /// head names another (a move owed to the old Relay, or a Relay change since).
+    /// head names another (a Relay change since).
     dialed: String,
 }
 
@@ -321,7 +309,7 @@ impl RingEvents for Attempt {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let merged = {
+        let (merged, cut) = {
             let mut st = lock(&inner.st);
             if st.gen != self.gen || st.stop.is_some() {
                 return;
@@ -331,13 +319,18 @@ impl RingEvents for Attempt {
             };
             let moved = m.head().roster().relay_url != st.chain.head().roster().relay_url;
             st.chain = m.clone();
+            st.fw_dirty = true;
             if moved {
-                // The Ring moved: follow it.
+                // The Ring moved: follow it, once the rest of what this Relay holds is in.
                 st.dirty = true;
-                inner.cv.notify_all();
+                st.follow = true;
             }
-            m
+            inner.cv.notify_all();
+            (m, Inner::prune_farewells(&mut st))
         };
+        if let Some(c) = cut {
+            c.shutdown();
+        }
         inner.events.roster(&merged);
     }
 
@@ -460,9 +453,11 @@ impl Inner {
         }
     }
 
-    fn set_move(&self, m: MoveState) {
-        lock(&self.st).move_state = Some(m.clone());
-        self.events.moved(&m);
+    /// `relay` holds the Ring at least up to `version`: reported for attempt `gen` only.
+    fn report_held(&self, gen: u64, relay: &str, version: u64) {
+        if self.is_current(gen) {
+            self.events.held(relay, version);
+        }
     }
 
     /// Waits until something the worker must act on, or `until`. `closed` and `refresh`
@@ -515,16 +510,9 @@ impl Inner {
         drop(c);
     }
 
-    /// Publishes every version of the trusted chain after `from` (up to `to`) on `c`,
-    /// oldest first.
-    fn publish_since(&self, c: &RingClient, from: u64, to: Option<u64>) -> Result<(), RingError> {
-        let versions: Vec<SignedRoster> = lock(&self.st)
-            .chain
-            .since(from)
-            .iter()
-            .filter(|r| to.is_none_or(|t| r.version() <= t))
-            .cloned()
-            .collect();
+    /// Publishes every version of the trusted chain after `from` on `c`, oldest first.
+    fn publish_since(&self, c: &RingClient, from: u64) -> Result<(), RingError> {
+        let versions: Vec<SignedRoster> = lock(&self.st).chain.since(from).to_vec();
         for r in &versions {
             match c.publish_roster(r) {
                 Ok(()) => {}
@@ -536,13 +524,55 @@ impl Inner {
         Ok(())
     }
 
-    /// The stop request, taken: says goodbye on `c` if there is one.
+    /// Fetches what the Relay `c` is connected to holds beyond `c`'s head, until it sends
+    /// nothing new, bounded by the request timeout. Each version comes through the attempt's
+    /// `chain` callback.
+    /// `true`: complete; `false`: the Relay refused, did not answer or closed first.
+    fn catch_up(&self, c: &RingClient) -> bool {
+        let until = Instant::now() + self.base.timeouts.request;
+        loop {
+            let before = c.chain().head().version();
+            let r = c
+                .probe_start()
+                .and_then(|t| t.wait_until(until, || lock(&self.st).stop.is_some()));
+            if r.is_err() {
+                return false;
+            }
+            if c.chain().head().version() == before {
+                return true;
+            }
+        }
+    }
+
+    /// Starts the worker for farewells and fetch jobs once one is owed (and the Connector
+    /// runs).
+    pub(super) fn start_worker(self: &Arc<Self>) -> std::io::Result<()> {
+        let mut t = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let st = lock(&self.st);
+            if t.is_some()
+                || st.stop.is_some()
+                || (st.farewells.is_empty() && st.fetches.is_empty())
+            {
+                return Ok(());
+            }
+        }
+        let i = self.clone();
+        *t = Some(
+            std::thread::Builder::new()
+                .name("ring-farewell".into())
+                .spawn(move || i.run_farewells())?,
+        );
+        Ok(())
+    }
+
+    /// The stop request: says goodbye on `c` if there is one.
     fn finish(&self, c: Option<Arc<RingClient>>) {
         let reason = {
             let mut st = lock(&self.st);
             st.gen += 1;
             st.client = None;
-            st.stop.as_mut().and_then(|s| s.reason.take())
+            st.stop.as_ref().and_then(|s| s.reason.clone())
         };
         if let (Some(c), Some(reason)) = (c, reason) {
             let _ = c.goodbye(reason);
@@ -553,34 +583,25 @@ impl Inner {
         let mut backoff = Backoff::default();
         'attempt: loop {
             // One attempt: what to dial, under a new generation.
-            let (target, moving, gen) = {
+            let (target, gen) = {
                 let mut st = lock(&self.st);
                 if st.stop.is_some() {
                     break;
                 }
                 st.dirty = false;
+                st.follow = false;
                 st.kick = false;
                 st.closed = None;
                 st.refresh = false;
-                st.pending_move = live_move(&st.chain, st.pending_move.as_ref());
-                let moving = st.pending_move.clone();
-                let target = match &moving {
-                    Some(j) => truncated(&st.chain, j.from),
-                    None => Some(st.chain.clone()),
-                };
                 st.gen += 1;
-                (target, moving, st.gen)
-            };
-            let Some(target) = target else {
-                // Cannot happen for a live move; drop it rather than loop.
-                lock(&self.st).pending_move = None;
-                continue;
+                (st.chain.clone(), st.gen)
             };
             self.set_link(LinkState::Connecting {
                 attempt: backoff.failures,
             });
             // The Relay this attempt dials: the target head's, whatever the chain says later.
             let dialed = target.head().roster().relay_url.clone();
+            let dialed_version = target.head().version();
             let mut cfg = self.base.clone();
             cfg.chain = target;
             let events = Arc::new(Attempt {
@@ -618,7 +639,7 @@ impl Inner {
             };
             let c = match c {
                 Ok(c) => c,
-                Err(e) if removed_error(&e) && moving.is_none() => {
+                Err(e) if removed_error(&e) => {
                     self.set_link(LinkState::Stopped {
                         error: Some(e.to_string()),
                     });
@@ -631,10 +652,10 @@ impl Inner {
                     }
                 }
                 Err(e) => {
-                    match &moving {
-                        Some(j) => self.move_failed(j, e.to_string()),
-                        None if quota_error(&e) => self.report_quota(gen, &dialed),
-                        None => {}
+                    if quota_error(&e) {
+                        // Only a Relay that holds the Ring counts its traffic.
+                        self.report_held(gen, &dialed, dialed_version);
+                        self.report_quota(gen, &dialed);
                     }
                     let retry_in = backoff.failed(self.backoff_unit);
                     if self.backoff_wait(retry_in, e.to_string()) {
@@ -645,74 +666,13 @@ impl Inner {
             };
             let up_at = Instant::now();
 
-            if let Some(job) = moving {
-                // Stay on the old Relay, reachable for the devices there, until it
-                // acknowledged the move.
-                self.connected(&c, gen);
-                let mut tries = Backoff::default();
-                loop {
-                    let r = self.publish_since(&c, job.from, Some(job.target));
-                    match r {
-                        Ok(()) => {
-                            // A stop that came meanwhile ends here, with the goodbye.
-                            if lock(&self.st).stop.is_some() {
-                                {
-                                    let mut st = lock(&self.st);
-                                    if st.pending_move.as_ref() == Some(&job) {
-                                        st.pending_move = None;
-                                    }
-                                }
-                                self.set_move(MoveState::Done { job });
-                                self.finish(Some(c));
-                                break 'attempt;
-                            }
-                            self.abandon();
-                            {
-                                let mut st = lock(&self.st);
-                                if st.pending_move.as_ref() == Some(&job) {
-                                    st.pending_move = None;
-                                }
-                                st.move_failures = 0;
-                                st.move_failed_batch = false;
-                            }
-                            self.set_move(MoveState::Done { job });
-                            backoff = Backoff::default();
-                            continue 'attempt;
-                        }
-                        Err(e) => {
-                            self.move_failed(&job, e.to_string());
-                            let retry_in = tries.failed(self.backoff_unit);
-                            match self.wait(Some(Instant::now() + retry_in), true) {
-                                Woke::Stop => {
-                                    self.finish(Some(c));
-                                    break 'attempt;
-                                }
-                                Woke::Closed(why) if quota_close(&why) => {
-                                    // Over the old Relay's quota: dialing it again at once
-                                    // would only be refused again.
-                                    self.abandon();
-                                    let retry_in = backoff.failed(self.backoff_unit);
-                                    if self.backoff_wait(retry_in, why.to_string()) {
-                                        break 'attempt;
-                                    }
-                                    continue 'attempt;
-                                }
-                                Woke::Closed(_) | Woke::Dirty => {
-                                    self.abandon();
-                                    continue 'attempt;
-                                }
-                                Woke::Refresh | Woke::Kick | Woke::Timeout => {}
-                            }
-                        }
-                    }
-                }
-            }
-
             // Versions set while the connect ran.
             if c.chain().head().version() < lock(&self.st).chain.head().version() {
                 let _ = self.sync(&c, &dialed);
             }
             self.connected(&c, gen);
+            let held = named_by(&c.chain(), &dialed).unwrap_or(dialed_version);
+            self.report_held(gen, &dialed, held);
             loop {
                 match self.wait(None, true) {
                     Woke::Stop => {
@@ -722,6 +682,10 @@ impl Inner {
                     Woke::Refresh => self.connected(&c, gen),
                     Woke::Kick | Woke::Timeout => {}
                     Woke::Dirty => {
+                        if std::mem::take(&mut lock(&self.st).follow) && !self.catch_up(&c) {
+                            // Follow what this device has; the rest comes later.
+                            self.owe_fetch(&dialed);
+                        }
                         if !self.sync(&c, &dialed) {
                             // Another Ring or another Relay: dial again, at once.
                             self.abandon();
@@ -732,6 +696,8 @@ impl Inner {
                         let quota = quota_close(&why);
                         if quota {
                             // Before `abandon`, which fences this attempt off.
+                            let held = named_by(&c.chain(), &dialed).unwrap_or(dialed_version);
+                            self.report_held(gen, &dialed, held);
                             self.report_quota(gen, &dialed);
                         }
                         self.abandon();
@@ -766,49 +732,37 @@ impl Inner {
     }
 
     /// Brings the Relay `c` is connected to up to the trusted chain. `false`: the chain is
-    /// of another Ring, names another Relay, or owes a move, so `c` is the wrong connection.
+    /// of another Ring or names another Relay, so `c` is the wrong connection.
     fn sync(&self, c: &RingClient, dialed: &str) -> bool {
-        let (ours, owed) = {
-            let st = lock(&self.st);
-            let owed = live_move(&st.chain, st.pending_move.as_ref());
-            (st.chain.clone(), owed)
-        };
+        let ours = lock(&self.st).chain.clone();
         let theirs = c.chain();
-        if ours.ring_id() != theirs.ring_id()
-            || ours.head().roster().relay_url != dialed
-            || owed.is_some()
-        {
+        if ours.ring_id() != theirs.ring_id() || ours.head().roster().relay_url != dialed {
             return false;
         }
         let from = theirs.head().version();
-        if ours.head().version() > from && self.publish_since(c, from, None).is_err() {
+        if ours.head().version() > from && self.publish_since(c, from).is_err() {
             // The next connect stages what the Relay lacks.
             return false;
         }
         true
     }
 
-    /// One failed attempt at the old Relay. A whole batch failed: `Failed`, which stays
-    /// reported (with the latest error) until the move is done.
-    fn move_failed(&self, job: &MoveJob, error: String) {
-        let (failures, failed) = {
+    /// `relay` may hold more than this device has: a fetch job asks it again, unless the head
+    /// names it (the link covers it then).
+    fn owe_fetch(self: &Arc<Self>, relay: &str) {
+        {
             let mut st = lock(&self.st);
-            st.move_failures += 1;
-            if st.move_failures >= self.move_attempts {
-                st.move_failures = 0;
-                st.move_failed_batch = true;
+            if st.stop.is_some() || st.chain.head().roster().relay_url == relay {
+                return;
             }
-            (st.move_failures, st.move_failed_batch)
-        };
-        let job = job.clone();
-        if failed {
-            self.set_move(MoveState::Failed { job, error });
-        } else {
-            self.set_move(MoveState::Moving {
-                job,
-                failures,
-                error: Some(error),
-            });
+            st.fetches
+                .entry(relay.to_string())
+                .or_insert_with(FetchJob::new);
+            st.fw_dirty = true;
+            self.cv.notify_all();
+        }
+        if let Err(e) = self.start_worker() {
+            eprintln!("xshell: cannot start the farewell worker: {e}");
         }
     }
 
@@ -835,35 +789,40 @@ impl Connector {
     }
 
     fn inner(cfg: ConnectorConfig, events: Arc<dyn ConnectorEvents>) -> Inner {
-        let move_state =
-            live_move(&cfg.client.chain, cfg.pending_move.as_ref()).map(|job| MoveState::Moving {
-                job,
-                failures: 0,
-                error: None,
-            });
+        let farewells = cfg
+            .farewells
+            .into_iter()
+            .filter(|f| f.still_owed(&cfg.client.chain))
+            .map(|f| (f.source.clone(), FwJob::new(f)))
+            .collect();
         Inner {
             st: Mutex::new(St {
                 chain: cfg.client.chain.clone(),
-                pending_move: cfg.pending_move,
-                move_state,
-                move_failures: 0,
-                move_failed_batch: false,
                 gen: 0,
                 client: None,
                 closed: None,
                 link: LinkState::Connecting { attempt: 0 },
                 dirty: false,
+                follow: false,
                 kick: false,
                 refresh: false,
                 stop: None,
                 foreground: None,
+                farewells,
+                fetches: BTreeMap::new(),
+                fw_dirty: false,
+                fw_gen: 0,
+                fw_inflight: None,
+                fw_client: None,
             }),
             cv: Condvar::new(),
             events,
             base: cfg.client,
             backoff_unit: cfg.backoff_unit,
             stable_after: cfg.stable_after,
-            move_attempts: cfg.move_attempts.max(1),
+            farewell_unit: cfg.farewell_backoff_unit,
+            farewell_max: cfg.farewell_backoff_max,
+            worker: Mutex::new(None),
             #[cfg(test)]
             before_quota: Mutex::new(None),
         }
@@ -875,46 +834,93 @@ impl Connector {
         let thread = std::thread::Builder::new()
             .name("ring-connector".into())
             .spawn(move || i.run())?;
-        Ok(Connector {
+        let c = Connector {
             inner,
             thread: Mutex::new(Some(thread)),
-        })
+        };
+        c.inner.start_worker()?;
+        Ok(c)
     }
 
     /// Trust `chain` from now on (it replaces the one held). Versions the Relay lacks are
     /// published; a head naming another Relay, or another Ring, makes the Connector dial
-    /// again. `pending_move`: a Relay move now owed to the old Relay (see
-    /// [`ConnectorConfig::pending_move`]). Never blocks.
-    pub fn set_chain(&self, chain: RosterChain, pending_move: Option<MoveJob>) {
-        let m = {
+    /// again at once. A farewell the chain no longer owes is dropped, and so is a fetch job
+    /// at the Relay the head names (another Ring drops them all). A chain held already, or an
+    /// older prefix of it (the owner persisting what the Connector reported), changes nothing.
+    /// Never
+    /// blocks, and reports nothing itself.
+    pub fn set_chain(&self, chain: RosterChain) {
+        let cut = {
             let mut st = lock(&self.inner.st);
+            // The chain held already, or an older prefix of it: an echo (the owner persisting
+            // what it was told, perhaps after a newer version came in).
+            let held = st
+                .chain
+                .get(chain.head().version())
+                .is_some_and(|r| r.token() == chain.head().token());
+            if st.chain.ring_id() == chain.ring_id() && held {
+                return;
+            }
             if st.chain.ring_id() != chain.ring_id() {
-                st.pending_move = None;
-                st.move_state = None;
+                st.farewells.clear();
+                st.fetches.clear();
             }
             st.chain = chain;
-            let mut m = None;
-            if let Some(job) = live_move(&st.chain, pending_move.as_ref()) {
-                if st.pending_move.as_ref() != Some(&job) {
-                    st.move_failures = 0;
-                    st.move_failed_batch = false;
-                }
-                st.pending_move = Some(job.clone());
-                let s = MoveState::Moving {
-                    job,
-                    failures: 0,
-                    error: None,
-                };
-                st.move_state = Some(s.clone());
-                m = Some(s);
-            }
             st.dirty = true;
+            st.fw_dirty = true;
             self.inner.cv.notify_all();
-            m
+            Inner::prune_farewells(&mut st)
         };
-        if let Some(m) = m {
-            self.inner.events.moved(&m);
+        if let Some(c) = cut {
+            c.shutdown();
         }
+    }
+
+    /// Replaces the farewells owed: one per old Relay (the last given counts), those the
+    /// trusted chain no longer owes left out. A farewell to a Relay already in the set keeps
+    /// its schedule; an attempt in flight at one left out is cut without a goodbye. Never
+    /// blocks, and reports nothing itself: states come from the farewell worker.
+    pub fn set_farewells(&self, farewells: Vec<Farewell>) {
+        let cut = {
+            let mut st = lock(&self.inner.st);
+            let mut next = BTreeMap::new();
+            for f in farewells {
+                if !f.still_owed(&st.chain) {
+                    continue;
+                }
+                let kept = next
+                    .remove(&f.source)
+                    .or_else(|| st.farewells.remove(&f.source));
+                let job = match kept {
+                    Some(mut j) => {
+                        j.farewell = f.clone();
+                        j
+                    }
+                    None => FwJob::new(f.clone()),
+                };
+                next.insert(f.source, job);
+            }
+            st.farewells = next;
+            st.fw_dirty = true;
+            self.inner.cv.notify_all();
+            Inner::prune_farewells(&mut st)
+        };
+        if let Some(c) = cut {
+            c.shutdown();
+        }
+        if let Err(e) = self.inner.start_worker() {
+            // Retried with the next set; the link itself is unaffected.
+            eprintln!("xshell: cannot start the farewell worker: {e}");
+        }
+    }
+
+    /// Every farewell owed, with its last state (`Sending` before its first attempt).
+    pub fn farewells(&self) -> Vec<FarewellState> {
+        lock(&self.inner.st)
+            .farewells
+            .values()
+            .map(FwJob::view)
+            .collect()
     }
 
     /// Uploads `next` on the current connection and waits for the Relay's answer. Best
@@ -1138,10 +1144,6 @@ impl Connector {
         lock(&self.inner.st).link.clone()
     }
 
-    pub fn move_state(&self) -> Option<MoveState> {
-        lock(&self.inner.st).move_state.clone()
-    }
-
     /// Retry now instead of waiting out the backoff (or a stop for removal). A live
     /// connection is left alone.
     pub fn kick(&self) {
@@ -1150,8 +1152,9 @@ impl Connector {
         self.inner.cv.notify_all();
     }
 
-    /// Stops for good: says goodbye with `reason` if connected, after waiting for an attempt
-    /// in flight to finish (bounded by the connect timeout). Idempotent.
+    /// Stops for good: says goodbye with `reason` if connected (a farewell's connection
+    /// included), after waiting for an attempt in flight to finish (bounded by the connect
+    /// timeout). Idempotent.
     pub fn stop(&self, reason: ByeReason) {
         self.stop_with(Some(reason));
     }
@@ -1169,18 +1172,21 @@ impl Connector {
             }
             self.inner.cv.notify_all();
         }
-        let Some(handle) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-            return;
-        };
-        // The worker ends within the connect timeout (an attempt in flight) plus the
+        let handles: Vec<JoinHandle<()>> = [&self.thread, &self.inner.worker]
+            .into_iter()
+            .filter_map(|t| t.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .collect();
+        // Each worker ends within the connect timeout (an attempt in flight) plus the
         // goodbye; past that it is left to finish on its own, fenced by the stop flag.
         let t = self.inner.base.timeouts;
         let deadline = Instant::now() + t.connect + t.bye + Duration::from_secs(1);
-        while !handle.is_finished() && Instant::now() < deadline {
+        while handles.iter().any(|h| !h.is_finished()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        if handle.is_finished() {
-            let _ = handle.join();
+        for h in handles {
+            if h.is_finished() {
+                let _ = h.join();
+            }
         }
     }
 }

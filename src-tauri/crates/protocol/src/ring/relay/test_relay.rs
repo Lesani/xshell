@@ -365,6 +365,12 @@ struct Shared {
     ignore_puts: AtomicBool,
     /// Drop every `roster.get` without an answer (see `ignore_roster_gets`).
     ignore_gets: AtomicBool,
+    /// Broadcast only the first version of a commit at `auth` (see `split_commits`).
+    split_commits: AtomicBool,
+    /// What the next `roster.get` gets instead of its answer (see `fail_next_roster_get`).
+    get_fault: Mutex<Option<GetFault>>,
+    /// `roster.get`s received after `welcome`.
+    gets: std::sync::atomic::AtomicUsize,
     /// `roster.put`s answered `roster_stale` (see `stale_roster_puts`).
     stale_puts: std::sync::atomic::AtomicUsize,
     /// Envelope rewriters by (Ring, addressee).
@@ -601,6 +607,9 @@ impl TestRelay {
             refuse_puts: AtomicBool::new(false),
             ignore_puts: AtomicBool::new(false),
             ignore_gets: AtomicBool::new(false),
+            split_commits: AtomicBool::new(false),
+            get_fault: Mutex::new(None),
+            gets: std::sync::atomic::AtomicUsize::new(0),
             stale_puts: std::sync::atomic::AtomicUsize::new(0),
             tampers: Mutex::new(HashMap::new()),
             recording: AtomicBool::new(false),
@@ -787,6 +796,26 @@ impl TestRelay {
     /// toward the quota); frames injected for a socket are its only answers.
     pub fn ignore_roster_gets(&self, on: bool) {
         self.shared.ignore_gets.store(on, Ordering::Release);
+    }
+
+    /// While on, a commit at `auth` of several versions (a staged move) broadcasts only the
+    /// first of them; a connected member gets the rest only by asking (`roster.get`).
+    pub fn split_commits(&self, on: bool) {
+        self.shared.split_commits.store(on, Ordering::Release);
+    }
+
+    /// The next `roster.get` after `welcome`, from anyone, is answered by `fault` instead.
+    pub fn fail_next_roster_get(&self, fault: GetFault) {
+        *self
+            .shared
+            .get_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(fault);
+    }
+
+    /// How many `roster.get`s after `welcome` the Relay received so far.
+    pub fn roster_gets(&self) -> usize {
+        self.shared.gets.load(Ordering::Acquire)
     }
 
     /// How many `roster.put`s were answered `roster_stale` so far.
@@ -1797,7 +1826,12 @@ impl Conn {
         });
         state.chain = chain;
         if existed {
-            state.announce(&added, &removed, Some(&key));
+            let shown = if self.shared.split_commits.load(Ordering::Acquire) {
+                &added[..added.len().min(1)]
+            } else {
+                &added[..]
+            };
+            state.announce(shown, &removed, Some(&key));
         }
         let gen = {
             let g = state.gens.entry(key).or_insert(0);
@@ -2008,8 +2042,24 @@ impl Conn {
                 }
             }
             ClientFrame::RosterGet { id, since } => {
+                self.shared.gets.fetch_add(1, Ordering::AcqRel);
                 if self.shared.ignore_gets.load(Ordering::Acquire) {
                     return;
+                }
+                let fault = self
+                    .shared
+                    .get_fault
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                match fault {
+                    Some(GetFault::Ignore) => return,
+                    Some(GetFault::Refuse) => {
+                        self.error(ErrorCode::Quota, Some(id), None, None);
+                        return;
+                    }
+                    Some(GetFault::Close) => return self.close(1011),
+                    None => {}
                 }
                 let tokens: Vec<String> = match self.rings().get(&ring) {
                     Some(s) => s
@@ -2630,6 +2680,190 @@ impl TrickleProxy {
 impl Drop for TrickleProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// What [`TestRelay::fail_next_roster_get`] does to the next `roster.get`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetFault {
+    /// Leaves it unanswered.
+    Ignore,
+    /// Refuses it (`error{code:"quota"}` with its id).
+    Refuse,
+    /// Closes the socket (1011).
+    Close,
+}
+
+/// A TCP proxy that can stand for a Relay that is gone: while closed it cuts every
+/// connection through it and closes each new one at once; while open it forwards both ways.
+/// [`GateProxy::hold_next`] holds the next connection's client bytes (its `auth`, say) until
+/// [`GateProxy::release`]. It counts every connection it accepted.
+pub struct GateProxy {
+    addr: SocketAddr,
+    shared: Arc<GateShared>,
+}
+
+#[derive(Default)]
+struct GateShared {
+    stop: AtomicBool,
+    open: AtomicBool,
+    /// Close new connections at once, leaving those through already alone.
+    refuse_new: AtomicBool,
+    accepted: std::sync::atomic::AtomicUsize,
+    /// Both sides of every connection forwarded, to cut them on close.
+    live: Mutex<Vec<(TcpStream, TcpStream)>>,
+    hold_next: AtomicBool,
+    /// Connections past this many accepted are held, or refused (see `hold_after`).
+    hold_after: std::sync::atomic::AtomicUsize,
+    refuse_after: std::sync::atomic::AtomicUsize,
+    /// `true` once the held connections may go on.
+    released: Mutex<bool>,
+    released_cv: std::sync::Condvar,
+}
+
+impl GateProxy {
+    /// A proxy in front of `upstream`, open.
+    pub fn start(upstream: SocketAddr) -> GateProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy address");
+        listener.set_nonblocking(true).expect("nonblocking proxy");
+        let shared = Arc::new(GateShared::default());
+        shared.hold_after.store(usize::MAX, Ordering::Release);
+        shared.refuse_after.store(usize::MAX, Ordering::Release);
+        shared.open.store(true, Ordering::Release);
+        let sh = shared.clone();
+        thread::spawn(move || {
+            while !sh.stop.load(Ordering::Acquire) {
+                let Ok((client, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let n = sh.accepted.fetch_add(1, Ordering::AcqRel) + 1;
+                if !sh.open.load(Ordering::Acquire)
+                    || sh.refuse_new.load(Ordering::Acquire)
+                    || n > sh.refuse_after.load(Ordering::Acquire)
+                {
+                    let _ = client.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                let _ = client.set_nonblocking(false);
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                let _ = client.set_nodelay(true);
+                let _ = server.set_nodelay(true);
+                let (Ok(c2), Ok(s2), Ok(c3), Ok(s3)) = (
+                    client.try_clone(),
+                    server.try_clone(),
+                    client.try_clone(),
+                    server.try_clone(),
+                ) else {
+                    continue;
+                };
+                sh.live
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((c3, s3));
+                let held = sh.hold_next.swap(false, Ordering::AcqRel);
+                if held {
+                    *sh.released.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                }
+                let held = held || n > sh.hold_after.load(Ordering::Acquire);
+                let gate = sh.clone();
+                thread::spawn(move || {
+                    if held {
+                        let mut r = gate.released.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*r && !gate.stop.load(Ordering::Acquire) {
+                            r = gate
+                                .released_cv
+                                .wait_timeout(r, Duration::from_millis(50))
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0;
+                        }
+                    }
+                    pipe(client, server, usize::MAX, Duration::ZERO)
+                });
+                thread::spawn(move || pipe(s2, c2, usize::MAX, Duration::ZERO));
+            }
+        });
+        GateProxy { addr, shared }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The `ws://` URL that reaches the upstream Relay through this proxy.
+    pub fn url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// Opens or closes the gate. Closing cuts every connection through it.
+    pub fn set_open(&self, open: bool) {
+        self.shared.open.store(open, Ordering::Release);
+        if !open {
+            for (c, s) in self
+                .shared
+                .live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
+                let _ = c.shutdown(std::net::Shutdown::Both);
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// While on, new connections are closed at once; those through already (held ones
+    /// included) go on.
+    pub fn refuse_new(&self, on: bool) {
+        self.shared.refuse_new.store(on, Ordering::Release);
+    }
+
+    /// Every connection accepted so far, those closed at once included.
+    pub fn connections(&self) -> usize {
+        self.shared.accepted.load(Ordering::Acquire)
+    }
+
+    /// Holds the bytes the next connection's client sends until [`GateProxy::release`]; the
+    /// Relay's bytes go through.
+    pub fn hold_next(&self) {
+        self.shared.hold_next.store(true, Ordering::Release);
+    }
+
+    /// Holds (as [`GateProxy::hold_next`]) every connection after the first `n` accepted,
+    /// until [`GateProxy::release`]; those after the release go on.
+    pub fn hold_after(&self, n: usize) {
+        *self
+            .shared
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        self.shared.hold_after.store(n, Ordering::Release);
+    }
+
+    /// Closes every connection after the first `n` accepted at once (an upstream gone for
+    /// them), leaving earlier ones alone.
+    pub fn refuse_after(&self, n: usize) {
+        self.shared.refuse_after.store(n, Ordering::Release);
+    }
+
+    /// Lets held connections go on.
+    pub fn release(&self) {
+        *self
+            .shared
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        self.shared.released_cv.notify_all();
+    }
+}
+
+impl Drop for GateProxy {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.set_open(false);
     }
 }
 

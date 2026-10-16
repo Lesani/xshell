@@ -37,6 +37,7 @@ macro_rules! scenario {
 
 scenario!(
     member_auth_succeeds,
+    old_relay_hands_a_move_to_a_lagging_device,
     non_member_auth_fails,
     forged_auth_signature_fails,
     failing_signer_fails_auth,
@@ -123,7 +124,7 @@ fn state_foreground_lease_expires() {
 #[test]
 fn every_scenario_is_listed_and_run_here() {
     // The macros above and the lists must not drift apart.
-    assert_eq!(SCENARIOS.len(), 40);
+    assert_eq!(SCENARIOS.len(), 41);
     assert_eq!(PUSH_SCENARIOS.len(), 5);
     assert_eq!(PUSH_UNAVAILABLE_SCENARIOS.len(), 1);
     assert_eq!(FOREGROUND_LEASE_SCENARIOS.len(), 1);

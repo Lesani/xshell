@@ -97,6 +97,10 @@ _Avoid_: notification server, push relay
 **Hosted Relay**:
 A **Relay** run by the xshell project for subscribers who do not self-host.
 
+**Farewell**:
+What a **Desktop** owes an old **Relay** after moving its **Ring** away from it: the newest **Roster** delivered there, so the devices still connected to it follow. Sent in the background and retried until that **Relay** has it; nothing waits for it.
+_Avoid_: move, migration (for the obligation), pending move
+
 **Subscription**:
 A store purchase (Push or Hosted tier) made on one **Mobile** that covers its whole **Ring**.
 _Avoid_: account, license, plan
@@ -126,6 +130,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 - A **Remote Host** joins its **Desktop**'s **Ring** automatically when that **Desktop** installs its **Daemon** over SSH; other machines pair with `xshelld pair`
 - A **Mobile** gates features per **Host** on the **Daemon**'s capabilities; when protocol ranges do not overlap it tells the user which side to update (the app, or the **Daemon** at a **Desktop**), and never upgrades a **Daemon** itself
 - A **Ring** has exactly one **Relay**, named in its **Roster**; it defaults to the **Hosted Relay**, and moving to another is a new **Roster** version
+- Moving a **Ring** takes effect at once; each old **Relay** that held the **Ring** is owed a **Farewell**, the **Hosted Relay** like any other. A device that only knew an old **Relay** and never reconnects while it is reachable must be paired again
 - The **Relay** stores the latest **Roster** but cannot forge one: every device checks its signatures and refuses older versions
 - The **Relay** routes only between keys of the same **Ring**; compromising it can drop traffic but not read or type into **Terminals**
 - A **Remote Host**'s **Terminals** are the source of truth: every connected **Desktop** shows exactly one **Tab** per **Terminal**, opening and closing **Tabs** as **Terminals** appear and end

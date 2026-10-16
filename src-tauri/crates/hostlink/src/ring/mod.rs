@@ -8,9 +8,9 @@ pub mod store;
 pub mod sync;
 
 pub use desktop::{
-    ConfiguredHosts, DesktopRing, DesktopRingConfig, HostOutcome, HostRef, LocalIdentity,
-    MemberView, PairingEvent, PairingFlow, PairingObserver, PhoneOffer, PresenceView, RingObserver,
-    RingView, REMOVE_IN_USE, REMOVE_SELF,
+    ConfiguredHosts, DesktopRing, DesktopRingConfig, FarewellView, HostOutcome, HostRef,
+    LocalIdentity, MemberView, PairingEvent, PairingFlow, PairingObserver, PhoneOffer,
+    PresenceView, RingObserver, RingView, REMOVE_IN_USE, REMOVE_SELF,
 };
 pub use store::HostMember;
 pub use sync::{HostRingState, HostSync, SyncWorker};
@@ -18,6 +18,11 @@ pub use sync::{HostRingState, HostSync, SyncWorker};
 /// The Hosted Relay, preset when a Ring is created (defined in `xshell-protocol`, which
 /// `xshelld pair` shares).
 pub use xshell_protocol::ring::url::HOSTED_RELAY_URL;
+
+/// The address earlier builds preset for the Hosted Relay, which never existed (ADR-0012):
+/// it never held a Ring, so no farewell is owed to it, and one an earlier build recorded is
+/// dropped on load.
+pub const LEGACY_PLACEHOLDER_RELAY_URL: &str = "wss://relay.xshell.app";
 
 /// The Relay a new Ring starts on: `XSHELL_RELAY_URL` when set (development against a
 /// local Relay), else the Hosted Relay.

@@ -1,5 +1,5 @@
 //! The Connector against the in-process test Relay: reconnect with backoff, goodbye, Relay
-//! moves (followed, and owed to the old Relay), removal, and fenced attempts.
+//! moves (followed, and farewells to the old Relay), removal, and fenced attempts.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -7,10 +7,12 @@ use xshell_protocol::ring::entitlement::{sign_entitlement, GatewayKeys, Tier};
 use xshell_protocol::ring::relay::contract::{
     config, connect, fake_entitlement, keys, now, TestRing, QUIET, WAIT,
 };
-use xshell_protocol::ring::relay::test_relay::{Fault, TestRelay, TestRelayOptions, TrickleProxy};
+use xshell_protocol::ring::relay::test_relay::{
+    Fault, GateProxy, GetFault, TestRelay, TestRelayOptions, TrickleProxy,
+};
 use xshell_protocol::ring::relay::wire::{ByeReason, ErrorCode, MemberPresence};
 use xshell_protocol::ring::relay::{
-    Connector, ConnectorConfig, ConnectorEvents, LinkState, MoveJob, MoveState, RingTimeouts,
+    Connector, ConnectorConfig, ConnectorEvents, Farewell, FarewellState, LinkState, RingTimeouts,
 };
 use xshell_protocol::ring::{DeviceKeys, RingError, RingId, RosterChain, SignKey, Signer};
 
@@ -18,7 +20,8 @@ use xshell_protocol::ring::{DeviceKeys, RingError, RingId, RosterChain, SignKey,
 enum Ev {
     State(LinkState),
     Chain(u64),
-    Moved(MoveState),
+    Farewell(FarewellState),
+    Held(String, u64),
     Entitlement(Option<String>),
     Error(ErrorCode, Option<SignKey>),
     Accepted,
@@ -76,8 +79,15 @@ impl ConnectorEvents for Rec {
         self.ev.lock().unwrap().push(Ev::Chain(c.head().version()));
         self.cv.notify_all();
     }
-    fn moved(&self, m: &MoveState) {
-        self.ev.lock().unwrap().push(Ev::Moved(m.clone()));
+    fn farewell(&self, f: &FarewellState) {
+        self.ev.lock().unwrap().push(Ev::Farewell(f.clone()));
+        self.cv.notify_all();
+    }
+    fn held(&self, relay: &str, version: u64) {
+        self.ev
+            .lock()
+            .unwrap()
+            .push(Ev::Held(relay.to_string(), version));
         self.cv.notify_all();
     }
     fn entitlement(&self, token: Option<&str>) {
@@ -325,88 +335,9 @@ fn set_chain_publishes_new_versions_on_the_same_relay() {
     assert!(rec.connected());
     ring.next(|_| {});
     ring.next(|_| {});
-    c.set_chain(ring.chain.clone(), None);
+    c.set_chain(ring.chain.clone());
     wait_until("published", || r.head_version(&ring.ring_id()) == Some(4));
     c.stop(ByeReason::quit());
-}
-
-#[test]
-fn relay_move_publishes_on_the_old_relay_first() {
-    let (a, b) = (relay(), relay());
-    let mut ring = TestRing::new(&a.url());
-    let (desk, drec) = start(cfg(&a, &ring.chain, ring.desktop.clone()));
-    let (dmn, mrec) = start(cfg(&a, &ring.chain, ring.daemon.clone()));
-    assert!(drec.connected() && mrec.connected());
-    ring.next(|d| d.relay_url = b.url());
-    let job = MoveJob::new(&ring.chain, 2).unwrap();
-    assert_eq!(job.source, a.url());
-    drec.clear();
-    desk.set_chain(ring.chain.clone(), Some(job.clone()));
-    assert!(drec
-        .wait(
-            WAIT,
-            |e| matches!(e, Ev::Moved(MoveState::Done { job: j }) if *j == job)
-        )
-        .is_some());
-    assert_eq!(
-        a.head_version(&ring.ring_id()),
-        Some(3),
-        "the old Relay knows"
-    );
-    assert!(drec.connected());
-    wait_until("both on the new Relay", || {
-        online(&b, &ring, &ring.desktop.sign_key()) && online(&b, &ring, &ring.daemon.sign_key())
-    });
-    assert_eq!(desk.move_state(), Some(MoveState::Done { job }));
-    desk.stop(ByeReason::quit());
-    dmn.stop(ByeReason::quit());
-}
-
-#[test]
-fn a_move_stays_on_the_old_relay_until_it_is_acknowledged() {
-    let (a, b) = (relay(), relay());
-    let mut ring = TestRing::new(&a.url());
-    let key = ring.desktop.sign_key();
-    a.refuse_roster_puts(true);
-    ring.next(|d| d.relay_url = b.url());
-    let job = MoveJob::new(&ring.chain, 2).unwrap();
-    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
-    cc.move_attempts = 2;
-    // Owed from the start (as after a restart with the job on disk).
-    cc.pending_move = Some(job.clone());
-    let (desk, drec) = start(cc.clone());
-    // Batches fail and are reported, again and again; the Connector never moves.
-    for _ in 0..2 {
-        drec.clear();
-        assert!(drec
-            .wait(WAIT, |e| matches!(e, Ev::Moved(MoveState::Failed { .. })))
-            .is_some());
-    }
-    assert!(online(&a, &ring, &key), "still reachable on the old Relay");
-    assert!(
-        !online(&b, &ring, &key),
-        "not on the new Relay before the ack"
-    );
-    assert_eq!(b.head_version(&ring.ring_id()), None);
-    assert_eq!(a.head_version(&ring.ring_id()), Some(2));
-    assert!(matches!(desk.move_state(), Some(MoveState::Failed { .. })));
-
-    // The old Relay takes it: only now does the Connector move.
-    a.refuse_roster_puts(false);
-    assert!(drec
-        .wait(WAIT, |e| matches!(e, Ev::Moved(MoveState::Done { .. })))
-        .is_some());
-    assert_eq!(a.head_version(&ring.ring_id()), Some(3));
-    wait_until("on the new Relay", || online(&b, &ring, &key));
-    desk.stop(ByeReason::quit());
-
-    // A restart with the job already acknowledged moves at once.
-    let (desk, drec) = start(cc);
-    assert!(drec
-        .wait(WAIT, |e| matches!(e, Ev::Moved(MoveState::Done { .. })))
-        .is_some());
-    assert!(drec.connected());
-    desk.stop(ByeReason::quit());
 }
 
 #[test]
@@ -479,45 +410,6 @@ fn stop_during_authentication_then_reconnect() {
     new.stop(ByeReason::quit());
 }
 
-#[test]
-fn stop_while_the_move_is_acknowledged_says_goodbye_on_the_old_relay() {
-    let (a, b) = (slow_relay(), relay());
-    // The old Relay answers slowly, so the stop arrives while the publication is in flight.
-    let proxy = TrickleProxy::start(a.addr(), 8, Duration::from_millis(15));
-    let old = format!("ws://127.0.0.1:{}", proxy.addr().port());
-    a.set_origin(&old);
-    let mut ring = TestRing::new(&old);
-    let key = ring.desktop.sign_key();
-    ring.next(|d| d.relay_url = b.url());
-    let mut cc = ConnectorConfig::new(xshell_protocol::ring::relay::RingClientConfig::new(
-        ring.chain.clone(),
-        ring.desktop.clone(),
-    ));
-    cc.client.timeouts = timeouts();
-    cc.backoff_unit = Duration::from_millis(50);
-    cc.pending_move = MoveJob::new(&ring.chain, 2);
-    let (desk, rec) = start(cc);
-    assert!(rec
-        .wait(Duration::from_secs(10), |e| matches!(
-            e,
-            Ev::State(LinkState::Connected { .. })
-        ))
-        .is_some());
-    desk.stop(ByeReason::quit());
-    assert!(rec
-        .all()
-        .iter()
-        .any(|e| matches!(e, Ev::Moved(MoveState::Done { .. }))));
-    assert_eq!(a.head_version(&ring.ring_id()), Some(3));
-    let p = a.presence(&ring.ring_id(), &key).unwrap();
-    assert_eq!(
-        p.last_reason.as_deref(),
-        Some("quit"),
-        "said goodbye: {p:?}"
-    );
-    assert!(!online(&b, &ring, &key));
-}
-
 // ---- publish_until (xshell#38) ----------------------------------------------------------
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -531,7 +423,7 @@ fn publish_until_succeeds_when_sync_published_first() {
     for _ in 0..5 {
         let next = ring.next(|_| {});
         // The worker's sync and this call race to upload the same version.
-        c.set_chain(ring.chain.clone(), None);
+        c.set_chain(ring.chain.clone());
         c.publish_until(&next, Instant::now() + WAIT, None)
             .expect("published");
         assert_eq!(r.head_version(&ring.ring_id()), Some(next.version()));
@@ -551,7 +443,7 @@ fn publish_until_waits_for_connection() {
         .wait(WAIT, |e| matches!(e, Ev::State(LinkState::Waiting { .. })))
         .is_some());
     let next = ring.next(|_| {});
-    c.set_chain(ring.chain.clone(), None);
+    c.set_chain(ring.chain.clone());
     assert!(c.connection().is_none());
     assert!(
         matches!(c.publish(&next), Err(RingError::Closed(_))),
@@ -624,9 +516,9 @@ fn publish_until_waits_for_the_versions_before_it() {
     // The worker's upload of v3 goes unanswered: the client stays at v2.
     r.ignore_roster_puts(true);
     ring.next(|_| {});
-    c.set_chain(ring.chain.clone(), None);
+    c.set_chain(ring.chain.clone());
     let v4 = ring.next(|_| {});
-    c.set_chain(ring.chain.clone(), None);
+    c.set_chain(ring.chain.clone());
     // A version that skips one and is not in the trusted chain is refused at once.
     let alt3 = ring
         .up_to(2)
@@ -671,7 +563,7 @@ fn publish_until_accepts_exactly_a_version_the_relay_moved_past() {
     ring.next(|_| {});
     let (other, orec) = start(cfg(&r, &ring.up_to(2), ring.desktop2.clone()));
     assert!(orec.connected());
-    other.set_chain(ring.chain.clone(), None);
+    other.set_chain(ring.chain.clone());
     wait_until("v4 on the Relay", || {
         r.head_version(&ring.ring_id()) == Some(4)
     });
@@ -1289,91 +1181,816 @@ fn quota_close_backs_off_even_after_a_stable_connection() {
     c.stop(ByeReason::quit());
 }
 
-/// A move owed to a Relay that refuses this Ring for quota: those refusals are a move
-/// failure, never a quota report (the quota is the old Relay's).
-#[test]
-fn a_move_owed_to_a_relay_over_quota_reports_no_quota() {
-    let b = relay();
-    // The old Relay is ahead of the move's start and over quota: its connect is refused.
-    let (a, mut ring) = ahead_and_over_quota();
-    ring.next(|d| d.relay_url = b.url());
-    let job = MoveJob::new(&ring.chain, 2).unwrap();
-    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
-    cc.move_attempts = 2;
-    cc.pending_move = Some(job.clone());
-    let (desk, drec) = start(cc);
-    assert!(drec
-        .wait(WAIT, |e| matches!(e, Ev::Moved(MoveState::Failed { .. })))
-        .is_some());
-    match drec.wait(WAIT, is_waiting) {
-        Some(Ev::State(LinkState::Waiting { error, .. })) => {
-            assert!(error.contains("quota"), "{error}")
-        }
-        other => panic!("{other:?}"),
+// ---- Farewells (xshell#51, ADR-0012) -----------------------------------------------------
+
+/// A Desktop's Connector on `chain`, its farewells retried quickly.
+fn desk_cfg(r: &TestRelay, ring: &TestRing, chain: &RosterChain) -> ConnectorConfig {
+    let mut c = cfg(r, chain, ring.desktop.clone());
+    c.farewell_backoff_unit = Duration::from_millis(50);
+    c.farewell_backoff_max = Duration::from_millis(400);
+    c
+}
+
+/// A Relay behind a gate: the Ring names the gate, and the Relay knows itself by its origin.
+fn gated(r: &TestRelay) -> GateProxy {
+    let g = GateProxy::start(r.addr());
+    r.set_origin(&g.url());
+    g
+}
+
+fn is_done(e: &Ev, source: &str) -> bool {
+    matches!(e, Ev::Farewell(FarewellState::Done { farewell }) if farewell.source == source)
+}
+
+/// Waits for a `Waiting` report of the farewell to `source` after at least `failures`.
+fn waiting(rec: &Rec, source: &str, failures: u32) -> FarewellState {
+    match rec.wait(Duration::from_secs(15), |e| {
+        matches!(e, Ev::Farewell(FarewellState::Waiting { farewell, failures: n, .. })
+            if farewell.source == source && *n >= failures)
+    }) {
+        Some(Ev::Farewell(s)) => s,
+        other => panic!(
+            "no farewell waiting for {source}: {other:?} {:?}",
+            rec.all()
+        ),
     }
-    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
-    assert!(!online(&b, &ring, &ring.desktop.sign_key()));
+}
+
+fn held(rec: &Rec, relay: &str, version: u64) -> bool {
+    rec.wait(
+        WAIT,
+        |e| matches!(e, Ev::Held(r, v) if r == relay && *v == version),
+    )
+    .is_some()
+}
+
+fn link_states(rec: &Rec) -> Vec<LinkState> {
+    rec.all()
+        .into_iter()
+        .filter_map(|e| match e {
+            Ev::State(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_farewell_is_owed_only_while_the_head_names_another_relay() {
+    let (a, b) = ("ws://127.0.0.1:1", "ws://127.0.0.1:2");
+    let mut ring = TestRing::new(a);
+    let here = Farewell::new(&ring.chain, 2).unwrap();
+    assert!(
+        !here.still_owed(&ring.chain),
+        "the head names the same Relay"
+    );
+    ring.next(|d| d.relay_url = b.into());
+    let f = Farewell::new(&ring.chain, 2).unwrap();
+    assert_eq!(
+        f,
+        Farewell {
+            source: a.into(),
+            from: 2,
+            target: 3
+        }
+    );
+    assert!(f.still_owed(&ring.chain));
+    assert!(Farewell::new(&ring.chain, 4).is_none());
+    let other = Farewell {
+        source: "ws://127.0.0.1:3".into(),
+        ..f.clone()
+    };
+    assert!(
+        !other.still_owed(&ring.chain),
+        "version 2 names another Relay"
+    );
+    let backwards = Farewell {
+        target: 2,
+        ..f.clone()
+    };
+    assert!(!backwards.still_owed(&ring.chain));
+    ring.next(|d| d.relay_url = a.into());
+    assert!(!f.still_owed(&ring.chain), "the head names it again");
+}
+
+#[test]
+fn held_is_reported_for_the_dialed_relay_on_connect() {
+    let (a, b) = (relay(), relay());
+    let mut ring = TestRing::new(&a.url());
+    let (desk, rec) = start(desk_cfg(&a, &ring, &ring.chain));
+    assert!(held(&rec, &a.url(), 2));
+    ring.next(|d| d.relay_url = b.url());
+    desk.set_chain(ring.chain.clone());
+    assert!(held(&rec, &b.url(), 3));
     desk.stop(ByeReason::quit());
 }
 
-/// The same when the old Relay lets the Desktop in but refuses the versions it publishes
-/// there for quota.
+/// Only a Relay that holds a Ring counts its traffic: a refusal or a close for quota says
+/// the Relay holds it, like a connection (D3, A4).
 #[test]
-fn a_move_whose_publication_is_refused_for_quota_reports_no_quota() {
+fn quota_refusals_report_the_relay_held() {
+    let (r, ring) = ahead_and_over_quota();
+    let (c, rec) = start(cfg(&r, &ring.up_to(2), ring.daemon.clone()));
+    assert!(held(&rec, &r.url(), 2), "{:?}", rec.all());
+    assert!(!rec
+        .all()
+        .iter()
+        .any(|e| matches!(e, Ev::State(LinkState::Connected { .. }))));
+    c.stop(ByeReason::quit());
+
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.daemon.clone()));
+    assert!(rec.connected());
+    rec.clear();
+    assert!(r.kick(&ring.ring_id(), &ring.daemon.sign_key(), close::QUOTA));
+    assert!(rec.wait(WAIT, is_waiting).is_some());
+    let all = rec.all();
+    assert!(
+        all.iter()
+            .any(|e| matches!(e, Ev::Held(relay, 2) if *relay == r.url())),
+        "{all:?}"
+    );
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn a_farewell_tells_the_old_relay_and_its_devices_follow() {
+    let (a, b) = (relay(), relay());
+    let mut ring = TestRing::new(&a.url());
+    let (desk, drec) = start(desk_cfg(&a, &ring, &ring.chain));
+    let (dmn, mrec) = start(cfg(&a, &ring.chain, ring.daemon.clone()));
+    assert!(drec.connected() && mrec.connected());
+    ring.next(|d| d.relay_url = b.url());
+    let f = Farewell::new(&ring.chain, 2).unwrap();
+    assert_eq!(f.source, a.url());
+    desk.set_chain(ring.chain.clone());
+    desk.set_farewells(vec![f.clone()]);
+    assert!(drec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Farewell(FarewellState::Done { farewell }) if *farewell == f
+        ))
+        .is_some());
+    assert_eq!(
+        a.head_version(&ring.ring_id()),
+        Some(3),
+        "the old Relay knows"
+    );
+    assert!(held(&drec, &a.url(), 3));
+    wait_until("both on the new Relay", || {
+        online(&b, &ring, &ring.desktop.sign_key()) && online(&b, &ring, &ring.daemon.sign_key())
+    });
+    assert!(desk.farewells().is_empty());
+    desk.stop(ByeReason::quit());
+    dmn.stop(ByeReason::quit());
+}
+
+#[test]
+fn the_link_follows_the_head_while_the_old_relay_refuses_the_farewell() {
+    let (a, b) = (relay(), relay());
+    let ga = gated(&a);
+    let mut ring = TestRing::new(&ga.url());
+    let key = ring.desktop.sign_key();
+    // The old Relay holds the Ring, then goes away.
+    let (d, _) = connect(&a.target(), &ring.chain, ring.daemon.clone());
+    drop(d);
+    ga.set_open(false);
+    ring.next(|d| d.relay_url = b.url());
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    // Owed from the start (as after a restart with it on disk).
+    cc.farewells = vec![Farewell::new(&ring.chain, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    assert!(rec.connected());
+    wait_until("on the new Relay", || online(&b, &ring, &key));
+    waiting(&rec, &ga.url(), 2);
+    assert_eq!(a.head_version(&ring.ring_id()), Some(2));
+    assert!(matches!(
+        desk.farewells().as_slice(),
+        [FarewellState::Waiting { .. } | FarewellState::Sending { .. }]
+    ));
+    // The old Relay comes back: the farewell goes out, the link never moved.
+    ga.set_open(true);
+    assert!(rec.wait(WAIT, |e| is_done(e, &ga.url())).is_some());
+    assert_eq!(a.head_version(&ring.ring_id()), Some(3));
+    assert!(
+        !link_states(&rec)
+            .iter()
+            .any(|s| matches!(s, LinkState::Waiting { .. })),
+        "{:?}",
+        rec.all()
+    );
+    desk.stop(ByeReason::quit());
+}
+
+#[test]
+fn a_dead_old_relay_never_delays_the_link() {
+    let b = relay();
+    let (closed, invalid) = ("ws://127.0.0.1:1", "wss://relay.xshell.invalid");
+    let mut ring = TestRing::new(closed);
+    ring.next(|d| d.relay_url = invalid.into());
+    ring.next(|d| d.relay_url = b.url());
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewell_backoff_unit = Duration::from_millis(10);
+    cc.farewell_backoff_max = Duration::from_millis(200);
+    cc.farewells = vec![
+        Farewell::new(&ring.chain, 2).unwrap(),
+        Farewell::new(&ring.chain, 3).unwrap(),
+    ];
+    let (desk, rec) = start(cc);
+    assert!(
+        rec.wait(Duration::from_secs(2), |e| matches!(
+            e,
+            Ev::State(LinkState::Connected { .. })
+        ))
+        .is_some(),
+        "connected at once: {:?}",
+        rec.all()
+    );
+    wait_until("on the new Relay", || {
+        online(&b, &ring, &ring.desktop.sign_key())
+    });
+    waiting(&rec, closed, 2);
+    waiting(&rec, invalid, 2);
+    // Every link state is about the head's Relay: one attempt, connected.
+    assert_eq!(
+        link_states(&rec),
+        [
+            LinkState::Connecting { attempt: 0 },
+            LinkState::Connected { limited: false }
+        ]
+    );
+    desk.stop(ByeReason::quit());
+}
+
+/// A → B → C while A is unreachable: once A is back, its farewell brings it straight to C,
+/// so a device that only knew A never visits B.
+#[test]
+fn a_farewell_carries_the_newest_head() {
+    let (a, b, c) = (relay(), relay(), relay());
+    let ga = gated(&a);
+    let mut ring = TestRing::new(&ga.url());
+    let (desk, rec) = start(desk_cfg(&a, &ring, &ring.chain));
+    assert!(rec.connected());
+    assert!(held(&rec, &ga.url(), 2));
+    ga.set_open(false);
+    ring.next(|d| d.relay_url = b.url());
+    desk.set_chain(ring.chain.clone());
+    desk.set_farewells(vec![Farewell::new(&ring.chain, 2).unwrap()]);
+    waiting(&rec, &ga.url(), 1);
+    assert!(held(&rec, &b.url(), 3));
+    ring.next(|d| d.relay_url = c.url());
+    desk.set_chain(ring.chain.clone());
+    desk.set_farewells(vec![
+        Farewell::new(&ring.chain, 2).unwrap(),
+        Farewell::new(&ring.chain, 3).unwrap(),
+    ]);
+    assert!(rec.wait(WAIT, |e| is_done(e, &b.url())).is_some());
+    assert_eq!(b.head_version(&ring.ring_id()), Some(4));
+    ga.set_open(true);
+    assert!(rec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Farewell(FarewellState::Done { farewell })
+                if farewell.source == ga.url() && farewell.target == 4
+        ))
+        .is_some());
+    assert_eq!(a.head_version(&ring.ring_id()), Some(4), "in one step");
+    let (dmn, mrec) = start(cfg(&a, &ring.up_to(2), ring.daemon.clone()));
+    wait_until("the Daemon on C", || {
+        online(&c, &ring, &ring.daemon.sign_key())
+    });
+    assert!(mrec.wait(WAIT, |e| matches!(e, Ev::Chain(4))).is_some());
+    let on_b = b
+        .presence(&ring.ring_id(), &ring.daemon.sign_key())
+        .unwrap();
+    assert!(
+        !on_b.online && on_b.last_seen.is_none(),
+        "never on B: {on_b:?}"
+    );
+    dmn.stop(ByeReason::quit());
+    desk.stop(ByeReason::quit());
+}
+
+/// [`Rec`] that also hands every chain it hears back to the Connector, as the Desktop and the
+/// Daemon do when they persist it.
+struct Echo {
+    rec: Arc<Rec>,
+    c: Mutex<Option<Arc<Connector>>>,
+}
+
+impl ConnectorEvents for Echo {
+    fn state(&self, s: &LinkState) {
+        self.rec.state(s);
+    }
+    fn roster(&self, chain: &RosterChain) {
+        self.rec.roster(chain);
+        let c = self.c.lock().unwrap().clone();
+        if let Some(c) = c {
+            c.set_chain(chain.clone());
+        }
+    }
+}
+
+/// What the versions after v3 (which names B) do in [`split_move`].
+#[derive(Clone, Copy, PartialEq)]
+enum Then {
+    /// v4 names C.
+    ToC,
+    /// v4 keeps B and removes the phone.
+    KeepB,
+    /// v4 names A again, v5 names C.
+    BackToAThenC,
+}
+
+/// What the Daemon's background connections to A meet in [`split_move`].
+#[derive(Clone, Copy, PartialEq)]
+enum Fetches {
+    Open,
+    /// Held at their `auth` until A's gate is released.
+    Held,
+    /// Closed at once: A is gone for them.
+    Refused,
+}
+
+/// A Daemon connected to A, and a Desktop that tells A of B and `then` in one step (its
+/// whole chain staged at `auth`, as a farewell does), while A broadcasts only the first new
+/// version (the test Relay's `split_commits`): the Daemon gets the rest only by asking.
+/// `fault` is what its first `roster.get` there gets; B's gate is open or not as `b_open`;
+/// `fetches` gates every later connection to A; with `echo` the Daemon's events hand each
+/// chain back to its Connector.
+struct SplitMove {
+    a: TestRelay,
+    ga: GateProxy,
+    b: TestRelay,
+    gb: GateProxy,
+    c: TestRelay,
+    ring: TestRing,
+    dmn: Arc<Connector>,
+    mrec: Arc<Rec>,
+    _desk: RingClient,
+    /// Connections through A's gate up to the Desktop's: later ones are the Daemon's.
+    n: usize,
+}
+
+fn split_move(
+    fault: Option<GetFault>,
+    b_open: bool,
+    echo: bool,
+    then: Then,
+    fetches: Fetches,
+) -> SplitMove {
+    let (a, b, c) = (relay(), relay(), relay());
+    let (ga, gb) = (gated(&a), gated(&b));
+    gb.set_open(b_open);
+    let mut ring = TestRing::new(&ga.url());
+    let mrec = Rec::new();
+    let events = Arc::new(Echo {
+        rec: mrec.clone(),
+        c: Mutex::new(None),
+    });
+    let mut dc = cfg(&a, &ring.chain, ring.daemon.clone());
+    dc.farewell_backoff_unit = Duration::from_millis(50);
+    dc.farewell_backoff_max = Duration::from_millis(400);
+    let dmn = Arc::new(Connector::start(dc, events.clone()).unwrap());
+    if echo {
+        *events.c.lock().unwrap() = Some(dmn.clone());
+    }
+    assert!(mrec.connected());
+    a.split_commits(true);
+    if let Some(f) = fault {
+        a.fail_next_roster_get(f);
+    }
+    let gets = a.roster_gets();
+    ring.next(|d| d.relay_url = gb.url());
+    match then {
+        Then::ToC => {
+            ring.next(|d| d.relay_url = c.url());
+        }
+        Then::KeepB => {
+            let phone = ring.mobile.sign_key();
+            ring.next(|d| {
+                d.remove(&phone);
+            });
+        }
+        Then::BackToAThenC => {
+            ring.next(|d| d.relay_url = ga.url());
+            ring.next(|d| d.relay_url = c.url());
+        }
+    }
+    // The Desktop's connection is the next one through A's gate; the Daemon's background
+    // ones come after it.
+    let n = ga.connections() + 1;
+    match fetches {
+        Fetches::Open => {}
+        Fetches::Held => ga.hold_after(n),
+        Fetches::Refused => ga.refuse_after(n),
+    }
+    let mut dcfg = config(&a.target(), &ring.chain, ring.desktop.clone());
+    dcfg.dial = Some(ga.url());
+    let desk = RingClient::connect(dcfg, Recorder::new()).expect("the Desktop tells A");
+    assert_eq!(
+        a.head_version(&ring.ring_id()),
+        Some(ring.chain.head().version())
+    );
+    assert!(mrec.wait(WAIT, |e| matches!(e, Ev::Chain(3))).is_some());
+    wait_until("the Daemon's catch-up request", || a.roster_gets() > gets);
+    SplitMove {
+        a,
+        ga,
+        b,
+        gb,
+        c,
+        ring,
+        dmn,
+        mrec,
+        _desk: desk,
+        n,
+    }
+}
+
+fn wait_long(what: &str, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A1: the old Relay commits A → B → C in one step but the Daemon hears only B; it fetches
+/// the rest before it follows, so it goes to C and never dials B.
+#[test]
+fn a_device_on_the_old_relay_never_dials_an_intermediate_relay() {
+    let m = split_move(None, false, false, Then::ToC, Fetches::Open);
+    let key = m.ring.daemon.sign_key();
+    wait_until("the Daemon on C", || online(&m.c, &m.ring, &key));
+    assert!(m.mrec.wait(WAIT, |e| matches!(e, Ev::Chain(4))).is_some());
+    assert_eq!(m.gb.connections(), 0, "never dialed the intermediate Relay");
+    m.dmn.stop(ByeReason::quit());
+}
+
+/// The catch-up after B fails (here the connection drops) and B is reachable: the Daemon
+/// follows B, and the fetch job (held until the Daemon is on B) asks A again, which brings
+/// C. With and without a persisting owner that hands every chain back (`set_chain` of the
+/// chain held changes nothing).
+#[test]
+fn an_unfinished_catch_up_reaches_the_newest_relay_through_a_reachable_one() {
+    for echo in [false, true] {
+        let m = split_move(Some(GetFault::Close), true, echo, Then::ToC, Fetches::Held);
+        let key = m.ring.daemon.sign_key();
+        wait_long(&format!("the Daemon on B (echo {echo})"), || {
+            online(&m.b, &m.ring, &key)
+        });
+        assert_eq!(m.dmn.chain().head().version(), 3);
+        m.ga.release();
+        wait_long(&format!("the Daemon on C (echo {echo})"), || {
+            online(&m.c, &m.ring, &key)
+        });
+        assert_eq!(m.dmn.chain().head().version(), 4);
+        m.dmn.stop(ByeReason::quit());
+    }
+}
+
+/// The same with B dead, whatever ended the catch-up (the connection dropped, the request
+/// was refused or never answered): the Daemon ends on C.
+#[test]
+fn an_unfinished_catch_up_past_a_dead_relay_reaches_the_newest_one() {
+    for fault in [GetFault::Close, GetFault::Refuse, GetFault::Ignore] {
+        let m = split_move(Some(fault), false, false, Then::ToC, Fetches::Open);
+        let key = m.ring.daemon.sign_key();
+        wait_long(&format!("the Daemon on C after {fault:?}"), || {
+            online(&m.c, &m.ring, &key)
+        });
+        assert_eq!(m.dmn.chain().head().version(), 4, "{fault:?}");
+        assert!(
+            !link_states(&m.mrec)
+                .iter()
+                .any(|s| matches!(s, LinkState::Stopped { .. })),
+            "{fault:?}"
+        );
+        m.dmn.stop(ByeReason::quit());
+    }
+}
+
+/// A gone for good (for every connection after the Desktop's) and B alive: the Daemon stays
+/// on B while the fetch job keeps asking A, without disturbing the link.
+#[test]
+fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
+    let m = split_move(
+        Some(GetFault::Close),
+        true,
+        false,
+        Then::ToC,
+        Fetches::Refused,
+    );
+    let key = m.ring.daemon.sign_key();
+    wait_long("the Daemon on B", || {
+        online(&m.b, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
+    let tries = m.ga.connections();
+    m.mrec.clear();
+    wait_long("the fetch job retried", || m.ga.connections() >= tries + 2);
+    assert!(online(&m.b, &m.ring, &key), "stays on B");
+    assert_eq!(m.dmn.chain().head().version(), 3);
+    assert_eq!(m.dmn.state(), LinkState::Connected { limited: false });
+    assert!(link_states(&m.mrec).is_empty(), "{:?}", m.mrec.all());
+    m.dmn.stop(ByeReason::quit());
+}
+
+/// An owner that hands back an older prefix of the chain held (its persisted report of v2,
+/// arriving after a fetch brought v4) changes nothing: no rewind, no redial.
+#[test]
+fn an_older_prefix_from_the_owner_is_an_echo() {
+    let m = split_move(Some(GetFault::Close), true, false, Then::ToC, Fetches::Open);
+    let key = m.ring.daemon.sign_key();
+    wait_long("the Daemon on C", || online(&m.c, &m.ring, &key));
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    m.mrec.clear();
+    m.dmn.set_chain(m.ring.up_to(2));
+    m.dmn.set_chain(m.ring.up_to(4));
+    std::thread::sleep(QUIET);
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(link_states(&m.mrec).is_empty(), "{:?}", m.mrec.all());
+    assert!(online(&m.c, &m.ring, &key));
+    m.dmn.stop(ByeReason::quit());
+}
+
+/// A version the fetch job brings that keeps the Relay (here a removal) reaches that Relay
+/// through the main connection, which stays up.
+#[test]
+fn a_fetched_version_for_the_same_relay_is_published_there() {
+    let m = split_move(
+        Some(GetFault::Close),
+        true,
+        false,
+        Then::KeepB,
+        Fetches::Held,
+    );
+    let key = m.ring.daemon.sign_key();
+    wait_long("the Daemon on B", || {
+        online(&m.b, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
+    assert_eq!(m.b.head_version(&m.ring.ring_id()), Some(3));
+    m.mrec.clear();
+    m.ga.release();
+    wait_until("v4 on B", || m.b.head_version(&m.ring.ring_id()) == Some(4));
+    std::thread::sleep(QUIET);
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(
+        link_states(&m.mrec).is_empty(),
+        "no reconnect: {:?}",
+        m.mrec.all()
+    );
+    assert!(online(&m.b, &m.ring, &key));
+    m.dmn.stop(ByeReason::quit());
+}
+
+/// A fetch in flight whose job the owner removes (a newer chain whose head names the fetch's
+/// Relay again) counts for nothing when its answer comes after all, though it would extend
+/// that chain.
+#[test]
+fn a_cancelled_fetch_in_flight_changes_nothing() {
+    let m = split_move(
+        Some(GetFault::Close),
+        false,
+        false,
+        Then::BackToAThenC,
+        Fetches::Held,
+    );
+    let key = m.ring.daemon.sign_key();
+    wait_long("the fetch held", || m.ga.connections() > m.n);
+    // A refuses everything new, so only the held fetch could bring v5.
+    m.ga.refuse_new(true);
+    m.dmn.set_chain(m.ring.up_to(4));
+    m.ga.release();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(m.a.head_version(&m.ring.ring_id()), Some(5));
+    assert_eq!(m.dmn.chain().head().version(), 4);
+    assert!(!online(&m.c, &m.ring, &key));
+    m.dmn.stop(ByeReason::quit());
+}
+
+#[test]
+fn a_farewell_to_the_relay_the_head_names_again_is_dropped() {
+    let (a, b) = (relay(), relay());
+    let ga = gated(&a);
+    ga.set_open(false);
+    let mut ring = TestRing::new(&ga.url());
+    let key = ring.desktop.sign_key();
+    ring.next(|d| d.relay_url = b.url());
+    let f = Farewell::new(&ring.chain, 2).unwrap();
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewell_backoff_unit = Duration::from_secs(30);
+    cc.farewells = vec![f.clone()];
+    let (desk, rec) = start(cc);
+    assert!(rec.connected());
+    waiting(&rec, &ga.url(), 1);
+    // Back to A.
+    ring.next(|d| d.relay_url = ga.url());
+    ga.set_open(true);
+    desk.set_chain(ring.chain.clone());
+    assert!(desk.farewells().is_empty());
+    desk.set_farewells(vec![f.clone()]);
+    assert!(desk.farewells().is_empty(), "not owed");
+    wait_until("back on A", || online(&a, &ring, &key));
+    assert_eq!(a.head_version(&ring.ring_id()), Some(4));
+    std::thread::sleep(QUIET);
+    assert!(!rec.all().iter().any(|e| is_done(e, &ga.url())));
+    desk.stop(ByeReason::quit());
+
+    // One kept on disk that the chain no longer owes is dropped at the start.
+    let mut cc = desk_cfg(&a, &ring, &ring.chain);
+    cc.farewells = vec![f];
+    let (desk, _) = start(cc);
+    assert!(desk.farewells().is_empty());
+    desk.stop(ByeReason::quit());
+}
+
+/// A3: A → B → A while the farewell to A is in flight (held at its `auth`): it is cut, and
+/// when its `auth` still reaches A the main link there survives it (a `replaced` blip at
+/// most).
+#[test]
+fn an_obsolete_farewell_in_flight_is_cut() {
+    let (a, b) = (slow_relay(), relay());
+    let ga = gated(&a);
+    let mut ring = TestRing::new(&ga.url());
+    let key = ring.desktop.sign_key();
+    ring.next(|d| d.relay_url = b.url());
+    ga.hold_next();
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewells = vec![Farewell::new(&ring.chain, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    assert!(rec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Farewell(FarewellState::Sending { .. })
+        ))
+        .is_some());
+    wait_until("the farewell held", || ga.connections() == 1);
+    ring.next(|d| d.relay_url = ga.url());
+    desk.set_chain(ring.chain.clone());
+    assert!(desk.farewells().is_empty());
+    wait_until("the link on A", || online(&a, &ring, &key));
+    ga.release();
+    std::thread::sleep(Duration::from_millis(500));
+    wait_until("connected on A", || {
+        desk.state() == LinkState::Connected { limited: false } && online(&a, &ring, &key)
+    });
+    std::thread::sleep(QUIET);
+    assert_eq!(desk.state(), LinkState::Connected { limited: false });
+    assert!(online(&a, &ring, &key));
+    assert!(!rec
+        .all()
+        .iter()
+        .any(|e| matches!(e, Ev::Farewell(FarewellState::Done { .. }))));
+    desk.stop(ByeReason::quit());
+}
+
+#[test]
+fn farewells_are_reported_per_relay() {
+    let (a1, a2, b) = (relay(), relay(), relay());
+    let (g1, g2) = (gated(&a1), gated(&a2));
+    g1.set_open(false);
+    g2.set_open(false);
+    let mut ring = TestRing::new(&g1.url());
+    ring.next(|d| d.relay_url = g2.url());
+    ring.next(|d| d.relay_url = b.url());
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewells = vec![
+        Farewell::new(&ring.chain, 3).unwrap(),
+        Farewell::new(&ring.chain, 2).unwrap(),
+    ];
+    let (desk, rec) = start(cc);
+    waiting(&rec, &g1.url(), 1);
+    waiting(&rec, &g2.url(), 1);
+    let sources = |c: &Connector| -> Vec<String> {
+        c.farewells()
+            .into_iter()
+            .map(|s| match s {
+                FarewellState::Sending { farewell }
+                | FarewellState::Waiting { farewell, .. }
+                | FarewellState::Done { farewell } => farewell.source,
+            })
+            .collect()
+    };
+    let mut both = vec![g1.url(), g2.url()];
+    both.sort();
+    assert_eq!(sources(&desk), both);
+    g2.set_open(true);
+    assert!(rec.wait(WAIT, |e| is_done(e, &g2.url())).is_some());
+    assert_eq!(sources(&desk), [g1.url()]);
+    assert!(!rec.all().iter().any(|e| is_done(e, &g1.url())));
+    desk.stop(ByeReason::quit());
+}
+
+#[test]
+fn stop_during_a_farewell_says_goodbye_on_the_old_relay() {
+    let (a, b) = (slow_relay(), relay());
+    // The old Relay answers slowly, so the stop arrives while the farewell is in flight.
+    let proxy = TrickleProxy::start(a.addr(), 8, Duration::from_millis(15));
+    let old = format!("ws://127.0.0.1:{}", proxy.addr().port());
+    a.set_origin(&old);
+    let mut ring = TestRing::new(&old);
+    let key = ring.desktop.sign_key();
+    ring.next(|d| d.relay_url = b.url());
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewells = vec![Farewell::new(&ring.chain, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    assert!(rec
+        .wait(WAIT, |e| matches!(
+            e,
+            Ev::Farewell(FarewellState::Sending { .. })
+        ))
+        .is_some());
+    std::thread::sleep(Duration::from_millis(100));
+    desk.stop(ByeReason::quit());
+    assert_eq!(a.head_version(&ring.ring_id()), Some(3));
+    let p = a.presence(&ring.ring_id(), &key).unwrap();
+    assert!(!p.online);
+    assert_eq!(
+        p.last_reason.as_deref(),
+        Some("quit"),
+        "said goodbye: {p:?}"
+    );
+}
+
+/// A farewell to a Relay that refuses this Ring for quota: a failure of the farewell, never
+/// a quota report (the quota is the old Relay's), but it says the Relay holds the Ring.
+#[test]
+fn a_farewell_to_a_relay_over_quota_reports_no_quota() {
+    let (a, b) = (quota_relay(8), relay());
+    let mut ring = TestRing::new(&a.url());
+    // The old Relay is ahead of this Desktop's chain (another Desktop published there), so
+    // the farewell's connect asks it for the rest, which the quota refuses.
+    let (d2, _) = connect(&a.target(), &ring.chain, ring.desktop2.clone());
+    let v3 = ring.next(|d| d.relay_url = b.url());
+    let v4 = ring.next(|_| {});
+    d2.publish_roster(&v3).unwrap();
+    d2.publish_roster(&v4).unwrap();
+    use_up_quota(&a, &ring);
+    let mine = ring.up_to(3);
+    let mut cc = desk_cfg(&b, &ring, &mine);
+    cc.farewells = vec![Farewell::new(&mine, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    match waiting(&rec, &a.url(), 1) {
+        FarewellState::Waiting { error, .. } => assert!(error.contains("quota"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(held(&rec, &a.url(), 2));
+    assert!(rec.connected());
+    assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
+    desk.stop(ByeReason::quit());
+}
+
+/// Frames before `auth` cost no quota: a farewell staged at `auth` reaches an old Relay over
+/// its quota, and nothing about the quota is reported.
+#[test]
+fn a_farewell_reaches_an_old_relay_over_its_quota() {
     let (a, b) = (quota_relay(8), relay());
     let mut ring = TestRing::new(&a.url());
     use_up_quota(&a, &ring);
     ring.next(|d| d.relay_url = b.url());
-    let job = MoveJob::new(&ring.chain, 2).unwrap();
-    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
-    cc.move_attempts = 2;
-    cc.pending_move = Some(job);
-    let (desk, drec) = start(cc);
-    assert!(drec
-        .wait(WAIT, |e| matches!(
-            e,
-            Ev::Moved(MoveState::Failed { error, .. }) if error.contains("quota")
-        ))
-        .is_some());
-    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
-    assert!(!drec.all().iter().any(|e| matches!(e, Ev::Accepted)));
+    let mut cc = desk_cfg(&b, &ring, &ring.chain);
+    cc.farewells = vec![Farewell::new(&ring.chain, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    assert!(rec.wait(WAIT, |e| is_done(e, &a.url())).is_some());
+    assert_eq!(a.head_version(&ring.ring_id()), Some(3));
+    assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
     desk.stop(ByeReason::quit());
 }
 
-/// A close for quota while a move is owed backs off, and a kick still ends that wait.
+/// A close for quota during a farewell is a failure that backs off.
 #[test]
-fn a_quota_close_during_a_move_backs_off_until_kicked() {
+fn a_quota_close_during_a_farewell_backs_off() {
     let (a, b) = (relay(), relay());
     let mut ring = TestRing::new(&a.url());
     let key = ring.desktop.sign_key();
-    a.refuse_roster_puts(true);
-    ring.next(|d| d.relay_url = b.url());
-    let job = MoveJob::new(&ring.chain, 2).unwrap();
-    let mut cc = cfg(&a, &ring.chain, ring.desktop.clone());
-    // Waits long enough that only a kick ends them within the test.
-    cc.backoff_unit = Duration::from_secs(30);
-    cc.pending_move = Some(job);
-    let (desk, drec) = start(cc);
-    assert!(drec
-        .wait(WAIT, |e| matches!(
-            e,
-            Ev::Moved(MoveState::Moving { error: Some(_), .. })
-        ))
-        .is_some());
-    wait_until("on the old Relay", || online(&a, &ring, &key));
-    drec.clear();
+    let (d2, _) = connect(&a.target(), &ring.chain, ring.desktop2.clone());
+    let v3 = ring.next(|d| d.relay_url = b.url());
+    let v4 = ring.next(|_| {});
+    d2.publish_roster(&v3).unwrap();
+    d2.publish_roster(&v4).unwrap();
+    // The farewell's connect waits for the rest of the chain, which never comes.
+    a.ignore_roster_gets(true);
+    let mine = ring.up_to(3);
+    let mut cc = desk_cfg(&b, &ring, &mine);
+    cc.farewell_backoff_unit = Duration::from_secs(30);
+    cc.farewell_backoff_max = Duration::from_secs(60);
+    cc.farewells = vec![Farewell::new(&mine, 2).unwrap()];
+    let (desk, rec) = start(cc);
+    wait_until("the farewell on A", || online(&a, &ring, &key));
     assert!(a.kick(&ring.ring_id(), &key, close::QUOTA));
-    match drec.wait(WAIT, is_waiting) {
-        Some(Ev::State(LinkState::Waiting { retry_in, .. })) => {
-            assert_eq!(retry_in, Duration::from_secs(30))
+    match waiting(&rec, &a.url(), 1) {
+        FarewellState::Waiting {
+            failures, retry_in, ..
+        } => {
+            assert_eq!(failures, 1);
+            assert_eq!(retry_in, Duration::from_secs(30));
         }
-        other => panic!("{other:?}: {:?}", drec.all()),
+        other => panic!("{other:?}"),
     }
+    assert!(held(&rec, &a.url(), 2));
     std::thread::sleep(QUIET);
     assert!(!online(&a, &ring, &key), "no redial during the wait");
-    assert!(quota_errors(&drec).is_empty(), "{:?}", drec.all());
-    desk.kick();
-    assert!(drec.connected(), "the kick ends the wait");
-    wait_until("back on the old Relay", || online(&a, &ring, &key));
+    assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
     desk.stop(ByeReason::quit());
 }
