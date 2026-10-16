@@ -21,7 +21,7 @@ export const S = {
   "hosts.form.advanced": "Advanced",
   "hosts.form.daemonCommand.label": "Daemon command",
   "hosts.form.daemonCommand.placeholder": "e.g. xshelld",
-  "hosts.form.daemonCommand.help": "Optional command to run an existing daemon on the host. xshell appends connect and skips automatic installation and upgrades. Leave blank for managed setup.",
+  "hosts.form.daemonCommand.help": "Optional command for an existing daemon. xshell appends connect and skips automatic installation. A valid selected build on this host takes precedence. Upgrade now and Replace with Desktop’s build install and select this Desktop’s xshelld; shell access is required. Leave blank for managed setup.",
   "hosts.form.launchPrefix.label": "Launch prefixes",
   "hosts.form.launchPrefix.placeholder": "none",
   "hosts.form.launchPrefix.help": "Optional command each agent starts under on this host, such as a wrapper that routes it through a proxy. xshell appends the agent and its arguments. Applies to agents started after you save; shells are not affected.",

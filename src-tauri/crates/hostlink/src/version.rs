@@ -43,8 +43,8 @@ pub fn same_build(daemon: Option<&BuildId>, ours: &BuildId) -> bool {
     daemon.is_some_and(|d| d.same(ours))
 }
 
-/// `managed == false` (a daemon command override) never reports an upgrade as pending or a
-/// build as different: the Desktop does not install or upgrade such a Daemon.
+/// `managed == false` (a direct Daemon this Desktop may not upgrade) never reports an
+/// upgrade as pending or a build as different.
 ///
 /// Versions are ordered by semver precedence (build metadata ignored). An older Daemon is
 /// upgrade pending. At equal precedence a Daemon whose build is not `ours_build` differs;
@@ -239,7 +239,7 @@ mod tests {
         assert_eq!(c("1.5.0", Some(b(B, None)), true), (false, true));
         assert_eq!(c("1.5.0", Some(b(A, Some(B))), true), (false, true));
         assert_eq!(c("1.5.0", None, true), (false, true));
-        // A Daemon command override is never offered a replacement.
+        // A Daemon this Desktop may not upgrade (direct, not upgradable): never offered one.
         assert_eq!(c("1.5.0", None, false), (false, false));
         // Older stays upgrade pending only; newer is neither.
         assert_eq!(c("1.4.0", Some(b(B, None)), true), (true, false));

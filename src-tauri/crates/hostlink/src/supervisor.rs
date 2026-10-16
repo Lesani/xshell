@@ -6,7 +6,7 @@ use crate::dial::{CommandDialer, Connection, DialError, Dialer};
 use crate::errors::HostError;
 use crate::errors::HostErrorHint;
 use crate::handle::Shared;
-use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name};
+use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name, selected_remote};
 use crate::link::{Link, LinkError};
 use crate::process::run_script;
 use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind};
@@ -89,6 +89,14 @@ struct Sup {
     dialer: Box<dyn Dialer>,
     /// Installed over the transport (no Daemon command, not direct).
     managed: bool,
+    /// Reached over the transport (not direct): managed, or through a Daemon command. Both
+    /// are this Desktop's to upgrade or replace on request (#55); only a managed one is
+    /// installed automatically.
+    scripted: bool,
+    /// The Daemon command, if any. Such a Host connects through the Host's `selected` build
+    /// when there is one (#55: Upgrade now and Replace select this Desktop's build), else
+    /// through exactly `<command> connect`.
+    override_: Option<String>,
     backoff: Backoff,
     install_verified: bool,
     last_gen: u64,
@@ -99,7 +107,8 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let transport: Arc<dyn Transport> = sh.mc.transports.for_host(&cfg).into();
     let direct = sh.mc.transports.direct(&cfg);
     let override_ = cfg.daemon_override();
-    let managed = override_.is_none() && direct.is_none();
+    let scripted = direct.is_none();
+    let managed = override_.is_none() && scripted;
     let dialer = direct.unwrap_or_else(|| {
         Box::new(CommandDialer {
             transport: transport.clone(),
@@ -112,6 +121,8 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
         transport,
         dialer,
         managed,
+        scripted,
+        override_: override_.map(String::from),
         backoff: Backoff::default(),
         install_verified: false,
         last_gen: 0,
@@ -124,10 +135,11 @@ impl Sup {
         self.sh.mc.backoff_unit
     }
 
-    /// Whether this Desktop upgrades the Daemon: a managed one, or one its direct dialer
-    /// says it may (the Local Host's Persistent Daemon). Read live: that can change.
+    /// Whether this Desktop upgrades the Daemon: one reached over the transport (managed or
+    /// through a Daemon command), or one its direct dialer says it may (the Local Host's
+    /// Persistent Daemon). Read live: that can change.
     fn upgradable(&self) -> bool {
-        self.managed || self.dialer.upgradable()
+        self.scripted || self.dialer.upgradable()
     }
 
     fn set_phase(&self, p: Option<Phase>) {
@@ -177,8 +189,7 @@ impl Sup {
                     Parked::Closed(why) => self.ended(c, why),
                     Parked::UpgradeTimeout => {
                         // The old Daemon did not exit by itself: SIGTERM it, then reconnect.
-                        // Not on a Daemon-command host: it may allow no other ssh command.
-                        if self.managed {
+                        if self.scripted {
                             let _ = kill_daemon(&*self.transport, &self.cancel);
                         } else if self.dialer.upgradable() {
                             let _ = self.dialer.stop_incompatible(&self.cancel);
@@ -368,6 +379,21 @@ impl Sup {
                     self.sh.publish(&mut st);
                 }
             }
+        }
+        if let (Some(cmd), true) = (&self.override_, self.scripted) {
+            // Each attempt: the selected build may have changed since (an upgrade, another
+            // Desktop). A host that refuses the script keeps the plain command.
+            let dir = selected_remote(&*self.transport, cmd, &self.cancel);
+            if self.cancel.is_cancelled() {
+                return Attempt::Cancelled;
+            }
+            self.dialer = Box::new(CommandDialer {
+                transport: self.transport.clone(),
+                remote_cmd: match &dir {
+                    Some(d) => connect_command(None, d),
+                    None => connect_command(Some(cmd), ""),
+                },
+            });
         }
         self.set_phase(None);
         let dialed = match self.dialer.dial(&self.cancel) {

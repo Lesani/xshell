@@ -1163,15 +1163,6 @@ impl HostHandle {
         let stop = match plan {
             Plan::Refuse(e) => return once.call(Err(e)),
             Plan::Request(link) => Stop::Request(link),
-            Plan::Kill if cfg.daemon_override().is_some() => {
-                // A Daemon command means the user manages the binary, and such hosts often
-                // allow only `<cmd> connect` / `<cmd> --version` over ssh: send no script.
-                self.end_upgrade();
-                return once.call(Err(HostError::new(
-                    crate::errors::HostErrorCode::Incompatible,
-                    "this host runs xshelld through a Daemon command: replace that binary with a compatible xshelld and restart its Daemon on the host",
-                )));
-            }
             Plan::Kill => match &direct {
                 Some(d) if d.upgradable() => Stop::Direct,
                 Some(_) => {
@@ -1270,17 +1261,15 @@ enum Stop {
 }
 
 /// Install this Desktop's build where the Daemon runs, check it, and record it as the Host's
-/// `selected` build (#49, C1). A Daemon command override is the user's to manage: nothing.
-/// A direct dialer that cannot select (a GUI-bound Local Daemon) selects nothing either.
+/// `selected` build (#49, C1). A Daemon command Host too (#55): its connect command prefers
+/// the selected build. A direct dialer that cannot select (a GUI-bound Local Daemon)
+/// selects nothing.
 fn prepare_switch(
     sh: &Shared,
     cfg: &HostConfig,
     direct: Option<&dyn crate::dial::Dialer>,
     cancel: &CancelToken,
 ) -> Result<(), HostError> {
-    if cfg.daemon_override().is_some() {
-        return Ok(());
-    }
     let mc = &sh.mc;
     let dir = mc.install_dir();
     if let Some(d) = direct {

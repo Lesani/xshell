@@ -187,6 +187,74 @@ pub fn select_script(dir: &str) -> String {
     )
 }
 
+/// Marks the `selected` probe's output (#55): lines before it (a login banner) are noise.
+pub const SELECTED_MARKER: &str = "@@XSHELL-SELECTED@@";
+/// Marks the Daemon command's own `--version` in the `selected` probe's output.
+const OWN_MARKER: &str = "@@XSHELL-OWN@@";
+/// The `selected` probe runs before every connection of a Daemon command Host; a host that
+/// swallows it silently must not hold the connection up for long.
+const SELECTED_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `selected` probe of a Daemon command Host `cmd` (#55). After [`SELECTED_MARKER`]:
+/// `selected <dir>` when the Host's `selected` record names a valid install, checked as
+/// `xshell_core::server::resolve_selected` does (no symlinks; owned by this user and not
+/// group- or world-writable: the root, the record, the directory and the binary; an
+/// executable `xshelld`); then, only in that case, [`OWN_MARKER`] and `<cmd> --version`,
+/// so the Desktop can refuse a selection older than the command's own Daemon.
+pub fn selected_script(cmd: &str) -> String {
+    format!(
+        r#"r="$HOME/.xshell/server"; u=$(id -u); s=
+ok() {{ [ ! -L "$1" ] && [ -n "$(find "$1" -prune -user "$u" ! -perm -020 ! -perm -002 2>/dev/null)" ]; }}
+echo {SELECTED_MARKER}
+if [ -d "$r" ] && ok "$r" && [ -f "$r/selected" ] && ok "$r/selected"; then
+  # The whole record is one line, as `resolve_selected` wants it.
+  [ "$(wc -l < "$r/selected")" -le 1 ] && {{ IFS= read -r s < "$r/selected"; }} 2>/dev/null
+  case "$s" in ''|.*|*[!A-Za-z0-9.+-]*) s=;; esac
+  if [ -n "$s" ] && [ -d "$r/$s" ] && ok "$r/$s" && [ -f "$r/$s/xshelld" ] && ok "$r/$s/xshelld" && [ -x "$r/$s/xshelld" ]; then
+    printf 'selected %s\n' "$s"
+    echo {OWN_MARKER}
+    {cmd} --version 2>/dev/null </dev/null | head -c 4096
+  fi
+fi
+exit 0"#
+    )
+}
+
+/// The Host's `selected` build directory for a Daemon command Host `cmd` (#55,
+/// [`selected_script`]). `None` when there is none, when it is older than the command's own
+/// Daemon (ADR-0003: a newer version takes over, never an older one), or when the host
+/// refuses the probe (a `ForceCommand` wrapper): the Daemon command is used then.
+pub fn selected_remote(t: &dyn Transport, cmd: &str, cancel: &CancelToken) -> Option<String> {
+    let script = sh_wrap(&selected_script(cmd));
+    let out = run_script(t, &script, None, SELECTED_TIMEOUT, cancel).ok()?;
+    if out.code != Some(0) {
+        return None;
+    }
+    parse_selected(&out.stdout)
+}
+
+fn parse_selected(stdout: &str) -> Option<String> {
+    let (_, rest) = stdout.split_once(&format!("{SELECTED_MARKER}\n"))?;
+    let mut lines = rest.lines();
+    let name = lines.next()?.strip_prefix("selected ")?;
+    if !valid_version(name) || !xshell_core::server::valid_dir_name(name) {
+        return None;
+    }
+    if lines.next() != Some(OWN_MARKER) {
+        return None;
+    }
+    let own = lines.find_map(parse_version_json);
+    let sel = name.split_once('+').map_or(name, |(v, _)| v);
+    if let (Some(own), Ok(sel)) = (own, semver::Version::parse(sel)) {
+        if let Ok(own) = semver::Version::parse(&own.version) {
+            if sel.cmp_precedence(&own) == std::cmp::Ordering::Less {
+                return None;
+            }
+        }
+    }
+    Some(name.to_string())
+}
+
 /// SIGTERM the running Daemon named by its pidfile, if the pid really is an `xshelld`.
 pub fn kill_daemon_script() -> String {
     r#"for d in "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/xshell}" "$HOME/.xshell/run"; do
@@ -743,6 +811,111 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The `selected` probe of a Daemon command Host (#55), through a real `sh` with a fake
+    /// HOME: a name only for a valid, private install not older than the command's Daemon.
+    #[cfg(unix)]
+    #[test]
+    fn selected_remote_reads_a_valid_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let t = crate::transport::LocalShellTransport {
+            env: vec![("HOME".into(), home.path().into())],
+        };
+        let c = CancelToken::new();
+        let own = home.path().join("own");
+        let cmd = own.display().to_string();
+        let set_own = |v: &str| {
+            std::fs::write(
+                &own,
+                format!(
+                    "#!/bin/sh\necho banner\necho '{{\"name\":\"xshelld\",\"version\":\"{v}\",\"protocol\":{{\"min\":1,\"max\":1}}}}'\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        set_own("1.5.0");
+        let read = || selected_remote(&t, &cmd, &c);
+        let mode = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        assert_eq!(read(), None);
+        let root = home.path().join(".xshell/server");
+        let name = "1.5.0+85ee920a1b2c";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        mode(&home.path().join(".xshell"), 0o700);
+        mode(&root, 0o700);
+        mode(&dir, 0o700);
+        std::fs::write(root.join("selected"), format!("{name}\n")).unwrap();
+        mode(&root.join("selected"), 0o600);
+        assert_eq!(read(), None, "no binary");
+        let bin = dir.join("xshelld");
+        std::fs::write(&bin, "").unwrap();
+        mode(&bin, 0o600);
+        assert_eq!(read(), None, "not executable");
+        mode(&bin, 0o700);
+        assert_eq!(read().as_deref(), Some(name));
+        // Not private: group- or world-writable binary, directory, record or root.
+        for p in [&bin, &dir, &root.join("selected"), &root] {
+            let m = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            mode(p, m | 0o002);
+            assert_eq!(read(), None, "{p:?} world-writable");
+            mode(p, m | 0o020);
+            assert_eq!(read(), None, "{p:?} group-writable");
+            mode(p, m);
+        }
+        // A symlinked binary.
+        let real = home.path().join("real-xshelld");
+        std::fs::rename(&bin, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &bin).unwrap();
+        assert_eq!(read(), None, "symlink");
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::rename(&real, &bin).unwrap();
+        assert_eq!(read().as_deref(), Some(name));
+        // Older than the command's own Daemon: refused; same or newer: taken.
+        set_own("1.6.0");
+        assert_eq!(read(), None, "older than the command's Daemon");
+        set_own("1.4.0");
+        assert_eq!(read().as_deref(), Some(name));
+        for bad in ["../x", ".hidden", "", "a/b", "a b"] {
+            std::fs::write(root.join("selected"), format!("{bad}\n")).unwrap();
+            assert_eq!(read(), None, "{bad:?}");
+        }
+        // More than the one line `resolve_selected` reads.
+        std::fs::write(root.join("selected"), format!("{name}\nextra\n")).unwrap();
+        assert_eq!(read(), None, "two lines");
+        std::fs::write(root.join("selected"), name).unwrap();
+        assert_eq!(read().as_deref(), Some(name), "no newline");
+    }
+
+    /// Only the marked output counts: a banner, or an exit-zero refusal, is never a build.
+    #[test]
+    fn parse_selected_needs_the_marker() {
+        assert_eq!(parse_selected("Welcome\n"), None);
+        assert_eq!(parse_selected("Denied\n"), None);
+        assert_eq!(parse_selected("@@XSHELL-SELECTED@@\n"), None);
+        assert_eq!(
+            parse_selected("Welcome\n@@XSHELL-SELECTED@@\nselected 1.5.0+abc\n@@XSHELL-OWN@@\n"),
+            Some("1.5.0+abc".into()),
+            "an unknown own version does not block"
+        );
+        let long = format!("1.5.0+{}", "a".repeat(123));
+        assert_eq!(long.len(), 129);
+        assert_eq!(
+            parse_selected(&format!(
+                "@@XSHELL-SELECTED@@\nselected {long}\n@@XSHELL-OWN@@\n"
+            )),
+            None,
+            "longer than a directory name may be"
+        );
+        assert_eq!(
+            parse_selected("@@XSHELL-SELECTED@@\nselected 1.5.0+abc\n"),
+            None,
+            "truncated"
+        );
+    }
 
     const R11: ProtocolRange = ProtocolRange { min: 1, max: 1 };
     const JSON: &str = r#"{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1}}"#;

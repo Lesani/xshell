@@ -387,9 +387,14 @@ pub(crate) mod tests {
     }
 
     /// Every remote command runs this local script instead.
+    /// Runs its script for every command, except the Daemon command Host's `selected` probe
+    /// (#55), which finds no selected build.
     pub struct ScriptTransport(pub String);
     impl Transport for ScriptTransport {
-        fn command(&self, _remote: &str) -> CommandSpec {
+        fn command(&self, remote: &str) -> CommandSpec {
+            if remote.contains(crate::install::SELECTED_MARKER) {
+                return LocalShellTransport::default().command("exit 0");
+            }
             LocalShellTransport::default().command(&self.0)
         }
         fn describe(&self) -> String {
@@ -577,7 +582,10 @@ pub(crate) mod tests {
             struct T(String, String, String);
             impl Transport for T {
                 fn command(&self, remote: &str) -> CommandSpec {
-                    let s = if remote.contains("@@XSHELL@@") {
+                    // The Daemon command `selected` probe (#55) finds nothing here.
+                    let s = if remote.contains(crate::install::SELECTED_MARKER) {
+                        "exit 0"
+                    } else if remote.contains("@@XSHELL@@") {
                         &self.0
                     } else if remote.contains("cat >") {
                         &self.1
@@ -719,6 +727,134 @@ pub(crate) mod tests {
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "probe {pid} survived");
         // And nothing runs after the shutdown.
         assert!(!m.test(&test_host("h_cccccccc", "c")).ok);
+    }
+
+    /// A Daemon command Host is offered Replace (a build of this version other than ours) and
+    /// Upgrade now (an older version) like a managed one (#55).
+    #[cfg(unix)]
+    #[test]
+    fn daemon_command_host_is_offered_replace_and_upgrade() {
+        use crate::link::testpeer::{hello_frame, terminals_frame};
+        for (daemon, want) in [
+            ("1.5.0", StatusKind::BuildDiffers),
+            ("1.4.0", StatusKind::UpgradePending),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let frames = dir.path().join("frames");
+            let mut b = hello_frame(1, 1, daemon);
+            b.extend(terminals_frame(vec![]));
+            std::fs::write(&frames, b).unwrap();
+            let rec = Recorder::new();
+            let mut mc = test_config(rec.clone());
+            mc.desktop_build = Some(xshell_protocol::build::BuildId {
+                commit: "85ee920a1b2c".into(),
+                dirty: None,
+                time: 1,
+            });
+            mc.transports = script_factory(&format!("cat '{}'; sleep 0.3", frames.display()));
+            let m = Manager::new(mc);
+            let mut h = test_host("h_dddddddd", "d");
+            h.daemon_command = Some("xd".into());
+            m.configure(vec![h]).unwrap();
+            let s = rec.wait_status(|s| s.status == want);
+            assert_eq!(s.daemon_version.as_deref(), Some(daemon));
+            m.shutdown();
+        }
+    }
+
+    /// A Daemon command Host connects through the Host's selected build when the probe finds
+    /// one, and through exactly `<command> connect` once it no longer does (#55).
+    #[cfg(unix)]
+    #[test]
+    fn daemon_command_host_connects_through_the_selected_build() {
+        use crate::link::testpeer::{msg_frame, terminals_frame};
+        use xshell_protocol::msg::{Hello, ServerMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let ours = xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 1,
+        };
+        let frames = |name: &str, build: Option<xshell_protocol::build::BuildId>| {
+            let mut b = msg_frame(&ServerMsg::Hello(Hello {
+                protocol: xshell_protocol::msg::ProtocolRange { min: 1, max: 1 },
+                version: "1.5.0".into(),
+                capabilities: vec![],
+                build,
+            }));
+            b.extend(terminals_frame(vec![]));
+            let p = dir.path().join(name);
+            std::fs::write(&p, b).unwrap();
+            p
+        };
+        let new = frames("new", Some(ours.clone()));
+        let old = frames("old", None);
+        let selected = dir.path().join("selected");
+        std::fs::write(&selected, "").unwrap();
+        struct T {
+            selected: std::path::PathBuf,
+            new: std::path::PathBuf,
+            old: std::path::PathBuf,
+            sent: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for T {
+            fn command(&self, remote: &str) -> CommandSpec {
+                self.sent.lock().unwrap().push(remote.to_string());
+                let s = if remote.contains(crate::install::SELECTED_MARKER) {
+                    format!("cat '{}'", self.selected.display())
+                } else if remote.contains("/.xshell/server/1.5.0+85ee920a1b2c/xshelld\" connect") {
+                    format!("cat '{}'; sleep 0.3", self.new.display())
+                } else if remote == "xd connect" {
+                    format!("cat '{}'; sleep 0.3", self.old.display())
+                } else {
+                    "exit 1".into()
+                };
+                LocalShellTransport::default().command(&s)
+            }
+            fn describe(&self) -> String {
+                "selected".into()
+            }
+        }
+        struct F(
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            Arc<Mutex<Vec<String>>>,
+        );
+        impl TransportFactory for F {
+            fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+                Box::new(T {
+                    selected: self.0.clone(),
+                    new: self.1.clone(),
+                    old: self.2.clone(),
+                    sent: self.3.clone(),
+                })
+            }
+        }
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        std::fs::write(
+            &selected,
+            "@@XSHELL-SELECTED@@\nselected 1.5.0+85ee920a1b2c\n@@XSHELL-OWN@@\n",
+        )
+        .unwrap();
+        let rec = Recorder::new();
+        let mut mc = test_config(rec.clone());
+        mc.desktop_build = Some(ours);
+        mc.transports = Arc::new(F(selected.clone(), new, old, sent.clone()));
+        let m = Manager::new(mc);
+        let mut h = test_host("h_dddddddd", "d");
+        h.daemon_command = Some("xd".into());
+        m.configure(vec![h]).unwrap();
+        let s = rec.wait_status(|s| s.status == StatusKind::Connected);
+        assert_eq!(
+            s.daemon_build.map(|b| b.commit),
+            Some("85ee920a1b2c".into())
+        );
+        // The selection goes away: the next connection uses the command itself.
+        std::fs::write(&selected, "@@XSHELL-SELECTED@@\n").unwrap();
+        rec.wait_status(|s| s.status == StatusKind::BuildDiffers);
+        assert!(sent.lock().unwrap().iter().any(|c| c == "xd connect"));
+        m.shutdown();
     }
 
     /// A Daemon that completes the handshake and hangs up at once, every time.
