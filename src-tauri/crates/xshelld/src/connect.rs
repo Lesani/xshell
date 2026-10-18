@@ -1,22 +1,15 @@
-//! `xshelld connect`: bridge stdio to the Daemon's socket, starting `serve` if none runs,
-//! unless the machine's Daemon is GUI-bound (xshell runs it there, ADR-0005): then a missing
-//! Daemon means xshell is closed, and `connect` exits with [`NOT_RUNNING_EXIT`] instead.
-//! Holds no state and writes nothing to stdout but bridged bytes; diagnostics go to stderr,
-//! which the Desktop shows as the ssh error text.
-
-//!
-//! Unix only: on Windows the Desktop reaches the Daemon's pipe itself, and a pipe has no
-//! half-close for the bridge.
+//! `xshelld connect`: a binary stdio bridge to the Daemon; diagnostics go to stderr.
+//! Unix may start a Persistent Daemon unless the GUI-bound marker forbids it.
+//! Windows attaches only to the existing GUI-bound Daemon (ADR-0013), and fully
+//! disconnects on either direction ending: Windows pipes have no half-close.
 
 use crate::cli::Opts;
 use crate::paths::Paths;
 
-/// Windows: `connect` is not offered.
-#[cfg(not(unix))]
-pub fn run_connect(_opts: &Opts, _paths: &Paths) -> i32 {
-    eprintln!("xshelld: connect is not supported on Windows");
-    1
-}
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::run_connect;
 
 #[cfg(unix)]
 pub use unix::run_connect;

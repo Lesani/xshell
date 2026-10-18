@@ -844,7 +844,6 @@ fn squatted_pipe_name_fails_start() {
 fn persistent_serve_refused_on_windows() {
     let h = TestHome::new();
     assert_eq!(h.cmd().arg("serve").status().unwrap().code(), Some(2));
-    assert_eq!(h.cmd().arg("connect").status().unwrap().code(), Some(1));
     assert!(xshell_core::pipe::connect(&h.pipe, Instant::now() + T, &|| false).is_err());
 }
 

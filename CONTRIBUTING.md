@@ -120,7 +120,7 @@ cargo test -p xshell-protocol --locked     # Wire protocol only
 cargo test -p xshelld -p xshell-hostlink --locked # Daemon and hostlink
 ```
 
-Building the desktop crate needs the Tauri system dependencies (see Prerequisites). Core, Daemon, and hostlink tests need no Tauri system dependencies. Run Daemon tests on Linux or macOS; Windows builds a stub.
+Building the desktop crate needs the Tauri system dependencies (see Prerequisites). Core, Daemon, and hostlink tests need no Tauri system dependencies. Run Unix bridge tests on Linux/macOS and GUI-bound Daemon/bridge tests natively on Windows (`cargo test -p xshelld --lib --locked` and `cargo test -p xshelld --test windows_connect --locked -- --test-threads=1`). Windows bridge validation also needs a real OpenSSH `ssh -T` pass against a packaged build with its Windows Desktop open; cross-compilation alone is not acceptance. See [ADR-0013](docs/adr/0013-windows-ssh-bridge-attaches-only.md) and the [bridge design](docs/windows-ssh-bridge-plan.md).
 
 Host-side logic belongs in `xshell-core`, not in `src/lib.rs`: a new command is a core function plus an entry in `dispatch.rs` (`METHODS` and the `match`), and the desktop gets a thin wrapper that keeps the frontend's parameter names. Core reads the home and temp directories only through `HostCtx`, never from `dirs::home_dir()` or `std::env::temp_dir()`.
 

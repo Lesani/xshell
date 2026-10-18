@@ -100,21 +100,28 @@ At least one [supported agent CLI](#supported-agents) must be installed and on `
 
 ## Remote hosts
 
-Sessions on another machine look like local ones, with a Host label. Remote terminals keep running when your laptop is offline or xshell quits. Every connected Desktop shows the same terminals. Closing a remote tab ends its terminal for everyone.
+Sessions on another machine look like local ones, with a Host label. Remote terminals keep running when the viewing laptop is offline or its xshell quits, while the Host’s Daemon stays open. Every connected Desktop shows the same terminals. Closing a remote tab ends its terminal for everyone.
 
 You need:
-- A Linux or macOS host with x86_64 or arm64.
-- Key-based SSH that works non-interactively: `ssh -o BatchMode=yes <target> true`.
+- A Linux or macOS host with x86_64 or arm64 for automatic installation, or a Windows host with xshell already installed and open (see below).
+- Key-based SSH that works non-interactively (Linux/macOS example: `ssh -o BatchMode=yes <target> true`).
 - The host key accepted once: run `ssh <target>` in a terminal first.
 - Your agent CLIs installed on the host.
 
 Open **Settings → Hosts**, choose **Add host**, enter a name and an SSH alias from `~/.ssh/config` or `user@host`, then choose **Save**.
 
-xshell installs only the `xshelld` binary at `~/.xshell/server/<version>/xshelld`, not packages, services, or agent CLIs. No ports are opened. Everything goes over SSH.
+On Linux and macOS, xshell installs only the `xshelld` binary at `~/.xshell/server/<version>/xshelld`, not packages, services, or agent CLIs. No ports are opened. Everything goes over SSH.
 
-For restricted SSH setups such as `ForceCommand`, install `xshelld` yourself from the [GitHub release assets](https://github.com/MertPROJ/xshell/releases). Download `xshelld-<triple>` and its `xshelld-<triple>.sha256` checksum for your host. Under **Advanced**, set **Daemon command**, for example `~/bin/xshelld`. Automatic installation is disabled. When using your command, xshell sends exactly `<command> connect`; **Test connection** sends `<command> --version`. Neither command is shell-wrapped, so a `ForceCommand` wrapper can match these strings in `SSH_ORIGINAL_COMMAND`. Before each connection, xshell also sends a shell probe for the host’s selected build. If the probe finds a valid selection, xshell uses that build; if the probe is refused or finds none, it uses your command. **Upgrade now** and **Replace with Desktop’s build** require shell access: they install and select this Desktop’s `xshelld`, then restart the host’s daemon. They do not overwrite your configured executable.
+For restricted Linux/macOS SSH setups such as `ForceCommand`, install `xshelld` yourself from the [GitHub release assets](https://github.com/MertPROJ/xshell/releases). Download `xshelld-<triple>` and its `xshelld-<triple>.sha256` checksum for your host. Under **Advanced**, set **Daemon command**, for example `~/bin/xshelld`. Automatic installation is disabled. When using your command, xshell sends exactly `<command> connect`; **Test connection** sends `<command> --version`. Neither command is shell-wrapped, so a `ForceCommand` wrapper can match these strings in `SSH_ORIGINAL_COMMAND`. Before each connection, xshell also sends a shell probe for the host’s selected build. If the probe finds a valid selection, xshell uses that build; if the probe is refused or finds none, it uses your command. **Upgrade now** and **Replace with Desktop’s build** require shell access: they install and select this Desktop’s `xshelld`, then restart the host’s daemon. They do not overwrite your configured executable.
 
-xshell stages updates without interrupting running terminals. When **Upgrade pending** appears, choose **Upgrade now** to switch. This restarts every terminal on that host, including those used by other Desktops. Agent sessions resume; shells start fresh in the same directory. A staged update also takes effect at the Daemon's next restart.
+For Windows, keep its xshell Desktop open and set **Advanced → Daemon command** to the existing installed `xshelld.exe`. This is a command **prefix**, without `connect` or `--version`; xshell appends those arguments. Quote for the **Host’s OpenSSH shell**, not your local Desktop’s shell:
+
+- Default Windows OpenSSH `cmd.exe`: `"C:\Program Files\xshell\xshelld.exe"`
+- If OpenSSH is configured to use PowerShell: `& 'C:\Program Files\xshell\xshelld.exe'`
+
+These paths are illustrative: verify the actual executable location. Invoke it directly, with no PowerShell pipeline, text reader/writer, or encoding conversion. The optional selected-build shell probe described above still runs and falls back to your command when refused. Windows `connect` only attaches: a missing Daemon returns exit 4 and starts nothing. Disconnecting the viewing Desktop leaves the Daemon’s Terminals running; quitting the **Windows Desktop** ends them. Update xshell on Windows there; Windows automatic installation/upgrade, a Persistent Daemon, and standalone Windows Daemon release assets are not added by this bridge. Only Daemon-owned Terminals are available, not arbitrary external processes. See [ADR-0013](docs/adr/0013-windows-ssh-bridge-attaches-only.md) and the [bridge design](docs/windows-ssh-bridge-plan.md).
+
+On Linux and macOS, xshell stages updates without interrupting running terminals. When **Upgrade pending** appears, choose **Upgrade now** to switch. This restarts every terminal on that host, including those used by other Desktops. Agent sessions resume; shells start fresh in the same directory. A staged update also takes effect at the Daemon's next restart.
 
 ## Contributing
 

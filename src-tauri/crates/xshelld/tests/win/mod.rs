@@ -298,6 +298,106 @@ pub fn connect_pipe(pipe: &Path) -> PipeStream {
     }
 }
 
+// ── Connect children ──────────────────────────────────────────────────────
+
+/// A bridge only: dropping it kills/reaps the bridge, never the Daemon.
+pub struct ConnectProc {
+    pub child: Child,
+    stderr: Option<std::thread::JoinHandle<String>>,
+    registration: Option<PathBuf>,
+}
+
+impl ConnectProc {
+    pub fn start(h: &TestHome, stall: Option<Duration>) -> Self {
+        Self::spawn(h.cmd().arg("connect").stdin(Stdio::piped()), stall)
+    }
+
+    pub fn spawn(cmd: &mut Command, stall: Option<Duration>) -> Self {
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove("XSHELLD_TEST_CONNECT_STALL_MS");
+        if let Some(stall) = stall {
+            cmd.env(
+                "XSHELLD_TEST_CONNECT_STALL_MS",
+                stall.as_millis().to_string(),
+            );
+        }
+        let mut child = cmd.spawn().unwrap();
+        // Register immediately: watchdog termination does not run this child's RAII.
+        let registration = std::env::var_os("XSHELLD_WIN_CHILD_DIR").map(|dir| {
+            let path = Path::new(&dir).join(format!("connect-{}.pid", child.id()));
+            if let Err(error) = fs::write(&path, child.id().to_string()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cannot register bridge with watchdog: {error}");
+            }
+            path
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        Self {
+            child,
+            stderr: Some(stderr),
+            registration,
+        }
+    }
+
+    pub fn take_stdin(&mut self) -> std::process::ChildStdin {
+        self.child.stdin.take().unwrap()
+    }
+    pub fn take_stdout(&mut self) -> std::process::ChildStdout {
+        self.child.stdout.take().unwrap()
+    }
+
+    pub fn wait_exit(&mut self, within: Duration) -> Option<i32> {
+        let by = Instant::now() + within;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                self.unregister();
+                return Some(status.code().unwrap_or(-1));
+            }
+            if Instant::now() >= by {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn stderr(&mut self) -> String {
+        assert!(
+            self.child.try_wait().unwrap().is_some(),
+            "reap bridge before collecting stderr"
+        );
+        self.stderr
+            .take()
+            .map(|t| t.join().unwrap())
+            .unwrap_or_default()
+    }
+
+    fn unregister(&mut self) {
+        if let Some(path) = self.registration.take() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+impl Drop for ConnectProc {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        self.unregister();
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
+}
+
 // ── Specs ─────────────────────────────────────────────────────────────────
 
 /// A raw `cmd.exe` Terminal.
@@ -688,7 +788,8 @@ impl Client {
 /// Run the test `name` (this test binary's) in a child process, with `deadline`: the body
 /// runs there (this returns `true` in the child), and the parent (`false`) waits. Past the
 /// deadline the parent removes the file named in `<dir>/pause.path`, ends the Daemon named
-/// in `<dir>/daemon.pid` and the child, and fails: a probe that blocks never hangs CI.
+/// in `<dir>/daemon.pid`, every bridge registered as `connect-<pid>.pid`, and the child,
+/// and fails: a probe that blocks never hangs CI.
 pub fn in_child(name: &str, deadline: Duration) -> bool {
     if std::env::var("XSHELLD_WIN_CHILD").as_deref() == Ok(name) {
         return true;
@@ -720,10 +821,14 @@ pub fn in_child(name: &str, deadline: Duration) -> bool {
                 kill_pid(pid);
             }
         }
+        kill_registered_connects(dir.path());
         let _ = child.kill();
         let _ = child.wait();
         panic!("{name} did not finish within {deadline:?}");
     };
+    if !status.success() {
+        kill_registered_connects(dir.path());
+    }
     assert!(status.success(), "{name} failed in its child process");
     false
 }
@@ -732,5 +837,21 @@ pub fn in_child(name: &str, deadline: Duration) -> bool {
 pub fn child_note(what: &str, value: &str) {
     if let Some(d) = std::env::var_os("XSHELLD_WIN_CHILD_DIR") {
         let _ = fs::write(Path::new(&d).join(what), value);
+    }
+}
+
+fn kill_registered_connects(dir: &Path) {
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("connect-") && name.ends_with(".pid") {
+            if let Ok(pid) = fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .trim()
+                .parse()
+            {
+                kill_pid(pid);
+            }
+        }
     }
 }

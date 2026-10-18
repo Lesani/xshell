@@ -1,7 +1,7 @@
 //! `xshelld`, the Remote Host Daemon: serves one Host's Terminals and Host-side commands to
 //! any number of Desktops over a per-user Unix socket, or on Windows over a per-user named
 //! pipe. On Windows only xshell starts it (`serve --gui-bound`, ADR-0005); Persistent
-//! `serve` and `connect` are Unix only.
+//! `serve` is Unix only; Windows `connect` attaches to the existing GUI-bound Daemon.
 
 pub mod build_id;
 pub mod cli;

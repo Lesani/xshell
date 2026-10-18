@@ -64,8 +64,9 @@ pub const USAGE: &str = "\
 usage: xshelld <command> [options]
 
 commands:
-  connect     bridge stdin/stdout to the Daemon, starting it if needed (never
-              when xshell on this machine runs it: then exit 4)
+  connect     bridge stdin/stdout to the Daemon
+              Unix may start a Persistent Daemon; Windows attaches only, never starts
+              a Daemon. A GUI-bound Daemon needs xshell open; if missing, exit 4.
   serve       run the Daemon in the foreground
   pair        add this computer to your devices: shows a code to enter in xshell
               on another computer (Settings → Mobile → Add a computer)
@@ -74,7 +75,7 @@ commands:
 
 options:
   --home DIR      home directory to serve (env XSHELLD_HOME)
-  --socket PATH   Daemon socket (env XSHELLD_SOCKET)
+  --socket PATH   Daemon socket or Windows pipe name (env XSHELLD_SOCKET)
 
 serve options:
   --gui-bound        run for the xshell app on this machine: no idle exit, and the
@@ -263,6 +264,14 @@ mod tests {
             .map(|(k, v)| (k.to_string(), OsString::from(v)))
             .collect();
         parse(args.iter().map(OsString::from), &|k| env.get(k).cloned())
+    }
+
+    #[test]
+    fn connect_help_describes_windows_attach_only() {
+        assert!(USAGE.contains("Unix may start a Persistent Daemon"));
+        assert!(USAGE.contains("Windows attaches only, never starts"));
+        assert!(USAGE.contains("if missing, exit 4"));
+        assert!(USAGE.contains("Windows pipe name"));
     }
 
     #[test]
