@@ -404,6 +404,17 @@ pub fn get_pi_context(ctx: &HostCtx, project_path: String) -> PiContext {
         for name in ["SYSTEM.md", "APPEND_SYSTEM.md"] {
             add_resource(&base, &resources.join(name), scope, &mut instructions);
         }
+        // Case-insensitive volumes can resolve two spelling variants to one file.
+        // File identity also preserves genuinely distinct case-sensitive Unix files;
+        // different logical names (e.g. SYSTEM.md) retain their separate roles.
+        let mut instruction_files = HashSet::new();
+        instructions.retain(|item| {
+            crate::last_line::open_confined(&base, Path::new(&item.path))
+                .and_then(|file| crate::last_line::file_id(&file))
+                .is_none_or(|identity| {
+                    instruction_files.insert((item.name.to_lowercase(), identity))
+                })
+        });
         if !instructions.is_empty() {
             result.sections.push(AgentContextSection {
                 title: format!("{scope} instructions"),
@@ -959,6 +970,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pi_context_deduplicates_physical_instruction_aliases() {
+        let fx = Fixture::new();
+        let original = fx.write("home/.pi/agent/AGENTS.md", "instructions");
+        let alias = original.with_file_name("AGENTS.MD");
+        // Case-sensitive volumes can reproduce a case-insensitive volume's aliases
+        // with a hardlink to the same physical file.
+        if !alias.exists() {
+            fs::hard_link(&original, &alias).unwrap();
+        }
+        let context = get_pi_context(&fx.ctx(), String::new());
+        let items: Vec<_> = context.sections.iter().flat_map(|s| &s.items).collect();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn pi_context_keeps_distinct_instruction_files_and_roles() {
+        let fx = Fixture::new();
+        let original = fx.write("home/.pi/agent/AGENTS.md", "instructions");
+        let alias = original.with_file_name("AGENTS.MD");
+        let case_sensitive = !alias.exists();
+        if case_sensitive {
+            fs::write(&alias, "distinct instructions").unwrap();
+        }
+        fs::hard_link(&original, original.with_file_name("APPEND_SYSTEM.md")).unwrap();
+        let context = get_pi_context(&fx.ctx(), String::new());
+        let items: Vec<_> = context.sections.iter().flat_map(|s| &s.items).collect();
+        assert_eq!(items.len(), if case_sensitive { 3 } else { 2 });
+        assert!(items.iter().any(|item| item.name == "APPEND_SYSTEM.md"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn pi_context_deduplicates_windows_case_aliases() {
@@ -1027,11 +1069,17 @@ mod tests {
         assert!(items
             .iter()
             .all(|i| project_key(&i.path) != path_key(&fx.home().join(".claude/CLAUDE.md"))));
-        // The Project has no override, so its instruction file remains visible even
-        // when Windows reports AGENTS.MD through the AGENTS.md case alias.
-        assert!(items
-            .iter()
-            .any(|i| project_key(&i.path) == path_key(&project.join("AGENTS.MD"))));
+        // The Project's file remains visible even when a case-insensitive volume
+        // reports AGENTS.MD through the AGENTS.md spelling alias.
+        let project_instruction =
+            crate::last_line::open_no_follow(&project.join("AGENTS.MD")).unwrap();
+        let project_instruction_id = crate::last_line::file_id(&project_instruction).unwrap();
+        assert!(items.iter().any(|item| {
+            item.detail.starts_with("Project")
+                && crate::last_line::open_no_follow(Path::new(&item.path))
+                    .and_then(|file| crate::last_line::file_id(&file))
+                    == Some(project_instruction_id)
+        }));
         assert_eq!(
             fs::read_to_string(fx.home().join(".pi/agent/auth.json")).unwrap(),
             "secret"
