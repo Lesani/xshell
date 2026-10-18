@@ -32,6 +32,16 @@ export function defaultShellForPlatform(platform: Platform): string {
   return "bash";
 }
 
+// Missing Remote Host OS metadata keeps the existing Linux fallback; never infer it
+// from the Desktop. Local Hosts may retain a configured preset valid for their OS.
+export function defaultShellForHost(remote: boolean, hostOS: string | null | undefined, configuredShell: string, localPlatform?: Platform): ShellPreset {
+  const platform = remote ? (hostOS ?? "linux") : (localPlatform ?? detectPlatform());
+  const configured = getShellById(configuredShell);
+  if (!remote && configured?.platforms.some(p => p === platform)) return configured;
+  const fallback = platform === "windows" ? "windows" : platform === "macos" ? "macos" : "linux";
+  return getShellById(defaultShellForPlatform(fallback))!;
+}
+
 export function getAvailableShells(): ShellPreset[] {
   return shellsForPlatform(detectPlatform());
 }

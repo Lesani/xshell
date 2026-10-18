@@ -73,7 +73,7 @@ interface TabBarProps {
   onToggleSidebar: () => void;
 }
 
-function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRect, anchorEl, installedAgents, onPick, onPickShell, onNewChat, onClose }: { project: ProjectInfo | null; displayName: string; openSessionIds: Set<string>; anchorRect: DOMRect; anchorEl: HTMLElement; installedAgents: Record<AgentId, boolean>; onPick: (s: SessionInfo) => void; onPickShell: (shellId: string, shellName: string) => void; onNewChat: (agent?: AgentId) => void; onClose: () => void }) {
+export function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRect, anchorEl, installedAgents, onPick, onPickShell, onNewChat, onClose }: { project: ProjectInfo | null; displayName: string; openSessionIds: Set<string>; anchorRect: DOMRect; anchorEl: HTMLElement; installedAgents: Record<AgentId, boolean>; onPick: (s: SessionInfo) => void; onPickShell: (shellId: string, shellName: string) => void; onNewChat: (agent?: AgentId) => void; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
 
@@ -120,9 +120,8 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
   const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();
   // If there's no project, collapsing the shells makes no sense — there's nothing else in the dropdown.
   const [shellsOpen, setShellsOpen] = useState(!project);
-  // With one agent installed the new-chat entry stays a single row for that agent; with
-  // multiple it becomes a collapsible group like "Start new shell" (open by default — it
-  // replaces the dropdown's primary action).
+  // Zero or one installed harness keeps the generic New chat action (Ask still shows
+  // the picker). Multiple harnesses get named shortcuts with explicit selections.
   const agents = AGENT_IDS.filter(id => installedAgents[id]).map(id => AGENTS[id]);
   const [agentsOpen, setAgentsOpen] = useState(true);
 
@@ -152,7 +151,7 @@ function RecentSessionsDropdown({ project, displayName, openSessionIds, anchorRe
         </>
       ) : project && (
         <>
-          <div className="tab-dropdown-item" onClick={() => { onNewChat(agents[0]?.id); onClose(); }}>
+          <div className="tab-dropdown-item" onClick={() => { onNewChat(); onClose(); }}>
             <AgentIcon agent={agents[0]?.id} size={14} className={`tab-dropdown-shell-icon ${agents[0]?.neutralIcon ? "tab-dropdown-icon-neutral" : ""}`} />
             <div className="tab-dropdown-item-content">
               <div className="tab-dropdown-item-title tab-dropdown-title-ui">New chat in {displayName}</div>

@@ -1,6 +1,6 @@
 # xshell
 
-A desktop IDE that hosts AI coding-agent CLIs (Claude Code, Codex, Cursor, opencode, Antigravity) in terminal tabs and surfaces their sessions, usage and project state. This file fixes the vocabulary for the remote-hosts feature, where agents run on another machine. Location is meant to be nearly invisible: a session on a **Remote Host** looks and behaves like a local one.
+A desktop IDE that hosts AI coding-agent CLIs (Claude Code, Codex, Cursor, opencode, Antigravity, Pi) in terminal tabs and surfaces their sessions, usage and project state. This file fixes the vocabulary for the remote-hosts feature, where agents run on another machine. Location is meant to be nearly invisible: a session on a **Remote Host** looks and behaves like a local one.
 
 ## Language
 
@@ -50,6 +50,11 @@ _Avoid_: activity, state
 **Permission Prompt**:
 An agent's question that blocks its turn until answered, with the options its TUI offers; a **Mobile** shows it as buttons, and whoever answers first, at any **Desktop**, wins. Each shown prompt has an id; an answer to a prompt that is no longer current, because someone answered or typed at it first, is "already answered". A prompt whose options cannot be read safely is shown as text only.
 _Avoid_: approval dialog, confirmation
+
+**Shell** (new-session choice):
+Starts a raw **Terminal** in the selected **Project** on its **Host**, without an
+agent harness. It is not an agent or an agent session, and is unavailable to a
+**Mobile**.
 
 **Tab**:
 A **Desktop**'s view of one **Terminal**.

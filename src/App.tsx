@@ -4,7 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { defaultShellForPlatform, getDefaultShellId, getShellById } from "./shells";
+import { defaultShellForHost, getDefaultShellId } from "./shells";
+import { resolveNewChatChoice } from "./hosts/newChatChoice";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
@@ -28,7 +29,7 @@ import { registry } from "./hosts/registry";
 import { cache } from "./hosts/cache";
 import { adoptTab, applyFocusRemovals, dissolveSmallGroups, keepsFocusWhenListed, applyGroupRemovals, applyTabDeltas, focusOf, reconcileHosts, remoteTabId, type Focus } from "./hosts/reconcile";
 import { localEdits, metaSync } from "./hosts/metaSync";
-import { planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
+import { refusal, planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
 import { daemonHost, type LocalHostInfo } from "./hosts/localHost";
 import { isRemoteDataHost, listsForReconcile, needsCache, persistableTabs, restorableTabs, restoreGroups, withHostData } from "./hosts/appTabs";
@@ -936,29 +937,16 @@ export default function App() {
   }, [installedAgents, hostsSnap]);
 
   const handleNewChat = useCallback((project: ProjectInfo, agent?: AgentId) => {
-    // Resolve which agent hosts the chat: explicit pick > single installed agent > the
-    // user's default. With multiple agents and no default ("ask"), open the picker dialog
-    // and re-enter with the chosen agent. Single-agent machines never see any of this.
-    if (!agent) {
-      const agents = installedAgentsFor(project.host);
-      const installed = AGENT_IDS.filter(a => agents[a]);
-      if (installed.length > 1) {
-        if (defaultAgent !== "ask" && installed.includes(defaultAgent)) agent = defaultAgent;
-        else if (defaultAgent !== "ask" && !project.host) agent = defaultAgent;
-        else { setAgentPickerProject(project); return; }
-      } else if (project.host && installed.length === 0) {
-        // A Remote Host with no detected agent CLI: the picker explains it.
-        if (!registry.isUsable(project.host)) { applyPlan(planNewChat(project, "claude", openContext()), true); return; }
-        setAgentPickerProject(project);
-        return;
-      } else {
-        agent = installed[0] ?? "claude";
-      }
-    }
+    const ctx = openContext();
+    const notice = project.host ? refusal(project.host, ctx) : null;
+    if (notice) { applyPlan({ kind: "refuse", notice }, true); return; }
+    const agents = installedAgentsFor(project.host);
+    const choice = resolveNewChatChoice(defaultAgent, AGENT_IDS.filter(a => agents[a]), agent);
+    if (choice.kind === "picker") { setAgentPickerProject(project); return; }
     // Claude: a pre-allocated UUID passed via `--session-id` (known JSONL name from the start,
     // and Claude's ai-title still fires). Codex and Cursor can't pre-assign a session id, so
     // they spawn bare and the title-sync links the tab once a session with a real title appears.
-    applyPlan(planNewChat(project, agent, openContext()), true);
+    applyPlan(planNewChat(project, choice.agent, ctx), true);
   }, [installedAgentsFor, defaultAgent, applyPlan, openContext]);
 
   // Open a raw shell tab (no Claude wrapping) — disposable by design, not persisted across restart.
@@ -1445,9 +1433,8 @@ export default function App() {
   // cwd = context project (or home if none).
   const handleNewShellInContext = useCallback(() => {
     // A Remote Host never gets the Desktop's default shell: use its OS's default instead.
-    const shellId = contextProject?.host ? defaultShellForPlatform(registry.getStatus(contextProject.host)?.os ?? "linux") : defaultShell;
-    const shell = getShellById(shellId);
-    handleNewShell(contextProject, shellId, shell?.name || "Shell");
+    const shell = defaultShellForHost(!!contextProject?.host, contextProject?.host ? registry.getStatus(contextProject.host)?.os : undefined, defaultShell);
+    handleNewShell(contextProject, shell.id, shell.name);
   }, [contextProject, defaultShell, handleNewShell]);
 
   // Group-aware tab selection: a tab inside a group requires activating its group AND
@@ -1572,7 +1559,12 @@ export default function App() {
       </div>
       </div>
       {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} onAddRemotePath={handleAddRemotePath} />}
-      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} hostName={agentPickerProject.host ? registry.hostName(agentPickerProject.host) : undefined} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
+      {agentPickerProject && <AgentPickerDialog project={agentPickerProject} hostName={agentPickerProject.host ? registry.hostName(agentPickerProject.host) : undefined} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onShell={() => {
+        const project = agentPickerProject;
+        setAgentPickerProject(null);
+        const shell = defaultShellForHost(!!project.host, project.host ? registry.getStatus(project.host)?.os : undefined, defaultShell);
+        handleNewShell(project, shell.id, shell.name);
+      }} onClose={() => setAgentPickerProject(null)} onOpenSettings={() => { setAgentPickerProject(null); setActiveTabId("settings"); }} />}
       {editingProjectKey && (() => {
         const proj = allProjects.find(p => sameKey(keyOf(p), editingProjectKey)) || userProjects.find(p => sameKey(keyOf(p), editingProjectKey));
         if (!proj) { setEditingProjectKey(null); return null; }
