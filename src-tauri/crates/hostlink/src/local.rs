@@ -1870,8 +1870,19 @@ while True:\n    conns.append(s.accept()[0])\n";
             std::fs::read_to_string(home.join(".xshell/server/selected")).unwrap(),
             "1.5.0+85ee920a1b2c\n"
         );
-        let pid = d.ensure_spawned().unwrap();
+        // SIGKILL is asynchronous. Until the old child exits, ensure_spawned correctly
+        // returns its PID rather than starting a second Daemon. Retry the public start
+        // seam until that child has ended and the replacement has actually started.
+        let previous_pid = pid;
         let deadline = Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            let next = d.ensure_spawned().unwrap();
+            if next != previous_pid {
+                break next;
+            }
+            assert!(Instant::now() < deadline, "the old build did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
         while !log.exists() {
             assert!(Instant::now() < deadline, "this build did not start");
             std::thread::sleep(Duration::from_millis(10));
