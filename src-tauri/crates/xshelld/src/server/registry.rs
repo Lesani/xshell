@@ -128,6 +128,7 @@ impl Daemon {
         reg: &Registry,
         agent: &str,
         sid: &str,
+        cwd: &str,
     ) -> Option<(Arc<Terminal>, SessionHold)> {
         let rank = |h: SessionHold| match h {
             SessionHold::Live => 0,
@@ -137,7 +138,7 @@ impl Daemon {
         };
         reg.terminals
             .values()
-            .filter(|t| t.runs_session(agent, sid))
+            .filter(|t| t.runs_session(agent, sid, cwd))
             .map(|t| (t.clone(), t.session_hold()))
             .filter(|(_, h)| *h != SessionHold::Ended)
             .min_by_key(|(t, h)| (rank(*h), t.created_at_ms(), t.id))
@@ -587,18 +588,29 @@ impl Daemon {
 /// before capability `term.open-existing`, or a relinked Terminal). All of them are kept: a
 /// Terminal is never ended silently; `term.open` resumes the oldest.
 fn warn_restored_duplicates(reg: &Registry) {
-    let mut seen: BTreeMap<(String, String), Vec<Uuid>> = BTreeMap::new();
+    let mut seen: BTreeMap<(String, String, String), Vec<Uuid>> = BTreeMap::new();
     for t in reg.terminals.values() {
-        if let Some((a, s)) = t.spec().agent_session() {
-            seen.entry((a.to_string(), s.to_string()))
+        let spec = t.spec();
+        if let Some((a, s)) = spec.agent_session() {
+            let project = if a == "pi" {
+                xshell_core::pi::project_key(&spec.cwd)
+            } else {
+                String::new()
+            };
+            seen.entry((a.to_string(), s.to_string(), project))
                 .or_default()
                 .push(t.id);
         }
     }
-    for ((agent, sid), ids) in seen.into_iter().filter(|(_, ids)| ids.len() > 1) {
+    for ((agent, sid, project), ids) in seen.into_iter().filter(|(_, ids)| ids.len() > 1) {
+        let scope = if project.is_empty() {
+            String::new()
+        } else {
+            format!(" in {project}")
+        };
         crate::log!(
             "WARN",
-            "{} restored terminals resume {agent} session {sid}: {ids:?}; all are kept",
+            "{} restored terminals resume {agent} session {sid}{scope}: {ids:?}; all are kept",
             ids.len()
         );
     }

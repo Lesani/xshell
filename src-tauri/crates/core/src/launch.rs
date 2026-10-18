@@ -90,6 +90,7 @@ fn resolve_cmd_shim(_bin: &str) -> Option<String> {
 pub fn agent_binary(agent: Option<&str>) -> &'static str {
     match agent {
         Some("codex") => "codex",
+        Some("pi") => "pi",
         Some("cursor") => "cursor-agent",
         Some("opencode") => "opencode",
         Some("antigravity") => "agy",
@@ -138,7 +139,8 @@ pub fn relaunch_spec(spec: &LaunchSpec, skip: bool) -> Result<LaunchSpec, String
 //  - Antigravity: `agy --conversation <id>` (conversations are workspace-scoped, so the
 //    project cwd we spawn in must match the conversation's recorded workspace — it does,
 //    since the session row carries that workspace as its project path).
-// New non-Claude chats carry no session_id (they start unlinked) → spawn bare.
+// Pi 1.3+: --session-id creates or resumes that exact project-scoped ID.
+// Other new non-Claude chats carry no session_id (they start unlinked) → spawn bare.
 pub fn resume_args(
     ctx: &HostCtx,
     agent_bin: &str,
@@ -171,6 +173,10 @@ fn resume_args_with(
     let mut v = Vec::new();
     if let Some(sid) = session_id {
         match agent_bin {
+            "pi" => {
+                v.push("--session-id".into());
+                v.push(sid.to_string());
+            }
             "codex" => {
                 v.push("resume".into());
                 v.push(sid.to_string());
@@ -330,12 +336,6 @@ fn plan_command_inner(
     let first_words = first
         .map(|msg| first_words(spec, &agent_args, msg))
         .transpose()?;
-    // A first message on Windows: the agent itself, found without `cmd.exe`. `first_words`
-    // accepted only a direct agent, so no shell or prefix wraps it below.
-    let direct_exec = match (direct, &first_words) {
-        (Some(resolve), Some(_)) => Some(resolve(agent_bin)?),
-        _ => None,
-    };
     if mode != "raw" && spec.skip_permissions == Some(true) {
         if let Some(flag) = permission_flag(agent_bin) {
             // `codex resume` is a subcommand with its own options, so the flag goes after it.
@@ -373,6 +373,16 @@ fn plan_command_inner(
     // The agent invocation: the launch prefix's words, if any, then the agent. `exec` is what
     // the shell runs, `exec_args` everything after it.
     let prefix: &[String] = spec.launch_prefix.as_deref().unwrap_or_default();
+    // Ordinary native Windows Pi uses the same npm-safe executable resolver as first
+    // messages, without granting Pi first-message support or changing wrapper semantics.
+    let native_pi = agent_bin == "pi"
+        && mode != "raw"
+        && prefix.is_empty()
+        && effective_shell.is_none_or(str::is_empty);
+    let direct_exec = match direct {
+        Some(resolve) if first.is_some() || native_pi => Some(resolve(agent_bin)?),
+        _ => None,
+    };
     let (exec, exec_args): (&str, Vec<String>) = match prefix.split_first() {
         Some((head, rest)) => {
             let mut v = rest.to_vec();
@@ -1936,5 +1946,184 @@ mod tests {
             plan_command_first(&ctx, &s, None, Some("hi there")).unwrap_err(),
             "a first message needs a new chat"
         );
+    }
+    #[test]
+    fn launch_pi_new_and_resume_use_exact_session_id() {
+        let fx = Fixture::new();
+        let s = LaunchSpec {
+            agent: Some("pi".into()),
+            session_id: Some("custom-id".into()),
+            ..spec("/work")
+        };
+        for exists in [false, true] {
+            let p = plan_command_inner(&fx.ctx(), &s, None, None, &|_, _| exists, None).unwrap();
+            let (_, expected) = os_default("pi", &strings(&["--session-id", "custom-id"]));
+            assert_eq!(p.args, expected);
+        }
+        assert_eq!(agent_binary(Some("pi")), "pi");
+        assert!(resume_args(&fx.ctx(), "pi", None, "/work").is_empty());
+    }
+
+    #[test]
+    fn launch_pi_windows_direct_npm_shim() {
+        use crate::direct_exec::{resolve_direct, Probe};
+        let fx = Fixture::new();
+        // The observed standard npm %_prog% run line, with Pi's actual package path.
+        let shim = r#"@ECHO off
+SET dp0=%~dp0
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js" %*
+"#;
+        let npm = fx.dir.path().join("npm");
+        let script = npm
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-coding-agent")
+            .join("dist")
+            .join("bundle")
+            .join("cli.js");
+        let node = npm.join("node.exe");
+        let cmd = npm.join("pi.cmd");
+        let paths = vec![npm.to_string_lossy().into_owned()];
+        let is_file = |p: &std::path::Path| p == node || p == script || p == cmd;
+        let read = |p: &std::path::Path| (p == cmd).then(|| shim.to_string());
+        let resolve = |bin: &str| {
+            resolve_direct(
+                bin,
+                &paths,
+                &strings(&[".exe", ".cmd"]),
+                &Probe {
+                    is_file: &is_file,
+                    read: &read,
+                },
+            )
+        };
+        let s = LaunchSpec {
+            agent: Some("pi".into()),
+            session_id: Some("custom-id".into()),
+            ..spec("/work")
+        };
+        let p = direct_plan(&fx.ctx(), &s, Some(&hooks()), None, &resolve).unwrap();
+        assert_eq!(p.program, node.to_string_lossy());
+        assert_eq!(
+            p.args,
+            vec![
+                script.to_string_lossy().into_owned(),
+                "--session-id".into(),
+                "custom-id".into()
+            ]
+        );
+        assert_eq!(p.env, plan_env(&[]));
+        assert_eq!(
+            direct_plan(&fx.ctx(), &s, None, None, &|_| Err(
+                "unsupported shim".into()
+            ))
+            .unwrap_err(),
+            "unsupported shim"
+        );
+        let long = LaunchSpec {
+            session_id: Some("x".repeat(direct_exec::COMMAND_LINE_BUDGET)),
+            ..s
+        };
+        assert_eq!(
+            direct_plan(&fx.ctx(), &long, None, None, &resolve).unwrap_err(),
+            direct_exec::TOO_LONG
+        );
+    }
+
+    #[test]
+    fn launch_pi_prefix_and_wrappers_preserved() {
+        let fx = Fixture::new();
+        let base = LaunchSpec {
+            agent: Some("pi".into()),
+            session_id: Some("sid".into()),
+            ..spec("/work")
+        };
+        let no_resolve = |_: &str| -> Result<DirectExec, String> {
+            panic!("wrapped Pi must not resolve as native Pi")
+        };
+        let prefix = LaunchSpec {
+            launch_prefix: Some(strings(&["headroom", "--profile", "pi"])),
+            ..base.clone()
+        };
+        let p = direct_plan(&fx.ctx(), &prefix, None, None, &no_resolve).unwrap();
+        let (program, args) = os_default(
+            "headroom",
+            &strings(&["--profile", "pi", "pi", "--session-id", "sid"]),
+        );
+        assert_eq!((p.program, p.args), (program, args));
+        for wrapped in [&base, &prefix] {
+            for (id, shell) in [
+                ("bash", "bash"),
+                ("powershell", "powershell.exe"),
+                ("cmd", "cmd.exe"),
+            ] {
+                let s = LaunchSpec {
+                    shell_id: Some(id.into()),
+                    shell_command: Some(shell.into()),
+                    ..wrapped.clone()
+                };
+                let p = direct_plan(&fx.ctx(), &s, None, None, &no_resolve).unwrap();
+                assert_eq!(p.program, shell);
+                assert!(p.args.join(" ").contains("--session-id"));
+                assert!(p.args.join(" ").contains("sid"));
+                if wrapped.launch_prefix.is_some() {
+                    assert!(p.args.join(" ").contains("headroom"));
+                }
+            }
+        }
+        let raw = LaunchSpec {
+            shell_mode: Some("raw".into()),
+            shell_command: Some("shell".into()),
+            ..base.clone()
+        };
+        let p = direct_plan(&fx.ctx(), &raw, None, None, &no_resolve).unwrap();
+        assert_eq!(p.program, "shell");
+        assert!(p.args.is_empty());
+        let empty_prefix = LaunchSpec {
+            launch_prefix: Some(vec![]),
+            ..base
+        };
+        let p = direct_plan(&fx.ctx(), &empty_prefix, None, None, &|_| {
+            Ok(DirectExec {
+                program: "/node.exe".into(),
+                lead_args: vec![],
+            })
+        })
+        .unwrap();
+        assert_eq!(p.program, "/node.exe");
+    }
+
+    #[test]
+    fn pi_has_no_bypass_hooks_or_first_message() {
+        let fx = Fixture::new();
+        let s = LaunchSpec {
+            agent: Some("pi".into()),
+            skip_permissions: Some(true),
+            ..spec("/work")
+        };
+        assert_eq!(permission_flag("pi"), None);
+        assert!(first_message_args(&fx.ctx(), &s, "hello").is_err());
+        let p = plan_command_inner(
+            &fx.ctx(),
+            &s,
+            Some(TerminalHooks {
+                hooks: &hooks(),
+                terminal: TID.parse().unwrap(),
+                run: 3,
+            }),
+            None,
+            &|_, _| false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.env, plan_env(&[]));
+        let (_, expected) = os_default("pi", &[]);
+        assert_eq!(p.args, expected);
+        assert!(relaunch_spec(&s, true).is_err());
     }
 }

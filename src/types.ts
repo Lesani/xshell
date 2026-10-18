@@ -1,3 +1,4 @@
+import type { AgentId } from "./agents";
 import type { HostId } from "./hosts/types";
 import type { ProjectKey } from "./hosts/projectKey";
 
@@ -51,6 +52,11 @@ export interface OpencodeContext {
   sections: AgentContextSection[];
 }
 
+export interface PiContext {
+  present: boolean;
+  sections: AgentContextSection[];
+}
+
 export interface AntigravityContext {
   present: boolean;
   sections: AgentContextSection[];
@@ -94,7 +100,7 @@ export interface SessionFolder {
   id: string;
   name: string;
   collapsed?: boolean;
-  sessionIds: string[];
+  sessionIds: string[]; // raw IDs for existing agents; scoped sessionFolderId keys for Pi
 }
 
 export interface ProjectSettings {
@@ -118,9 +124,9 @@ export interface SessionInfo {
   model: string;                  // raw model id from last assistant turn, e.g. "claude-opus-4-7-..."
   context_tokens: number;         // last assistant turn's input + cache_creation + cache_read
   context_limit: number;          // e.g. 200000
-  cost_usd: number;               // 0 unless xshell-stats hook is set up; sourced from Claude Code's reported total
+  cost_usd: number;               // recorded cost (Claude hook total, or agent session usage costs)
   is_authoritative_stats: boolean; // true when xshell-stats hook data exists for this session
-  daily_cost: Record<string, number>; // { "YYYY-MM-DD": usd } from the hook; empty when no hook
+  daily_cost: Record<string, number>; // { "YYYY-MM-DD": usd } from recorded usage; empty when unavailable
   rate_limit_5h_pct: number | null;
   rate_limit_7d_pct: number | null;
   // Lifetime token totals across every non-synthetic assistant turn in the JSONL. Always
@@ -134,7 +140,7 @@ export interface SessionInfo {
   daily_tokens: Record<string, [number, number, number, number]>;
   // Which coding agent produced this session — drives the row icon, model formatting, and
   // the resume command the terminal tab spawns.
-  agent: "claude" | "codex" | "cursor" | "opencode" | "antigravity";
+  agent: AgentId;
   host?: HostId; // absent = Local Host; stamped only at the fetch boundary
 }
 
@@ -305,7 +311,7 @@ export interface Tab {
   encodedName?: string;
   shellMode?: 'claude' | 'raw'; // default 'claude'. 'raw' = plain shell, no claude command
   shellId?: string; // e.g. 'powershell', 'cmd', 'bash', 'zsh' — when shellMode='raw'
-  agent?: 'claude' | 'codex' | 'cursor' | 'opencode' | 'antigravity'; // which agent CLI the tab hosts; default 'claude'
+  agent?: AgentId; // which agent CLI the tab hosts; default 'claude'
   groupId?: string; // when set, the tab is a member of a group (not standalone in the tab bar)
   lastActiveAt?: number; // ms epoch — bumped whenever the tab becomes the focused leaf; drives "recent" sort in the tab search dialog
   createdAt?: number; // ms epoch at tab creation (stable, unlike lastActiveAt) — lets the title-sync link an unlinked agent tab to a session that appeared after it opened

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
-import { hostInvoke } from "../hosts/hostInvoke";
+import { loadProjectSessions } from "../hosts/projectSessions";
 import { keyOf, keyOfTab, lookupKey, sameKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
 import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot, ShieldOff } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
@@ -79,13 +79,13 @@ export function RecentSessionsDropdown({ project, displayName, openSessionIds, a
 
   // Fetch fresh sessions on open (only when a project is in context)
   useEffect(() => {
-    if (!project?.encoded_name) { setSessions([]); return; }
+    if (!project?.path) { setSessions([]); return; }
     let alive = true;
-    hostInvoke<SessionInfo[]>(project.host, "get_sessions", { encodedName: project.encoded_name })
-      .then(v => { if (alive) setSessions(project.host ? v.map(s => ({ ...s, host: project.host })) : v); })
+    loadProjectSessions(project)
+      .then(result => { if (alive) setSessions(result.sessions); })
       .catch(() => { if (alive) setSessions([]); });
     return () => { alive = false; };
-  }, [project?.encoded_name, project?.host]);
+  }, [project?.encoded_name, project?.path, project?.host]);
 
   // Close on click outside (ignore clicks on the anchor so toggling works)
   useEffect(() => {

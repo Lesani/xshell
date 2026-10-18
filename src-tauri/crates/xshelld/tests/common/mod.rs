@@ -286,7 +286,7 @@ pub fn shared_fake_agents() {
     ONCE.call_once(|| {
         let bin = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fake-agents");
         fs::create_dir_all(&bin).unwrap();
-        for name in ["claude", "codex", "cursor-agent"] {
+        for name in ["claude", "codex", "cursor-agent", "pi"] {
             // Written aside and renamed: another test binary may be running the old file.
             let tmp = bin.join(format!(".{name}.{}", std::process::id()));
             fs::write(

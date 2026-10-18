@@ -4,13 +4,13 @@ import { hostInvoke } from "../hosts/hostInvoke";
 import { toProjectKey } from "../hosts/projectKey";
 import { latestGate } from "../hosts/requestGate";
 import { useHostsSnapshot } from "../hosts/useHosts";
-import { initialSkillsPanelState, skillsPanelReducer, type SkillsPanelLoaded } from "../hosts/skillsPanelState";
+import { initialSkillsPanelState, skillsPanelReducer, shouldShowClaudeContext, type SkillsPanelLoaded } from "../hosts/skillsPanelState";
 import type { HostId } from "../hosts/types";
 import { Network, User, FolderTree, Puzzle, ChevronRight, Plug, Globe, Terminal as TerminalIcon, Wand2, FolderOpen, Sparkles, Brain, Bot, Slash, Zap, FileText, Layers } from "lucide-react";
-import type { ProjectSkills, Skill, Plugin, McpInfo, ProjectMemories, Memory, SubagentInfo, SlashCommand, HookEntry, ClaudeMdFile, SettingsSource, CodexContext, CursorContext, OpencodeContext, AntigravityContext, AgentContextSection } from "../types";
+import type { ProjectSkills, Skill, Plugin, McpInfo, ProjectMemories, Memory, SubagentInfo, SlashCommand, HookEntry, ClaudeMdFile, SettingsSource, CodexContext, CursorContext, OpencodeContext, AntigravityContext, PiContext, AgentContextSection } from "../types";
 import { useTooltip, useTt, ttProps, TooltipProvider } from "./Tooltip";
 import { MarkdownDialog } from "./MarkdownDialog";
-import { AGENTS, AgentIcon } from "../agents";
+import { AGENTS, AgentIcon, type AgentId } from "../agents";
 
 interface Props {
   projectPath: string;
@@ -20,7 +20,7 @@ interface Props {
   projectName: string;
   // Which agents have sessions in this project — part of the root-section gating (a pure
   // Codex/Cursor project hides the Claude roots and vice versa; see visibility rules below).
-  agentPresence?: { claude: boolean; codex: boolean; cursor: boolean; opencode: boolean; antigravity: boolean };
+  agentPresence?: Partial<Record<AgentId, boolean>>;
 }
 
 function revealFolder(path: string) { invoke("reveal_in_explorer", { path }).catch(() => {}); }
@@ -405,7 +405,7 @@ function sectionIcon(title: string): ReactNode {
   return <Bot size={11} />;
 }
 
-function AgentContextRoot({ title, icon, trustLevel, sections, onOpenDoc }: { title: string; icon: ReactNode; trustLevel: string | null; sections: AgentContextSection[]; onOpenDoc: (path: string, title: string) => void }) {
+function AgentContextRoot({ title, icon, trustLevel, sections, onOpenDoc, hint = "agent" }: { hint?: string; title: string; icon: ReactNode; trustLevel: string | null; sections: AgentContextSection[]; onOpenDoc: (path: string, title: string) => void }) {
   const tt = useTt();
   const total = sections.reduce((sum, sec) => sum + sec.items.length, 0);
   return (
@@ -414,7 +414,7 @@ function AgentContextRoot({ title, icon, trustLevel, sections, onOpenDoc }: { ti
       variant="root"
       icon={icon}
       label={title}
-      sublabel={<span className="tn-hint">agent</span>}
+      sublabel={<span className="tn-hint">{hint}</span>}
       meta={trustLevel ? <span className="tn-tag" {...ttProps(tt, "Project trust level from config.toml")}>{trustLevel}</span> : undefined}
       defaultOpen
     >
@@ -445,7 +445,7 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
   const [stored, dispatch] = useReducer(skillsPanelReducer, key, initialSkillsPanelState);
   if (stored.key !== key) dispatch({ type: "switch", key });
   const st = stored.key === key ? stored : initialSkillsPanelState(key);
-  const { data, codexCtx, cursorCtx, opencodeCtx, antigravityCtx, memories, loading, openMemory, openDoc } = st;
+  const { data, codexCtx, cursorCtx, opencodeCtx, antigravityCtx, piCtx, memories, loading, openMemory, openDoc } = st;
   // Host-scoped (not project-scoped): fetched once per Host, as before.
   const [username, setUsername] = useState("user");
   const [homeDir, setHomeDir] = useState<string>("");
@@ -491,6 +491,8 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
       catch (e) { if (live()) { console.error("[SkillsPanel] cursor context error:", e); put({ cursorCtx: null }); } }
       try { put({ opencodeCtx: await hostInvoke<OpencodeContext>(host, "get_opencode_context", { projectPath }) }); }
       catch (e) { if (live()) { console.error("[SkillsPanel] opencode context error:", e); put({ opencodeCtx: null }); } }
+      try { put({ piCtx: await hostInvoke<PiContext>(host, "get_pi_context", { projectPath }) }); }
+      catch (_) { put({ piCtx: null }); } // optional on older Hosts
       try { put({ antigravityCtx: await hostInvoke<AntigravityContext>(host, "get_antigravity_context", { projectPath }) }); }
       catch (e) { if (live()) { console.error("[SkillsPanel] antigravity context error:", e); put({ antigravityCtx: null }); } }
     })();
@@ -521,17 +523,17 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
   // a pure Codex/Cursor user (no ~/.claude content) never reads Claude vocabulary. The
   // Codex/Cursor roots show only when they actually have context to render — having merely
   // used the agent in this project (or a Codex trust flag) isn't enough to warrant an empty
-  // "Nothing here yet" root. If nothing at all has content, fall back to the Claude roots.
+  // "Nothing here yet" root. Empty Pi presence never falls back to Claude roots.
   const claudeContentCount = data ? data.personal_skills.length + data.project_skills.length + data.plugins.length + data.user_mcps.length + data.project_mcps.length + data.subagents.length + data.slash_commands.length + data.hooks.length + data.claude_md_files.length + data.settings_sources.filter(s => s.exists).length : 0;
   const codexVisible = (codexCtx?.sections.length ?? 0) > 0;
   const cursorVisible = (cursorCtx?.sections.length ?? 0) > 0;
   const opencodeVisible = (opencodeCtx?.sections.length ?? 0) > 0;
   const antigravityVisible = (antigravityCtx?.sections.length ?? 0) > 0;
-  let claudeVisible = claudeContentCount + memories.items.length > 0 || !!agentPresence?.claude;
-  if (!claudeVisible && !codexVisible && !cursorVisible && !opencodeVisible && !antigravityVisible) claudeVisible = true;
+  const piVisible = !!piCtx && (piCtx.present || piCtx.sections.length > 0 || !!agentPresence?.pi);
+  const claudeVisible = shouldShowClaudeContext(claudeContentCount + memories.items.length > 0, codexVisible || cursorVisible || opencodeVisible || antigravityVisible || piVisible, agentPresence, !!piCtx?.present);
   // When Claude shares the tree with another agent, its roots name their agent in the hint
   // so the grouping is unambiguous; single-agent trees stay free of agent labels.
-  const claudeHintSuffix = claudeVisible && (codexVisible || cursorVisible || opencodeVisible || antigravityVisible) ? ` · ${AGENTS.claude.label}` : "";
+  const claudeHintSuffix = claudeVisible && (codexVisible || cursorVisible || opencodeVisible || antigravityVisible || piVisible) ? ` · ${AGENTS.claude.label}` : "";
 
   return (
     <TooltipProvider tt={tt}>
@@ -612,6 +614,9 @@ export function SkillsPanel({ projectPath, host, projectName, agentPresence }: P
                 sections={opencodeCtx.sections}
                 onOpenDoc={(path, title) => setOpenDoc({ path, title })}
               />
+            )}
+            {piVisible && piCtx && (
+              <AgentContextRoot title={AGENTS.pi.label} icon={<AgentIcon agent="pi" size={12} className="tn-agent-icon-neutral" />} hint="conventional files" trustLevel={null} sections={piCtx.sections} onOpenDoc={(path, title) => setOpenDoc({ path, title })} />
             )}
             {antigravityVisible && antigravityCtx && (
               <AgentContextRoot

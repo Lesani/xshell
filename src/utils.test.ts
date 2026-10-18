@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { normalizePath, processSessions, timeAgo } from "./utils";
+import { normalizePath, normalizeProjectPath, processSessions, timeAgo, sessionMessageLabel } from "./utils";
 import type { SessionInfo } from "./types";
 
 function session(overrides: Partial<SessionInfo>): SessionInfo {
@@ -93,4 +93,19 @@ describe("processSessions", () => {
     processSessions(input);
     expect(input).toEqual(before);
   });
+});
+
+it("project path normalization preserves Unix case and Windows spelling equivalence", () => {
+  expect(normalizeProjectPath("/Project/")).toBe("/Project");
+  expect(normalizeProjectPath("/Project")).not.toBe(normalizeProjectPath("/project"));
+  expect(normalizeProjectPath("//Project/A")).not.toBe(normalizeProjectPath("//project/a"));
+  expect(normalizeProjectPath("C:\\Work\\PROJECT")).toBe(normalizeProjectPath("c:/work/project/"));
+  expect(normalizeProjectPath("\\\\Host\\Share\\Project")).toBe(normalizeProjectPath("//host/share/project/"));
+  expect(normalizeProjectPath("/")).toBe("/");
+});
+
+it("Pi total-message counts are not labeled as user messages", () => {
+  expect(sessionMessageLabel({ agent: "pi", message_count: 2 })).toBe("2 messages");
+  expect(sessionMessageLabel({ agent: "pi", message_count: 1 })).toBe("1 message");
+  expect(sessionMessageLabel({ agent: "claude", message_count: 1 })).toBe("1 user message");
 });

@@ -670,3 +670,35 @@ describe("migrationNotice", () => {
     expect(migrationNotice(3)).toBe("3 restored tabs couldn't move to xshell's local terminal service. They'll run the old way for now. xshell retries next start.");
   });
 });
+
+describe("Pi project-scoped migration identity", () => {
+  beforeEach(() => { lockState.holder = null; });
+  const tabs = [
+    legacy("pi-a", "custom", { agent: "pi", projectPath: "/A" }),
+    legacy("pi-b", "custom", { agent: "pi", projectPath: "/B" }),
+    legacy("claude", "custom", { agent: "claude", projectPath: "/A" }),
+  ];
+  it("does not collapse Pi custom IDs across Projects or Claude", () => {
+    const input = { saved: tabs, live: [], uuidOf: uuidOf(tabs), now: 1, ...settings };
+    expect(planLocalMigration(input).ops).toHaveLength(3);
+    expect(dedupeBySession([...tabs, { ...tabs[0], id: "duplicate" }])).toEqual({ keep: tabs, dups: [{ ...tabs[0], id: "duplicate" }] });
+    const plan = planLocalMigration({ ...input, live: [info("running-a", 1, { agent: "pi", sessionId: "custom", cwd: "/A" })] });
+    expect(plan.target["pi-a"]).toBe("running-a");
+    expect(plan.ops.map(o => o.fromId)).toEqual(["pi-b", "claude"]);
+  });
+
+  it("offline cached ownership only holds the matching Pi Project", async () => {
+    const disk: Disk = { open_tabs: tabs };
+    const result = await instance("pi-test", disk, new FakeDaemon(), { ready: async () => null, cached: () => [info("running-a", 1, { agent: "pi", sessionId: "custom", cwd: "/A" })] }).start();
+    expect(result.heldBack).toEqual([tabs[0]]);
+    expect(result.inProcess).toEqual([tabs[1], tabs[2]]);
+  });
+
+  it("normalizes Pi Windows cwd spelling, not Unix case", () => {
+    const w = legacy("windows", "custom", { agent: "pi", projectPath: "C:\\Work\\Proj" });
+    const d = { ...w, id: "duplicate", projectPath: "c:/work/proj/" };
+    expect(dedupeBySession([w, d]).dups).toEqual([d]);
+    expect(dedupeBySession([tabs[0], { ...tabs[0], id: "case", projectPath: "/a" }]).keep).toHaveLength(2);
+    expect(planLocalMigration({ saved: [w], live: [info("w", 1, { agent: "pi", sessionId: "custom", cwd: "c:/work/proj/" })], uuidOf: uuidOf([w]), now: 1, ...settings }).target.windows).toBe("w");
+  });
+});

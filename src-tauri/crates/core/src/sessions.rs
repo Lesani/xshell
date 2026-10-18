@@ -73,6 +73,16 @@ pub fn valid_session_id(s: &str) -> bool {
 }
 
 pub fn get_sessions(ctx: &HostCtx, encoded_name: String) -> Vec<SessionInfo> {
+    get_sessions_for_project(ctx, encoded_name, None)
+}
+
+/// Raw project paths disambiguate Pi's Windows-equivalent cwd spellings. Other agents
+/// retain their encoded-name filtering; older callers retain Pi's encoded fallback.
+pub fn get_sessions_for_project(
+    ctx: &HostCtx,
+    encoded_name: String,
+    project_path: Option<&str>,
+) -> Vec<SessionInfo> {
     let mut sessions: Vec<SessionInfo> = vec![];
 
     // Claude sessions live under ~/.claude/projects/<encoded_name>/. A project can be
@@ -162,6 +172,14 @@ pub fn get_sessions(ctx: &HostCtx, encoded_name: String) -> Vec<SessionInfo> {
             .into_iter()
             .filter(|s| encode_project_name(&s.project_path) == encoded_name),
     );
+
+    let pi_project_key = project_path.map(crate::pi::project_key);
+    sessions.extend(crate::pi::parse_pi_sessions(ctx).into_iter().filter(|s| {
+        pi_project_key.as_ref().map_or_else(
+            || encode_project_name(&s.project_path) == encoded_name,
+            |key| crate::pi::project_key(&s.project_path) == *key,
+        )
+    }));
 
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     sessions
@@ -257,6 +275,8 @@ pub fn get_all_recent_sessions(ctx: &HostCtx, limit: usize) -> Vec<SessionInfo> 
     // Antigravity conversations across all workspaces — same recency pool.
     all_sessions.extend(parse_antigravity_sessions(ctx));
 
+    all_sessions.extend(crate::pi::parse_pi_sessions(ctx));
+
     all_sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     all_sessions.truncate(limit);
     all_sessions
@@ -325,6 +345,13 @@ mod tests {
         );
     }
 
+    fn pi_session(fx: &Fixture, cwd: &str, sid: &str, ts: &str) {
+        fx.write_jsonl(
+            format!("home/.pi/agent/sessions/group/{sid}.jsonl"),
+            &[json!({"type":"session", "version":3,"id":sid,"cwd":cwd,"timestamp":ts})],
+        );
+    }
+
     // opencode.db with the two tables parse_opencode_sessions reads.
     fn opencode_db(fx: &Fixture, rows: &[(&str, &str, i64)]) {
         let dir = fx.home().join(".local/share/opencode");
@@ -370,16 +397,19 @@ mod tests {
                 ("oc-other", "/work/beta", 1_767_744_000_000),
             ],
         );
+        pi_session(&fx, cwd, "pi-1", "2026-01-05T00:00:00Z");
+        pi_session(&fx, "/work/beta", "pi-other", "2026-01-08T00:00:00Z");
         let got = get_sessions(&fx.ctx(), encode_project_name(cwd));
         assert_eq!(
             ids(&got),
             vec![
+                ("pi-1", "pi"),
                 ("codex-1", "codex"),
                 ("oc-1", "opencode"),
                 ("claude-1", "claude")
             ]
         );
-        assert_eq!(got[1].timestamp, "2026-01-03T00:00:00Z");
+        assert_eq!(got[2].timestamp, "2026-01-03T00:00:00Z");
     }
 
     #[test]
@@ -389,11 +419,12 @@ mod tests {
         claude_session(&fx, "/work/alpha", "s-mid", "2026-01-02T10:00:00Z");
         claude_session(&fx, "/work/beta", "s-new", "2026-01-03T10:00:00Z");
         codex_session(&fx, "/work/gamma", "codex-x", "2026-01-02T12:00:00Z");
+        pi_session(&fx, "/work/pi", "pi-latest", "2026-01-04T00:00:00Z");
         let ctx = fx.ctx();
         assert_eq!(
             ids(&get_all_recent_sessions(&ctx, 2)),
-            vec![("s-new", "claude"), ("codex-x", "codex")]
+            vec![("pi-latest", "pi"), ("s-new", "claude")]
         );
-        assert_eq!(get_all_recent_sessions(&ctx, 100).len(), 4);
+        assert_eq!(get_all_recent_sessions(&ctx, 100).len(), 5);
     }
 }

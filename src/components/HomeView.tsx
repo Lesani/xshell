@@ -1,3 +1,4 @@
+import { dailyCostSeries, dailyTokensSeries, hasRecordedCost, projectUsage, type SeriesPoint } from "../hosts/projectUsage";
 import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { FolderPlus, Plus, Trash2, GitBranch, Search, ArrowRight, ArrowUp, Pencil, Folder as FolderIcon, ChevronRight, X, FolderOpen, MessageSquare, Sparkles, AlertTriangle } from "lucide-react";
@@ -5,11 +6,11 @@ import { SkillsPanel } from "./SkillsPanel";
 import { ClaudeChatIcon } from "./ClaudeChatIcon";
 import { AGENTS, AgentIcon } from "../agents";
 import { ttProps } from "./Tooltip";
-import { timeAgo, processSessions } from "../utils";
+import { timeAgo, processSessions, sessionMessageLabel } from "../utils";
 import { useProjectImage } from "../hooks/useProjectImage";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo } from "../types";
-import { keyOf, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
+import { keyOf, lookupKey, sessionKeyOf, sessionFolderId, type ProjectKey } from "../hosts/projectKey";
 import { HostBadge } from "./HostBadge";
 import { registry } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
@@ -128,68 +129,12 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
-// A point in either a single-band (cost) or multi-band (tokens) series. `values` indexes
-// match the `bandLabels` passed to MetricAreaChart — for cost that's a single $ band, for
-// tokens it's [cache_read, cache_creation, input, output] in cost-impact order so the
-// cheapest band sits visually at the bottom and pricier bands stack above.
-type SeriesPoint = { date: string; values: number[] };
 
 // Token band ordering used everywhere downstream — chart bands, legend chips, hover tooltip.
 // Bottom→top in cost-impact order so the cheapest category forms the base of the stack and
 // the most expensive sits visually on top of the pile.
 const TOKEN_BAND_CLASSES = ["trend-band-cache-read", "trend-band-cache-creation", "trend-band-input", "trend-band-output"];
 const TOKEN_BAND_LABELS  = ["Cache read", "Cache creation", "Input", "Output"];
-
-// Aggregate per-day cost across a project's sessions and produce a continuous N-day series
-// (oldest → newest, missing days = 0). The hook only stores days that had spending, so we
-// pad zeros for quiet days — that's what makes the trendline read as a real trend rather
-// than a few disconnected pillars.
-function dailyCostSeries(sessions: SessionInfo[], days: number): SeriesPoint[] {
-  const byDate = new Map<string, number>();
-  for (const s of sessions) {
-    if (!s.daily_cost) continue;
-    for (const [date, usd] of Object.entries(s.daily_cost)) {
-      byDate.set(date, (byDate.get(date) || 0) + usd);
-    }
-  }
-  return paddedSeries(byDate, days, (v) => [v ?? 0]);
-}
-
-// Same shape as dailyCostSeries but with four token bands per day. Source is the JSONL-derived
-// daily_tokens map on each session — independent of the xshell-stats hook, so it works even
-// for users without the hook installed. Reorder Rust's [input, cache_creation, cache_read,
-// output] tuple into [cache_read, cache_creation, input, output] for visual cost-impact order.
-function dailyTokensSeries(sessions: SessionInfo[], days: number): SeriesPoint[] {
-  const byDate = new Map<string, [number, number, number, number]>();
-  for (const s of sessions) {
-    if (!s.daily_tokens) continue;
-    for (const [date, t] of Object.entries(s.daily_tokens)) {
-      const cur = byDate.get(date) || [0, 0, 0, 0];
-      // Rust order: [input, cache_creation, cache_read, output] →
-      // chart order: [cache_read, cache_creation, input, output]
-      cur[0] += t[2] || 0;
-      cur[1] += t[1] || 0;
-      cur[2] += t[0] || 0;
-      cur[3] += t[3] || 0;
-      byDate.set(date, cur);
-    }
-  }
-  return paddedSeries(byDate, days, (v) => v ?? [0, 0, 0, 0]);
-}
-
-// Common pad-with-zeros loop shared by both daily series.
-function paddedSeries<T>(byDate: Map<string, T>, days: number, fill: (v: T | undefined) => number[]): SeriesPoint[] {
-  const out: SeriesPoint[] = [];
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setUTCDate(today.getUTCDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    out.push({ date: key, values: fill(byDate.get(key)) });
-  }
-  return out;
-}
 
 // Format a YYYY-MM-DD key as a short user-facing label like "Apr 27".
 function shortDate(iso: string): string {
@@ -384,12 +329,9 @@ function SessionRow({ session, isOpen, groupName, onClick, isDragging, onPointer
   // Color the context bar green/yellow/red based on how close we are to the limit — same
   // thresholds Claude's own `/status` output uses loosely: <60% fine, 60-85% warn, >85% hot.
   const contextLevel = contextPct >= 85 ? "hot" : contextPct >= 60 ? "warn" : "ok";
-  // Cost is only ever shown when the xshell-stats statusline hook is configured — that's
-  // the single authoritative source (Claude Code's own running total for the session,
-  // including system-prompt + tools tokens). Without the hook there's nothing to show, so
-  // the row hides cost + context entirely. Model + msg count + branch still show since
-  // those come straight from the JSONL. Rate-limit usage lives once in the sidebar.
-  const showCostContext = session.is_authoritative_stats && showMetrics;
+  // Claude uses hook totals; Pi uses recorded session usage. Unknown context limits
+  // never become a fabricated percentage. Model/message metadata remains independent.
+  const showCostContext = hasRecordedCost(session) && showMetrics;
   const hasMetrics = !!session.model || session.message_count > 0 || (showCostContext && (session.context_tokens > 0 || session.cost_usd > 0));
   return (
     <div className={`session-item ${isDragging ? "session-dragging" : ""}`} onClick={onClick} onPointerDown={onPointerDownDrag} onContextMenu={(e) => { if (onAddAsTab && !isOpen) { e.preventDefault(); onAddAsTab(); } }}>
@@ -407,8 +349,8 @@ function SessionRow({ session, isOpen, groupName, onClick, isDragging, onPointer
         {hasMetrics && (
           <div className="session-item-metrics">
             {modelLabel && <span className={`session-model-badge session-model-${tier}`} onMouseEnter={(e) => tt?.showTt(session.model, e.currentTarget)} onMouseLeave={() => tt?.hideTt()}><Sparkles size={9} />{modelLabel}</span>}
-            {session.message_count > 0 && <span className="session-metric" onMouseEnter={(e) => tt?.showTt(`${session.message_count} user message${session.message_count === 1 ? "" : "s"}`, e.currentTarget)} onMouseLeave={() => tt?.hideTt()}><MessageSquare size={9} />{session.message_count}</span>}
-            {showCostContext && session.context_tokens > 0 && (
+            {session.message_count > 0 && <span className="session-metric" onMouseEnter={(e) => tt?.showTt(sessionMessageLabel(session), e.currentTarget)} onMouseLeave={() => tt?.hideTt()}><MessageSquare size={9} />{session.message_count}</span>}
+            {showCostContext && session.context_tokens > 0 && session.context_limit > 0 && (
               <span className={`session-metric session-metric-ctx`} onMouseEnter={(e) => tt?.showTt(`${session.context_tokens.toLocaleString()} / ${session.context_limit.toLocaleString()} tokens (${contextPct}%)`, e.currentTarget)} onMouseLeave={() => tt?.hideTt()}>
                 <span className={`session-ctx-bar session-ctx-${contextLevel}`}>
                   <span className="session-ctx-fill" style={{ width: `${contextPct}%` }} />
@@ -416,7 +358,7 @@ function SessionRow({ session, isOpen, groupName, onClick, isDragging, onPointer
                 {contextPct}%
               </span>
             )}
-            {showCostContext && session.cost_usd > 0 && <span className="session-metric session-cost" onMouseEnter={(e) => tt?.showTt("Cost reported by Claude Code", e.currentTarget)} onMouseLeave={() => tt?.hideTt()}>{formatCost(session.cost_usd)}</span>}
+            {showCostContext && session.cost_usd > 0 && <span className="session-metric session-cost" onMouseEnter={(e) => tt?.showTt(session.agent === "pi" ? "Recorded Pi usage cost (not estimated)" : "Cost reported by Claude Code", e.currentTarget)} onMouseLeave={() => tt?.hideTt()}>{formatCost(session.cost_usd)}</span>}
           </div>
         )}
       </div>
@@ -455,24 +397,11 @@ function SearchBar({ value, onChange, placeholder, onFocus, onBlur }: { value: s
 
 // Replaces the old "Continue where you left" cards with a slim stats overview: a daily area
 // chart on the left, and two tiles on the right (Total + Messages). The chart + total tile
-// switch between Cost and Tokens via the segmented control. Cost mode is double-gated (hook
-// data + the "Cost chart on project page" setting); Tokens mode is JSONL-only and always
+// switch between recorded Cost and Tokens via the segmented control. Cost follows the
+// "Cost chart on project page" setting; Tokens mode is JSONL-only and always
 // available when the project has any usage.
 function ProjectStatsPanel({ sessions, view, onChangeView, costAllowed, tt }: { sessions: SessionInfo[]; view: 'cost' | 'tokens'; onChangeView: (v: 'cost' | 'tokens') => void; costAllowed: boolean; tt?: TtFns }) {
-  const totalCost = sessions.reduce((sum, s) => sum + (s.is_authoritative_stats ? s.cost_usd : 0), 0);
-  // Sum the four token categories across every session for the Total tile and the toggle gate.
-  // Indexing follows the Rust SessionInfo field order: [input, cache_creation, cache_read, output].
-  const tokenTotals = sessions.reduce(
-    (acc, s) => {
-      acc[0] += s.total_input_tokens || 0;
-      acc[1] += s.total_cache_creation_tokens || 0;
-      acc[2] += s.total_cache_read_tokens || 0;
-      acc[3] += s.total_output_tokens || 0;
-      return acc;
-    },
-    [0, 0, 0, 0],
-  );
-  const totalTokens = tokenTotals[0] + tokenTotals[1] + tokenTotals[2] + tokenTotals[3];
+  const { totalCost, tokenTotals, totalTokens, costSessionCount, costLabel, hasCostSource, offersCost } = projectUsage(sessions);
   // Per-band visibility for the tokens chart legend. Click a chip to mute its band — handy
   // when one category dominates the stack and hides the smaller bands. Reset on session set
   // changes would surprise users mid-toggle, so it survives across re-renders.
@@ -484,7 +413,7 @@ function ProjectStatsPanel({ sessions, view, onChangeView, costAllowed, tt }: { 
     if (!next.some(Boolean)) return prev.map(() => true);
     return next;
   });
-  // Cost mode is double-gated: needs both authoritative hook data AND the user-level setting.
+  // Cost mode needs recorded costs (Pi usage or Claude hook) and the user-level setting.
   // Tokens mode just needs JSONL usage. Hide the panel entirely when neither has anything.
   const costAvailable = totalCost > 0 && costAllowed;
   const tokensAvailable = totalTokens > 0;
@@ -492,28 +421,15 @@ function ProjectStatsPanel({ sessions, view, onChangeView, costAllowed, tt }: { 
 
   const totalMessages = sessions.reduce((sum, s) => sum + (s.message_count || 0), 0);
 
-  // Cost is a Claude-only concept (Codex/Cursor have no per-use cost locally), so a project
-  // with no Claude sessions drops the Cost/Tokens toggle entirely and always shows tokens —
-  // a non-Claude user never reads Claude setup copy. Mixed projects keep the toggle and the
-  // cost view names its agent so the dollar figure isn't mistaken for a project total.
-  const hasClaudeSessions = sessions.some(s => s.agent === "claude");
-  const hasOtherAgentSessions = sessions.some(s => s.agent !== "claude");
-
-  // Reason the Cost button is disabled — surfaced as a tooltip so the user knows what to
-  // change to unlock it. We can tell the three causes apart from session data + the costAllowed
-  // prop: if no Claude session has hook data the user hasn't connected (Codex sessions are
-  // authoritative too but never carry cost, so they don't count here), otherwise it's either
-  // the setting being off or just no recorded cost yet.
-  const hasAuthoritativeData = sessions.some(s => s.agent === "claude" && s.is_authoritative_stats);
   const costDisabledReason = !costAvailable
-    ? !hasAuthoritativeData
+    ? !hasCostSource
       ? "Connect Claude Code in Settings → Agents"
       : !costAllowed
         ? "Enable “Cost chart on project page” in Settings → Agents"
         : "No recorded cost yet for this project"
     : null;
 
-  const effectiveView: 'cost' | 'tokens' = !hasClaudeSessions ? 'tokens'
+  const effectiveView: 'cost' | 'tokens' = !offersCost ? 'tokens'
     : view === 'cost' && !costAvailable ? 'tokens'
     : view === 'tokens' && !tokensAvailable ? 'cost'
     : view;
@@ -524,9 +440,9 @@ function ProjectStatsPanel({ sessions, view, onChangeView, costAllowed, tt }: { 
         <div className="project-stats-chart">
           <div className="project-stats-section-row">
             <div className="project-stats-section-label">
-              {effectiveView === 'cost' ? `Daily cost${hasOtherAgentSessions ? " (Claude Code)" : ""} · last 30 days` : 'Daily tokens · last 30 days'}
+              {effectiveView === 'cost' ? `${costLabel} · last 30 days` : 'Daily tokens · last 30 days'}
             </div>
-            {hasClaudeSessions && <div className="metric-toggle" role="tablist" aria-label="Stats metric">
+            {offersCost && <div className="metric-toggle" role="tablist" aria-label="Stats metric">
               {/* Wrap the disabled Cost button in a span — disabled buttons swallow mouse
                   events on most browsers, so the tooltip would never fire from the button
                   itself. The span captures hover and forwards the disabled-reason text. */}
@@ -577,7 +493,7 @@ function ProjectStatsPanel({ sessions, view, onChangeView, costAllowed, tt }: { 
         </div>
         <div className="project-stats-tiles">
           {effectiveView === 'cost' ? (
-            <Tile label="Total" value={formatCost(totalCost)} sub={`across ${sessions.length} session${sessions.length === 1 ? "" : "s"}`} accent="success" />
+            <Tile label="Total" value={formatCost(totalCost)} sub={`recorded in ${costSessionCount} session${costSessionCount === 1 ? "" : "s"}`} accent="success" />
           ) : (
             <Tile
               label="Total"
@@ -668,8 +584,8 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
   const [showAllProjects, setShowAllProjects] = useState(false);
 
   // Row metrics are toggled per agent: Claude's setting is hook-gated, Codex's and
-  // opencode's read their own files directly — each session row follows its agent's toggle.
-  const metricsForSession = (s: SessionInfo) => s.agent === "codex" ? showSessionRowMetricsCodex : s.agent === "opencode" ? showSessionRowMetricsOpencode : showSessionRowMetrics;
+  // opencode's read their own files directly. Pi shows recorded metrics without a hook.
+  const metricsForSession = (s: SessionInfo) => s.agent === "pi" ? true : s.agent === "codex" ? showSessionRowMetricsCodex : s.agent === "opencode" ? showSessionRowMetricsOpencode : showSessionRowMetrics;
 
   // Live-read folders for the selected project. A new array identity only when it actually changes.
   const folders: SessionFolder[] = useMemo(() => {
@@ -757,7 +673,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
         suppressedClick = true;
         document.body.style.userSelect = "none";
         document.body.style.cursor = "grabbing";
-        setDragState({ sessionId: session.id, sourceFolderId, hoverFolderId: undefined, pos: { x: ev.clientX, y: ev.clientY }, offset, active: true, title: session.title });
+        setDragState({ sessionId: sessionFolderId(session), sourceFolderId, hoverFolderId: undefined, pos: { x: ev.clientX, y: ev.clientY }, offset, active: true, title: session.title });
       }
       if (active) {
         const hover = findDropFolder(ev.clientX, ev.clientY);
@@ -771,7 +687,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
       document.body.style.cursor = "";
       if (active) {
         const hover = findDropFolder(ev.clientX, ev.clientY);
-        if (hover !== undefined && hover !== sourceFolderId) handleMoveSession(session.id, sourceFolderId, hover);
+        if (hover !== undefined && hover !== sourceFolderId) handleMoveSession(sessionFolderId(session), sourceFolderId, hover);
         setDragState(null);
       }
       // Prevent the synthetic click that pointerup triggers when we intended a drag
@@ -793,11 +709,11 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
   if (selectedProject) {
     const sortedAll = sortWithOpen(projectSessions, openSessionIds);
     const filteredAll = filterSessions(sortedAll, search);
-    const sessionById = new Map(projectSessions.map(s => [s.id, s]));
+    const sessionById = new Map(projectSessions.map(s => [sessionFolderId(s), s]));
 
     // Split into: categorized (inside folders) vs ungrouped
     const categorized = getCategorizedIds(folders);
-    const ungrouped = sortedAll.filter(s => !categorized.has(s.id));
+    const ungrouped = sortedAll.filter(s => !categorized.has(sessionFolderId(s)));
 
     // When searching we flatten — folders are a long-term organization tool, not a filter layer.
     const isSearching = search.trim().length > 0;
@@ -895,7 +811,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                             {folderSessions.length === 0 ? (
                               <div className="folder-empty">Drop sessions here</div>
                             ) : folderSessions.map(session => (
-                              <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, folder.id)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
+                              <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === sessionFolderId(session)} onPointerDownDrag={(e) => startSessionDrag(e, session, folder.id)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
                             ))}
                           </div>
                         </div>
@@ -916,7 +832,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
                 ) : (
                   <div className="session-list">
                     {ungrouped.map(session => (
-                      <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === session.id} onPointerDownDrag={(e) => startSessionDrag(e, session, null)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
+                      <SessionRow key={sessionKeyOf(session)} session={session} isOpen={openSessionIds.has(sessionKeyOf(session))} groupName={sessionGroupName?.[sessionKeyOf(session)]} onClick={() => onOpenSession(session, selectedProject)} isDragging={dragState?.active && dragState.sessionId === sessionFolderId(session)} onPointerDownDrag={(e) => startSessionDrag(e, session, null)} onAddAsTab={() => onOpenSessionBackground(session, selectedProject)} tt={tt} showMetrics={metricsForSession(session)} />
                     ))}
                   </div>
                 )}
@@ -951,7 +867,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
           );
         })()}
         </div>
-        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} host={selectedProject.host} projectName={projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity") }} />}
+        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} host={selectedProject.host} projectName={projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity"), pi: projectSessions.some(s => s.agent === "pi") }} />}
       </div>
     );
   }

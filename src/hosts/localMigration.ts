@@ -1,4 +1,5 @@
 import type { Group, LayoutNode, Tab } from "../types";
+import { scopedSessionKey } from "./projectKey";
 import { collectLeafIds } from "../layout";
 import { remoteTabId } from "./reconcile";
 import { fmt } from "./strings";
@@ -18,7 +19,8 @@ import { isHostError, SESSION_CLOSING, SESSION_OPEN, type LaunchSpec, type Termi
 export const isLegacyLocal = (t: Tab): boolean => !!(t.sessionId && t.projectPath && !t.host && !t.terminal);
 
 const agentOf = (t: Tab): string => t.agent ?? "claude";
-const sessionKey = (agent: string | null | undefined, sid: string) => `${agent || "claude"}\u0000${sid}`;
+const sessionKey = (agent: string | null | undefined, sid: string, cwd?: string) =>
+  agent === "pi" ? scopedSessionKey(undefined, agent, sid, cwd) : `${agent || "claude"}\u0000${sid}`;
 
 export interface MigrationOp {
   fromId: string;
@@ -53,16 +55,16 @@ export function migrationSpec(t: Tab, o: { fullscreenRendering: boolean; forceSy
 
 export function planLocalMigration(i: PlanInput): MigrationPlan {
   const listed = new Set(i.live.map(x => x.terminal));
-  // (agent, session) → the Terminal reserved for it: listed ones first, then this batch's.
+  // Agent/session (plus Pi cwd) → reserved Terminal: listed first, then this batch.
   const owner = new Map<string, string>();
-  for (const x of i.live) if (x.spec.sessionId) { const k = sessionKey(x.spec.agent, x.spec.sessionId); if (!owner.has(k)) owner.set(k, x.terminal); }
+  for (const x of i.live) if (x.spec.sessionId) { const k = sessionKey(x.spec.agent, x.spec.sessionId, x.spec.cwd); if (!owner.has(k)) owner.set(k, x.terminal); }
   const ops: MigrationOp[] = [];
   const target: Record<string, string> = {};
   for (const t of i.saved) {
     if (!isLegacyLocal(t)) continue;
     const uuid = i.uuidOf[t.id];
     if (!uuid) continue;
-    const k = sessionKey(t.agent, t.sessionId!);
+    const k = sessionKey(t.agent, t.sessionId!, t.projectPath);
     if (listed.has(uuid)) { target[t.id] = uuid; continue; }
     const other = owner.get(k);
     if (other) { target[t.id] = other; continue; }
@@ -295,12 +297,12 @@ export const NO_MIGRATION: MigrationOutcome = { inProcess: [], migrated: [], hel
 
 export interface MigrationSettings { fullscreenRendering: boolean; forceSyncOutput: boolean }
 
-// One Tab per (agent, session); the others are returned as duplicates (M6).
+// One Tab per agent/session (plus Pi cwd); the others are duplicates (M6).
 export function dedupeBySession(tabs: Tab[]): { keep: Tab[]; dups: Tab[] } {
   const seen = new Set<string>();
   const keep: Tab[] = [], dups: Tab[] = [];
   for (const t of tabs) {
-    const k = sessionKey(t.agent, t.sessionId ?? "");
+    const k = sessionKey(t.agent, t.sessionId ?? "", t.projectPath);
     if (seen.has(k)) dups.push(t); else { seen.add(k); keep.push(t); }
   }
   return { keep, dups };
@@ -322,7 +324,7 @@ export async function migrateLocalTabs(snapshot: StoreState, settings: Migration
   }
 }
 
-const sessionOf = (t: Tab) => sessionKey(t.agent, t.sessionId ?? "");
+const sessionOf = (t: Tab) => sessionKey(t.agent, t.sessionId ?? "", t.projectPath);
 
 async function migrate(settings: MigrationSettings, deps: MigrationDeps): Promise<MigrationOutcome> {
   // M5: another instance is migrating, or runs these Tabs in-process: leave them alone, and
@@ -358,7 +360,7 @@ async function migrate(settings: MigrationSettings, deps: MigrationDeps): Promis
     // session) run in-process this run. The lock stays held so no other instance opens
     // these sessions meanwhile, and the journal stays as it is.
     const cached = deps.cached();
-    const running = new Set((cached ?? []).filter(i => i.spec.sessionId).map(i => sessionKey(i.spec.agent, i.spec.sessionId!)));
+    const running = new Set((cached ?? []).filter(i => i.spec.sessionId).map(i => sessionKey(i.spec.agent, i.spec.sessionId!, i.spec.cwd)));
     const mayExist = (t: Tab) => sent.has(t.id) || running.has(sessionOf(t));
     const { keep, dups } = dedupeBySession(legacy.filter(t => !mayExist(t)));
     const heldBack = legacy.filter(t => mayExist(t) || dups.includes(t));

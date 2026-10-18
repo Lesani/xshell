@@ -2074,9 +2074,12 @@ impl Terminal {
     }
 
     /// Whether this Terminal's current spec runs `agent`'s session `sid`
-    /// (`LaunchSpec::agent_session`).
-    pub fn runs_session(&self, agent: &str, sid: &str) -> bool {
-        self.record.lock().unwrap().spec.agent_session() == Some((agent, sid))
+    /// (`LaunchSpec::agent_session`). Only Pi additionally scopes the ID to `cwd`.
+    pub fn runs_session(&self, agent: &str, sid: &str, cwd: &str) -> bool {
+        let r = self.record.lock().unwrap();
+        r.spec.agent_session() == Some((agent, sid))
+            && (agent != "pi"
+                || xshell_core::pi::project_key(&r.spec.cwd) == xshell_core::pi::project_key(cwd))
     }
 
     /// How this Terminal holds its session now. Locks `life` alone.

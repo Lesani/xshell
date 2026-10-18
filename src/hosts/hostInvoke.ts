@@ -62,7 +62,13 @@ async function remoteCall<T>(host: HostId, cmd: HostMethod, args: Record<string,
     return { value, stale: false, at: Date.now() };
   } catch (e) {
     if (isHostError(e) && e.code !== "remote" && allowCache && cacheable && FALLBACK_CODES.has(e.code)) {
-      const hit = cache.get(host, cmd, args);
+      let hit = cache.get(host, cmd, args);
+      // projectPath is an additive history qualifier. Keep pre-update offline history
+      // usable until a live qualified read fills its new cache entry.
+      if (!hit && cmd === "get_sessions" && typeof args?.projectPath === "string") {
+        const { projectPath: _projectPath, ...legacyArgs } = args;
+        hit = cache.get(host, cmd, legacyArgs);
+      }
       if (hit) {
         setStale(sk, true);
         return { value: hit.v as T, stale: true, at: hit.at };

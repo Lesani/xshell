@@ -1,3 +1,4 @@
+import { PiIcon } from "./components/PiIcon";
 import { ClaudeChatIcon } from "./components/ClaudeChatIcon";
 import { OpenAIIcon } from "./components/OpenAIIcon";
 import { CursorIcon } from "./components/CursorIcon";
@@ -10,7 +11,7 @@ import { AntigravityIcon } from "./components/AntigravityIcon";
 // parsing in lib.rs, and allowlisting its binary in detect_agent_binary — the UI surfaces
 // (session rows, dropdowns, pickers, settings) all render from here.
 
-export type AgentId = "claude" | "codex" | "cursor" | "opencode" | "antigravity";
+export type AgentId = "claude" | "codex" | "cursor" | "opencode" | "antigravity" | "pi";
 
 export interface AgentMeta {
   id: AgentId;
@@ -31,11 +32,13 @@ export const AGENTS: Record<AgentId, AgentMeta> = {
   cursor: { id: "cursor", label: "Cursor",      binary: "cursor-agent", tagline: "Cursor's coding agent CLI",    neutralIcon: false, bypassFlag: false },
   opencode: { id: "opencode", label: "opencode", binary: "opencode",    tagline: "The open-source coding agent CLI", neutralIcon: true, bypassFlag: false },
   antigravity: { id: "antigravity", label: "Antigravity", binary: "agy", tagline: "Google's coding agent CLI",       neutralIcon: false, bypassFlag: false },
+  pi: { id: "pi", label: "Pi", binary: "pi", tagline: "Pi 1.3+ coding agent CLI", neutralIcon: true, bypassFlag: false },
 };
 
 export const AGENT_IDS = Object.keys(AGENTS) as AgentId[];
 
 export function AgentIcon({ agent, size = 14, className }: { agent: AgentId | undefined; size?: number; className?: string }) {
+  if (agent === "pi") return <PiIcon size={size} className={className} />;
   if (agent === "codex") return <OpenAIIcon size={size} className={className} />;
   if (agent === "cursor") return <CursorIcon size={size} className={className} />;
   if (agent === "opencode") return <OpencodeIcon size={size} className={className} />;

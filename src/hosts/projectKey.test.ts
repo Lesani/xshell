@@ -89,3 +89,12 @@ describe("picker checked state (amendment 25)", () => {
     expect(isPinned(["/home/u/p"], "h_ab12cd34", "/home/u/p")).toBe(false);
   });
 });
+
+it("Pi session keys scope custom IDs by agent, Host and normalized Project path", () => {
+  const pi = { id: "custom", agent: "pi", project_path: "/Project" };
+  expect(sessionKeyOf(pi)).toBe(sessionKeyOfTab({ agent: "pi", sessionId: "custom", projectPath: "/Project" }));
+  expect(sessionKeyOf(pi)).not.toBe(sessionKeyOf({ ...pi, project_path: "/project" }));
+  expect(sessionKeyOf(pi)).not.toBe(sessionKeyOf({ ...pi, agent: "claude" }));
+  expect(sessionKeyOf(pi)).not.toBe(sessionKeyOf({ ...pi, host: "h_ab12cd34" }));
+  expect(sessionKeyOf({ ...pi, project_path: "C:\\Work\\P" })).toBe(sessionKeyOf({ ...pi, project_path: "c:/work/p/" }));
+});

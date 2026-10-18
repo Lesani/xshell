@@ -176,3 +176,53 @@ describe("local Daemon mode (ADR-0005): new Local Tabs are Daemon Terminals", ()
     }
   });
 });
+
+describe("Pi exact project session identity", () => {
+  it("local Pi chat preallocates exact session UUID", () => {
+    const uuid = vi.fn().mockReturnValueOnce("session-id").mockReturnValueOnce("terminal-id");
+    const plan = planNewChat(project, "pi", ctx({ uuid }));
+    expect(plan).toMatchObject({ kind: "create", tab: { id: "terminal-new-terminal-id", agent: "pi", sessionId: "session-id", projectPath: project.path } });
+  });
+
+  it("remote Pi separates session UUID from terminal UUID", () => {
+    for (const p of [remoteProject, project]) {
+      const uuid = vi.fn().mockReturnValueOnce("session-uuid").mockReturnValueOnce("terminal-uuid");
+      const plan = planNewChat(p, "pi", ctx({ uuid, localDaemon: true }));
+      expect(plan).toMatchObject({ kind: "create", tab: { agent: "pi", sessionId: "session-uuid", terminal: "terminal-uuid", id: "remote-terminal-uuid" }, pending: { uuid: "terminal-uuid", open: { spec: { agent: "pi", sessionId: "session-uuid", cwd: p.path } } } });
+      expect(uuid).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it("Pi resume preserves session identity and focuses existing terminal", () => {
+    const s = session({ agent: "pi", host: H, id: "custom-id" });
+    const plan = planOpenSession(s, remoteProject, [], ctx());
+    if (plan.kind !== "create") throw new Error("expected create");
+    expect(plan.pending?.open.spec).toMatchObject({ agent: "pi", sessionId: "custom-id", cwd: project.path });
+    expect(planOpenSession(s, remoteProject, [plan.tab], ctx())).toEqual({ kind: "focus", tab: plan.tab });
+  });
+
+  it("same Pi custom ID across projects opens two Terminals", () => {
+    for (const host of [undefined, H]) {
+      const a = planOpenSession(session({ agent: "pi", id: "custom", host }), project, [], ctx());
+      if (a.kind !== "create") throw new Error("expected create");
+      const b = planOpenSession(session({ agent: "pi", id: "custom", host, project_path: "/other" }), undefined, [a.tab], ctx({ uuid: () => "another-terminal" }));
+      expect(b.kind).toBe("create");
+      if (b.kind === "create") expect(b.tab.id).not.toBe(a.tab.id);
+    }
+  });
+
+  it("Pi vs Claude same raw ID remains separate", () => {
+    const c = planOpenSession(session(), project, [], ctx());
+    if (c.kind !== "create") throw new Error("expected create");
+    const p = planOpenSession(session({ agent: "pi" }), project, [c.tab], ctx());
+    expect(p.kind).toBe("create");
+    if (p.kind === "create") expect(planOpenSession(session(), project, [p.tab], ctx()).kind).toBe("create");
+  });
+
+  it("Pi cwd identity normalizes Windows spelling but preserves Unix case", () => {
+    const a = planOpenSession(session({ agent: "pi", project_path: "C:\\Work\\Proj" }), undefined, [], ctx());
+    if (a.kind !== "create") throw new Error("expected create");
+    expect(planOpenSession(session({ agent: "pi", project_path: "c:/work/proj/" }), undefined, [a.tab], ctx())).toEqual({ kind: "focus", tab: a.tab });
+    expect(planOpenSession(session({ agent: "pi", project_path: "/Project" }), undefined, [{ ...a.tab, projectPath: "/project" }], ctx()).kind).toBe("create");
+  });
+});

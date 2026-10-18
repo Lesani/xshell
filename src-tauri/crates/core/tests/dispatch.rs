@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 use xshell_core::{
-    claude, codex, cursor, dispatch, files, git, memories, opencode, sessions, skills, HostCtx,
+    claude, codex, cursor, dispatch, files, git, memories, opencode, pi, sessions, skills, HostCtx,
     METHODS,
 };
 
@@ -137,10 +137,101 @@ fn unknown_method_is_rejected() {
 }
 
 #[test]
-fn methods_list_has_no_duplicates_and_43_entries() {
+fn get_sessions_project_path_matches_windows_pi_without_changing_claude() {
+    let fx = Fixture::new();
+    let claude_cwd = r"C:\Work\P";
+    let pi_cwd = "c:/work/p/";
+    let encoded = claude::encode_project_name(claude_cwd);
+    fx.write_jsonl(
+        format!("home/.claude/projects/{encoded}/claude.jsonl"),
+        &[
+            json!({"type":"user", "cwd":claude_cwd, "timestamp":"2026-01-02T10:00:00Z",
+            "uuid":"u1", "message":{"role":"user", "content":"Claude"}}),
+        ],
+    );
+    fx.write_jsonl(
+        "home/.pi/agent/sessions/group/pi.jsonl",
+        &[json!({"type":"session", "version":3, "id":"pi", "cwd":pi_cwd})],
+    );
+    assert_ne!(encoded, claude::encode_project_name(pi_cwd));
+    let rows = call(
+        &fx.ctx(),
+        "get_sessions",
+        json!({
+            "encodedName":encoded, "projectPath":claude_cwd
+        }),
+    )
+    .unwrap();
+    let agents: HashSet<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["agent"].as_str().unwrap())
+        .collect();
+    assert_eq!(agents, HashSet::from(["claude", "pi"]));
+
+    // Omitting the optional argument retains each agent's old encoded-name behavior.
+    let legacy = call(&fx.ctx(), "get_sessions", json!({"encodedName":encoded})).unwrap();
+    assert_eq!(legacy.as_array().unwrap().len(), 1);
+    assert_eq!(legacy[0]["agent"], "claude");
+    let pi_encoded = claude::encode_project_name(pi_cwd);
+    let legacy_pi = call(&fx.ctx(), "get_sessions", json!({"encodedName":pi_encoded})).unwrap();
+    assert_eq!(legacy_pi.as_array().unwrap().len(), 1);
+    assert_eq!(legacy_pi[0]["agent"], "pi");
+    assert_eq!(
+        legacy_pi,
+        to_value(sessions::get_sessions(&fx.ctx(), pi_encoded)).unwrap()
+    );
+
+    let different = call(
+        &fx.ctx(),
+        "get_sessions",
+        json!({
+            "encodedName":encoded, "projectPath":"C:/Work/Other"
+        }),
+    )
+    .unwrap();
+    assert_eq!(different, legacy); // Raw-path filtering applies only to Pi.
+}
+
+#[test]
+fn get_sessions_project_path_preserves_unix_case() {
+    let fx = Fixture::new();
+    fx.write_jsonl(
+        "home/.pi/agent/sessions/group/pi.jsonl",
+        &[json!({"type":"session", "version":3, "id":"pi", "cwd":"/Work/P"})],
+    );
+    let encoded = claude::encode_project_name("/Work/P");
+    let mismatched = call(
+        &fx.ctx(),
+        "get_sessions",
+        json!({
+            "encodedName":encoded, "projectPath":"/work/p"
+        }),
+    )
+    .unwrap();
+    assert!(mismatched.as_array().unwrap().is_empty());
+    for params in [
+        json!({"encodedName":encoded}),
+        json!({"encodedName":encoded, "projectPath":null}),
+        json!({"encodedName":encoded, "projectPath":"/Work/P/"}),
+    ] {
+        assert_eq!(
+            call(&fx.ctx(), "get_sessions", params)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn methods_list_has_no_duplicates_and_45_entries() {
     let set: HashSet<&str> = METHODS.iter().copied().collect();
-    assert_eq!(METHODS.len(), 43);
-    assert_eq!(set.len(), 43);
+    assert_eq!(METHODS.len(), 45);
+    assert_eq!(set.len(), 45);
 }
 
 #[test]
@@ -169,6 +260,7 @@ fn null_params_accepted_for_argless_methods() {
         "list_cursor_projects",
         "list_opencode_projects",
         "list_antigravity_projects",
+        "list_pi_projects",
     ] {
         assert_eq!(call(&ctx, m, Value::Null), call(&ctx, m, json!({})), "{m}");
         assert!(call(&ctx, m, Value::Null).is_ok(), "{m}");
@@ -666,4 +758,24 @@ fn transfer_methods_dispatch_camel_case_params() {
     assert!(e
         .unwrap_err()
         .starts_with("invalid args for command `upload_begin`"));
+}
+
+#[test]
+fn pi_dispatch_matches_direct_calls_and_context_dto() {
+    let fx = Fixture::new();
+    fx.write_jsonl("home/.pi/agent/sessions/group/file.jsonl", &[
+        json!({"type":"session", "version":3,"id":"pi-only","cwd":CWD,"timestamp":"2026-01-01T00:00:00Z"})
+    ]);
+    fx.write("home/.pi/agent/AGENTS.md", "instructions");
+    let ctx = fx.ctx();
+    assert_eq!(
+        call(&ctx, "list_pi_projects", Value::Null).unwrap(),
+        to_value(pi::list_pi_projects(&ctx)).unwrap()
+    );
+    let c = call(&ctx, "get_pi_context", json!({"projectPath":CWD})).unwrap();
+    assert_eq!(c, to_value(pi::get_pi_context(&ctx, CWD.into())).unwrap());
+    assert_eq!(c.as_object().unwrap().len(), 2);
+    assert_eq!(c["present"], true);
+    assert!(c["sections"].is_array());
+    assert!(call(&ctx, "get_pi_context", json!({})).is_err());
 }

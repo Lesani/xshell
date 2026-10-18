@@ -53,16 +53,16 @@ function remoteTab(host: HostId | undefined, base: Omit<Tab, "id" | "host" | "te
 // Amendment 18: the single host-aware open path behind handleOpenSession and
 // handleOpenSessionBackground.
 export function planOpenSession(session: SessionInfo, project: ProjectInfo | undefined, tabs: Tab[], ctx: OpenContext): Plan {
-  const existing = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf(session));
-  if (existing) return { kind: "focus", tab: existing };
   const projectPath = session.project_path || project?.path || "";
+  const existing = tabs.find(t => sessionKeyOfTab(t) === sessionKeyOf({ ...session, project_path: projectPath }));
+  if (existing) return { kind: "focus", tab: existing };
   const projectName = session.project_name || project?.name || "";
   const host = session.host;
   if (!host && !ctx.localDaemon) {
     // Unique tab id (not derived from session id) — otherwise, a tab that auto-switches its
     // sessionId after /branch would leave its original session id "free", and a later re-open
     // of that session would generate a colliding tab id.
-    const tabId = `terminal-${session.id}-${ctx.now.toString(36)}`;
+    const tabId = session.agent === "pi" ? `terminal-${ctx.uuid()}` : `terminal-${session.id}-${ctx.now.toString(36)}`;
     return { kind: "create", tab: { id: tabId, type: "terminal", title: session.title, sessionId: session.id, agent: session.agent, projectPath, projectName, lastActiveAt: ctx.now } };
   }
   const refused = host ? refusal(host, ctx) : null;
@@ -74,14 +74,13 @@ export function planOpenSession(session: SessionInfo, project: ProjectInfo | und
     ctx);
 }
 
-// New agent chat in `project` with a resolved agent. Claude gets a pre-assigned session id.
+// Claude and Pi accept exact pre-assigned session IDs; other agents start unlinked.
 export function planNewChat(project: ProjectInfo, agent: AgentId, ctx: OpenContext): Plan {
   const base = { type: "terminal" as const, title: "New Chat", projectPath: project.path, projectName: project.name, shellMode: "claude" as const, lastActiveAt: ctx.now, createdAt: ctx.now };
-  const sessionId = agent === "claude" ? ctx.uuid() : undefined;
+  const sessionId = agent === "claude" || agent === "pi" ? ctx.uuid() : undefined;
   if (!project.host && !ctx.localDaemon) {
-    const tabId = `terminal-new-${ctx.now}`;
-    if (agent === "claude") return { kind: "create", tab: { ...base, id: tabId, sessionId, agent: "claude" as const } };
-    return { kind: "create", tab: { ...base, id: tabId, agent } };
+    const tabId = agent === "pi" ? `terminal-new-${ctx.uuid()}` : `terminal-new-${ctx.now}`;
+    return { kind: "create", tab: { ...base, id: tabId, agent, ...(sessionId ? { sessionId } : {}) } };
   }
   const refused = project.host ? refusal(project.host, ctx) : null;
   if (refused) return { kind: "refuse", notice: refused };

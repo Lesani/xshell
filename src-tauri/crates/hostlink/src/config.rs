@@ -31,7 +31,7 @@ pub struct HostConfig {
 }
 
 /// The agent ids a launch prefix can be set for (the frontend's `AgentId`).
-pub const PREFIX_AGENTS: &[&str] = &["claude", "codex", "cursor", "opencode", "antigravity"];
+pub const PREFIX_AGENTS: &[&str] = &["claude", "codex", "cursor", "opencode", "antigravity", "pi"];
 
 impl HostConfig {
     /// The override, trimmed; blank counts as none.
@@ -199,7 +199,11 @@ mod tests {
         h.launch_prefixes
             .insert("codex".into(), "'my wrapper' --flag".into());
         assert!(validate_one(&h).is_ok());
-        for (agent, bad) in [("claude", "a\nb"), ("claude", "'unclosed"), ("pi", "wrap")] {
+        for (agent, bad) in [
+            ("claude", "a\nb"),
+            ("claude", "'unclosed"),
+            ("unknown", "wrap"),
+        ] {
             let mut b = h.clone();
             b.launch_prefixes.insert(agent.into(), bad.into());
             assert!(validate_one(&b).is_err(), "{agent} {bad:?}");
@@ -214,6 +218,9 @@ mod tests {
         h.launch_prefixes
             .insert("codex".into(), "'my wrapper' --flag".into());
         h.launch_prefixes.insert("cursor".into(), "  ".into());
+        h.launch_prefixes
+            .insert("pi".into(), "headroom --profile pi".into());
+        assert!(validate_one(&h).is_ok());
         let spec = |agent: Option<&str>, mode: Option<&str>| LaunchSpec {
             agent: agent.map(Into::into),
             shell_mode: mode.map(Into::into),
@@ -232,9 +239,45 @@ mod tests {
             h.launch_prefix(&spec(Some("codex"), None)),
             words(&["my wrapper", "--flag"])
         );
+        assert_eq!(
+            h.launch_prefix(&spec(Some("pi"), None)),
+            words(&["headroom", "--profile", "pi"])
+        );
+        assert_eq!(h.launch_prefix(&spec(Some("pi"), Some("raw"))), None);
         assert_eq!(h.launch_prefix(&spec(Some("cursor"), None)), None);
         assert_eq!(h.launch_prefix(&spec(Some("opencode"), None)), None);
         assert_eq!(h.launch_prefix(&spec(None, Some("raw"))), None);
+    }
+
+    #[test]
+    fn pi_launch_prefix_preserves_exact_session_id_argv() {
+        let mut h = test_host("h_ab12cd34", "dev");
+        h.launch_prefixes
+            .insert("pi".into(), "'my wrapper' --profile pi".into());
+        validate_one(&h).unwrap();
+        let mut spec = LaunchSpec {
+            agent: Some("pi".into()),
+            session_id: Some("custom-id".into()),
+            cwd: "/work/project".into(),
+            ..Default::default()
+        };
+        spec.launch_prefix = h.launch_prefix(&spec);
+        let ctx = xshell_core::HostCtx {
+            home: None,
+            temp_dir: std::env::temp_dir(),
+        };
+        let plan = xshell_core::plan_command(&ctx, &spec).unwrap();
+        let mut expected: Vec<String> = ["--profile", "pi", "pi", "--session-id", "custom-id"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        if cfg!(windows) {
+            expected.splice(0..0, ["/C".into(), "my wrapper".into()]);
+            assert_eq!(plan.program, "cmd.exe");
+        } else {
+            assert_eq!(plan.program, "my wrapper");
+        }
+        assert_eq!(plan.args, expected);
     }
 
     #[test]

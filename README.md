@@ -14,7 +14,7 @@
 
 </div>
 
-> Independent project. Not affiliated with, endorsed by, or a product of Anthropic, OpenAI, Anysphere, Google, or any other agent vendor. xshell reads the session files written by the official agent CLIs (`claude`, `codex`, `cursor-agent`, `opencode`, `agy`) and spawns them as subprocesses. All product names, logos, and brands are trademarks of their respective owners.
+> Independent project. Not affiliated with, endorsed by, or a product of Anthropic, OpenAI, Anysphere, Google, or any other agent vendor. xshell reads the session files written by the official agent CLIs (`claude`, `codex`, `cursor-agent`, `opencode`, `agy`, `pi`) and spawns them as subprocesses. All product names, logos, and brands are trademarks of their respective owners.
 
 ## Preview
 
@@ -53,8 +53,15 @@ xshell auto-detects whichever of these agent CLIs are installed and lists their 
 | **Cursor** | `cursor-agent` | `~/.cursor/chats` | Context tree |
 | **opencode** | `opencode` | opencode's local database | Tokens, context %, context tree |
 | **Antigravity** | `agy` | `~/.gemini/antigravity-cli` | Context tree |
+| **Pi** (1.3+) | `pi` | `~/.pi/agent/sessions` | Recorded tokens/cost, conventional context files |
 
-More agents are on the way — the registry is built to grow.
+Pi uses your existing provider configuration. New chats and resume use an exact,
+project-scoped session ID. This integration reads default session storage and
+conventional instruction, skill, prompt, and extension files; custom storage and
+dynamically resolved resources are not included. Pi has no xshell status hooks,
+permission-bypass toggle, rate-limit integration, or Mobile Chat View. Enter
+Windows UNC paths with backslashes (`\\server\share\project`); mixed-case
+forward-slash UNC identity is tracked in [#61](https://github.com/Lesani/xshell/issues/61).
 
 ## Features
 
@@ -69,6 +76,14 @@ More agents are on the way — the registry is built to grow.
 - 🔓 **Per-tab skip permissions** for Claude Code and Codex, locally or remotely. Toggle permission bypass for one tab. Changing it interrupts the current run, restarts the agent in the same tab, and resumes the conversation.
 
 Built with Tauri 2 and Rust. Native on Windows, macOS, and Linux.
+
+## Start a project terminal
+
+With **Settings → Agents → Default agent → Ask every time**, **New Chat** offers
+installed agents and **Shell**, even if only one agent is installed. Shell opens
+in the selected project's directory on its Host. A Remote Host uses its native
+shell through the existing SSH connection, not a local terminal. An explicit
+default agent still starts immediately; shell choices also remain in the tab menu.
 
 ## Install
 
@@ -96,7 +111,8 @@ The script downloads the right binary for your platform from the [latest GitHub 
 | macOS | `xshell_<version>_universal.dmg` |
 | Linux | `xshell_<version>_amd64.deb`, `xshell-<version>-1.x86_64.rpm`, or `xshell_<version>_amd64.AppImage` |
 
-At least one [supported agent CLI](#supported-agents) must be installed and on `PATH`.
+Install a [supported agent CLI](#supported-agents) on the Host's `PATH` to start
+agent chats. **Shell** works without an agent CLI.
 
 ## Remote hosts
 

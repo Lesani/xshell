@@ -21,6 +21,7 @@ pub mod memories;
 pub mod opencode;
 pub mod past;
 pub mod paths;
+pub mod pi;
 pub mod pipe;
 pub mod private_fs;
 pub mod prompt;

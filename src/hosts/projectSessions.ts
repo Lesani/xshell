@@ -9,7 +9,7 @@ export async function loadProjectSessions(project: ProjectInfo): Promise<{ sessi
   let sessions: SessionInfo[] = [];
   let stale = false;
   try {
-    const r = await hostQuery<SessionInfo[]>(project.host, "get_sessions", { encodedName });
+    const r = await hostQuery<SessionInfo[]>(project.host, "get_sessions", { encodedName, projectPath: project.path });
     sessions = r.value;
     stale = r.stale;
   } catch (_) { sessions = []; }

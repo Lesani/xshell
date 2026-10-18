@@ -32,7 +32,7 @@ describe("skipPermsState: local tabs", () => {
 
   it("is hidden for raw shells and agents without a flag", () => {
     expect(skipPermsState({ ...local, shellMode: "raw" }, ctx())).toEqual({ kind: "hidden" });
-    for (const agent of ["cursor", "opencode", "antigravity"] as const) {
+    for (const agent of ["cursor", "opencode", "antigravity", "pi"] as const) {
       expect(skipPermsState({ ...local, agent }, ctx())).toEqual({ kind: "hidden" });
     }
   });

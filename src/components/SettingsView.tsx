@@ -273,23 +273,14 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
           {active === "agents" && (
             <>
               {(() => {
-                // Default-agent choice only means something with 2+ agents installed; with
-                // one, the select is pinned to it and disabled. Probe state drives this.
                 const installedIds = AGENT_IDS.filter(id => agentProbes[id].probe?.installed);
-                const multi = installedIds.length > 1;
-                const single = installedIds[0] ?? "claude";
                 return (
                   <Section title="Defaults" description="Which agent hosts a new chat (the + button and the tab dropdown).">
-                    <SettingRow title="Default agent" description={multi ? "Pick an agent to start new chats without being asked — or keep “Ask every time” to choose per chat." : "Only one agent was found on this machine, so it's always used. This choice unlocks when a second agent is detected."}>
-                      <select className="settings-select" value={multi ? defaultAgent : single} disabled={!multi} onChange={(e) => onSetDefaultAgent(e.target.value as "ask" | AgentId)}>
-                        {multi ? (
-                          <>
-                            <option value="ask">Ask every time</option>
-                            {installedIds.map(id => <option key={id} value={id}>{AGENTS[id].label}</option>)}
-                          </>
-                        ) : (
-                          <option value={single}>{AGENTS[single as AgentId].label}</option>
-                        )}
+                    <SettingRow title="Default agent" description="Ask shows the choice dialog for each new chat; Shell is always available. Choose an installed agent to start it immediately.">
+                      <select className="settings-select" value={defaultAgent} onChange={(e) => onSetDefaultAgent(e.target.value as "ask" | AgentId)}>
+                        <option value="ask">Ask every time</option>
+                        {defaultAgent !== "ask" && !installedIds.includes(defaultAgent) && <option value={defaultAgent} disabled>{AGENTS[defaultAgent].label} (not detected)</option>}
+                        {installedIds.map(id => <option key={id} value={id}>{AGENTS[id].label}</option>)}
                       </select>
                     </SettingRow>
                   </Section>
@@ -370,6 +361,16 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
                   <Toggle checked={showSessionRowMetricsOpencode} onChange={onSetShowSessionRowMetricsOpencode} />
                 </SettingRow>
               </Section>
+              </div>}
+              </div>
+
+              <div className="settings-agent-block">
+              <AgentHeader icon={<AgentIcon agent="pi" size={15} />} name={AGENTS.pi.label} tagline={AGENTS.pi.tagline} state={agentProbes.pi} onRefresh={probeAgents} open={expandedAgents.pi} onToggle={() => toggleAgent("pi")} tt={tt} />
+              {expandedAgents.pi && <div className="settings-agent-body">
+              <div className="settings-agent-empty">Pi 1.3+ sessions in default storage <code>~/.pi/agent/sessions</code> appear in project and home lists and can be resumed. Recorded lifetime tokens and costs feed project stats; missing costs and context limits are not estimated. The context tree lists conventional instruction, skill, prompt, and extension files read-only — not Pi's fully resolved dynamic context. Custom session storage is not supported. No setup is needed: Pi inherits your existing providers, and xshell does not change Pi configuration or install hooks. No Pi status, rate-limit, permission-bypass, or Mobile integration is provided.</div>
+              <SettingRow title="Cost chart on project page" description="Include recorded costs in project stats. This is the same project-chart preference used for Claude Code; Pi costs do not require a Claude connection. Tokens remain available regardless.">
+                <Toggle checked={showProjectStatsChart} onChange={onSetShowProjectStatsChart} />
+              </SettingRow>
               </div>}
               </div>
 

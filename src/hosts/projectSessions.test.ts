@@ -19,8 +19,16 @@ describe("project page sessions", () => {
   it("local: today's call, never stale, not stamped", async () => {
     invoke.mockResolvedValueOnce([{ id: "s" }]);
     const r = await loadProjectSessions(local);
-    expect(invoke.mock.calls).toEqual([["get_sessions", { encodedName: "-home-u-p" }]]);
+    expect(invoke.mock.calls).toEqual([["get_sessions", { encodedName: "-home-u-p", projectPath: local.path }]]);
     expect(r).toEqual({ sessions: [{ id: "s" }], stale: false });
+  });
+
+  it("Windows discovery retains the recorded encoding and qualifies Pi history by raw cwd", async () => {
+    const project = { ...remote, path: "C:\\Work\\P", encoded_name: "C--Work-P" };
+    invoke.mockResolvedValueOnce([{ id: "pi-id", agent: "pi", project_path: "c:/work/p/" }]);
+    const result = await loadProjectSessions(project);
+    expect(invoke.mock.calls[0]).toEqual(["host_call", { host: H, method: "get_sessions", params: { encodedName: "C--Work-P", projectPath: project.path } }]);
+    expect(result.sessions[0]).toMatchObject({ agent: "pi", project_path: "c:/work/p/", host: H });
   });
 
   it("offline shows the cache as stale; the refetch on reconnect clears it", async () => {

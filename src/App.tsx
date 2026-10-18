@@ -6,6 +6,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { defaultShellForHost, getDefaultShellId } from "./shells";
 import { resolveNewChatChoice } from "./hosts/newChatChoice";
+import { loadHostProjects } from "./hosts/hostProjects";
+import { resolveTabProject, runtimeProjectKey, runtimeTabProjectKey, titlePollProjects } from "./hosts/projectRuntime";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
@@ -159,7 +161,7 @@ async function loadStartup() {
   const restored = restoreGroups(restorable, renderedGroups(durableGroups, migration.heldBack));
   // The local Projects and sessions, fetched once with the rest of the startup.
   const data = Promise.all([
-    hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => [] as ProjectInfo[]),
+    loadHostProjects().then(r => r?.projects ?? []),
     hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
   ]);
   return { v, hostConfigs, localDaemon, migration, durableGroups, restored, data };
@@ -210,7 +212,7 @@ export default function App() {
     // The Local Host's data stays on the in-process path, also in local Daemon mode.
     if (!isRemoteDataHost(host)) return;
     const [projects, sessions] = await Promise.all([
-      hostInvoke<ProjectInfo[]>(host, "list_claude_projects").catch(() => null),
+      loadHostProjects(host).then(r => r?.projects ?? null),
       hostInvoke<SessionInfo[]>(host, "get_all_recent_sessions", { limit: 100 }).catch(() => null),
     ]);
     if (!registry.isConfigured(host)) return;
@@ -488,7 +490,7 @@ export default function App() {
   // ── Derive user projects ──────────────────────────────────────────
   useEffect(() => {
     setUserProjects(savedPaths.map(key => {
-      const found = allProjects.find(p => sameKey(keyOf(p), key));
+      const found = allProjects.find(p => runtimeProjectKey(p) === runtimeProjectKey(parseProjectKey(key)));
       if (found) return found;
       const { host, path } = parseProjectKey(key);
       const name = path.split(/[\\/]/).filter(Boolean).pop() || path;
@@ -502,16 +504,10 @@ export default function App() {
     if (tabs.length === 0) return;
 
     const syncTitles = async () => {
-      // Distinct projects across open tabs, by key (original-cased path: encoding is
-      // case-sensitive). A Project is (Host, path), so the same path on two Hosts is polled twice.
-      const projectsByKey = new Map<string, { host?: ProjectInfo["host"]; path: string }>();
-      for (const t of tabs) {
-        const k = keyOfTab(t);
-        // Later tabs overwrite earlier ones (same casing rule as before Remote Hosts).
-        if (k) projectsByKey.set(lookupKey(k), { host: t.host, path: t.projectPath! });
-      }
+      // Keep Unix case-distinct Projects separate, including when choosing a Shell cwd.
+      const projectsByKey = titlePollProjects(tabs);
       const projectMap = new Map<string, ProjectInfo>();
-      for (const p of allProjects) projectMap.set(lookupKey(keyOf(p)), p);
+      for (const p of allProjects) projectMap.set(runtimeProjectKey(p), p);
 
       for (const [pp, { host, path: origPath }] of projectsByKey) {
         // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so the
@@ -519,30 +515,29 @@ export default function App() {
         const encodedName = encodedNameFor({ encoded_name: projectMap.get(pp)?.encoded_name, path: origPath });
         if (!encodedName) continue;
         try {
-          const sessions = await hostInvoke<SessionInfo[]>(host, "get_sessions", { encodedName });
+          const sessions = await hostInvoke<SessionInfo[]>(host, "get_sessions", { encodedName, projectPath: origPath });
           setTabs(prev => {
             let changed = false;
             // Sessions already linked to an open tab — an unlinked tab must not claim them.
             // Host-qualified, so a remote session never claims a local id (amendment 19).
             const claimed = new Set(prev.map(sessionKeyOfTab).filter(Boolean) as string[]);
             const next = prev.map(tab => {
-              const tk = keyOfTab(tab);
-              if (!tk || lookupKey(tk) !== pp) return tab;
+              if (runtimeTabProjectKey(tab) !== pp) return tab;
               // Link an unlinked new-chat tab (Codex — which has no pre-created id — or a Cursor
               // tab whose create-chat fell back) to its freshly-created session: newest unclaimed
               // session of the same agent that appeared after the tab opened and already has a
               // real title (not the bare "Session <id>" fallback), so we rename straight to the
               // meaningful name instead of flashing an intermediate one.
-              if (!tab.sessionId && tab.agent && tab.agent !== "claude") {
+              if (!tab.sessionId && tab.agent && tab.agent !== "claude" && tab.agent !== "pi") {
                 const candidate = sessions
-                  .filter(s => s.agent === tab.agent && !claimed.has(sessionKeyOf({ host, id: s.id })) && !s.title.startsWith("Session ") && new Date(s.timestamp).getTime() >= (tab.createdAt ?? 0))
+                  .filter(s => s.agent === tab.agent && !claimed.has(sessionKeyOf({ ...s, host })) && !s.title.startsWith("Session ") && new Date(s.timestamp).getTime() >= (tab.createdAt ?? 0))
                   .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
-                if (candidate) { claimed.add(sessionKeyOf({ host, id: candidate.id })); changed = true; return { ...tab, sessionId: candidate.id, title: candidate.title }; }
+                if (candidate) { claimed.add(sessionKeyOf({ ...candidate, host })); changed = true; return { ...tab, sessionId: candidate.id, title: candidate.title }; }
                 return tab;
               }
               // Linked tab: keep its title in sync — picks up `/rename`, ai-title, first-prompt alike.
               if (!tab.sessionId) return tab;
-              const match = sessions.find(s => s.id === tab.sessionId);
+              const match = sessions.find(s => sessionKeyOf({ ...s, host }) === sessionKeyOfTab(tab));
               if (match && match.title !== tab.title) { changed = true; return { ...tab, title: match.title }; }
               return tab;
             });
@@ -783,7 +778,7 @@ export default function App() {
     setSessionsLoading(true);
     const [sessions, projects] = await Promise.all([
       hostInvoke<SessionInfo[]>(undefined, "get_all_recent_sessions", { limit: 100 }).catch(() => [] as SessionInfo[]),
-      hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects").catch(() => projectsByHost.local),
+      loadHostProjects().then(r => r?.projects ?? projectsByHost.local),
     ]);
     setRecentSessions(sessions);
     setAllProjects(projects);
@@ -829,7 +824,8 @@ export default function App() {
       // Browse is Local only: the picked folder is on this computer.
       if (selected && typeof selected === "string" && !flattenSidebarPaths(sidebarLayout).some(p => sameKey(p, selected))) {
         await persistSidebarLayout(addProjectToLayout(sidebarLayout, asProjectKey(selected)));
-        setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects"));
+        const result = await loadHostProjects();
+        if (result) setAllProjects(result.projects);
       }
     } catch (_) {}
   }, [sidebarLayout, persistSidebarLayout]);
@@ -943,9 +939,8 @@ export default function App() {
     const agents = installedAgentsFor(project.host);
     const choice = resolveNewChatChoice(defaultAgent, AGENT_IDS.filter(a => agents[a]), agent);
     if (choice.kind === "picker") { setAgentPickerProject(project); return; }
-    // Claude: a pre-allocated UUID passed via `--session-id` (known JSONL name from the start,
-    // and Claude's ai-title still fires). Codex and Cursor can't pre-assign a session id, so
-    // they spawn bare and the title-sync links the tab once a session with a real title appears.
+    // Claude and Pi receive a pre-allocated exact session UUID. Other harnesses start
+    // unlinked and the title-sync associates a newly recorded session when supported.
     applyPlan(planNewChat(project, choice.agent, ctx), true);
   }, [installedAgentsFor, defaultAgent, applyPlan, openContext]);
 
@@ -1415,11 +1410,7 @@ export default function App() {
   // Null on home (no context → hide + and dropdown).
   const contextProject: ProjectInfo | null = (() => {
     if (activeTabProjectPath && activeTabProjectKey) {
-      const found = allProjects.find(p => sameKey(keyOf(p), activeTabProjectKey));
-      if (found) return found;
-      if (!activeTab?.projectName) return null;
-      const fallback: ProjectInfo = { name: activeTab.projectName, path: activeTabProjectPath, encoded_name: "", session_count: 0, last_active: "" };
-      return activeTab.host ? { ...fallback, host: activeTab.host } : fallback;
+      return resolveTabProject(allProjects, activeTab);
     }
     if (selectedProject) return selectedProject;
     return null;
@@ -1558,7 +1549,7 @@ export default function App() {
         })}
       </div>
       </div>
-      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { try { setAllProjects(await hostInvoke<ProjectInfo[]>(undefined, "list_claude_projects")); } catch (_) {} }} onAddRemotePath={handleAddRemotePath} />}
+      {showProjectPicker && <ProjectPicker allProjects={allProjects} savedPaths={savedPaths} onToggle={handleToggleProject} onBrowse={() => { handleBrowseFolder(); setShowProjectPicker(false); }} onClose={() => setShowProjectPicker(false)} onRefresh={async () => { const result = await loadHostProjects(); if (result) setAllProjects(result.projects); }} onAddRemotePath={handleAddRemotePath} />}
       {agentPickerProject && <AgentPickerDialog project={agentPickerProject} hostName={agentPickerProject.host ? registry.hostName(agentPickerProject.host) : undefined} agents={AGENT_IDS.filter(a => installedAgentsFor(agentPickerProject.host)[a])} onPick={(agent) => { const p = agentPickerProject; setAgentPickerProject(null); handleNewChat(p, agent); }} onShell={() => {
         const project = agentPickerProject;
         setAgentPickerProject(null);

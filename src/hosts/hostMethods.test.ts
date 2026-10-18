@@ -15,9 +15,16 @@ function coreMethods(src: string): string[] {
 describe("hostMethods", () => {
   it("TS list equals core METHODS", () => {
     const rust = coreMethods(dispatchSrc);
-    expect(rust.length).toBe(43);
+    expect(rust.length).toBe(45);
     expect(new Set(HOST_METHODS)).toEqual(new Set(rust));
     expect(HOST_METHODS.length).toBe(rust.length);
+  });
+
+  it("Pi optional discovery and context are cacheable Host methods", () => {
+    for (const method of ["list_pi_projects", "get_pi_context"] as const) {
+      expect(HOST_METHODS).toContain(method);
+      expect(CACHEABLE_METHODS.has(method)).toBe(true);
+    }
   });
 
   it("cacheable methods are host methods", () => {

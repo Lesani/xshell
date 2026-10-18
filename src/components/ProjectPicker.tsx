@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { hostInvoke, hostQuery } from "../hosts/hostInvoke";
+import { buildProjectRows, loadPickerProjects, type AgentProjectLists, type PickerRow } from "../hosts/hostProjects";
 import { isPinned, toProjectKey, type ProjectKey } from "../hosts/projectKey";
 import { isUsableStatus } from "../hosts/registry";
 import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
@@ -7,12 +7,12 @@ import { fmt } from "../hosts/strings";
 import type { HostId } from "../hosts/types";
 import { HostBadge } from "./HostBadge";
 import { Check, FolderPlus, Search } from "lucide-react";
-import type { CodexProjectInfo, ProjectInfo } from "../types";
-import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
+import type { ProjectInfo } from "../types";
+import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
 import { useTooltip, ttProps } from "./Tooltip";
-import { normalizePath } from "../utils";
 
 interface ProjectPickerProps {
+  // App merges agents here; never use this prop as raw Claude discovery.
   allProjects: ProjectInfo[];
   savedPaths: ProjectKey[];
   onToggle: (key: ProjectKey) => void;
@@ -23,54 +23,12 @@ interface ProjectPickerProps {
   onAddRemotePath?: (host: HostId, path: string) => Promise<"ok" | "notFound" | "offline">;
 }
 
-// One row per directory where a coding agent has been used. Claude rows come from
-// ~/.claude/projects (the allProjects prop, owned by App); Codex and Cursor are fetched
-// here (the picker is their only consumer). A directory several agents know collapses into
-// a single row carrying each agent's mark + session count.
-interface PickerRow {
-  path: string;
-  name: string;
-  counts: Partial<Record<AgentId, number>>; // sessions per agent in this directory
-  lastActive: string;
-}
+// Raw per-agent lists are fetched here, independently of App's merged discovery.
+interface HostLists { lists: AgentProjectLists; stale: boolean; loaded: boolean }
 
-type AgentLists = Record<"codex" | "cursor" | "opencode" | "antigravity", CodexProjectInfo[]>;
-const EMPTY_LISTS: AgentLists = { codex: [], cursor: [], opencode: [], antigravity: [] };
-
-// Fold every agent's directory list into rows: create-or-merge by normalized path (within one
-// Host), record the agent's session count, and keep the freshest activity timestamp.
-function buildRows(claude: ProjectInfo[], lists: AgentLists, filter: string): PickerRow[] {
-  const map = new Map<string, PickerRow>();
-  const fold = (agent: AgentId, path: string, sessionCount: number, lastActive: string) => {
-    const key = normalizePath(path);
-    const existing = map.get(key);
-    if (existing) {
-      existing.counts[agent] = sessionCount;
-      if (lastActive > existing.lastActive) existing.lastActive = lastActive;
-    } else {
-      const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
-      map.set(key, { path, name, counts: { [agent]: sessionCount }, lastActive });
-    }
-  };
-  for (const p of claude) fold("claude", p.path, p.session_count, p.last_active);
-  for (const c of lists.codex) fold("codex", c.path, c.session_count, c.last_active);
-  for (const c of lists.cursor) fold("cursor", c.path, c.session_count, c.last_active);
-  for (const c of lists.opencode) fold("opencode", c.path, c.session_count, c.last_active);
-  for (const c of lists.antigravity) fold("antigravity", c.path, c.session_count, c.last_active);
-  const list = [...map.values()].sort((a, b) => b.lastActive.localeCompare(a.lastActive));
-  const q = filter.trim().toLowerCase();
-  return q ? list.filter(r => r.name.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)) : list;
-}
-
-// A Remote Host's discovered projects (live, or cached while it is offline).
-interface HostLists { claude: ProjectInfo[]; lists: AgentLists; stale: boolean; loaded: boolean }
-
-export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onClose, onRefresh, onAddRemotePath }: ProjectPickerProps) {
+export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefresh, onAddRemotePath }: ProjectPickerProps) {
   const ref = useRef<HTMLDivElement>(null);
-  const [codexProjects, setCodexProjects] = useState<CodexProjectInfo[]>([]);
-  const [cursorProjects, setCursorProjects] = useState<CodexProjectInfo[]>([]);
-  const [opencodeProjects, setOpencodeProjects] = useState<CodexProjectInfo[]>([]);
-  const [antigravityProjects, setAntigravityProjects] = useState<CodexProjectInfo[]>([]);
+  const [localLists, setLocalLists] = useState<AgentProjectLists>({});
   const [filter, setFilter] = useState("");
   const { tt, Tooltip } = useTooltip();
   const hostsSnap = useHostsSnapshot();
@@ -81,10 +39,9 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
   // (or since the last open) appear without requiring a restart.
   useEffect(() => {
     onRefresh?.();
-    hostInvoke<CodexProjectInfo[]>(undefined, "list_codex_projects").then(setCodexProjects).catch(() => {});
-    hostInvoke<CodexProjectInfo[]>(undefined, "list_cursor_projects").then(setCursorProjects).catch(() => {});
-    hostInvoke<CodexProjectInfo[]>(undefined, "list_opencode_projects").then(setOpencodeProjects).catch(() => {});
-    hostInvoke<CodexProjectInfo[]>(undefined, "list_antigravity_projects").then(setAntigravityProjects).catch(() => {});
+    let alive = true;
+    loadPickerProjects().then(r => { if (alive) setLocalLists(prev => ({ ...prev, ...r.lists })); });
+    return () => { alive = false; };
   }, []);
 
   // Each configured Host's lists — live when connected, else the cached copy marked stale.
@@ -92,15 +49,12 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
   useEffect(() => {
     let alive = true;
     for (const h of hosts) {
-      const methods = ["list_claude_projects", "list_codex_projects", "list_cursor_projects", "list_opencode_projects", "list_antigravity_projects"] as const;
-      Promise.all(methods.map(m => hostQuery<(ProjectInfo | CodexProjectInfo)[]>(h.id, m).then(r => r, () => null))).then(results => {
+      loadPickerProjects(h.id).then(r => {
         if (!alive) return;
-        const val = (i: number) => (results[i]?.value ?? []).map(x => ({ ...x, host: h.id }));
         setHostLists(prev => ({ ...prev, [h.id]: {
-          claude: val(0) as ProjectInfo[],
-          lists: { codex: val(1), cursor: val(2), opencode: val(3), antigravity: val(4) },
-          stale: results.some(r => r?.stale),
-          loaded: results.some(r => r !== null),
+          lists: { ...prev[h.id]?.lists, ...r.lists },
+          stale: r.stale || (!r.loaded && !!prev[h.id]?.loaded),
+          loaded: r.loaded || !!prev[h.id]?.loaded,
         } }));
       });
     }
@@ -119,14 +73,10 @@ export function ProjectPicker({ allProjects, savedPaths, onToggle, onBrowse, onC
     return () => { document.removeEventListener("mousedown", handleClick); document.removeEventListener("keydown", handleKey); };
   }, [onClose]);
 
-  const localClaude = useMemo(() => allProjects.filter(p => !p.host), [allProjects]);
-  const rows = useMemo(
-    () => buildRows(localClaude, { codex: codexProjects, cursor: cursorProjects, opencode: opencodeProjects, antigravity: antigravityProjects }, filter),
-    [localClaude, codexProjects, cursorProjects, opencodeProjects, antigravityProjects, filter],
-  );
+  const rows = useMemo(() => buildProjectRows(localLists, filter), [localLists, filter]);
   const hostRows = useMemo(() => Object.fromEntries(hosts.map(h => {
     const l = hostLists[h.id];
-    return [h.id, l ? buildRows(l.claude, l.lists, filter) : []];
+    return [h.id, l ? buildProjectRows(l.lists, filter) : []];
   })) as Record<HostId, PickerRow[]>, [hosts, hostLists, filter]);
   const totalRows = rows.length + Object.values(hostRows).reduce((n, r) => n + r.length, 0);
 

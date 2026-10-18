@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
 import { localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { usesClaudeBranchDetection } from "../tabs/sessionBranch";
+import { sessionKeyOf, sessionKeyOfTab } from "../hosts/projectKey";
 import { skipPermsOn, skipPermsState } from "../tabs/skipPermissions";
 import { registry, HostUnknownError } from "../hosts/registry";
 import { useHostLive, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
@@ -873,7 +875,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // "pre-existing" and won't be flagged as a fork of us. Runs async; checkBranch gates
   // itself on `knownSeededRef` so we never scan with an empty set.
   const seedKnownSessionIds = useCallback(async () => {
-    if (!tab.projectPath) return;
+    if (!tab.projectPath || !usesClaudeBranchDetection(tab)) return;
     try {
       const ids = await hostInvoke<string[]>(tab.host, "list_project_session_ids", { cwd: tab.projectPath });
       const set = new Set<string>(ids);
@@ -884,14 +886,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       knownSessionIdsRef.current = new Set(tab.sessionId ? [tab.sessionId] : []);
       knownSeededRef.current = true;
     }
-  }, [tab.projectPath, tab.sessionId]);
+  }, [tab.projectPath, tab.sessionId, tab.agent, tab.shellMode, tab.host]);
 
   // Detect /branch forks. Rust verifies candidacy via (a) our-session UUID overlap AND
   // (b) tail-UUID match — so sibling forks of a shared ancestor don't trigger. The known
   // filter also excludes any jsonl that existed when we attached (e.g. user resumed the
   // parent in another tab; that bumps mtime but the file is pre-existing → correctly ignored).
   const checkBranch = useCallback(async () => {
-    if (!tab.projectPath || !tab.sessionId || (tab.shellMode || "claude") !== "claude") return;
+    if (!tab.projectPath || !tab.sessionId || !usesClaudeBranchDetection(tab)) return;
     if (!knownSeededRef.current) return;
     try {
       const info = await hostInvoke<BranchInfo | null>(tab.host, "detect_session_branch", {
@@ -910,7 +912,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
       setBranchNotice({ oldTitle, newTitle: info.title });
       branchNoticeTimerRef.current = window.setTimeout(() => setBranchNotice(null), 6000);
     } catch (_) {}
-  }, [tab.projectPath, tab.sessionId, tab.shellMode, tab.id, tab.title, onBranchSwitch]);
+  }, [tab.projectPath, tab.sessionId, tab.shellMode, tab.agent, tab.host, tab.id, tab.title, onBranchSwitch]);
 
   // Re-seed whenever the tab's sessionId changes (initial attach, or after a branch-switch).
   useEffect(() => {
@@ -984,8 +986,8 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   // last-seen values in state across activate/deactivate so switching tabs doesn't flash
   // an empty strip for the 4s until the next poll lands.
   useEffect(() => {
-    if (!isClaudeSession || !tab.sessionId || !projectEncodedName) setSessionStats(null);
-  }, [isClaudeSession, tab.sessionId, projectEncodedName]);
+    setSessionStats(null);
+  }, [isClaudeSession, tab.sessionId, tab.agent, tab.projectPath, tab.host, projectEncodedName]);
 
   // Poll session stats (cost, context tokens) while active. Cost ticks up as claude works,
   // so 4s feels live without hammering disk; the underlying Rust cache short-circuits when
@@ -995,16 +997,16 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
     let cancelled = false;
     const fetchStats = async () => {
       try {
-        const sessions = await hostInvoke<SessionInfo[]>(tab.host, "get_sessions", { encodedName: projectEncodedName });
+        const sessions = await hostInvoke<SessionInfo[]>(tab.host, "get_sessions", { encodedName: projectEncodedName, projectPath: tab.projectPath });
         if (cancelled) return;
-        const match = sessions.find(s => s.id === tab.sessionId);
+        const match = sessions.find(s => sessionKeyOf({ ...s, host: tab.host }) === sessionKeyOfTab(tab));
         if (match) setSessionStats(match);
       } catch (_) {}
     };
     fetchStats();
     const interval = setInterval(fetchStats, 4000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [isActive, isClaudeSession, tab.sessionId, projectEncodedName]);
+  }, [isActive, isClaudeSession, tab.sessionId, tab.agent, tab.projectPath, tab.host, projectEncodedName]);
 
   // Poll every 5s, but only while this tab is the active (focused) one. Background tabs
   // don't scan — the user can't /branch in a tab they aren't looking at. On each tick we
@@ -1013,7 +1015,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   useEffect(() => {
     if (!isActive) return;
     if (!tab.projectPath || !tab.sessionId) return;
-    if ((tab.shellMode || "claude") !== "claude") return;
+    if (!usesClaudeBranchDetection(tab)) return;
     checkBranch();
     const interval = window.setInterval(checkBranch, 5000);
     return () => window.clearInterval(interval);

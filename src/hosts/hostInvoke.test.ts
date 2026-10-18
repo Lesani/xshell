@@ -101,6 +101,19 @@ describe("per-result provenance (amendment 24)", () => {
     expect(isStale(H, "get_sessions", { encodedName: "x" })).toBe(false);
   });
 
+  it("raw project history queries retain the pre-update offline cache", async () => {
+    invoke.mockResolvedValueOnce([{ id: "legacy" }]);
+    await hostQuery(H, "get_sessions", { encodedName: "-work-p" });
+    const args = { encodedName: "-work-p", projectPath: "/work/p" };
+    invoke.mockRejectedValueOnce({ code: "offline", message: "down" });
+    await expect(hostQuery(H, "get_sessions", args)).resolves.toMatchObject({ value: [{ id: "legacy" }], stale: true });
+    expect(isStale(H, "get_sessions", args)).toBe(true);
+    invoke.mockResolvedValueOnce([{ id: "fresh" }]);
+    await expect(hostQuery(H, "get_sessions", args)).resolves.toMatchObject({ value: [{ id: "fresh" }], stale: false });
+    invoke.mockRejectedValueOnce({ code: "offline", message: "down" });
+    await expect(hostQuery(H, "get_sessions", args)).resolves.toMatchObject({ value: [{ id: "fresh" }], stale: true });
+  });
+
   it("live-only calls never use the cache", async () => {
     invoke.mockResolvedValueOnce({ present: true });
     await hostInvoke(H, "get_codex_usage");
@@ -127,4 +140,15 @@ describe("rethrowHostCall", () => {
     expect(caught(plain)).toBe(plain);
     expect(caught("str")).toBe("str");
   });
+});
+
+it("Pi discovery and context retain offline cached values independently", async () => {
+  for (const method of ["list_pi_projects", "get_pi_context"] as const) {
+    const args = method === "get_pi_context" ? { projectPath: "/p" } : undefined;
+    const value = method === "get_pi_context" ? { present: true, sections: [] } : [{ path: "/p", session_count: 1, last_active: "" }];
+    invoke.mockResolvedValueOnce(value);
+    await expect(hostQuery(H, method, args)).resolves.toMatchObject({ value, stale: false });
+    invoke.mockRejectedValueOnce({ code: "offline", message: "down" });
+    await expect(hostQuery(H, method, args)).resolves.toMatchObject({ value, stale: true });
+  }
 });

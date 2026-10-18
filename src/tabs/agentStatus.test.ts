@@ -55,7 +55,7 @@ describe("agentStatusOf", () => {
   it("raw shells and hookless agents show nothing", () => {
     const m = new Map<string, AgentStatus>([[local.id, "working"]]);
     expect(agentStatusOf({ ...local, shellMode: "raw" }, ctx({ local: m }))).toBeNull();
-    for (const agent of ["cursor", "opencode", "antigravity"] as const) {
+    for (const agent of ["cursor", "opencode", "antigravity", "pi"] as const) {
       expect(agentStatusOf({ ...local, agent }, ctx({ local: m }))).toBeNull();
       expect(agentStatusOf({ ...remote, agent }, ctx({ live: [info("working")], status: status("connected") }))).toBeNull();
     }

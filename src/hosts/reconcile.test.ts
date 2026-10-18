@@ -354,3 +354,14 @@ describe("reconcileHosts with the Local Host", () => {
     expect([c.id, d.id]).toContain(s.activeLeafByGroup.g1);
   });
 });
+
+it("restored Pi Terminals keep scoped custom IDs without collapsing across Projects", () => {
+  const list = [
+    info("pi-a", { spec: { cwd: "/A", agent: "pi", sessionId: "custom" } }),
+    info("pi-b", { spec: { cwd: "/B", agent: "pi", sessionId: "custom" } }),
+    info("claude", { spec: { cwd: "/A", agent: "claude", sessionId: "custom" } }),
+  ];
+  const delta = reconcile([], H, list, new Set());
+  expect(delta.add.map(t => [t.agent, t.sessionId, t.projectPath])).toEqual([["pi", "custom", "/A"], ["pi", "custom", "/B"], ["claude", "custom", "/A"]]);
+  expect(reconcile(delta.add, H, list, new Set())).toMatchObject({ add: [], remove: [], update: [] });
+});

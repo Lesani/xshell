@@ -1,5 +1,5 @@
 import type { HostId } from "./types";
-import { normalizePath } from "../utils";
+import { normalizePath, normalizeProjectPath } from "../utils";
 
 // A Project is identified by (Host, path). This module is the only place that knows the
 // key format:
@@ -70,13 +70,23 @@ export function keyBasename(key: string): string {
 
 // ── Session identity (amendment 19) ─────────────────────────────────
 // Runtime identity of a session for dedup, tab claims, open-state maps and React keys.
-// RPCs and stored per-project folders keep the raw id.
+// RPCs keep raw IDs; new Pi folder entries use scoped keys too.
 export function sessionKey(host: HostId | undefined, id: string): string {
   return host ? `${host}:${id}` : id;
 }
-export const sessionKeyOf = (s: { host?: HostId; id: string }): string => sessionKey(s.host, s.id);
-export const sessionKeyOfTab = (t: { host?: HostId; sessionId?: string }): string | null =>
-  t.sessionId ? sessionKey(t.host, t.sessionId) : null;
+// Pi permits the same custom ID in different Projects and alongside other agents.
+// Keep every other agent's existing Host + raw-ID identity unchanged.
+export function scopedSessionKey(host: HostId | undefined, agent: string | null | undefined, id: string, path = ""): string {
+  return agent === "pi" ? JSON.stringify([host ?? null, "pi", normalizeProjectPath(path), id]) : sessionKey(host, id);
+}
+export const sessionKeyOf = (s: { host?: HostId; id: string; agent?: string; project_path?: string }): string =>
+  scopedSessionKey(s.host, s.agent, s.id, s.project_path);
+export const sessionKeyOfTab = (t: { host?: HostId; sessionId?: string; agent?: string; projectPath?: string }): string | null =>
+  t.sessionId ? scopedSessionKey(t.host, t.agent, t.sessionId, t.projectPath) : null;
+
+// Existing folder entries stay raw IDs; Pi's new entries need a separate namespace.
+export const sessionFolderId = (s: { host?: HostId; id: string; agent?: string; project_path?: string }): string =>
+  s.agent === "pi" ? sessionKeyOf(s) : s.id;
 
 // ── Project picker checked state (amendment 25) ──────────────────────
 // Within one Host, compare with today's `normalizePath` (separators, trailing slashes,

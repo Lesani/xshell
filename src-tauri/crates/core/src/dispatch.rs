@@ -3,8 +3,8 @@
 
 use crate::ctx::HostCtx;
 use crate::{
-    agents, antigravity, claude, codex, cursor, files, git, memories, opencode, sessions, skills,
-    stats, transfer,
+    agents, antigravity, claude, codex, cursor, files, git, memories, opencode, pi, sessions,
+    skills, stats, transfer,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -43,10 +43,12 @@ pub const METHODS: &[&str] = &[
     "list_cursor_projects",
     "list_opencode_projects",
     "list_antigravity_projects",
+    "list_pi_projects",
     "get_codex_context",
     "get_cursor_context",
     "get_opencode_context",
     "get_antigravity_context",
+    "get_pi_context",
     "get_claude_cost_summary",
     "get_codex_usage",
     "get_project_sessions",
@@ -64,8 +66,9 @@ pub const METHODS: &[&str] = &[
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EncodedName {
+struct ProjectSessionsArgs {
     encoded_name: String,
+    project_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,8 +227,12 @@ pub fn dispatch(ctx: &HostCtx, method: &str, params: Value) -> Result<Value, Str
     match method {
         "list_claude_projects" => out(claude::list_claude_projects(ctx)),
         "get_sessions" => {
-            let a: EncodedName = p.parse()?;
-            out(sessions::get_sessions(ctx, a.encoded_name))
+            let a: ProjectSessionsArgs = p.parse()?;
+            out(sessions::get_sessions_for_project(
+                ctx,
+                a.encoded_name,
+                a.project_path.as_deref(),
+            ))
         }
         "get_all_recent_sessions" => {
             let a: Limit = p.parse()?;
@@ -320,6 +327,11 @@ pub fn dispatch(ctx: &HostCtx, method: &str, params: Value) -> Result<Value, Str
         "list_codex_projects" => out(codex::list_codex_projects(ctx)),
         "list_cursor_projects" => out(cursor::list_cursor_projects(ctx)),
         "list_opencode_projects" => out(opencode::list_opencode_projects(ctx)),
+        "list_pi_projects" => out(pi::list_pi_projects(ctx)),
+        "get_pi_context" => {
+            let a: ProjectPath = p.parse()?;
+            out(pi::get_pi_context(ctx, a.project_path))
+        }
         "list_antigravity_projects" => out(antigravity::list_antigravity_projects(ctx)),
         "get_codex_context" => {
             let a: ProjectPath = p.parse()?;

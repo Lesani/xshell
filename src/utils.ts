@@ -6,6 +6,18 @@ export function normalizePath(p: string): string {
   return p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
 }
 
+// Windows drive/UNC paths are case-insensitive; Unix paths are not. Used for
+// project-scoped Pi identity and discovery, without changing legacy agent keys.
+export function normalizeProjectPath(path: string): string {
+  // Forward // is ambiguous without Host metadata; do not case-fold a Unix path.
+  if (/^(?:[a-z]:[\\/]|\\\\)/i.test(path)) return normalizePath(path).replace(/\\/g, "/");
+  return path.replace(/\/+$/, "") || (path.startsWith("/") ? "/" : "");
+}
+
+export function sessionMessageLabel(session: Pick<SessionInfo, "agent" | "message_count">): string {
+  return `${session.message_count} ${session.agent === "pi" ? "" : "user "}message${session.message_count === 1 ? "" : "s"}`;
+}
+
 export function timeAgo(isoDate: string): string {
   if (!isoDate) return "";
   const now = Date.now();

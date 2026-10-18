@@ -344,7 +344,9 @@ impl Conn {
                 let mut reg = d.reg.lock().unwrap();
                 if !reg.frozen && !reg.terminals.contains_key(&spec.terminal) {
                     if let Some((agent, sid)) = &session {
-                        if let Some((owner, hold)) = d.session_owner(&reg, agent, sid) {
+                        if let Some((owner, hold)) =
+                            d.session_owner(&reg, agent, sid, &spec.launch.cwd)
+                        {
                             let r = self.open_existing(&spec, &owner, hold);
                             drop(reg);
                             reply(&self.ob, id, r);

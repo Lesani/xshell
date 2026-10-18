@@ -68,6 +68,8 @@ pub(crate) const MOBILE_CALLS: &[&str] = &[
 /// client-chosen path (skills, memories, agent contexts) and host probes.
 #[cfg(test)]
 pub(crate) const MOBILE_REFUSED_CALLS: &[&str] = &[
+    "list_pi_projects",
+    "get_pi_context",
     "read_text_file",
     "list_dir",
     "search_dir",
@@ -494,6 +496,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pi_methods_and_launch_are_refused_to_mobile() {
+        let ctx = HostCtx::with_home("/nonexistent-home", "/tmp");
+        for method in ["list_pi_projects", "get_pi_context"] {
+            assert_eq!(
+                check_call(&ctx, method, &json!({"projectPath":"/work"})),
+                Err(format!("{FORBIDDEN}: call {method}"))
+            );
+        }
+        let pi = LaunchSpec {
+            agent: Some("pi".into()),
+            ..agent("/work")
+        };
+        assert!(check_open(&ctx, &pi).unwrap_err().contains("agent"));
+    }
+
+    #[test]
     fn every_core_method_classified() {
         let allowed: HashSet<_> = MOBILE_CALLS.iter().collect();
         let refused: HashSet<_> = MOBILE_REFUSED_CALLS.iter().collect();
@@ -591,6 +609,10 @@ pub(crate) mod tests {
             },
             LaunchSpec {
                 shell_command: Some("bash".into()),
+                ..ok.clone()
+            },
+            LaunchSpec {
+                agent: Some("pi".into()),
                 ..ok.clone()
             },
             LaunchSpec {

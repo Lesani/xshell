@@ -783,3 +783,72 @@ fn codex_unlinked_terminal_does_not_match() {
     assert!(!r.existed);
     assert_eq!(r.terminal, Some(t));
 }
+
+#[test]
+fn pi_same_custom_id_in_different_projects_opens_two_terminals() {
+    let mut e = env();
+    let other = e.h.project("other");
+    let other_fake = Fake::in_dir(&other);
+    let _reaper = FakeReaper(other_fake.pids_log.clone());
+    let pi = |cwd: &std::path::Path| LaunchSpec {
+        agent: Some("pi".into()),
+        session_id: Some("custom-id".into()),
+        cwd: cwd.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let (a, ra) = e.desk_open(pi(&e.cwd));
+    let (b, rb) = e.desk_open(pi(&other));
+    assert_ne!(a, b);
+    assert_ne!(ra.pid, rb.pid);
+    e.fake.wait_launches(1);
+    other_fake.wait_launches(1);
+    assert_eq!(e.fake.launches()[0], vec!["--session-id", "custom-id"]);
+    assert_eq!(other_fake.launches()[0], vec!["--session-id", "custom-id"]);
+    assert_eq!(e.listed_on("custom-id").len(), 2);
+}
+
+#[test]
+fn pi_same_project_session_deduplicates_existing_terminal() {
+    let mut e = env();
+    let pi = LaunchSpec {
+        agent: Some("pi".into()),
+        session_id: Some("custom-id".into()),
+        cwd: e.cwd.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let (a, first) = e.desk_open(pi.clone());
+    let request = Uuid::new_v4();
+    let r = open_reply(e.desk.request(&adopt_msg(request, pi.clone())).unwrap());
+    assert_eq!(r.terminal, Some(a));
+    assert_eq!(r.pid, first.pid);
+    assert!(r.existed);
+    session_open(e.desk.request(&ClientMsg::TermOpen {
+        spec: OpenSpec {
+            terminal: Uuid::new_v4(),
+            launch: pi,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        },
+    }));
+    e.assert_launches("custom-id", 1);
+    assert_eq!(e.listed_on("custom-id").len(), 1);
+}
+
+#[test]
+fn pi_and_claude_same_raw_id_remain_separate() {
+    let mut e = env();
+    let (claude, _) = e.desk_open(e.claude(SID));
+    let (pi, _) = e.desk_open(LaunchSpec {
+        agent: Some("pi".into()),
+        ..e.claude(SID)
+    });
+    assert_ne!(claude, pi);
+    e.assert_launches(SID, 2);
+    let rows = e.listed_on(SID);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r.spec.agent.as_deref() == Some("pi")));
+    assert!(rows
+        .iter()
+        .any(|r| r.spec.agent.as_deref() == Some("claude")));
+}

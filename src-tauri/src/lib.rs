@@ -23,6 +23,7 @@ use xshell_core::files::DirItem;
 use xshell_core::git::{GitBranch, GitCommit, GitStatus};
 use xshell_core::memories::ProjectMemories;
 use xshell_core::opencode::OpencodeContext;
+use xshell_core::pi::PiContext;
 use xshell_core::sessions::{CodexProjectInfo, MessagePreview, ProjectInfo, SessionInfo};
 use xshell_core::skills::ProjectSkills;
 use xshell_core::stats::{ClaudeCostSummary, GlobalRateLimits, StatuslineProbe};
@@ -428,8 +429,8 @@ fn list_claude_projects() -> Vec<ProjectInfo> {
 }
 
 #[tauri::command]
-fn get_sessions(encoded_name: String) -> Vec<SessionInfo> {
-    xshell_core::sessions::get_sessions(&ctx(), encoded_name)
+fn get_sessions(encoded_name: String, project_path: Option<String>) -> Vec<SessionInfo> {
+    xshell_core::sessions::get_sessions_for_project(&ctx(), encoded_name, project_path.as_deref())
 }
 
 #[tauri::command]
@@ -579,6 +580,16 @@ fn list_cursor_projects() -> Vec<CodexProjectInfo> {
 #[tauri::command]
 fn list_opencode_projects() -> Vec<CodexProjectInfo> {
     xshell_core::opencode::list_opencode_projects(&ctx())
+}
+
+#[tauri::command]
+fn list_pi_projects() -> Vec<CodexProjectInfo> {
+    xshell_core::pi::list_pi_projects(&ctx())
+}
+
+#[tauri::command]
+fn get_pi_context(project_path: String) -> PiContext {
+    xshell_core::pi::get_pi_context(&ctx(), project_path)
 }
 
 #[tauri::command]
@@ -754,6 +765,8 @@ pub fn run() {
             list_cursor_projects,
             list_opencode_projects,
             list_antigravity_projects,
+            list_pi_projects,
+            get_pi_context,
             get_codex_context,
             get_cursor_context,
             get_opencode_context,
@@ -899,7 +912,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 100);
+        assert_eq!(registered.len(), 102);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

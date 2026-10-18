@@ -20,6 +20,7 @@ pub fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String> {
         && binary != "cursor-agent"
         && binary != "opencode"
         && binary != "agy"
+        && binary != "pi"
     {
         return Err(format!("Unknown agent binary: {}", binary));
     }
@@ -88,4 +89,19 @@ pub fn detect_agent_binary(binary: String) -> Result<AgentBinaryProbe, String> {
         path: Some(path),
         version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pi_binary_is_allowlisted_but_unknown_commands_are_not() {
+        assert!(detect_agent_binary("pi".into()).is_ok());
+        for binary in ["unknown", "pi --version", "pi; echo injected"] {
+            assert!(detect_agent_binary(binary.into())
+                .unwrap_err()
+                .starts_with("Unknown agent binary:"));
+        }
+    }
 }
