@@ -1,5 +1,7 @@
 # A Relay move never waits for the old Relay
 
+Design superseded by [ADR-0015](0015-change-relays-by-leaving-and-pairing-again.md): the target enrollment design requires per-device leave and pairing into a new Ring, with no move-ring function. The automatic move described below remains the current implementation until that change lands.
+
 Until now a Desktop that changed its Ring's Relay stayed on the old Relay until that Relay had
 acknowledged the new Roster version, and refused another change meanwhile ("it never moves
 without the acknowledgement"). The intent was that devices still connected to the old Relay
