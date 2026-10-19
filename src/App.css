@@ -469,9 +469,10 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .home-section-actions { display: flex; gap: 6px; }
 
 .btn { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: var(--radius-md); border: 1px solid var(--border-default); background: var(--bg-elevated); color: var(--text-secondary); font-size: 11px; font-family: var(--font-sans); cursor: pointer; transition: all 0.15s ease; white-space: nowrap; }
-.btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-strong); }
+.btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-strong); }
 .btn-primary { background: var(--accent-terracotta); border-color: var(--accent-terracotta); color: var(--text-primary); }
-.btn-primary:hover { background: var(--accent-coral); border-color: var(--accent-coral); }
+.btn-primary:hover:not(:disabled) { background: var(--accent-coral); border-color: var(--accent-coral); }
+.btn:disabled { opacity: 0.45; cursor: default; }
 
 /* 4px dots marking the corners of a bordered frame — used by the Add Projects picker list. */
 .corner-dot { position: absolute; width: 4px; height: 4px; background: color-mix(in oklab, var(--text-primary) 25%, transparent); z-index: 1; }
@@ -1762,7 +1763,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .sessions-view-header-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
 .btn-ghost { background: transparent; border-color: transparent; color: var(--text-muted); }
-.btn-ghost:hover { background: var(--bg-hover); color: var(--error); border-color: transparent; }
+.btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--error); border-color: transparent; }
 
 /* ── Context Menu ─────────────────────────────────────────────────── */
 
