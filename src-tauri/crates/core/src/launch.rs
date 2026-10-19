@@ -1,4 +1,4 @@
-use crate::agent_status::{hook_agent, HookAgent};
+use crate::agent_status::{hook_agent, HookAgent, EVENT_SOCKET_ENV, TERMINAL_ID_ENV};
 use crate::claude::encode_project_name;
 use crate::ctx::HostCtx;
 use crate::direct_exec::{self, DirectExec};
@@ -27,12 +27,21 @@ impl CommandPlan {
         for a in &self.args {
             cmd.arg(a);
         }
+        clear_inherited_hooks(&mut cmd);
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
         cmd.cwd(&self.cwd);
         cmd
     }
+}
+
+/// Drops the hook variables this process may have inherited (xshell started from a Terminal
+/// of another xshell): a Terminal without hooks would otherwise report to the outer one. A
+/// hooked plan sets its own in `env`.
+pub fn clear_inherited_hooks(cmd: &mut CommandBuilder) {
+    cmd.env_remove(TERMINAL_ID_ENV);
+    cmd.env_remove(EVENT_SOCKET_ENV);
 }
 
 // The Git Bash preset sends bare `bash.exe`, which on Windows resolves via PATH and gets
@@ -576,6 +585,70 @@ mod tests {
         v.iter()
             .map(|(k, val)| (k.to_string(), val.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn inherited_hook_variables_are_dropped_and_a_plans_own_are_kept() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env(TERMINAL_ID_ENV, "outer.1");
+        cmd.env(EVENT_SOCKET_ENV, "/outer.sock");
+        clear_inherited_hooks(&mut cmd);
+        assert_eq!(cmd.get_env(TERMINAL_ID_ENV), None);
+        assert_eq!(cmd.get_env(EVENT_SOCKET_ENV), None);
+
+        let plan = |env| CommandPlan {
+            program: "sh".into(),
+            args: vec![],
+            env,
+            cwd: "/".into(),
+        };
+        let hooked = plan(vec![
+            (TERMINAL_ID_ENV.into(), "inner.2".into()),
+            (EVENT_SOCKET_ENV.into(), "/inner.sock".into()),
+        ])
+        .to_command_builder();
+        assert_eq!(hooked.get_env(TERMINAL_ID_ENV), Some(OsStr::new("inner.2")));
+        assert_eq!(
+            hooked.get_env(EVENT_SOCKET_ENV),
+            Some(OsStr::new("/inner.sock"))
+        );
+    }
+
+    /// Run as a child of [`a_hookless_plan_drops_hook_variables_inherited_by_the_process`],
+    /// whose environment carries an outer Terminal's hook variables.
+    #[test]
+    fn hookless_plan_child() {
+        if std::env::var_os("XSHELL_TEST_HOOKLESS_CHILD").is_none() {
+            return;
+        }
+        assert!(std::env::var_os(TERMINAL_ID_ENV).is_some());
+        let cmd = CommandPlan {
+            program: "sh".into(),
+            args: vec![],
+            env: vec![],
+            cwd: "/".into(),
+        }
+        .to_command_builder();
+        assert_eq!(cmd.get_env(TERMINAL_ID_ENV), None);
+        assert_eq!(cmd.get_env(EVENT_SOCKET_ENV), None);
+    }
+
+    #[test]
+    fn a_hookless_plan_drops_hook_variables_inherited_by_the_process() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch::tests::hookless_plan_child",
+                "--nocapture",
+            ])
+            .env("XSHELL_TEST_HOOKLESS_CHILD", "1")
+            .env(TERMINAL_ID_ENV, "outer.1")
+            .env(EVENT_SOCKET_ENV, "/outer.sock")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
     }
 
     // Every plan carries the terminal variables first, then `extra`.

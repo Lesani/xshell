@@ -2968,6 +2968,7 @@ mod win {
         }
         // Shared with the first-message search, so it finds the agent this Terminal runs.
         xshell_core::direct_exec::terminal_env(&mut cmd, std::env::vars_os());
+        xshell_core::launch::clear_inherited_hooks(&mut cmd);
         for (k, v) in &plan.env {
             cmd.env(k, v);
         }
