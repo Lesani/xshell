@@ -20,6 +20,7 @@
 }
 
 :root {
+  color-scheme: dark;
   /* Surfaces */
   --bg-deep: #141413;
   --bg-surface: #1c1c1b;
@@ -78,6 +79,7 @@
    dark, where they go lighter) — that's what reads as "highlighted" on a light bg.
    Brand (terracotta/coral) and semantic colors (error, focus) carry over unchanged. */
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg-deep: #f5f4ed;
   --bg-surface: #faf9f5;
   --bg-elevated: #ffffff;
@@ -1173,7 +1175,10 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .settings-color-hex { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
 .settings-reset-btn { display: inline-flex; align-items: center; gap: 4px; background: transparent; border: 1px solid var(--border-default); color: var(--text-tertiary); padding: 3px 8px; border-radius: var(--radius-sm); font-size: 10px; cursor: pointer; transition: background 0.12s, color 0.12s; }
 .settings-reset-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
-.settings-select { background: var(--bg-deep); border: 1px solid var(--border-default); border-radius: var(--radius-sm); color: var(--text-primary); padding: 5px 8px; font-size: 11px; outline: none; cursor: pointer; min-width: 160px; }
+.settings-select { -webkit-appearance: none; appearance: none; background: var(--bg-deep) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238a867e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 9px center; border: 1px solid var(--border-default); border-radius: var(--radius-sm); color: var(--text-primary); padding: 5px 26px 5px 8px; font-size: 11px; font-family: var(--font-sans); outline: none; cursor: pointer; min-width: 160px; }
+/* WebKitGTK draws a native <select> (and its popup) from the GTK theme, ignoring the
+   background above: appearance: none and themed options keep it readable on any theme. */
+.settings-select option { background: var(--bg-elevated); color: var(--text-primary); }
 .settings-select:focus { border-color: var(--accent-terracotta); }
 
 /* Settings as a full page (not modal). Flat layout — no extra bordered container. */
