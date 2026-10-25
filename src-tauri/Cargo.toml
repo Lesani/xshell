@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink", "crates/buildinfo"]
+members = [".", "crates/core", "crates/protocol", "crates/xshelld", "crates/hostlink", "crates/buildinfo", "crates/pairing-access"]
 # Vendored, patched crates (see each one's XSHELL-PATCH.md): not workspace members.
 exclude = ["vendor"]
 resolver = "2"
@@ -43,6 +43,7 @@ uuid = { workspace = true }
 xshell-core = { path = "crates/core" }
 xshell-protocol = { path = "crates/protocol" }
 xshell-hostlink = { path = "crates/hostlink" }
+xshell-pairing-access = { path = "crates/pairing-access" }
 dirs = { workspace = true }
 # All already in the tree via tauri-plugin-updater: no new crates.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }

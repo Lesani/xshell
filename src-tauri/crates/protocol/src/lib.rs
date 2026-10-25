@@ -11,6 +11,8 @@ pub mod launch;
 pub mod msg;
 pub mod negotiate;
 #[cfg(feature = "ring")]
+pub mod pairing_access;
+#[cfg(feature = "ring")]
 pub mod ring;
 
 pub use launch::LaunchSpec;
