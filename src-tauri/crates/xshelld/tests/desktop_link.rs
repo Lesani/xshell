@@ -330,6 +330,21 @@ fn upgrade_restores_same_uuid_new_pid() {
     std::fs::write(&old, bytes).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The test-only byte patch invalidates Apple Silicon's ad-hoc Mach-O signature.
+    // Re-sign only this temporary fixture, without a certificate or timestamp service.
+    #[cfg(target_os = "macos")]
+    {
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&old)
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "sign temporary upgrade fixture: {}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
     struct InitialBuild {
         inner: std::sync::Arc<dyn xshell_hostlink::TransportFactory>,
         old: std::path::PathBuf,
