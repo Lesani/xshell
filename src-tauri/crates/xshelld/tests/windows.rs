@@ -1202,14 +1202,11 @@ fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
         .iter()
         .any(|s| s == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED));
     let terminal = Uuid::new_v4();
-    let pid = c.open(
-        terminal,
-        LaunchSpec {
-            cwd: h.home().to_string_lossy().into_owned(),
-            shell_mode: Some("terminal".into()),
-            ..Default::default()
-        },
-    );
+    // Use the established persistent cmd fixture. "terminal" is not raw mode and
+    // would start the short-lived fake agent instead of a shell.
+    let pid = c.open(terminal, cmd_spec(&h.home()));
+    c.attach(terminal);
+    c.marker(terminal, 901);
     let (bytes, build) = update_fixture_bytes();
     let dir = stage_fixture(&h, &bytes, &build);
     let request = ClientMsg::DaemonUpgradeSelected {
@@ -1241,6 +1238,8 @@ fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
     assert!(list
         .iter()
         .any(|t| t.terminal == terminal && t.pid.is_some() && t.pid != Some(pid)));
+    next.attach(terminal);
+    next.marker(terminal, 902);
     owner.terminate(T);
     assert!(wait_dead(new_pid, T));
     for t in list {
