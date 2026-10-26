@@ -229,6 +229,22 @@ describe("local parity: terminal commands", () => {
   });
 });
 
+describe("Pi input bytes across Terminal transports", () => {
+  it.each([
+    { host: undefined, terminal: undefined, command: "write_terminal" },
+    { host: "local", terminal: "pi-local", command: "host_term_input" },
+    { host: H, terminal: "pi-remote", command: "host_term_input" },
+  ])("preserves CSI-u, bracketed multiline UTF-8 and submit bytes: $command/$host", ({ host, terminal, command }) => {
+    invoke.mockResolvedValue(undefined);
+    const tab: Tab = { id: "pi-input", type: "terminal", title: "Pi", agent: "pi", host, terminal };
+    const frames = ["\x1b[13;2u", "\x1b[200~eins äöü\rzwei ß @€\rdrei\x1b[201~", "\r", "\x1b\r"];
+    for (const data of frames) writeTerminal(tab, data);
+    expect(invoke.mock.calls).toEqual(frames.map(data => [command,
+      terminal ? { host, terminal, data } : { id: tab.id, data },
+    ]));
+  });
+});
+
 describe("close intent through the TerminalTab-facing API", () => {
   it("markClosing closes once; the later unmount neither detaches nor closes again, even after the list dropped it", async () => {
     invoke.mockResolvedValue({ exitCode: null });

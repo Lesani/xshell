@@ -15,12 +15,13 @@
 //! output frame per Terminal per interval, barriers apart.
 
 use super::transport::Stream;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, Write};
 use std::net::Shutdown;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use xshell_core::terminal::replay::{BRACKETED_PASTE_ENABLE, RESET};
 use xshell_core::terminal::OVERFLOW_NOTICE;
 use xshell_protocol::frame::KIND_OUTPUT;
 
@@ -39,6 +40,8 @@ pub(crate) enum Out {
         terminal: Uuid,
         data: Arc<[u8]>,
         urgent: bool,
+        /// Program mode after this output; survives eviction even for an idle Terminal.
+        bracketed_paste: bool,
     },
     /// A control frame about one Terminal (`term.exit`, an attach's `res`): never dropped,
     /// and a barrier for that Terminal's output.
@@ -363,17 +366,23 @@ impl Outbox {
 
     /// Queue Terminal output; never blocks. Returns the Terminals whose queued output was
     /// dropped to make room (each gets `OVERFLOW_NOTICE` first), so the caller can nudge them.
-    pub fn push_output(&self, terminal: Uuid, data: Arc<[u8]>) -> Vec<Uuid> {
-        self.push_output_inner(terminal, data, false)
+    pub fn push_output(&self, terminal: Uuid, data: Arc<[u8]>, bracketed_paste: bool) -> Vec<Uuid> {
+        self.push_output_inner(terminal, data, false, bracketed_paste)
     }
 
     /// [`Outbox::push_output`] for a piece of an attach's replay: a paced connection writes
     /// it at once.
-    pub fn push_replay(&self, terminal: Uuid, data: Arc<[u8]>) -> Vec<Uuid> {
-        self.push_output_inner(terminal, data, true)
+    pub fn push_replay(&self, terminal: Uuid, data: Arc<[u8]>, bracketed_paste: bool) -> Vec<Uuid> {
+        self.push_output_inner(terminal, data, true, bracketed_paste)
     }
 
-    fn push_output_inner(&self, terminal: Uuid, data: Arc<[u8]>, urgent: bool) -> Vec<Uuid> {
+    fn push_output_inner(
+        &self,
+        terminal: Uuid,
+        data: Arc<[u8]>,
+        urgent: bool,
+        bracketed_paste: bool,
+    ) -> Vec<Uuid> {
         let mut g = self.inner.lock().unwrap();
         if g.state != State::Open {
             return Vec::new();
@@ -383,7 +392,20 @@ impl Outbox {
             // Each Terminal's first dropped chunk becomes its notice, in place: the notice
             // stays ahead of any control frame queued after that output (a `term.exit` is a
             // barrier no output of its Terminal may cross).
-            let notice: Arc<[u8]> = Arc::from(OVERFLOW_NOTICE);
+            // Last mode for EVERY evicted Terminal, including one that never prints again.
+            // The triggering chunk may complete a mode sequence whose start was evicted.
+            let mut modes = HashMap::new();
+            for o in &g.q {
+                if let Out::Output {
+                    terminal,
+                    bracketed_paste,
+                    ..
+                } = o
+                {
+                    modes.insert(*terminal, *bracketed_paste);
+                }
+            }
+            modes.insert(terminal, bracketed_paste);
             let mut kept = VecDeque::with_capacity(g.q.len());
             let q = std::mem::take(&mut g.q);
             for o in q {
@@ -392,17 +414,33 @@ impl Outbox {
                         terminal: t,
                         data: d,
                         urgent,
+                        ..
                     } => {
                         g.output_bytes -= d.len();
                         g.total_bytes -= d.len();
                         if !dropped.contains(&t) {
                             dropped.push(t);
+                            let mode = modes[&t];
+                            let notice: Arc<[u8]> = if mode {
+                                // Prefix restoration, never append after original output.
+                                Arc::from(
+                                    [
+                                        RESET,
+                                        BRACKETED_PASTE_ENABLE,
+                                        &OVERFLOW_NOTICE[RESET.len()..],
+                                    ]
+                                    .concat(),
+                                )
+                            } else {
+                                Arc::from(OVERFLOW_NOTICE)
+                            };
                             g.output_bytes += notice.len();
                             g.total_bytes += notice.len();
                             kept.push_back(Out::Output {
                                 terminal: t,
-                                data: notice.clone(),
+                                data: notice,
                                 urgent,
+                                bracketed_paste: mode,
                             });
                         }
                     }
@@ -417,6 +455,7 @@ impl Outbox {
                 terminal,
                 data,
                 urgent,
+                bracketed_paste,
             },
         );
         dropped
@@ -753,7 +792,7 @@ mod tests {
             if step == 150 {
                 ob.note_input_at(now);
             }
-            ob.push_output(tid(1), bytes(b"x"));
+            ob.push_output(tid(1), bytes(b"x"), false);
             if !flush(&ob, now).is_empty() {
                 flushes.push(step * 20);
             }
@@ -775,9 +814,9 @@ mod tests {
     fn paced_controls_pass_while_output_held() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         assert_eq!(flush(&ob, t0), vec![out(1, "a")]);
-        ob.push_output(tid(1), bytes(b"b"));
+        ob.push_output(tid(1), bytes(b"b"), false);
         ob.push_control(ctl("res"));
         ob.push_terminals(ctl("list"));
         assert_eq!(flush(&ob, t0 + ms(10)), vec![c("res"), c("list")]);
@@ -791,10 +830,10 @@ mod tests {
     fn paced_exit_flushes_output_first() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"start"));
+        ob.push_output(tid(1), bytes(b"start"), false);
         flush(&ob, t0);
-        ob.push_output(tid(1), bytes(b"last "));
-        ob.push_output(tid(1), bytes(b"words"));
+        ob.push_output(tid(1), bytes(b"last "), false);
+        ob.push_output(tid(1), bytes(b"words"), false);
         ob.push_about(tid(1), ctl("exit"));
         assert_eq!(
             flush(&ob, t0 + ms(10)),
@@ -812,10 +851,10 @@ mod tests {
         let mut frames_of_1 = Vec::new();
         for step in 0..150u64 {
             let now = t0 + ms(step * 20);
-            ob.push_output(tid(1), bytes(b"x"));
+            ob.push_output(tid(1), bytes(b"x"), false);
             if step % 5 == 0 {
                 let other = tid(2 + (step % 3) as u8);
-                ob.push_output(other, bytes(b"bye"));
+                ob.push_output(other, bytes(b"bye"), false);
                 ob.push_about(other, ctl("exit"));
             }
             for (k, _) in flush(&ob, now) {
@@ -832,7 +871,7 @@ mod tests {
         let ob = paced();
         let t0 = Instant::now();
         for (t, d) in [(1, "a"), (2, "1"), (1, "b"), (2, "2"), (1, "c")] {
-            ob.push_output(tid(t), bytes(d.as_bytes()));
+            ob.push_output(tid(t), bytes(d.as_bytes()), false);
         }
         assert_eq!(flush(&ob, t0), vec![out(1, "abc"), out(2, "12")]);
     }
@@ -843,15 +882,15 @@ mod tests {
     fn barriers_keep_exact_order() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"old"));
-        ob.push_output(tid(2), bytes(b"x"));
+        ob.push_output(tid(1), bytes(b"old"), false);
+        ob.push_output(tid(2), bytes(b"x"), false);
         ob.push_about(tid(1), ctl("exit1"));
-        ob.push_output(tid(1), bytes(b"new"));
+        ob.push_output(tid(1), bytes(b"new"), false);
         ob.push_control(ctl("res"));
-        ob.push_output(tid(2), bytes(b"y"));
+        ob.push_output(tid(2), bytes(b"y"), false);
         ob.push_about(tid(2), ctl("res2"));
-        ob.push_replay(tid(2), bytes(b"replay"));
-        ob.push_output(tid(1), bytes(b"newer"));
+        ob.push_replay(tid(2), bytes(b"replay"), false);
+        ob.push_output(tid(1), bytes(b"newer"), false);
         // Due: everything, cut at each barrier of the same Terminal.
         assert_eq!(
             flush(&ob, t0),
@@ -866,9 +905,9 @@ mod tests {
             ]
         );
         // Not due: the exit takes the output before it and leaves what follows held.
-        ob.push_output(tid(1), bytes(b"old"));
+        ob.push_output(tid(1), bytes(b"old"), false);
         ob.push_about(tid(1), ctl("exit1"));
-        ob.push_output(tid(1), bytes(b"new"));
+        ob.push_output(tid(1), bytes(b"new"), false);
         assert_eq!(flush(&ob, t0 + ms(10)), vec![out(1, "old"), c("exit1")]);
         assert_eq!(flush(&ob, t0 + ms(1000)), vec![out(1, "new")]);
     }
@@ -878,17 +917,17 @@ mod tests {
     fn replay_is_immediate_after_its_res() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         flush(&ob, t0);
-        ob.push_output(tid(2), bytes(b"held"));
+        ob.push_output(tid(2), bytes(b"held"), false);
         ob.push_about(tid(1), ctl("res"));
-        ob.push_replay(tid(1), bytes(b"replay"));
-        ob.push_output(tid(1), bytes(b"live"));
+        ob.push_replay(tid(1), bytes(b"replay"), false);
+        ob.push_output(tid(1), bytes(b"live"), false);
         assert_eq!(flush(&ob, t0 + ms(5)), vec![c("res"), out(1, "replay")]);
         // Rapid reattach: again at once.
         ob.cancel_output(tid(1));
         ob.push_about(tid(1), ctl("res"));
-        ob.push_replay(tid(1), bytes(b"replay2"));
+        ob.push_replay(tid(1), bytes(b"replay2"), false);
         assert_eq!(flush(&ob, t0 + ms(10)), vec![c("res"), out(1, "replay2")]);
         assert_eq!(flush(&ob, t0 + ms(1000)), vec![out(2, "held")]);
     }
@@ -897,13 +936,13 @@ mod tests {
     fn size_latest_wins_and_waits_for_earlier_output() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         flush(&ob, t0);
         // No output held before it: at once.
         ob.push_size(tid(1), ctl("s1"));
         assert_eq!(flush(&ob, t0 + ms(1)), vec![c("s1")]);
         // Behind held output: it waits with it, and only the newest is kept.
-        ob.push_output(tid(1), bytes(b"b"));
+        ob.push_output(tid(1), bytes(b"b"), false);
         ob.push_size(tid(1), ctl("s2"));
         ob.push_size(tid(2), ctl("other"));
         ob.push_size(tid(1), ctl("s3"));
@@ -918,12 +957,12 @@ mod tests {
     fn size_keeps_one_output_frame_per_interval() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         flush(&ob, t0);
-        ob.push_output(tid(1), bytes(b"old"));
+        ob.push_output(tid(1), bytes(b"old"), false);
         ob.push_size(tid(1), ctl("size"));
-        ob.push_output(tid(1), bytes(b"redraw"));
-        ob.push_output(tid(2), bytes(b"other"));
+        ob.push_output(tid(1), bytes(b"redraw"), false);
+        ob.push_output(tid(2), bytes(b"other"), false);
         assert_eq!(flush(&ob, t0 + ms(500)), vec![]);
         assert_eq!(
             flush(&ob, t0 + ms(1000)),
@@ -933,13 +972,13 @@ mod tests {
         assert_eq!(flush(&ob, t0 + ms(2000)), vec![out(1, "redraw")]);
         // A size with no output of its Terminal before it in the flush cuts nothing.
         ob.push_size(tid(1), ctl("size2"));
-        ob.push_output(tid(1), bytes(b"after"));
+        ob.push_output(tid(1), bytes(b"after"), false);
         assert_eq!(flush(&ob, t0 + ms(2001)), vec![c("size2")]);
         assert_eq!(flush(&ob, t0 + ms(3000)), vec![out(1, "after")]);
         // Barriers still take everything before them along.
-        ob.push_output(tid(1), bytes(b"x"));
+        ob.push_output(tid(1), bytes(b"x"), false);
         ob.push_size(tid(1), ctl("size3"));
-        ob.push_output(tid(1), bytes(b"y"));
+        ob.push_output(tid(1), bytes(b"y"), false);
         ob.push_about(tid(1), ctl("exit"));
         assert_eq!(
             flush(&ob, t0 + ms(3001)),
@@ -956,9 +995,9 @@ mod tests {
         let mut frames = Vec::new();
         for step in 0..200u64 {
             let now = t0 + ms(step * 20);
-            ob.push_output(tid(1), bytes(b"x"));
+            ob.push_output(tid(1), bytes(b"x"), false);
             ob.push_size(tid(1), ctl(&format!("s{}", step % 7)));
-            ob.push_output(tid(1), bytes(b"y"));
+            ob.push_output(tid(1), bytes(b"y"), false);
             let got = flush(&ob, now);
             let n = got.iter().filter(|(k, _)| *k == o(1)).count();
             assert!(n <= 1, "{n} frames in one flush at {}", step * 20);
@@ -973,9 +1012,9 @@ mod tests {
     fn drop_output_keeps_sizes() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         flush(&ob, t0);
-        ob.push_output(tid(1), bytes(b"held"));
+        ob.push_output(tid(1), bytes(b"held"), false);
         ob.push_size(tid(1), ctl("s"));
         ob.drop_output(tid(1));
         assert_eq!(queued(&ob), vec![('s', b"#s;".to_vec())]);
@@ -987,10 +1026,13 @@ mod tests {
     fn paced_overflow_still_drops_with_notice() {
         let ob = Outbox::with_pace(100, 10_000, None, Some(PACE));
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"first"));
+        ob.push_output(tid(1), bytes(b"first"), false);
         flush(&ob, t0);
-        assert!(ob.push_output(tid(1), bytes(&[b'a'; 60])).is_empty());
-        assert_eq!(ob.push_output(tid(1), bytes(&[b'b'; 60])), vec![tid(1)]);
+        assert!(ob.push_output(tid(1), bytes(&[b'a'; 60]), false).is_empty());
+        assert_eq!(
+            ob.push_output(tid(1), bytes(&[b'b'; 60]), false),
+            vec![tid(1)]
+        );
         assert_eq!(flush(&ob, t0 + ms(10)), vec![]);
         let mut want = OVERFLOW_NOTICE.to_vec();
         want.extend_from_slice(&[b'b'; 60]);
@@ -1003,11 +1045,11 @@ mod tests {
     fn cancel_output_drops_only_that_terminal() {
         let ob = paced();
         let t0 = Instant::now();
-        ob.push_output(tid(1), bytes(b"a"));
+        ob.push_output(tid(1), bytes(b"a"), false);
         flush(&ob, t0);
-        ob.push_output(tid(1), bytes(b"held"));
+        ob.push_output(tid(1), bytes(b"held"), false);
         ob.push_size(tid(1), ctl("s"));
-        ob.push_output(tid(2), bytes(b"other"));
+        ob.push_output(tid(2), bytes(b"other"), false);
         ob.push_control(ctl("res"));
         ob.cancel_output(tid(1));
         assert_eq!(
@@ -1027,7 +1069,7 @@ mod tests {
         let ob2 = ob.clone();
         let h = std::thread::spawn(move || writer_loop(ob2, a, Duration::from_secs(1)));
         let t1 = Uuid::new_v4();
-        ob.push_output(t1, bytes(b"one"));
+        ob.push_output(t1, bytes(b"one"), false);
         let f = read_frame(&mut b, MAX_FRAME_LEN).unwrap().unwrap();
         assert_eq!(
             f,
@@ -1036,8 +1078,8 @@ mod tests {
                 data: b"one".to_vec()
             }
         );
-        ob.push_output(t1, bytes(b"two "));
-        ob.push_output(t1, bytes(b"three"));
+        ob.push_output(t1, bytes(b"two "), false);
+        ob.push_output(t1, bytes(b"three"), false);
         std::thread::sleep(ms(100));
         ob.close();
         let f = read_frame(&mut b, MAX_FRAME_LEN).unwrap().unwrap();
@@ -1053,6 +1095,111 @@ mod tests {
     }
 
     #[test]
+    fn overflow_restores_each_terminals_mode_without_more_output() {
+        let ob = Outbox::new(160, 10_000, None);
+        let (enabled, disabled, trigger) = (tid(1), tid(2), tid(3));
+        ob.push_output(enabled, bytes(b"\x1b[?2004hfirst"), true);
+        ob.push_output(disabled, bytes(b"\x1b[?2004h\x1b[?2004lsecond"), false);
+        ob.push_about(enabled, bytes(b"exit"));
+        let dropped = ob.push_output(trigger, bytes(&[b'x'; 150]), false);
+        assert!(dropped.contains(&enabled) && dropped.contains(&disabled));
+        {
+            let g = ob.inner.lock().unwrap();
+            assert_eq!(g.total_bytes, g.q.iter().map(Out::len).sum::<usize>());
+            assert_eq!(
+                g.output_bytes,
+                g.q.iter()
+                    .filter(|o| o.is_output())
+                    .map(Out::len)
+                    .sum::<usize>()
+            );
+            assert!(g.total_bytes <= ob.total_cap);
+        }
+        let all = ob.take_all();
+        assert!(matches!(&all[1], Out::Output { terminal, .. } if *terminal == disabled));
+        assert!(matches!(&all[2], Out::About { terminal, .. } if *terminal == enabled));
+        for (terminal, expected) in [(enabled, true), (disabled, false)] {
+            let mut mode = vt100::Parser::new(24, 80, 0);
+            for item in &all {
+                if let Out::Output {
+                    terminal: t, data, ..
+                } = item
+                {
+                    if *t == terminal {
+                        mode.process(data);
+                    }
+                }
+            }
+            assert_eq!(mode.screen().bracketed_paste(), expected, "{terminal}");
+        }
+        let g = ob.inner.lock().unwrap();
+        assert_eq!(g.output_bytes, 0);
+        assert_eq!(g.total_bytes, 0);
+    }
+
+    #[test]
+    fn overflow_after_split_decstr_does_not_restore_paste_mode() {
+        use xshell_core::terminal::replay::ReplayBuffer;
+        let ob = Outbox::new(100, 10_000, None);
+        let (reset, trigger) = (tid(1), tid(2));
+        let mut replay = ReplayBuffer::new(32);
+        // Match Terminal::on_output: track only original bytes, then enqueue its mode.
+        for chunk in [b"\x1b[?2004h".as_slice(), b"\x1b[!", b"p"] {
+            replay.push(chunk);
+            ob.push_output(reset, bytes(chunk), replay.bracketed_paste());
+        }
+        ob.push_about(reset, bytes(b"exit"));
+        assert_eq!(
+            ob.push_output(trigger, bytes(&[b'x'; 100]), false),
+            vec![reset]
+        );
+        let queued = ob.take_all();
+        // xterm's DECSTR disables DEC2004. Do not use vt100 as a DECSTR oracle.
+        assert!(
+            matches!(&queued[0], Out::Output { terminal, data, bracketed_paste: false, .. }
+            if *terminal == reset && data.as_ref() == OVERFLOW_NOTICE)
+        );
+        assert!(matches!(&queued[1], Out::About { terminal, .. } if *terminal == reset));
+    }
+
+    #[test]
+    fn overflow_uses_latest_mode_and_preserves_live_sequence_continuation() {
+        for enabled in [false, true] {
+            let ob = Outbox::new(100, 10_000, None);
+            let t = tid(1);
+            ob.push_output(t, bytes(b"\x1b[?2004h\x1b[?2004"), true);
+            ob.push_output(t, bytes(&[b'x'; 60]), true);
+            // The incoming chunk's tracked mode supersedes all dropped chunks.
+            let mut incoming = if enabled {
+                b"h".to_vec()
+            } else {
+                b"l".to_vec()
+            };
+            incoming.extend_from_slice(&[b'x'; 40]);
+            incoming.extend_from_slice(b"\x1b[31");
+            assert_eq!(ob.push_output(t, bytes(&incoming), enabled), vec![t]);
+            let mut p = vt100::Parser::new(24, 80, 0);
+            for item in ob.take_all() {
+                if let Out::Output { data, .. } = item {
+                    p.process(&data);
+                }
+            }
+            p.process(b"mred");
+            assert_eq!(p.screen().bracketed_paste(), enabled);
+            assert!(p.screen().contents().ends_with("red"));
+            // Repeated resets must not let synthetic RIS overwrite original mode metadata.
+            ob.push_output(t, bytes(&[b'x'; 60]), enabled);
+            assert_eq!(ob.push_output(t, bytes(&[b'y'; 60]), enabled), vec![t]);
+            for item in ob.take_all() {
+                if let Out::Output { data, .. } = item {
+                    p.process(&data);
+                }
+            }
+            assert_eq!(p.screen().bracketed_paste(), enabled);
+        }
+    }
+
+    #[test]
     fn overflow_drops_output_keeps_control() {
         let ob = Outbox::new(100, 10_000, None);
         let t1 = Uuid::new_v4();
@@ -1060,9 +1207,9 @@ mod tests {
         let a = [b'a'; 60];
         let b = [b'b'; 60];
         let c = [b'c'; 60];
-        assert!(ob.push_output(t1, bytes(&a)).is_empty());
-        assert_eq!(ob.push_output(t1, bytes(&b)), vec![t1]);
-        assert_eq!(ob.push_output(t1, bytes(&c)), vec![t1]);
+        assert!(ob.push_output(t1, bytes(&a), false).is_empty());
+        assert_eq!(ob.push_output(t1, bytes(&b), false), vec![t1]);
+        assert_eq!(ob.push_output(t1, bytes(&c), false), vec![t1]);
         assert_eq!(
             queued(&ob),
             vec![
@@ -1078,10 +1225,10 @@ mod tests {
     fn overflow_notice_stays_before_exit_barrier() {
         let ob = Outbox::new(100, 10_000, None);
         let (ta, tb) = (Uuid::new_v4(), Uuid::new_v4());
-        ob.push_output(ta, bytes(b"last words"));
+        ob.push_output(ta, bytes(b"last words"), false);
         ob.push_control(bytes(b"exit-A"));
-        ob.push_output(tb, bytes(&[b'b'; 60]));
-        let mut dropped = ob.push_output(tb, bytes(&[b'c'; 60]));
+        ob.push_output(tb, bytes(&[b'b'; 60]), false);
+        let mut dropped = ob.push_output(tb, bytes(&[b'c'; 60]), false);
         dropped.sort();
         let mut want = vec![ta, tb];
         want.sort();
@@ -1137,7 +1284,7 @@ mod tests {
         let ob = Outbox::new(1 << 20, 1 << 21, None);
         let t1 = Uuid::new_v4();
         for chunk in [&b"one "[..], b"two ", b"three"] {
-            ob.push_output(t1, bytes(chunk));
+            ob.push_output(t1, bytes(chunk), false);
         }
         ob.close();
         let ob2 = ob.clone();

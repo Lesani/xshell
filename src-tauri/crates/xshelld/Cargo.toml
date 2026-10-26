@@ -53,6 +53,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Independently render attach snapshots to check program-controlled paste mode.
+vt100 = "=0.16.2"
 md5 = { workspace = true }
 tempfile = "3"
 xshell-hostlink = { path = "../hostlink" }

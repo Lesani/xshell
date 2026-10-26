@@ -1395,7 +1395,10 @@ impl Terminal {
             let mut o = self.out.lock().unwrap();
             o.replay.push(bytes);
             for ob in o.subs.values() {
-                dropped.extend(overflowed(ob, ob.push_output(self.id, chunk.clone())));
+                dropped.extend(overflowed(
+                    ob,
+                    ob.push_output(self.id, chunk.clone(), o.replay.bracketed_paste()),
+                ));
             }
         }
         d.nudge_overflowed(dropped);
@@ -2182,7 +2185,10 @@ impl Terminal {
         for (conn, ob) in subs {
             let snap = if ob.is_mobile() { &tail } else { &full };
             for piece in snap.chunks(REPLAY_CHUNK) {
-                dropped.extend(overflowed(&ob, ob.push_replay(self.id, Arc::from(piece))));
+                dropped.extend(overflowed(
+                    &ob,
+                    ob.push_replay(self.id, Arc::from(piece), o.replay.bracketed_paste()),
+                ));
             }
             o.subs.insert(conn, ob);
         }
@@ -2229,7 +2235,10 @@ impl Terminal {
             o.replay.snapshot()
         };
         for piece in snap.chunks(REPLAY_CHUNK) {
-            dropped.extend(overflowed(ob, ob.push_replay(self.id, Arc::from(piece))));
+            dropped.extend(overflowed(
+                ob,
+                ob.push_replay(self.id, Arc::from(piece), o.replay.bracketed_paste()),
+            ));
         }
         let alone = o.subs.keys().all(|c| *c == conn);
         match o.exit_code {
@@ -2298,7 +2307,11 @@ impl Terminal {
                 let tail = o.replay.snapshot_tail(self.mobile_replay_cap);
                 let mut more = Vec::new();
                 for piece in tail.chunks(REPLAY_CHUNK) {
-                    more.extend(ob.push_output(self.id, Arc::from(piece)));
+                    more.extend(ob.push_output(
+                        self.id,
+                        Arc::from(piece),
+                        o.replay.bracketed_paste(),
+                    ));
                 }
                 Some(more)
             } else {
@@ -3544,9 +3557,9 @@ mod status_tests {
             let mut o = t.out.lock().unwrap();
             o.subs.insert(1, desk.clone());
             o.subs.insert(2, mob.clone());
-            mob.push_output(t.id, Arc::from(&b"stale"[..]));
+            mob.push_output(t.id, Arc::from(&b"stale"[..]), false);
             t.notify_size(&o, (40, 20));
-            mob.push_output(t.id, Arc::from(&b"more"[..]));
+            mob.push_output(t.id, Arc::from(&b"more"[..]), false);
         }
         t.recover_mobile_overflow(&mob, Duration::from_millis(10));
         let got: Vec<String> = mob

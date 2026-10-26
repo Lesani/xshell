@@ -27,6 +27,7 @@ import { detectMonoFontFamily, ensureMonoFontsLoaded } from "../lib/fonts";
 import type { Tab, GitStatus, GitFile, GitCommit, BranchInfo, SessionInfo, GitBranch as GitBranchEntry } from "../types";
 import { AGENTS } from "../agents";
 import type { ThemeMode } from "./SettingsView";
+import { handlePiShiftEnter } from "./piInput";
 
 const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 8;
@@ -449,15 +450,15 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         }
       } catch (_) { /* clipboard.read() unsupported/denied, no image item, or too large — fall back to text */ }
       const text = await navigator.clipboard.readText().catch(() => "");
-      // term.paste() applies bracketed-paste escapes so multi-line text lands as one paste
-      // instead of the shell treating each embedded newline as a submitted Enter keystroke
-      // (which was cropping long pastes down to whatever the last line happened to be).
+      // term.paste() frames multiline input when the program has enabled DEC2004.
+      // Programs that opt out retain xterm's normal unbracketed paste behavior.
       if (text) term.paste(text);
     };
 
     // Intercept Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 for zoom, and Ctrl+V for paste
     // (Windows Terminal convention — the terminal would otherwise swallow Ctrl+V as ^V).
     term.attachCustomKeyEventHandler((ev) => {
+      if (!handlePiShiftEnter(tabRef.current, ev, (data, user) => term.input(data, user))) return false;
       if (!ev.ctrlKey || ev.type !== "keydown") return true;
       if (ev.key === "+" || ev.key === "=") { applyFontSize(fontSizeRef.current + 1); ev.preventDefault(); return false; }
       if (ev.key === "-" || ev.key === "_") { applyFontSize(fontSizeRef.current - 1); ev.preventDefault(); return false; }
