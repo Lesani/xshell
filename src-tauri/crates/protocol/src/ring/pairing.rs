@@ -224,17 +224,29 @@ pub struct PairingOffer {
 impl PairingOffer {
     pub fn encode(&self) -> String {
         let secret = Zeroizing::new(b64::encode(self.secret.as_bytes()));
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            v: u8,
+            ring_id: &'a RingId,
+            relay_url: &'a str,
+            sign_key: SignKey,
+            noise_key: NoiseKey,
+            secret: &'a str,
+            expires_at: u64,
+        }
+        // Borrow the credential, never clone it into a serde_json::Value.
         let body = Zeroizing::new(
-            json!({
-                "v": 1,
-                "ringId": self.ring_id,
-                "relayUrl": self.relay_url,
-                "signKey": self.sign_key,
-                "noiseKey": self.noise_key,
-                "secret": *secret,
-                "expiresAt": self.expires_at,
+            serde_json::to_string(&Body {
+                v: 1,
+                ring_id: &self.ring_id,
+                relay_url: &self.relay_url,
+                sign_key: self.sign_key,
+                noise_key: self.noise_key,
+                secret: &secret,
+                expires_at: self.expires_at,
             })
-            .to_string(),
+            .expect("pairing offer fields are serializable"),
         );
         format!("{OFFER_PREFIX}{}", b64::encode(body.as_bytes()))
     }
@@ -252,13 +264,15 @@ impl PairingOffer {
             .strip_prefix(OFFER_PREFIX)
             .ok_or_else(|| bad("not a pairing code"))?;
         let bytes = Zeroizing::new(b64::decode(body).map_err(|_| bad("encoding"))?);
-        let obj = strict_object(&bytes).map_err(PairError::Invalid)?;
+        let obj =
+            PrivateOfferObject(strict_object(&bytes).map_err(|_| bad("invalid pairing object"))?);
         let text = |k: &str| {
-            obj.get(k)
+            obj.0
+                .get(k)
                 .and_then(Value::as_str)
                 .ok_or_else(|| PairError::Invalid(format!("missing {k}")))
         };
-        if obj.get("v").and_then(Value::as_u64) != Some(1) {
+        if obj.0.get("v").and_then(Value::as_u64) != Some(1) {
             return Err(bad("unsupported version"));
         }
         let ring_id = RingId::parse(text("ringId")?).map_err(|_| bad("ringId"))?;
@@ -269,6 +283,7 @@ impl PairingOffer {
         let mut secret = Zeroizing::new([0u8; OFFER_SECRET_BYTES]);
         b64::decode_into(text("secret")?, &mut secret).map_err(|_| bad("secret"))?;
         let expires_at = obj
+            .0
             .get("expiresAt")
             .and_then(Value::as_u64)
             .filter(|n| *n <= MAX_SAFE_INT)
@@ -281,6 +296,32 @@ impl PairingOffer {
             secret: PairSecret::from_bytes(&secret[..]),
             expires_at,
         })
+    }
+}
+
+/// Parser-owned allocations may contain credentials even in malformed/unknown fields.
+/// The initial serde parser and allocator scratch copies are not an erasure guarantee.
+struct PrivateOfferObject(serde_json::Map<String, Value>);
+impl Drop for PrivateOfferObject {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        fn wipe(value: &mut Value) {
+            match value {
+                Value::String(s) => s.zeroize(),
+                Value::Array(values) => values.iter_mut().for_each(wipe),
+                Value::Object(values) => {
+                    for (mut key, mut value) in std::mem::take(values) {
+                        key.zeroize();
+                        wipe(&mut value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (mut key, mut value) in std::mem::take(&mut self.0) {
+            key.zeroize();
+            wipe(&mut value);
+        }
     }
 }
 

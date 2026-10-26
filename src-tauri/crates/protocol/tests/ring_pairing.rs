@@ -9,7 +9,8 @@ use xshell_protocol::ring::pairing::{
 };
 use xshell_protocol::ring::relay::contract::{self, TestRing};
 use xshell_protocol::ring::relay::pair::{
-    host_pairing, pair_as_guest, GuestRequest, HostRequest, PairOptions, PairPipe, PairingHost,
+    host_pairing, pair_as_guest, pair_as_guest_pinned, pair_as_guest_pinned_with_joined,
+    GuestRequest, HostRequest, PairOptions, PairPipe, PairingHost,
 };
 use xshell_protocol::ring::relay::test_relay::{TestRelay, TestRelayOptions};
 use xshell_protocol::ring::relay::{ChainPin, RingClient, RingTimeouts};
@@ -34,6 +35,8 @@ struct Desk {
     used: AtomicBool,
     until: Instant,
     publish: bool,
+    reply_relay: Option<String>,
+    advance_after_join: bool,
 }
 
 impl Desk {
@@ -46,6 +49,8 @@ impl Desk {
             used: AtomicBool::new(false),
             until: Instant::now() + ttl,
             publish: true,
+            reply_relay: None,
+            advance_after_join: false,
         })
     }
 }
@@ -77,9 +82,18 @@ impl PairingHost for Desk {
                 .publish_roster(&next)
                 .map_err(|_| PairRefusal::PublishFailed)?;
         }
+        if self.advance_after_join {
+            let later = ring.next(|_| {});
+            self.client
+                .publish_roster(&later)
+                .map_err(|_| PairRefusal::PublishFailed)?;
+        }
         Ok(Joined {
             ring_id: next.ring_id().clone(),
-            relay_url: next.roster().relay_url.clone(),
+            relay_url: self
+                .reply_relay
+                .clone()
+                .unwrap_or_else(|| next.roster().relay_url.clone()),
             version: next.version(),
             hash: next.hash(),
             signed_by: next.roster().signed_by,
@@ -135,7 +149,7 @@ fn phone(
 ) -> Result<xshell_protocol::ring::RosterChain, PairError> {
     // The phone parses what it scanned.
     let o = PairingOffer::parse(&offer.encode()).unwrap();
-    pair_as_guest(
+    pair_as_guest_pinned(
         &GuestRequest {
             relay_url: &o.relay_url,
             secret: &o.secret,
@@ -148,6 +162,7 @@ fn phone(
         },
         &opts(),
         None,
+        Some(o.sign_key),
     )
 }
 
@@ -167,6 +182,35 @@ fn guest_pairs_via_pipe() {
     // The phone is a member now: it connects like any device.
     let (c, _) = contract::connect(&r.target(), &chain, me.clone());
     assert!(!c.is_closed());
+}
+
+#[test]
+fn enrollment_evidence_retains_joined_head_when_fetched_chain_is_newer() {
+    let r = TestRelay::start();
+    let mut desk = Desk::new(&r, Duration::from_secs(60));
+    Arc::get_mut(&mut desk).unwrap().advance_after_join = true;
+    let secret = PairSecret::generate().unwrap();
+    let (offer, host) = show_qr(&r, &desk, &secret);
+    let (chain, joined) = pair_as_guest_pinned_with_joined(
+        &GuestRequest {
+            relay_url: &offer.relay_url,
+            secret: &offer.secret,
+            pin: Some(offer.noise_key),
+            ring_id: Some(&offer.ring_id),
+            keys: contract::keys(),
+            role: Role::Mobile,
+            name: "phone",
+            wait: Duration::ZERO,
+        },
+        &opts(),
+        None,
+        Some(offer.sign_key),
+    )
+    .unwrap();
+    host.join().unwrap().unwrap();
+    assert_eq!(joined.version, 3);
+    assert_eq!(chain.head().version(), 4);
+    assert_eq!(chain.get(joined.version).unwrap().hash(), joined.hash);
 }
 
 #[test]
@@ -415,4 +459,35 @@ fn fetch_chain_refuses_hidden_head() {
         RingTimeouts::default(),
     );
     assert!(matches!(r, Err(RingError::Invalid(_))), "{r:?}");
+}
+
+#[test]
+fn message_four_redirect_is_rejected_before_chain_connection() {
+    let r = TestRelay::start();
+    let forbidden = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    forbidden.set_nonblocking(true).unwrap();
+    let mut desk = Desk::new(&r, Duration::from_secs(600));
+    Arc::get_mut(&mut desk).unwrap().reply_relay =
+        Some(format!("ws://{}", forbidden.local_addr().unwrap()));
+    let secret = PairSecret::generate().unwrap();
+    let (offer, host) = show_qr(&r, &desk, &secret);
+    assert!(phone(&offer, &contract::keys()).is_err());
+    host.join().unwrap().unwrap();
+    assert!(matches!(forbidden.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn valid_noise_wrong_approver_is_rejected_before_chain_fetch() {
+    let r = TestRelay::start();
+    let desk = Desk::new(&r, Duration::from_secs(600));
+    let secret = PairSecret::from_bytes(&[5; 32]);
+    let (mut offer, host) = show_qr(&r, &desk, &secret);
+    offer.sign_key = DeviceKeys::from_seeds(&[91; 32], &[92; 32]).sign_key();
+    let gets = r.roster_gets();
+    assert!(matches!(
+        phone(&offer, &contract::keys()),
+        Err(PairError::Pin)
+    ));
+    host.join().unwrap().unwrap();
+    assert_eq!(r.roster_gets(), gets);
 }

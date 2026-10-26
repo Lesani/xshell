@@ -12,6 +12,7 @@ export function useRing() {
   const [status, setStatus] = useState<RingStatus | null>(null);
   const [pairing, setPairing] = useState<PairingEvents>({ phone: null, computer: null });
   const mounted = useRef(false);
+  const operations = useRef<Partial<Record<PairingFlow, string>>>({});
 
   useEffect(() => {
     mounted.current = true;
@@ -23,7 +24,7 @@ export function useRing() {
       .catch(() => {});
     listen<PairingEvent>("ring:pairing", e => {
       const ev = e.payload;
-      if (mounted.current && (ev.flow === "phone" || ev.flow === "computer")) setPairing(p => ({ ...p, [ev.flow]: ev }));
+      if (mounted.current && (ev.flow === "phone" || ev.flow === "computer") && operations.current[ev.flow] === ev.operation) setPairing(p => ({ ...p, [ev.flow]: ev }));
     })
       .then(keep)
       .catch(() => {});
@@ -57,10 +58,22 @@ export function useRing() {
     return s;
   }, []);
 
-  const startPhone = useCallback(() => invoke<PhoneStart>("ring_pair_phone_start"), []);
-  const cancelPhone = useCallback(() => invoke<void>("ring_pair_phone_cancel"), []);
-  const pairComputer = useCallback((code: string) => invoke<void>("ring_pair_computer", { code }), []);
-  const cancelComputer = useCallback(() => invoke<void>("ring_pair_cancel"), []);
+  const startPhone = useCallback((operation: string) => {
+    operations.current.phone = operation;
+    return invoke<PhoneStart>("ring_pair_phone_start", { operation });
+  }, []);
+  const cancelPhone = useCallback((operation: string) => {
+    if (operations.current.phone === operation) delete operations.current.phone;
+    return invoke<void>("ring_pair_phone_cancel", { operation });
+  }, []);
+  const pairComputer = useCallback((code: string, operation: string) => {
+    operations.current.computer = operation;
+    return invoke<{ operation: string }>("ring_pair_computer", { code, operation }).then(started => { if (started.operation !== operation) throw new Error("protocol"); });
+  }, []);
+  const cancelComputer = useCallback((operation: string) => {
+    if (operations.current.computer === operation) delete operations.current.computer;
+    return invoke<void>("ring_pair_cancel", { operation });
+  }, []);
 
   return { status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
 }

@@ -1,5 +1,6 @@
 use std::process::{Command, Stdio};
-use xshell_pairing_access::{tls, Controller, HelperInput, HelperOutput};
+use std::time::{Duration, Instant};
+use xshell_pairing_access::{now, tls, Controller, HelperInput, HelperOutput};
 use xshell_protocol::pairing_access::*;
 use xshell_protocol::ring::{DeviceKeys, RingId};
 fn controller() -> Controller {
@@ -10,6 +11,7 @@ fn controller() -> Controller {
             approver: keys.sign_key(),
             role: MobileRole::Mobile,
             purpose: ReachabilityPurpose::Reachability,
+            enrollment: None,
         },
         "test-controller".into(),
         xshell_pairing_access::now() + 60,
@@ -27,6 +29,7 @@ fn server(c: &Controller) -> ServerDescriptor {
         scope: c.proposal().scope.clone(),
         endpoint: "127.0.0.1:47839".parse().unwrap(),
         expires_at: c.proposal().expires_at,
+        recipient: None,
     }
 }
 #[test]
@@ -39,6 +42,7 @@ fn pairing_access_import_is_not_verification_and_all_scope_metadata_is_bound() {
         controller_fingerprint: c.controller_fingerprint(),
         server_fingerprint: tls::fingerprint(&descriptor.certificate),
         endpoint: descriptor.endpoint,
+        descriptor: None,
     };
     decision.endpoint.set_port(12345);
     assert_eq!(c.verify(decision), Err(AccessError::BootstrapUnverified));
@@ -267,6 +271,7 @@ fn pairing_access_controller_rejects_wrong_same_key_and_excess_chain_servers() {
             scope: controller.proposal().scope.clone(),
             endpoint,
             expires_at: controller.proposal().expires_at,
+            recipient: None,
         };
         controller.import_server(descriptor.clone()).unwrap();
         controller
@@ -274,6 +279,7 @@ fn pairing_access_controller_rejects_wrong_same_key_and_excess_chain_servers() {
                 controller_fingerprint: controller.controller_fingerprint(),
                 server_fingerprint: tls::fingerprint(&descriptor.certificate),
                 endpoint,
+                descriptor: None,
             })
             .unwrap();
         let worker = std::thread::spawn(move || {
@@ -322,4 +328,133 @@ fn pairing_access_controller_rejects_wrong_same_key_and_excess_chain_servers() {
             assert!(!received, "helper sent application data to {scenario}");
         }
     }
+}
+
+#[test]
+fn enrollment_verification_binds_full_descriptor_and_recipient_not_only_fingerprints() {
+    use xshell_protocol::pairing_access::enrollment::*;
+    use xshell_protocol::ring::DeviceKeys;
+    let desktop = DeviceKeys::from_seeds(&[41; 32], &[42; 32]);
+    let mobile = DeviceKeys::from_seeds(&[43; 32], &[44; 32]);
+    let scope = Scope {
+        ring: xshell_protocol::ring::RingId::derive(&desktop.sign_key()),
+        approver: desktop.sign_key(),
+        role: MobileRole::Mobile,
+        purpose: ReachabilityPurpose::MobileEnrollment,
+        enrollment: Some(EnrollmentTarget {
+            approver_noise: desktop.noise_key(),
+            relay: "wss://relay.invalid".into(),
+            device_name: "phone".into(),
+            initial_head: ChainHead {
+                version: 1,
+                hash: xshell_protocol::ring::b64::encode(&[7; 32]),
+            },
+        }),
+    };
+    let mut controller =
+        Controller::open(scope.clone(), "fixture controller".into(), now() + 60).unwrap();
+    let identity = tls::Identity::generate(true, controller.proposal().expires_at).unwrap();
+    let descriptor = ServerDescriptor {
+        version: VERSION,
+        task: controller.proposal().task,
+        certificate: identity.certificate,
+        controller_fingerprint: controller.controller_fingerprint(),
+        scope,
+        endpoint: "127.0.0.1:47839".parse().unwrap(),
+        expires_at: controller.proposal().expires_at,
+        recipient: Some(RecipientIdentity {
+            signing: mobile.sign_key(),
+            noise: mobile.noise_key(),
+        }),
+    };
+    controller.import_server(descriptor.clone()).unwrap();
+    let mut decision = VerificationDecision {
+        controller_fingerprint: descriptor.controller_fingerprint,
+        server_fingerprint: tls::fingerprint(&descriptor.certificate),
+        endpoint: descriptor.endpoint,
+        descriptor: Some(descriptor.clone()),
+    };
+    let other = DeviceKeys::from_seeds(&[45; 32], &[46; 32]);
+    decision
+        .descriptor
+        .as_mut()
+        .unwrap()
+        .recipient
+        .as_mut()
+        .unwrap()
+        .noise = other.noise_key();
+    assert_eq!(
+        controller.verify(decision),
+        Err(AccessError::BootstrapUnverified)
+    );
+    controller
+        .verify(VerificationDecision {
+            controller_fingerprint: descriptor.controller_fingerprint,
+            server_fingerprint: tls::fingerprint(&descriptor.certificate),
+            endpoint: descriptor.endpoint,
+            descriptor: Some(descriptor),
+        })
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_private_ipc_recovers_stale_socket_rejects_permissions_and_symlinks_without_creating_ring(
+) {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::Arc;
+    use xshell_hostlink::ring::{DesktopRing, DesktopRingConfig, RingObserver, RingView};
+    use xshell_protocol::pairing_access::enrollment::*;
+    struct Quiet;
+    impl RingObserver for Quiet {
+        fn changed(&self, _: &RingView) {}
+    }
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join(".xshell");
+    let dir = parent.join("pairing");
+    xshell_hostlink::ring::store::ensure_private_dir(&dir).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("desktop.sock");
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let desktop = DesktopRing::open(
+        DesktopRingConfig::new(root.path().join("ring"), "fixture".into()),
+        Arc::new(Quiet),
+    );
+    let server = xshell_pairing_access::local::serve(desktop.clone(), path.clone()).unwrap();
+    let keys = xshell_protocol::ring::DeviceKeys::from_seeds(&[51; 32], &[52; 32]);
+    let request = DesktopRequest::Scope {
+        ring: xshell_protocol::ring::RingId::derive(&keys.sign_key()),
+        device_name: "phone".into(),
+    };
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(DesktopResponse::Error {
+            error: AccessError::MissingRing,
+        }) = xshell_pairing_access::local::exchange(&path, &request)
+        {
+            break;
+        }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(desktop.chain().is_none());
+    assert!(!root.path().join("ring/ring.json").exists());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(
+        xshell_pairing_access::local::exchange(&path, &request),
+        Err(AccessError::PermissionRequired)
+    ));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let moved = dir.join("saved.sock");
+    std::fs::rename(&path, &moved).unwrap();
+    symlink(&moved, &path).unwrap();
+    assert!(matches!(
+        xshell_pairing_access::local::exchange(&path, &request),
+        Err(AccessError::PermissionRequired)
+    ));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&moved, &path).unwrap();
+    drop(server);
+    desktop.quit();
 }

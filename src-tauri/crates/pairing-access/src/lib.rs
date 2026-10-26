@@ -4,10 +4,15 @@
 //! On Windows a trusted launcher must supply private inherited pipes with the intended
 //! peer and ACLs: the helper classifies pipe handles, but does not verify peer SIDs/ACLs.
 //! Linux runtime tests do not establish Windows or macOS IPC behavior.
+mod enrollment;
+pub mod local;
 pub mod tls;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use xshell_protocol::pairing_access::enrollment::{
+    DesktopRequest, DesktopResponse, EnrollmentResponse, PairOperationId,
+};
 use xshell_protocol::pairing_access::*;
 
 pub fn now() -> u64 {
@@ -73,7 +78,9 @@ impl Controller {
         if Instant::now() >= self.deadline {
             return Err(AccessError::Expired);
         }
-        if decision.controller_fingerprint != self.controller_fingerprint()
+        if (server.scope.purpose == ReachabilityPurpose::MobileEnrollment
+            && decision.descriptor.as_ref() != Some(server))
+            || decision.controller_fingerprint != self.controller_fingerprint()
             || decision.server_fingerprint != tls::fingerprint(&server.certificate)
             || decision.endpoint != server.endpoint
         {
@@ -134,6 +141,21 @@ impl Controller {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "method", deny_unknown_fields, rename_all = "kebab-case")]
 pub enum HelperInput {
+    OpenEnrollment {
+        ring: xshell_protocol::ring::RingId,
+        device_name: String,
+        label: String,
+        expires_at: u64,
+    },
+    Enroll {
+        operation: PairOperationId,
+    },
+    EnrollmentStatus {
+        operation: PairOperationId,
+    },
+    EnrollmentCancel {
+        operation: PairOperationId,
+    },
     Open {
         scope: Scope,
         label: String,
@@ -152,6 +174,9 @@ pub enum HelperInput {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "status", deny_unknown_fields, rename_all = "kebab-case")]
 pub enum HelperOutput {
+    Enrollment {
+        response: EnrollmentResponse,
+    },
     Proposal {
         descriptor: ControllerDescriptor,
         controller_fingerprint: [u8; 32],
@@ -172,6 +197,7 @@ pub enum HelperOutput {
 /// pre-window dispatch. The caller owns protected input/output pipes for this live process.
 pub fn run(input: &mut impl Read, output: &mut impl Write) -> Result<(), AccessError> {
     let mut controller: Option<Controller> = None;
+    let mut enrollment: Option<enrollment::Job> = None;
     loop {
         // EOF before a new header is normal; partial frames are not.
         let mut first = [0];
@@ -183,13 +209,65 @@ pub fn run(input: &mut impl Read, output: &mut impl Write) -> Result<(), AccessE
         let mut prefixed = (&first[..]).chain(&mut *input);
         let command: HelperInput = read_frame(&mut prefixed)?;
         let result = match command {
+            HelperInput::OpenEnrollment {
+                ring,
+                device_name,
+                label,
+                expires_at,
+            } => {
+                if controller.is_some() {
+                    Err(AccessError::RequestConflict)
+                } else {
+                    local::endpoint()
+                        .and_then(|path| {
+                            local::exchange(&path, &DesktopRequest::Scope { ring, device_name })
+                        })
+                        .and_then(|response| {
+                            let scope = match response {
+                                DesktopResponse::Scope { scope } => scope,
+                                DesktopResponse::Error { error } => return Err(error),
+                                _ => return Err(AccessError::InvalidRequest),
+                            };
+                            let c = Controller::open(scope, label, expires_at)?;
+                            let response = HelperOutput::Proposal {
+                                descriptor: c.proposal().clone(),
+                                controller_fingerprint: c.controller_fingerprint(),
+                            };
+                            controller = Some(c);
+                            Ok(response)
+                        })
+                }
+            }
+            HelperInput::Enroll { operation } => {
+                if enrollment.is_some() {
+                    Err(AccessError::Busy)
+                } else {
+                    controller.as_ref().ok_or(AccessError::Unauthorized).and_then(|c| {
+                        let job = enrollment::Job::start(c, local::endpoint()?, operation)?;
+                        enrollment = Some(job);
+                        Ok(HelperOutput::Enrollment { response: EnrollmentResponse { progress: Some(xshell_protocol::pairing_access::enrollment::EnrollmentProgress { operation, stage: xshell_protocol::pairing_access::enrollment::EnrollmentStage::HelperReserved }), receipt: None, error: None } })
+                    })
+                }
+            }
+            HelperInput::EnrollmentStatus { operation } => enrollment
+                .as_ref()
+                .ok_or(AccessError::Unauthorized)
+                .and_then(|job| job.status(operation, false))
+                .map(|response| HelperOutput::Enrollment { response }),
+            HelperInput::EnrollmentCancel { operation } => enrollment
+                .as_ref()
+                .ok_or(AccessError::Unauthorized)
+                .and_then(|job| job.status(operation, true))
+                .map(|response| HelperOutput::Enrollment { response }),
             HelperInput::Open {
                 scope,
                 label,
                 expires_at,
             } => {
                 // Replacing a live helper identity is not implicit; one task per process.
-                if controller.is_some() {
+                if scope.purpose != ReachabilityPurpose::Reachability {
+                    Err(AccessError::Unauthorized)
+                } else if controller.is_some() {
                     Err(AccessError::RequestConflict)
                 } else {
                     Controller::open(scope, label, expires_at).map(|c| {
@@ -201,6 +279,11 @@ pub fn run(input: &mut impl Read, output: &mut impl Write) -> Result<(), AccessE
                         response
                     })
                 }
+            }
+            HelperInput::ImportServer { .. } | HelperInput::Verify { .. }
+                if enrollment.is_some() =>
+            {
+                Err(AccessError::Busy)
             }
             HelperInput::ImportServer { descriptor } => controller
                 .as_mut()
@@ -234,7 +317,7 @@ pub fn run(input: &mut impl Read, output: &mut impl Write) -> Result<(), AccessE
     }
 }
 
-pub const HELP: &str = "Pairing access commands. Public descriptors and redacted outcomes only.\nUsage: xshell pairing-access\n";
+pub const HELP: &str = "Pairing access commands. Exchanges public setup details and redacted operation results through protected inherited streams. Enrollment requires a running xshell Desktop and explicit authorization on the phone.\nUsage: xshell pairing-access\n";
 /// No descriptor, credential, address, or key is accepted in argv/environment/files.
 pub fn cli_main(args: &[std::ffi::OsString]) -> i32 {
     if args == [std::ffi::OsString::from("--help")] {
@@ -326,5 +409,31 @@ fn protected_stdio() -> bool {
     #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod confidentiality_tests {
+    use super::*;
+    #[test]
+    fn helper_real_parser_and_output_reject_private_start_without_echo() {
+        // Synthetic only; output assertions intentionally never print input on failure.
+        let canary = "xsp1.SyntheticPrivateCanary0123456789";
+        for method in ["enroll", "start", "open-enrollment"] {
+            let raw = format!("{{\"method\":\"{method}\",\"offer\":\"{canary}\"}}");
+            let mut input = (raw.len() as u32).to_be_bytes().to_vec();
+            input.extend_from_slice(raw.as_bytes());
+            let mut output = Vec::new();
+            let error = run(&mut input.as_slice(), &mut output).unwrap_err();
+            assert!(output.is_empty());
+            assert!(!format!("{error:?} {error}").contains(canary));
+        }
+        let rendered = format!(
+            "{:?}",
+            HelperOutput::Error {
+                error: AccessError::InvalidRequest
+            }
+        );
+        assert!(!rendered.contains(canary));
     }
 }

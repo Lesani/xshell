@@ -75,6 +75,7 @@ export interface Qr {
 }
 
 export interface PhoneStart {
+  operation: string;
   // The `xsp1.…` pairing text the QR code encodes.
   payload: string;
   qr: Qr;
@@ -84,8 +85,8 @@ export interface PhoneStart {
 
 export type PairingFlow = "phone" | "computer";
 
-export type PairingEvent =
+export type PairingEvent = { operation: string } & (
   | { flow: PairingFlow; state: "waiting" }
   | { flow: PairingFlow; state: "paired"; name: string; role: MemberRole }
   | { flow: PairingFlow; state: "expired" }
-  | { flow: PairingFlow; state: "failed"; code: string };
+  | { flow: PairingFlow; state: "failed"; code: string });

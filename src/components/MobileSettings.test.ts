@@ -121,9 +121,9 @@ describe("pairing and the connection", () => {
     }
     const pairComputer = vi.fn(async () => {});
     const dispatch = vi.fn();
-    await submitComputer(code, COMPUTER_IDLE, status({ connection: "connecting" }), pairComputer, dispatch);
-    expect(pairComputer).toHaveBeenCalledWith("0123456789ABCDEF");
-    expect(dispatch).toHaveBeenCalledWith({ type: "submit" });
+    await submitComputer(code, COMPUTER_IDLE, status({ connection: "connecting" }), pairComputer, dispatch, "test-op");
+    expect(pairComputer).toHaveBeenCalledWith("0123456789ABCDEF", "test-op");
+    expect(dispatch).toHaveBeenCalledWith({ type: "submit", operation: "test-op" });
   });
 });
 
@@ -176,7 +176,7 @@ describe("farewell lines in the view", () => {
 });
 
 describe("Cancel pairing", () => {
-  const offer = { payload: "p", expiresAt: Date.now() + 600_000, qr: { size: 1, rows: ["1"] } } as never;
+  const offer = { operation: "test-op", payload: "p", expiresAt: Date.now() + 600_000, qr: { size: 1, rows: ["1"] } } as never;
   const pairing = (cancelPhone = vi.fn(async () => {})): Pairing => ({
     events: { phone: null, computer: null },
     startPhone: async () => offer,
@@ -194,9 +194,9 @@ describe("Cancel pairing", () => {
 
   it("calls the cancel and the view returns to Pair a phone", async () => {
     const cancel = vi.fn(async () => {});
-    let st = phoneReducer(phoneReducer(PHONE_IDLE, { type: "start" }), { type: "started", offer });
+    let st = phoneReducer(phoneReducer(PHONE_IDLE, { type: "start", operation: "test-op" }), { type: "started", offer });
     expect(st.state).toBe("waiting");
-    await cancelPhonePairing(cancel, a => { st = phoneReducer(st, a); });
+    await cancelPhonePairing(cancel, a => { st = phoneReducer(st, a); }, "test-op");
     expect(cancel).toHaveBeenCalledOnce();
     expect(st).toEqual(PHONE_IDLE);
     const html = panel(st);

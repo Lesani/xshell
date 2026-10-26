@@ -1,10 +1,13 @@
-//! Bounded public Pairing-access contract. This is not an enrollment or cryptographic wire
-//! protocol. UI invocations do not require external-task authorization.
+//! Bounded Pairing-access contracts. The readiness wire is unchanged; the separately
+//! protected enrollment types have no readiness dispatcher. UI invocations do not require
+//! external-task authorization.
 use crate::ring::{RingId, SignKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use uuid::Uuid;
+use zeroize::Zeroizing;
+pub mod enrollment;
 
 pub const VERSION: u8 = 1;
 pub const FRAME_MAX: usize = 4096;
@@ -36,6 +39,9 @@ pub enum AccessError {
     PermissionRequired,
     AddressUnavailable,
     BootstrapUnverified,
+    DesktopUnavailable,
+    MissingRing,
+    RingConflict,
     TransportClosedOutcomeUnknown,
 }
 impl std::fmt::Display for AccessError {
@@ -53,6 +59,8 @@ pub struct Scope {
     pub approver: SignKey,
     pub role: MobileRole,
     pub purpose: ReachabilityPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrollment: Option<enrollment::EnrollmentTarget>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,6 +71,7 @@ pub enum MobileRole {
 #[serde(rename_all = "kebab-case")]
 pub enum ReachabilityPurpose {
     Reachability,
+    MobileEnrollment,
 }
 
 /// DER is public and encoded compactly; private material has no contract representation.
@@ -98,6 +107,21 @@ pub struct ControllerDescriptor {
 }
 impl ControllerDescriptor {
     pub fn validate(&self, now: u64) -> Result<(), AccessError> {
+        match (&self.scope.purpose, &self.scope.enrollment) {
+            (ReachabilityPurpose::Reachability, None) => {}
+            (ReachabilityPurpose::MobileEnrollment, Some(target)) => {
+                target.initial_head.validate()?;
+                if !printable(&target.device_name, LABEL_MAX) {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let relay = crate::ring::url::RelayUrl::parse(&target.relay)
+                    .map_err(|_| AccessError::InvalidRequest)?;
+                if format!("{}{}", relay.origin(), relay.path) != target.relay {
+                    return Err(AccessError::InvalidRequest);
+                }
+            }
+            _ => return Err(AccessError::Unauthorized),
+        }
         if self.version != VERSION
             || self.task.is_nil()
             || !printable(&self.label, LABEL_MAX)
@@ -122,6 +146,8 @@ pub struct ServerDescriptor {
     pub scope: Scope,
     pub endpoint: SocketAddr,
     pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<enrollment::RecipientIdentity>,
 }
 impl ServerDescriptor {
     pub fn validate_for(
@@ -136,6 +162,10 @@ impl ServerDescriptor {
             || self.scope != proposal.scope
             || self.expires_at != proposal.expires_at
             || self.controller_fingerprint != controller_fingerprint
+        {
+            return Err(AccessError::ScopeMismatch);
+        }
+        if (self.scope.purpose == ReachabilityPurpose::MobileEnrollment) != self.recipient.is_some()
         {
             return Err(AccessError::ScopeMismatch);
         }
@@ -154,6 +184,8 @@ pub struct VerificationDecision {
     pub controller_fingerprint: [u8; 32],
     pub server_fingerprint: [u8; 32],
     pub endpoint: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<ServerDescriptor>,
 }
 
 pub fn validate_endpoint(endpoint: SocketAddr) -> Result<(), AccessError> {
@@ -191,7 +223,20 @@ pub struct Request {
     pub command: Command,
 }
 impl Request {
+    /// A bounded nonsecret replay key, never a retained serialized request.
+    pub fn replay_digest(&self) -> Result<[u8; 32], AccessError> {
+        use sha2::{Digest, Sha256};
+        let body =
+            Zeroizing::new(serde_json::to_vec(self).map_err(|_| AccessError::InvalidRequest)?);
+        if body.len() > FRAME_MAX {
+            return Err(AccessError::TooLarge);
+        }
+        Ok(Sha256::digest(&body).into())
+    }
     pub fn validate(&self) -> Result<(), AccessError> {
+        if self.scope.purpose != ReachabilityPurpose::Reachability {
+            return Err(AccessError::Unauthorized);
+        }
         if self.task.is_nil()
             || self.request.is_nil()
             || self.sequence == 0
@@ -244,6 +289,9 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T, Access
     serde_json::from_slice(bytes).map_err(|_| AccessError::InvalidRequest)
 }
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, AccessError> {
+    decode(&read_frame_body(reader)?, FRAME_MAX)
+}
+pub fn read_frame_body(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, AccessError> {
     let mut header = [0; 4];
     reader
         .read_exact(&mut header)
@@ -252,14 +300,15 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, Acce
     if len > FRAME_MAX {
         return Err(AccessError::TooLarge);
     }
-    let mut body = vec![0; len];
+    let mut body = Zeroizing::new(vec![0; len]);
     reader
         .read_exact(&mut body)
         .map_err(|_| AccessError::TransportClosedOutcomeUnknown)?;
-    decode(&body, FRAME_MAX)
+    Ok(body)
 }
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(), AccessError> {
-    let body = serde_json::to_vec(value).map_err(|_| AccessError::InvalidRequest)?;
+    let mut body = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *body, value).map_err(|_| AccessError::InvalidRequest)?;
     if body.len() > FRAME_MAX {
         return Err(AccessError::TooLarge);
     }
@@ -273,6 +322,86 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_wire_is_frozen_and_enrollment_consent_fails_closed() {
+        assert_eq!(
+            serde_json::to_string(&Command::Prepare {
+                sentinel: "ready".into()
+            })
+            .unwrap(),
+            r#"{"method":"prepare","sentinel":"ready"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Command::Status {}).unwrap(),
+            r#"{"method":"status"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Command::Cancel {}).unwrap(),
+            r#"{"method":"cancel"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ReachabilityPurpose::Reachability).unwrap(),
+            "\"reachability\""
+        );
+        let keys = crate::ring::DeviceKeys::from_seeds(&[1; 32], &[2; 32]);
+        let mut proposal = ControllerDescriptor {
+            version: VERSION,
+            task: Uuid::from_u128(1),
+            label: "\"".repeat(LABEL_MAX),
+            certificate: Certificate(vec![1; CERT_MAX]),
+            scope: Scope {
+                ring: RingId::derive(&keys.sign_key()),
+                approver: keys.sign_key(),
+                role: MobileRole::Mobile,
+                purpose: ReachabilityPurpose::Reachability,
+                enrollment: None,
+            },
+            expires_at: 600,
+        };
+        proposal.validate(1).unwrap();
+        let bytes = serde_json::to_vec(&proposal).unwrap();
+        assert!(bytes.len() <= DESCRIPTOR_MAX);
+        assert!(
+            bytes.len().div_ceil(3) * 4 + "xshell-remote://pairing-access?descriptor=".len()
+                <= LINK_MAX
+        );
+        let server = ServerDescriptor {
+            version: VERSION,
+            task: proposal.task,
+            certificate: proposal.certificate.clone(),
+            controller_fingerprint: [255; 32],
+            scope: proposal.scope.clone(),
+            endpoint: "[abcd:abcd:abcd:abcd:abcd:abcd:abcd:abcd]:65535"
+                .parse()
+                .unwrap(),
+            expires_at: 600,
+            recipient: None,
+        };
+        let server_bytes = serde_json::to_vec(&server).unwrap();
+        assert!(server_bytes.len() <= DESCRIPTOR_MAX);
+        server.validate_for(&proposal, [255; 32], 1).unwrap();
+        println!(
+            "bounded readiness descriptors: controller {} bytes; server {} bytes; cap {}",
+            bytes.len(),
+            server_bytes.len(),
+            DESCRIPTOR_MAX
+        );
+        proposal.scope.purpose = ReachabilityPurpose::MobileEnrollment;
+        assert_eq!(proposal.validate(1), Err(AccessError::Unauthorized));
+        let request = Request {
+            task: proposal.task,
+            request: Uuid::from_u128(2),
+            sequence: 1,
+            scope: proposal.scope,
+            command: Command::Status {},
+        };
+        assert_eq!(request.validate(), Err(AccessError::Unauthorized));
+        assert_eq!(
+            (FRAME_MAX, DESCRIPTOR_MAX, LINK_MAX, CERT_MAX),
+            (4096, 3072, 4096, 1024)
+        );
+    }
+
     #[test]
     fn pairing_access_parser_limits() {
         assert_eq!(
@@ -315,6 +444,7 @@ mod tests {
             approver: keys.sign_key(),
             role: MobileRole::Mobile,
             purpose: ReachabilityPurpose::Reachability,
+            enrollment: None,
         };
         let mut descriptor = ControllerDescriptor {
             version: VERSION,

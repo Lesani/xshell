@@ -70,6 +70,7 @@ libc = { workspace = true }
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 tempfile = "3"
 # Already in the tree (xshell-protocol, xshell-core): a fake Host's chunks in tests.
 base64 = "=0.22.1"

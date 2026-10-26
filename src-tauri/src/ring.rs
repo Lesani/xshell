@@ -40,6 +40,7 @@ pub struct RingStatus {
 
 pub struct RingState {
     pub worker: Arc<SyncWorker>,
+    _pairing_ipc: Option<xshell_pairing_access::local::Server>,
 }
 
 fn host_name() -> String {
@@ -143,8 +144,14 @@ pub fn setup(app: &AppHandle) {
         }
         Err(e) => eprintln!("xshell: cannot find settings.json: {e}"),
     }
+    let pairing_ipc = xshell_pairing_access::local::endpoint()
+        .and_then(|path| xshell_pairing_access::local::serve(worker.ring.clone(), path));
+    if let Err(error) = &pairing_ipc {
+        eprintln!("xshell: pairing access: {error}");
+    }
     app.manage(RingState {
         worker: worker.clone(),
+        _pairing_ipc: pairing_ipc.ok(),
     });
     // Hosts may be connected already: record them before attaching, so the start
     // reconciles them.
@@ -276,40 +283,58 @@ pub fn qr_rows(payload: &str) -> Result<Qr, String> {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PhoneStart {
+    pub operation: uuid::Uuid,
     pub payload: String,
     pub qr: Qr,
     pub expires_at: u64,
 }
 
+#[derive(Serialize, Clone)]
+pub struct PairingStarted {
+    pub operation: uuid::Uuid,
+}
+
 /// The `ring:pairing` event: `{flow, state, name?, role?, code?}`.
 #[derive(Serialize, Clone)]
 struct PairingPayload<'a> {
+    operation: uuid::Uuid,
     flow: PairingFlow,
     #[serde(flatten)]
     event: &'a PairingEvent,
 }
 
-struct TauriPairingObserver(AppHandle);
+struct TauriPairingObserver<R: tauri::Runtime = tauri::Wry>(AppHandle<R>, uuid::Uuid);
 
-impl PairingObserver for TauriPairingObserver {
+impl<R: tauri::Runtime> PairingObserver for TauriPairingObserver<R> {
     fn pairing(&self, flow: PairingFlow, event: &PairingEvent) {
-        let _ = self.0.emit("ring:pairing", PairingPayload { flow, event });
+        let _ = self.0.emit(
+            "ring:pairing",
+            PairingPayload {
+                operation: self.1,
+                flow,
+                event,
+            },
+        );
     }
 }
 
-fn pairing_observer(app: &AppHandle) -> Arc<dyn PairingObserver> {
-    Arc::new(TauriPairingObserver(app.clone()))
+fn pairing_observer(app: &AppHandle, operation: uuid::Uuid) -> Arc<dyn PairingObserver> {
+    Arc::new(TauriPairingObserver(app.clone(), operation))
 }
 
 /// Shows a new phone offer (cancelling the previous one). Progress arrives as `ring:pairing`.
 #[tauri::command]
-pub async fn ring_pair_phone_start(app: AppHandle) -> Result<PhoneStart, String> {
+pub async fn ring_pair_phone_start(
+    app: AppHandle,
+    operation: uuid::Uuid,
+) -> Result<PhoneStart, String> {
     let w = worker(&app)?;
-    let obs = pairing_observer(&app);
+    let obs = pairing_observer(&app, operation);
     run(move || {
-        let offer = w.ring.pair_phone(obs)?;
+        let offer = w.ring.pair_phone_owned(operation, obs)?;
         let qr = qr_rows(&offer.payload)?;
         Ok(PhoneStart {
+            operation,
             payload: offer.payload,
             qr,
             expires_at: offer.expires_at,
@@ -319,10 +344,10 @@ pub async fn ring_pair_phone_start(app: AppHandle) -> Result<PhoneStart, String>
 }
 
 #[tauri::command]
-pub async fn ring_pair_phone_cancel(app: AppHandle) -> Result<(), String> {
+pub async fn ring_pair_phone_cancel(app: AppHandle, operation: uuid::Uuid) -> Result<(), String> {
     let w = worker(&app)?;
     run(move || {
-        w.ring.cancel_pairing(PairingFlow::Phone);
+        w.ring.cancel_pairing_owned(PairingFlow::Phone, operation);
         Ok(())
     })
     .await
@@ -331,17 +356,27 @@ pub async fn ring_pair_phone_cancel(app: AppHandle) -> Result<(), String> {
 /// Adds the computer that `xshelld pair` shows `code` on. Returns once the code is valid;
 /// progress arrives as `ring:pairing`.
 #[tauri::command]
-pub async fn ring_pair_computer(app: AppHandle, code: String) -> Result<(), String> {
+pub async fn ring_pair_computer(
+    app: AppHandle,
+    code: String,
+    operation: uuid::Uuid,
+) -> Result<PairingStarted, String> {
     let w = worker(&app)?;
-    let obs = pairing_observer(&app);
-    run(move || w.ring.pair_computer(&code, obs)).await
+    let obs = pairing_observer(&app, operation);
+    run(move || {
+        w.ring
+            .pair_computer_owned(operation, &code, obs)
+            .map(|()| PairingStarted { operation })
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn ring_pair_cancel(app: AppHandle) -> Result<(), String> {
+pub async fn ring_pair_cancel(app: AppHandle, operation: uuid::Uuid) -> Result<(), String> {
     let w = worker(&app)?;
     run(move || {
-        w.ring.cancel_pairing(PairingFlow::Computer);
+        w.ring
+            .cancel_pairing_owned(PairingFlow::Computer, operation);
         Ok(())
     })
     .await
@@ -366,9 +401,33 @@ mod pairing_tests {
     }
 
     #[test]
+    fn tauri_pairing_delivery_preserves_operation_identity() {
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.listen_any("ring:pairing", move |event| {
+            tx.send(event.payload().to_string()).unwrap();
+        });
+        let operation = uuid::Uuid::from_u128(19);
+        let observer = TauriPairingObserver(app.handle().clone(), operation);
+        observer.pairing(PairingFlow::Phone, &PairingEvent::Waiting);
+        observer.pairing(PairingFlow::Phone, &PairingEvent::Expired);
+        for state in ["waiting", "expired"] {
+            let payload: serde_json::Value =
+                serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+                    .unwrap();
+            assert_eq!(payload["operation"], operation.to_string());
+            assert_eq!(payload["state"], state);
+        }
+    }
+
+    #[test]
     fn pairing_event_flattens_next_to_flow() {
         let v = |flow, event: PairingEvent| {
             serde_json::to_value(PairingPayload {
+                operation: uuid::Uuid::nil(),
                 flow,
                 event: &event,
             })
@@ -376,7 +435,7 @@ mod pairing_tests {
         };
         assert_eq!(
             v(PairingFlow::Phone, PairingEvent::Waiting),
-            serde_json::json!({"flow": "phone", "state": "waiting"})
+            serde_json::json!({"operation": uuid::Uuid::nil(), "flow": "phone", "state": "waiting"})
         );
         assert_eq!(
             v(
@@ -385,7 +444,7 @@ mod pairing_tests {
                     code: "not_found".into()
                 }
             ),
-            serde_json::json!({"flow": "computer", "state": "failed", "code": "not_found"})
+            serde_json::json!({"operation": uuid::Uuid::nil(), "flow": "computer", "state": "failed", "code": "not_found"})
         );
     }
 }

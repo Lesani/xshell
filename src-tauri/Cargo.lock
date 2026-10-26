@@ -6330,9 +6330,11 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "uuid",
  "windows-sys 0.61.2",
+ "xshell-hostlink",
  "xshell-protocol",
  "zeroize",
 ]
