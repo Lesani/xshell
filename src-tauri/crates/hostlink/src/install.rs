@@ -182,11 +182,15 @@ pub const BUILD_NOT_INSTALLED: &str = "this Desktop’s xshelld is not installed
 /// `xshelld`. `dir` passed [`valid_version`]; it is quoted anyway.
 pub fn select_script(dir: &str) -> String {
     let q = sh_quote(dir);
+    let invalid = "the selected build record is not a regular file";
     format!(
         "set -e; umask 077; r=\"$HOME/.xshell/server\"; d=\"$r/\"{q}; \
          [ -x \"$d/xshelld\" ] || {{ echo \"{BUILD_NOT_INSTALLED}\" >&2; exit 1; }}; \
+         if [ -L \"$r/selected\" ] || {{ [ -e \"$r/selected\" ] && [ ! -f \"$r/selected\" ]; }}; then \
+           echo \"{invalid}\" >&2; exit 1; fi; \
          t=\"$r/.selected.$$.tmp\"; trap 'rm -f \"$t\"' EXIT; printf '%s\\n' {q} > \"$t\"; \
-         mv -f \"$t\" \"$r/selected\""
+         mv -f \"$t\" \"$r/selected\"; \
+         [ -f \"$r/selected\" ] && [ ! -L \"$r/selected\" ] || {{ echo \"{invalid}\" >&2; exit 1; }}"
     )
 }
 
@@ -1630,6 +1634,28 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert!(select_remote(&t, "1;rm", &c).is_err());
+
+        // A directory must not turn `mv` into a successful move *inside* selected.
+        let selected = root.join("selected");
+        std::fs::remove_file(&selected).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let error = select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap_err();
+        assert!(error.message.contains("not a regular file"), "{error:?}");
+        assert!(std::fs::read_dir(&selected).unwrap().next().is_none());
+        std::fs::remove_dir(&selected).unwrap();
+        // Refuse a dangling record symlink rather than silently replacing it.
+        std::os::unix::fs::symlink(root.join("missing"), &selected).unwrap();
+        assert!(select_remote(&t, "1.5.0+85ee920a1b2c", &c).is_err());
+        assert!(std::fs::symlink_metadata(&selected)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&selected).unwrap();
+        select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(selected).unwrap(),
+            "1.5.0+85ee920a1b2c\n"
+        );
     }
 }
 

@@ -3,6 +3,11 @@ on:
   push: # every branch, so fork feature branches get CI before a PR
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_windows_desktop:
+        description: Build an internal Windows Desktop/Daemon pair for release E2E
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -171,6 +176,36 @@ jobs:
       - name: Desktop compiles for Windows
         if: matrix.os == 'windows-latest'
         run: cargo check -p xshell --locked
+      # Manual internal candidates only: no release/tag, signing key or installer upload.
+      # The Windows owning Desktop is needed for the real OpenSSH update walkthrough.
+      - name: Build internal Windows Desktop candidate
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop
+        working-directory: .
+        shell: bash
+        run: |
+          export XSHELL_BUILD_COMMIT="$(git rev-parse HEAD | cut -c1-12)"
+          export XSHELL_BUILD_TIME="$(git log -1 --format=%ct HEAD)"
+          export XSHELL_BUILD_DIRTY=""
+          npm ci
+          npm run build
+          export XSHELL_WINDOWS_DAEMON_ASSET="$(cygpath -w "$PWD/src-tauri/xshelld-x86_64-pc-windows-msvc")"
+          export XSHELL_WINDOWS_DAEMON_SHA256="$(awk 'NR == 1 { print $1 }' src-tauri/xshelld-x86_64-pc-windows-msvc.sha256)"
+          cargo build --manifest-path src-tauri/Cargo.toml -p xshell --release --features tauri/custom-protocol --locked
+          cargo run -q --manifest-path src-tauri/Cargo.toml -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+            src-tauri/target/release/xshell.exe "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          stage="$RUNNER_TEMP/xshell-windows-candidate"
+          mkdir -p "$stage"
+          cp src-tauri/target/release/xshell.exe "$stage/xshell.exe"
+          cp src-tauri/target/release-daemon/xshelld.exe "$stage/xshelld.exe"
+          embedded_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto"),image=fs.readFileSync(process.argv[1]),payload=fs.readFileSync(process.argv[2]),at=image.indexOf(payload);if(at<0)throw Error("Windows payload missing from Desktop");const hash=crypto.createHash("sha256").update(image.subarray(at,at+payload.length)).digest("hex");if(hash!==process.env.XSHELL_WINDOWS_DAEMON_SHA256.toLowerCase())throw Error("Windows payload digest mismatch");process.stdout.write(hash)' "$stage/xshell.exe" src-tauri/xshelld-x86_64-pc-windows-msvc)"
+          printf 'commit=%s\nwindows_daemon_sha256=%s\n' "$GITHUB_SHA" "$embedded_sha" > "$stage/manifest"
+          (cd "$stage" && sha256sum xshell.exe xshelld.exe > SHA256SUMS)
+      - if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshell-windows-candidate
+          path: ${{ runner.temp }}/xshell-windows-candidate
+          if-no-files-found: error
   windows-2022:
     # The reply probes (#40) on a second ConPTY build (Windows Server 2022, build 20348): the
     # Windows build a Windows Host offers replies from is the lowest one they pass on.
