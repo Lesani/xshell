@@ -19,6 +19,8 @@ semver = { workspace = true }
 # The headless screen model Permission Prompts are read from (exact pin: its rendering is
 # part of what the extractor relies on).
 vt100 = "=0.16.2"
+# Track program-controlled replay modes without rendering a second screen.
+vte = "=0.15.0"
 # File transfers: content versions and strict chunk decoding (the pins xshell-protocol uses).
 sha2 = "=0.10.9"
 base64 = "=0.22.1"

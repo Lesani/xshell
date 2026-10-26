@@ -75,6 +75,44 @@ fn output_before_attach_is_replayed() {
 }
 
 #[test]
+fn reattach_after_enable_eviction_preserves_paste_mode_and_input_bytes() {
+    for enabled in [true, false] {
+        let h = TestHome::new();
+        let srv = start(&h, |cfg| cfg.replay_capacity = 64);
+        let mut a = client(&srv);
+        let t = Uuid::new_v4();
+        let input = "\x1b[13;2u\x1b[200~eins äöü\rzwei ß @€\rdrei\x1b[201~\x1b\r\r";
+        let prog = h.script("paste-mode", &format!(
+            "stty raw -echo\nprintf '\\033[?2004h'\n{}\ni=0; while [ $i -lt 80 ]; do printf 'discarded line %s\\n' \"$i\"; i=$((i+1)); done\nprintf 'REPLAY_READY'\ndd bs=1 count={} 2>/dev/null | od -An -v -tx1\nprintf '\\nINPUT_DONE'\nexec sleep 1000",
+            if enabled { "" } else { "printf '\\033[?2004l'" }, input.len(),
+        ));
+        let pid = ok_pid(&a.open(t, raw_spec(&h.project("p"), &prog)));
+        a.attach(t);
+        a.output_until(t, "REPLAY_READY");
+        a.request(&ClientMsg::TermDetach { terminal: t }).unwrap();
+        let mut b = client(&srv);
+        b.attach(t);
+        let replay = b.output_until(t, "REPLAY_READY");
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&replay);
+        assert_eq!(parser.screen().bracketed_paste(), enabled);
+        assert!(!String::from_utf8_lossy(&replay).contains("discarded line 0\n"));
+        // Same process, including raw carriage returns and UTF-8 through the real input queue.
+        assert!(pid > 1);
+        b.input(t, input);
+        let out = b.output_until(t, "INPUT_DONE");
+        let hex = String::from_utf8_lossy(&out);
+        let actual: Vec<u8> = hex
+            .split_whitespace()
+            .take_while(|s| *s != "INPUT_DONE")
+            .map(|s| u8::from_str_radix(s, 16).expect("od hex byte"))
+            .collect();
+        assert_eq!(actual, input.as_bytes());
+        b.request(&ClientMsg::TermClose { terminal: t }).unwrap();
+    }
+}
+
+#[test]
 fn two_connections_same_terminal() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});

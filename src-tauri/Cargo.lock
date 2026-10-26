@@ -6300,6 +6300,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "uuid",
  "vt100",
+ "vte",
  "windows-sys 0.61.2",
  "xshell-protocol",
 ]
@@ -6375,6 +6376,7 @@ dependencies = [
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "vt100",
  "windows-sys 0.61.2",
  "xshell-buildinfo",
  "xshell-core",
