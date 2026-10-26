@@ -140,6 +140,30 @@ jobs:
             ${{ runner.temp }}/probe-facts.txt
             ${{ runner.temp }}/conpty-fixtures
           if-no-files-found: ignore
+      # Reuse this native lane for exact branch-build Windows update bytes. No service or
+      # cross-compiled image substitutes for the Windows process regressions above.
+      - name: Native Windows update artifact
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          export XSHELL_BUILD_COMMIT="$(git rev-parse HEAD | cut -c1-12)"
+          export XSHELL_BUILD_TIME="$(git log -1 --format=%ct HEAD)"
+          export XSHELL_BUILD_DIRTY=""
+          cargo build -p xshelld --profile release-daemon --locked
+          source=target/release-daemon/xshelld.exe
+          cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp --             "$source" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          "$source" --version | tee xshelld-x86_64-pc-windows-msvc.version.json
+          node -e 'const fs=require("fs"), v=JSON.parse(fs.readFileSync("xshelld-x86_64-pc-windows-msvc.version.json","utf8")); if(v.version!==require("../package.json").version || v.os!=="windows" || v.arch!=="x86_64" || v.build.commit!==process.env.XSHELL_BUILD_COMMIT || v.build.dirty!==null || v.build.time!==Number(process.env.XSHELL_BUILD_TIME)) process.exit(1)'
+          cp "$source" xshelld-x86_64-pc-windows-msvc
+          sha256sum xshelld-x86_64-pc-windows-msvc > xshelld-x86_64-pc-windows-msvc.sha256
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshelld-x86_64-pc-windows-msvc
+          path: |
+            src-tauri/xshelld-x86_64-pc-windows-msvc
+            src-tauri/xshelld-x86_64-pc-windows-msvc.sha256
+            src-tauri/xshelld-x86_64-pc-windows-msvc.version.json
       # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.
       - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol --all-features --locked

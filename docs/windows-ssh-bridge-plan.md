@@ -2,6 +2,14 @@
 
 Issue: Lesani/xshell#57. ADR-0013 is binding.
 
+This is the original bridge-slice plan. Its exclusion of explicit Windows Daemon
+updates is superseded by ADR-0013's #77 amendment and
+[Host Daemon updates](host-daemon-updates.md). Configured Hosts now support
+verified staging and an owning-Desktop-selected restart after a one-time owner
+update/reopen. The bridge remains attach-only; the Windows Desktop must remain
+open, and no Persistent Daemon or automatic Host setup is added. The environment
+notes below describe the original slice, not current test-access availability.
+
 ## Scope and user model
 
 A Desktop adds a Windows Remote Host via an SSH alias and an explicit Daemon

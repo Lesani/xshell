@@ -852,7 +852,12 @@ fn gui_bound_writes_mode_marker_and_refuses_upgrade() {
     let h = TestHome::new();
     let _d = Daemon::start(&h);
     let mut c = Client::connect(&h.pipe);
-    c.hello();
+    assert!(!c
+        .hello()
+        .0
+        .capabilities
+        .iter()
+        .any(|s| s == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED));
     assert_eq!(h.mode().as_deref(), Some("gui-bound"));
     let e = c.request(&ClientMsg::DaemonUpgrade).unwrap_err();
     assert!(e.contains("update xshell there"), "{e}");
@@ -1024,4 +1029,272 @@ fn local_dialer_spawns_gui_bound_and_second_desktop_sees_terminal() {
     assert!(wait_dead(pid, Duration::from_secs(5)));
     let e = xshell_core::pipe::connect(&h.pipe, Instant::now() + T, &|| false).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+}
+
+// ── Exact selected updates (#77), on the existing native process lane ──────
+
+fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
+    let mut bytes = fs::read(bin()).unwrap();
+    let original = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
+    let stamp = format!(
+        "@@XSHELL-BUILD-V1:{}:{}@@",
+        original.display(),
+        original.time
+    );
+    let mut count = 0;
+    for i in 0..=bytes.len() - stamp.len() {
+        if bytes[i..].starts_with(stamp.as_bytes()) {
+            let j = i + "@@XSHELL-BUILD-V1:".len();
+            bytes[j] = if bytes[j] == b'0' { b'1' } else { b'0' };
+            count += 1;
+        }
+    }
+    assert!(count > 0);
+    let build = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
+    (bytes, build)
+}
+
+fn stage_fixture(h: &TestHome, bytes: &[u8], build: &xshell_protocol::build::BuildId) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let dir = xshell_protocol::build::install_dir_name(env!("CARGO_PKG_VERSION"), Some(build));
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    let mut child = h
+        .cmd()
+        .args(["stage-build", &dir, &hash, &bytes.len().to_string()])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            base64::engine::general_purpose::STANDARD
+                .encode(bytes)
+                .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    dir
+}
+
+#[test]
+fn native_staging_is_immutable_private_and_never_selects_or_starts() {
+    use sha2::{Digest, Sha256};
+    let h = TestHome::new();
+    let (bytes, build) = update_fixture_bytes();
+    let dir = stage_fixture(&h, &bytes, &build);
+    stage_fixture(&h, &bytes, &build); // An identical immutable install is idempotent.
+    let root = xshell_core::server::server_root(&h.home());
+    let file = root.join(&dir).join("xshelld.exe");
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert!(!root.join("selected").exists());
+    assert!(h.mode().is_none());
+    let sddl = xshell_core::private_fs::security_sddl(&file).unwrap();
+    assert!(!sddl.contains(";;;WD)"), "{sddl}");
+    let mut different = bytes.clone();
+    different.push(0);
+    let hash = format!("{:x}", Sha256::digest(&different));
+    assert!(xshelld::stage::stage(
+        &h.home(),
+        &dir,
+        &hash,
+        different.len() as u64,
+        &mut base64_text(&different).as_bytes()
+    )
+    .is_err());
+    assert_eq!(fs::read(file).unwrap(), bytes);
+    assert!(xshelld::stage::stage(
+        &h.home(),
+        "../escape",
+        &hash,
+        different.len() as u64,
+        &mut base64_text(&different).as_bytes()
+    )
+    .is_err());
+    // Traversed junctions are rejected before writing outside the current-user tree.
+    let unsafe_home = TestHome::new();
+    let elsewhere = unsafe_home.dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let junction = unsafe_home.home().join(".xshell");
+    assert!(Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&elsewhere)
+        .status()
+        .unwrap()
+        .success());
+    assert!(xshelld::stage::stage(
+        &unsafe_home.home(),
+        &dir,
+        &format!("{:x}", Sha256::digest(&bytes)),
+        bytes.len() as u64,
+        &mut base64_text(&bytes).as_bytes()
+    )
+    .is_err());
+    assert!(fs::read_dir(elsewhere).unwrap().next().is_none());
+}
+
+fn base64_text(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[test]
+fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
+    let h = TestHome::new();
+    let owner = LocalDaemon::new(LocalDaemonConfig {
+        bin: bin().into(),
+        env: h.daemon_env(),
+        home: h.home(),
+        socket: h.pipe.clone(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: None,
+    })
+    .unwrap();
+    let old_pid = owner.ensure_spawned().unwrap();
+    let mut c = Client::connect(&h.pipe);
+    assert!(c
+        .hello()
+        .0
+        .capabilities
+        .iter()
+        .any(|s| s == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED));
+    let terminal = Uuid::new_v4();
+    let pid = c.open(
+        terminal,
+        LaunchSpec {
+            cwd: h.home().to_string_lossy().into_owned(),
+            shell_mode: Some("terminal".into()),
+            ..Default::default()
+        },
+    );
+    let (bytes, build) = update_fixture_bytes();
+    let dir = stage_fixture(&h, &bytes, &build);
+    let request = ClientMsg::DaemonUpgradeSelected {
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: build.clone(),
+    };
+    // A failed selection does not freeze or stop the current Terminals.
+    let record = xshell_core::server::server_root(&h.home()).join("selected");
+    fs::create_dir(&record).unwrap();
+    assert!(c.request(&request).is_err());
+    assert!(alive(pid) && alive(old_pid));
+    fs::remove_dir(&record).unwrap();
+    // Likewise, a persistence failure is reported before selection and stop.
+    let state = h.home().join(".xshell/daemon/terminals.json");
+    fs::remove_file(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+    assert!(c.request(&request).is_err());
+    assert!(!record.exists());
+    assert!(alive(pid) && alive(old_pid));
+    fs::remove_dir(&state).unwrap();
+    c.request(&request).unwrap();
+    assert_eq!(fs::read_to_string(&record).unwrap(), format!("{dir}\n"));
+    assert!(wait_dead(old_pid, T));
+    let new_pid = owner.ensure_spawned().unwrap();
+    assert_ne!(new_pid, old_pid);
+    let mut next = Client::connect(&h.pipe);
+    let (hello, list) = next.hello();
+    assert!(hello.build.unwrap().same(&build));
+    assert!(list
+        .iter()
+        .any(|t| t.terminal == terminal && t.pid.is_some() && t.pid != Some(pid)));
+    owner.terminate(T);
+    assert!(wait_dead(new_pid, T));
+    for t in list {
+        if let Some(pid) = t.pid {
+            assert!(wait_dead(pid, T));
+        }
+    }
+}
+
+#[test]
+fn native_selected_record_validation_and_valid_older_bundle_fallback() {
+    let h = TestHome::new();
+    let (mut bytes, build) = update_fixture_bytes();
+    let current = env!("CARGO_PKG_VERSION").as_bytes();
+    assert_eq!(current, b"1.5.0"); // This fixture changes only equal-length version literals.
+    for i in 0..=bytes.len() - current.len() {
+        if bytes[i..].starts_with(current) {
+            bytes[i..i + 5].copy_from_slice(b"1.4.0");
+        }
+    }
+    let dir = xshell_protocol::build::install_dir_name("1.4.0", Some(&build));
+    use sha2::{Digest, Sha256};
+    xshelld::stage::stage(
+        &h.home(),
+        &dir,
+        &format!("{:x}", Sha256::digest(&bytes)),
+        bytes.len() as u64,
+        &mut base64_text(&bytes).as_bytes(),
+    )
+    .unwrap();
+    xshell_core::server::write_windows_selected(&h.home(), &dir).unwrap();
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        Path::new(bin())
+    );
+    let record = xshell_core::server::server_root(&h.home()).join("selected");
+    fs::write(&record, "../unsafe\n").unwrap();
+    assert!(xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).is_err());
+}
+
+#[test]
+fn selected_update_worker_refusal_and_concurrent_busy_are_before_stop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Mutex};
+    use xshelld::server::{Config, GuiBound, Server, TestHook, TestPoint};
+    let h = TestHome::new();
+    let (bytes, build) = update_fixture_bytes();
+    let dir = stage_fixture(&h, &bytes, &build);
+    let paths = xshelld::paths::resolve(&h.home(), None, Some(&h.pipe));
+    let mut cfg = Config::new(h.home(), paths);
+    cfg.gui_bound = Some(GuiBound {
+        parent_pid: std::process::id(),
+    });
+    cfg.supports_selected_restart = true;
+    let refuse = Arc::new(AtomicBool::new(true));
+    let refusal = refuse.clone();
+    let (committed, on_commit) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let wait = Mutex::new(wait);
+    cfg.test_hook = Some(TestHook(Arc::new(move |_, point| {
+        if point == TestPoint::UpgradeWorker {
+            return refusal.load(Ordering::SeqCst);
+        }
+        if point == TestPoint::UpgradeCommitted {
+            committed.send(()).unwrap();
+            let _ = wait.lock().unwrap().recv_timeout(T);
+        }
+        false
+    })));
+    let server = Server::start(cfg).unwrap();
+    let mut c = Client::connect(&h.pipe);
+    c.hello();
+    let request = ClientMsg::DaemonUpgradeSelected {
+        version: env!("CARGO_PKG_VERSION").into(),
+        build,
+    };
+    assert!(c.request(&request).unwrap_err().contains("worker"));
+    let selected = xshell_core::server::server_root(&h.home()).join("selected");
+    assert!(!selected.exists());
+    refuse.store(false, Ordering::SeqCst);
+    c.request(&request).unwrap();
+    on_commit.recv_timeout(T).unwrap();
+    assert!(c.request(&request).unwrap_err().contains("busy"));
+    assert_eq!(fs::read_to_string(selected).unwrap(), format!("{dir}\n"));
+    release.send(()).unwrap();
+    assert_eq!(
+        server.wait_timeout(T),
+        Some(xshelld::server::ExitReason::Upgrade)
+    );
 }

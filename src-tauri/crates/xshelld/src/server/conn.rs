@@ -42,6 +42,9 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
 /// (with files) only where this Host takes them.
 fn offered(cfg: &super::Config, c: &str) -> bool {
     let off = match c {
+        "daemon.upgrade-selected" => {
+            !(cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
+        }
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
         _ => false,
@@ -584,6 +587,74 @@ impl Conn {
             } => agent::on_event(&d, &self.ob, id, terminal, run, status, session_id),
             // xshell on this machine brings its own Daemon; one replaced from elsewhere
             // would only be started again in the old version.
+            ClientMsg::DaemonUpgradeSelected { version, build } => {
+                let result = (|| -> Result<std::sync::mpsc::Sender<()>, String> {
+                    if !offered(&d.cfg, xshell_protocol::cap::DAEMON_UPGRADE_SELECTED) {
+                        return Err(UPGRADE_REFUSED.into());
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = (version, build);
+                        Err(UPGRADE_REFUSED.into())
+                    }
+                    #[cfg(windows)]
+                    {
+                        // Validate outside the registry; recheck exiting/frozen at commit.
+                        let dir = xshell_protocol::build::install_dir_name(&version, Some(&build));
+                        let file = xshell_core::server::windows_install(&d.cfg.home, &dir)
+                            .map_err(|e| e.to_string())?;
+                        let identity = xshell_core::server::native_identity(&file)
+                            .map_err(|e| e.to_string())?;
+                        if identity.version != version || !identity.build.same(&build) {
+                            return Err("installed target identity differs".into());
+                        }
+                        let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                            .map_err(|e| e.to_string())?;
+                        let target = semver::Version::parse(&version).map_err(|e| e.to_string())?;
+                        if target.cmp_precedence(&current).is_lt()
+                            || (target.cmp_precedence(&current).is_eq()
+                                && crate::build_id::BUILD
+                                    .as_ref()
+                                    .is_some_and(|b| b.same(&build)))
+                        {
+                            return Err("target is older or already running".into());
+                        }
+                        let mut reg = d.reg.lock().unwrap();
+                        if reg.frozen || d.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err("daemon update busy".into());
+                        }
+                        if d.test_point(uuid::Uuid::nil(), super::TestPoint::UpgradeWorker) {
+                            return Err("cannot start selected-update worker".into());
+                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let worker = d.clone();
+                        std::thread::Builder::new()
+                            .name("selected-upgrade".into())
+                            .spawn(move || {
+                                if rx.recv().is_ok() {
+                                    worker.test_point(
+                                        uuid::Uuid::nil(),
+                                        super::TestPoint::UpgradeCommitted,
+                                    );
+                                    worker.exit(ExitReason::Upgrade);
+                                }
+                            })
+                            .map_err(|e| e.to_string())?;
+                        d.try_persist(&reg)?;
+                        xshell_core::server::write_windows_selected(&d.cfg.home, &dir)
+                            .map_err(|e| e.to_string())?;
+                        reg.frozen = true;
+                        Ok(tx)
+                    }
+                })();
+                match result {
+                    Ok(tx) => {
+                        reply(&self.ob, id, Ok(Value::Null));
+                        let _ = tx.send(());
+                    }
+                    Err(e) => reply(&self.ob, id, Err(e)),
+                }
+            }
             ClientMsg::DaemonUpgrade if d.cfg.gui_bound.is_some() => {
                 reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
             }

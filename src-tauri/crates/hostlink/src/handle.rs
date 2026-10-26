@@ -16,7 +16,7 @@ use crate::config::HostConfig;
 use crate::errors::{HostError, HostErrorCode};
 use crate::link::{Link, LinkEvents, Waiter};
 use crate::manager::ManagerConfig;
-use crate::status::{HostSnapshot, HostStatus, Phase, StatusKind};
+use crate::status::{HostSnapshot, HostStatus, Phase, StatusKind, UpdateAction};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -89,6 +89,16 @@ pub(crate) struct Attachment {
     inflight: HashSet<u64>,
 }
 
+/// Identity of the connection shown when the user confirmed. Never retarget a queued action.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTarget {
+    pub config_generation: u64,
+    pub link_generation: u64,
+    pub daemon_version: Option<String>,
+    pub daemon_build: Option<xshell_protocol::build::BuildId>,
+}
+
 pub(crate) struct State {
     pub cfg: HostConfig,
     pub status: HostStatus,
@@ -108,8 +118,10 @@ pub(crate) struct State {
     pub upgrading: bool,
     /// The Daemon acknowledged `daemon.upgrade`; it must close the link by then.
     pub upgrade_deadline: Option<Instant>,
-    /// After an upgrade, the next Daemon must report the Desktop's version.
+    /// After an accepted stop, the next usable connection must report the expected version/build.
     pub upgrade_expect: bool,
+    pub upgrade_operation: Option<u64>,
+    pub upgrade_complete_deadline: Option<Instant>,
 }
 
 impl State {
@@ -242,6 +254,8 @@ impl Shared {
                 upgrading: false,
                 upgrade_deadline: None,
                 upgrade_expect: false,
+                upgrade_operation: None,
+                upgrade_complete_deadline: None,
             }),
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
@@ -269,6 +283,29 @@ impl Shared {
 
     /// Emit the status if it changed since the last emit.
     pub(crate) fn publish(&self, st: &mut State) {
+        st.status.update_action = st
+            .status
+            .daemon_version
+            .as_deref()
+            .filter(|v| {
+                crate::version::update_eligible(
+                    &self.mc.desktop_version,
+                    self.mc.desktop_build.as_ref(),
+                    v,
+                    st.status.daemon_build.as_ref(),
+                )
+            })
+            .map(|v| {
+                if semver::Version::parse(v)
+                    .ok()
+                    .zip(semver::Version::parse(&self.mc.desktop_version).ok())
+                    .is_some_and(|(d, us)| d.cmp_precedence(&us).is_lt())
+                {
+                    UpdateAction::Update
+                } else {
+                    UpdateAction::Replace
+                }
+            });
         if st.published.as_ref() != Some(&st.status) {
             st.published = Some(st.status.clone());
             self.snap.lock().unwrap().status = st.status.clone();
@@ -703,6 +740,8 @@ impl HostHandle {
             st.upgrading = false;
             st.upgrade_deadline = None;
             st.upgrade_expect = false;
+            st.upgrade_operation = None;
+            st.upgrade_complete_deadline = None;
             self.sh.kick.store(false, Ordering::SeqCst);
             for a in st.atts.values_mut() {
                 a.attached_gen = 0;
@@ -1134,106 +1173,192 @@ impl HostHandle {
     /// direct Host: its dialer's own stop), then reconnect. The supervisor's check after the
     /// switch decides whether it worked.
     pub fn upgrade(&self, w: Waiter) {
+        self.upgrade_target(None, w);
+    }
+
+    pub fn upgrade_target(&self, target: Option<UpdateTarget>, w: Waiter) {
+        self.upgrade_inner(target, false, w);
+    }
+
+    /// Explicit local mode switches may restart the same exact build; not a remote update.
+    pub(crate) fn restart_for_mode(&self, w: Waiter) {
+        self.upgrade_inner(None, true, w);
+    }
+
+    fn upgrade_inner(&self, target: Option<UpdateTarget>, mode_switch: bool, w: Waiter) {
         let once = Once::new(w);
-        enum Plan {
-            Request(Arc<Link>),
-            Kill,
-            Refuse(HostError),
-        }
-        let (plan, cfg) = {
+        let reservation = (|| {
             let mut st = self.sh.lock();
-            let cfg = st.cfg.clone();
-            let plan = match Shared::usable_link(&st) {
-                Ok((l, _)) => Plan::Request(l),
-                Err(_) if st.status.status == StatusKind::Incompatible => Plan::Kill,
-                Err(e) => Plan::Refuse(e),
-            };
-            if !matches!(plan, Plan::Refuse(_)) {
-                st.upgrading = true;
-                st.upgrade_expect = true;
-                st.status.phase = Some(Phase::Upgrading);
-                self.sh.publish(&mut st);
+            if st.upgrading {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Busy,
+                    "a Host update is already in progress",
+                ));
             }
-            (plan, cfg)
-        };
-        // The configuration the plan was made under decides. A direct Host (a local socket)
-        // has no transport to run scripts through; its dialer may select a build and stop
-        // the Daemon itself (the Local Host's Persistent Daemon).
-        let direct = self.sh.mc.transports.direct(&cfg);
-        let stop = match plan {
-            Plan::Refuse(e) => return once.call(Err(e)),
-            Plan::Request(link) => Stop::Request(link),
-            Plan::Kill => match &direct {
-                Some(d) if d.upgradable() => Stop::Direct,
-                Some(_) => {
-                    self.end_upgrade();
-                    return once.call(Err(HostError::new(
-                        crate::errors::HostErrorCode::Incompatible,
-                        "this Daemon cannot be upgraded from here: restart it in a compatible version",
-                    )));
+            if let Some(t) = &target {
+                if t.config_generation != st.status.config_generation
+                    || t.link_generation != st.status.link_generation
+                    || t.daemon_version != st.status.daemon_version
+                    || t.daemon_build != st.status.daemon_build
+                {
+                    return Err(HostError::new(
+                        crate::HostErrorCode::Invalid,
+                        "the Host update target changed; review it again",
+                    ));
                 }
-                None => Stop::Script,
-            },
+            }
+            if !mode_switch
+                && self
+                    .sh
+                    .mc
+                    .transports
+                    .direct(&st.cfg)
+                    .is_some_and(|d| !d.upgradable())
+            {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Incompatible,
+                    "this Daemon cannot be upgraded here",
+                ));
+            }
+            if !(mode_switch && st.cfg.id == crate::LOCAL_HOST_ID)
+                && !crate::version::update_eligible(
+                    &self.sh.mc.desktop_version,
+                    self.sh.mc.desktop_build.as_ref(),
+                    st.status.daemon_version.as_deref().unwrap_or(""),
+                    st.status.daemon_build.as_ref(),
+                )
+            {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Invalid,
+                    "this Host does not need this Desktop's build",
+                ));
+            }
+            if let Some(reason) = &st.status.update_unavailable {
+                return Err(HostError::offline(reason.clone()));
+            }
+            let windows = st.status.os.as_deref() == Some("windows");
+            let stop = match Shared::usable_link(&st) {
+                Ok((link, _)) => {
+                    if windows
+                        && !st
+                            .status
+                            .daemon_capabilities
+                            .iter()
+                            .any(|c| c == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED)
+                    {
+                        return Err(HostError::offline("update and reopen xshell on that Windows Host first; its owning Desktop must support Daemon updates"));
+                    }
+                    Stop::Request(link)
+                }
+                Err(_)
+                    if st.status.status == StatusKind::Incompatible
+                        && (matches!(st.status.os.as_deref(), Some("linux" | "macos"))
+                            || (cfg!(unix)
+                                && self
+                                    .sh
+                                    .mc
+                                    .transports
+                                    .direct(&st.cfg)
+                                    .is_some_and(|d| d.upgradable()))) =>
+                {
+                    Stop::Script
+                }
+                Err(e) => return Err(e),
+            };
+            let cfg = st.cfg.clone();
+            let gen = st.gen;
+            let op = st.next_epoch();
+            st.upgrade_operation = Some(op);
+            st.upgrading = true;
+            st.upgrade_expect = false;
+            st.status.phase = Some(Phase::Preparing);
+            st.status.last_error = None;
+            st.status.error_hint = None;
+            self.sh.publish(&mut st);
+            Ok((cfg, gen, op, windows, stop))
+        })();
+        let (cfg, gen, op, windows, mut stop) = match reservation {
+            Ok(r) => r,
+            Err(e) => return once.call(Err(e)),
         };
+        let direct = self.sh.mc.transports.direct(&cfg);
+        if matches!(stop, Stop::Script) {
+            if let Some(d) = &direct {
+                if !d.upgradable() {
+                    let e = HostError::new(
+                        crate::HostErrorCode::Incompatible,
+                        "this Daemon cannot be upgraded here",
+                    );
+                    finish_upgrade(&self.sh, op, Some(&e));
+                    return once.call(Err(e));
+                }
+                stop = Stop::Direct;
+            }
+        }
         let sh = self.sh.clone();
         let o = once.clone();
         let cancel = self.cancel_token();
         let spawned = std::thread::Builder::new()
             .name("host-upgrade".into())
             .spawn(move || {
-                if let Err(e) = prepare_switch(&sh, &cfg, direct.as_deref(), &cancel) {
-                    let mut st = sh.lock();
-                    st.upgrading = false;
-                    st.upgrade_expect = false;
-                    st.status.phase = None;
-                    st.status.last_error = Some(e.message.clone());
-                    sh.publish(&mut st);
-                    drop(st);
-                    return o.call(Err(e));
-                }
-                match stop {
-                    Stop::Request(link) => request_upgrade(&sh, &link, o),
-                    Stop::Script => {
-                        let t = sh.mc.transports.for_host(&cfg);
-                        let r = crate::supervisor::kill_daemon(&*t, &cancel);
-                        sh.kick.store(true, Ordering::SeqCst);
-                        o.call(r.map(|_| Value::Null));
+                let result = (|| {
+                    check_upgrade(&sh, op, gen, &cancel)?;
+                    if windows {
+                        let cmd = cfg.daemon_override().ok_or_else(|| {
+                            HostError::offline(
+                                "Windows updates require a configured Daemon command",
+                            )
+                        })?;
+                        crate::install::stage_windows(
+                            &*sh.mc.transports.for_host(&cfg),
+                            &*sh.mc.binaries,
+                            cmd,
+                            &sh.mc.desktop_version,
+                            sh.mc.desktop_build.as_ref(),
+                            &cancel,
+                        )
+                        .map_err(|e| HostError::offline(e.message))?;
+                    } else {
+                        prepare_switch(&sh, &cfg, direct.as_deref(), &cancel, op, gen)?;
                     }
-                    Stop::Direct => {
-                        let stopped = direct.as_deref().and_then(|d| d.stop_incompatible(&cancel));
-                        let r = match stopped {
-                            Some(Ok(())) => Ok(Value::Null),
-                            Some(Err(e)) => Err(e),
-                            None => Err(HostError::new(
-                                crate::errors::HostErrorCode::Incompatible,
-                                "this Daemon cannot be upgraded from here",
-                            )),
-                        };
-                        if r.is_err() {
-                            let mut st = sh.lock();
-                            st.upgrading = false;
-                            st.upgrade_expect = false;
-                            st.status.phase = None;
-                            sh.publish(&mut st);
+                    check_upgrade(&sh, op, gen, &cancel)?;
+                    match stop {
+                        Stop::Request(link) => {
+                            request_upgrade(&sh, &link, op, gen, windows, o.clone());
+                            return Ok(());
                         }
-                        sh.kick.store(true, Ordering::SeqCst);
-                        o.call(r);
+                        Stop::Script => crate::supervisor::kill_daemon(
+                            &*sh.mc.transports.for_host(&cfg),
+                            &cancel,
+                        )?,
+                        Stop::Direct => {
+                            match direct.as_deref().and_then(|d| d.stop_incompatible(&cancel)) {
+                                Some(r) => r?,
+                                None => {
+                                    return Err(HostError::offline(
+                                        "this Daemon cannot be upgraded here",
+                                    ))
+                                }
+                            }
+                        }
                     }
+                    accept_upgrade(&sh, op, gen, false);
+                    sh.kick.store(true, Ordering::SeqCst);
+                    o.call(Ok(Value::Null));
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    finish_upgrade(&sh, op, Some(&e));
+                    o.call(Err(e));
+                } else {
+                    wait_upgrade_completion(&sh, op, &cancel);
                 }
             });
         if spawned.is_err() {
-            self.end_upgrade();
-            once.call(Err(HostError::offline("cannot start the upgrade")));
+            let e = HostError::offline("cannot start the upgrade");
+            finish_upgrade(&self.sh, op, Some(&e));
+            once.call(Err(e));
         }
-    }
-
-    /// An upgrade that did not start: back to the plain status.
-    fn end_upgrade(&self) {
-        let mut st = self.sh.lock();
-        st.upgrading = false;
-        st.upgrade_expect = false;
-        st.status.phase = None;
-        self.sh.publish(&mut st);
     }
 
     /// The generation of the newest link: it grows with each connection attempt.
@@ -1269,6 +1394,8 @@ fn prepare_switch(
     cfg: &HostConfig,
     direct: Option<&dyn crate::dial::Dialer>,
     cancel: &CancelToken,
+    op: u64,
+    gen: u64,
 ) -> Result<(), HostError> {
     let mc = &sh.mc;
     let dir = mc.install_dir();
@@ -1296,39 +1423,158 @@ fn prepare_switch(
         &|| {},
     )
     .map_err(failed)?;
+    check_upgrade(sh, op, gen, cancel)?;
     crate::install::select_remote(&*t, &dir, cancel).map_err(failed)
 }
 
-/// Send `daemon.upgrade`; once it is acknowledged the old Daemon must close the link within
-/// `upgrade_close_timeout` (the supervisor SIGTERMs it otherwise).
-fn request_upgrade(sh: &Arc<Shared>, link: &Arc<Link>, once: Arc<Once<Reply>>) {
+fn check_upgrade(sh: &Shared, op: u64, gen: u64, cancel: &CancelToken) -> Result<(), HostError> {
+    let st = sh.lock();
+    if cancel.is_cancelled() || st.upgrade_operation != Some(op) || st.gen != gen {
+        Err(HostError::offline(
+            "the Host update was cancelled or its connection changed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_upgrade(sh: &Shared, op: u64, error: Option<&HostError>) {
+    let mut st = sh.lock();
+    if st.upgrade_operation != Some(op) {
+        return;
+    }
+    st.upgrade_operation = None;
+    st.upgrading = false;
+    st.upgrade_expect = false;
+    st.upgrade_deadline = None;
+    st.upgrade_complete_deadline = None;
+    st.status.phase = None;
+    if let Some(e) = error {
+        st.status.last_error = Some(e.message.clone());
+        st.status.error_hint = Some(crate::HostErrorHint::UpdateFailed);
+    }
+    sh.publish(&mut st);
+}
+
+/// The preparation worker stays alive until this operation finishes. Its deadline is
+/// independent of an SSH probe/dial that may currently block the supervisor.
+fn wait_upgrade_completion(sh: &Shared, op: u64, cancel: &CancelToken) {
+    let mut st = sh.lock();
+    loop {
+        if st.upgrade_operation != Some(op) {
+            return;
+        }
+        if cancel.is_cancelled() {
+            drop(st);
+            finish_upgrade(
+                sh,
+                op,
+                Some(&HostError::offline("the Host update was cancelled")),
+            );
+            return;
+        }
+        expire_upgrade(sh, &mut st);
+        if st.upgrade_operation != Some(op) {
+            return;
+        }
+        st = sh.cv.wait_timeout(st, Duration::from_millis(50)).unwrap().0;
+    }
+}
+
+pub(crate) fn expire_upgrade(sh: &Shared, st: &mut State) {
+    if st
+        .upgrade_complete_deadline
+        .is_some_and(|d| d <= Instant::now())
+    {
+        st.upgrade_operation = None;
+        st.upgrading = false;
+        st.upgrade_expect = false;
+        st.upgrade_deadline = None;
+        st.upgrade_complete_deadline = None;
+        st.status.phase = None;
+        st.status.last_error = Some("This Host did not reconnect with this Desktop’s build. Check that xshell is still open there, then reconnect.".into());
+        st.status.error_hint = Some(crate::HostErrorHint::UpdateFailed);
+        sh.publish(st);
+    }
+}
+
+pub(crate) fn accept_upgrade(sh: &Shared, op: u64, original_gen: u64, rpc: bool) {
+    let mut st = sh.lock();
+    if st.upgrade_operation != Some(op) {
+        return;
+    }
+    // A successful blocking stop can return after the supervisor has already adopted
+    // its successor. Only a newer usable exact connection can complete this operation;
+    // the original connection (notably a same-build mode switch) never counts.
+    if !rpc
+        && st.gen > original_gen
+        && st.status.link_generation == st.gen
+        && !st.link_closed
+        && st.link().is_some()
+        && st.status.usable()
+        && st.status.daemon_version.as_deref() == Some(sh.mc.desktop_version.as_str())
+        && sh
+            .mc
+            .desktop_build
+            .as_ref()
+            .is_none_or(|build| crate::version::same_build(st.status.daemon_build.as_ref(), build))
+    {
+        st.upgrade_operation = None;
+        st.upgrading = false;
+        st.upgrade_expect = false;
+        st.upgrade_deadline = None;
+        st.upgrade_complete_deadline = None;
+        st.status.phase = None;
+        st.status.last_error = None;
+        st.status.error_hint = None;
+        sh.publish(&mut st);
+        sh.cv.notify_all();
+        return;
+    }
+    st.upgrade_expect = true;
+    st.status.phase = Some(Phase::Upgrading);
+    sh.publish(&mut st);
+    st.upgrade_complete_deadline = Some(Instant::now() + Duration::from_secs(120));
+    if rpc {
+        st.upgrade_deadline = Some(Instant::now() + sh.mc.upgrade_close_timeout);
+    }
+    sh.cv.notify_all();
+}
+
+fn request_upgrade(
+    sh: &Arc<Shared>,
+    link: &Arc<Link>,
+    op: u64,
+    original_gen: u64,
+    windows: bool,
+    once: Arc<Once<Reply>>,
+) {
+    let msg = if windows {
+        let Some(build) = sh.mc.desktop_build.clone() else {
+            let e = HostError::offline("this Desktop's exact build is unknown");
+            finish_upgrade(sh, op, Some(&e));
+            return once.call(Err(e));
+        };
+        ClientMsg::DaemonUpgradeSelected {
+            version: sh.mc.desktop_version.clone(),
+            build,
+        }
+    } else {
+        ClientMsg::DaemonUpgrade
+    };
     let weak = Arc::downgrade(sh);
     let o = once.clone();
     let w: Waiter = Box::new(move |r| {
         if let Some(sh) = weak.upgrade() {
-            let mut st = sh.lock();
             match &r {
-                Ok(_) => {
-                    st.upgrade_deadline = Some(Instant::now() + sh.mc.upgrade_close_timeout);
-                }
-                Err(_) => {
-                    st.upgrading = false;
-                    st.upgrade_expect = false;
-                    st.status.phase = None;
-                    sh.publish(&mut st);
-                }
+                Ok(_) => accept_upgrade(&sh, op, original_gen, true),
+                Err(e) => finish_upgrade(&sh, op, Some(e)),
             }
-            sh.cv.notify_all();
         }
         o.call(r);
     });
-    if let Err(e) = link.request(ClientMsg::DaemonUpgrade, sh.mc.term_timeout, w) {
-        let mut st = sh.lock();
-        st.upgrading = false;
-        st.upgrade_expect = false;
-        st.status.phase = None;
-        sh.publish(&mut st);
-        drop(st);
+    if let Err(e) = link.request(msg, sh.mc.term_timeout, w) {
+        finish_upgrade(sh, op, Some(&e));
         once.call(Err(e));
     }
 }
@@ -1499,6 +1745,110 @@ pub(crate) mod tests {
     }
 
     const T5: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn update_reservation_stale_target_and_late_callback_guards() {
+        let sh = shared();
+        let _peer = connect(&sh, vec![]);
+        let h = handle(&sh);
+        {
+            let mut st = sh.lock();
+            st.status.daemon_version = Some("1.4.0".into());
+            st.upgrading = true;
+            st.upgrade_operation = Some(11);
+        }
+        let (w, rx) = res_slot();
+        h.upgrade(w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            crate::HostErrorCode::Busy
+        );
+        let old = HostError::offline("late failure");
+        finish_upgrade(&sh, 10, Some(&old));
+        assert_eq!(sh.lock().upgrade_operation, Some(11));
+        accept_upgrade(&sh, 10, 0, true);
+        assert!(sh.lock().upgrade_complete_deadline.is_none());
+        finish_upgrade(&sh, 11, None);
+        let (w, rx) = res_slot();
+        h.upgrade_target(
+            Some(UpdateTarget {
+                config_generation: 0,
+                link_generation: 0,
+                daemon_version: Some("1.4.0".into()),
+                daemon_build: None,
+            }),
+            w,
+        );
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            crate::HostErrorCode::Invalid
+        );
+        assert!(!sh.lock().upgrading);
+    }
+
+    #[test]
+    fn completion_deadline_runs_without_a_supervisor_and_eligibility_is_rechecked() {
+        let sh = shared();
+        let _peer = connect(&sh, vec![]);
+        let h = handle(&sh);
+        for version in ["1.6.0", "dev", "1.5.0"] {
+            sh.lock().status.daemon_version = Some(version.into());
+            let (w, rx) = res_slot();
+            h.upgrade(w);
+            assert_eq!(
+                rx.recv_timeout(T5).unwrap().unwrap_err().code,
+                crate::HostErrorCode::Invalid
+            );
+            assert!(!sh.lock().upgrading);
+        }
+        {
+            let mut st = sh.lock();
+            st.status.daemon_version = Some("1.4.0".into());
+            st.status.os = Some("windows".into());
+        }
+        let (w, rx) = res_slot();
+        h.upgrade(w);
+        assert!(rx
+            .recv_timeout(T5)
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("owning Desktop"));
+        assert!(!sh.lock().upgrading);
+        {
+            let mut st = sh.lock();
+            st.upgrade_operation = Some(3);
+            st.upgrading = true;
+            st.upgrade_complete_deadline = Some(Instant::now() + Duration::from_millis(10));
+        }
+        wait_upgrade_completion(&sh, 3, &CancelToken::new());
+        let st = sh.lock();
+        assert!(!st.upgrading);
+        assert_eq!(
+            st.status.error_hint,
+            Some(crate::HostErrorHint::UpdateFailed)
+        );
+    }
+
+    #[test]
+    fn update_acknowledgement_is_not_completion() {
+        let sh = shared();
+        let (mut peer, link, _) = connect(&sh, vec![]);
+        {
+            let mut st = sh.lock();
+            st.upgrading = true;
+            st.upgrade_operation = Some(7);
+        }
+        let (w, rx) = res_slot();
+        request_upgrade(&sh, &link, 7, 0, false, Once::new(w));
+        let id = peer.expect("daemon.upgrade")["id"].as_u64().unwrap();
+        peer.write(&res_frame(id, Ok(Value::Null)));
+        rx.recv_timeout(T5).unwrap().unwrap();
+        let st = sh.lock();
+        assert!(st.upgrading && st.upgrade_expect);
+        assert_eq!(st.status.phase, Some(Phase::Upgrading));
+        assert!(st.upgrade_complete_deadline.unwrap() > Instant::now() + Duration::from_secs(119));
+    }
 
     #[test]
     fn sink_before_attach() {

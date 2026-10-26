@@ -145,7 +145,11 @@ impl Sup {
     fn set_phase(&self, p: Option<Phase>) {
         let mut st = self.sh.lock();
         st.status.phase = if st.upgrading {
-            Some(p.unwrap_or(Phase::Upgrading))
+            Some(p.unwrap_or(if st.upgrade_expect {
+                Phase::Upgrading
+            } else {
+                Phase::Preparing
+            }))
         } else {
             p
         };
@@ -163,6 +167,10 @@ impl Sup {
             }
             if self.cancel.is_cancelled() {
                 break;
+            }
+            {
+                let mut st = self.sh.lock();
+                crate::handle::expire_upgrade(&self.sh, &mut st);
             }
             {
                 let mut st = self.sh.lock();
@@ -189,9 +197,14 @@ impl Sup {
                     Parked::Closed(why) => self.ended(c, why),
                     Parked::UpgradeTimeout => {
                         // The old Daemon did not exit by itself: SIGTERM it, then reconnect.
-                        if self.scripted {
+                        if self.scripted
+                            && matches!(
+                                self.sh.lock().status.os.as_deref(),
+                                Some("linux" | "macos")
+                            )
+                        {
                             let _ = kill_daemon(&*self.transport, &self.cancel);
-                        } else if self.dialer.upgradable() {
+                        } else if self.dialer.upgradable() && cfg!(unix) {
                             let _ = self.dialer.stop_incompatible(&self.cancel);
                         }
                         c.link.close();
@@ -222,6 +235,7 @@ impl Sup {
         let deadline = Instant::now() + d;
         let mut st = self.sh.lock();
         loop {
+            crate::handle::expire_upgrade(&self.sh, &mut st);
             if self.cancel.is_cancelled() {
                 return Waited::Stop;
             }
@@ -260,9 +274,15 @@ impl Sup {
                 st.status.incompatible_reason = None;
             }
         }
-        st.status.phase = st.upgrading.then_some(Phase::Upgrading);
-        st.status.last_error = Some(f.message);
-        st.status.error_hint = f.hint;
+        st.status.phase = st.upgrading.then_some(if st.upgrade_expect {
+            Phase::Upgrading
+        } else {
+            Phase::Preparing
+        });
+        if st.status.error_hint != Some(HostErrorHint::UpdateFailed) {
+            st.status.last_error = Some(f.message);
+            st.status.error_hint = f.hint;
+        }
         st.status.protocol = None;
         st.status.daemon_capabilities.clear();
         st.status.next_retry_at = Some(now_ms() + delay.as_millis() as u64);
@@ -283,14 +303,17 @@ impl Sup {
                 .ended(up_for, self.sh.mc.stable_after, self.unit())
         };
         self.sh.set_link(&mut st, None);
+        st.upgrade_deadline = None;
         st.status
             .set_kind(if self.backoff.failures < OFFLINE_AFTER {
                 StatusKind::Reconnecting
             } else {
                 StatusKind::Offline
             });
-        st.status.last_error = Some(why);
-        st.status.error_hint = None;
+        if st.status.error_hint != Some(HostErrorHint::UpdateFailed) {
+            st.status.last_error = Some(why);
+            st.status.error_hint = None;
+        }
         st.status.next_retry_at = (!delay.is_zero()).then(|| now_ms() + delay.as_millis() as u64);
         self.sh.publish(&mut st);
         delay
@@ -304,6 +327,7 @@ impl Sup {
         let mut retry_at = Instant::now() + retry_delay;
         let mut st = self.sh.lock();
         loop {
+            crate::handle::expire_upgrade(&self.sh, &mut st);
             if self.cancel.is_cancelled() || st.gen != c.gen {
                 return Parked::Stop;
             }
@@ -383,7 +407,25 @@ impl Sup {
         if let (Some(cmd), true) = (&self.override_, self.scripted) {
             // Each attempt: the selected build may have changed since (an upgrade, another
             // Desktop). A host that refuses the script keeps the plain command.
-            let dir = selected_remote(&*self.transport, cmd, &self.cancel);
+            // Platform probe is the exact configured command, before any POSIX script.
+            let probe = crate::install::probe_override(&*self.transport, cmd, &self.cancel).ok();
+            let platform = probe
+                .as_ref()
+                .and_then(|p| p.os.as_deref())
+                .and_then(os_name)
+                .map(String::from)
+                .or_else(|| self.sh.lock().status.os.clone());
+            if let Some(probe) = &probe {
+                let mut st = self.sh.lock();
+                st.status.os = probe.os.as_deref().and_then(os_name).map(String::from);
+                st.status.arch = probe.arch.clone();
+                self.sh.publish(&mut st);
+            }
+            let dir = if matches!(platform.as_deref(), Some("linux" | "macos")) {
+                selected_remote(&*self.transport, cmd, &self.cancel)
+            } else {
+                None
+            };
             if self.cancel.is_cancelled() {
                 return Attempt::Cancelled;
             }
@@ -466,7 +508,9 @@ impl Sup {
         let adopted = self.sh.adopt(gen, &link, |st| {
             // After an upgrade or a replacement (R7, C4): the Daemon must be this Desktop's
             // version and build. Another Desktop's connector may have won the restart.
-            let expect = upgradable && st.upgrade_expect;
+            // Authorization/classification belongs to the current mode; completion belongs
+            // to the already accepted operation, including a GUI-bound successor.
+            let expect = st.upgrade_expect;
             let ver_mismatch = expect && hello.version != version;
             let build_mismatch = expect
                 && ours_build.is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
@@ -477,11 +521,15 @@ impl Sup {
             } else {
                 StatusKind::Connected
             });
-            st.status.phase = None;
+            st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
+            st.status.update_unavailable = (st.status.os.as_deref() == Some("windows") && !hello.capabilities.iter().any(|c| c == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
+                .then(|| "To update this Host remotely, first update and reopen xshell on that Windows Host. Its owning Desktop must support Daemon updates.".into());
             st.status.daemon_version = Some(hello.version.clone());
             st.status.daemon_build = hello.build.clone();
             st.status.protocol = Some(negotiated);
             st.status.daemon_capabilities = hello.capabilities.clone();
+            let previous_update_error = (st.status.error_hint == Some(HostErrorHint::UpdateFailed) && (upgrade_pending || build_differs))
+                .then(|| st.status.last_error.clone()).flatten();
             st.status.last_error = if ver_mismatch {
                 Some(format!(
                     "xshelld {} is still running after the upgrade to {version}",
@@ -494,15 +542,17 @@ impl Sup {
                     build_text(hello.build.as_ref()),
                     build_text(ours_build)
                 ))
-            } else {
-                None
-            };
-            st.status.error_hint = None;
+            } else { previous_update_error };
+            st.status.error_hint = st.status.last_error.as_ref().map(|_| HostErrorHint::UpdateFailed);
             st.status.incompatible_reason = None;
             st.status.next_retry_at = None;
-            st.upgrading = false;
-            st.upgrade_expect = false;
-            st.upgrade_deadline = None;
+            if expect {
+                st.upgrading = false;
+                st.upgrade_expect = false;
+                st.upgrade_operation = None;
+                st.upgrade_complete_deadline = None;
+                st.upgrade_deadline = None;
+            }
         });
         let Some(left) = adopted else {
             link.close();
@@ -534,6 +584,11 @@ impl Sup {
     fn link_failure(&self, conn: &dyn Connection, e: LinkError) -> Failure {
         match e {
             LinkError::Incompatible { hello, message } => {
+                if self.sh.lock().status.os.as_deref() == Some("windows") {
+                    let mut st = self.sh.lock();
+                    st.status.update_unavailable = (!hello.capabilities.iter().any(|c| c == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
+                        .then(|| "Its Windows owning Desktop must be updated and reopened to support Daemon updates.".into());
+                }
                 let reason = match version::classify(
                     &self.sh.mc.desktop_version,
                     self.sh.mc.desktop_build.as_ref(),
@@ -579,6 +634,53 @@ mod tests {
     use crate::manager::tests::{script_factory, test_config, Recorder};
     use crate::manager::Manager;
     use crate::status::HostStatus;
+
+    #[test]
+    fn accepted_non_rpc_update_has_a_completion_deadline_even_while_disconnected() {
+        let mut mc = test_config(Recorder::new());
+        mc.transports = script_factory("exit 1");
+        let sh = Arc::new(Shared::new(test_host("h_ab12cd34", "x"), Arc::new(mc), 1));
+        let transport: Arc<dyn Transport> =
+            Arc::new(crate::transport::LocalShellTransport::default());
+        let supervisor = Sup {
+            sh: sh.clone(),
+            cancel: CancelToken::new(),
+            transport: transport.clone(),
+            dialer: Box::new(CommandDialer {
+                transport,
+                remote_cmd: "unused".into(),
+            }),
+            managed: false,
+            scripted: true,
+            override_: None,
+            backoff: Backoff::default(),
+            install_verified: true,
+            last_gen: 0,
+        };
+        {
+            let mut st = sh.lock();
+            st.upgrading = true;
+            st.upgrade_operation = Some(7);
+        }
+        crate::handle::accept_upgrade(&sh, 7, 0, false);
+        {
+            let mut st = sh.lock();
+            assert!(st.upgrade_deadline.is_none()); // No RPC-close deadline for forced stops.
+            assert!(st.upgrade_complete_deadline.is_some());
+            st.upgrade_complete_deadline = Some(Instant::now());
+            crate::handle::expire_upgrade(&sh, &mut st);
+            assert!(!st.upgrading && !st.upgrade_expect);
+            assert_eq!(st.status.phase, None);
+            assert!(st
+                .status
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("did not reconnect"));
+        }
+        // Expiration does not cancel ordinary reconnect retries.
+        assert!(!supervisor.cancel.is_cancelled());
+    }
 
     /// The schedule lives in `xshell_protocol::backoff`; supervision uses it as is.
     #[test]

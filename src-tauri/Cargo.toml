@@ -27,6 +27,8 @@ name = "xshell_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+sha2 = "=0.10.9"
+xshell-protocol = { path = "crates/protocol", default-features = false }
 tauri-build = { version = "2", features = [] }
 xshell-buildinfo = { path = "crates/buildinfo" }
 

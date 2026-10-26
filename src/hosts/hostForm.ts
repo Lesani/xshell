@@ -60,6 +60,7 @@ const HINT_KEYS: Record<HostErrorHint, StringKey> = {
   "binary-unavailable": "hosts.hint.binaryUnavailable",
   "daemon-command-failed": "hosts.hint.daemonCommandFailed",
   "xshell-not-running": "hosts.hint.xshellNotRunning",
+  "update-failed": "hosts.hint.updateFailed",
 };
 
 export function hintText(hint: HostErrorHint | null | undefined, target: string): string | null {

@@ -104,6 +104,7 @@ pub struct Config {
     /// Run for the xshell app on this machine (ADR-0005): no idle exit, no `daemon.upgrade`,
     /// and the mode marker says `gui-bound`. `None`: a Persistent Daemon.
     pub gui_bound: Option<GuiBound>,
+    pub supports_selected_restart: bool,
     /// Stops the server from another thread, also while it is still starting: a trigger
     /// during restore abandons the start (Terminals ended, state file kept).
     pub abort: Option<Arc<StopLatch>>,
@@ -205,6 +206,10 @@ pub struct Config {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPoint {
+    /// Selected-update worker reservation (registry locked); true refuses its spawn.
+    UpgradeWorker,
+    /// Selected-update commit has been acknowledged; on its worker, outside all locks.
+    UpgradeCommitted,
     /// A Relaunch was accepted and is about to start its worker thread (registry locked: do
     /// not block). Returning `true` makes the thread start fail.
     StartWorker,
@@ -519,6 +524,7 @@ impl Config {
             event_exe: std::env::current_exe().ok(),
             job_launcher: std::env::current_exe().ok(),
             gui_bound: None,
+            supports_selected_restart: false,
             abort: None,
             ring_backoff_unit: Duration::from_secs(1),
             ring_timeouts: Default::default(),

@@ -182,6 +182,22 @@ mod win {
         set_dacl(h, &sddl)
     }
 
+    /// Verify the home that contains private update state without changing its inherited
+    /// permissions. Ancestors may be system-owned, but this home must belong to us.
+    pub fn check_owned_dir(path: &Path) -> io::Result<()> {
+        let me = me()?;
+        let h = open(path, READ_CONTROL, OPEN_EXISTING, None)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let attrs = attributes(&h)?;
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refuse(path, "is not a real directory"));
+        }
+        if !owner_is(&h, &me.sid)? {
+            return Err(refuse(path, "is owned by another user"));
+        }
+        Ok(())
+    }
+
     /// Create `dir` private (its parents as usual), or make an existing one private: refused
     /// when it is a reparse point, not a directory, or owned by someone else.
     pub fn ensure_dir(dir: &Path) -> io::Result<()> {
@@ -466,6 +482,8 @@ mod win_tests {
                 return;
             }
         }
+        let e = check_owned_dir(&d).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
         let e = ensure_dir(&d).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
         assert!(dacl(&security_sddl(&d).unwrap()).contains(";;;WD)"));

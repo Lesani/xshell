@@ -14,6 +14,7 @@ pub mod log;
 pub mod pair;
 pub mod paths;
 pub mod server;
+pub mod stage;
 
 use cli::Command;
 use std::path::PathBuf;
@@ -28,6 +29,28 @@ pub fn main_entry() -> i32 {
         }
     };
     let (opts, serve) = match cmd {
+        Command::StageBuild {
+            dir,
+            sha256,
+            length,
+        } => {
+            let home = std::env::var_os("XSHELLD_HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir);
+            let r = home
+                .ok_or_else(|| "cannot determine home".to_string())
+                .and_then(|h| {
+                    stage::stage(&h, &dir, &sha256, length, &mut std::io::stdin().lock())
+                        .map_err(|e| e.to_string())
+                });
+            return match r {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("xshelld: {e}");
+                    1
+                }
+            };
+        }
         Command::Version => {
             println!("{}", cli::version_json());
             return 0;
@@ -131,6 +154,7 @@ pub fn main_entry() -> i32 {
         cfg.idle_timeout = t;
     }
     cfg.gui_bound = gui_bound;
+    cfg.supports_selected_restart = cfg!(windows) && opts.supports_selected_restart;
     cfg.test_hook = test_hook();
     // Test hook (Windows): `XSHELLD_TEST_JOB_LAUNCHER=<path>` starts Terminals through that
     // launcher instead of this executable (a missing one makes every start fail).

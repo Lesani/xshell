@@ -19,5 +19,23 @@ OpenSSH binary transport as well as the local pipe bridge.
 
 Windows Hosts are initially configured using an explicit Daemon command pointing
 to the installed executable. Automatic Windows probing/install/upgrade and a
-Windows Persistent Daemon remain out of scope. Unix connection semantics stay
-unchanged. Closing the Windows Desktop continues to end its agents.
+Windows Persistent Daemon were excluded from the initial bridge slice. Unix
+connection semantics stay unchanged. Closing the Windows Desktop continues to
+end its agents.
+
+## Amendment: explicit Daemon updates (#77)
+
+Configured Windows Hosts can stage a verified Daemon build and explicitly request
+its selection and restart through the owning Desktop. This is not automatic Host
+setup: `connect` remains attach-only and never starts a Daemon or Desktop.
+
+The owning Desktop must first be updated and reopened with support for selected
+GUI-bound restart. Its explicit readiness flag gates the Daemon capability. An old
+owner shows that prerequisite rather than an operative remote Update action.
+Staging does not select or stop anything; the running Daemon validates the exact
+target, persists its Terminals, atomically selects the build and exits. The same
+owning Desktop restarts it with its existing parent and Job lifetime. No Windows
+Persistent Daemon or new owner IPC service is introduced.
+
+See [Host Daemon updates](../host-daemon-updates.md) for the update and artifact
+requirements.

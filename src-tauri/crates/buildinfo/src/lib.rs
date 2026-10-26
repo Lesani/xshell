@@ -42,6 +42,7 @@ pub const WATCHED: &[&str] = &[
     "src-tauri/Cargo.lock",
     "src-tauri/Cargo.toml",
     "src-tauri/build.rs",
+    "src-tauri/windows_asset.rs",
     "src-tauri/capabilities",
     "src-tauri/crates",
     "src-tauri/src",

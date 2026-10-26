@@ -227,6 +227,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
@@ -269,14 +271,16 @@ jobs:
           cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
 
       - name: Build (native)
-        if: endsWith(matrix.target, '-apple-darwin')
+        if: endsWith(matrix.target, '-apple-darwin') || endsWith(matrix.target, '-windows-msvc')
         run: cargo build -p xshelld --profile release-daemon --target ${{ matrix.target }} --locked
 
       - name: Stage asset and checksum
         shell: bash
         run: |
           name="xshelld-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release-daemon/xshelld" "$name"
+          source="target/${{ matrix.target }}/release-daemon/xshelld"
+          if [[ "${{ matrix.target }}" == *windows-msvc ]]; then source="$source.exe"; fi
+          cp "$source" "$name"
           if [[ "${{ matrix.target }}" == *linux-musl ]]; then
             file "$name"
             file "$name" | grep -Eq 'statically linked|static-pie linked'
@@ -289,7 +293,7 @@ jobs:
           if [ "$arch" = arm64 ]; then arch=aarch64; fi
           if [[ "${{ matrix.target }}" == "$arch"-* ]]; then
             want="\"build\":{\"commit\":\"$XSHELL_BUILD_COMMIT\",\"dirty\":null,\"time\":$XSHELL_BUILD_TIME}}"
-            v="$("./$name" --version)"
+            v="$("./$source" --version)"
             echo "$v"
             [[ "$v" == *"$want"* ]] || { echo "$name --version: expected $want" >&2; exit 1; }
           fi

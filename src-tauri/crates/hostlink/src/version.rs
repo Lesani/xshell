@@ -39,6 +39,26 @@ pub fn incompatible_message(ours: ProtocolRange, hello: &Hello) -> String {
 
 /// Whether `daemon` is the build `ours`: an unknown Daemon build (every Daemon from before
 /// #49) is never the same.
+/// Update authorization is semver precedence, never protocol-range direction.
+pub fn update_eligible(
+    desktop: &str,
+    ours: Option<&BuildId>,
+    daemon: &str,
+    build: Option<&BuildId>,
+) -> bool {
+    match (
+        semver::Version::parse(daemon),
+        semver::Version::parse(desktop),
+    ) {
+        (Ok(d), Ok(us)) => match d.cmp_precedence(&us) {
+            Ordering::Less => true,
+            Ordering::Equal => ours.is_some_and(|b| !same_build(build, b)),
+            Ordering::Greater => false,
+        },
+        _ => false,
+    }
+}
+
 pub fn same_build(daemon: Option<&BuildId>, ours: &BuildId) -> bool {
     daemon.is_some_and(|d| d.same(ours))
 }
@@ -99,6 +119,25 @@ mod tests {
     }
     const R11: ProtocolRange = ProtocolRange { min: 1, max: 1 };
     const R23: ProtocolRange = ProtocolRange { min: 2, max: 3 };
+
+    #[test]
+    fn update_eligibility_requires_known_precedence_and_exact_difference() {
+        let ours = b(A, None);
+        for (version, build, eligible) in [
+            ("1.4.0", None, true),
+            ("1.5.0", None, true),
+            ("1.5.0+meta", Some(ours.clone()), false),
+            ("1.5.0", Some(b(B, None)), true),
+            ("1.6.0", None, false),
+            ("dev", None, false),
+        ] {
+            assert_eq!(
+                update_eligible("1.5.0", Some(&ours), version, build.as_ref()),
+                eligible
+            );
+        }
+        assert!(!update_eligible("1.5.0", None, "1.5.0", None));
+    }
 
     #[test]
     fn classify_older_overlap_is_pending() {

@@ -392,7 +392,9 @@ pub(crate) mod tests {
     pub struct ScriptTransport(pub String);
     impl Transport for ScriptTransport {
         fn command(&self, remote: &str) -> CommandSpec {
-            if remote.contains(crate::install::SELECTED_MARKER) {
+            if remote.contains(crate::install::SELECTED_MARKER)
+                || (self.0 == "exec sleep 1000" && remote.ends_with(" --version"))
+            {
                 return LocalShellTransport::default().command("exit 0");
             }
             LocalShellTransport::default().command(&self.0)
@@ -800,7 +802,9 @@ pub(crate) mod tests {
         impl Transport for T {
             fn command(&self, remote: &str) -> CommandSpec {
                 self.sent.lock().unwrap().push(remote.to_string());
-                let s = if remote.contains(crate::install::SELECTED_MARKER) {
+                let s = if remote == "xd --version" {
+                    r#"echo '{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"os":"Linux","arch":"x86_64"}'"#.into()
+                } else if remote.contains(crate::install::SELECTED_MARKER) {
                     format!("cat '{}'", self.selected.display())
                 } else if remote.contains("/.xshell/server/1.5.0+85ee920a1b2c/xshelld\" connect") {
                     format!("cat '{}'; sleep 0.3", self.new.display())
@@ -1199,7 +1203,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn direct_upgradable_incompatible_upgrade_stops_through_dialer() {
-        let peer = socket_peer(greeting(2, 3), false);
+        let peer = socket_peer(crate::link::testpeer::hello_frame(2, 3, "1.4.0"), false);
         let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rec = Recorder::new();
@@ -1221,6 +1225,213 @@ pub(crate) mod tests {
         up().unwrap();
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         m.shutdown();
+    }
+
+    /// A real supervisor handshake boundary, with an explicitly controlled old-to-new
+    /// peer transition. RPC updates acknowledge before closing; direct stops expose the
+    /// successor while their return is still held by the test.
+    #[cfg(unix)]
+    fn completion_peer(
+        initial: Vec<u8>,
+        successor: Vec<u8>,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SocketPeer {
+        use std::io::Write;
+        use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+        use xshell_protocol::msg::{decode_inbound, ClientMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("completion.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                count.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(if ready.load(Ordering::SeqCst) {
+                        &successor
+                    } else {
+                        &initial
+                    })
+                    .unwrap();
+                let ready = ready.clone();
+                std::thread::spawn(move || {
+                    while let Ok(Some(Frame::Json(bytes))) = read_frame(&mut stream, MAX_FRAME_LEN)
+                    {
+                        let request = decode_inbound(&bytes).unwrap();
+                        if request.msg == ClientMsg::DaemonUpgrade {
+                            ready.store(true, Ordering::SeqCst);
+                            stream
+                                .write_all(&crate::link::testpeer::res_frame(
+                                    request.id.unwrap(),
+                                    Ok(serde_json::Value::Null),
+                                ))
+                                .unwrap();
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        SocketPeer {
+            path,
+            accepts,
+            _dir: dir,
+        }
+    }
+
+    #[cfg(unix)]
+    fn exact_successor(build: &xshell_protocol::build::BuildId) -> Vec<u8> {
+        use crate::link::testpeer::{msg_frame, terminals_frame};
+        use xshell_protocol::msg::{Hello, ProtocolRange, ServerMsg};
+        let mut bytes = msg_frame(&ServerMsg::Hello(Hello {
+            protocol: ProtocolRange { min: 1, max: 1 },
+            version: "1.5.0".into(),
+            capabilities: vec![],
+            build: Some(build.clone()),
+        }));
+        bytes.extend(terminals_frame(vec![]));
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn assert_update_completed(host: &crate::HostHandle) {
+        let state = host.sh.lock();
+        assert_eq!(state.status.phase, None);
+        assert!(!state.upgrading && !state.upgrade_expect);
+        assert_eq!(state.upgrade_operation, None);
+        assert!(state.upgrade_deadline.is_none());
+        assert!(state.upgrade_complete_deadline.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_mode_switch_completes_when_gui_successor_is_not_upgradable() {
+        let build = xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let peer = completion_peer(greeting(1, 1), exact_successor(&build), Default::default());
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let rec = Recorder::new();
+        let mut config = test_config(rec.clone());
+        config.desktop_build = Some(build);
+        config.transports = Arc::new(FlagFactory(
+            peer.path.clone(),
+            on.clone(),
+            Default::default(),
+        ));
+        let manager = Manager::new(config);
+        manager.set_local(local_host());
+        let first = rec.wait_status(|s| s.usable());
+        let host = manager.host(crate::LOCAL_HOST_ID).unwrap();
+        // LocalDaemon::switch does this before restart_for_mode, not after adoption.
+        on.store(false, Ordering::SeqCst);
+        let (waiter, reply) = crate::link::testpeer::slot();
+        host.restart_for_mode(waiter);
+        reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        rec.wait_status(|s| s.usable() && s.link_generation > first.link_generation);
+        assert_update_completed(&host);
+        manager.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_direct_stop_reconciles_successor_adopted_before_stop_returns() {
+        use std::sync::mpsc;
+        struct HeldStop {
+            path: std::path::PathBuf,
+            ready: Arc<std::sync::atomic::AtomicBool>,
+            started: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        struct HeldDialer(Arc<HeldStop>);
+        impl crate::dial::Dialer for HeldDialer {
+            fn dial(&self, cancel: &crate::CancelToken) -> Result<crate::Dialed, crate::DialError> {
+                crate::dial::UnixSocketDialer {
+                    path: self.0.path.clone(),
+                }
+                .dial(cancel)
+            }
+            fn describe(&self) -> String {
+                "held direct stop".into()
+            }
+            fn upgradable(&self) -> bool {
+                true
+            }
+            fn stop_incompatible(
+                &self,
+                _: &crate::CancelToken,
+            ) -> Option<Result<(), crate::HostError>> {
+                self.0.ready.store(true, Ordering::SeqCst);
+                self.0.started.send(()).unwrap();
+                self.0
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                Some(Ok(()))
+            }
+        }
+        struct HeldFactory(Arc<HeldStop>);
+        impl TransportFactory for HeldFactory {
+            fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+                Box::new(LocalShellTransport::default())
+            }
+            fn direct(&self, _: &HostConfig) -> Option<Box<dyn crate::dial::Dialer>> {
+                Some(Box::new(HeldDialer(self.0.clone())))
+            }
+        }
+        let build = xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = completion_peer(
+            crate::link::testpeer::hello_frame(2, 3, "1.4.0"),
+            exact_successor(&build),
+            ready.clone(),
+        );
+        let (started, on_stop) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let rec = Recorder::new();
+        let mut config = test_config(rec.clone());
+        config.desktop_build = Some(build);
+        config.transports = Arc::new(HeldFactory(Arc::new(HeldStop {
+            path: peer.path.clone(),
+            ready,
+            started,
+            release: Mutex::new(wait),
+        })));
+        let manager = Manager::new(config);
+        manager
+            .configure(vec![test_host("h_aaaaaaaa", "sock")])
+            .unwrap();
+        rec.wait_status(|s| s.status == StatusKind::Incompatible);
+        let host = manager.host("h_aaaaaaaa").unwrap();
+        let old_generation = host.link_generation();
+        let (waiter, reply) = crate::link::testpeer::slot();
+        host.upgrade(waiter);
+        on_stop.recv_timeout(Duration::from_secs(5)).unwrap();
+        host.kick();
+        rec.wait_status(|s| s.usable() && s.link_generation > old_generation);
+        {
+            let state = host.sh.lock();
+            assert!(state.upgrading);
+            assert!(!state.upgrade_expect);
+            assert!(
+                state.upgrade_complete_deadline.is_none(),
+                "deadline must not precede successful stop return"
+            );
+        }
+        release.send(()).unwrap();
+        reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_update_completed(&host);
+        manager.shutdown();
     }
 
     #[cfg(unix)]

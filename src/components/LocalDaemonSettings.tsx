@@ -5,6 +5,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { fmt } from "../hosts/strings";
 import { LOCAL_HOST, type LocalHostInfo, type LocalPersistentInfo } from "../hosts/localHost";
 import { confirmAgainCount, controls, effectivePersistent, errorCode, initialState, localDaemonLine, localDaemonVisible, otherBuildNote, reduce, startsSwitch, startsUpgrade, statusErrorText, switchErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
+import { updateTarget, type UpdateTarget } from "../hosts/hostUpdate";
 import { buildText } from "../buildId";
 import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
@@ -106,6 +107,7 @@ export function LocalDaemonSettings() {
   const [info, setInfo] = useState<LocalHostInfo | null>(null);
   const [state, setState] = useState<State>(initialState);
   const stateRef = useRef(state);
+  const confirmedTarget = useRef<UpdateTarget | null>(null);
   const mounted = useRef(false);
   useEffect(() => trackMounted(mounted), []);
 
@@ -117,6 +119,10 @@ export function LocalDaemonSettings() {
 
   const dispatch = useCallback((a: Action) => {
     const prev = stateRef.current;
+    if ((a.type === "upgrade" || a.type === "replace") && prev.phase.kind === "idle") {
+      if (!status) return;
+      confirmedTarget.current = updateTarget(status);
+    }
     const next = reduce(prev, a);
     stateRef.current = next;
     setState(next);
@@ -133,11 +139,11 @@ export function LocalDaemonSettings() {
         });
     }
     if (startsUpgrade(prev, next)) {
-      invoke("host_upgrade", { host: LOCAL_HOST })
+      invoke("host_upgrade", { host: LOCAL_HOST, target: confirmedTarget.current })
         .then(() => dispatch({ type: "upgraded" }))
         .catch(e => dispatch({ type: "failed", error: fmt("local.persistent.err.failed", { error: errorCode(e) }) }));
     }
-  }, [info, refresh]);
+  }, [info, refresh, status]);
 
   return <LocalDaemonSection info={info} status={status} live={live} state={state} dispatch={dispatch} />;
 }
