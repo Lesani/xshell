@@ -53,6 +53,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::time::Instant;
+use xshell_protocol::pairing_access::enrollment::*;
+use xshell_protocol::pairing_access::{AccessError, MobileRole, ReachabilityPurpose, Scope};
 use xshell_protocol::ring::pairing::{
     JoinRequest, Joined, PairCode, PairError, PairRefusal, PairSecret, PairingOffer,
 };
@@ -586,6 +588,13 @@ struct ProbeTag {
     sent_at: u64,
 }
 
+struct EnrollmentOperation {
+    task: uuid::Uuid,
+    parameters: EnrollmentParameters,
+    response: EnrollmentResponse,
+    released: bool,
+    reserved: bool,
+}
 #[derive(Default)]
 struct Live {
     state: Option<RingState>,
@@ -601,7 +610,10 @@ struct Live {
     quitting: bool,
     /// The pairing in progress per flow (its cancel flag). Secrets live only in memory, on
     /// the pairing's thread: `ring.json` never holds one.
-    pairing: Vec<(PairingFlow, Cancel)>,
+    pairing: Vec<(PairingFlow, uuid::Uuid, Cancel)>,
+    // Nonsecret operation tombstones include cancellation before delayed start reservation.
+    pairing_operations: Vec<(uuid::Uuid, Instant)>,
+    enrollment: Option<EnrollmentOperation>,
     quota: Quota,
     /// Bumped for every Connector started: its [`Events`] carry it, and a report of a retired
     /// one (an older epoch, or none running) changes nothing.
@@ -1010,7 +1022,7 @@ impl DesktopRing {
     fn ensure_connector(&self) {
         let fresh = {
             let mut l = self.lock();
-            if l.connector.is_some() || l.quitting || l.state.is_none() {
+            if l.connector.is_some() || l.quitting {
                 return;
             }
             if l.owner.is_some() {
@@ -1427,14 +1439,241 @@ impl DesktopRing {
         Ok(Some((chain, outcomes)))
     }
 
+    /// The same connection election owns the private enrollment endpoint, even before
+    /// a Ring exists. Missing membership never creates a Ring or a second signer.
+    pub fn pairing_ipc_owner(&self) -> bool {
+        self.ensure_connector();
+        let state = self.lock();
+        state.owner.is_some() && !state.quitting
+    }
+
+    pub fn enrollment_scope(
+        &self,
+        ring: &RingId,
+        device_name: String,
+    ) -> Result<Scope, AccessError> {
+        if !xshell_protocol::pairing_access::printable(
+            &device_name,
+            xshell_protocol::pairing_access::LABEL_MAX,
+        ) {
+            return Err(AccessError::InvalidRequest);
+        }
+        let s = self.pairing_state().map_err(|e| {
+            if e == PAIR_NOT_ENABLED {
+                AccessError::MissingRing
+            } else {
+                AccessError::Busy
+            }
+        })?;
+        if s.chain.ring_id() != ring {
+            return Err(AccessError::ScopeMismatch);
+        }
+        let head = s.chain.head();
+        Ok(Scope {
+            ring: ring.clone(),
+            approver: s.keys.sign_key(),
+            role: MobileRole::Mobile,
+            purpose: ReachabilityPurpose::MobileEnrollment,
+            enrollment: Some(EnrollmentTarget {
+                approver_noise: s.keys.noise_key(),
+                relay: head.roster().relay_url.clone(),
+                device_name,
+                initial_head: ChainHead {
+                    version: head.version(),
+                    hash: head.hash(),
+                },
+            }),
+        })
+    }
+
+    pub fn enrollment_offer(
+        &self,
+        task: uuid::Uuid,
+        operation: PairOperationId,
+        parameters: EnrollmentParameters,
+    ) -> Result<EnrollmentStart, AccessError> {
+        operation.validate()?;
+        parameters.validate(now())?;
+        if task.is_nil() {
+            return Err(AccessError::InvalidRequest);
+        }
+        {
+            let mut live = self.lock();
+            if live
+                .enrollment
+                .as_ref()
+                .is_some_and(|e| !e.released && now() < e.parameters.expires_at)
+            {
+                return Err(AccessError::Busy);
+            }
+            live.enrollment = Some(EnrollmentOperation {
+                task,
+                parameters: parameters.clone(),
+                response: EnrollmentResponse {
+                    progress: Some(EnrollmentProgress {
+                        operation,
+                        stage: EnrollmentStage::HelperReserved,
+                    }),
+                    receipt: Some(EnrollmentReceipt {
+                        operation,
+                        evidence: EnrollmentEvidence::OutcomeUnknown,
+                    }),
+                    error: None,
+                },
+                released: false,
+                reserved: false,
+            });
+        }
+        struct Observer;
+        impl PairingObserver for Observer {
+            fn pairing(&self, _: PairingFlow, _: &PairingEvent) {}
+        }
+        match self.pair_phone_scoped(
+            operation.uuid(),
+            Arc::new(Observer),
+            Some(parameters.clone()),
+        ) {
+            Ok(offer) => {
+                self.note_enrollment(
+                    operation.uuid(),
+                    EnrollmentStage::DesktopOfferReady,
+                    EnrollmentEvidence::OutcomeUnknown,
+                );
+                Ok(EnrollmentStart {
+                    operation,
+                    parameters,
+                    offer: SecretOffer::new(offer.payload)?,
+                })
+            }
+            Err(_) => {
+                self.note_enrollment(
+                    operation.uuid(),
+                    EnrollmentStage::HelperReserved,
+                    EnrollmentEvidence::NoDesktopCommit,
+                );
+                Err(AccessError::Busy)
+            }
+        }
+    }
+    fn note_enrollment(
+        &self,
+        operation: uuid::Uuid,
+        stage: EnrollmentStage,
+        evidence: EnrollmentEvidence,
+    ) {
+        let mut live = self.lock();
+        if let Some(enrollment) = &mut live.enrollment {
+            let response = &mut enrollment.response;
+            if response
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.operation.uuid() == operation)
+            {
+                let operation = PairOperationId::new(operation).expect("reserved operation");
+                response.progress = Some(EnrollmentProgress { operation, stage });
+                response.receipt = Some(EnrollmentReceipt {
+                    operation,
+                    evidence,
+                });
+            }
+        }
+    }
+    pub fn enrollment_status(
+        &self,
+        task: uuid::Uuid,
+        operation: PairOperationId,
+        cancel: bool,
+    ) -> EnrollmentResponse {
+        let _commit = self.lock_commit();
+        let mut live = self.lock();
+        let Some(enrollment) = &mut live.enrollment else {
+            return EnrollmentResponse::error(AccessError::Unauthorized);
+        };
+        if enrollment.task != task
+            || !enrollment
+                .response
+                .progress
+                .as_ref()
+                .is_some_and(|v| v.operation == operation)
+        {
+            return EnrollmentResponse::error(AccessError::Unauthorized);
+        }
+        if now() >= enrollment.parameters.expires_at {
+            return EnrollmentResponse::error(AccessError::Expired);
+        }
+        if cancel {
+            enrollment.released = true;
+        }
+        if cancel
+            && matches!(
+                enrollment.response.receipt.as_ref().map(|r| &r.evidence),
+                Some(EnrollmentEvidence::OutcomeUnknown)
+            )
+        {
+            enrollment.response.receipt = Some(EnrollmentReceipt {
+                operation,
+                evidence: EnrollmentEvidence::NoDesktopCommit,
+            });
+        }
+        let reserved = enrollment.reserved;
+        let result = enrollment.response.clone();
+        if cancel {
+            // A pre-reservation cancellation belongs to this exact recorded task, not an
+            // arbitrary public operation ID. Failed/colliding starts own no GUI operation.
+            if !live
+                .pairing_operations
+                .iter()
+                .any(|(op, _)| *op == operation.uuid())
+            {
+                live.pairing_operations
+                    .retain(|(_, until)| Instant::now() < *until);
+                if live.pairing_operations.len() < xshell_protocol::pairing_access::CACHE_MAX {
+                    live.pairing_operations
+                        .push((operation.uuid(), Instant::now() + Duration::from_secs(600)));
+                }
+            }
+            if reserved {
+                for (flow, op, flag) in &live.pairing {
+                    if *flow == PairingFlow::Phone && *op == operation.uuid() {
+                        flag.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Starts a phone offer, replacing the one shown. The slot on the Relay is held before
     /// this returns; a thread waits for the phone and runs the Desktop's side.
     pub fn pair_phone(&self, observer: Arc<dyn PairingObserver>) -> Result<PhoneOffer, String> {
+        self.pairing_state()?;
+        self.cancel_pairing(PairingFlow::Phone);
+        self.pair_phone_owned(uuid::Uuid::new_v4(), observer)
+    }
+
+    /// GUI-owned operation; a competing reservation is busy, never stolen.
+    pub fn pair_phone_owned(
+        &self,
+        operation: uuid::Uuid,
+        observer: Arc<dyn PairingObserver>,
+    ) -> Result<PhoneOffer, String> {
+        self.pair_phone_scoped(operation, observer, None)
+    }
+
+    fn pair_phone_scoped(
+        &self,
+        operation: uuid::Uuid,
+        observer: Arc<dyn PairingObserver>,
+        enrollment: Option<EnrollmentParameters>,
+    ) -> Result<PhoneOffer, String> {
         let s = self.pairing_state()?;
         self.hurry_connection();
         let secret = PairSecret::generate().map_err(|e| e.to_string())?;
         let head = s.chain.head();
-        let ttl = self.cfg.pair_ttl;
+        let ttl = enrollment
+            .as_ref()
+            .map(|p| Duration::from_secs(p.expires_at.saturating_sub(now())).min(self.cfg.pair_ttl))
+            .unwrap_or(self.cfg.pair_ttl);
         let offer = PairingOffer {
             ring_id: head.ring_id().clone(),
             relay_url: head.roster().relay_url.clone(),
@@ -1443,13 +1682,43 @@ impl DesktopRing {
             secret: secret.clone(),
             expires_at: now() + ttl.as_secs(),
         };
-        let cancel = self.start_pairing(PairingFlow::Phone);
+        let mut until = Instant::now() + ttl;
+        if enrollment.is_some() {
+            let remaining = (std::time::UNIX_EPOCH + Duration::from_secs(offer.expires_at))
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or_default();
+            until = until.min(Instant::now() + remaining);
+        }
+        let cancel =
+            self.start_pairing_scoped(PairingFlow::Phone, operation, enrollment.is_some())?;
+        if let Some(parameters) = &enrollment {
+            if parameters.ring != *head.ring_id()
+                || parameters.approver.signing != s.keys.sign_key()
+                || parameters.approver.noise != s.keys.noise_key()
+                || parameters.relay != head.roster().relay_url
+                || parameters.initial_head.hash != head.hash()
+                || parameters.initial_head.version != head.version()
+            {
+                self.end_pairing(PairingFlow::Phone, &cancel);
+                return Err("scope-mismatch".into());
+            }
+        }
         let opts = self.pair_options();
         let pipe = PairPipe::open(&offer.relay_url, &secret.slot(), &opts).map_err(|e| {
             self.end_pairing(PairingFlow::Phone, &cancel);
             format!("{}: {e}", e.as_code())
         })?;
-        let until = Instant::now() + ttl;
+        // Acquisition consumes the original lifetime; never restart the clock after dial.
+        if Instant::now() >= until || cancel.load(Ordering::Acquire) {
+            pipe.close();
+            self.end_pairing(PairingFlow::Phone, &cancel);
+            return Err(if Instant::now() >= until {
+                "expired"
+            } else {
+                "cancelled"
+            }
+            .into());
+        }
         let me = self.me.clone();
         let c = cancel.clone();
         let ring_id = offer.ring_id.clone();
@@ -1460,7 +1729,17 @@ impl DesktopRing {
                 observer.pairing(PairingFlow::Phone, &PairingEvent::Waiting);
                 let r = pipe.wait_peer(until, Some(&c)).and_then(|()| {
                     let ring = me.upgrade().ok_or(PairError::Cancelled)?;
-                    ring.host(pipe, &s.keys, &secret, &ring_id, Role::Mobile, until, &c)
+                    ring.host(
+                        pipe,
+                        &s.keys,
+                        &secret,
+                        &ring_id,
+                        Role::Mobile,
+                        until,
+                        &c,
+                        &s.chain.head().hash(),
+                        enrollment.as_ref().map(|p| (operation, p)),
+                    )
                 });
                 if let Some(ring) = me.upgrade() {
                     ring.end_pairing(PairingFlow::Phone, &c);
@@ -1484,11 +1763,23 @@ impl DesktopRing {
         code: &str,
         observer: Arc<dyn PairingObserver>,
     ) -> Result<(), String> {
+        PairCode::parse(code).map_err(|e| format!("{}: {e}", e.as_code()))?;
+        self.pairing_state()?;
+        self.cancel_pairing(PairingFlow::Computer);
+        self.pair_computer_owned(uuid::Uuid::new_v4(), code, observer)
+    }
+
+    pub fn pair_computer_owned(
+        &self,
+        operation: uuid::Uuid,
+        code: &str,
+        observer: Arc<dyn PairingObserver>,
+    ) -> Result<(), String> {
         let code = PairCode::parse(code).map_err(|e| format!("{}: {e}", e.as_code()))?;
         let s = self.pairing_state()?;
         self.hurry_connection();
         let secret = code.secret();
-        let cancel = self.start_pairing(PairingFlow::Computer);
+        let cancel = self.start_pairing(PairingFlow::Computer, operation)?;
         let opts = self.pair_options();
         let until = Instant::now() + self.cfg.pair_ttl;
         let me = self.me.clone();
@@ -1515,6 +1806,8 @@ impl DesktopRing {
                             Role::Daemon,
                             until,
                             &c,
+                            &head.hash(),
+                            None,
                         )
                     },
                 );
@@ -1532,13 +1825,20 @@ impl DesktopRing {
 
     /// Stops the pairing of `flow` in progress, if any (its observer hears `cancelled`).
     pub fn cancel_pairing(&self, flow: PairingFlow) {
+        let _commit = self.lock_commit();
         let mut l = self.lock();
-        for (f, c) in &l.pairing {
-            if *f == flow {
+        let external = l
+            .enrollment
+            .as_ref()
+            .filter(|e| e.reserved)
+            .and_then(|e| e.response.progress.as_ref().map(|p| p.operation.uuid()));
+        for (f, operation, c) in &l.pairing {
+            if *f == flow && Some(*operation) != external {
                 c.store(true, Ordering::Release);
             }
         }
-        l.pairing.retain(|(f, _)| *f != flow);
+        l.pairing
+            .retain(|(f, operation, _)| *f != flow || Some(*operation) == external);
     }
 
     /// The state a pairing needs: a Ring, and this instance running its connection (it
@@ -1569,18 +1869,90 @@ impl DesktopRing {
         }
     }
 
-    /// A new pairing of `flow`: the previous one is cancelled.
-    fn start_pairing(&self, flow: PairingFlow) -> Cancel {
-        self.cancel_pairing(flow);
+    /// Reserves one operation; only legacy UI convenience methods explicitly replace.
+    fn start_pairing(&self, flow: PairingFlow, operation: uuid::Uuid) -> Result<Cancel, String> {
+        self.start_pairing_scoped(flow, operation, false)
+    }
+    fn start_pairing_scoped(
+        &self,
+        flow: PairingFlow,
+        operation: uuid::Uuid,
+        external: bool,
+    ) -> Result<Cancel, String> {
+        let mut state = self.lock();
+        state
+            .pairing_operations
+            .retain(|(_, until)| Instant::now() < *until);
+        if state.quitting
+            || operation.is_nil()
+            || state
+                .pairing_operations
+                .iter()
+                .any(|(op, _)| *op == operation)
+            || state.pairing_operations.len() >= xshell_protocol::pairing_access::CACHE_MAX
+            || state.pairing.iter().any(|(f, _, _)| *f == flow)
+        {
+            return Err("busy".into());
+        }
         let c: Cancel = Arc::new(AtomicBool::new(false));
-        self.lock().pairing.push((flow, c.clone()));
-        c
+        state
+            .pairing_operations
+            .push((operation, Instant::now() + Duration::from_secs(600)));
+        state.pairing.push((flow, operation, c.clone()));
+        if external {
+            if let Some(enrollment) = &mut state.enrollment {
+                if enrollment
+                    .response
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.operation.uuid() == operation)
+                {
+                    enrollment.reserved = true;
+                }
+            }
+        }
+        Ok(c)
+    }
+
+    pub fn cancel_pairing_owned(&self, flow: PairingFlow, operation: uuid::Uuid) {
+        let _commit = self.lock_commit();
+        let mut state = self.lock();
+        if state.enrollment.as_ref().is_some_and(|e| {
+            e.reserved
+                && e.response
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.operation.uuid() == operation)
+        }) {
+            return;
+        }
+        state
+            .pairing_operations
+            .retain(|(_, until)| Instant::now() < *until);
+        if state.pairing_operations.len() < xshell_protocol::pairing_access::CACHE_MAX
+            && !state
+                .pairing_operations
+                .iter()
+                .any(|(op, _)| *op == operation)
+        {
+            state
+                .pairing_operations
+                .push((operation, Instant::now() + Duration::from_secs(600)));
+        }
+        for (f, op, cancel) in &state.pairing {
+            if *f == flow && *op == operation {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        state
+            .pairing
+            .retain(|(f, op, _)| !(*f == flow && *op == operation));
     }
 
     fn end_pairing(&self, flow: PairingFlow, c: &Cancel) {
         self.lock()
             .pairing
-            .retain(|(f, x)| !(*f == flow && Arc::ptr_eq(x, c)));
+            .retain(|(f, _, x)| !(*f == flow && Arc::ptr_eq(x, c)));
     }
 
     fn pair_options(&self) -> PairOptions {
@@ -1602,12 +1974,16 @@ impl DesktopRing {
         role: Role,
         until: Instant,
         cancel: &Cancel,
+        initial_head: &str,
+        enrollment: Option<(uuid::Uuid, &EnrollmentParameters)>,
     ) -> Result<JoinRequest, PairError> {
         let adder = Adder {
             ring: self,
             used: AtomicBool::new(false),
             until,
             cancel: cancel.clone(),
+            initial_head,
+            enrollment,
         };
         host_pairing(
             pipe,
@@ -1628,11 +2004,23 @@ impl DesktopRing {
     /// already, not an error. Waits for the Relay to hold the version (for the connection
     /// to come up, say) up to `pair_publish_wait` and never past `until`; `cancel` (the
     /// pairing cancelled, the app quitting) ends the wait.
+    #[cfg(test)]
     fn add_paired_member(
         &self,
         req: &JoinRequest,
         until: Instant,
         cancel: &Cancel,
+        initial_head: &str,
+    ) -> Result<Joined, PairRefusal> {
+        self.add_paired_member_scoped(req, until, cancel, initial_head, None)
+    }
+    fn add_paired_member_scoped(
+        &self,
+        req: &JoinRequest,
+        until: Instant,
+        cancel: &Cancel,
+        initial_head: &str,
+        enrollment: Option<(uuid::Uuid, &EnrollmentParameters)>,
     ) -> Result<Joined, PairRefusal> {
         let (s, next) = {
             let _c = self.lock_commit();
@@ -1640,12 +2028,50 @@ impl DesktopRing {
                 let Some(mut s) = cur else {
                     return Ok((None, Err(PairRefusal::PublishFailed)));
                 };
+                if cancel.load(Ordering::Acquire) {
+                    return Ok((None, Err(PairRefusal::Used)));
+                }
+                if Instant::now() >= until {
+                    return Ok((None, Err(PairRefusal::Expired)));
+                }
+                if let Some((_, p)) = enrollment {
+                    if now() >= p.expires_at {
+                        return Ok((None, Err(PairRefusal::Expired)));
+                    }
+                    if req.sign_key != p.recipient.signing
+                        || req.noise_key != p.recipient.noise
+                        || req.role != Role::Mobile
+                        || req.name != p.device_name
+                        || s.keys.sign_key() != p.approver.signing
+                        || s.keys.noise_key() != p.approver.noise
+                        || s.chain.ring_id() != &p.ring
+                        || s.chain.head().roster().relay_url != p.relay
+                    {
+                        return Ok((None, Err(PairRefusal::Duplicate)));
+                    }
+                }
                 let head = s.chain.head();
+                if head.hash() != initial_head {
+                    return Ok((None, Err(PairRefusal::PublishFailed)));
+                }
                 if let Some(m) = head.member(&req.sign_key) {
-                    if m.noise_key == req.noise_key && m.role == req.role {
+                    if m.noise_key != req.noise_key || m.role != req.role {
+                        return Ok((None, Err(PairRefusal::Duplicate)));
+                    }
+                    if head.roster().signed_by == s.keys.sign_key() {
                         return Ok((None, Ok((s, None))));
                     }
-                    return Ok((None, Err(PairRefusal::Duplicate)));
+                    // A fresh offer pins this approving Desktop, not the signer of an
+                    // intervening update. Preserve every member on an exact-key retry,
+                    // but return an authenticated successor signed by the approver.
+                    let next = head
+                        .next(&*s.keys, now(), |_| {})
+                        .map_err(|e| e.to_string())?;
+                    s.chain
+                        .accept(std::slice::from_ref(&next))
+                        .map_err(|e| e.to_string())?;
+                    s.retarget_farewells();
+                    return Ok((Some(s.clone()), Ok((s, Some(next)))));
                 }
                 if head
                     .roster()
@@ -1684,6 +2110,18 @@ impl DesktopRing {
                     return Err(PairRefusal::PublishFailed);
                 }
             };
+            if let Some((operation, _)) = enrollment {
+                self.note_enrollment(
+                    operation,
+                    EnrollmentStage::DesktopCommitted,
+                    EnrollmentEvidence::DesktopCommitted {
+                        head: ChainHead {
+                            version: s.chain.head().version(),
+                            hash: s.chain.head().hash(),
+                        },
+                    },
+                );
+            }
             if next.is_some() {
                 self.hook();
                 self.adopt(s.clone());
@@ -1703,6 +2141,18 @@ impl DesktopRing {
                 return Err(PairRefusal::PublishFailed);
             }
             None => return Err(PairRefusal::PublishFailed),
+        }
+        if let Some((operation, _)) = enrollment {
+            self.note_enrollment(
+                operation,
+                EnrollmentStage::PublicationAcknowledged,
+                EnrollmentEvidence::PublicationAcknowledged {
+                    head: ChainHead {
+                        version: head.version(),
+                        hash: head.hash(),
+                    },
+                },
+            );
         }
         Ok(Joined {
             ring_id: head.ring_id().clone(),
@@ -2123,6 +2573,14 @@ impl DesktopRing {
     /// The app quits: say goodbye (`quit`), stop connecting, and hand the connection over
     /// (the owner lock is released after the goodbye).
     pub fn quit(&self) {
+        {
+            let _commit = self.lock_commit();
+            let mut live = self.lock();
+            live.quitting = true;
+            for (_, _, cancel) in &live.pairing {
+                cancel.store(true, Ordering::Release);
+            }
+        }
         self.cancel_pairing(PairingFlow::Phone);
         self.cancel_pairing(PairingFlow::Computer);
         let c = {
@@ -2147,6 +2605,8 @@ struct Adder<'a> {
     used: AtomicBool,
     until: Instant,
     cancel: Cancel,
+    initial_head: &'a str,
+    enrollment: Option<(uuid::Uuid, &'a EnrollmentParameters)>,
 }
 
 impl PairingHost for Adder<'_> {
@@ -2161,7 +2621,13 @@ impl PairingHost for Adder<'_> {
     }
 
     fn add(&self, req: &JoinRequest) -> Result<Joined, PairRefusal> {
-        self.ring.add_paired_member(req, self.until, &self.cancel)
+        self.ring.add_paired_member_scoped(
+            req,
+            self.until,
+            &self.cancel,
+            self.initial_head,
+            self.enrollment,
+        )
     }
 }
 
@@ -3522,6 +3988,287 @@ mod tests {
             &guest_opts(),
             None,
         )
+    }
+
+    #[test]
+    fn owned_pairing_stale_cancel_cannot_cancel_successor_or_replay_start() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        ring.pair_phone_owned(a, Arc::new(Pairings::default()))
+            .unwrap();
+        assert!(ring
+            .pair_phone_owned(b, Arc::new(Pairings::default()))
+            .is_err());
+        ring.cancel_pairing_owned(PairingFlow::Phone, a);
+        let offer = ring
+            .pair_phone_owned(b, Arc::new(Pairings::default()))
+            .unwrap();
+        ring.cancel_pairing_owned(PairingFlow::Phone, a);
+        assert!(scan(&offer.payload, &Arc::new(DeviceKeys::generate().unwrap())).is_ok());
+        assert!(ring
+            .pair_phone_owned(a, Arc::new(Pairings::default()))
+            .is_err());
+        let cancelled_before_reservation = uuid::Uuid::new_v4();
+        ring.cancel_pairing_owned(PairingFlow::Phone, cancelled_before_reservation);
+        assert!(ring
+            .pair_phone_owned(cancelled_before_reservation, Arc::new(Pairings::default()))
+            .is_err());
+    }
+
+    #[test]
+    fn pairing_commit_keeps_old_reader_open_without_storage_migration() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (candidate, _) = open(cfg(t.path(), &r.url()));
+        candidate.enable(None, false).unwrap();
+        wait_view(&candidate, "connected", connected);
+        let (reader, _) = open(cfg(t.path(), &r.url()));
+        let offer = candidate.pair_phone(Arc::new(Pairings::default())).unwrap();
+        scan(&offer.payload, &Arc::new(DeviceKeys::generate().unwrap())).unwrap();
+        wait_view(
+            &reader,
+            "read-only reader loads committed membership",
+            |v| v.members.len() == 2,
+        );
+        assert!(reader.view().problem.is_none());
+        // Frozen old-reader top-level shape; deny_unknown_fields must never see a receipt.
+        let bytes = std::fs::read(t.path().join("ring/ring.json")).unwrap();
+        let file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let fields = [
+            "v",
+            "signSeed",
+            "noiseSeed",
+            "rosters",
+            "localMember",
+            "pendingMove",
+            "farewells",
+            "heldRelays",
+            "hostMembers",
+        ];
+        assert!(file
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| fields.contains(&key.as_str())));
+        assert!(t.path().join("ring/ring.json").exists());
+    }
+
+    #[test]
+    fn pairing_abort_after_local_commit_reopens_existing_chain_without_receipt_migration() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (candidate, _) = open(cfg(t.path(), &r.url()));
+        candidate.enable(None, false).unwrap();
+        wait_view(&candidate, "connected", connected);
+        let initial = candidate.chain().unwrap().head().clone();
+        let mobile = DeviceKeys::from_seeds(&[71; 32], &[72; 32]);
+        let req = JoinRequest {
+            role: Role::Mobile,
+            sign_key: mobile.sign_key(),
+            noise_key: mobile.noise_key(),
+            name: "phone".into(),
+        };
+        *candidate.after_commit.lock().unwrap() =
+            Some(Box::new(|| panic!("synthetic postcommit interruption")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            candidate.add_paired_member(
+                &req,
+                Instant::now() + WAIT,
+                &Arc::new(AtomicBool::new(false)),
+                &initial.hash(),
+            )
+        }));
+        assert!(result.is_err());
+        candidate.quit();
+        drop(candidate);
+        let (reopened, _) = open(cfg(t.path(), &r.url()));
+        let chain = reopened.chain().unwrap();
+        assert_eq!(chain.head().version(), initial.version() + 1);
+        assert!(chain
+            .head()
+            .member(&mobile.sign_key())
+            .is_some_and(
+                |member| member.noise_key == mobile.noise_key() && member.role == Role::Mobile
+            ));
+        assert!(reopened.lock().pairing_operations.is_empty());
+        // Lost volatile attribution is not proof of publication or a successful task.
+        assert!(reopened.view().problem.is_none());
+    }
+
+    #[test]
+    fn pairing_transaction_rechecks_cancel_expiry_and_authorized_initial_head() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let initial = ring.chain().unwrap().head().clone();
+        let phone = DeviceKeys::from_seeds(&[81; 32], &[82; 32]);
+        let req = JoinRequest {
+            role: Role::Mobile,
+            sign_key: phone.sign_key(),
+            noise_key: phone.noise_key(),
+            name: "phone".into(),
+        };
+        for (cancel, until, head) in [
+            (true, Instant::now() + WAIT, initial.hash()),
+            (false, Instant::now(), initial.hash()),
+            (
+                false,
+                Instant::now() + WAIT,
+                xshell_protocol::ring::b64::encode(&[99; 32]),
+            ),
+        ] {
+            assert!(ring
+                .add_paired_member(&req, until, &Arc::new(AtomicBool::new(cancel)), &head)
+                .is_err());
+            assert_eq!(ring.chain().unwrap().head(), &initial);
+        }
+        ring.add_paired_member(
+            &req,
+            Instant::now() + WAIT,
+            &Arc::new(AtomicBool::new(false)),
+            &initial.hash(),
+        )
+        .unwrap();
+        // A later operation cannot adopt the first operation's successor as its baseline.
+        assert!(ring
+            .add_paired_member(
+                &req,
+                Instant::now() + WAIT,
+                &Arc::new(AtomicBool::new(false)),
+                &initial.hash()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn exact_member_retry_after_another_desktop_signed_head_pins_this_approver() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let phone = Arc::new(DeviceKeys::from_seeds(&[81; 32], &[82; 32]));
+        let other = DeviceKeys::from_seeds(&[83; 32], &[84; 32]);
+        let state = ring.pairing_state().unwrap();
+        let added = state
+            .chain
+            .head()
+            .next(&*state.keys, now(), |d| {
+                d.add(Member::new(
+                    "other Desktop",
+                    Role::Desktop,
+                    other.sign_key(),
+                    other.noise_key(),
+                    now(),
+                ));
+                d.add(Member::new(
+                    "phone",
+                    Role::Mobile,
+                    phone.sign_key(),
+                    phone.noise_key(),
+                    now(),
+                ));
+            })
+            .unwrap();
+        let intervening = added.next(&other, now(), |_| {}).unwrap();
+        let mut chain = state.chain.clone();
+        chain.accept(&[added, intervening]).unwrap();
+        ring.persist_newer(&chain);
+        wait_view(&ring, "other head adopted", |_| {
+            ring.chain().unwrap().head() == chain.head()
+        });
+        let members = chain.head().roster().members.clone();
+        let offer = ring.pair_phone(Arc::new(Pairings::default())).unwrap();
+        let retried = scan(&offer.payload, &phone).expect("exact-member retry remains pinned");
+        assert_eq!(retried.head().roster().signed_by, state.keys.sign_key());
+        assert_eq!(retried.head().version(), chain.head().version() + 1);
+        assert_eq!(retried.head().roster().members, members);
+    }
+
+    #[test]
+    fn enrollment_owned_cancellation_and_expected_recipient_are_enforced() {
+        let r = relay();
+        let t = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(t.path(), &r.url()));
+        ring.enable(None, false).unwrap();
+        wait_view(&ring, "connected", connected);
+        let phone = Arc::new(DeviceKeys::from_seeds(&[85; 32], &[86; 32]));
+        let gui = uuid::Uuid::new_v4();
+        let offer = ring
+            .pair_phone_owned(gui, Arc::new(Pairings::default()))
+            .unwrap();
+        let scope = ring
+            .enrollment_scope(&ring.chain().unwrap().ring_id().clone(), "my phone".into())
+            .unwrap();
+        let parameters = scope.enrollment.as_ref().unwrap().parameters(
+            &scope,
+            RecipientIdentity {
+                signing: phone.sign_key(),
+                noise: phone.noise_key(),
+            },
+            now() + 60,
+        );
+        let task = uuid::Uuid::new_v4();
+        let collision = PairOperationId::new(gui).unwrap();
+        assert!(ring.enrollment_offer(task, collision, parameters).is_err());
+        ring.enrollment_status(task, collision, true);
+        scan(&offer.payload, &phone).expect("failed external reservation cannot cancel GUI");
+
+        let scope = ring
+            .enrollment_scope(&ring.chain().unwrap().ring_id().clone(), "my phone".into())
+            .unwrap();
+        let expected = Arc::new(DeviceKeys::from_seeds(&[87; 32], &[88; 32]));
+        let parameters = scope.enrollment.as_ref().unwrap().parameters(
+            &scope,
+            RecipientIdentity {
+                signing: expected.sign_key(),
+                noise: expected.noise_key(),
+            },
+            now() + 60,
+        );
+        let external = PairOperationId::new(uuid::Uuid::new_v4()).unwrap();
+        let offer = ring
+            .enrollment_offer(uuid::Uuid::new_v4(), external, parameters)
+            .unwrap();
+        ring.cancel_pairing_owned(PairingFlow::Phone, external.uuid());
+        ring.cancel_pairing(PairingFlow::Phone);
+        assert!(ring
+            .pair_phone_owned(uuid::Uuid::new_v4(), Arc::new(Pairings::default()))
+            .is_err());
+        scan(offer.offer.expose(), &expected).expect("GUI cannot steal external reservation");
+
+        let scope = ring
+            .enrollment_scope(&ring.chain().unwrap().ring_id().clone(), "my phone".into())
+            .unwrap();
+        let parameters = scope.enrollment.as_ref().unwrap().parameters(
+            &scope,
+            RecipientIdentity {
+                signing: expected.sign_key(),
+                noise: expected.noise_key(),
+            },
+            now() + 60,
+        );
+        // Explicitly release the completed task; a new request is never an automatic retry.
+        let task = ring.lock().enrollment.as_ref().unwrap().task;
+        ring.enrollment_status(task, external, true);
+        let head = ring.chain().unwrap().head().clone();
+        let offer = ring
+            .enrollment_offer(
+                uuid::Uuid::new_v4(),
+                PairOperationId::new(uuid::Uuid::new_v4()).unwrap(),
+                parameters,
+            )
+            .unwrap();
+        let wrong = Arc::new(DeviceKeys::from_seeds(&[89; 32], &[90; 32]));
+        assert!(scan(offer.offer.expose(), &wrong).is_err());
+        assert_eq!(ring.chain().unwrap().head(), &head);
     }
 
     #[test]

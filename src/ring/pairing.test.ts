@@ -4,7 +4,7 @@ import { fmt, S, type StringKey } from "./strings";
 import type { PhoneStart } from "./types";
 
 const HOSTED = "wss://xshell-relay-hosted.m-roither.workers.dev";
-const OFFER: PhoneStart = { payload: "xsp1.abc", qr: { size: 2, rows: ["10", "01"] }, expiresAt: 1000 };
+const OFFER: PhoneStart = { operation: "test-op", payload: "xsp1.abc", qr: { size: 2, rows: ["10", "01"] }, expiresAt: 1000 };
 
 describe("countdown", () => {
   it("formats {m}:{ss} and rounds partial seconds up", () => {
@@ -88,37 +88,37 @@ describe("phone panel", () => {
   const run = (s: PhoneState, ...as: Parameters<typeof phoneReducer>[1][]) => as.reduce(phoneReducer, s);
 
   it("goes idle → starting → waiting → paired", () => {
-    const w = run(PHONE_IDLE, { type: "start" }, { type: "started", offer: OFFER });
+    const w = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "started", offer: OFFER });
     expect(w).toEqual({ state: "waiting", offer: OFFER });
-    expect(run(w, { type: "event", event: { flow: "phone", state: "waiting" } })).toBe(w);
-    expect(run(w, { type: "event", event: { flow: "phone", state: "paired", name: "Pixel", role: "mobile" } })).toEqual({ state: "paired", name: "Pixel" });
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "waiting" } })).toBe(w);
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "paired", name: "Pixel", role: "mobile" } })).toEqual({ state: "paired", name: "Pixel" });
   });
 
   it("expires from the event or the countdown, then offers a new code", () => {
-    const w = run(PHONE_IDLE, { type: "start" }, { type: "started", offer: OFFER });
+    const w = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "started", offer: OFFER });
     expect(run(w, { type: "tick", nowMs: 999_000 })).toBe(w);
     const e = run(w, { type: "tick", nowMs: 1000_000 });
     expect(e).toEqual({ state: "expired" });
-    expect(run(w, { type: "event", event: { flow: "phone", state: "expired" } })).toEqual({ state: "expired" });
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "expired" } })).toEqual({ state: "expired" });
     expect(offersNewCode(e)).toBe(true);
-    expect(run(e, { type: "start" })).toEqual({ state: "starting" });
+    expect(run(e, { type: "start", operation: "test-op" })).toEqual({ state: "starting", operation: "test-op" });
   });
 
   it("fails from an event or the command", () => {
-    const w = run(PHONE_IDLE, { type: "start" }, { type: "started", offer: OFFER });
-    expect(run(w, { type: "event", event: { flow: "phone", state: "failed", code: "role" } })).toEqual({ state: "failed", code: "role" });
-    const f = run(PHONE_IDLE, { type: "start" }, { type: "startFailed", error: "not_enabled: off" });
+    const w = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "started", offer: OFFER });
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "failed", code: "role" } })).toEqual({ state: "failed", code: "role" });
+    const f = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "startFailed", operation: "test-op", error: "not_enabled: off" });
     expect(f).toEqual({ state: "failed", code: "not_enabled", error: "not_enabled: off" });
     expect(offersNewCode(f)).toBe(true);
   });
 
   it("ignores other flows, idle events and the replaced offer's cancel", () => {
-    const w = run(PHONE_IDLE, { type: "start" }, { type: "started", offer: OFFER });
-    expect(run(w, { type: "event", event: { flow: "computer", state: "expired" } })).toBe(w);
-    expect(run(w, { type: "event", event: { flow: "phone", state: "failed", code: "cancelled" } })).toBe(w);
-    expect(run(PHONE_IDLE, { type: "event", event: { flow: "phone", state: "paired", name: "x", role: "mobile" } })).toBe(PHONE_IDLE);
-    expect(run(w, { type: "start" })).toBe(w);
-    expect(run(w, { type: "cancel" })).toEqual(PHONE_IDLE);
+    const w = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "started", offer: OFFER });
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "computer", state: "expired" } })).toBe(w);
+    expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "failed", code: "cancelled" } })).toBe(w);
+    expect(run(PHONE_IDLE, { type: "event", event: { operation: "test-op", flow: "phone", state: "paired", name: "x", role: "mobile" } })).toBe(PHONE_IDLE);
+    expect(run(w, { type: "start", operation: "test-op" })).toBe(w);
+    expect(run(w, { type: "cancel", operation: "test-op" })).toEqual(PHONE_IDLE);
   });
 });
 
@@ -129,34 +129,34 @@ describe("computer section", () => {
   it("connects, then pairs", () => {
     expect(canSubmit("7KQ4", COMPUTER_IDLE)).toBe(false);
     expect(canSubmit(CODE, COMPUTER_IDLE)).toBe(true);
-    const c = run(COMPUTER_IDLE, { type: "submit" });
-    expect(c).toEqual({ state: "connecting" });
+    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
+    expect(c).toEqual({ state: "connecting", operation: "test-op" });
     expect(canSubmit(CODE, c)).toBe(false);
     expect(computerLine(c)).toBe(S["mobile.pair.computer.connecting"]);
-    const p = run(c, { type: "event", event: { flow: "computer", state: "paired", name: "tower", role: "daemon" } });
+    const p = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "paired", name: "tower", role: "daemon" } });
     expect(p).toEqual({ state: "paired", name: "tower" });
     expect(computerLine(p)).toBe("Added tower");
   });
 
   it("reports not found, invalid and expired", () => {
-    const c = run(COMPUTER_IDLE, { type: "submit" });
-    const nf = run(c, { type: "event", event: { flow: "computer", state: "failed", code: "not_found" } });
+    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
+    const nf = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "not_found" } });
     expect(computerLine(nf)).toBe(S["mobile.pair.computer.notFound"]);
-    const inv = run(c, { type: "submitFailed", error: "invalid_code" });
+    const inv = run(c, { type: "submitFailed", operation: "test-op", error: "invalid_code" });
     expect(computerLine(inv)).toBe(S["mobile.pair.computer.invalid"]);
-    const ex = run(c, { type: "event", event: { flow: "computer", state: "expired" } });
+    const ex = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "expired" } });
     expect(computerLine(ex)).toBe(S["mobile.pair.expired"]);
   });
 
   it("clears a finished attempt on edit, not a running one", () => {
-    const c = run(COMPUTER_IDLE, { type: "submit" });
+    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
     expect(run(c, { type: "edit" })).toBe(c);
-    const f = run(c, { type: "event", event: { flow: "computer", state: "failed", code: "relay" } });
+    const f = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "relay" } });
     expect(computerLine(f)).toBe("Couldn't pair the device: relay");
     expect(run(f, { type: "edit" })).toEqual(COMPUTER_IDLE);
-    expect(run(c, { type: "event", event: { flow: "phone", state: "expired" } })).toBe(c);
-    expect(run(c, { type: "event", event: { flow: "computer", state: "failed", code: "cancelled" } })).toBe(c);
-    expect(run(c, { type: "cancel" })).toEqual(COMPUTER_IDLE);
+    expect(run(c, { type: "event", event: { operation: "test-op", flow: "phone", state: "expired" } })).toBe(c);
+    expect(run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "cancelled" } })).toBe(c);
+    expect(run(c, { type: "cancel", operation: "test-op" })).toEqual(COMPUTER_IDLE);
     expect(computerLine(COMPUTER_IDLE)).toBeNull();
   });
 });
@@ -192,5 +192,18 @@ describe("pairing strings", () => {
     expect(fmt("mobile.pair.failed", { error: "relay" })).toBe("Couldn't pair the device: relay");
     expect(fmt("mobile.pair.computer.desc", { relayArg: "" })).not.toContain("{");
     for (const k of KEYS) expect(fmt(k, { m: 1, ss: "00", name: "n", error: "e", relayArg: "" }), k).not.toMatch(/\{\w+\}/);
+  });
+});
+
+describe("pairing operation ownership", () => {
+  it("late A start/result/event cannot populate or end reissued B", () => {
+    const a = phoneReducer(PHONE_IDLE, { type: "start", operation: "A" });
+    const cancelled = phoneReducer(a, { type: "cancel", operation: "A" });
+    const b = phoneReducer(cancelled, { type: "start", operation: "B" });
+    expect(phoneReducer(b, { type: "cancel", operation: "A" })).toBe(b);
+    expect(phoneReducer(b, { type: "started", offer: { ...OFFER, operation: "A" } })).toBe(b);
+    expect(phoneReducer(b, { type: "startFailed", operation: "A", error: "relay" })).toBe(b);
+    expect(phoneReducer(b, { type: "event", event: { flow: "phone", operation: "A", state: "paired", name: "old", role: "mobile" } })).toBe(b);
+    expect(phoneReducer(b, { type: "started", offer: { ...OFFER, operation: "B" } }).state).toBe("waiting");
   });
 });

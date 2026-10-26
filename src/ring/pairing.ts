@@ -65,7 +65,7 @@ export function computerDesc(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">)
 // The codes the Desktop reports (`PairingEvent::Failed`, and the start of a command's error).
 const CODES = new Set([
   "expired", "used", "role", "duplicate", "full", "publish_failed", "not_found", "crypto", "pin",
-  "relay", "timeout", "protocol", "cancelled", "other_window", "not_enabled", "invalid_code",
+  "relay", "timeout", "protocol", "cancelled", "busy", "other_window", "not_enabled", "invalid_code",
 ]);
 
 // The failure code a command error starts with, or "other".
@@ -99,20 +99,20 @@ export function pairedLine(name: string): string {
 
 export type PhoneState =
   | { state: "idle" }
-  | { state: "starting" }
+  | { state: "starting"; operation: string }
   | { state: "waiting"; offer: PhoneStart }
   | { state: "paired"; name: string }
   | { state: "expired" }
   | { state: "failed"; code: string; error?: string };
 
 export type PhoneAction =
-  | { type: "start" }
+  | { type: "start"; operation: string }
   | { type: "started"; offer: PhoneStart }
-  | { type: "startFailed"; error: string }
+  | { type: "startFailed"; operation: string; error: string }
   | { type: "event"; event: PairingEvent }
   // The countdown reached zero.
   | { type: "tick"; nowMs: number }
-  | { type: "cancel" };
+  | { type: "cancel"; operation: string };
 
 export const PHONE_IDLE: PhoneState = { state: "idle" };
 
@@ -130,19 +130,21 @@ function ended(event: PairingEvent): PhoneState | null {
 export function phoneReducer(s: PhoneState, a: PhoneAction): PhoneState {
   switch (a.type) {
     case "start":
-      return s.state === "starting" || s.state === "waiting" ? s : { state: "starting" };
+      return s.state === "starting" || s.state === "waiting" ? s : { state: "starting", operation: a.operation };
     case "started":
-      return s.state === "starting" ? { state: "waiting", offer: a.offer } : s;
+      return s.state === "starting" && s.operation === a.offer.operation ? { state: "waiting", offer: a.offer } : s;
     case "startFailed":
-      return s.state === "starting" ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
+      return s.state === "starting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
     case "event": {
       if (a.event.flow !== "phone" || (s.state !== "starting" && s.state !== "waiting")) return s;
+      const operation = s.state === "starting" ? s.operation : s.offer.operation;
+      if (a.event.operation !== operation) return s;
       return ended(a.event) ?? s;
     }
     case "tick":
       return s.state === "waiting" && secondsLeft(s.offer.expiresAt, a.nowMs) === 0 ? { state: "expired" } : s;
     case "cancel":
-      return PHONE_IDLE;
+      return (s.state === "starting" && s.operation === a.operation) || (s.state === "waiting" && s.offer.operation === a.operation) ? PHONE_IDLE : s;
   }
 }
 
@@ -155,28 +157,28 @@ export function offersNewCode(s: PhoneState): boolean {
 
 export type ComputerState =
   | { state: "idle" }
-  | { state: "connecting" }
+  | { state: "connecting"; operation: string }
   | { state: "paired"; name: string }
   | { state: "failed"; code: string; error?: string };
 
 export type ComputerAction =
-  | { type: "submit" }
-  | { type: "submitFailed"; error: string }
+  | { type: "submit"; operation: string }
+  | { type: "submitFailed"; operation: string; error: string }
   | { type: "event"; event: PairingEvent }
   // The code was edited: a finished attempt's line goes away.
   | { type: "edit" }
-  | { type: "cancel" };
+  | { type: "cancel"; operation: string };
 
 export const COMPUTER_IDLE: ComputerState = { state: "idle" };
 
 export function computerReducer(s: ComputerState, a: ComputerAction): ComputerState {
   switch (a.type) {
     case "submit":
-      return s.state === "connecting" ? s : { state: "connecting" };
+      return s.state === "connecting" ? s : { state: "connecting", operation: a.operation };
     case "submitFailed":
-      return s.state === "connecting" ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
+      return s.state === "connecting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
     case "event": {
-      if (a.event.flow !== "computer" || s.state !== "connecting") return s;
+      if (a.event.flow !== "computer" || s.state !== "connecting" || a.event.operation !== s.operation) return s;
       switch (a.event.state) {
         case "paired": return { state: "paired", name: a.event.name };
         case "expired": return { state: "failed", code: "expired" };
@@ -187,7 +189,7 @@ export function computerReducer(s: ComputerState, a: ComputerAction): ComputerSt
     case "edit":
       return s.state === "connecting" ? s : COMPUTER_IDLE;
     case "cancel":
-      return COMPUTER_IDLE;
+      return s.state === "connecting" && s.operation === a.operation ? COMPUTER_IDLE : s;
   }
 }
 

@@ -10,7 +10,7 @@ use super::super::pairing::{
     MAX_PAIR_MESSAGE,
 };
 use super::super::url::RelayUrl;
-use super::super::{b64, DeviceKeys, NoiseKey, RingError, RingId, Role, Signer};
+use super::super::{b64, DeviceKeys, NoiseKey, RingError, RingId, Role, SignKey, Signer};
 use super::client::{ChainPin, RingClient, RingTimeouts};
 use super::transport::{self, Conn};
 use super::wire::{
@@ -235,6 +235,29 @@ pub fn pair_as_guest(
     opts: &PairOptions,
     cancel: Option<&Cancel>,
 ) -> Result<RosterChain, PairError> {
+    pair_as_guest_pinned(req, opts, cancel, None)
+}
+
+/// QR/enrollment callers pin the approving signer in addition to the Noise key. Scope
+/// checks precede any authentication or chain fetch at a message-4 Relay address.
+pub fn pair_as_guest_pinned(
+    req: &GuestRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    approver: Option<SignKey>,
+) -> Result<RosterChain, PairError> {
+    pair_as_guest_pinned_with_joined(req, opts, cancel, approver).map(|(chain, _)| chain)
+}
+
+/// Retains the authenticated message-4 head for enrollment evidence. A later fetched
+/// chain head is Mobile persistence evidence, not the approving Desktop's commit head.
+pub fn pair_as_guest_pinned_with_joined(
+    req: &GuestRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    approver: Option<SignKey>,
+) -> Result<(RosterChain, Joined), PairError> {
+    let expected_relay = RelayUrl::parse(req.relay_url).map_err(|_| PairError::Pin)?;
     let mut pipe = PairPipe::open(req.relay_url, &req.secret.slot(), opts)?;
     if !pipe.has_peer() {
         if req.wait.is_zero() {
@@ -253,12 +276,16 @@ pub fn pair_as_guest(
     pipe.send(&m3)?;
     let joined = g.finish(&pipe.recv(cancel)?)?;
     pipe.close();
-    if joined.ring_id != hello.ring_id {
-        return Err(PairError::Payload("another ring".into()));
+    if joined.ring_id != hello.ring_id
+        || req.ring_id.is_some_and(|ring| ring != &joined.ring_id)
+        || approver.is_some_and(|key| key != joined.signed_by)
+        || RelayUrl::parse(&joined.relay_url).map_err(|_| PairError::Pin)? != expected_relay
+    {
+        return Err(PairError::Pin);
     }
     let signer: Arc<dyn Signer> = req.keys.clone();
-    RingClient::fetch_chain(
-        &joined.relay_url,
+    let chain = RingClient::fetch_chain(
+        req.relay_url,
         &joined.ring_id,
         signer,
         &ChainPin {
@@ -268,7 +295,26 @@ pub fn pair_as_guest(
         opts.tls.clone(),
         opts.ring,
     )
-    .map_err(relay_err)
+    .map_err(relay_err)?;
+    // Fetch verified signatures and the exact message-4 head first; now bind that
+    // head's signer/member relationship to the authenticated Desktop and recipient.
+    let joined_head = chain.get(joined.version).ok_or(PairError::Pin)?;
+    let head = chain.head();
+    if joined_head.roster().signed_by != joined.signed_by
+        || !joined_head
+            .member(&joined.signed_by)
+            .is_some_and(|m| m.role == Role::Desktop && m.noise_key == hello.noise_key)
+        || !head
+            .member(&joined.signed_by)
+            .is_some_and(|m| m.role == Role::Desktop && m.noise_key == hello.noise_key)
+        || !head
+            .member(&req.keys.sign_key())
+            .is_some_and(|m| m.role == req.role && m.noise_key == req.keys.noise_key())
+        || RelayUrl::parse(&head.roster().relay_url).map_err(|_| PairError::Pin)? != expected_relay
+    {
+        return Err(PairError::Pin);
+    }
+    Ok((chain, joined))
 }
 
 /// The Desktop's bookkeeping, called by [`host_pairing`] once message 3 arrived.

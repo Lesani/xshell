@@ -46,7 +46,7 @@ zeroize = { version = "=1.8.2", optional = true }
 # `ring` dependency (`ring/std` without `?`). no_std + alloc is all we use.
 snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"], optional = true }
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
-rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "=1.0.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]

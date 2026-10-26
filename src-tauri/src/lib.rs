@@ -40,10 +40,13 @@ fn cli_args(args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
     (args.get(1)? == "event").then(|| &args[2..])
 }
 
-/// Run a command line that is not the app (see [`cli_args`]) and return its exit code. Called
-/// from `main` before Tauri starts.
+/// Handle `pairing-access` or the local agent hook (`event`) before Tauri starts. Public
+/// Pairing-access descriptors and redacted outcomes use the helper's inherited streams.
 pub fn run_cli() -> Option<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|arg| arg == "pairing-access") {
+        return Some(xshell_pairing_access::cli_main(&args[2..]));
+    }
     let rest = cli_args(&args)?;
     Some(xshell_core::agent_status::event_main(
         rest,

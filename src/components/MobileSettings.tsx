@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useReducer, useState } from "react";
+import { Fragment, useEffect, useReducer, useRef, useState } from "react";
 import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
 import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
@@ -14,10 +14,10 @@ import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../r
 
 export interface Pairing {
   events: PairingEvents;
-  startPhone: () => Promise<PhoneStart>;
-  cancelPhone: () => Promise<void>;
-  pairComputer: (code: string) => Promise<void>;
-  cancelComputer: () => Promise<void>;
+  startPhone: (operation: string) => Promise<PhoneStart>;
+  cancelPhone: (operation: string) => Promise<void>;
+  pairComputer: (code: string, operation: string) => Promise<void>;
+  cancelComputer: (operation: string) => Promise<void>;
 }
 
 // Text with `code` spans, as the copy writes commands.
@@ -45,8 +45,8 @@ export function PairingNote({ s, offerShown = false }: { s: RingStatus; offerSho
 }
 
 // "Cancel pairing": ends the offer on the Desktop and returns the panel to "Pair a phone".
-export async function cancelPhonePairing(cancelPhone: () => Promise<void>, dispatch: (a: PhoneAction) => void): Promise<void> {
-  dispatch({ type: "cancel" });
+export async function cancelPhonePairing(cancelPhone: () => Promise<void>, dispatch: (a: PhoneAction) => void, operation: string): Promise<void> {
+  dispatch({ type: "cancel", operation });
   try {
     await cancelPhone();
   } catch {
@@ -56,6 +56,12 @@ export async function cancelPhonePairing(cancelPhone: () => Promise<void>, dispa
 
 export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: Pairing; initial?: PhoneState }) {
   const [st, dispatch] = useReducer(phoneReducer, initial);
+  const operation = useRef<string | null>(null);
+  const acquiring = useRef(false);
+  const cancel = (owned: string) => {
+    if (operation.current === owned) operation.current = null;
+    return p.cancelPhone(owned);
+  };
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { if (p.events.phone) dispatch({ type: "event", event: p.events.phone }); }, [p.events.phone]);
   const waiting = st.state === "waiting";
@@ -69,15 +75,21 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
     return () => clearInterval(t);
   }, [waiting]);
   // Leaving Settings ends the offer: nobody sees the code any more.
-  useEffect(() => () => { p.cancelPhone().catch(() => {}); }, []);
+  useEffect(() => () => { if (operation.current) cancel(operation.current).catch(() => {}); }, []);
 
   const start = async () => {
-    dispatch({ type: "start" });
+    if (acquiring.current || st.state === "starting" || st.state === "waiting" || pairingBlocked(s) !== null) return;
+    acquiring.current = true;
+    const owned = crypto.randomUUID();
+    operation.current = owned;
+    dispatch({ type: "start", operation: owned });
     setNow(Date.now());
     try {
-      dispatch({ type: "started", offer: await p.startPhone() });
+      dispatch({ type: "started", offer: await p.startPhone(owned) });
     } catch (e) {
-      dispatch({ type: "startFailed", error: errorText(e) });
+      dispatch({ type: "startFailed", operation: owned, error: errorText(e) });
+    } finally {
+      acquiring.current = false;
     }
   };
   const busy = st.state === "starting" || waiting;
@@ -104,7 +116,7 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
           </button>
         ) : null}
         {st.state === "waiting" ? (
-          <button className="btn btn-ghost settings-action-btn" onClick={() => { cancelPhonePairing(p.cancelPhone, dispatch); }}>
+          <button className="btn btn-ghost settings-action-btn" onClick={() => { const owned = operation.current; if (owned) cancelPhonePairing(() => cancel(owned), dispatch, owned); }}>
             {fmt("mobile.pair.phone.cancel")}
           </button>
         ) : (
@@ -119,13 +131,13 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
 
 // "Add a computer", from its button and from Enter alike: nothing while the code is not
 // ready or pairing cannot succeed.
-export async function submitComputer(code: string, st: ComputerState, s: RingStatus, pairComputer: (code: string) => Promise<void>, dispatch: (a: ComputerAction) => void): Promise<void> {
+export async function submitComputer(code: string, st: ComputerState, s: RingStatus, pairComputer: (code: string, operation: string) => Promise<void>, dispatch: (a: ComputerAction) => void, operation: string = crypto.randomUUID()): Promise<void> {
   if (!canSubmit(code, st) || pairingBlocked(s) !== null) return;
-  dispatch({ type: "submit" });
+  dispatch({ type: "submit", operation });
   try {
-    await pairComputer(normalizeCode(code));
+    await pairComputer(normalizeCode(code), operation);
   } catch (e) {
-    dispatch({ type: "submitFailed", error: errorText(e) });
+    dispatch({ type: "submitFailed", operation, error: errorText(e) });
   }
 }
 
@@ -135,9 +147,15 @@ function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
   useEffect(() => { if (p.events.computer) dispatch({ type: "event", event: p.events.computer }); }, [p.events.computer]);
   const connecting = st.state === "connecting";
   // Leaving Settings while it looks for the computer stops looking.
-  useEffect(() => () => { p.cancelComputer().catch(() => {}); }, []);
+  const operation = useRef<string | null>(null);
+  useEffect(() => () => { if (operation.current) p.cancelComputer(operation.current).catch(() => {}); }, []);
 
-  const submit = () => submitComputer(code, st, s, p.pairComputer, dispatch);
+  const submit = () => {
+    if (!canSubmit(code, st) || pairingBlocked(s) !== null) return;
+    const owned = crypto.randomUUID();
+    operation.current = owned;
+    return submitComputer(code, st, s, p.pairComputer, dispatch, owned);
+  };
   const blocked = pairingBlocked(s) !== null;
   const invalid = codeError(code);
   const line = computerLine(st);
