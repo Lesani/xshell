@@ -169,6 +169,14 @@ pub fn write_windows_selected(home: &Path, name: &str) -> io::Result<()> {
 
 pub fn windows_spawn_target(home: &Path, bundled: &Path) -> io::Result<PathBuf> {
     let own = native_identity(bundled)?;
+    // Selection is opt-in state. Without a record, use the validated bundle without
+    // creating update directories or imposing their current-user ownership policy on
+    // an otherwise unrelated HOME (including elevated Windows profiles).
+    match std::fs::symlink_metadata(super::server_root(home).join(SELECTED)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(bundled.into()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
     let root = windows_server_root(home)?;
     let Some(record) = private_fs::open_read(&root.join(SELECTED))? else {
         return Ok(bundled.into());

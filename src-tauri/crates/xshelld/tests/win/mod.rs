@@ -105,8 +105,26 @@ impl Default for TestHome {
 
 impl TestHome {
     pub fn new() -> Self {
+        Self::create(false)
+    }
+
+    /// Synthetic HOME for private update state: an elevated token's default owner can
+    /// be Administrators, so create this fixture with the native current-user owner/DACL.
+    pub fn new_private_home() -> Self {
+        Self::create(true)
+    }
+
+    fn create(private_home: bool) -> Self {
         let dir = tempfile::Builder::new().prefix("xd").tempdir().unwrap();
-        fs::create_dir(dir.path().join("home")).unwrap();
+        if private_home {
+            xshell_core::private_fs::ensure_dir(&dir.path().join("home")).unwrap();
+            xshell_core::private_fs::check_owned_dir(&dir.path().join("home")).unwrap();
+            // The owning Daemon may create log/state children before staging. Keep the
+            // update root's parent user-owned too, rather than inheriting TokenOwner.
+            xshell_core::private_fs::ensure_dir(&dir.path().join("home").join(".xshell")).unwrap();
+        } else {
+            fs::create_dir(dir.path().join("home")).unwrap();
+        }
         fs::create_dir(dir.path().join("bin")).unwrap();
         TestHome {
             dir,

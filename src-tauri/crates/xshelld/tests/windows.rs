@@ -1033,6 +1033,38 @@ fn local_dialer_spawns_gui_bound_and_second_desktop_sees_terminal() {
 
 // ── Exact selected updates (#77), on the existing native process lane ──────
 
+#[test]
+fn bundled_spawn_without_selection_does_not_require_private_update_home() {
+    // Deliberately keep the normal Windows-created HOME, whose default owner can be
+    // Administrators under an elevated token. Ordinary bundled startup has no update
+    // state to authorize and must neither reject nor tighten this directory.
+    let h = TestHome::new();
+    let before = xshell_core::private_fs::security_sddl(&h.home()).unwrap();
+    assert!(!h.home().join(".xshell").exists());
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        Path::new(bin())
+    );
+    assert!(!h.home().join(".xshell").exists());
+    assert_eq!(
+        xshell_core::private_fs::security_sddl(&h.home()).unwrap(),
+        before
+    );
+    // An older owning Desktop may already have unrelated log/state directories. With
+    // no selection, leave their ownership/DACL alone too.
+    let root = xshell_core::server::server_root(&h.home());
+    fs::create_dir_all(&root).unwrap();
+    let before = xshell_core::private_fs::security_sddl(&root).unwrap();
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        Path::new(bin())
+    );
+    assert_eq!(
+        xshell_core::private_fs::security_sddl(&root).unwrap(),
+        before
+    );
+}
+
 fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
     let mut bytes = fs::read(bin()).unwrap();
     let original = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
@@ -1089,7 +1121,7 @@ fn stage_fixture(h: &TestHome, bytes: &[u8], build: &xshell_protocol::build::Bui
 #[test]
 fn native_staging_is_immutable_private_and_never_selects_or_starts() {
     use sha2::{Digest, Sha256};
-    let h = TestHome::new();
+    let h = TestHome::new_private_home();
     let (bytes, build) = update_fixture_bytes();
     let dir = stage_fixture(&h, &bytes, &build);
     stage_fixture(&h, &bytes, &build); // An identical immutable install is idempotent.
@@ -1121,10 +1153,11 @@ fn native_staging_is_immutable_private_and_never_selects_or_starts() {
     )
     .is_err());
     // Traversed junctions are rejected before writing outside the current-user tree.
-    let unsafe_home = TestHome::new();
+    let unsafe_home = TestHome::new_private_home();
     let elsewhere = unsafe_home.dir.path().join("elsewhere");
     fs::create_dir(&elsewhere).unwrap();
     let junction = unsafe_home.home().join(".xshell");
+    fs::remove_dir(&junction).unwrap(); // Replace the fixture's empty private parent.
     assert!(Command::new("cmd")
         .args(["/C", "mklink", "/J"])
         .arg(&junction)
@@ -1150,7 +1183,7 @@ fn base64_text(bytes: &[u8]) -> String {
 
 #[test]
 fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
-    let h = TestHome::new();
+    let h = TestHome::new_private_home();
     let owner = LocalDaemon::new(LocalDaemonConfig {
         bin: bin().into(),
         env: h.daemon_env(),
@@ -1219,7 +1252,7 @@ fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
 
 #[test]
 fn native_selected_record_validation_and_valid_older_bundle_fallback() {
-    let h = TestHome::new();
+    let h = TestHome::new_private_home();
     let (mut bytes, build) = update_fixture_bytes();
     let current = env!("CARGO_PKG_VERSION").as_bytes();
     assert_eq!(current, b"1.5.0"); // This fixture changes only equal-length version literals.
@@ -1253,7 +1286,7 @@ fn selected_update_worker_refusal_and_concurrent_busy_are_before_stop() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Mutex};
     use xshelld::server::{Config, GuiBound, Server, TestHook, TestPoint};
-    let h = TestHome::new();
+    let h = TestHome::new_private_home();
     let (bytes, build) = update_fixture_bytes();
     let dir = stage_fixture(&h, &bytes, &build);
     let paths = xshelld::paths::resolve(&h.home(), None, Some(&h.pipe));
