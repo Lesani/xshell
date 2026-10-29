@@ -34,7 +34,7 @@ pub fn no_reparse(path: &Path) -> io::Result<()> {
 
 pub fn windows_server_root(home: &Path) -> io::Result<PathBuf> {
     no_reparse(home)?;
-    private_fs::check_owned_dir(home)?;
+    private_fs::check_update_home_anchor(home)?;
     let mut dir = home.to_path_buf();
     for part in [".xshell", "server"] {
         dir.push(part);
