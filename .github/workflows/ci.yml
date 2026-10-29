@@ -126,7 +126,7 @@ jobs:
       - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --all-targets --locked -- -D warnings
       - name: Windows update-home anchor and private-state security regressions
         if: runner.os == 'Windows'
-        run: cargo test -p xshell-core private_fs:: --locked -- --nocapture
+        run: 'cargo test -p xshell-core private_fs:: --locked -- --nocapture'
       # On Windows the reply probes (#40) log what ConPTY does as facts, and the ConPTY
       # renderings of the prompt fixtures are kept as an artifact.
       - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --locked --no-fail-fast
