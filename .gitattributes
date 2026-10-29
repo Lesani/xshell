@@ -1,2 +1,4 @@
 # Test vectors are compared byte for byte; keep LF on every OS.
 src-tauri/crates/protocol/testdata/** text eol=lf
+# Git for Windows must leave the manual native-fixture Bash script executable by Bash.
+.github/scripts/build-windows-older-fixture.sh text eol=lf
