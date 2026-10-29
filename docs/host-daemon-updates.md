@@ -68,3 +68,51 @@ The unit-only PE fixture never becomes a production build input. Cross-checking 
 Windows Rust target proves compilation only. Native Windows CI and installed release
 Desktop + OpenSSH end-to-end evidence remain separate gates; neither is replaced by a
 Linux SSH test or by cross-compilation.
+
+## Manual native Windows E2E candidates and older owner fixture
+
+On the feature branch's **CI** workflow, manually request `build_windows_desktop=true`
+for the internal `xshell-windows-candidate` Desktop/Daemon pair. Optionally also request
+`build_windows_older_fixture=true` to build the fixed-purpose **1.4.9 test-only owner
+pair**. The latter requires the former; both default off. Push/default CI and the native
+Windows, macOS, Linux and SSH checks continue unchanged. This is not a release workflow:
+there is no remote fixture commit, tag, signing, installer, or publication.
+
+The clean target revision **R** is built, checked and uploaded first, including the raw
+Windows update asset. The older fixture is then compiled in a separate disposable local
+worktree based on exact R, with a separate default Cargo target directory. Its real local
+source commit changes only eight self-version lines in these six metadata files:
+
+- `src-tauri/Cargo.toml`, `src-tauri/crates/xshelld/Cargo.toml`, `src-tauri/Cargo.lock`
+- `src-tauri/tauri.conf.json`, `package.json`, `package-lock.json`
+
+No dependency constraints or locked dependency versions change. All other R source,
+including the Windows profile-anchor correction and owner readiness flag, is retained.
+The normal build identity is derived from that actual local fixture HEAD and commit time,
+not R's workflow SHA. Both embedded-Windows-asset variables are cleared: this older owner
+is a native matching Desktop/Daemon test pair, not a remote-update distribution Desktop.
+It is **not** a historical 1.4.9 release and must not be described as one.
+
+The separate `xshell-windows-older-fixture-1.4.9` artifact includes the two native x64
+executables, native Daemon `--version` JSON, both image build-stamp checks, Desktop PE
+product/file versions, SHA-256 checksums, full base/fixture source IDs and CI/runner
+provenance, the version-only source diff, and a verified standalone Git bundle containing
+fixture/base history (the runner unshallows its checkout when needed). Rechecks prove the
+preserved R Desktop/Daemon and raw asset hashes remain unchanged after the older build.
+Verify the artifact checksums, source diff/bundle, versions and identities before VM use.
+The small metadata transform can be checked locally without a Windows build:
+
+```sh
+node --test .github/scripts/windows-older-fixture-metadata.test.mjs
+```
+
+For equal-version replacement, retain the genuine fixed-code 1.5.0 predecessor at
+`1a3220e4bcd81ea42e23a0511d1600cdfdbc626b` and use the subsequent R as the actual
+replacement target. Do not manufacture another same-version fixture. For older-version
+Update, run the actual matching 1.4.9 fixture owner **and** Daemon: a 1.5.0 owner correctly
+ignores an older selected Daemon. The Linux controller must be built from clean R with R's
+exact embedded Windows asset. Native CI/provenance do not establish live E2E acceptance.
+The separate VM walkthrough must still prove actual Update and same-version replacement,
+Terminal restoration, default-profile nonmutation, owner-close/offline/no-SSH-autostart/
+reopen lifetime, and representative failure-before-stop paths. Do not change the profile's
+ownership/DACLs or override HOME to obtain acceptance.

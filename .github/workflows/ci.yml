@@ -8,6 +8,10 @@ on:
         description: Build an internal Windows Desktop/Daemon pair for release E2E
         type: boolean
         default: false
+      build_windows_older_fixture:
+        description: Also build a test-only 1.4.9 owner pair (requires Windows Desktop candidate)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -179,6 +183,12 @@ jobs:
       - name: Desktop compiles for Windows
         if: matrix.os == 'windows-latest'
         run: cargo check -p xshell --locked
+      - name: Validate manual older-fixture request
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_older_fixture && !inputs.build_windows_desktop
+        shell: bash
+        run: |
+          echo '::error::The older fixture requires build_windows_desktop=true'
+          exit 1
       # Manual internal candidates only: no release/tag, signing key or installer upload.
       # The Windows owning Desktop is needed for the real OpenSSH update walkthrough.
       - name: Build internal Windows Desktop candidate
@@ -208,6 +218,20 @@ jobs:
         with:
           name: xshell-windows-candidate
           path: ${{ runner.temp }}/xshell-windows-candidate
+          if-no-files-found: error
+      # Freeze/upload the real target first. Only the disposable local worktree is versioned down.
+      - name: Build test-only native Windows 1.4.9 owner pair
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop && inputs.build_windows_older_fixture
+        working-directory: .
+        shell: bash
+        run: |
+          node --test .github/scripts/windows-older-fixture-metadata.test.mjs
+          bash .github/scripts/build-windows-older-fixture.sh
+      - if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop && inputs.build_windows_older_fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshell-windows-older-fixture-1.4.9
+          path: ${{ runner.temp }}/xshell-windows-older-fixture-1.4.9
           if-no-files-found: error
   windows-2022:
     # The reply probes (#40) on a second ConPTY build (Windows Server 2022, build 20348): the
