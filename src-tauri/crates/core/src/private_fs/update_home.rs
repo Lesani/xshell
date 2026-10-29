@@ -379,7 +379,12 @@ mod tests {
         assert!(policy("O:BAD:P(D;;FA;;;WD)(A;;FA;;;BA)", ID, ID));
         assert!(!policy("O:BAD:NO_ACCESS_CONTROL", ID, ID));
         assert!(!policy("O:BA", ID, ID));
-        assert!(!policy("O:BAD:P(OA;;FR;;;WD)", ID, ID));
+        // Without an object GUID Windows normalizes OA to an ordinary allow ACE.
+        assert!(!policy(
+            "O:BAD:P(OA;;FR;00112233-4455-6677-8899-aabbccddeeff;;WD)",
+            ID,
+            ID
+        ));
     }
 
     #[test]
