@@ -26,8 +26,9 @@ test('older fixture refuses unexpected versions and cannot transform twice', () 
   assert.throws(() => olderFixtureMetadata(olderFixtureMetadata(files)));
 });
 test('older fixture handles Windows CRLF without unrelated changes', () => {
-  const crlf = Object.fromEntries(metadataPaths.map(file => [file, files[file].replaceAll('\n', '\r\n')]));
+  const lf = Object.fromEntries(metadataPaths.map(file => [file, files[file].replaceAll('\r\n', '\n')]));
+  const crlf = Object.fromEntries(metadataPaths.map(file => [file, lf[file].replaceAll('\n', '\r\n')]));
   const output = olderFixtureMetadata(crlf);
-  const lfOutput = olderFixtureMetadata(files);
+  const lfOutput = olderFixtureMetadata(lf);
   for (const file of metadataPaths) assert.equal(output[file].replaceAll('\r\n', '\n'), lfOutput[file]);
 });
