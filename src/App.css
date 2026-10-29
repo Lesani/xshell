@@ -1953,3 +1953,8 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
   .usage-card { flex: 1 1 100%; }
   .usage-card-body { flex-wrap: wrap; gap: 6px 14px; }
 }
+
+/* Outside the stable Terminal portals: changing Host/focus never remounts a Terminal. */
+.host-update-banner:has(.host-update-action) { padding: 8px 12px; border-bottom: 1px solid var(--border-default); background: var(--bg-elevated); flex-shrink: 0; }
+.host-update-action { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+.host-update-action .host-row-error { flex-basis: 100%; }

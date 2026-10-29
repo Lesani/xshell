@@ -89,6 +89,9 @@ pub enum ClientMsg {
     },
     #[serde(rename = "daemon.upgrade")]
     DaemonUpgrade,
+    /// Exact installed target; only owners advertising selected restart accept this.
+    #[serde(rename = "daemon.upgrade-selected")]
+    DaemonUpgradeSelected { version: String, build: BuildId },
     /// An agent hook reporting the Agent Status of the Terminal it runs in. Sent by the hook
     /// client on the Host itself (`xshelld event`, or the Desktop executable for Local Host
     /// Terminals), never by a Desktop's UI. `run` names the Terminal's process (a Relaunch
@@ -661,6 +664,7 @@ const CLIENT_TYPES: &[&str] = &[
     "term.update",
     "term.relaunch",
     "daemon.upgrade",
+    "daemon.upgrade-selected",
     "term.event",
     "ring.identity",
     "ring.join",
@@ -1263,6 +1267,27 @@ mod tests {
         let inb = decode_inbound(&b).unwrap();
         assert_eq!(inb.id, Some(3));
         assert_eq!(inb.msg, ClientMsg::DaemonUpgrade);
+    }
+
+    #[test]
+    fn selected_upgrade_is_additive_and_requires_exact_build() {
+        let msg = ClientMsg::DaemonUpgradeSelected {
+            version: "1.5.0".into(),
+            build: BuildId {
+                commit: "85ee920a1b2c".into(),
+                dirty: None,
+                time: 7,
+            },
+        };
+        let bytes = body(encode_msg(&msg, Some(9)).unwrap());
+        assert_eq!(decode_inbound(&bytes).unwrap().msg, msg);
+        for build in ["null", "{}"] {
+            assert!(decode_inbound(
+                format!(r#"{{"t":"daemon.upgrade-selected","version":"1.5.0","build":{build}}}"#)
+                    .as_bytes()
+            )
+            .is_err());
+        }
     }
 
     #[test]

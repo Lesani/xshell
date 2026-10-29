@@ -83,6 +83,8 @@ pub enum HostErrorHint {
     DaemonCommandFailed,
     /// The Host's Daemon is run by xshell there, and xshell is closed (ADR-0005).
     XshellNotRunning,
+    /// An explicit update failed; retain its error while ordinary reconnect retries continue.
+    UpdateFailed,
 }
 
 /// Map an ssh failure to a hint. `stderr` is ssh's (and the remote command's) stderr.

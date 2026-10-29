@@ -131,6 +131,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::TermUpdate { .. } => "term.update",
         ClientMsg::TermRelaunch { .. } => "term.relaunch",
         ClientMsg::DaemonUpgrade => "daemon.upgrade",
+        ClientMsg::DaemonUpgradeSelected { .. } => "daemon.upgrade-selected",
         ClientMsg::TermEvent { .. } => "term.event",
         ClientMsg::RingIdentity => "ring.identity",
         ClientMsg::RingJoin { .. } => "ring.join",

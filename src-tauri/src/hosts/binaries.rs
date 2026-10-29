@@ -12,6 +12,37 @@ use tokio::sync::Notify;
 use xshell_hostlink::{BinarySource, CancelToken, ChainSource, DirSource, Fetched, Origin, Wanted};
 use xshell_protocol::build::{install_dir_name, scan_stamp};
 
+#[path = "../../windows_asset.rs"]
+mod windows_asset;
+include!(concat!(env!("OUT_DIR"), "/windows-daemon.rs"));
+
+/// Windows updates use only bytes embedded in the delivered Desktop. Missing assets do
+/// not fall back to a same-version GitHub release from a different source revision.
+pub struct DesktopBinarySource {
+    other: ChainSource,
+}
+impl BinarySource for DesktopBinarySource {
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String> {
+        if want.triple != "x86_64-pc-windows-msvc" {
+            return self.other.fetch(want, cancel);
+        }
+        let (bytes, hash) =
+            EMBEDDED_WINDOWS_DAEMON.ok_or("This Desktop’s Windows Daemon build is unavailable.")?;
+        let build = want
+            .build
+            .as_ref()
+            .ok_or("this Desktop’s exact build is unknown")?;
+        windows_asset::verify(bytes, hash, build)?;
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        Ok(Fetched {
+            bytes: bytes.to_vec(),
+            origin: Origin::Bundled("<embedded Windows Daemon>".into()),
+        })
+    }
+}
+
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 
 pub fn release_repo() -> &'static str {
@@ -300,7 +331,7 @@ impl BinarySource for CargoArtifactSource {
 
 /// Next to the executable first (shipped or copied binaries), then (debug builds) the
 /// workspace's own build output, then the release download.
-pub fn production_source(exe_dir: Option<PathBuf>, cache_dir: PathBuf) -> ChainSource {
+pub fn production_source(exe_dir: Option<PathBuf>, cache_dir: PathBuf) -> DesktopBinarySource {
     let mut v: Vec<Box<dyn BinarySource>> = Vec::new();
     if let Some(d) = &exe_dir {
         v.push(Box::new(DirSource(d.clone())));
@@ -311,7 +342,9 @@ pub fn production_source(exe_dir: Option<PathBuf>, cache_dir: PathBuf) -> ChainS
         }
     }
     v.push(Box::new(HttpReleaseSource::new(cache_dir)));
-    ChainSource(v)
+    DesktopBinarySource {
+        other: ChainSource(v),
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +352,32 @@ mod tests {
     use super::*;
     use std::time::Instant;
     use xshell_protocol::build::BuildId;
+
+    #[test]
+    fn embedded_windows_source_is_exact_or_explicitly_unavailable() {
+        let source = production_source(None, PathBuf::from("unused-cache"));
+        let mut wanted = want("x86_64-pc-windows-msvc", env!("CARGO_PKG_VERSION"));
+        match EMBEDDED_WINDOWS_DAEMON {
+            None => assert_eq!(
+                source.fetch(&wanted, &CancelToken::new()).unwrap_err(),
+                "This Desktop’s Windows Daemon build is unavailable."
+            ),
+            Some((bytes, hash)) => {
+                let build = scan_stamp(bytes).unwrap().unwrap();
+                wanted.build = Some(build.clone());
+                assert_eq!(
+                    source.fetch(&wanted, &CancelToken::new()).unwrap().bytes,
+                    bytes
+                );
+                windows_asset::verify(bytes, hash, &build).unwrap();
+                wanted.build = Some(BuildId {
+                    commit: "000000000000".into(),
+                    ..build
+                });
+                assert!(source.fetch(&wanted, &CancelToken::new()).is_err());
+            }
+        }
+    }
 
     #[test]
     fn release_asset_urls() {

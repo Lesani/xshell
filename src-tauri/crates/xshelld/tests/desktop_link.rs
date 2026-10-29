@@ -311,8 +311,77 @@ fn hup_proof(fx: &Fx) -> xshell_core::launch::LaunchSpec {
 
 #[test]
 fn upgrade_restores_same_uuid_new_pid() {
-    // Command only: nothing starts a Daemon over a socket.
-    let fx = Fx::new();
+    // A real initial Daemon from a different test build, followed by this Desktop's
+    // exact executable. Both native --version and hello parse the modified stamp.
+    let initial = tempfile::tempdir().unwrap();
+    let old = initial.path().join("xshelld");
+    let current = xshelld::build_id::BUILD.as_ref().unwrap();
+    let stamp = format!("@@XSHELL-BUILD-V1:{}:{}@@", current.display(), current.time);
+    let mut bytes = std::fs::read(common::bin()).unwrap();
+    let mut changes = 0;
+    for i in 0..=bytes.len() - stamp.len() {
+        if bytes[i..].starts_with(stamp.as_bytes()) {
+            let start = i + "@@XSHELL-BUILD-V1:".len();
+            bytes[start] = if bytes[start] == b'0' { b'1' } else { b'0' };
+            changes += 1;
+        }
+    }
+    assert!(changes > 0);
+    std::fs::write(&old, bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The test-only byte patch invalidates Apple Silicon's ad-hoc Mach-O signature.
+    // Re-sign only this temporary fixture, without a certificate or timestamp service.
+    #[cfg(target_os = "macos")]
+    {
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&old)
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "sign temporary upgrade fixture: {}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
+    struct InitialBuild {
+        inner: std::sync::Arc<dyn xshell_hostlink::TransportFactory>,
+        old: std::path::PathBuf,
+    }
+    impl xshell_hostlink::TransportFactory for InitialBuild {
+        fn for_host(
+            &self,
+            cfg: &xshell_hostlink::HostConfig,
+        ) -> Box<dyn xshell_hostlink::Transport> {
+            struct T {
+                inner: Box<dyn xshell_hostlink::Transport>,
+                old: std::path::PathBuf,
+            }
+            impl xshell_hostlink::Transport for T {
+                fn command(&self, remote: &str) -> xshell_hostlink::transport::CommandSpec {
+                    self.inner.command(&remote.replace(
+                        &override_cmd(),
+                        &xshell_hostlink::transport::sh_quote(self.old.to_str().unwrap()),
+                    ))
+                }
+                fn describe(&self) -> String {
+                    "initial test build".into()
+                }
+            }
+            Box::new(T {
+                inner: self.inner.for_host(cfg),
+                old: self.old.clone(),
+            })
+        }
+    }
+    let fx = Fx::with(|cfg| {
+        cfg.desktop_build = Some(current.clone());
+        cfg.transports = std::sync::Arc::new(InitialBuild {
+            inner: cfg.transports.clone(),
+            old,
+        });
+    });
     fx.a.wait_usable();
     let h = fx.a.host();
     let t = Uuid::new_v4();
@@ -332,7 +401,9 @@ fn upgrade_restores_same_uuid_new_pid() {
     let during = fx.a.rec.statuses.lock().unwrap()[n..c].to_vec();
     assert!(!during.is_empty());
     assert!(
-        during.iter().all(|s| s.phase == Some(Phase::Upgrading)),
+        during
+            .iter()
+            .all(|s| matches!(s.phase, Some(Phase::Preparing | Phase::Upgrading))),
         "{during:#?}"
     );
     assert!(during.iter().any(|s| s.status == StatusKind::Reconnecting));
@@ -899,6 +970,11 @@ fn local_switch_off_then_quit_ends_terminals() {
     assert!(wait_dead(old), "the Persistent Daemon still runs");
     let gui = a.daemon.gui_pid().expect("a GUI-bound child");
     assert_eq!(daemon_pid(&home), gui as i32);
+    assert_eq!(
+        a.host().status().phase,
+        None,
+        "the accepted update must complete in GUI-bound mode"
+    );
     let now = restored(&a.rec, lists, t, pid);
     a.quit();
     assert!(wait_dead(gui as i32));

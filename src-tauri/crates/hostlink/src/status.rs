@@ -26,6 +26,7 @@ pub enum Phase {
     Probing,
     Installing,
     Upgrading,
+    Preparing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -33,6 +34,13 @@ pub enum Phase {
 pub enum IncompatibleReason {
     DaemonOlder,
     DaemonNewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateAction {
+    Update,
+    Replace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,7 +60,7 @@ pub struct HostStatus {
     pub protocol: Option<u32>,
     /// The connected Daemon's hello capabilities; empty while not connected.
     pub daemon_capabilities: Vec<String>,
-    /// `linux` or `macos`, from the last probe.
+    /// `linux`, `macos` or `windows`, from the last exact platform probe.
     pub os: Option<String>,
     pub arch: Option<String>,
     pub incompatible_reason: Option<IncompatibleReason>,
@@ -63,9 +71,11 @@ pub struct HostStatus {
     /// Changes whenever the Host's connection settings are replaced; Tabs re-attach then.
     pub config_generation: u64,
     /// The link generation that last became usable: a request meant for that connection
-    /// names it ([`crate::HostHandle::ring_identity`]). Not for the frontend.
-    #[serde(skip)]
+    /// names it ([`crate::HostHandle::ring_identity`]), including a bound update confirmation.
     pub link_generation: u64,
+    /// Retained during reconnect: capability absence alone is not an old-owner diagnosis.
+    pub update_unavailable: Option<String>,
+    pub update_action: Option<UpdateAction>,
 }
 
 impl HostStatus {
@@ -94,6 +104,8 @@ impl HostStatus {
             since_ms: now_ms(),
             config_generation,
             link_generation: 0,
+            update_unavailable: None,
+            update_action: None,
         }
     }
 
@@ -159,7 +171,7 @@ mod tests {
                 "errorHint":"host-key","daemonVersion":null,"desktopVersion":"1.5.0",
                 "daemonBuild":null,"desktopBuild":null,"protocol":null,
                 "daemonCapabilities":[],"os":null,"arch":null,"incompatibleReason":"daemon-older","nextRetryAt":null,
-                "sinceMs":1,"configGeneration":7
+                "sinceMs":1,"configGeneration":7,"linkGeneration":0,"updateUnavailable":null,"updateAction":null
             })
         );
         s.set_kind(StatusKind::UpgradePending);

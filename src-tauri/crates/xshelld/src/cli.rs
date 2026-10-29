@@ -29,6 +29,11 @@ pub enum Command {
     ConsoleMode {
         pid: u32,
     },
+    StageBuild {
+        dir: String,
+        sha256: String,
+        length: u64,
+    },
     Version,
     Help,
 }
@@ -43,6 +48,7 @@ pub struct Opts {
     pub idle_timeout: Option<Duration>,
     /// `serve --gui-bound`: run for the xshell app on this machine (ADR-0005) and end with it.
     pub gui_bound: bool,
+    pub supports_selected_restart: bool,
     /// `--parent-pid`: the app's pid. Required with `--gui-bound`, refused otherwise.
     pub parent_pid: Option<u32>,
     /// `serve --interactive-env`: take the PATH of an interactive login shell, as a GUI-bound
@@ -137,6 +143,22 @@ pub fn parse(
     match cmd {
         "--version" | "-V" | "version" => return Ok(Command::Version),
         "--help" | "-h" | "help" => return Ok(Command::Help),
+        "stage-build" => {
+            let values: Vec<_> = args.collect();
+            if values.len() != 3 {
+                return Err(
+                    "usage: xshelld stage-build <install-dir> <sha256> <decoded-length>".into(),
+                );
+            }
+            return Ok(Command::StageBuild {
+                dir: values[0].to_string_lossy().into_owned(),
+                sha256: values[1].to_string_lossy().into_owned(),
+                length: values[2]
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("invalid decoded length")?,
+            });
+        }
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
         "console-mode" => return parse_console_mode(args),
@@ -161,6 +183,9 @@ pub fn parse(
             "--socket" => opts.socket = Some(value()?.into()),
             "--idle-timeout-ms" => opts.idle_timeout = Some(parse_ms(&value()?, &flag)?),
             "--gui-bound" if inline.is_none() => opts.gui_bound = true,
+            "--supports-selected-restart" if inline.is_none() && cmd == "serve" => {
+                opts.supports_selected_restart = true
+            }
             "--interactive-env" if inline.is_none() => opts.interactive_env = true,
             "--job" => {
                 let v = value()?;
@@ -198,6 +223,9 @@ pub fn parse(
     }
     if opts.job.is_some() && !(cmd == "serve" && opts.gui_bound) {
         return Err("--job is an option of serve --gui-bound only".into());
+    }
+    if opts.supports_selected_restart && !opts.gui_bound {
+        return Err("--supports-selected-restart requires serve --gui-bound".into());
     }
     if opts.gui_bound != opts.parent_pid.is_some() {
         return Err("--gui-bound and --parent-pid go together".into());
@@ -315,6 +343,39 @@ mod tests {
         assert!(run(&["frobnicate"], &[]).is_err());
         assert_eq!(run(&["--version"], &[]), Ok(Command::Version));
         assert_eq!(run(&[], &[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn selected_restart_flag_is_explicit_serve_readiness() {
+        let Command::Serve(o) = run(
+            &[
+                "serve",
+                "--gui-bound",
+                "--parent-pid",
+                "9",
+                "--supports-selected-restart",
+            ],
+            &[],
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(o.supports_selected_restart);
+        for args in [
+            &["serve", "--supports-selected-restart"][..],
+            &["connect", "--supports-selected-restart"],
+            &["pair", "--supports-selected-restart"],
+        ] {
+            assert!(run(args, &[]).is_err());
+        }
+        assert_eq!(
+            run(&["stage-build", "1.5.0+85ee920a1b2c", "hash", "12"], &[]).unwrap(),
+            Command::StageBuild {
+                dir: "1.5.0+85ee920a1b2c".into(),
+                sha256: "hash".into(),
+                length: 12
+            }
+        );
     }
 
     #[test]

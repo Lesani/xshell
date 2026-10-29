@@ -6309,10 +6309,12 @@ dependencies = [
 name = "xshell-hostlink"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "libc",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "shlex",
  "tempfile",
  "uuid",
@@ -6367,12 +6369,15 @@ dependencies = [
 name = "xshelld"
 version = "1.5.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "libc",
  "md5",
  "portable-pty",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "uuid",

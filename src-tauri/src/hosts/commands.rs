@@ -287,9 +287,15 @@ pub async fn host_term_relaunch(
 }
 
 #[tauri::command]
-pub async fn host_upgrade(state: State<'_, Hosts>, host: String) -> Result<(), HostError> {
+pub async fn host_upgrade(
+    state: State<'_, Hosts>,
+    host: String,
+    target: xshell_hostlink::handle::UpdateTarget,
+) -> Result<(), HostError> {
     let h = handle(&state, &host)?;
-    reply(|w| h.upgrade(w)).await.map(|_| ())
+    reply(|w| h.upgrade_target(Some(target), w))
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]

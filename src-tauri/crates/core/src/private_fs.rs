@@ -23,6 +23,12 @@ pub fn file_sddl(sid: &str) -> String {
 pub use win::*;
 
 #[cfg(windows)]
+#[path = "private_fs/update_home.rs"]
+mod update_home;
+#[cfg(windows)]
+pub use update_home::check_update_home_anchor;
+
+#[cfg(windows)]
 mod win {
     use super::*;
     use crate::pipe::{current_user_sid, last_error, os_error, owned, raw, wide, SecDesc, Sid};
@@ -60,7 +66,7 @@ mod win {
         Ok(Me { sid, text })
     }
 
-    fn refuse(path: &Path, why: &str) -> io::Error {
+    pub(super) fn refuse(path: &Path, why: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{} {why}; refusing it", path.display()),
@@ -68,7 +74,7 @@ mod win {
     }
 
     /// Open `path` as itself (not what a reparse point names). `None`: it does not exist.
-    fn open(
+    pub(super) fn open(
         path: &Path,
         access: u32,
         disposition: u32,
@@ -97,7 +103,7 @@ mod win {
         owned(h).map(Some)
     }
 
-    fn attributes(h: &OwnedHandle) -> io::Result<u32> {
+    pub(super) fn attributes(h: &OwnedHandle) -> io::Result<u32> {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(raw(h), &mut info) } == 0 {
             return Err(last_error());
@@ -105,7 +111,7 @@ mod win {
         Ok(info.dwFileAttributes)
     }
 
-    fn owner_is(h: &OwnedHandle, sid: &Sid) -> io::Result<bool> {
+    pub(super) fn owner_is(h: &OwnedHandle, sid: &Sid) -> io::Result<bool> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let r = unsafe {
@@ -180,6 +186,22 @@ mod win {
             file_sddl(&me.text)
         };
         set_dacl(h, &sddl)
+    }
+
+    /// Verify the home that contains private update state without changing its inherited
+    /// permissions. Ancestors may be system-owned, but this home must belong to us.
+    pub fn check_owned_dir(path: &Path) -> io::Result<()> {
+        let me = me()?;
+        let h = open(path, READ_CONTROL, OPEN_EXISTING, None)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let attrs = attributes(&h)?;
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refuse(path, "is not a real directory"));
+        }
+        if !owner_is(&h, &me.sid)? {
+            return Err(refuse(path, "is owned by another user"));
+        }
+        Ok(())
     }
 
     /// Create `dir` private (its parents as usual), or make an existing one private: refused
@@ -466,6 +488,8 @@ mod win_tests {
                 return;
             }
         }
+        let e = check_owned_dir(&d).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
         let e = ensure_dir(&d).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
         assert!(dacl(&security_sddl(&d).unwrap()).contains(";;;WD)"));

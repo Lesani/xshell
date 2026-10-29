@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Plus, RefreshCw, RefreshCcw, ArrowUpCircle, Pencil, Trash2, X, ChevronRight, PlugZap } from "lucide-react";
+import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap } from "lucide-react";
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
 import { ColorPicker } from "./ColorPicker";
 import { HostBadge } from "./HostBadge";
+import { HostUpdateAction } from "./HostUpdateAction";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LocalDaemonSettings } from "./LocalDaemonSettings";
 import { fmt } from "../hosts/strings";
@@ -154,36 +155,15 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
   const usable = isUsableStatus(status);
   const [test, setTest] = useState<TestState>({ busy: false, text: null, ok: false });
   const [details, setDetails] = useState(false);
-  const [confirmUpgrade, setConfirmUpgrade] = useState(false);
-  const [upgrading, setUpgrading] = useState(false);
-  const [confirmReplace, setConfirmReplace] = useState(false);
-  const [replacing, setReplacing] = useState(false);
-  const canUpgrade = status?.status === "upgrade-pending" || (status?.status === "incompatible" && status.incompatibleReason === "daemon-older");
-  // #49: the same upgrade, offered as a replacement while the Daemon is another build.
-  const canReplace = status?.status === "build-differs";
-  const switching = status?.phase === "upgrading";
   const hint = hintText(status?.errorHint, host.sshTarget);
   // A usable Host still shows why an upgrade or a replacement did not take (it can be retried).
-  const showError = !!status?.lastError && (!usable || status.status === "build-differs" || status.status === "upgrade-pending");
+  const showError = !!status?.lastError && status.errorHint !== "update-failed" && (!usable || status.status === "build-differs" || status.status === "upgrade-pending");
   const firstLine = status?.lastError?.split("\n").find(l => l.trim()) ?? "";
 
   const testNow = async () => {
     setTest({ busy: true, text: null, ok: false });
     const r = await runTest(host);
     setTest({ busy: false, ...r });
-  };
-  const upgrade = async () => {
-    setConfirmUpgrade(false);
-    setUpgrading(true);
-    try { await invoke("host_upgrade", { host: host.id }); } catch (_) {}
-    setUpgrading(false);
-  };
-  // Failures show as the Host's last error.
-  const replace = async () => {
-    setConfirmReplace(false);
-    setReplacing(true);
-    try { await invoke("host_upgrade", { host: host.id }); } catch (_) {}
-    setReplacing(false);
   };
 
   return (
@@ -197,11 +177,8 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
         <StatusChip status={status} now={now} />
       </div>
 
-      {status?.status === "upgrade-pending" && <div className="host-row-note">{fmt("hosts.upgradePending.desc", { daemon: status.daemonVersion ?? "", desktop: status.desktopVersion })}</div>}
-      {canReplace && <div className="host-row-note">{fmt("hosts.buildDiffers.desc", { daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</div>}
-      {status?.status === "incompatible" && status.incompatibleReason && (
-        <div className="host-row-note host-row-warn">{fmt(status.incompatibleReason === "daemon-older" ? "hosts.incompatible.older" : "hosts.incompatible.newer")}</div>
-      )}
+      <HostUpdateAction host={host} status={status} description />
+      {status?.status === "incompatible" && !status.updateAction && status.incompatibleReason === "daemon-newer" && <div className="host-row-note host-row-warn">{fmt("hosts.incompatible.newer")}</div>}
       {showError && (
         <div className="host-row-error">
           <span className="host-row-error-label">{fmt("hosts.row.lastError")}</span>
@@ -232,19 +209,12 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
       <div className="host-row-actions">
         <button className="btn btn-ghost settings-action-btn" disabled={test.busy} onClick={testNow}><PlugZap size={11} /> {test.busy ? fmt("hosts.row.testing") : fmt("hosts.row.test")}</button>
         <button className="btn btn-ghost settings-action-btn" onClick={() => invoke("hosts_kick", { host: host.id }).catch(() => {})}><RefreshCw size={11} /> {fmt("hosts.row.reconnect")}</button>
-        {canUpgrade && <button className="btn btn-ghost settings-action-btn" disabled={upgrading || switching} onClick={() => setConfirmUpgrade(true)}><ArrowUpCircle size={11} /> {upgrading || switching ? fmt("hosts.row.upgrading") : fmt("hosts.row.upgrade")}</button>}
-        {(canReplace || replacing) && <button className="btn btn-ghost settings-action-btn" disabled={replacing || switching} onClick={() => setConfirmReplace(true)}><RefreshCcw size={11} /> {replacing || switching ? fmt("hosts.row.replacing") : fmt("hosts.row.replaceBuild")}</button>}
         <span style={{ flex: 1 }} />
         <button className="btn btn-ghost settings-action-btn" onClick={onEdit}><Pencil size={11} /> {fmt("hosts.row.edit")}</button>
         <button className="btn btn-ghost settings-action-btn host-row-remove" onClick={onRemove}><Trash2 size={11} /> {fmt("hosts.row.remove")}</button>
       </div>
 
-      {confirmUpgrade && (
-        <ConfirmDialog title={fmt("hosts.upgrade.confirmTitle")} body={fmt("hosts.upgrade.confirmBody", { host: host.name, n: live?.length ?? 0 })} confirm={fmt("hosts.upgrade.confirm")} onConfirm={upgrade} onCancel={() => setConfirmUpgrade(false)} />
-      )}
-      {confirmReplace && (
-        <ConfirmDialog title={fmt("hosts.replace.confirmTitle")} body={fmt("hosts.replace.confirmBody", { host: host.name, build: buildText(status?.desktopBuild), n: live?.length ?? 0 })} confirm={fmt("hosts.replace.confirm")} onConfirm={replace} onCancel={() => setConfirmReplace(false)} />
-      )}
+
     </div>
   );
 }

@@ -215,6 +215,7 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         // Desktop bookkeeping; a session id set here would reach a later Relaunch.
         ClientMsg::TermUpdate { .. } => Err(forbidden("term.update")),
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
+        ClientMsg::DaemonUpgradeSelected { .. } => Err(forbidden("daemon.upgrade-selected")),
         // Agent hooks report from the Host itself, over the local socket, never from a phone.
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
         // Ring membership is the Desktop's to manage.
@@ -871,6 +872,14 @@ pub(crate) mod tests {
         for m in [
             &upd,
             &ClientMsg::DaemonUpgrade,
+            &ClientMsg::DaemonUpgradeSelected {
+                version: "1.5.0".into(),
+                build: xshell_protocol::build::BuildId {
+                    commit: "85ee920a1b2c".into(),
+                    dirty: None,
+                    time: 7,
+                },
+            },
             &ClientMsg::RingIdentity,
             &join,
         ] {

@@ -111,3 +111,149 @@ fn ssh_unresolvable_target_hint() {
     assert_eq!(s.error_hint, Some(HostErrorHint::Unresolved), "{s:?}");
     d.m.shutdown();
 }
+
+/// The update regression uses a fresh remote HOME and runtime directory for each case,
+/// even when the sshd's dedicated user is shared with another test. No existing Daemon,
+/// selection, Terminal or SSH configuration is read or stopped.
+#[test]
+#[ignore]
+fn ssh_selected_updates_restore_uuid_with_exact_identity() {
+    use xshell_hostlink::transport::sh_quote;
+    let Some((target, bin_dir)) = env() else {
+        return;
+    };
+    let triple = xshell_hostlink::install::target_triple("Linux", std::env::consts::ARCH).unwrap();
+    let bytes =
+        std::fs::read(std::path::Path::new(&bin_dir).join(format!("xshelld-{triple}"))).unwrap();
+    let expected = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
+    struct Isolated {
+        target: String,
+        home: String,
+    }
+    impl Transport for Isolated {
+        fn command(&self, remote: &str) -> xshell_hostlink::transport::CommandSpec {
+            let home = sh_quote(&self.home);
+            let script = format!(
+                "export HOME={home} XSHELLD_HOME={home} XDG_RUNTIME_DIR={home}/run; {remote}"
+            );
+            SshTransport::new(&self.target).command(&format!("sh -c {}", sh_quote(&script)))
+        }
+        fn describe(&self) -> String {
+            "isolated SSH update fixture".into()
+        }
+    }
+    struct Cleanup(Arc<Isolated>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let script = format!("sh -c {}; for i in $(seq 1 100); do [ ! -f \"$XDG_RUNTIME_DIR/xshell/daemon.pid\" ] && break; sleep 0.1; done; rm -rf {}", sh_quote(&kill_daemon_script()), sh_quote(&self.0.home));
+            let _ = run_script(
+                &*self.0,
+                &sh_wrap(&script),
+                None,
+                Duration::from_secs(30),
+                &CancelToken::new(),
+            );
+        }
+    }
+    for older in [true, false] {
+        let home = ssh_run(&target, "mktemp -d /tmp/x77-ssh.XXXXXXXX")
+            .trim()
+            .to_string();
+        assert!(home.starts_with("/tmp/x77-ssh.") && !home.contains('\n'));
+        let isolated = Arc::new(Isolated {
+            target: target.clone(),
+            home: home.clone(),
+        });
+        let _cleanup = Cleanup(isolated.clone());
+        // The debug fixture retains a contiguous version literal (an optimized native
+        // compiler may encode the five bytes as separate instruction immediates).
+        let mut initial = if older {
+            std::fs::read(common::bin()).unwrap()
+        } else {
+            bytes.clone()
+        };
+        let initial_build = xshell_protocol::build::scan_stamp(&initial)
+            .unwrap()
+            .unwrap();
+        let old_build = format!(
+            "@@XSHELL-BUILD-V1:{}:{}@@",
+            initial_build.display(),
+            initial_build.time
+        );
+        let version = VERSION.as_bytes();
+        for i in 0..initial.len() {
+            if initial[i..].starts_with(old_build.as_bytes()) {
+                let j = i + "@@XSHELL-BUILD-V1:".len();
+                initial[j] = if initial[j] == b'0' { b'1' } else { b'0' };
+            }
+            if older && initial[i..].starts_with(version) {
+                assert_eq!(version, b"1.5.0");
+                initial[i..i + 5].copy_from_slice(b"1.4.0");
+            }
+        }
+        let upload = run_script(&*isolated, &sh_wrap("set -e; mkdir -m 700 -p \"$HOME/run\" \"$HOME/initial\"; cat > \"$HOME/initial/xshelld\"; chmod 700 \"$HOME/initial/xshelld\""), Some(initial), Duration::from_secs(60), &CancelToken::new()).unwrap();
+        assert_eq!(upload.code, Some(0), "{}", upload.stderr);
+        let factory = Arc::new(Fixed(Arc::new({
+            let isolated = isolated.clone();
+            move || {
+                Box::new(Isolated {
+                    target: isolated.target.clone(),
+                    home: isolated.home.clone(),
+                }) as Box<dyn Transport>
+            }
+        })));
+        let rec = Recorder::new();
+        let mut cfg = manager_config(
+            factory,
+            Arc::new(DirSource(bin_dir.clone().into())),
+            rec.clone(),
+        );
+        cfg.desktop_build = Some(expected.clone());
+        let mut host = host_config(Some(sh_quote(&format!("{home}/initial/xshelld"))));
+        host.ssh_target = target.clone();
+        let desk = Desk::new(cfg, rec, host);
+        let first = desk.wait_usable();
+        assert_eq!(
+            first.status,
+            if older {
+                StatusKind::UpgradePending
+            } else {
+                StatusKind::BuildDiffers
+            }
+        );
+        let h = desk.host();
+        let terminal = Uuid::new_v4();
+        let pid = open(
+            &h,
+            terminal,
+            LaunchSpec {
+                cwd: home.clone(),
+                shell_mode: Some("raw".into()),
+                shell_command: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+            VecSink::new(),
+        )
+        .unwrap();
+        let from = desk.rec.count();
+        upgrade(&h).unwrap();
+        let (_, done) = desk
+            .rec
+            .wait_status_from(from, "exact update reconnect", |s| {
+                s.status == StatusKind::Connected
+                    && s.phase.is_none()
+                    && s.link_generation > first.link_generation
+            });
+        assert_eq!(done.daemon_version.as_deref(), Some(VERSION));
+        assert!(done.daemon_build.as_ref().unwrap().same(&expected));
+        assert!(done.last_error.is_none(), "{done:?}");
+        let restored = desk
+            .rec
+            .wait_list("same Terminal UUID after SSH update", |list| {
+                list.iter()
+                    .any(|t| t.terminal == terminal && t.pid.is_some() && t.pid != Some(pid))
+            });
+        assert_eq!(restored.len(), 1);
+        desk.m.shutdown();
+    }
+}

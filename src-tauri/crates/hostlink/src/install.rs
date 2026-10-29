@@ -143,22 +143,25 @@ pub fn probe_override(
         cancel,
     )
     .map_err(|e| proc_failure(e, "the host probe"))?;
-    parse_override_probe(&out.stdout).ok_or_else(|| {
-        let msg = if !out.stderr.trim().is_empty() {
-            out.stderr.trim().to_string()
-        } else {
-            format!(
-                "`{}` printed no xshelld version (exit {:?})",
-                override_version_command(cmd),
-                out.code
+    (out.code == Some(0))
+        .then(|| parse_override_probe(&out.stdout))
+        .flatten()
+        .ok_or_else(|| {
+            let msg = if !out.stderr.trim().is_empty() {
+                out.stderr.trim().to_string()
+            } else {
+                format!(
+                    "`{}` printed no xshelld version (exit {:?})",
+                    override_version_command(cmd),
+                    out.code
+                )
+            };
+            InstallError::new(
+                classify_ssh_failure(&out.stderr, None, out.code)
+                    .or(Some(HostErrorHint::DaemonCommandFailed)),
+                msg,
             )
-        };
-        InstallError::new(
-            classify_ssh_failure(&out.stderr, None, out.code)
-                .or(Some(HostErrorHint::DaemonCommandFailed)),
-            msg,
-        )
-    })
+        })
 }
 
 /// Write stdin to a temp file and move it into directory `dir`, then print its `--version`.
@@ -179,11 +182,15 @@ pub const BUILD_NOT_INSTALLED: &str = "this Desktop’s xshelld is not installed
 /// `xshelld`. `dir` passed [`valid_version`]; it is quoted anyway.
 pub fn select_script(dir: &str) -> String {
     let q = sh_quote(dir);
+    let invalid = "the selected build record is not a regular file";
     format!(
         "set -e; umask 077; r=\"$HOME/.xshell/server\"; d=\"$r/\"{q}; \
          [ -x \"$d/xshelld\" ] || {{ echo \"{BUILD_NOT_INSTALLED}\" >&2; exit 1; }}; \
+         if [ -L \"$r/selected\" ] || {{ [ -e \"$r/selected\" ] && [ ! -f \"$r/selected\" ]; }}; then \
+           echo \"{invalid}\" >&2; exit 1; fi; \
          t=\"$r/.selected.$$.tmp\"; trap 'rm -f \"$t\"' EXIT; printf '%s\\n' {q} > \"$t\"; \
-         mv -f \"$t\" \"$r/selected\""
+         mv -f \"$t\" \"$r/selected\"; \
+         [ -f \"$r/selected\" ] && [ ! -L \"$r/selected\" ] || {{ echo \"{invalid}\" >&2; exit 1; }}"
     )
 }
 
@@ -304,6 +311,7 @@ pub fn parse_probe(stdout: &str) -> Result<Probe, String> {
 
 pub fn target_triple(os: &str, arch: &str) -> Result<&'static str, String> {
     match (os, arch) {
+        ("windows" | "Windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         ("Linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-musl"),
         ("Linux", "aarch64" | "arm64") => Ok("aarch64-unknown-linux-musl"),
         ("Darwin", "arm64" | "aarch64") => Ok("aarch64-apple-darwin"),
@@ -317,6 +325,7 @@ pub fn os_name(uname_s: &str) -> Option<&'static str> {
     match uname_s {
         "Linux" => Some("linux"),
         "Darwin" => Some("macos"),
+        "windows" | "Windows" => Some("windows"),
         _ => None,
     }
 }
@@ -957,6 +966,77 @@ mod tests {
         assert!(parse_probe(&format!("{MARKER}\n")).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn windows_staging_transfers_only_base64_stdin_and_refuses_nonzero_json() {
+        use crate::transport::{CommandSpec, LocalShellTransport};
+        use base64::Engine;
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("image");
+        let capture = temp.path().join("stdin");
+        let bytes = b"PE-test-bytes @@XSHELL-BUILD-V1:85ee920a1b2c:7@@";
+        std::fs::write(&image, bytes).unwrap();
+        struct NativeHelper {
+            commands: Arc<Mutex<Vec<String>>>,
+            capture: PathBuf,
+        }
+        impl Transport for NativeHelper {
+            fn command(&self, remote: &str) -> CommandSpec {
+                self.commands.lock().unwrap().push(remote.into());
+                let script = if remote == "native --version" {
+                    r#"echo '{"name":"xshelld","version":"1.4.0","protocol":{"min":1,"max":1},"os":"windows","arch":"x86_64"}'"#.into()
+                } else {
+                    format!(
+                        "cat > {}; echo '{{\"name\":\"xshelld\"}}'; exit 7",
+                        sh_quote(self.capture.to_str().unwrap())
+                    )
+                };
+                LocalShellTransport::default().command(&script)
+            }
+            fn describe(&self) -> String {
+                "native helper fixture".into()
+            }
+        }
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let helper = NativeHelper {
+            commands: commands.clone(),
+            capture: capture.clone(),
+        };
+        let build = BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let error = stage_windows(
+            &helper,
+            &FileSource(image),
+            "native",
+            "1.5.0",
+            Some(&build),
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("exit Some(7)"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(std::fs::read(capture).unwrap())
+                .unwrap(),
+            bytes
+        );
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].starts_with("native stage-build 1.5.0+85ee920a1b2c "));
+        assert!(!commands
+            .iter()
+            .any(|c| c.contains("sh -c") || c.contains("selected") || c.contains("kill")));
+        assert_eq!(
+            target_triple("windows", "x86_64"),
+            Ok("x86_64-pc-windows-msvc")
+        );
+        assert!(target_triple("windows", "aarch64").is_err());
+    }
+
     #[test]
     fn target_triple_map() {
         assert_eq!(
@@ -1554,5 +1634,89 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert!(select_remote(&t, "1;rm", &c).is_err());
+
+        // A directory must not turn `mv` into a successful move *inside* selected.
+        let selected = root.join("selected");
+        std::fs::remove_file(&selected).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let error = select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap_err();
+        assert!(error.message.contains("not a regular file"), "{error:?}");
+        assert!(std::fs::read_dir(&selected).unwrap().next().is_none());
+        std::fs::remove_dir(&selected).unwrap();
+        // Refuse a dangling record symlink rather than silently replacing it.
+        std::os::unix::fs::symlink(root.join("missing"), &selected).unwrap();
+        assert!(select_remote(&t, "1.5.0+85ee920a1b2c", &c).is_err());
+        assert!(std::fs::symlink_metadata(&selected)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&selected).unwrap();
+        select_remote(&t, "1.5.0+85ee920a1b2c", &c).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(selected).unwrap(),
+            "1.5.0+85ee920a1b2c\n"
+        );
     }
+}
+
+/// Stage exact Windows bytes through the configured native helper, without selecting or
+/// stopping anything. The running Daemon commits selection only after its own validation.
+pub fn stage_windows(
+    t: &dyn Transport,
+    src: &dyn BinarySource,
+    cmd: &str,
+    version: &str,
+    build: Option<&BuildId>,
+    cancel: &CancelToken,
+) -> Result<(), InstallError> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let build =
+        build.ok_or_else(|| InstallError::new(None, "this Desktop's exact build is unknown"))?;
+    let probe = probe_override(t, cmd, cancel)?;
+    let triple = target_triple(
+        probe.os.as_deref().unwrap_or(""),
+        probe.arch.as_deref().unwrap_or(""),
+    )
+    .map_err(|e| InstallError::new(Some(HostErrorHint::UnsupportedPlatform), e))?;
+    if triple != "x86_64-pc-windows-msvc" {
+        return Err(InstallError::new(None, "the Host platform changed"));
+    }
+    let want = Wanted {
+        triple: triple.into(),
+        version: version.into(),
+        build: Some(build.clone()),
+    };
+    let fetched = src.fetch(&want, cancel).map_err(|e| {
+        InstallError::new(
+            Some(HostErrorHint::BinaryUnavailable),
+            format!("This Desktop’s Windows Daemon build is unavailable. {e}"),
+        )
+    })?;
+    check_fetched(&fetched, &want)
+        .map_err(|e| InstallError::new(Some(HostErrorHint::BinaryUnavailable), e))?;
+    if fetched.bytes.is_empty() || fetched.bytes.len() > 64 * 1024 * 1024 {
+        return Err(InstallError::new(None, "invalid Windows Daemon size"));
+    }
+    let dir = install_dir_name(version, Some(build));
+    if !xshell_core::server::valid_dir_name(&dir) {
+        return Err(InstallError::new(None, "invalid install directory"));
+    }
+    let hash = format!("{:x}", Sha256::digest(&fetched.bytes));
+    let remote = format!("{cmd} stage-build {dir} {hash} {}", fetched.bytes.len());
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(&fetched.bytes)
+        .into_bytes();
+    let out = run_script(t, &remote, Some(encoded), UPLOAD_TIMEOUT, cancel)
+        .map_err(|e| proc_failure(e, "Windows staging"))?;
+    if out.code != Some(0) {
+        return Err(InstallError::new(
+            None,
+            format!(
+                "Windows staging failed (exit {:?}): {}",
+                out.code, out.stderr
+            ),
+        ));
+    }
+    Ok(())
 }

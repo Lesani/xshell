@@ -300,7 +300,11 @@ impl LocalDaemon {
     }
 
     fn spawn_gui_bound(&self) -> io::Result<Child> {
-        let mut cmd = Command::new(&self.bin);
+        #[cfg(windows)]
+        let exe = xshell_core::server::windows_spawn_target(&self.home, &self.bin)?;
+        #[cfg(not(windows))]
+        let exe = &self.bin;
+        let mut cmd = Command::new(exe);
         cmd.arg("serve")
             .arg("--gui-bound")
             .arg("--parent-pid")
@@ -317,7 +321,8 @@ impl LocalDaemon {
         {
             /// `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`.
             const FLAGS: u32 = 0x0000_0200 | 0x0800_0000;
-            cmd.arg("--job")
+            cmd.arg("--supports-selected-restart")
+                .arg("--job")
                 .arg(&self.job.1)
                 .current_dir(&self.home)
                 .creation_flags(FLAGS);
@@ -646,7 +651,7 @@ impl LocalDaemon {
             }
             let gen = host.link_generation();
             let (tx, rx) = mpsc::channel();
-            host.upgrade(Box::new(move |r| {
+            host.restart_for_mode(Box::new(move |r| {
                 let _ = tx.send(r);
             }));
             // Settled once the reply (or the request's own timeout) arrives: until then the

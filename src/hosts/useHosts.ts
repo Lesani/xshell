@@ -49,5 +49,5 @@ export function statusLabel(s: HostStatus | undefined): string {
 
 export function phaseLabel(s: HostStatus | undefined): string | null {
   if (!s?.phase) return null;
-  return { probing: fmt("hosts.phase.probing"), installing: fmt("hosts.phase.installing"), upgrading: fmt("hosts.phase.upgrading") }[s.phase];
+  return { preparing: fmt("hosts.update.preparingPhase"), probing: fmt("hosts.phase.probing"), installing: fmt("hosts.phase.installing"), upgrading: fmt("hosts.phase.upgrading") }[s.phase];
 }

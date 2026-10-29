@@ -19,6 +19,8 @@ path = "src/main.rs"
 xshell-buildinfo = { path = "../buildinfo" }
 
 [dependencies]
+base64 = "=0.22.1"
+sha2 = "=0.10.9"
 xshell-core = { path = "../core" }
 xshell-protocol = { path = "../protocol", features = ["relay-client"] }
 serde = { workspace = true }
@@ -29,6 +31,7 @@ dirs = { workspace = true }
 zeroize = "=1.8.2"
 # ConPTY on Windows, a pty elsewhere.
 portable-pty = { workspace = true }
+semver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

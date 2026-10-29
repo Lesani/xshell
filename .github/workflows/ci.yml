@@ -3,6 +3,15 @@ on:
   push: # every branch, so fork feature branches get CI before a PR
   pull_request:
   workflow_dispatch:
+    inputs:
+      build_windows_desktop:
+        description: Build an internal Windows Desktop/Daemon pair for release E2E
+        type: boolean
+        default: false
+      build_windows_older_fixture:
+        description: Also build a test-only 1.4.9 owner pair (requires Windows Desktop candidate)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -119,6 +128,9 @@ jobs:
         with:
           node-version: lts/*
       - run: cargo clippy -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --all-targets --locked -- -D warnings
+      - name: Windows update-home anchor and private-state security regressions
+        if: runner.os == 'Windows'
+        run: 'cargo test -p xshell-core private_fs:: --locked -- --nocapture'
       # On Windows the reply probes (#40) log what ConPTY does as facts, and the ConPTY
       # renderings of the prompt fixtures are kept as an artifact.
       - run: cargo test -p xshell-protocol -p xshell-core -p xshelld -p xshell-hostlink -p xshell-buildinfo --locked --no-fail-fast
@@ -140,6 +152,30 @@ jobs:
             ${{ runner.temp }}/probe-facts.txt
             ${{ runner.temp }}/conpty-fixtures
           if-no-files-found: ignore
+      # Reuse this native lane for exact branch-build Windows update bytes. No service or
+      # cross-compiled image substitutes for the Windows process regressions above.
+      - name: Native Windows update artifact
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          export XSHELL_BUILD_COMMIT="$(git rev-parse HEAD | cut -c1-12)"
+          export XSHELL_BUILD_TIME="$(git log -1 --format=%ct HEAD)"
+          export XSHELL_BUILD_DIRTY=""
+          cargo build -p xshelld --profile release-daemon --locked
+          source=target/release-daemon/xshelld.exe
+          cargo run -q -p xshell-protocol --no-default-features --locked --example build_stamp --             "$source" "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          "$source" --version | tee xshelld-x86_64-pc-windows-msvc.version.json
+          node -e 'const fs=require("fs"), v=JSON.parse(fs.readFileSync("xshelld-x86_64-pc-windows-msvc.version.json","utf8")); if(v.version!==require("../package.json").version || v.os!=="windows" || v.arch!=="x86_64" || v.build.commit!==process.env.XSHELL_BUILD_COMMIT || v.build.dirty!==null || v.build.time!==Number(process.env.XSHELL_BUILD_TIME)) process.exit(1)'
+          cp "$source" xshelld-x86_64-pc-windows-msvc
+          sha256sum xshelld-x86_64-pc-windows-msvc > xshelld-x86_64-pc-windows-msvc.sha256
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshelld-x86_64-pc-windows-msvc
+          path: |
+            src-tauri/xshelld-x86_64-pc-windows-msvc
+            src-tauri/xshelld-x86_64-pc-windows-msvc.sha256
+            src-tauri/xshelld-x86_64-pc-windows-msvc.version.json
       # The Ring client's IO loop has a Windows (WSAPoll) and a Unix (poll) path.
       - run: cargo clippy -p xshell-protocol --all-features --all-targets --locked -- -D warnings
       - run: cargo test -p xshell-protocol --all-features --locked
@@ -147,6 +183,56 @@ jobs:
       - name: Desktop compiles for Windows
         if: matrix.os == 'windows-latest'
         run: cargo check -p xshell --locked
+      - name: Validate manual older-fixture request
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_older_fixture && !inputs.build_windows_desktop
+        shell: bash
+        run: |
+          echo '::error::The older fixture requires build_windows_desktop=true'
+          exit 1
+      # Manual internal candidates only: no release/tag, signing key or installer upload.
+      # The Windows owning Desktop is needed for the real OpenSSH update walkthrough.
+      - name: Build internal Windows Desktop candidate
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop
+        working-directory: .
+        shell: bash
+        run: |
+          export XSHELL_BUILD_COMMIT="$(git rev-parse HEAD | cut -c1-12)"
+          export XSHELL_BUILD_TIME="$(git log -1 --format=%ct HEAD)"
+          export XSHELL_BUILD_DIRTY=""
+          npm ci
+          npm run build
+          export XSHELL_WINDOWS_DAEMON_ASSET="$(cygpath -w "$PWD/src-tauri/xshelld-x86_64-pc-windows-msvc")"
+          export XSHELL_WINDOWS_DAEMON_SHA256="$(awk 'NR == 1 { print $1 }' src-tauri/xshelld-x86_64-pc-windows-msvc.sha256)"
+          cargo build --manifest-path src-tauri/Cargo.toml -p xshell --release --features tauri/custom-protocol --locked
+          cargo run -q --manifest-path src-tauri/Cargo.toml -p xshell-protocol --no-default-features --locked --example build_stamp -- \
+            src-tauri/target/release/xshell.exe "$XSHELL_BUILD_COMMIT" "$XSHELL_BUILD_TIME"
+          stage="$RUNNER_TEMP/xshell-windows-candidate"
+          mkdir -p "$stage"
+          cp src-tauri/target/release/xshell.exe "$stage/xshell.exe"
+          cp src-tauri/target/release-daemon/xshelld.exe "$stage/xshelld.exe"
+          embedded_sha="$(node -e 'const fs=require("fs"),crypto=require("crypto"),image=fs.readFileSync(process.argv[1]),payload=fs.readFileSync(process.argv[2]),at=image.indexOf(payload);if(at<0)throw Error("Windows payload missing from Desktop");const hash=crypto.createHash("sha256").update(image.subarray(at,at+payload.length)).digest("hex");if(hash!==process.env.XSHELL_WINDOWS_DAEMON_SHA256.toLowerCase())throw Error("Windows payload digest mismatch");process.stdout.write(hash)' "$stage/xshell.exe" src-tauri/xshelld-x86_64-pc-windows-msvc)"
+          printf 'commit=%s\nwindows_daemon_sha256=%s\n' "$GITHUB_SHA" "$embedded_sha" > "$stage/manifest"
+          (cd "$stage" && sha256sum xshell.exe xshelld.exe > SHA256SUMS)
+      - if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshell-windows-candidate
+          path: ${{ runner.temp }}/xshell-windows-candidate
+          if-no-files-found: error
+      # Freeze/upload the real target first. Only the disposable local worktree is versioned down.
+      - name: Build test-only native Windows 1.4.9 owner pair
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop && inputs.build_windows_older_fixture
+        working-directory: .
+        shell: bash
+        run: |
+          node --test .github/scripts/windows-older-fixture-metadata.test.mjs
+          bash .github/scripts/build-windows-older-fixture.sh
+      - if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.build_windows_desktop && inputs.build_windows_older_fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: xshell-windows-older-fixture-1.4.9
+          path: ${{ runner.temp }}/xshell-windows-older-fixture-1.4.9
+          if-no-files-found: error
   windows-2022:
     # The reply probes (#40) on a second ConPTY build (Windows Server 2022, build 20348): the
     # Windows build a Windows Host offers replies from is the lowest one they pass on.

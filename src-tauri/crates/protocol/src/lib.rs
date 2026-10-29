@@ -35,6 +35,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::CALL,
     cap::TERM,
     cap::DAEMON_UPGRADE,
+    cap::DAEMON_UPGRADE_SELECTED,
     cap::TERM_RELAUNCH,
     cap::LAUNCH_PREFIX,
     cap::AGENT_STATUS,
@@ -63,6 +64,7 @@ pub mod cap {
     pub const TERM: &str = "term";
     /// `daemon.upgrade` (Desktop only).
     pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
+    pub const DAEMON_UPGRADE_SELECTED: &str = "daemon.upgrade-selected";
     /// `term.relaunch`.
     pub const TERM_RELAUNCH: &str = "term.relaunch";
     /// Launch prefixes in `term.open`.

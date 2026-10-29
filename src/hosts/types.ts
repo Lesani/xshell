@@ -33,18 +33,22 @@ export type HostErrorHint =
   | "binary-unavailable"
   | "daemon-command-failed"
   // The Host's xshell is closed, and its terminals run only while it is open.
-  | "xshell-not-running";
+  | "xshell-not-running"
+  | "update-failed";
 
 export interface HostStatus {
   host: HostId;
   status: HostStatusKind;
-  phase: "probing" | "installing" | "upgrading" | null;
+  phase: "probing" | "installing" | "upgrading" | "preparing" | null;
   lastError: string | null;
   errorHint: HostErrorHint | null;
   daemonVersion: string | null;
   desktopVersion: string;
   protocol: number | null;
-  os: "linux" | "macos" | null;
+  os: "linux" | "macos" | "windows" | null;
+  linkGeneration?: number;
+  updateAction?: "update" | "replace" | null;
+  updateUnavailable?: string | null;
   arch: string | null;
   incompatibleReason: "daemon-older" | "daemon-newer" | null;
   nextRetryAt: number | null; // ms epoch
