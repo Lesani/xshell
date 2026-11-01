@@ -970,7 +970,7 @@ pub(crate) mod tests {
                 std::time::Duration::from_millis(150),
                 std::time::Duration::from_millis(1500),
             ),
-            saves: Mutex::new(0),
+            saves: Mutex::new(super::super::registry::SaveStatus::default()),
             snap_seq: AtomicU64::new(0),
             session_streams: crate::server::session_stream::SessionStreams::new(
                 std::time::Duration::from_secs(1),
@@ -1002,6 +1002,80 @@ pub(crate) mod tests {
         );
         d.reg.lock().unwrap().terminals.insert(id, t.clone());
         t
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_title_frozen_registry_refuses_protocol_updates_without_mutation() {
+        use std::io::Write;
+        use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+        use xshell_protocol::msg::{decode_server, encode_msg, Hello, ServerMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let d = daemon(dir.path());
+        let id = Uuid::new_v4();
+        let t = insert(&d, id, raw_shell("/"));
+        let old = json!({"customTitle":"kept", "title":"automatic"})
+            .as_object()
+            .unwrap()
+            .clone();
+        t.set_record(t.spec(), old.clone());
+        {
+            let mut reg = d.reg.lock().unwrap();
+            d.try_persist(&reg).unwrap();
+            reg.frozen = true;
+        }
+        let bytes = std::fs::read(&d.cfg.paths.state).unwrap();
+        let (mut client, server) = crate::server::transport::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let d2 = d.clone();
+        let thread = std::thread::spawn(move || {
+            crate::server::conn::handle(d2, server, 1, Role::Desktop, None)
+        });
+        let read = |client: &mut crate::server::transport::Stream| {
+            let Frame::Json(j) = read_frame(client, MAX_FRAME_LEN).unwrap().unwrap() else {
+                panic!("expected JSON")
+            };
+            decode_server(&j).unwrap()
+        };
+        client
+            .write_all(
+                &encode_msg(
+                    &ClientMsg::Hello(Hello {
+                        protocol: xshell_protocol::PROTOCOL,
+                        version: "test".into(),
+                        capabilities: vec![],
+                        build: None,
+                    }),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(read(&mut client), ServerMsg::Hello(_)));
+        assert!(matches!(read(&mut client), ServerMsg::Terminals { .. }));
+        for value in [json!("new"), Value::Null, json!("kept")] {
+            let msg = ClientMsg::TermUpdate {
+                terminal: id,
+                session_id: None,
+                meta: Some(json!({"customTitle":value}).as_object().unwrap().clone()),
+            };
+            client
+                .write_all(&encode_msg(&msg, Some(1)).unwrap())
+                .unwrap();
+            let ServerMsg::Res(r) = read(&mut client) else {
+                panic!("a refusal must not broadcast")
+            };
+            assert_eq!(
+                r.outcome.into_result(),
+                Err("xshelld is upgrading or shutting down".into())
+            );
+            assert_eq!(t.info().meta, old);
+            assert_eq!(std::fs::read(&d.cfg.paths.state).unwrap(), bytes);
+        }
+        drop(client);
+        thread.join().unwrap();
     }
 
     #[test]

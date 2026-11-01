@@ -16,6 +16,9 @@ use xshell_core::launch::LaunchSpec;
 use xshell_core::terminal::state;
 use xshell_core::HostCtx;
 use xshell_protocol::msg::{encode_msg, ServerMsg, TerminalInfo};
+use xshell_protocol::terminal_meta::{
+    sanitize_restored_custom_title, validate_custom_title_record,
+};
 
 pub(crate) struct Daemon {
     pub cfg: Config,
@@ -45,13 +48,21 @@ pub(crate) struct Daemon {
     pub prompts: super::prompts::Prompts,
     /// The state file's writes: the version of the snapshot last put in place. Taken after
     /// `Registry` (every save under it), or alone (a prompt-id floor), and nothing under it.
-    pub saves: Mutex<u64>,
+    pub saves: Mutex<SaveStatus>,
     /// Snapshot versions, drawn under the registry lock: a higher one holds newer state.
     pub snap_seq: AtomicU64,
     /// Streams agent Terminals' conversations to subscribed connections.
     pub session_streams: super::session_stream::SessionStreams,
     /// The dropped files replies hold, kept out of the sweep.
     pub drops: Arc<super::drops::Drops>,
+}
+
+/// Installed snapshots suppress older prepared writes, but only a confirmed durable
+/// supersession may confirm a waiting prompt floor. Access only under `Daemon.saves`.
+#[derive(Default)]
+pub(crate) struct SaveStatus {
+    version: u64,
+    durable: bool,
 }
 
 /// A registered connection: its outbox and the role that decides what it is told.
@@ -233,18 +244,88 @@ impl Daemon {
         spec: LaunchSpec,
         meta: Map<String, Value>,
     ) -> Result<(), String> {
+        self.apply_record_update(reg, t, spec, meta, false)
+    }
+
+    pub fn apply_record_update(
+        &self,
+        reg: &Registry,
+        t: &Terminal,
+        spec: LaunchSpec,
+        meta: Map<String, Value>,
+        custom_title_touched: bool,
+    ) -> Result<(), String> {
+        validate_custom_title_record(&meta).map_err(|e| e.to_string())?;
         self.check_budget(reg, t.id, &spec, &meta)?;
+        let durable = custom_title_touched || t.custom_title_changed(&meta);
+        let mut uncertain = None;
+        if durable {
+            if !conn::offered(&self.cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE) {
+                return Err(
+                    "this Daemon does not support custom Tab names; update it first".into(),
+                );
+            }
+            if reg.frozen {
+                return Err("xshelld is upgrading or shutting down".into());
+            }
+            let version = self.snap_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let list: Vec<_> = reg
+                .terminals
+                .values()
+                .map(|entry| {
+                    if entry.id == t.id {
+                        entry.persisted_with_record(&spec, &meta)
+                    } else {
+                        entry.persisted()
+                    }
+                })
+                .collect();
+            let mut last = self.saves.lock().unwrap();
+            let prepared = state::prepare(&self.cfg.paths.state, &list, "tmp")
+                .map_err(|e| self.save_failed(e))?;
+            let result = prepared.commit_staged_with_sync_hook(|| {
+                if self.test_point(t.id, TestPoint::CustomTitleDirectorySync) {
+                    Err(std::io::Error::other(
+                        "injected custom-title directory sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            match result {
+                Ok(()) => {
+                    last.version = version;
+                    last.durable = true;
+                }
+                Err(e) if e.installed => {
+                    last.version = version;
+                    last.durable = false;
+                    uncertain = Some(format!(
+                        "{} {}",
+                        xshell_protocol::CUSTOM_TITLE_NOT_DURABLE,
+                        self.save_failed(e.error)
+                    ));
+                }
+                Err(e) => return Err(self.save_failed(e.error)),
+            }
+            // Never take a Terminal lock, relink or broadcast under saves.
+            drop(last);
+        }
         let relinked = spec.session_id != t.spec().session_id;
         t.set_record(spec, meta);
         if relinked {
-            // The line was the previous session's; the new one's is read.
             t.set_last_line(None);
             self.last_lines.request(t.id);
             self.session_streams.wake(t.id);
         }
-        self.persist(reg);
+        if !durable {
+            self.persist(reg);
+        }
         self.broadcast_terminals(reg);
-        Ok(())
+        match uncertain {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Send `f`, a message about `terminal` (running `spec`), to every connection that
@@ -270,9 +351,9 @@ impl Daemon {
         }
         let (version, list) = self.snapshot(reg);
         let mut last = self.saves.lock().unwrap();
-        state::save_atomic(&self.cfg.paths.state, &list).map_err(|e| self.save_failed(e))?;
-        *last = (*last).max(version);
-        Ok(())
+        let prepared =
+            state::prepare(&self.cfg.paths.state, &list, "tmp").map_err(|e| self.save_failed(e))?;
+        self.commit_snapshot(&mut last, version, prepared)
     }
 
     /// What the state file would hold now, and the snapshot's version.
@@ -295,13 +376,39 @@ impl Daemon {
         let prepared =
             state::prepare(&self.cfg.paths.state, &list, &tag).map_err(|e| self.save_failed(e))?;
         let mut last = self.saves.lock().unwrap();
-        if version <= *last {
+        if version <= last.version {
             prepared.discard();
-            return Ok(());
+            return if last.durable {
+                Ok(())
+            } else {
+                Err("superseding terminal snapshot is not confirmed durable".into())
+            };
         }
-        prepared.commit().map_err(|e| self.save_failed(e))?;
-        *last = version;
-        Ok(())
+        self.commit_snapshot(&mut last, version, prepared)
+    }
+
+    /// All saves record installation even on a post-rename failure, so no older prompt
+    /// snapshot can overwrite it or falsely confirm its pending floor.
+    fn commit_snapshot(
+        &self,
+        last: &mut SaveStatus,
+        version: u64,
+        prepared: state::Prepared,
+    ) -> Result<(), String> {
+        match prepared.commit_staged() {
+            Ok(()) => {
+                last.version = version;
+                last.durable = true;
+                Ok(())
+            }
+            Err(e) => {
+                if e.installed {
+                    last.version = version;
+                    last.durable = false;
+                }
+                Err(self.save_failed(e.error))
+            }
+        }
     }
 
     fn save_failed(&self, e: std::io::Error) -> String {
@@ -367,7 +474,10 @@ impl Daemon {
         }
         let mut reg = self.reg.lock().unwrap();
         let had = loaded.terminals.len();
-        for p in loaded.terminals {
+        for mut p in loaded.terminals {
+            if sanitize_restored_custom_title(&mut p.meta) {
+                crate::log!("WARN", "sanitized restored customTitle for {}", p.terminal);
+            }
             self.test_point(p.terminal, TestPoint::Restore);
             if self.aborted() {
                 // Under the lock: no exit of a Terminal restored so far saves a shorter list.

@@ -365,11 +365,26 @@ fn relaunch_uses_record_updated_meanwhile() {
     e.c.request(&ClientMsg::TermUpdate {
         terminal: t,
         session_id: Some(other.into()),
-        meta: None,
+        meta: Some(
+            serde_json::json!({"customTitle":"during Relaunch", "title":"automatic"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
     })
     .unwrap();
+    // The candidate serializer must preserve the still-pending skip-permissions spec;
+    // overwriting a snapshot with the visible spec would lose it on a crash here.
+    let saved = e.h.state_json();
+    assert_eq!(saved["terminals"][0]["spec"]["skipPermissions"], true);
+    assert_eq!(saved["terminals"][0]["spec"]["sessionId"], other);
+    assert_eq!(
+        saved["terminals"][0]["meta"]["customTitle"],
+        "during Relaunch"
+    );
     gate.open();
     e.c.wait_res(id).unwrap();
+    assert_eq!(e.list()[0].meta["customTitle"], "during Relaunch");
     assert_eq!(
         e.fake.wait_launches(2)[1],
         vec![SKIP, "--session-id", other]

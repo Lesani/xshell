@@ -1042,15 +1042,25 @@ impl HostHandle {
         meta: Option<Map<String, Value>>,
         w: Waiter,
     ) {
-        self.request(
-            ClientMsg::TermUpdate {
-                terminal: t,
-                session_id,
-                meta,
-            },
-            self.sh.mc.term_timeout,
-            w,
-        );
+        let custom = meta
+            .as_ref()
+            .is_some_and(|m| m.contains_key(xshell_protocol::terminal_meta::CUSTOM_TITLE_KEY));
+        let msg = ClientMsg::TermUpdate {
+            terminal: t,
+            session_id,
+            meta,
+        };
+        if custom {
+            self.gated(
+                msg,
+                &[xshell_protocol::cap::TERM_CUSTOM_TITLE],
+                "this Daemon does not support custom Tab names; update it first",
+                None,
+                w,
+            );
+        } else {
+            self.request(msg, self.sh.mc.term_timeout, w);
+        }
     }
 
     /// `term.relaunch`: restart the Terminal with `skipPermissions` set to `skip`. Answers
@@ -2616,6 +2626,74 @@ pub(crate) mod tests {
         };
         h.term_open(open_spec(t, launch), Arc::new(VecSink::default()), w);
         peer.expect("term.open");
+    }
+
+    #[test]
+    fn custom_title_update_gate_tracks_current_link_and_classifies_reply() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let h = handle(&sh);
+        let patch = || {
+            Some(
+                json!({"customTitle": "Review"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let mut peer = connect_capable(&sh, vec![info(t)], &["term"]);
+        for value in [
+            patch(),
+            Some(json!({"customTitle": null}).as_object().unwrap().clone()),
+        ] {
+            let (w, rx) = res_slot();
+            h.term_update(t, None, value, w);
+            assert_eq!(
+                rx.recv_timeout(T5).unwrap().unwrap_err().code,
+                HostErrorCode::Invalid
+            );
+            assert_nothing_sent(&h, &mut peer, t);
+        }
+        // Ordinary title updates remain ungated on the same old Daemon.
+        let (w, _rx) = res_slot();
+        h.term_update(
+            t,
+            None,
+            Some(json!({"title": "automatic"}).as_object().unwrap().clone()),
+            w,
+        );
+        assert_eq!(peer.expect("term.update")["meta"]["title"], "automatic");
+
+        let mut peer = connect_capable(
+            &sh,
+            vec![info(t)],
+            &[xshell_protocol::cap::TERM_CUSTOM_TITLE],
+        );
+        let (w, rx) = res_slot();
+        h.term_update(t, None, patch(), w);
+        let sent = peer.expect("term.update");
+        assert_eq!(sent["meta"]["customTitle"], "Review");
+        peer.reply(
+            sent["id"].as_u64().unwrap(),
+            Err(format!(
+                "{} sync failure",
+                xshell_protocol::CUSTOM_TITLE_NOT_DURABLE
+            )),
+        );
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Indeterminate
+        );
+
+        // The old capability must not survive reconnect, even for a clear.
+        let mut peer = connect_capable(&sh, vec![info(t)], &["term"]);
+        let (w, rx) = res_slot();
+        h.term_update(t, None, patch(), w);
+        assert_eq!(
+            rx.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
+        assert_nothing_sent(&h, &mut peer, t);
     }
 
     #[test]

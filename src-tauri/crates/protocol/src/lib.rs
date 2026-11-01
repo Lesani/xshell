@@ -14,6 +14,7 @@ pub mod negotiate;
 pub mod pairing_access;
 #[cfg(feature = "ring")]
 pub mod ring;
+pub mod terminal_meta;
 
 pub use launch::LaunchSpec;
 use msg::ProtocolRange;
@@ -34,6 +35,7 @@ pub const PROTOCOL: ProtocolRange = ProtocolRange {
 pub const CAPABILITIES: &[&str] = &[
     cap::CALL,
     cap::TERM,
+    cap::TERM_CUSTOM_TITLE,
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
     cap::TERM_RELAUNCH,
@@ -62,6 +64,11 @@ pub mod cap {
     pub const CALL: &str = "call";
     /// Terminal requests (`term.*`).
     pub const TERM: &str = "term";
+    /// Durable custom-name updates and clears through `term.update` (computer Desktop only).
+    /// See [`crate::terminal_meta`] for validation. Success confirms the native atomic-state
+    /// save: synced file and atomic replacement, plus parent-directory sync on Unix.
+    /// An installed but unconfirmed save returns [`crate::CUSTOM_TITLE_NOT_DURABLE`].
+    pub const TERM_CUSTOM_TITLE: &str = "term.custom-title";
     /// `daemon.upgrade` (Desktop only).
     pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
     pub const DAEMON_UPGRADE_SELECTED: &str = "daemon.upgrade-selected";
@@ -133,6 +140,10 @@ pub mod cap {
 /// is GUI-bound, ADR-0005) and xshell is closed: nothing was started.
 pub const NOT_RUNNING_EXIT: i32 = 4;
 
+/// A custom-name snapshot was installed but its durability could not be confirmed.
+/// Observed memory follows the installed file; explicit equal-value retries must save again.
+pub const CUSTOM_TITLE_NOT_DURABLE: &str = "custom_title_not_durable:";
+
 /// Prefix of a `term.open` error after which the Terminal may still be running: the Daemon
 /// could not save it, ended it, and could not confirm in time that its processes are gone.
 /// Every other `term.open` error is a refusal (no Terminal exists).
@@ -145,6 +156,11 @@ pub const NOT_RUNNING_MESSAGE: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_include_term_custom_title() {
+        assert!(CAPABILITIES.contains(&cap::TERM_CUSTOM_TITLE));
+    }
 
     #[test]
     fn capabilities_include_term_relaunch() {

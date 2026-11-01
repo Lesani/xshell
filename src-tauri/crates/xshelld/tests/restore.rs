@@ -186,3 +186,78 @@ fn crash_leftover_forking_on_hup_is_ended() {
     }
     assert!(alive(pids[1]), "the relaunched agent is not running");
 }
+
+/// Real binary restore repairs only the reserved field, keeping the UUID, automatic title,
+/// other metadata and Terminal, including records from before custom names existed.
+#[test]
+fn custom_title_restore_and_clear_keep_uuid_and_current_automatic_title() {
+    use serde_json::json;
+    use xshell_core::terminal::state::{load, save_atomic};
+    let h = TestHome::new();
+    let t = Uuid::new_v4();
+    let s = ServeProc::start(&h, &[]);
+    let (mut c, _) = client(&h);
+    c.open(t, sh_spec(&h.project("app")));
+    c.request(&ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: None,
+        meta: Some(
+            json!({"customTitle":"Review", "title":"latest", "other":42})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+    })
+    .unwrap();
+    drop(c);
+    drop(s);
+    let s = ServeProc::start(&h, &[]);
+    let (mut c, list) = client(&h);
+    assert_eq!(list[0].terminal, t);
+    assert_eq!(list[0].meta["customTitle"], "Review");
+    assert_eq!(list[0].meta["title"], "latest");
+    c.request(&ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: None,
+        meta: Some(json!({"customTitle":null}).as_object().unwrap().clone()),
+    })
+    .unwrap();
+    drop(c);
+    drop(s);
+    // Clear and old-record absence both restore without reintroducing an override.
+    let s = ServeProc::start(&h, &[]);
+    let (c, list) = client(&h);
+    assert_eq!(list[0].terminal, t);
+    assert!(!list[0].meta.contains_key("customTitle"));
+    assert_eq!(list[0].meta["title"], "latest");
+    drop(c);
+    drop(s);
+    for (value, expected) in [
+        (json!("  normalized  "), Some("normalized")),
+        (json!("bad\n"), None),
+        (json!(null), None),
+        (json!(7), None),
+    ] {
+        let mut saved = load(&h.paths().state).unwrap().terminals;
+        saved[0].meta.insert("customTitle".into(), value);
+        save_atomic(&h.paths().state, &saved).unwrap();
+        let s = ServeProc::start(&h, &[]);
+        let (c, list) = client(&h);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].terminal, t);
+        assert_eq!(
+            list[0].meta.get("customTitle").and_then(|v| v.as_str()),
+            expected
+        );
+        assert_eq!(list[0].meta["title"], "latest");
+        assert_eq!(list[0].meta["other"], 42);
+        drop(c);
+        drop(s);
+        assert_eq!(
+            h.state_json()["terminals"][0]["meta"]
+                .get("customTitle")
+                .and_then(|v| v.as_str()),
+            expected
+        );
+    }
+}

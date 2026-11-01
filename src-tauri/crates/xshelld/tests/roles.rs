@@ -1155,3 +1155,60 @@ fn mobile_answer_refused_for_hidden_terminal() {
         assert_eq!(e.desk.request(&answer_msg(t)), Err(PROMPT_ANSWERED.into()));
     }
 }
+
+#[test]
+fn mobile_cannot_write_custom_title_but_observes_named_agents_not_shells() {
+    let mut e = env();
+    let agent = e.desk_open(e.claude());
+    let shell = e.desk_open(e.shell());
+    for t in [agent, shell] {
+        e.desk
+            .request(&ClientMsg::TermUpdate {
+                terminal: t,
+                session_id: None,
+                meta: Some(
+                    json!({"customTitle":"Shared name"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            })
+            .unwrap();
+        for v in [json!("Mobile name"), Value::Null] {
+            refused(e.mob.request(&ClientMsg::TermUpdate {
+                terminal: t,
+                session_id: None,
+                meta: Some(json!({"customTitle":v}).as_object().unwrap().clone()),
+            }));
+        }
+    }
+    let list = e.mob.terminals_where(|l| {
+        l.iter().any(|i| {
+            i.terminal == agent && i.meta.get("customTitle") == Some(&json!("Shared name"))
+        })
+    });
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].terminal, agent);
+    assert_eq!(list[0].meta["customTitle"], "Shared name");
+    let before = e.h.state_ids();
+    for v in [json!("Mobile name"), Value::Null, json!(7)] {
+        let mut msg = open_msg(Uuid::new_v4(), e.claude());
+        if let ClientMsg::TermOpen { spec } = &mut msg {
+            spec.adopt_existing = true;
+            spec.meta.insert("customTitle".into(), v);
+        }
+        // Role permits opening this known agent Project, but reserved metadata is refused
+        // before even adoption of the already-running session.
+        assert!(e
+            .mob
+            .request(&msg)
+            .unwrap_err()
+            .contains("reserved for term.update"));
+        assert!(e
+            .desk
+            .request(&msg)
+            .unwrap_err()
+            .contains("reserved for term.update"));
+        assert_eq!(e.h.state_ids(), before);
+    }
+}

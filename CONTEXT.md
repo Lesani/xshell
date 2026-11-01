@@ -59,7 +59,10 @@ agent harness. It is not an agent or an agent session, and is unavailable to a
 **Mobile**.
 
 **Tab**:
-A **Desktop**'s view of one **Terminal**.
+A **Desktop**'s view of one **Terminal**. A custom Tab name belongs to the owning
+**Daemon**'s Terminal record, survives restore, and is shared with other updated
+**Desktops** and **Mobile**. It overrides presentation only: the automatic title and
+agent session history remain independent. Only a computer **Desktop** may set or clear it.
 
 **Attach**:
 To bind a **Tab** to a live **Terminal** and replay the output it has not yet shown.
