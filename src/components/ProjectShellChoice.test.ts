@@ -1,6 +1,6 @@
 import { isValidElement, type ReactNode, type ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_IDS, type AgentId } from "../agents";
+import { AGENTS, AGENT_IDS, type AgentId } from "../agents";
 import { AgentPickerDialog } from "./AgentPickerDialog";
 import { RecentSessionsDropdown } from "./TabBar";
 import type { ProjectInfo } from "../types";
@@ -16,7 +16,7 @@ vi.mock("react", async importOriginal => ({
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 
 const project: ProjectInfo = { name: "project", path: "/work/project", encoded_name: "project", session_count: 0, last_active: "" };
-type NodeProps = { children?: ReactNode; onClick?: () => void };
+type NodeProps = { children?: ReactNode; onClick?: () => void; className?: string };
 function nodes(node: ReactNode): ReactElement<NodeProps>[] {
   if (Array.isArray(node)) return node.flatMap(nodes);
   if (!isValidElement<NodeProps>(node)) return [];
@@ -32,9 +32,9 @@ function click(tree: ReactNode, label: string) {
   expect(matches).toHaveLength(1);
   matches[0].props.onClick!();
 }
-function picker(agents: AgentId[] = []) {
+function picker(agents: AgentId[] = [], hostName?: string) {
   const onPick = vi.fn(), onShell = vi.fn(), onClose = vi.fn(), onOpenSettings = vi.fn();
-  const tree = AgentPickerDialog({ project, agents, onPick, onShell, onClose, onOpenSettings });
+  const tree = AgentPickerDialog({ project, hostName, agents, onPick, onShell, onClose, onOpenSettings });
   return { tree, onPick, onShell, onClose, onOpenSettings };
 }
 afterEach(() => { effects.length = 0; vi.unstubAllGlobals(); });
@@ -52,6 +52,74 @@ describe("Project Shell picker component", () => {
       }
     });
   }
+  it("all installed harnesses and Shell retain registry order and exact callbacks", () => {
+    const p = picker([...AGENT_IDS]);
+    const options = nodes(p.tree).filter(n => n.props.className === "agent-picker-option");
+    expect(options.every(n => n.type === "button")).toBe(true);
+    expect(options.map(n => text(n))).toEqual([...AGENT_IDS.map(id => AGENTS[id].label), "Shell"]);
+    for (const id of AGENT_IDS) {
+      p.onPick.mockClear();
+      click(p.tree, AGENTS[id].label);
+      expect(p.onPick).toHaveBeenCalledExactlyOnceWith(id);
+      expect(p.onShell).not.toHaveBeenCalled();
+      expect(p.onOpenSettings).not.toHaveBeenCalled();
+      expect(p.onClose).not.toHaveBeenCalled();
+    }
+    p.onPick.mockClear();
+    click(p.tree, "Shell");
+    expect(p.onShell).toHaveBeenCalledExactlyOnceWith();
+    expect(p.onPick).not.toHaveBeenCalled();
+    expect(p.onOpenSettings).not.toHaveBeenCalled();
+    expect(p.onClose).not.toHaveBeenCalled();
+  });
+  it("Settings remains available with every installed harness without starting a Terminal", () => {
+    const p = picker([...AGENT_IDS]);
+    click(p.tree, " Open Settings");
+    expect(p.onOpenSettings).toHaveBeenCalledExactlyOnceWith();
+    expect(p.onPick).not.toHaveBeenCalled();
+    expect(p.onShell).not.toHaveBeenCalled();
+    expect(p.onClose).not.toHaveBeenCalled();
+  });
+  it("Escape with every installed harness cancels without starting a Terminal", () => {
+    const listeners = new Map<string, (e: { key?: string }) => void>();
+    const removeEventListener = vi.fn();
+    vi.stubGlobal("document", {
+      addEventListener: (name: string, cb: (e: { key?: string }) => void) => listeners.set(name, cb),
+      removeEventListener,
+    });
+    const p = picker([...AGENT_IDS]);
+    const cleanup = effects[0]();
+    listeners.get("keydown")!({ key: "Escape" });
+    expect(p.onClose).toHaveBeenCalledExactlyOnceWith();
+    expect(p.onPick).not.toHaveBeenCalled();
+    expect(p.onShell).not.toHaveBeenCalled();
+    expect(p.onOpenSettings).not.toHaveBeenCalled();
+    cleanup?.();
+    expect(removeEventListener.mock.calls).toEqual([
+      ["mousedown", listeners.get("mousedown")],
+      ["keydown", listeners.get("keydown")],
+    ]);
+  });
+  it("a Remote Project keeps its Host title and supplied harness list", () => {
+    const supplied: AgentId[] = ["pi", "codex"];
+    const p = picker(supplied, "Remote Build Host");
+    const title = nodes(p.tree).find(n => n.props.className === "picker-title");
+    expect(text(title)).toContain(project.name);
+    expect(text(title)).toContain("Remote Build Host");
+    const options = nodes(p.tree).filter(n => n.props.className === "agent-picker-option");
+    expect(options.map(n => text(n))).toEqual([...supplied.map(id => AGENTS[id].label), "Shell"]);
+    for (const id of supplied) {
+      p.onPick.mockClear();
+      click(p.tree, AGENTS[id].label);
+      expect(p.onPick).toHaveBeenCalledExactlyOnceWith(id);
+    }
+    p.onPick.mockClear();
+    click(p.tree, "Shell");
+    expect(p.onShell).toHaveBeenCalledExactlyOnceWith();
+    expect(p.onPick).not.toHaveBeenCalled();
+    expect(p.onOpenSettings).not.toHaveBeenCalled();
+    expect(p.onClose).not.toHaveBeenCalled();
+  });
   it("cancel starts nothing", () => {
     const listeners = new Map<string, (e: { key?: string }) => void>();
     vi.stubGlobal("document", {
