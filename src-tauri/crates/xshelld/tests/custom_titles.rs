@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
 use uuid::Uuid;
 use xshell_protocol::msg::{ClientMsg, ServerMsg, TerminalInfo};
 use xshell_protocol::terminal_meta::CUSTOM_TITLE_KEY;
