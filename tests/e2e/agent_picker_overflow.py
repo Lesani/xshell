@@ -116,6 +116,7 @@ class Runner:
         self.sid = None
         self.started = False
         self.start_attempted = False
+        self.wheel_sequence = 0
         self.report = {"expectLayout": args.expect_layout, "home": str(self.home),
                        "port": args.port, "samples": [], "interactions": [], "status": "setup-failure"}
 
@@ -172,7 +173,10 @@ class Runner:
     def wheel(self, delta):
         g = self.js(GEOMETRY)
         r = g["dialog"]["rect"]
-        self.request("POST", "/actions", {"actions": [{"type": "wheel", "id": "wheel",
+        # WebKitGTK retains wheel-source offsets across calls; a fresh source
+        # makes each native action an independent delta rather than a no-op.
+        self.wheel_sequence += 1
+        self.request("POST", "/actions", {"actions": [{"type": "wheel", "id": f"wheel-{self.wheel_sequence}",
             "actions": [{"type": "scroll", "x": int(r["x"] + r["width"] / 2),
                          "y": int(r["y"] + r["height"] / 2), "deltaX": 0,
                          "deltaY": delta, "duration": 150}]}]})
@@ -340,17 +344,38 @@ class Runner:
         activate()
         self.wait(lambda: not self.exists('.agent-picker'), 'picker selection')
         self.wait(lambda: self.terminal_count() == before + 1, 'exactly one new Terminal')
-        self.wait(lambda: len(self.launch_log()) == launches + 1, 'actual fixture process')
+        tab_id = self.js("return document.querySelector('.tab-item.active').dataset.dragId")
+        # Hookless Pi and raw Shell deliberately lack XSHELL_TERMINAL_ID. Bind
+        # their live process to the actual Tab through the production journal.
+        journal = self.home / '.xshell/daemon/terminals.json'
+        def launched_terminal():
+            rows = json.loads(journal.read_text())['terminals'] if journal.exists() else []
+            return next((row for row in rows if 'remote-' + row['terminal'] == tab_id
+                         and row.get('leader')), None)
+        terminal = self.wait(launched_terminal, 'Daemon journal for active Tab')
+        spec, pid = terminal['spec'], terminal['leader']['pid']
+        assert spec['cwd'] == self.f['project']
+        assert Path(f"/proc/{pid}/cwd").resolve() == Path(self.f['project'])
+        if label == 'Shell':
+            assert spec['shellMode'] == 'raw' and spec['shellId'] == 'bash'
+            assert Path(f"/proc/{pid}/exe").resolve().name == 'bash'
+            assert len(self.launch_log()) == launches
+            actual = {'binary': 'bash', 'cwd': spec['cwd'], 'pid': pid}
+        else:
+            self.wait(lambda: len(self.launch_log()) == launches + 1, 'actual fixture process')
+            added = self.launch_log()[launches:]
+            assert len(added) == 1
+            actual = added[0]
+            assert actual['binary'] == {'Pi': 'pi', 'Claude Code': 'claude'}[label]
+            assert spec['agent'] == actual['binary'] and actual['pid'] == pid
+            assert actual['cwd'] == spec['cwd']
+            session_index = actual['argv'].index('--session-id') + 1
+            assert actual['argv'][session_index] == spec['sessionId']
         time.sleep(.3)
         assert self.terminal_count() == before + 1
-        added = self.launch_log()[launches:]
-        assert len(added) == 1
-        actual = added[0]
-        assert actual['binary'] == {'Pi': 'pi', 'Shell': 'bash', 'Claude Code': 'claude'}[label]
-        assert actual['cwd'] == self.f['project'] and actual['terminal']
-        assert Path(f"/proc/{actual['pid']}/cwd").resolve() == Path(self.f['project'])
-        self.report['interactions'].append({"activation": label, "process": actual, "terminalsBefore": before,
-                                           "terminalsAfter": self.terminal_count()})
+        self.report['interactions'].append({"activation": label, "process": actual,
+                                           "daemonTerminal": terminal, "activeTabId": tab_id,
+                                           "terminalsBefore": before, "terminalsAfter": self.terminal_count()})
         self.shot(f"creation-{len(self.report['interactions'])}-{label.replace(' ', '-')}")
         if close:
             target = dict(self.rect['requested'])
