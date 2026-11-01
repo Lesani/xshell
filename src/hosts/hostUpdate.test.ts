@@ -14,14 +14,36 @@ describe("Host update targeting and eligibility", () => {
     expect(updateAction(status({ os: "windows", updateUnavailable: "old owner" }))).toBeNull();
     expect(updateAction(status({ status: "offline" }))).toBeNull();
   });
-  it("targets the focused split leaf, with first-leaf fallback, never Home or Settings", () => {
+  it("targets the selected Remote Project only on Home, never global Home, Local Project or Settings", () => {
+    const projectA = { host: "h_a" };
+    const projectB = { host: "h_b" };
+    expect(activeUpdateHost("home", [], [], {}, projectA)).toBe("h_a");
+    expect(activeUpdateHost("home", [], [], {}, projectB)).toBe("h_b");
+    expect(activeUpdateHost("home", [], [], {}, null)).toBeUndefined();
+    expect(activeUpdateHost("home", [], [], {}, {})).toBeUndefined();
+    expect(activeUpdateHost("settings", [], [], {}, projectA)).toBeUndefined();
+  });
+  it("keeps Terminal precedence over a stale Project, including Local and unresolved Terminals", () => {
+    const tabs = [{ id: "a", host: "h_a" }, { id: "b", host: "h_b" }, { id: "local" }];
+    const projectA = { host: "h_a" };
+    expect(activeUpdateHost("b", tabs, [], {}, projectA)).toBe("h_b");
+    expect(activeUpdateHost("local", tabs, [], {}, projectA)).toBeUndefined();
+    expect(activeUpdateHost("missing", tabs, [], {}, projectA)).toBeUndefined();
+  });
+  it("targets the focused split leaf, with first-leaf fallback, instead of a stale Project", () => {
     const tabs = [{ id: "a", host: "h_a" }, { id: "b", host: "h_b" }];
     const groups: { id: string; layout: LayoutNode }[] = [{ id: "g", layout: { kind: "split", direction: "col", ratio: 0.5, children: [{ kind: "leaf", tabId: "a" }, { kind: "leaf", tabId: "b" }] } }];
-    expect(activeUpdateHost("b", tabs, [], {})).toBe("h_b");
-    expect(activeUpdateHost("g", tabs, groups, { g: "b" })).toBe("h_b");
-    expect(activeUpdateHost("g", tabs, groups, { g: "missing" })).toBe("h_a");
-    expect(activeUpdateHost("home", tabs, groups, {})).toBeUndefined();
-    expect(activeUpdateHost("settings", tabs, groups, {})).toBeUndefined();
+    expect(activeUpdateHost("g", tabs, groups, { g: "b" }, { host: "h_a" })).toBe("h_b");
+    expect(activeUpdateHost("g", tabs, groups, { g: "missing" }, { host: "h_b" })).toBe("h_a");
+    expect(activeUpdateHost("g", tabs, groups, {}, { host: "h_b" })).toBe("h_a");
+  });
+  it("never falls back to a stale Project when a split leaf is Local or unresolved", () => {
+    const tabs = [{ id: "a", host: "h_a" }, { id: "local" }];
+    const groups: { id: string; layout: LayoutNode }[] = [{ id: "g", layout: { kind: "split", direction: "col", ratio: 0.5, children: [{ kind: "leaf", tabId: "a" }, { kind: "leaf", tabId: "local" }] } }];
+    const projectB = { host: "h_b" };
+    expect(activeUpdateHost("g", tabs, groups, { g: "local" }, projectB)).toBeUndefined();
+    expect(activeUpdateHost("g", tabs.filter(t => t.id !== "a"), groups, { g: "a" }, projectB)).toBeUndefined();
+    expect(activeUpdateHost("g", tabs.filter(t => t.id !== "a"), groups, { g: "missing" }, projectB)).toBeUndefined();
   });
   it("binds one confirmation across surfaces, cancel has no effect, and keeps invocation errors", async () => {
     const invoke = vi.fn().mockRejectedValue({ message: "stage failed" });

@@ -2,7 +2,7 @@ import { sameBuild } from "../buildId";
 import { invoke } from "@tauri-apps/api/core";
 import { registry } from "./registry";
 import { collectLeafIds } from "../layout";
-import type { LayoutNode } from "../types";
+import type { LayoutNode, ProjectInfo } from "../types";
 import type { HostConfig, HostStatus } from "./types";
 
 export type UpdateAction = "update" | "replace";
@@ -14,8 +14,9 @@ export function updateAction(status: HostStatus | undefined): UpdateAction | nul
   return status.updateAction ?? null;
 }
 
-export function activeUpdateHost(active: string, tabs: readonly { id: string; host?: string }[], groups: readonly { id: string; layout: LayoutNode }[], focused: Record<string, string>): string | undefined {
-  if (active === "home" || active === "settings") return undefined;
+export function activeUpdateHost(active: string, tabs: readonly { id: string; host?: string }[], groups: readonly { id: string; layout: LayoutNode }[], focused: Record<string, string>, selectedProject: Pick<ProjectInfo, "host"> | null): string | undefined {
+  if (active === "home") return selectedProject?.host;
+  if (active === "settings") return undefined;
   const group = groups.find(g => g.id === active);
   const leaves = group ? collectLeafIds(group.layout) : [];
   const leaf = group ? (leaves.includes(focused[active]) ? focused[active] : leaves[0]) : active;
