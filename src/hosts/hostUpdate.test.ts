@@ -14,14 +14,15 @@ describe("Host update targeting and eligibility", () => {
     expect(updateAction(status({ os: "windows", updateUnavailable: "old owner" }))).toBeNull();
     expect(updateAction(status({ status: "offline" }))).toBeNull();
   });
-  it("targets the selected Remote Project only on Home, never global Home, Local Project or Settings", () => {
+  it("targets the selected Project's Host on Home, never global Home or Settings", () => {
     const projectA = { host: "h_a" };
     const projectB = { host: "h_b" };
     expect(activeUpdateHost("home", [], [], {}, projectA)).toBe("h_a");
     expect(activeUpdateHost("home", [], [], {}, projectB)).toBe("h_b");
     expect(activeUpdateHost("home", [], [], {}, null)).toBeUndefined();
-    expect(activeUpdateHost("home", [], [], {}, {})).toBeUndefined();
+    expect(activeUpdateHost("home", [], [], {}, {})).toBe("local");
     expect(activeUpdateHost("settings", [], [], {}, projectA)).toBeUndefined();
+    expect(activeUpdateHost("settings", [], [], {}, {})).toBeUndefined();
   });
   it("keeps Terminal precedence over a stale Project, including Local and unresolved Terminals", () => {
     const tabs = [{ id: "a", host: "h_a" }, { id: "b", host: "h_b" }, { id: "local" }];
@@ -29,6 +30,25 @@ describe("Host update targeting and eligibility", () => {
     expect(activeUpdateHost("b", tabs, [], {}, projectA)).toBe("h_b");
     expect(activeUpdateHost("local", tabs, [], {}, projectA)).toBeUndefined();
     expect(activeUpdateHost("missing", tabs, [], {}, projectA)).toBeUndefined();
+  });
+  it("targets a resolved Local Daemon Tab but never an in-process Tab or unresolved leaf", () => {
+    const tabs = [{ id: "daemon", terminal: "local-terminal" }, { id: "in-process" }, { id: "remote", host: "h_a", terminal: "remote-terminal" }];
+    const projectB = { host: "h_b" };
+    expect(activeUpdateHost("daemon", tabs, [], {}, projectB)).toBe("local");
+    expect(activeUpdateHost("in-process", tabs, [], {}, projectB)).toBeUndefined();
+    expect(activeUpdateHost("missing", tabs, [], {}, projectB)).toBeUndefined();
+    expect(activeUpdateHost("remote", tabs, [], {}, {})).toBe("h_a");
+  });
+  it("targets a mixed split's focused Host with the existing first-leaf fallback", () => {
+    const tabs = [{ id: "daemon", terminal: "local-terminal" }, { id: "remote", host: "h_a", terminal: "remote-terminal" }];
+    const groups: { id: string; layout: LayoutNode }[] = [{ id: "g", layout: { kind: "split", direction: "col", ratio: 0.5, children: [{ kind: "leaf", tabId: "daemon" }, { kind: "leaf", tabId: "remote" }] } }];
+    const projectB = { host: "h_b" };
+    expect(activeUpdateHost("g", tabs, groups, { g: "daemon" }, projectB)).toBe("local");
+    expect(activeUpdateHost("g", tabs, groups, { g: "remote" }, {})).toBe("h_a");
+    expect(activeUpdateHost("g", tabs, groups, {}, projectB)).toBe("local");
+    expect(activeUpdateHost("g", tabs, groups, { g: "missing" }, projectB)).toBe("local");
+    expect(activeUpdateHost("g", tabs.filter(t => t.id !== "daemon"), groups, { g: "daemon" }, projectB)).toBeUndefined();
+    expect(activeUpdateHost("g", tabs.filter(t => t.id !== "daemon"), groups, {}, projectB)).toBeUndefined();
   });
   it("targets the focused split leaf, with first-leaf fallback, instead of a stale Project", () => {
     const tabs = [{ id: "a", host: "h_a" }, { id: "b", host: "h_b" }];

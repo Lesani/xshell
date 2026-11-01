@@ -117,6 +117,7 @@ export const S = {
   "local.daemon.line": "Terminal setup {v} · {mode}",
   "local.daemon.lineBuild": "Terminal setup {v} ({build}) · {mode}",
   "local.daemon.otherBuild": "Another xshell app using {build} runs this computer’s terminals. Quit that xshell app to use this Desktop’s build.",
+  "local.daemon.settingsHint": "Check Settings → Hosts → This computer for available actions.",
   "local.mode.guiBound": "ends with xshell",
   "local.mode.persistent": "keeps running",
   "sidebar.project.hostTooltip": "{project} on {host}",
