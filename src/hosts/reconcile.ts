@@ -34,6 +34,8 @@ export function tabFromTerminal(host: HostId | undefined, info: TerminalInfo): T
     shellMode: raw ? "raw" : "claude",
     createdAt: num(meta.createdAt) ?? info.createdAtMs,
   };
+  const customTitle = str(meta.customTitle);
+  if (customTitle) tab.customTitle = customTitle;
   if (host) tab.host = host;
   if (spec.sessionId) tab.sessionId = spec.sessionId;
   if (agent) tab.agent = agent;
@@ -70,8 +72,14 @@ export function reconcile(
       continue;
     }
     let next = t;
-    const title = str(info.meta.title);
-    if (title && title !== t.title && !isDirty(t.id, "title")) next = { ...next, title };
+    const observed = tabFromTerminal(host, info);
+    const title = observed.title;
+    if (title !== t.title && !isDirty(t.id, "title")) next = { ...next, title };
+    if (observed.customTitle !== t.customTitle) {
+      next = { ...next };
+      if (observed.customTitle === undefined) delete next.customTitle;
+      else next.customTitle = observed.customTitle;
+    }
     const sid = info.spec.sessionId || undefined;
     if (sid && sid !== t.sessionId && !isDirty(t.id, "sessionId")) next = { ...next, sessionId: sid };
     const projectName = str(info.meta.projectName);

@@ -1,3 +1,4 @@
+import { effectiveTabName } from "../tabs/tabName";
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
@@ -1136,8 +1137,8 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
         {tab.groupId && (
           <span className="terminal-header-label">
             {tab.projectName && <span className="terminal-header-project">{tab.projectName}</span>}
-            {tab.projectName && tab.title && <span className="terminal-header-sep">·</span>}
-            {tab.title && <span className="terminal-header-title">{tab.title}</span>}
+            {tab.projectName && effectiveTabName(tab) && <span className="terminal-header-sep">·</span>}
+            {effectiveTabName(tab) && <span className="terminal-header-title">{effectiveTabName(tab)}</span>}
           </span>
         )}
         {showStatsStrip ? (

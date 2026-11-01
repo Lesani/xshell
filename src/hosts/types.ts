@@ -109,7 +109,8 @@ export interface HostSnapshot {
   terminals: TerminalInfo[] | null; // null = never connected this run
 }
 
-// "indeterminate": an open failed after its Terminal started, which may still run.
+// "indeterminate": an open may have started, or a custom-name save was installed but
+// its durability could not be confirmed. Reconcile observations; never replay intent automatically.
 export type HostErrorCode = "unknown-host" | "offline" | "incompatible" | "timeout" | "remote" | "busy" | "invalid" | "indeterminate";
 
 export interface HostError {
