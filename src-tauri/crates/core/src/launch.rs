@@ -1,4 +1,6 @@
-use crate::agent_status::{hook_agent, HookAgent, EVENT_SOCKET_ENV, TERMINAL_ID_ENV};
+use crate::agent_status::{
+    hook_agent, HookAgent, EVENT_EXE_ENV, EVENT_SOCKET_ENV, TERMINAL_ID_ENV,
+};
 use crate::claude::encode_project_name;
 use crate::ctx::HostCtx;
 use crate::direct_exec::{self, DirectExec};
@@ -42,6 +44,7 @@ impl CommandPlan {
 pub fn clear_inherited_hooks(cmd: &mut CommandBuilder) {
     cmd.env_remove(TERMINAL_ID_ENV);
     cmd.env_remove(EVENT_SOCKET_ENV);
+    cmd.env_remove(EVENT_EXE_ENV);
 }
 
 // The Git Bash preset sends bare `bash.exe`, which on Windows resolves via PATH and gets
@@ -288,9 +291,10 @@ fn first_words(spec: &LaunchSpec, resume: &[String], msg: &str) -> Result<Vec<St
 }
 
 /// [`plan_command`], with the agent set up to report its Agent Status through `hooks`. Only
-/// agents with hooks (Claude Code, Codex) outside raw shells get them; the rest plan as
+/// agents with hooks (Claude Code, Codex, Pi) outside raw shells get them; the rest plan as
 /// without. Claude Code gets `--settings <hooks file>`, Codex its `-c` overrides, both the
-/// `XSHELL_TERMINAL_ID`/`XSHELL_EVENT_SOCKET` variables, and a shell wrapper reports the
+/// `XSHELL_TERMINAL_ID`/`XSHELL_EVENT_SOCKET` variables. Pi gets its owned `--extension`
+/// and helper executable environment. A shell wrapper reports the
 /// agent's end itself, since the shell outlives it.
 pub fn plan_command_with(
     ctx: &HostCtx,
@@ -332,7 +336,6 @@ fn plan_command_inner(
 ) -> Result<CommandPlan, String> {
     let mode = spec.shell_mode.as_deref().unwrap_or("claude");
     let agent_bin = agent_binary(spec.agent.as_deref());
-    let hooked = hook_agent(spec).zip(hooks);
     // The resume check uses the raw cwd, before the empty-cwd fallback below. It is made
     // once: the first message is checked against the same resume arguments the command gets,
     // so a session file appearing meanwhile never pairs `--resume` with a first message.
@@ -351,21 +354,6 @@ fn plan_command_inner(
             let at = usize::from(agent_args.first().is_some_and(|a| a == "resume"));
             agent_args.insert(at, flag.to_string());
         }
-    }
-    match hooked {
-        Some((HookAgent::Claude, h)) => {
-            agent_args.push("--settings".into());
-            agent_args.push(h.hooks.claude_settings.to_string_lossy().into_owned());
-        }
-        // Last: `codex resume [flag] <id>` takes `-c` after its positionals too.
-        Some((HookAgent::Codex, h)) => agent_args.extend(h.hooks.codex_overrides()),
-        None => {}
-    }
-    // Last: everything after `--` is the message. A first message needs a direct agent, so
-    // it is never part of a shell's command line: on Unix the agent is exec'd with it as one
-    // argv word, on Windows the resolved executable gets it (see `direct_exec` above).
-    if let Some(words) = first_words {
-        agent_args.extend(words);
     }
     let shell_kind = spec.shell_id.as_deref().unwrap_or("");
     // Override the frontend-supplied `bash.exe` for the Git Bash preset with an absolute path
@@ -392,6 +380,45 @@ fn plan_command_inner(
         Some(resolve) if first.is_some() || native_pi => Some(resolve(agent_bin)?),
         _ => None,
     };
+    // CMD parses command text (CALL expands it again), not just Windows argv. Decline
+    // only Pi's new hooks if their owned paths cannot cross that boundary literally.
+    // User prefixes and the unhooked agent launch retain their existing semantics.
+    let cmd_boundary = direct_exec.is_none()
+        && match effective_shell.filter(|s| !s.is_empty()) {
+            Some(_) => match shell_kind {
+                "cmd" => true,
+                "powershell" | "pwsh" | "gitbash" | "bash" | "zsh" | "fish" => false,
+                _ => cfg!(windows),
+            },
+            None => cfg!(windows),
+        };
+    let hooked = hook_agent(spec).zip(hooks).filter(|(agent, h)| {
+        *agent != HookAgent::Pi
+            || h.hooks.pi_extension.as_ref().is_some_and(|path| {
+                !cmd_boundary || (pi_cmd_path_safe(path) && pi_cmd_path_safe(&h.hooks.exe))
+            })
+    });
+    match hooked {
+        Some((HookAgent::Claude, h)) => {
+            agent_args.push("--settings".into());
+            agent_args.push(h.hooks.claude_settings.to_string_lossy().into_owned());
+        }
+        // Last: `codex resume [flag] <id>` takes `-c` after its positionals too.
+        Some((HookAgent::Codex, h)) => agent_args.extend(h.hooks.codex_overrides()),
+        Some((HookAgent::Pi, h)) => {
+            if let Some(path) = &h.hooks.pi_extension {
+                agent_args.push("--extension".into());
+                agent_args.push(path.to_string_lossy().into_owned());
+            }
+        }
+        None => {}
+    }
+    // Last: everything after `--` is the message. A first message needs a direct agent, so
+    // it is never part of a shell's command line: on Unix the agent is exec'd with it as one
+    // argv word, on Windows the resolved executable gets it (see `direct_exec` above).
+    if let Some(words) = first_words {
+        agent_args.extend(words);
+    }
     let (exec, exec_args): (&str, Vec<String>) = match prefix.split_first() {
         Some((head, rest)) => {
             let mut v = rest.to_vec();
@@ -532,7 +559,13 @@ fn plan_command_inner(
     if mode != "raw" && agent_bin == "claude" && spec.force_sync_output.unwrap_or(true) {
         env.push(("CLAUDE_CODE_FORCE_SYNC_OUTPUT".into(), "1".into()));
     }
-    if let Some((_, h)) = hooked {
+    if let Some((agent, h)) = hooked {
+        if agent == HookAgent::Pi {
+            env.push((
+                EVENT_EXE_ENV.into(),
+                h.hooks.exe.to_string_lossy().into_owned(),
+            ));
+        }
         env.extend(h.env());
     }
     // Empty cwd → fall back to the user's home directory (raw shells launched from home view).
@@ -549,6 +582,17 @@ fn plan_command_inner(
         args,
         env,
         cwd,
+    })
+}
+
+// Pi-only CMD integration accepts literal ASCII path words, with no quoting,
+// expansion or command operators. Other launch shapes do not need this restriction.
+fn pi_cmd_path_safe(path: &std::path::Path) -> bool {
+    path.to_str().is_some_and(|path| {
+        !path.is_empty()
+            && path
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_./\\:-".contains(&b))
     })
 }
 
@@ -1370,6 +1414,160 @@ mod tests {
             exe: "/opt/x shell/xshelld".into(),
             endpoint: "/run/x/daemon.sock".into(),
             claude_settings: "/h/.xshell/daemon/claude-hooks.json".into(),
+            pi_extension: None,
+        }
+    }
+
+    #[test]
+    fn pi_owned_extension_is_optional_and_argv_safe_across_launch_shapes() {
+        let fx = Fixture::new();
+        let plan_for = |spec: &LaunchSpec, h: &crate::agent_status::AgentHooks| {
+            plan_command_inner(
+                &fx.ctx(),
+                spec,
+                Some(TerminalHooks {
+                    hooks: h,
+                    terminal: TID.parse().unwrap(),
+                    run: 3,
+                }),
+                None,
+                &|_, _| false,
+                None,
+            )
+            .unwrap()
+        };
+        let mut h = hooks();
+        let base = LaunchSpec {
+            agent: Some("pi".into()),
+            session_id: Some("session".into()),
+            ..spec("/w")
+        };
+        let unhooked = plan_for(&base, &h);
+        assert!(!unhooked.args.iter().any(|a| a == "--extension"));
+        assert!(!unhooked.env.iter().any(|(k, _)| k == EVENT_EXE_ENV));
+        let path = "/private/a b/'q';$meta&/pi-status.js";
+        h.pi_extension = Some(path.into());
+        let plan = plan_for(&base, &h);
+        if cfg!(windows) {
+            assert_eq!(plan, unhooked);
+        } else {
+            assert!(plan.args.windows(2).any(|a| a == ["--extension", path]));
+            assert!(plan.env.iter().any(|(key, _)| key == EVENT_EXE_ENV));
+        }
+        for (id, command) in [
+            ("bash", "/bin/bash"),
+            ("powershell", "pwsh"),
+            ("cmd", "cmd.exe"),
+        ] {
+            let s = LaunchSpec {
+                shell_id: Some(id.into()),
+                shell_command: Some(command.into()),
+                ..base.clone()
+            };
+            let p = plan_for(&s, &h);
+            if id == "cmd" {
+                let baseline =
+                    plan_command_inner(&fx.ctx(), &s, None, None, &|_, _| false, None).unwrap();
+                assert_eq!(p, baseline);
+                continue;
+            }
+            assert!(p.args.iter().any(|a| a.contains("--extension")), "{p:?}");
+            assert!(p.args.iter().any(|a| a.contains("ended")), "{p:?}");
+            let quoted = match id {
+                "bash" => crate::agent_status::posix_quote(path),
+                "powershell" => format!("'{}'", path.replace('\'', "''")),
+                _ => path.into(),
+            };
+            assert!(p.args.iter().any(|a| a.contains(&quoted)), "{p:?}");
+            assert!(p.env.iter().any(|(key, _)| key == EVENT_EXE_ENV));
+        }
+        let prefixed = LaunchSpec {
+            launch_prefix: Some(vec!["wrapper".into(), "a b".into()]),
+            ..base.clone()
+        };
+        let p = plan_for(&prefixed, &h);
+        if cfg!(windows) {
+            assert_eq!(
+                p,
+                plan_command_inner(&fx.ctx(), &prefixed, None, None, &|_, _| false, None).unwrap()
+            );
+        } else {
+            assert!(p.args.windows(2).any(|a| a == ["--extension", path]));
+        }
+        let raw = plan_for(
+            &LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..base.clone()
+            },
+            &h,
+        );
+        assert!(!raw.env.iter().any(|(k, _)| k == EVENT_EXE_ENV));
+        assert!(plan_command_first(&fx.ctx(), &base, None, Some("hello")).is_err());
+        let mut cmd = CommandBuilder::new("pi");
+        cmd.env(EVENT_EXE_ENV, "outer-helper");
+        clear_inherited_hooks(&mut cmd);
+        assert_eq!(cmd.get_env(EVENT_EXE_ENV), None);
+    }
+
+    #[test]
+    fn pi_cmd_owned_paths_fail_closed_without_changing_other_agents() {
+        let fx = Fixture::new();
+        for unsafe_path in [
+            r"C:\A&B\pi-status.js",
+            r"C:\%EXPAND%\pi-status.js",
+            r"C:\space dir\pi-status.js",
+            r"C:\A!B\pi-status.js",
+            r"C:\A^B\pi-status.js",
+            "",
+        ] {
+            assert!(!pi_cmd_path_safe(std::path::Path::new(unsafe_path)));
+            for poison_helper in [false, true] {
+                let mut h = hooks();
+                h.exe = r"C:\owned\xshelld.exe".into();
+                h.pi_extension = Some(r"C:\owned\pi-status.js".into());
+                if poison_helper {
+                    h.exe = unsafe_path.into();
+                } else {
+                    h.pi_extension = Some(unsafe_path.into());
+                }
+                let spec = LaunchSpec {
+                    agent: Some("pi".into()),
+                    shell_id: Some("cmd".into()),
+                    shell_command: Some("cmd.exe".into()),
+                    ..spec("/w")
+                };
+                assert_eq!(
+                    hooked(&fx.ctx(), &spec, &h),
+                    plan_command_with(&fx.ctx(), &spec, None).unwrap()
+                );
+                let claude = LaunchSpec {
+                    agent: Some("claude".into()),
+                    ..spec
+                };
+                assert!(hooked(&fx.ctx(), &claude, &h)
+                    .args
+                    .iter()
+                    .any(|a| a == "--settings"));
+            }
+        }
+        for path in [
+            r"C:\Users\tester\.xshell\pi-status.js",
+            "C:/owned/pi-status.js",
+        ] {
+            assert!(pi_cmd_path_safe(std::path::Path::new(path)));
+            let mut h = hooks();
+            h.exe = r"C:\owned\xshelld.exe".into();
+            h.pi_extension = Some(path.into());
+            let spec = LaunchSpec {
+                agent: Some("pi".into()),
+                shell_id: Some("cmd".into()),
+                shell_command: Some("cmd.exe".into()),
+                ..spec("/w")
+            };
+            let plan = hooked(&fx.ctx(), &spec, &h);
+            assert!(plan.args.windows(2).any(|a| a == ["--extension", path]));
+            assert!(plan.args.iter().any(|a| a == "ended"));
+            assert!(plan.env.iter().any(|(key, _)| key == EVENT_EXE_ENV));
         }
     }
 
@@ -2091,6 +2289,19 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_
             ]
         );
         assert_eq!(p.env, plan_env(&[]));
+        let mut h = hooks();
+        let extension = r"C:\private dir\pi's & status.js";
+        h.pi_extension = Some(extension.into());
+        let hooked = direct_plan(&fx.ctx(), &s, Some(&h), None, &resolve).unwrap();
+        let mut expected = p.args.clone();
+        expected.extend(strings(&["--extension", extension]));
+        assert_eq!(hooked.program, p.program);
+        assert_eq!(hooked.args, expected);
+        assert!(hooked
+            .env
+            .iter()
+            .any(|(k, v)| k == EVENT_EXE_ENV && v == &h.exe.to_string_lossy()));
+
         assert_eq!(
             direct_plan(&fx.ctx(), &s, None, None, &|_| Err(
                 "unsupported shim".into()
@@ -2172,7 +2383,7 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_
     }
 
     #[test]
-    fn pi_has_no_bypass_hooks_or_first_message() {
+    fn pi_has_no_bypass_or_first_message_and_missing_extension_adds_no_hooks() {
         let fx = Fixture::new();
         let s = LaunchSpec {
             agent: Some("pi".into()),

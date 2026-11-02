@@ -55,10 +55,20 @@ describe("agentStatusOf", () => {
   it("raw shells and hookless agents show nothing", () => {
     const m = new Map<string, AgentStatus>([[local.id, "working"]]);
     expect(agentStatusOf({ ...local, shellMode: "raw" }, ctx({ local: m }))).toBeNull();
-    for (const agent of ["cursor", "opencode", "antigravity", "pi"] as const) {
+    for (const agent of ["cursor", "opencode", "antigravity"] as const) {
       expect(agentStatusOf({ ...local, agent }, ctx({ local: m }))).toBeNull();
       expect(agentStatusOf({ ...remote, agent }, ctx({ live: [info("working")], status: status("connected") }))).toBeNull();
     }
+  });
+
+  it("Pi uses the same Local/Remote capability, unknown and stale semantics without raw-shell inference", () => {
+    const pi = { ...remote, agent: "pi" as const };
+    expect(agentStatusOf({ ...local, agent: "pi" }, ctx({ local: new Map([[local.id, "working"]]) }))).toEqual({ status: "working", stale: false });
+    expect(agentStatusOf(pi, ctx({ live: [info()], status: status("connected") }))).toBeNull();
+    expect(agentStatusOf(pi, ctx({ live: [info("working")], status: status("connected", []) }))).toBeNull();
+    expect(agentStatusOf(pi, ctx({ live: [info("working")], status: status("connected") }))).toEqual({ status: "working", stale: false });
+    expect(agentStatusOf(pi, ctx({ live: [info("working")], status: status("offline") }))).toEqual({ status: "working", stale: true });
+    expect(agentStatusOf({ ...pi, shellMode: "raw" }, ctx({ live: [info("working")], status: status("connected") }))).toBeNull();
   });
 
   it("unknown status values are ignored", () => {

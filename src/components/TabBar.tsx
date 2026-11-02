@@ -35,9 +35,9 @@ function tabInitials(name: string): string {
 // A small version of the sidebar's project icon, sized for a tab. Shows the project image when set,
 // otherwise an emoji / initials over the project's custom color. `linked` adds the ring that the old
 // status dot used to convey (this tab's project is the one currently hovered/selected/linked).
-function TabProjectIcon({ iconValue, color, name, linked }: { iconValue?: string; color?: string; name: string; linked: boolean }) {
+function TabProjectIcon({ iconValue, color, name, linked, className = "" }: { iconValue?: string; color?: string; name: string; linked: boolean; className?: string }) {
   const imgSrc = useProjectImage(iconValue);
-  const cls = `tab-project-icon ${linked ? "tab-project-icon-linked" : ""}`;
+  const cls = `tab-project-icon ${linked ? "tab-project-icon-linked" : ""} ${className}`;
   if (imgSrc) return <div className={cls}><img src={imgSrc} className="tab-project-img" alt="" /></div>;
   return <div className={cls} style={color ? { background: color } : undefined}>{iconValue || tabInitials(name)}</div>;
 }
@@ -406,6 +406,8 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               status: liveHost ? hostsSnap.status[liveHost] : undefined,
               local: localAgentStatuses,
             });
+            const piWorking = !isClosing && !isRawShell && tab.agent === "pi" && agentStatus?.status === "working" && !agentStatus.stale;
+            const iconClass = piWorking ? "tab-pi-working" : "";
             const statusHost = tab.host ? hostNameOf(tab.host) : liveHost ? fmt("picker.group.local") : "";
             const tooltipText = agentStatus ? `${permsTooltip}\n${agentStatusTooltip(agentStatus, statusHost)}` : permsTooltip;
             return (
@@ -427,8 +429,8 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
                 {isRawShell
                   ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
                   : projectDisplayName
-                    ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} />
-                    : <div className={`tab-dot ${matches ? "tab-dot-active" : ""}`} />}
+                    ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} className={iconClass} />
+                    : <div className={`tab-dot ${matches ? "tab-dot-active" : ""} ${iconClass}`} />}
                 <div className="tab-item-text">
                   <span className="tab-item-title truncate">{displayTitle}</span>
                   {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}

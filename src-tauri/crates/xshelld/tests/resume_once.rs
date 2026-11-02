@@ -802,8 +802,16 @@ fn pi_same_custom_id_in_different_projects_opens_two_terminals() {
     assert_ne!(ra.pid, rb.pid);
     e.fake.wait_launches(1);
     other_fake.wait_launches(1);
-    assert_eq!(e.fake.launches()[0], vec!["--session-id", "custom-id"]);
-    assert_eq!(other_fake.launches()[0], vec!["--session-id", "custom-id"]);
+    let extension =
+        e.h.paths()
+            .claude_hooks
+            .parent()
+            .unwrap()
+            .join("pi-status.js");
+    let extension = extension.to_string_lossy();
+    let expected = vec!["--session-id", "custom-id", "--extension", &extension];
+    assert_eq!(e.fake.raw_launches()[0], expected);
+    assert_eq!(other_fake.raw_launches()[0], expected);
     assert_eq!(e.listed_on("custom-id").len(), 2);
 }
 
