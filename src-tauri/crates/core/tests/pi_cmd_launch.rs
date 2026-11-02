@@ -20,7 +20,11 @@ fn execute_cmd_case(shape: &str, poison: Option<(&str, bool)>) {
     // They name real fixture files under this test's private working directory.
     fs::create_dir(cwd.join("owned")).unwrap();
     fs::write(cwd.join("owned/pi-status.js"), "// fixture only").unwrap();
-    fs::write(cwd.join("owned/helper.cmd"), "@exit /b 0\r\n").unwrap();
+    fs::write(
+        cwd.join("owned/helper.cmd"),
+        "@echo %*>helper-args.txt\r\nexit /b 0\r\n",
+    )
+    .unwrap();
     let probe = "x86-probe.cmd";
     fs::write(cwd.join(probe), "@echo unintended>probe-ran\r\n").unwrap();
     fs::write(
@@ -35,7 +39,8 @@ fn execute_cmd_case(shape: &str, poison: Option<(&str, bool)>) {
     )
     .unwrap();
     let mut hooks = AgentHooks {
-        exe: PathBuf::from("owned/helper.cmd"),
+        // CMD command position requires native separators, unlike a file-valued argv.
+        exe: PathBuf::from("owned").join("helper.cmd"),
         endpoint: "private-test-endpoint".into(),
         claude_settings: cwd.join("unused.json"),
         pi_extension: Some(PathBuf::from("owned/pi-status.js")),
@@ -98,8 +103,22 @@ fn execute_cmd_case(shape: &str, poison: Option<(&str, bool)>) {
         .env("X86_EXPAND", "EXPANDED")
         .env("PATH", std::env::var_os("PATH").unwrap())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(
+            fs::File::create(cwd.join("stdout.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(cwd.join("stderr.log")).unwrap(),
+        ));
+    let diagnostics =
+        || {
+            let read = |name: &str| {
+                String::from_utf8_lossy(&fs::read(cwd.join(name)).unwrap_or_default()).into_owned()
+            };
+            format!(
+            "{shape} / {poison:?}; program={:?}; args={:?}; cwd={cwd:?}; stdout={:?}; stderr={:?}",
+            plan.program, plan.args, read("stdout.log"), read("stderr.log")
+        )
+        };
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
@@ -116,11 +135,15 @@ fn execute_cmd_case(shape: &str, poison: Option<(&str, bool)>) {
         if Instant::now() >= deadline {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("CMD fixture did not exit for {shape} / {poison:?}");
+            panic!("CMD fixture did not exit: {}", diagnostics());
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(status.success(), "CMD fixture failed: {shape} / {poison:?}");
+    assert!(
+        status.success(),
+        "CMD fixture failed ({status}): {}",
+        diagnostics()
+    );
     let json = |name: &str| -> serde_json::Value {
         let text = fs::read_to_string(cwd.join(name)).unwrap();
         serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap()
@@ -138,6 +161,23 @@ fn execute_cmd_case(shape: &str, poison: Option<(&str, bool)>) {
         !cwd.join("probe-ran").exists(),
         "CMD executed part of an owned path"
     );
+    let helper_args = cwd.join("helper-args.txt");
+    if poison.is_none() && shape == "explicit-cmd" {
+        assert_eq!(
+            fs::read_to_string(&helper_args)
+                .unwrap_or_else(|e| panic!("missing helper argv: {e}; {}", diagnostics()))
+                .trim(),
+            "event - ended",
+            "{}",
+            diagnostics()
+        );
+    } else {
+        assert!(
+            !helper_args.exists(),
+            "unexpected helper: {}",
+            diagnostics()
+        );
+    }
     if poison.is_some() {
         assert_eq!(json("hook-env.json"), serde_json::json!([null, null, null]));
         for key in [EVENT_EXE_ENV, EVENT_SOCKET_ENV, TERMINAL_ID_ENV] {
