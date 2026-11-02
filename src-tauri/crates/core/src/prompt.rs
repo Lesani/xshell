@@ -103,6 +103,7 @@ fn is_marker(agent: HookAgent, c: char) -> bool {
     match agent {
         HookAgent::Claude => matches!(c, '❯' | '>'),
         HookAgent::Codex => matches!(c, '›' | '>'),
+        HookAgent::Pi => false,
     }
 }
 
@@ -296,6 +297,7 @@ fn is_footer(agent: HookAgent, line: &str) -> bool {
     let hints = match agent {
         HookAgent::Claude => CLAUDE_HINTS,
         HookAgent::Codex => CODEX_HINTS,
+        HookAgent::Pi => return false,
     };
     let l = line.to_lowercase();
     !l.is_empty() && l.split(" · ").all(|seg| hints.contains(&seg.trim()))
@@ -342,6 +344,9 @@ fn cap_text(lines: &[String]) -> String {
 /// The Permission Prompt `agent`'s TUI shows on `rows` (a [`ScreenModel`]'s visible rows),
 /// if it is one this module recognises (see the module documentation).
 pub fn extract(agent: HookAgent, rows: &[String]) -> Option<Found> {
+    if agent == HookAgent::Pi {
+        return None;
+    }
     let r: Vec<Row> = rows.iter().map(|s| Row::new(s)).collect();
     // The lowest option row, past blank rows and the footer (plus the rows its own label
     // may have wrapped onto).
@@ -509,6 +514,7 @@ fn evidence(
         p
     };
     match agent {
+        HookAgent::Pi => false,
         HookAgent::Claude => {
             // The question directly above the block (one blank row between at most).
             let Some((last_row, _)) = text.last() else {
@@ -548,6 +554,7 @@ fn is_composer_mark(agent: HookAgent, c: char) -> bool {
     match agent {
         HookAgent::Claude => matches!(c, '❯' | '>'),
         HookAgent::Codex => c == '›',
+        HookAgent::Pi => false,
     }
 }
 
@@ -731,6 +738,7 @@ fn is_composer_footer(agent: HookAgent, row: &str) -> bool {
         && segs.iter().all(|s| match agent {
             HookAgent::Claude => is_claude_footer_segment(s),
             HookAgent::Codex => is_codex_footer_segment(s),
+            HookAgent::Pi => false,
         })
 }
 
@@ -763,11 +771,15 @@ pub fn composer(agent: HookAgent, rows: &[String]) -> bool {
 /// The input rows of `agent`'s chat composer when [`composer`] recognises it (the prompt
 /// mark's row first, without a box's sides), else `None`.
 pub fn composer_input(agent: HookAgent, rows: &[String]) -> Option<Vec<String>> {
+    if agent == HookAgent::Pi {
+        return None;
+    }
     let r: Vec<&str> = rows.iter().map(|s| s.trim_end()).collect();
     let last = r.iter().rposition(|s| !s.is_empty())?;
     match agent {
         HookAgent::Claude => claude_composer(&r[..=last]),
         HookAgent::Codex => codex_composer(&r[..=last]),
+        HookAgent::Pi => None,
     }
 }
 
@@ -965,6 +977,22 @@ mod tests {
 
     fn labels(f: &Found) -> Vec<&str> {
         f.options.iter().map(|o| o.label.as_str()).collect()
+    }
+
+    #[test]
+    fn pi_never_interprets_permission_prompts_composers_or_images() {
+        for text in [
+            CLAUDE,
+            CODEX,
+            "────────────────────────\n❯ [Image #1]\n────────────────────────\n  ? for shortcuts",
+            "\n› [Image #1]\n\n  ? for shortcuts",
+        ] {
+            let r = rows(text);
+            assert_eq!(extract(HookAgent::Pi, &r), None);
+            assert!(!composer(HookAgent::Pi, &r));
+            assert_eq!(composer_input(HookAgent::Pi, &r), None);
+            assert_eq!(composer_images(HookAgent::Pi, &r), None);
+        }
     }
 
     #[test]

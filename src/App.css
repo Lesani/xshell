@@ -1982,3 +1982,15 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .rename-tab-dialog [role=alert] { color: var(--error); }
 .rename-tab-dialog input { width: 100%; box-sizing: border-box; background: var(--bg-deep); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 4px; padding: 8px; }
 .rename-tab-dialog .modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+
+/* Pi's current lifecycle status animates the existing Project identity, not the badge. */
+.tab-pi-working {
+  animation: tab-pi-working 1.2s ease-in-out infinite;
+}
+@keyframes tab-pi-working {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.85); opacity: 0.55; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tab-pi-working { animation: none; }
+}

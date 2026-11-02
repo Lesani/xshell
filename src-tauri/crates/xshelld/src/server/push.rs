@@ -909,6 +909,8 @@ impl Inner {
         let agent = match hook_agent(&info.spec)? {
             HookAgent::Claude => PushAgent::Claude,
             HookAgent::Codex => PushAgent::Codex,
+            // Live Pi status uses the existing snapshots, not a new sealed-push schema.
+            HookAgent::Pi => return None,
         };
         let needs_you = reg
             .terminals
@@ -1476,6 +1478,44 @@ mod tests {
             run: t.run,
             status: AgentStatus::NeedsYou,
             at: 0,
+        }
+    }
+
+    #[test]
+    fn pi_live_status_never_becomes_a_sealed_push_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = daemon(dir.path());
+        let t = terminal::unresolved(
+            &d,
+            PersistedTerminal {
+                terminal: Uuid::new_v4(),
+                spec: LaunchSpec {
+                    agent: Some("pi".into()),
+                    shell_mode: Some("claude".into()),
+                    cwd: "/pi".into(),
+                    ..Default::default()
+                },
+                meta: Map::new(),
+                cols: 80,
+                rows: 24,
+                created_at_ms: 0,
+                leader: None,
+                prompt_id_floor: None,
+            },
+        );
+        t.reset_status_for_test();
+        d.reg.lock().unwrap().terminals.insert(t.id, t.clone());
+        for status in [AgentStatus::Working, AgentStatus::Finished] {
+            assert_eq!(t.on_agent_event(&d, t.run, status), Ok(true));
+            assert_eq!(t.info().agent_status, Some(status));
+            assert!(t.info().status_at_ms.is_some());
+            let event = AgentEvent {
+                terminal: t.id,
+                run: t.run,
+                status,
+                at: 0,
+            };
+            assert!(Inner::current_in(&d.reg.lock().unwrap(), &event).is_none());
         }
     }
 

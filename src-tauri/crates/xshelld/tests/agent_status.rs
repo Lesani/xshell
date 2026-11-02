@@ -38,7 +38,7 @@ fn hook_fake_agents() {
     ONCE.call_once(|| {
         let bin = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hook-agents");
         fs::create_dir_all(&bin).unwrap();
-        for name in ["claude", "codex"] {
+        for name in ["claude", "codex", "pi"] {
             let tmp = bin.join(format!(".{name}.{}", std::process::id()));
             fs::write(
                 &tmp,
@@ -75,6 +75,7 @@ fn user_agent_config(served: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
                 ".claude/settings.local.json",
                 ".claude.json",
                 ".codex/config.toml",
+                ".pi/agent/settings.json",
             ]
             .map(|r| home.join(r))
         })
@@ -264,6 +265,120 @@ impl Env {
             })
             .unwrap();
     }
+}
+
+#[test]
+fn pi_without_a_prepared_extension_stays_unknown() {
+    let mut e = env_with(|c| c.event_exe = None);
+    let t = e.open("pi", None);
+    assert!(!e.argv().iter().any(|a| a == "--extension"));
+    e.run("printf 'Working...\\033]9;hello\\007'");
+    e.type_in(t, "hello\r");
+    assert_eq!(
+        (e.info(t).agent_status, e.info(t).status_at_ms),
+        (None, None)
+    );
+    let vars = fs::read_to_string(e.cwd.join("env.log")).unwrap();
+    assert!(!vars.contains("XSHELL_EVENT_EXE="));
+}
+
+/// Exercise the real CLI's opt-in acknowledgement in the fake's captured launch environment.
+fn pi_event(e: &Env, status: &str, expected_exit: i32) {
+    e.run(&format!(
+        "\"$XSHELL_EVENT_EXE\" event --strict - {}; printf '%s' \"$?\" > strict-exit",
+        posix_quote(status)
+    ));
+    assert_eq!(
+        fs::read_to_string(e.cwd.join("strict-exit")).unwrap(),
+        expected_exit.to_string()
+    );
+}
+
+#[test]
+fn pi_lifecycle_status_viewers_initial_idle_restore_and_run_fencing() {
+    let mut e = env();
+    let t = e.open("pi", None);
+    // Pi reads interrupt keys in raw mode; do not let this shell fixture's tty turn
+    // Ctrl+C into SIGINT before the Daemon's input/status path can be observed.
+    e.run("stty -isig -echo");
+    let args = e.argv();
+    let extension = &args[args.iter().position(|a| a == "--extension").unwrap() + 1];
+    assert_eq!(
+        fs::read(extension).unwrap(),
+        include_bytes!("../../core/src/pi_status.js")
+    );
+    let mut other = Client::connect(&e.srv.socket);
+    other.hello(range(1, 1));
+    let mut mobile = Client::in_process(&e.srv, Role::Mobile);
+    assert_eq!(
+        (e.info(t).agent_status, e.info(t).status_at_ms),
+        (None, None)
+    );
+    pi_event(&e, "finished", 0);
+    assert_eq!(
+        (e.info(t).agent_status, e.info(t).status_at_ms),
+        (None, None)
+    );
+    // Text, OSC9 and Enter do not manufacture activity on a failed/unloaded integration.
+    e.run("printf 'Working...\\033]9;Approval requested\\007'");
+    e.type_in(t, "hello\r");
+    assert_eq!(e.now(t), None);
+    pi_event(&e, "needs-you", 1);
+    pi_event(&e, "working", 0);
+    let working = e.wait(t, Some(Working));
+    assert!(working.status_at_ms.is_some());
+    Env::wait_status(&mut other, t, Some(Working));
+    Env::wait_status(&mut mobile, t, Some(Working));
+    // Escape/Ctrl+C cannot finish before the authoritative abort settlement.
+    for input in ["\x1b", "\x03", "\r"] {
+        e.type_in(t, input);
+    }
+    assert_eq!(e.now(t), Some(Working));
+    pi_event(&e, "finished", 0);
+    let finished = e.wait(t, Some(Finished));
+    Env::wait_status(&mut other, t, Some(Finished));
+    Env::wait_status(&mut mobile, t, Some(Finished));
+    assert!(finished.status_at_ms.is_some());
+    pi_event(&e, "finished", 0); // idle reload does not create a second completion
+    assert_eq!(e.info(t).status_at_ms, finished.status_at_ms);
+    let old_run = e.run_id();
+    let launches = e.fake.pids().len();
+    e.srv.stopper().shutdown();
+    assert!(e.srv.wait_timeout(T).is_some());
+    e.srv = start(&e.h, |_| {});
+    e.fake.wait_pids(launches + 1);
+    e.c = Client::connect(&e.srv.socket);
+    e.c.hello(range(1, 1));
+    assert_ne!(e.run_id(), old_run);
+    assert_eq!(
+        (e.info(t).agent_status, e.info(t).status_at_ms),
+        (None, None)
+    );
+    pi_event(&e, "finished", 0);
+    assert_eq!(
+        (e.info(t).agent_status, e.info(t).status_at_ms),
+        (None, None)
+    );
+    let refused = std::process::Command::new(bin())
+        .args([
+            "event",
+            "--strict",
+            "--socket",
+            &e.srv.socket.to_string_lossy(),
+            &format!("{t}.{old_run}"),
+            "working",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(refused.code(), Some(1));
+    assert_eq!(e.now(t), None);
+    let mut reconnected = Client::in_process(&e.srv, Role::Mobile);
+    pi_event(&e, "working", 0);
+    Env::wait_status(&mut reconnected, t, Some(Working));
+    e.send("exit 0");
+    e.wait(t, Some(Ended));
+    Env::wait_status(&mut reconnected, t, Some(Ended));
+    assert_eq!(e.now(t), Some(Ended));
 }
 
 #[test]

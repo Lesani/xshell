@@ -13,7 +13,7 @@ export const AGENT_STATUS_CAPABILITY = "agent.status";
 export const AGENT_STATUSES: readonly AgentStatus[] = ["working", "needs-you", "finished", "ended"];
 
 // The agents whose hooks report a status; other agents and shells never show one.
-const HOOK_AGENTS: readonly string[] = ["claude", "codex"];
+const HOOK_AGENTS: readonly string[] = ["claude", "codex", "pi"];
 
 // A value from the Daemon or the local store, or null when this Desktop does not know it.
 export function asAgentStatus(v: unknown): AgentStatus | null {

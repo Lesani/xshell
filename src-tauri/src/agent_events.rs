@@ -92,12 +92,16 @@ pub fn start(
     let hooks = (|| {
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         ensure_private_dir(settings_dir)?;
-        let hooks = AgentHooks {
+        let mut hooks = AgentHooks {
             exe,
             endpoint: socket.to_string_lossy().into_owned(),
             claude_settings: settings_dir.join("claude-settings.json"),
+            pi_extension: None,
         };
         hooks.write_claude_settings()?;
+        if let Err(e) = hooks.prepare_pi_extension() {
+            eprintln!("xshell: Pi status integration unavailable: {e}");
+        }
         Ok::<_, io::Error>(hooks)
     })();
     let hooks = match hooks {

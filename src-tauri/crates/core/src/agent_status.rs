@@ -6,6 +6,7 @@
 //! - [`AgentHooks`]: what a launch adds so the agent reports. Claude Code gets a
 //!   `--settings` file with hooks; Codex gets `-c` overrides (`notify` for a finished turn,
 //!   OSC 9 TUI notifications for approvals, which [`Tracker::on_output`] scans for).
+//!   Pi gets a per-launch lifecycle extension and never uses input/output heuristics.
 //! - [`event_main`]: the hook client (`xshelld event …`, or the Desktop executable's
 //!   `xshell event …`), which sends one `term.event` over the event socket.
 //! - [`serve_event_conn`]: the Desktop's side of one event-socket connection.
@@ -31,12 +32,15 @@ pub use xshell_protocol::msg::AgentStatus;
 pub const TERMINAL_ID_ENV: &str = "XSHELL_TERMINAL_ID";
 /// The socket the hook client sends to.
 pub const EVENT_SOCKET_ENV: &str = "XSHELL_EVENT_SOCKET";
+/// The helper executable captured by the per-launch Pi extension.
+pub const EVENT_EXE_ENV: &str = "XSHELL_EVENT_EXE";
 
 /// The agents whose hooks report an Agent Status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookAgent {
     Claude,
     Codex,
+    Pi,
 }
 
 /// The hook-reporting agent a Terminal runs, if any: none for raw shells and for agents
@@ -48,6 +52,7 @@ pub fn hook_agent(spec: &LaunchSpec) -> Option<HookAgent> {
     match agent_binary(spec.agent.as_deref()) {
         "claude" => Some(HookAgent::Claude),
         "codex" => Some(HookAgent::Codex),
+        "pi" => Some(HookAgent::Pi),
         _ => None,
     }
 }
@@ -60,7 +65,8 @@ pub fn hook_agent(spec: &LaunchSpec) -> Option<HookAgent> {
 /// Hooks drive Claude Code completely (`UserPromptSubmit`/`PostToolUse` working,
 /// `Notification` needs you, `Stop` finished, `SessionEnd` ended). Codex has no hooks
 /// without writing `~/.codex`, so its `notify` reports finished, OSC 9 approval
-/// notifications in its output mean needs you, and input fills in working. Ended is final.
+/// notifications in its output mean needs you, and input fills in working. Pi uses only
+/// lifecycle reports (initial idle is not a completion). Ended is final.
 #[derive(Debug, Clone)]
 pub struct Tracker {
     agent: Option<HookAgent>,
@@ -98,6 +104,15 @@ impl Tracker {
         if self.agent.is_none() {
             return Err("not an agent terminal".into());
         }
+        if self.agent == Some(HookAgent::Pi) {
+            if s == AgentStatus::NeedsYou {
+                return Err("Pi does not report permission prompts".into());
+            }
+            // Startup idle is not a completed turn (and must not create unread status).
+            if self.status.is_none() && s == AgentStatus::Finished {
+                return Ok(false);
+            }
+        }
         Ok(self.set(s))
     }
 
@@ -111,6 +126,9 @@ impl Tracker {
         let Some(agent) = self.agent else {
             return false;
         };
+        if agent == HookAgent::Pi {
+            return false;
+        }
         if data == b"\x1b" || data == b"\x03" {
             return matches!(
                 self.status,
@@ -237,6 +255,7 @@ pub struct AgentHooks {
     pub exe: PathBuf,
     pub endpoint: String,
     pub claude_settings: PathBuf,
+    pub pi_extension: Option<PathBuf>,
 }
 
 /// The hooks for one Terminal's run: `terminal` is what the hook client reports under (the
@@ -313,6 +332,37 @@ pub fn claude_settings_json(exe: &Path) -> String {
 pub const CODEX_NOTIFICATIONS: &[&str] = &["approval-requested", "plan-mode-prompt"];
 
 impl AgentHooks {
+    /// Install the static per-launch extension in the existing private hook directory.
+    /// Failure disables only Pi integration; callers retain the other agents' hooks.
+    pub fn prepare_pi_extension(&mut self) -> io::Result<()> {
+        self.pi_extension = None;
+        let dir = self
+            .claude_settings
+            .parent()
+            .ok_or_else(|| io::Error::other("hook settings have no directory"))?;
+        let path = dir.join("pi-status.js");
+        let tmp = dir.join(format!(".pi-status.{}.tmp", Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            let mut file = options.open(&tmp)?;
+            file.write_all(include_str!("pi_status.js").as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        } else {
+            self.pi_extension = Some(path);
+        }
+        result
+    }
+
     /// Write [`claude_settings_json`] to `claude_settings`, atomically and private (0600).
     /// The directory must exist.
     pub fn write_claude_settings(&self) -> io::Result<()> {
@@ -414,6 +464,8 @@ fn parse_event_args(args: &[OsString]) -> Result<EventArgs, String> {
             socket = Some(PathBuf::from(it.next().ok_or("--socket needs a value")?));
         } else if let Some(v) = s.strip_prefix("--socket=") {
             socket = Some(PathBuf::from(v));
+        } else if s == "--strict" {
+            // Exit handling is opt-in; not a positional argument.
         } else if s == "-v" || s == "--verbose" {
             verbose = true;
         } else {
@@ -862,9 +914,9 @@ fn exchange(
 ///
 /// `-` reads `<terminal>.<run>` from [`TERMINAL_ID_ENV`]; the socket comes from `--socket`,
 /// [`EVENT_SOCKET_ENV`], then `default_socket`. A Codex payload that is not a turn end sends
-/// nothing. Never reads stdin, gives up within seconds, and always exits 0: a failing
+/// nothing. Never reads stdin, gives up within seconds, and by default exits 0: a failing
 /// Claude Code `Stop` hook (exit 2) would keep the turn from ending. `-v` prints why
-/// nothing was recorded.
+/// nothing was recorded. `--strict` instead exits 1 on any reporting failure.
 pub fn event_main(
     args: &[OsString],
     env: &dyn Fn(&str) -> Option<OsString>,
@@ -878,6 +930,9 @@ pub fn event_main(
     if let Err(e) = r {
         if verbose {
             eprintln!("xshell event: {e}");
+        }
+        if args.iter().any(|a| a == "--strict") {
+            return 1;
         }
     }
     0
@@ -969,6 +1024,101 @@ mod tests {
 
     fn codex() -> Tracker {
         Tracker::new(&spec("codex"))
+    }
+
+    #[test]
+    fn pi_status_is_lifecycle_only_and_initial_idle_is_not_completion() {
+        let mut t = Tracker::new(&spec("pi"));
+        assert_eq!(t.agent(), Some(HookAgent::Pi));
+        assert_eq!(t.on_event(Finished), Ok(false));
+        assert_eq!(t.status(), None);
+        for input in [b"\r".as_slice(), b"hello\r", b"\x1b", b"\x03"] {
+            assert!(!t.on_input(input));
+        }
+        assert!(!t.on_output(b"Working... \x1b]9;Approval requested\x07"));
+        assert_eq!(t.status(), None);
+        assert!(t.on_event(NeedsYou).is_err());
+        assert_eq!(t.on_event(Working), Ok(true));
+        for input in [b"\x1b".as_slice(), b"\x03", b"\r"] {
+            assert!(!t.on_input(input));
+            assert_eq!(t.status(), Some(Working));
+        }
+        assert_eq!(t.on_event(Finished), Ok(true));
+        assert_eq!(t.on_event(Finished), Ok(false));
+        assert!(t.on_exit());
+        assert_eq!(t.on_event(Working), Ok(false));
+        assert_eq!(t.status(), Some(Ended));
+        assert_eq!(
+            hook_agent(&LaunchSpec {
+                shell_mode: Some("raw".into()),
+                ..spec("pi")
+            }),
+            None
+        );
+        assert_eq!(claude().on_event(Finished), Ok(true));
+        assert_eq!(codex().on_event(Finished), Ok(true));
+    }
+
+    #[test]
+    fn pi_extension_is_private_atomic_and_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = hooks("/exe");
+        h.claude_settings = dir.path().join("claude.json");
+        h.prepare_pi_extension().unwrap();
+        let path = h.pi_extension.as_ref().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), include_bytes!("pi_status.js"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Rename failure removes its unique temporary sibling and clears availability.
+        std::fs::remove_file(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        assert!(h.prepare_pi_extension().is_err());
+        assert!(h.pi_extension.is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_event_reports_accepted_refused_malformed_and_unreachable() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("strict.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let worker = std::thread::spawn(move || {
+            for accept in [true, false] {
+                let (s, _) = listener.accept().unwrap();
+                serve_event_conn(s, "test", move |_, _, _| {
+                    if accept {
+                        Ok(())
+                    } else {
+                        Err("refused".into())
+                    }
+                });
+            }
+        });
+        let a = args(&[
+            "--strict",
+            "--socket",
+            &sock.to_string_lossy(),
+            &id,
+            "working",
+        ]);
+        assert_eq!(event_main(&a, &envmap(&[]), None), 0);
+        assert_eq!(event_main(&a, &envmap(&[]), None), 1);
+        worker.join().unwrap();
+        assert_eq!(event_main(&a, &envmap(&[]), None), 1);
+        assert_eq!(
+            event_main(&args(&["--strict", "bad"]), &envmap(&[]), None),
+            1
+        );
+        assert_eq!(event_main(&args(&["bad"]), &envmap(&[]), None), 0);
     }
 
     #[test]
@@ -1181,6 +1331,7 @@ mod tests {
             exe: exe.into(),
             endpoint: "/run/xshell/daemon.sock".into(),
             claude_settings: "/h/.xshell/daemon/claude-hooks.json".into(),
+            pi_extension: None,
         }
     }
 

@@ -1060,7 +1060,9 @@ pub(crate) fn spawn_with(
     let tracker = Tracker::new(&spec);
     // Only an agent run directly draws its own dialogs on the whole screen; a wrapping shell
     // or launch prefix may print anything around it (and a Mobile never sees those).
-    let screen_agent = tracker.agent().filter(|_| spec.is_direct_agent());
+    let screen_agent = tracker
+        .agent()
+        .filter(|a| *a != HookAgent::Pi && spec.is_direct_agent());
     let pair = native_pty_system()
         .openpty(PtySize {
             rows,

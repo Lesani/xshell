@@ -15,11 +15,15 @@ use xshell_core::agent_status::{AgentHooks, AgentStatus};
 /// (agents launch without hooks) without an event executable or when the file cannot be
 /// written.
 pub(crate) fn hooks(cfg: &Config) -> Option<AgentHooks> {
-    let hooks = AgentHooks {
+    let mut hooks = AgentHooks {
         exe: cfg.event_exe.clone()?,
         endpoint: cfg.paths.socket.to_string_lossy().into_owned(),
         claude_settings: cfg.paths.claude_hooks.clone(),
+        pi_extension: None,
     };
+    if let Err(e) = hooks.prepare_pi_extension() {
+        crate::log!("WARN", "Pi status integration unavailable: {e}");
+    }
     match hooks.write_claude_settings() {
         Ok(()) => Some(hooks),
         Err(e) => {

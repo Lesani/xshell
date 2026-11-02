@@ -178,3 +178,52 @@ describe("TabBar shared names", () => {
     expect(container.querySelector("[role=menu]")).toBeNull();
   });
 });
+
+describe("TabBar Pi leading-icon status", () => {
+  function workingPi() {
+    tabs[0].agent = "pi";
+    store.snap.status.local.daemonCapabilities = ["agent.status"];
+    store.snap.live.local![0].agentStatus = "working";
+  }
+  it.each(["initials", "emoji", "image", "dot"])("animates the actual %s identity when selected and inactive", async kind => {
+    workingPi();
+    if (kind === "dot") tabs[0].projectName = "";
+    if (kind === "emoji") props.projectIcons = { "/p": { icon: "🦀", color: "#123456" } };
+    if (kind === "image") {
+      props.projectIcons = { "/p": { icon: "img:/private/project.png" } };
+      vi.mocked(invoke).mockResolvedValue("data:image/png;base64,aGVsbG8=");
+    }
+    await act(async () => { root.render(<TabBar {...props} />); });
+    const selector = kind === "dot" ? ".tab-dot" : ".tab-project-icon";
+    const icon = tabEl().querySelector(selector)!;
+    expect(icon.classList.contains("tab-pi-working")).toBe(true);
+    expect(tabEl().querySelector(".tab-item-text")?.classList.contains("tab-pi-working")).toBe(false);
+    if (kind === "initials") expect(icon.textContent).toBe("PR");
+    if (kind === "emoji") expect(icon.textContent).toBe("🦀");
+    if (kind === "image") expect(icon.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,aGVsbG8=");
+    expect(tabEl().querySelector('[aria-label="Agent status: Working"]')).not.toBeNull();
+    props.activeTabId = "shell"; render();
+    expect(tabEl().classList.contains("active")).toBe(false);
+    expect(tabEl().querySelector(selector)?.classList.contains("tab-pi-working")).toBe(true);
+    expect(tabEl("shell").querySelector(".tab-pi-working")).toBeNull();
+    for (const status of ["finished", "ended", undefined] as const) {
+      store.snap.live.local![0].agentStatus = status; render();
+      expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
+    }
+  });
+  it("does not aggregate a working Pi into the group icon", () => {
+    workingPi();
+    props.entries = [{ kind: "group", id: "g", group: { id: "g", name: "Group", layout: { kind: "leaf", tabId: "tab" } } }];
+    render(); expect(container.querySelector(".tab-pi-working")).toBeNull();
+    expect(container.querySelector(".tab-group-icon")).not.toBeNull();
+  });
+  it("stale, closing, raw and other agents never animate", () => {
+    workingPi(); render(); expect(tabEl().querySelector(".tab-pi-working")).not.toBeNull();
+    replaceStatus({ status: "reconnecting" }); expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
+    expect(tabEl().getAttribute("aria-label")).toContain("Working (last known)");
+    replaceStatus({ status: "connected" }); props.closingTabIds.add("tab"); render();
+    expect(tabEl().querySelector(".tab-pi-working")).toBeNull(); props.closingTabIds.clear();
+    for (const agent of ["claude", "codex"] as const) { tabs[0].agent = agent; render(); expect(tabEl().querySelector(".tab-pi-working")).toBeNull(); }
+    tabs[0].agent = "pi"; tabs[0].shellMode = "raw"; render(); expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
+  });
+});

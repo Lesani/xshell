@@ -377,6 +377,7 @@ fn first_message_reaches_npm_codex_unchanged() {
         exe: exe.into(),
         endpoint: String::new(),
         claude_settings: Default::default(),
+        pi_extension: None,
     }
     .codex_overrides();
     assert_eq!(got[..8], want[..], "{got:?}");

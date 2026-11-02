@@ -189,6 +189,7 @@ fn unknown_screens_are_not_prompts() {
         let other = match fx.agent {
             HookAgent::Claude => HookAgent::Codex,
             HookAgent::Codex => HookAgent::Claude,
+            HookAgent::Pi => panic!("Pi has no prompt fixtures"),
         };
         assert_eq!(extract(other, &fx.screen()), None, "{}", fx.name);
     }
@@ -224,6 +225,7 @@ fn other(agent: HookAgent) -> HookAgent {
     match agent {
         HookAgent::Claude => HookAgent::Codex,
         HookAgent::Codex => HookAgent::Claude,
+        HookAgent::Pi => panic!("Pi has no prompt fixtures"),
     }
 }
 
@@ -342,5 +344,15 @@ fn conpty_renderings_read_as_their_sources() {
             "{name}:\n{}",
             screen.join("\n")
         );
+    }
+}
+
+#[test]
+fn pi_rejects_every_claude_and_codex_fixture() {
+    for fx in Fixture::all() {
+        let rows = fx.screen();
+        assert_eq!(extract(HookAgent::Pi, &rows), None, "{}", fx.name);
+        assert!(!composer(HookAgent::Pi, &rows), "{}", fx.name);
+        assert_eq!(composer_images(HookAgent::Pi, &rows), None, "{}", fx.name);
     }
 }

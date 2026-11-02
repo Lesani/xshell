@@ -338,6 +338,30 @@ fn send_submit(c: &mut Client, t: &Term, text: &str) -> u64 {
 }
 
 #[test]
+fn pi_status_support_does_not_grant_prompt_or_submit_capability() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.open("pi");
+    for fixture in [
+        "claude-composer-idle",
+        "codex-composer-idle",
+        "claude-bash-100x30",
+    ] {
+        t.show(fixture, true);
+        e.status(&t, AgentStatus::Working);
+        assert_eq!(
+            submit(&mut m, &t, "must not type"),
+            Err(SUBMIT_NOT_CHAT.into())
+        );
+        assert_eq!(
+            submit(&mut e.desk, &t, "must not type"),
+            Err(SUBMIT_NOT_CHAT.into())
+        );
+        assert!(t.input().is_empty());
+    }
+}
+
+#[test]
 fn submit_types_paste_then_enter() {
     let mut e = env();
     let mut m = e.mobile();
