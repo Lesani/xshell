@@ -175,3 +175,36 @@ describe("metaSync without echo loops (amendment 17)", () => {
     expect(a.m.isDirty(a.tabs[0].id, "title")).toBe(false);
   });
 });
+
+describe("shared names stay outside automatic MetaSync", () => {
+  it("observed_custom_title_never_becomes_local_edit", () => {
+    const before = tabFromTerminal(H, info("u", "s", "Auto"));
+    const after = { ...before, customTitle: "Shared" };
+    expect(localEdits([before], [after])).toEqual([]);
+    const m = new MetaSync();
+    const observed = { ...info("u", "s", "Auto"), meta: { title: "Auto", customTitle: "Shared" } };
+    m.observe(H, [observed], [before]);
+    const d = reconcile([before], H, [observed], new Set(), (id, f) => m.isDirty(id, f));
+    expect(d.update[0].customTitle).toBe("Shared");
+    expect(m.takeUpdates(d.update)).toEqual([]);
+  });
+  it("automatic_poll_update_preserves_custom_title_and_sends_only_automatic_field", () => {
+    const m = new MetaSync();
+    const before = { ...tabFromTerminal(H, info("u", "s", "Old")), customTitle: "Shared" };
+    const after = { ...before, title: "Latest automatic" };
+    for (const e of localEdits([before], [after])) m.markDirty(e.tabId, e.field, e.value);
+    const [update] = m.takeUpdates([after]);
+    expect(update.meta).toEqual({ title: "Latest automatic" });
+    expect(after.customTitle).toBe("Shared");
+  });
+  it("removed_automatic_and_custom_keys_use_fallback_without_echo", () => {
+    const m = new MetaSync();
+    const before = { ...tabFromTerminal(H, info("u", "s", "Old")), customTitle: "Shared" };
+    const listed = info("u", "s");
+    m.observe(H, [listed], [before]);
+    const d = reconcile([before], H, [listed], new Set(), (id, f) => m.isDirty(id, f));
+    expect(d.update[0].title).toBe("Session");
+    expect(d.update[0].customTitle).toBeUndefined();
+    expect(m.takeUpdates(d.update)).toEqual([]);
+  });
+});

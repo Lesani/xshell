@@ -1,3 +1,4 @@
+import { tabName, effectiveTabName } from "../tabs/tabName";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, Terminal as TerminalIcon, Settings, X, PanelLeft, ChevronRight, ChevronLeft, Bot } from "lucide-react";
 import { useProjectImage } from "../hooks/useProjectImage";
@@ -100,7 +101,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
       const tk = keyOfTab(t);
       const customName = tk ? projectIcons[lookupKey(tk)]?.customName : undefined;
       const projDisplayName = customName || t.projectName || "";
-      const haystack = `${t.title} ${projDisplayName} ${t.shellId || ""}`.toLowerCase();
+      const haystack = `${effectiveTabName(t)} ${t.title} ${projDisplayName} ${t.shellId || ""}`.toLowerCase();
       return haystack.includes(q);
     });
   }, [sortedTabs, query, projectIcons]);
@@ -267,8 +268,7 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
             const customName = settings?.customName;
             const projDisplayName = customName || tab.projectName || (tab.projectPath ? "" : "~");
             const isRawShell = tab.shellMode === "raw";
-            const displayTitle = isRawShell ? (projDisplayName || tab.title) : tab.title;
-            const displaySubtitle = isRawShell ? tab.title : projDisplayName;
+            const { primary: displayTitle, secondary: displaySubtitle } = tabName(tab, projDisplayName);
             const matches = !!highlightKey && tabKey && lookupKey(tabKey) === highlightKey;
             const showDivider = i > 0 && i === firstRawIdx;
             return (

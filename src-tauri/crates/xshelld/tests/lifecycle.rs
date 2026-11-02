@@ -250,6 +250,8 @@ fn unresolved_cleanup_does_not_relaunch() {
         groups: vec![],
     };
     p.leader = Some(leader.clone());
+    p.meta.insert("customTitle".into(), json!("invalid\n"));
+    p.meta.insert("other".into(), json!(42));
     save_atomic(&h.paths().state, &[p]).unwrap();
     let srv = start(&h, |c| c.cleanup_override = Some(unkillable));
     let mut c = Client::connect(&srv.socket);
@@ -259,7 +261,24 @@ fn unresolved_cleanup_does_not_relaunch() {
     assert_eq!(list[0].exit_code, Some(-1));
     assert_eq!(list[0].pid, None);
     assert_eq!(list[0].meta.get("title"), Some(&json!("kept")));
+    assert!(!list[0].meta.contains_key("customTitle"));
+    assert_eq!(list[0].meta["other"], json!(42));
+    c.request(&ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: None,
+        meta: Some(
+            json!({"customTitle":"kept unresolved"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+    })
+    .unwrap();
     let state = h.state_json();
+    assert_eq!(
+        state["terminals"][0]["meta"]["customTitle"],
+        "kept unresolved"
+    );
     assert_eq!(state["terminals"][0]["leader"]["pid"], json!(999_999));
     // Attaching shows it ended; input is refused.
     let id = c.request_id();

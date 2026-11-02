@@ -1045,6 +1045,8 @@ pub(crate) fn spawn_with(
     first: Option<&str>,
     spawned: impl FnOnce(&Leader),
 ) -> Result<Arc<Terminal>, SpawnError> {
+    xshell_protocol::terminal_meta::validate_custom_title_record(&meta)
+        .map_err(|e| SpawnError::from(e.to_string()))?;
     if !spec.cwd.is_empty() && !Path::new(&spec.cwd).is_dir() {
         return Err(format!("working directory does not exist: {}", spec.cwd).into());
     }
@@ -2601,6 +2603,12 @@ impl Terminal {
         (spec, m)
     }
 
+    pub fn custom_title_changed(&self, meta: &Map<String, Value>) -> bool {
+        let record = self.record.lock().unwrap();
+        let key = xshell_protocol::terminal_meta::CUSTOM_TITLE_KEY;
+        record.meta.get(key) != meta.get(key)
+    }
+
     pub fn set_record(&self, spec: LaunchSpec, meta: Map<String, Value>) {
         let mut r = self.record.lock().unwrap();
         r.spec = spec;
@@ -2698,6 +2706,23 @@ impl Terminal {
     }
 
     pub fn persisted(&self) -> PersistedTerminal {
+        self.persisted_record(None)
+    }
+
+    /// Candidate metadata/spec with all live persistence bookkeeping (including pending
+    /// Relaunch, replacement leaders and prompt floor) taken by the same serializer.
+    pub fn persisted_with_record(
+        &self,
+        spec: &LaunchSpec,
+        meta: &Map<String, Value>,
+    ) -> PersistedTerminal {
+        self.persisted_record(Some((spec, meta)))
+    }
+
+    fn persisted_record(
+        &self,
+        candidate: Option<(&LaunchSpec, &Map<String, Value>)>,
+    ) -> PersistedTerminal {
         let r = self.record.lock().unwrap();
         let io = self.io.lock().unwrap();
         let (cols, rows) = io.arb.current();
@@ -2721,14 +2746,15 @@ impl Terminal {
                 groups,
             }
         });
+        let (base_spec, meta) = candidate.unwrap_or((&r.spec, &r.meta));
         let spec = r
             .pending_skip
-            .and_then(|skip| relaunch_spec(&r.spec, skip).ok())
-            .unwrap_or_else(|| r.spec.clone());
+            .and_then(|skip| relaunch_spec(base_spec, skip).ok())
+            .unwrap_or_else(|| base_spec.clone());
         PersistedTerminal {
             terminal: self.id,
             spec,
-            meta: r.meta.clone(),
+            meta: meta.clone(),
             cols,
             rows,
             created_at_ms: r.created_at_ms,
@@ -3279,6 +3305,67 @@ mod status_tests {
     fn event(c: &mut StatusCell, s: AgentStatus, now: u64) -> bool {
         let changed = c.tracker.on_event(s).unwrap();
         c.stamp(changed, now)
+    }
+
+    #[test]
+    fn custom_title_candidate_preserves_pending_relaunch_prompt_and_leaders() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::server::role::tests::daemon(dir.path());
+        let kept = Leader {
+            pid: 123,
+            start_time: Some(456),
+            groups: vec![ProcIdentity {
+                pid: 123,
+                start_time: Some(456),
+            }],
+        };
+        let p = PersistedTerminal {
+            terminal: Uuid::new_v4(),
+            spec: LaunchSpec {
+                agent: Some("claude".into()),
+                shell_mode: Some("claude".into()),
+                session_id: Some("old".into()),
+                ..Default::default()
+            },
+            meta: json!({"title":"automatic", "other":42})
+                .as_object()
+                .unwrap()
+                .clone(),
+            cols: 103,
+            rows: 37,
+            created_at_ms: 789,
+            leader: Some(kept.clone()),
+            prompt_id_floor: Some(999),
+        };
+        let t = unresolved(&d, p.clone());
+        t.restore_prompt_floor(999);
+        t.record.lock().unwrap().pending_skip = Some(true);
+        let mut spec = p.spec.clone();
+        spec.session_id = Some("new".into());
+        let meta = json!({"title":"latest", "customTitle":"name", "other":42})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut expected = p.clone();
+        expected.spec = spec.clone();
+        expected.spec.skip_permissions = Some(true);
+        expected.meta = meta.clone();
+        assert_eq!(t.persisted_with_record(&spec, &meta), expected);
+        let replacement = Leader {
+            pid: 321,
+            start_time: Some(654),
+            groups: vec![],
+        };
+        t.set_replacement(Some(replacement.clone()));
+        expected.leader = Some(replacement);
+        assert_eq!(t.persisted_with_record(&spec, &meta), expected);
+        assert_eq!(
+            t.info().meta,
+            p.meta,
+            "candidate must not mutate the live record"
+        );
+        assert_eq!(t.spec(), p.spec);
     }
 
     #[test]

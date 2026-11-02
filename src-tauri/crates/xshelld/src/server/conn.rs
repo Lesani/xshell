@@ -40,7 +40,7 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
 
 /// Whether `hello` offers capability `c`: not hidden by a test, and Chat View replies
 /// (with files) only where this Host takes them.
-fn offered(cfg: &super::Config, c: &str) -> bool {
+pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
     let off = match c {
         "daemon.upgrade-selected" => {
             !(cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
@@ -328,6 +328,18 @@ impl Conn {
                 spawn_call(&d, &self.ob, &self.inflight, self.role, id, method, params)
             }
             ClientMsg::TermOpen { spec } => {
+                // Reserved on both roles, including null, before adoption or spawning.
+                if spec
+                    .meta
+                    .contains_key(xshell_protocol::terminal_meta::CUSTOM_TITLE_KEY)
+                {
+                    reply(
+                        &self.ob,
+                        id,
+                        Err("customTitle is reserved for term.update".into()),
+                    );
+                    return;
+                }
                 // A first message is checked for every role, after the role's own checks and
                 // before the registry is locked: a refusal here starts nothing.
                 if let Some(msg) = spec.first_message.as_deref() {
@@ -510,8 +522,19 @@ impl Conn {
             ClientMsg::TermUpdate {
                 terminal,
                 session_id,
-                meta,
+                mut meta,
             } => {
+                let touched = match meta
+                    .as_mut()
+                    .map(xshell_protocol::terminal_meta::normalize_custom_title_patch)
+                    .transpose()
+                {
+                    Ok(t) => t.unwrap_or(false),
+                    Err(e) => {
+                        reply(&self.ob, id, Err(e.to_string()));
+                        return;
+                    }
+                };
                 let reg = d.reg.lock().unwrap();
                 let r = match reg.terminals.get(&terminal) {
                     None => Err(format!("unknown terminal {terminal}")),
@@ -523,7 +546,7 @@ impl Conn {
                         )),
                         _ => {
                             let (spec, meta) = t.updated(session_id, meta);
-                            d.apply_record(&reg, t, spec, meta).map(|()| Value::Null)
+                            d.apply_record_update(&reg, t, spec, meta, touched).map(|()| Value::Null)
                         }
                     },
                 };

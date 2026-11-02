@@ -15,8 +15,8 @@ pub enum HostErrorCode {
     Remote,
     Busy,
     Invalid,
-    /// A `term.open` the Daemon failed after starting its Terminal, without confirming the
-    /// Terminal is gone ([`xshell_protocol::OPEN_INDETERMINATE`]): it may still run.
+    /// An open whose cleanup is unconfirmed, or a custom-name write installed without
+    /// confirmed durability. Reconcile observed state; this is not a clean refusal.
     Indeterminate,
 }
 
@@ -48,7 +48,9 @@ impl HostError {
     /// The Daemon's error text as an error: [`HostErrorCode::Indeterminate`] when it says
     /// the outcome is open, otherwise [`HostErrorCode::Remote`].
     pub fn from_daemon(m: String) -> Self {
-        if m.starts_with(xshell_protocol::OPEN_INDETERMINATE) {
+        if m.starts_with(xshell_protocol::OPEN_INDETERMINATE)
+            || m.starts_with(xshell_protocol::CUSTOM_TITLE_NOT_DURABLE)
+        {
             Self::new(HostErrorCode::Indeterminate, m)
         } else {
             Self::remote(m)
@@ -202,6 +204,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&XshellNotRunning).unwrap(),
             r#""xshell-not-running""#
+        );
+    }
+
+    #[test]
+    fn custom_title_not_durable_is_indeterminate() {
+        let message = format!("{} sync failed", xshell_protocol::CUSTOM_TITLE_NOT_DURABLE);
+        let e = HostError::from_daemon(message.clone());
+        assert_eq!(e.code, HostErrorCode::Indeterminate);
+        assert_eq!(e.message, message);
+        assert_eq!(
+            HostError::from_daemon("cannot save the terminal list".into()).code,
+            HostErrorCode::Remote
         );
     }
 

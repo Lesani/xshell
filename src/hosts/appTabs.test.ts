@@ -113,3 +113,24 @@ describe("M4: \"local\" never enters the Remote data path", () => {
     expect(withHostData(prev, H, null)).toBe(prev);
   });
 });
+
+describe("shared names in cached/reconnect reconstruction", () => {
+  it("cache_restores_separate_titles_and_absent_keys_restore_current_fallback", async () => {
+    const { emptyCache, putTerminals, parseCache } = await import("./cache");
+    const { reconcile, applyTabDelta } = await import("./reconcile");
+    const named = { ...info("u", 0), meta: { title: "Old", customTitle: "Shared" } };
+    let cached = putTerminals(emptyCache(), "local", [named], 1);
+    const restore = () => {
+      const disk = parseCache(JSON.parse(JSON.stringify(cached)));
+      return restorableTabs({ saved: [], hosts: [], localDaemon: true, cached: h => disk.hosts[h]?.terminals ?? null });
+    };
+    const before = restore();
+    expect(before[0]).toMatchObject({ title: "Old", customTitle: "Shared" });
+    // A combined {title:null,customTitle:null} patch removes both keys in the list.
+    const cleared = { ...named, meta: {} };
+    const current = applyTabDelta(before, reconcile(before, undefined, [cleared], new Set()));
+    expect(current[0].title).toBe("Session"); expect(current[0]).not.toHaveProperty("customTitle");
+    cached = putTerminals(cached, "local", [cleared], 2);
+    expect(restore()).toEqual(current);
+  });
+});

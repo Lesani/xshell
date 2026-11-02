@@ -201,8 +201,8 @@ pub struct Config {
     pub test_hook: Option<TestHook>,
 }
 
-/// Where a [`TestHook`] runs. Points other than [`TestPoint::ExitHandled`] run on the thread
-/// doing the work, with no lock held, so a hook may block to order a race.
+/// Where a [`TestHook`] runs, on the thread doing the work. Points whose documentation
+/// names held locks must not re-enter the Daemon; other points may block to order a race.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPoint {
@@ -257,6 +257,9 @@ pub enum TestPoint {
     /// The prompt worker is about to write a snapshot with a new prompt-id floor; the prompt
     /// waiting for it is not listed yet (no lock held).
     PromptPersist,
+    /// Custom-name replacement succeeded and Unix directory sync follows (registry and
+    /// saves locked). Returning true injects a sync failure; do not block or call the Daemon.
+    CustomTitleDirectorySync,
     /// An answer was checked against the screen and is about to be queued, with this
     /// Terminal's screen and prompt locked: a hook may block, but must not touch the Terminal.
     AnswerChecked,
@@ -725,7 +728,7 @@ impl Server {
             push,
             last_lines,
             prompts,
-            saves: Mutex::new(0),
+            saves: Mutex::new(registry::SaveStatus::default()),
             snap_seq: AtomicU64::new(0),
             session_streams,
         });

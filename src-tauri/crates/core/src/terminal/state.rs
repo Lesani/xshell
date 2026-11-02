@@ -102,7 +102,8 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 }
 
 /// Replace the state file atomically: write `<path>.tmp` (0600), fsync, rename, fsync the
-/// directory. Creates the parent directory (0700) if needed.
+/// directory on Unix. Windows retains the synced-file/atomic-rename guarantee without
+/// parent-directory fsync. Creates the parent directory (0700 on Unix) if needed.
 pub fn save_atomic(path: &Path, list: &[PersistedTerminal]) -> io::Result<()> {
     prepare(path, list, "tmp")?.commit()
 }
@@ -152,17 +153,54 @@ pub fn prepare(path: &Path, list: &[PersistedTerminal], tag: &str) -> io::Result
     })
 }
 
+/// A failed commit, distinguishing refusal before replacement from an installed snapshot
+/// whose durability could not be confirmed. No rollback is attempted after installation.
+#[derive(Debug)]
+pub struct CommitError {
+    pub error: io::Error,
+    pub installed: bool,
+}
+
 impl Prepared {
-    /// Put it in place (atomically) and sync the directory.
+    /// Backward-compatible I/O result for callers that do not need the installation stage.
     pub fn commit(self) -> io::Result<()> {
-        if let Err(e) = fs::rename(&self.tmp, &self.path) {
+        self.commit_staged().map_err(|e| e.error)
+    }
+
+    /// Put it in place atomically and sync the directory on Unix.
+    pub fn commit_staged(self) -> Result<(), CommitError> {
+        self.commit_staged_with_sync_hook(|| Ok(()))
+    }
+
+    /// Test seam after real replacement, before the Unix directory sync. The hook must not
+    /// acquire any caller locks. It is not called on platforms without directory fsync.
+    #[doc(hidden)]
+    pub fn commit_staged_with_sync_hook(
+        self,
+        before_sync: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), CommitError> {
+        if let Err(error) = fs::rename(&self.tmp, &self.path) {
             let _ = fs::remove_file(&self.tmp);
-            return Err(e);
+            return Err(CommitError {
+                error,
+                installed: false,
+            });
         }
         #[cfg(unix)]
-        if let Some(dir) = self.path.parent() {
-            fs::File::open(dir)?.sync_all()?;
+        {
+            let synced = before_sync().and_then(|()| {
+                if let Some(dir) = self.path.parent() {
+                    fs::File::open(dir)?.sync_all()?;
+                }
+                Ok(())
+            });
+            synced.map_err(|error| CommitError {
+                error,
+                installed: true,
+            })?;
         }
+        #[cfg(not(unix))]
+        let _ = before_sync;
         Ok(())
     }
 
@@ -208,6 +246,51 @@ mod tests {
             }),
             prompt_id_floor: Some(1_700_000_000_123),
         }
+    }
+
+    #[test]
+    fn staged_commit_reports_preinstall_failure_without_replacing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminals.json");
+        save_atomic(&path, &[entry("/old")]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let prepared = prepare(&path, &[entry("/new")], "next").unwrap();
+        // A genuine failed rename, not a simulated replacement.
+        fs::remove_file(dir.path().join("terminals.json.next")).unwrap();
+        let error = prepared.commit_staged().unwrap_err();
+        assert!(!error.installed);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_commit_reports_installed_directory_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminals.json");
+        save_atomic(&path, &[entry("/old")]).unwrap();
+        let prepared = prepare(&path, &[entry("/new")], "next").unwrap();
+        let error = prepared
+            .commit_staged_with_sync_hook(|| Err(io::Error::other("sync fault")))
+            .unwrap_err();
+        assert!(error.installed);
+        assert_eq!(error.error.to_string(), "sync fault");
+        assert_eq!(load(&path).unwrap().terminals[0].spec.cwd, "/new");
+        assert!(!dir.path().join("terminals.json.next").exists());
+    }
+
+    #[test]
+    fn legacy_commit_preserves_io_result_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminals.json");
+        prepare(&path, &[entry("/old")], "next")
+            .unwrap()
+            .commit()
+            .unwrap();
+        let prepared = prepare(&path, &[entry("/new")], "next").unwrap();
+        fs::remove_file(dir.path().join("terminals.json.next")).unwrap();
+        let result: io::Result<()> = prepared.commit();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(load(&path).unwrap().terminals[0].spec.cwd, "/old");
     }
 
     #[test]

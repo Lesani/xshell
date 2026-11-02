@@ -304,7 +304,8 @@ export interface ProjectMemories {
 export interface Tab {
   id: string;
   type: 'home' | 'terminal';
-  title: string;
+  title: string; // automatic title, independent of the observed shared name
+  customTitle?: string; // observed Daemon-owned display override; never a local edit
   sessionId?: string;
   projectPath?: string;
   projectName?: string;

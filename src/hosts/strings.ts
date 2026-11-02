@@ -4,6 +4,26 @@
 // system and this module does not introduce one. `{param}` placeholders are filled by fmt().
 
 export const S = {
+  "tab.rename.action": "Rename Tab…",
+  "tab.rename.automatic": "Use automatic name",
+  "tab.rename.title": "Rename Tab",
+  "tab.rename.label": "Tab name",
+  "tab.rename.help": "Saved on this Terminal’s Host and shared with your other Desktops and Mobile. The agent’s session name is unchanged.",
+  "tab.rename.save": "Save",
+  "tab.rename.cancel": "Cancel",
+  "tab.rename.saving": "Saving…",
+  "tab.rename.clearing": "Restoring automatic name…",
+  "tab.rename.blank": "Enter a Tab name, or choose Use automatic name.",
+  "tab.rename.tooLong": "Use 256 characters or fewer.",
+  "tab.rename.controls": "Use a single line without control characters.",
+  "tab.rename.unsupported": "Update xshell on this Host to save shared Tab names.",
+  "tab.rename.offline": "Connect to this Host to change the Tab name.",
+  "tab.rename.inProcess": "Shared Tab names require this Terminal to run in a Daemon.",
+  "tab.rename.gone": "This Terminal is no longer available.",
+  "tab.rename.failed": "Couldn’t save the Tab name: {error}",
+  "tab.rename.notConfirmed": "Couldn’t confirm that the Tab name was saved. The current name may have changed. Reconnect if needed, then try again.",
+  "tab.rename.menuA11y": "Tab name actions",
+
   "hosts.hint.updateFailed": "Check xshell on that Host, then reconnect to try again.",
   "hosts.update.action": "Update",
   "hosts.update.replace": "Use this Desktop’s build",

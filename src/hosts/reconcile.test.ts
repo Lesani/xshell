@@ -365,3 +365,38 @@ it("restored Pi Terminals keep scoped custom IDs without collapsing across Proje
   expect(delta.add.map(t => [t.agent, t.sessionId, t.projectPath])).toEqual([["pi", "custom", "/A"], ["pi", "custom", "/B"], ["claude", "custom", "/A"]]);
   expect(reconcile(delta.add, H, list, new Set())).toMatchObject({ add: [], remove: [], update: [] });
 });
+
+describe("shared custom title observation", () => {
+  it("custom_title_is_observed_and_removed_independently_of_dirty_automatic_title", () => {
+    const t = tabFromTerminal(H, info("u", {}, { title: "Old", customTitle: "Shared" }));
+    const [changed] = reconcile([t], H, [info("u", {}, { title: "Remote", customTitle: "Other" })], new Set(), () => true).update;
+    expect(changed).toMatchObject({ title: "Old", customTitle: "Other" });
+    const [cleared] = reconcile([changed], H, [info("u", {}, {})], new Set(), () => true).update;
+    expect(cleared.title).toBe("Old");
+    expect(cleared).not.toHaveProperty("customTitle");
+  });
+  it.each([false, true])("absent_automatic_title_reconciles_to_current_fallback (raw=%s)", raw => {
+    const spec = { cwd: "/p", shellMode: raw ? "raw" : "claude", shellId: raw ? "bash" : undefined };
+    const old = info("u", { spec }, { title: "Old", customTitle: "Shared" });
+    const tab = tabFromTerminal(H, old);
+    const withoutAutomatic = { ...old, meta: { customTitle: "Shared" } };
+    const [changed] = reconcile([tab], H, [withoutAutomatic], new Set()).update;
+    expect(changed).toMatchObject({ title: raw ? "Bash" : "Session", customTitle: "Shared" });
+    const cleared = { ...old, meta: {} }; // list after {title:null, customTitle:null} patch
+    const [automatic] = reconcile([changed], H, [cleared], new Set()).update;
+    expect(automatic.title).toBe(raw ? "Bash" : "Session");
+    expect(automatic).not.toHaveProperty("customTitle");
+    expect(tabFromTerminal(H, cleared)).toEqual(automatic);
+    const [combined] = reconcile([tab], H, [cleared], new Set()).update;
+    expect(combined).toEqual(automatic);
+  });
+  it("same_looking_terminals_on_different_hosts_keep_distinct_names", () => {
+    const a = tabFromTerminal(H, info("a", {}, { customTitle: "A" }));
+    const b = tabFromTerminal(H2, info("b", {}, { customTitle: "B" }));
+    const result = applyReconcile(state([a, b]), reconcile([a, b], H, [info("a", {}, { customTitle: "New A" })], new Set()));
+    expect(result.tabs.map(t => t.customTitle)).toEqual(["New A", "B"]);
+  });
+  it("old_or_type_wrong_custom_field_is_absent", () => {
+    for (const value of [undefined, null, 42, {}, ""]) expect(tabFromTerminal(H, info("u", {}, { customTitle: value })).customTitle).toBeUndefined();
+  });
+});

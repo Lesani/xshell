@@ -1,4 +1,8 @@
-import { useState, useEffect, useRef, useLayoutEffect, useCallback } from "react";
+import { tabName } from "../tabs/tabName";
+import { CustomTitleController, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches, type CustomTitleTarget } from "../tabs/customTitle";
+import { TabNameMenu } from "./TabNameMenu";
+import { RenameTabDialog } from "./RenameTabDialog";
+import { useState, useEffect, useRef, useLayoutEffect, useCallback, useSyncExternalStore } from "react";
 import { loadProjectSessions } from "../hosts/projectSessions";
 import { keyOf, keyOfTab, lookupKey, sameKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
 import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot, ShieldOff } from "lucide-react";
@@ -216,9 +220,26 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
 
 export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const [names] = useState(() => new CustomTitleController(() => tabsRef.current, registry.getSnapshot));
+  const nameState = useSyncExternalStore(names.subscribe, names.getSnapshot);
+  const [nameMenu, setNameMenu] = useState<{ tabId: string; target: CustomTitleTarget | null; anchor: HTMLElement; x: number; y: number } | null>(null);
+  const nameTrigger = useRef<HTMLElement | null>(null);
+  const closeNameMenu = useCallback(() => setNameMenu(null), []);
   const hostsSnap = useHostsSnapshot();
   const hostNameOf = (h: string) => hostsSnap.configs.find(c => c.id === h)?.name || h;
   const localAgentStatuses = useLocalAgentStatuses();
+  useEffect(() => { names.invalidate(); }, [names, tabs, hostsSnap]);
+  const menuTab = nameMenu ? tabs.find(t => t.id === nameMenu.tabId && (!nameMenu.target || customTitleTargetMatches(nameMenu.target, t, hostsSnap)) && !t.groupId && !closingTabIds.has(t.id)) : undefined;
+  useEffect(() => { if (nameMenu && !menuTab) closeNameMenu(); }, [nameMenu, menuTab, closeNameMenu]);
+  const dialogTab = nameState.dialog ? tabs.find(t => t.id === nameState.dialog!.target.tabId && !closingTabIds.has(t.id)) : undefined;
+  useEffect(() => { if (nameState.dialog && !dialogTab) names.dismiss(); }, [names, nameState.dialog, dialogTab]);
+  const openNameDialog = (tab: Tab, clear: boolean) => {
+    if (nameMenu) nameTrigger.current = nameMenu.anchor;
+    closeNameMenu();
+    if (names.open(tab, nameMenu?.target) && clear) void names.submit(null);
+  };
   const highlightKey = hoveredProjectKey || linkedProjectKey || (selectedProject ? keyOf(selectedProject) : null);
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
@@ -235,11 +256,12 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
       if (e.key.toLowerCase() !== "k") return;
       e.preventDefault();
       e.stopPropagation();
+      if (nameState.dialog || nameMenu) return;
       setSearchOpen(v => !v);
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [isMac]);
+  }, [isMac, nameState.dialog, nameMenu]);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const commitRename = () => {
@@ -375,9 +397,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const customName = projectSettings?.customName;
             const projectDisplayName = customName || tab.projectName || "";
             const isRawShell = tab.shellMode === "raw";
-            const displayTitle = isRawShell ? (projectDisplayName || tab.title) : tab.title;
-            const displaySubtitle = isRawShell ? tab.title : projectDisplayName;
-            const baseTooltip = displaySubtitle ? `${displayTitle} — ${displaySubtitle}` : displayTitle;
+            const { primary: displayTitle, secondary: displaySubtitle, tooltip: baseTooltip } = tabName(tab, projectDisplayName);
             const hostTooltip = tab.host ? `${baseTooltip} · ${fmt("tab.tooltip.onHost", { host: hostNameOf(tab.host) })}` : baseTooltip;
             const permsTooltip = tab.skipPermissions ? `${hostTooltip} · ${fmt("tab.skipPerms.tabTooltip")}` : hostTooltip;
             const liveHost = daemonHost(tab);
@@ -389,7 +409,20 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
             const statusHost = tab.host ? hostNameOf(tab.host) : liveHost ? fmt("picker.group.local") : "";
             const tooltipText = agentStatus ? `${permsTooltip}\n${agentStatusTooltip(agentStatus, statusHost)}` : permsTooltip;
             return (
-              <div key={tab.id} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${tab.skipPermissions ? "tab-skip-perms" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
+              <div key={tab.id} role="button" tabIndex={0} aria-label={tooltipText} aria-haspopup={tab.type === "terminal" ? "menu" : undefined}
+                onContextMenu={e => {
+                  if (tab.type !== "terminal" || isClosing) return;
+                  e.preventDefault(); setTooltip(null);
+                  setNameMenu({ tabId: tab.id, target: captureCustomTitleTarget(tab, registry.getSnapshot()), anchor: e.currentTarget, x: e.clientX, y: e.clientY });
+                }}
+                onKeyDown={e => {
+                  if (isClosing) return;
+                  if (tab.type === "terminal" && (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10"))) {
+                    e.preventDefault(); setTooltip(null);
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    setNameMenu({ tabId: tab.id, target: captureCustomTitleTarget(tab, registry.getSnapshot()), anchor: e.currentTarget, x: rect.left, y: rect.bottom });
+                  } else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelectTab(tab.id); }
+                }} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${tab.skipPermissions ? "tab-skip-perms" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                 {isRawShell
                   ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
@@ -458,6 +491,14 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
       {dropdown && (
         <RecentSessionsDropdown project={activeTabProject} displayName={activeTabProject ? (projectIcons[lookupKey(keyOf(activeTabProject))]?.customName || activeTabProject.name) : ""} openSessionIds={openSessionIds} anchorRect={dropdown.rect} anchorEl={dropdown.el} installedAgents={installedAgents} onPick={(s) => activeTabProject && onOpenSession(s, activeTabProject)} onPickShell={(id, name) => onNewShell(activeTabProject, id, name)} onNewChat={onNewChatInActive} onClose={() => setDropdown(null)} />
       )}
+
+      {nameMenu && menuTab && <TabNameMenu anchor={nameMenu.anchor} x={nameMenu.x} y={nameMenu.y}
+        unavailable={customTitleUnavailable(menuTab, hostsSnap)} hasCustomTitle={!!menuTab.customTitle} busy={nameState.pending}
+        onRename={() => openNameDialog(menuTab, false)} onAutomatic={() => openNameDialog(menuTab, true)} onClose={closeNameMenu} />}
+      {nameState.dialog && dialogTab && nameTrigger.current && <RenameTabDialog returnFocus={nameTrigger.current}
+        seed={nameState.dialog.seed} operation={nameState.dialog.operation} error={nameState.dialog.error}
+        unavailable={customTitleUnavailable(dialogTab, hostsSnap)} hasCustomTitle={!!dialogTab.customTitle || nameState.dialog.retryClear}
+        onSubmit={names.submit} onClose={names.dismiss} />}
 
       {tooltip && <TabTooltip text={tooltip.text} rect={tooltip.rect} />}
 

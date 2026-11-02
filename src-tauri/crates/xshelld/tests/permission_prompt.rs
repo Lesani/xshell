@@ -1070,3 +1070,94 @@ fn hint_fragment_in_later_output_ends_the_prompt() {
     assert_eq!(e.info(&t).permission_prompt, None);
     assert!(t.keys().is_empty());
 }
+
+/// An installed custom snapshot protects the name against an older prompt save, but is
+/// proof of that floor's durability only after a successful sync. Both outcomes use the
+/// same real protocol/barrier sequence; no prompt may be published on uncertain supersession.
+#[test]
+fn custom_title_supersedes_older_prompt_snapshot_only_confirms_when_durable() {
+    use serde_json::json;
+    use std::sync::atomic::AtomicBool;
+    for sync_fails in [false, true] {
+        let fail = Arc::new(AtomicBool::new(sync_fails));
+        let fail_hook = fail.clone();
+        let (_at, clock) = test_clock(5_000_000_000_000);
+        let mut e = env_with(|c| {
+            c.prompt_clock = Some(clock);
+            let hold = c.test_hook.take().unwrap();
+            c.test_hook = Some(TestHook(Arc::new(move |t, p| {
+                if p == TestPoint::CustomTitleDirectorySync {
+                    fail_hook.load(Ordering::SeqCst)
+                } else {
+                    (hold.0)(t, p)
+                }
+            })));
+        });
+        let t = e.open("claude");
+        e.hold.at(Some(TestPoint::PromptPersist));
+        e.show(&t, "claude-bash-100x30");
+        e.status(&t, "claude", AgentStatus::NeedsYou);
+        e.hold.wait_held();
+        let patch = ClientMsg::TermUpdate {
+            terminal: t.id,
+            session_id: None,
+            meta: Some(
+                json!({"customTitle":"newer custom name"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        };
+        let result = e.desk.request(&patch);
+        if sync_fails {
+            assert!(result
+                .unwrap_err()
+                .starts_with(xshell_protocol::CUSTOM_TITLE_NOT_DURABLE));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(e.info(&t).permission_prompt, None);
+        let installed = e.h.state_json();
+        assert_eq!(
+            installed["terminals"][0]["meta"]["customTitle"],
+            "newer custom name"
+        );
+        assert!(installed["terminals"][0]["promptIdFloor"].as_u64().unwrap() >= 5_000_000_000_000);
+        // Releasing V1 while holding the next read lets the original confirmation finish
+        // without permitting a later scan/save to mask a false-positive confirmation.
+        e.hold.at(Some(TestPoint::PromptRead));
+        e.run(&t, r"printf '\033[?25l'");
+        e.hold.wait_held();
+        assert_eq!(
+            e.h.state_json(),
+            installed,
+            "older prompt snapshot overwrote custom name"
+        );
+        if sync_fails {
+            assert_eq!(
+                e.info(&t).permission_prompt,
+                None,
+                "unsynced V2 falsely confirmed V1"
+            );
+            assert_eq!(
+                answer(&mut e.desk, &t, 5_000_000_000_000, 0),
+                Err(PROMPT_ANSWERED.into())
+            );
+            e.desk.drain_for(Duration::from_millis(50));
+            assert!(!e.desk.log.iter().any(|event| matches!(event, Ev::Msg(ServerMsg::Terminals { list }) if list.iter().any(|i| i.terminal == t.id && i.permission_prompt.is_some()))), "an unconfirmed prompt was published");
+            // An explicit equal-value retry performs the first confirmed durable save.
+            fail.store(false, Ordering::SeqCst);
+            e.desk.request(&patch).unwrap();
+            assert_eq!(e.info(&t).permission_prompt, None);
+        } else {
+            assert_eq!(
+                e.info(&t).permission_prompt.as_ref().map(|p| p.id),
+                Some(5_000_000_000_000)
+            );
+        }
+        e.hold.at(None);
+        wait_prompt(&mut e.desk, &t, |q| q.is_some());
+        assert_eq!(e.info(&t).meta["customTitle"], "newer custom name");
+        assert!(t.keys().is_empty());
+    }
+}
