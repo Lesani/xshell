@@ -1,3 +1,6 @@
+import { useLocalAgentStatuses } from "./tabs/localAgentStatus";
+import { groupTabsSetting, normalizeProjectTabs, tabBarEntries } from "./tabs/projectOrder";
+import { projectTerminals } from "./tabs/projectTerminals";
 import { adoptRightPanel, decodeRightPanels, defaultRightPanel, ensureRightPanels, pruneRightPanels, removeRightPanelHost, rightPanelKey, setRightPanel, RIGHT_PANELS_SETTING, type RightPanel, type RightPanels } from "./tabs/rightPanel";
 import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
@@ -105,7 +108,7 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
 // the result (H: the whole startup is single-flight and its state application fenced).
 async function loadStartup() {
   const store = await load("settings.json", { defaults: {}, autoSave: true });
-  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels] = await Promise.all([
+  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs] = await Promise.all([
     store.get<string[]>("project_paths"),
     store.get<Record<string, ProjectSettings>>("project_icons"),
     store.get<Tab[]>("open_tabs"),
@@ -136,8 +139,9 @@ async function loadStartup() {
     store.get<boolean>("session_row_metrics_opencode"),
     store.get<HostConfig[]>("hosts"),
     store.get<unknown>(RIGHT_PANELS_SETTING),
+    store.get<unknown>("group_tabs_by_project"),
   ]);
-  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels };
+  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs };
   // Remote Hosts: start the registry (a no-op with none configured) and load the offline
   // cache so their last known Terminals show as Tabs right away. In local Daemon mode the
   // Local Host joins the registry and its cached Tabs restore too.
@@ -201,6 +205,7 @@ export default function App() {
   const setRecentSessions = useCallback((local: SessionInfo[]) => setRecentByHost(prev => ({ ...prev, local })), []);
   // Remote Hosts: registry snapshot (dormant and constant when no Hosts are configured).
   const hostsSnap = useHostsSnapshot();
+  const localAgentStatuses = useLocalAgentStatuses();
   const [notice, setNotice] = useState<{ id: number; text: string } | null>(null);
   const showNotice = useCallback((text: string) => setNotice({ id: Date.now(), text }), []);
   const dismissNotice = useCallback(() => setNotice(null), []);
@@ -238,6 +243,7 @@ export default function App() {
   const [gitLazyPolling, setGitLazyPolling] = useState(true);
   // Show git changes as a folder tree (default). Off = flat list with a dimmed path per file.
   const [gitChangesTree, setGitChangesTree] = useState(true);
+  const [groupTabsByProject, setGroupTabsByProject] = useState(true);
   // When on (default), a newly opened agent terminal shows the file-explorer panel immediately.
   const [fileExplorerOnStart, setFileExplorerOnStart] = useState(true);
   const [rightPanels, setRightPanels] = useState<RightPanels>({});
@@ -425,6 +431,7 @@ export default function App() {
       if (typeof v.rlSidebar === "boolean") setShowRateLimitInSidebar(v.rlSidebar);
       if (typeof v.rowMetrics === "boolean") setShowSessionRowMetrics(v.rowMetrics);
       if (typeof v.gitTree === "boolean") setGitChangesTree(v.gitTree);
+      setGroupTabsByProject(groupTabsSetting(v.storedGroupTabs));
       if (typeof v.fileExpOnStart === "boolean") setFileExplorerOnStart(v.fileExpOnStart);
       if (typeof v.fsRender === "boolean") setFullscreenRendering(v.fsRender);
       if (typeof v.syncOut === "boolean") setForceSyncOutput(v.syncOut);
@@ -442,7 +449,7 @@ export default function App() {
       updateRightPanels(ensureRightPanels(decodeRightPanels(v.storedRightPanels), restored.tabs, typeof v.fileExpOnStart === "boolean" ? v.fileExpOnStart : true));
       setRightPanelsLoaded(true);
       if (restored.tabs.length) {
-        setTabs(restored.tabs);
+        setTabs(groupTabsSetting(v.storedGroupTabs) ? normalizeProjectTabs(restored.tabs, restored.groups) : restored.tabs);
         setGroups(restored.groups);
         let maxN = 0;
         for (const g of restored.groups) {
@@ -628,6 +635,10 @@ export default function App() {
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("git_changes_tree", enabled); } catch (_) {}
   }, []);
 
+  const persistGroupTabsByProject = useCallback(async (enabled: boolean) => {
+    setGroupTabsByProject(enabled);
+    try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("group_tabs_by_project", enabled); } catch (_) {}
+  }, []);
   const persistFileExplorerOnStart = useCallback(async (enabled: boolean) => {
     setFileExplorerOnStart(enabled);
     try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("file_explorer_on_start", enabled); } catch (_) {}
@@ -1148,27 +1159,16 @@ export default function App() {
     }
   });
 
-  // Derived: tab bar entries. A tab with groupId doesn't appear standalone — its group does.
-  // Walking tabs in order yields a deterministic, order-preserving set of entries.
-  // Memoized so the array reference is stable when tabs/groups don't change — the drag-reorder
-  // hook in TabBar uses this as its `items` and would otherwise thrash its effect on every render.
-  type Entry = { kind: "tab"; id: string; tab: Tab } | { kind: "group"; id: string; group: Group };
-  const entries: Entry[] = useMemo(() => {
-    const seen = new Set<string>();
-    const out: Entry[] = [];
-    for (const t of tabs) {
-      if (t.groupId) {
-        if (seen.has(t.groupId)) continue;
-        const g = groups.find(gr => gr.id === t.groupId);
-        if (!g) continue; // orphaned groupId — defensive skip
-        seen.add(t.groupId);
-        out.push({ kind: "group", id: g.id, group: g });
-      } else {
-        out.push({ kind: "tab", id: t.id, tab: t });
-      }
-    }
-    return out;
-  }, [tabs, groups]);
+  // One canonical atomic entry sequence serves rendering and drag hit-testing.
+  // Normalize the actual Tabs before paint, preserving each Terminal's keyed portal.
+  const entries = useMemo(() => tabBarEntries(tabs, groups), [tabs, groups]);
+  useLayoutEffect(() => {
+    if (tabsRestored && groupTabsByProject) setTabs(prev => normalizeProjectTabs(prev, groups));
+  }, [tabs, groups, tabsRestored, groupTabsByProject]);
+  const selectedProjectTerminals = useMemo(() => {
+    const key = selectedProject ? runtimeProjectKey(selectedProject) : null;
+    return projectTerminals(tabs, groups, hostsSnap, closingTabIds, localAgentStatuses).filter(row => row.projectKey === key);
+  }, [tabs, groups, hostsSnap, closingTabIds, localAgentStatuses, selectedProject]);
 
   // ── Remote Tabs mirror each Host's `terminals` list (ADR-0001) ──────
   // Buffered until the restore of open_tabs + cache has committed (amendment 21); then the
@@ -1515,7 +1515,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar groupTabsByProject={groupTabsByProject} tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onHoverProject={setHoveredProjectKey} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectKey={activeTabProjectKey} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
@@ -1523,11 +1523,11 @@ export default function App() {
         <HostUpdateBanner host={activeUpdateHost(activeTabId, tabs, groups, activeLeafByGroup, selectedProject)} />
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView onSaveHosts={persistHosts} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
+          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={persistHosts} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} />
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <HomeView contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} projectSessionsStale={projectSessionsStale} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} sessionGroupName={(() => {
+          <HomeView projectTerminals={selectedProjectTerminals} onFocusTerminal={handleSelectTab} contextTreeEnabled={contextTreeEnabled} showSessionRowMetrics={showSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} showProjectStatsChart={showProjectStatsChart} projects={userProjects} allProjects={allProjects} activeCountByProject={activeCountByProject} selectedProject={selectedProject} projectIcons={projectIcons} recentSessions={recentSessions} projectSessions={projectSessions} projectSessionsStale={projectSessionsStale} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} sessionGroupName={(() => {
             const map: Record<string, string> = {};
             for (const t of tabs) {
               const sk = sessionKeyOfTab(t);

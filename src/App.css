@@ -1994,3 +1994,14 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 @media (prefers-reduced-motion: reduce) {
   .tab-pi-working { animation: none; }
 }
+
+/* Live Terminal inventory is independent of history/folder loading and collapse. */
+.project-open-terminals { display: flex; flex-direction: column; gap: 5px; margin-bottom: 22px; }
+.project-terminal-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 12px 14px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--bg-surface); color: var(--text-primary); cursor: pointer; font: inherit; }
+.project-terminal-row:hover { background: var(--bg-hover); }
+.project-terminal-row:focus-visible { outline: 2px solid var(--accent-terracotta); outline-offset: 2px; }
+.project-terminal-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.project-terminal-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.project-terminal-detail, .project-terminal-state, .project-terminals-empty { color: var(--text-secondary); font-size: 11px; }
+.project-terminal-state { flex-shrink: 0; }
+.project-terminals-empty { padding: 14px; }

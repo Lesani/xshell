@@ -32,6 +32,8 @@ interface SettingsViewProps {
   onSetGitLazyPolling: (enabled: boolean) => void;
   gitChangesTree: boolean;
   onSetGitChangesTree: (enabled: boolean) => void;
+  groupTabsByProject: boolean;
+  onSetGroupTabsByProject: (enabled: boolean) => void;
   fileExplorerOnStart: boolean;
   onSetFileExplorerOnStart: (enabled: boolean) => void;
   contextTreeEnabled: boolean;
@@ -179,7 +181,7 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -455,6 +457,11 @@ export function SettingsView({ onSaveHosts, onRemoveHost, theme, onSetTheme, def
 
           {active === "behavior" && (
             <>
+              <Section title="Tabs">
+                <SettingRow title={fmt("settings.groupTabs.label")} description={fmt("settings.groupTabs.description")}>
+                  <Toggle checked={groupTabsByProject} onChange={onSetGroupTabsByProject} />
+                </SettingRow>
+              </Section>
               <Section title="Window" description="How the xshell window itself behaves.">
                 <SettingRow title="Always on top" description="Keep the xshell window above all other applications, even when they have focus.">
                   <Toggle checked={alwaysOnTop} onChange={onSetAlwaysOnTop} />

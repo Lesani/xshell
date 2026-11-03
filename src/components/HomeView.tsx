@@ -1,3 +1,6 @@
+import type { ProjectTerminal } from "../tabs/projectTerminals";
+import { agentStatusLabel } from "../tabs/agentStatus";
+import { Terminal as TerminalIcon } from "lucide-react";
 import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { dailyCostSeries, dailyTokensSeries, hasRecordedCost, projectUsage, type SeriesPoint } from "../hosts/projectUsage";
 import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
@@ -24,6 +27,8 @@ interface HomeViewProps {
   projectIcons: Record<string, ProjectSettings>;
   recentSessions: SessionInfo[];
   projectSessions: SessionInfo[];
+  projectTerminals?: ProjectTerminal[];
+  onFocusTerminal?: (tabId: string) => void;
   // True when the project's session list came from the offline cache (amendment 24).
   projectSessionsStale?: boolean;
   openSessionIds: Set<string>;               // session keys (sessionKeyOf)
@@ -45,6 +50,15 @@ interface HomeViewProps {
   onRemoveProject: (key: ProjectKey) => void;
   onEditProject: (key: ProjectKey) => void;
   onSaveFolders: (key: ProjectKey, folders: SessionFolder[]) => void;
+}
+
+function terminalStateLabel(row: ProjectTerminal, host: string): string {
+  if (row.state === "last-known") return fmt("home.terminals.lastKnown", { host });
+  if (row.state === "status-unavailable") return fmt("home.terminals.statusUnavailable");
+  if (row.state === "unconfirmed") return fmt("home.terminals.unconfirmed");
+  if (row.state === "closing") return fmt("home.terminals.closing");
+  if (row.state === "ended") return fmt("home.terminals.ended");
+  return row.agentStatus ? agentStatusLabel(row.agentStatus) : "";
 }
 
 function genFolderId(): string {
@@ -543,7 +557,7 @@ function filterSessions(sessions: SessionInfo[], query: string): SessionInfo[] {
   return sessions.filter(s => s.title.toLowerCase().includes(q) || s.project_name.toLowerCase().includes(q) || s.git_branch.toLowerCase().includes(q));
 }
 
-export function HomeView({ projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, projectSessionsStale, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
+export function HomeView({ projectTerminals = [], onFocusTerminal, projects, activeCountByProject, selectedProject, projectIcons, recentSessions, projectSessions, projectSessionsStale, openSessionIds, sessionGroupName, loading, sessionsLoading, contextTreeEnabled, showSessionRowMetrics, showSessionRowMetricsCodex, showSessionRowMetricsOpencode, showProjectStatsChart, projectStatsView, onChangeProjectStatsView, onOpenSession, onOpenSessionBackground, onSelectProject, onNewChat, onAddProject, onRemoveProject, onEditProject, onSaveFolders }: HomeViewProps) {
   const [search, setSearch] = useState("");
   // Scroll-driven collapse of the stats strip in the project detail view. Same UX the old
   // preview cards had: scroll down → strip slides up out of view; pull back up at the very
@@ -702,15 +716,19 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
     window.addEventListener("pointerup", onUp);
   }, [handleMoveSession]);
 
-  if (loading) {
+  if (loading && !selectedProject) {
     return <div className="loading-wrapper"><div className="spinner" /><span>Loading...</span></div>;
   }
 
   // Project sessions view
   if (selectedProject) {
-    const sortedAll = sortWithOpen(projectSessions, openSessionIds);
+    const represented = new Set(projectTerminals.map(row => row.sessionKey).filter(Boolean));
+    const pastSessions = projectSessions.filter(session => !represented.has(sessionKeyOf(session)));
+    const sortedAll = sortWithOpen(pastSessions, openSessionIds);
+    const query = search.trim().toLowerCase();
+    const terminalRows = projectTerminals.filter(row => [row.title, row.detail, row.host ? registry.hostName(row.host) : fmt("picker.group.local"), row.kind === "shell" ? "Shell" : AGENTS[row.agent].label, row.groupName ?? "", terminalStateLabel(row, row.host ? registry.hostName(row.host) : fmt("picker.group.local"))].some(value => value.toLowerCase().includes(query)));
     const filteredAll = filterSessions(sortedAll, search);
-    const sessionById = new Map(projectSessions.map(s => [sessionFolderId(s), s]));
+    const sessionById = new Map(pastSessions.map(s => [sessionFolderId(s), s]));
 
     // Split into: categorized (inside folders) vs ungrouped
     const categorized = getCategorizedIds(folders);
@@ -764,7 +782,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
 
             <div className="project-detail-sticky">
               <div className="section-header section-header-with-actions">
-                <span className="section-header-label">Sessions</span>
+                <span className="section-header-label">{fmt("home.terminals.heading")}</span>
                 <span className="section-header-line" />
                 <div className="section-header-actions">
                   <button className="btn btn-primary" onClick={() => onNewChat(selectedProject)} onMouseEnter={(e) => showTt(`New chat in ${selectedProject.name}`, e.currentTarget)} onMouseLeave={hideTt}><Plus size={12} /> New Chat</button>
@@ -774,6 +792,21 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
               <SearchBar value={search} onChange={setSearch} placeholder={sessionsLoading ? "Loading..." : `Search through ${sortedAll.length} session${sortedAll.length !== 1 ? "s" : ""}...`} />
             </div>
 
+            <section className="project-open-terminals" aria-label={fmt("home.terminals.heading")}>
+              {terminalRows.map(row => {
+                const host = row.host ? registry.hostName(row.host) : fmt("picker.group.local");
+                const state = terminalStateLabel(row, host);
+                return <button key={row.tabId} className="project-terminal-row" data-terminal-tab={row.tabId}
+                  aria-label={fmt("home.terminals.focusA11y", { title: row.title, host })} onClick={() => onFocusTerminal?.(row.tabId)}>
+                  {row.kind === "shell" ? <TerminalIcon size={16} /> : <AgentIcon agent={row.agent} size={16} />}
+                  <span className="project-terminal-text"><span className="project-terminal-title">{row.title}</span>
+                    <span className="project-terminal-detail">{[row.kind === "shell" ? "Shell" : AGENTS[row.agent].label, host, row.detail, row.groupName].filter(Boolean).join(" · ")}</span></span>
+                  {state && <span className="project-terminal-state">{state}</span>}
+                </button>;
+              })}
+              {terminalRows.length === 0 && <div className="project-terminals-empty">{fmt(query ? "home.terminals.noMatches" : "home.terminals.empty", { search })}</div>}
+            </section>
+            <div className="section-header"><span className="section-header-label">{fmt("home.history.heading")}</span><span className="section-header-line" /></div>
             <div className="project-detail-sessions" key={keyOf(selectedProject)}>
           {sessionsLoading ? <SessionsLoader /> : isSearching ? (
             <div className="session-list">
@@ -782,6 +815,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
             </div>
           ) : (
             <>
+              {sortedAll.length === 0 && folders.length > 0 && <div className="project-terminals-empty">{fmt("home.history.empty")}</div>}
               {folders.length > 0 && (
                 <div className="folder-list">
                   {folders.map(folder => {
@@ -827,7 +861,7 @@ export function HomeView({ projects, activeCountByProject, selectedProject, proj
               <div className={`ungrouped-zone ${dragState?.active && dragState.hoverFolderId === null && dragState.sourceFolderId !== null ? "ungrouped-drop-hover" : ""}`} data-drop-folder="">
                 {ungrouped.length === 0 && folders.length === 0 ? (
                   <div className="empty-state">
-                    <div className="empty-state-title">No sessions yet</div>
+                    <div className="empty-state-title">{fmt("home.history.empty")}</div>
                     <div className="empty-state-desc">Start a new chat to begin.</div>
                   </div>
                 ) : (
