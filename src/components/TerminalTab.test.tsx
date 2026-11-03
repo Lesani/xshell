@@ -6,7 +6,7 @@ import type { Tab } from "../types";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 vi.mock("../hosts/useHosts", () => ({ useHostsSnapshot: () => ({ configs: [], status: {}, live: {}, agents: {}, epochs: {} }), useHostLive: () => null, useHostStatus: () => undefined }));
 function heading(tab: Tab) {
-  const html = renderToStaticMarkup(<TerminalTab tab={tab} isActive={false} gitLazyPolling gitChangesTree={false} fileExplorerOnStart={false} terminalBgColor="#141413" defaultFontSize={14} defaultShellId="bash" fullscreenRendering={false} forceSyncOutput={false} webglRendering={false} terminalFontWeight={400} eagerInit={false} theme="dark" projectEncodedName="" showTerminalHeaderStats={false} onBranchSwitch={vi.fn()} onSkipPermissionsChange={vi.fn()} />);
+  const html = renderToStaticMarkup(<TerminalTab tab={tab} isActive={false} gitLazyPolling gitChangesTree={false} rightPanel="closed" onRightPanelChange={vi.fn()} terminalBgColor="#141413" defaultFontSize={14} defaultShellId="bash" fullscreenRendering={false} forceSyncOutput={false} webglRendering={false} terminalFontWeight={400} eagerInit={false} theme="dark" projectEncodedName="" showTerminalHeaderStats={false} onBranchSwitch={vi.fn()} onSkipPermissionsChange={vi.fn()} />);
   const container = document.createElement("div"); container.innerHTML = html;
   return container.querySelector(".terminal-header-label")?.textContent;
 }
