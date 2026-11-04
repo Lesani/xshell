@@ -1,3 +1,4 @@
+import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { tabName } from "../tabs/tabName";
 import { CustomTitleController, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches, type CustomTitleTarget } from "../tabs/customTitle";
 import { TabNameMenu } from "./TabNameMenu";
@@ -39,7 +40,7 @@ function TabProjectIcon({ iconValue, color, name, linked, className = "" }: { ic
   const imgSrc = useProjectImage(iconValue);
   const cls = `tab-project-icon ${linked ? "tab-project-icon-linked" : ""} ${className}`;
   if (imgSrc) return <div className={cls}><img src={imgSrc} className="tab-project-img" alt="" /></div>;
-  return <div className={cls} style={color ? { background: color } : undefined}>{iconValue || tabInitials(name)}</div>;
+  return <div className={cls} style={{ background: color, color: isProjectIconText(iconValue) ? projectIconContrast(color) : undefined }}>{iconValue || tabInitials(name)}</div>;
 }
 
 // Tab bar shows tabs and groups interleaved. A group is one "entry" representing

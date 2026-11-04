@@ -1,3 +1,4 @@
+import type { RightPanel } from "../tabs/rightPanel";
 import { effectiveTabName } from "../tabs/tabName";
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
@@ -145,7 +146,8 @@ interface TerminalTabProps {
   isActive: boolean;
   gitLazyPolling: boolean;
   gitChangesTree: boolean;
-  fileExplorerOnStart: boolean;
+  rightPanel: RightPanel;
+  onRightPanelChange: (panel: RightPanel) => void;
   terminalBgColor: string;
   defaultFontSize: number;
   defaultShellId: string;
@@ -216,7 +218,7 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover most of the terminal but stay usable.
 const PANEL_EDGE_RESERVE = 140; // = the CSS max-width reserve on .terminal-side-panel
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fileExplorerOnStart, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
+export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rightPanel, onRightPanelChange, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -250,18 +252,12 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
   }, []);
   useEffect(() => () => { if (inputPausedTimerRef.current) window.clearTimeout(inputPausedTimerRef.current); }, []);
 
-  const [showGitPanel, setShowGitPanel] = useState(false);
-  // The git and file-explorer panels share one slot on the right — only one is open at a
-  // time (VS Code-style). Width is shared too, so resizing one carries over to the other.
-  // Initial open is driven only by the "open file explorer on start" setting (claude tabs);
-  // the git panel never auto-opens — it opens when the user clicks its activity-bar button.
-  const openExplorerByDefault = fileExplorerOnStart && (tab.shellMode || "claude") === "claude";
-  const [showFilePanel, setShowFilePanel] = useState(openExplorerByDefault);
-  // Once the file explorer is opened we keep it mounted (just hidden) for the life of the tab,
-  // so its browsed path + expansion state survive toggling the panel and switching tabs —
-  // resetting only when the tab is closed or the app restarts. Lazy: nothing mounts until the
-  // user opens it the first time (or it opens on start), so tabs that never use it pay nothing.
-  const [fileExplorerMounted, setFileExplorerMounted] = useState(openExplorerByDefault);
+  // One personal choice owns the shared right slot; diff/history state remains local.
+  const showGitPanel = rightPanel === "git";
+  const showFilePanel = rightPanel === "files";
+  // Keep the explorer alive after first use, preserving its browsed path/expansion state.
+  const [fileExplorerMounted, setFileExplorerMounted] = useState(showFilePanel);
+  useEffect(() => { if (showFilePanel) setFileExplorerMounted(true); }, [showFilePanel]);
   const [gitPanelWidth, setGitPanelWidth] = useState(DEFAULT_PANEL);
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitCommits, setGitCommits] = useState<GitCommit[]>([]);
@@ -1296,7 +1292,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             </div>
           </>
         )}
-        {isClaudeSession && tab.projectPath && fileExplorerMounted && (
+        {isClaudeSession && tab.projectPath && (fileExplorerMounted || showFilePanel) && (
           // Kept mounted once opened (toggled with `display`, not unmounted) so the explorer's
           // path + expansion state persist across panel toggles and tab switches.
           <>
@@ -1319,7 +1315,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
                 <button
                   className={`terminal-activity-btn ${showGitPanel ? "active" : ""}`}
                   disabled={gitDisabled}
-                  onClick={() => { if (gitDisabled) return; setShowFilePanel(false); setShowGitPanel(v => !v); if (!showGitPanel) fetchGitStatus(); hideTt(); }}
+                  onClick={() => { if (gitDisabled) return; onRightPanelChange(showGitPanel ? "closed" : "git"); if (!showGitPanel) fetchGitStatus(); hideTt(); }}
                   onMouseEnter={(e) => showTt(tip, e.currentTarget)}
                   onMouseLeave={hideTt}
                   aria-label="Toggle git panel"
@@ -1332,7 +1328,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, fil
             <button
               className={`terminal-activity-btn ${showFilePanel ? "active" : ""}`}
               disabled={!tab.projectPath}
-              onClick={() => { if (!tab.projectPath) return; setShowGitPanel(false); setFileExplorerMounted(true); setShowFilePanel(v => !v); hideTt(); }}
+              onClick={() => { if (!tab.projectPath) return; setFileExplorerMounted(true); onRightPanelChange(showFilePanel ? "closed" : "files"); hideTt(); }}
               onMouseEnter={(e) => showTt(`${showFilePanel ? "Hide" : "Show"} file explorer`, e.currentTarget)}
               onMouseLeave={hideTt}
               aria-label="Toggle file explorer"

@@ -1,3 +1,4 @@
+import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { dailyCostSeries, dailyTokensSeries, hasRecordedCost, projectUsage, type SeriesPoint } from "../hosts/projectUsage";
 import { useState, useEffect, useMemo, useCallback, useRef, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -530,7 +531,7 @@ function ProjectIcon({ project, projectIcons, size }: { project: ProjectInfo; pr
   if (imgSrc) return <img src={imgSrc} style={{ width: size, height: size, borderRadius: radius, objectFit: "cover", flexShrink: 0 }} alt="" />;
   const bg = settings?.color || "var(--accent-terracotta)";
   return (
-    <div style={{ width: size, height: size, borderRadius: radius, background: bg, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-primary)", fontSize: iconValue ? size * 0.5 : Math.max(7, size * 0.35), fontWeight: 600, flexShrink: 0 }}>
+    <div style={{ width: size, height: size, borderRadius: radius, background: bg, display: "flex", alignItems: "center", justifyContent: "center", color: (isProjectIconText(iconValue) ? projectIconContrast(settings?.color) : undefined) ?? "var(--text-primary)", fontSize: iconValue ? size * 0.5 : Math.max(7, size * 0.35), fontWeight: 600, flexShrink: 0 }}>
       {iconValue || displayName.slice(0, 2).toUpperCase()}
     </div>
   );

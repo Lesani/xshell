@@ -1,3 +1,4 @@
+import { adoptRightPanel, decodeRightPanels, defaultRightPanel, ensureRightPanels, pruneRightPanels, removeRightPanelHost, rightPanelKey, setRightPanel, RIGHT_PANELS_SETTING, type RightPanel, type RightPanels } from "./tabs/rightPanel";
 import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -104,7 +105,7 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
 // the result (H: the whole startup is single-flight and its state application fenced).
 async function loadStartup() {
   const store = await load("settings.json", { defaults: {}, autoSave: true });
-  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts] = await Promise.all([
+  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels] = await Promise.all([
     store.get<string[]>("project_paths"),
     store.get<Record<string, ProjectSettings>>("project_icons"),
     store.get<Tab[]>("open_tabs"),
@@ -134,8 +135,9 @@ async function loadStartup() {
     store.get<boolean>("rate_limit_in_sidebar_codex"),
     store.get<boolean>("session_row_metrics_opencode"),
     store.get<HostConfig[]>("hosts"),
+    store.get<unknown>(RIGHT_PANELS_SETTING),
   ]);
-  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts };
+  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels };
   // Remote Hosts: start the registry (a no-op with none configured) and load the offline
   // cache so their last known Terminals show as Tabs right away. In local Daemon mode the
   // Local Host joins the registry and its cached Tabs restore too.
@@ -238,6 +240,39 @@ export default function App() {
   const [gitChangesTree, setGitChangesTree] = useState(true);
   // When on (default), a newly opened agent terminal shows the file-explorer panel immediately.
   const [fileExplorerOnStart, setFileExplorerOnStart] = useState(true);
+  const [rightPanels, setRightPanels] = useState<RightPanels>({});
+  const rightPanelsRef = useRef<RightPanels>({});
+  const [rightPanelsLoaded, setRightPanelsLoaded] = useState(false);
+  const rightPanelSavesRef = useRef(Promise.resolve());
+  const updateRightPanels = useCallback((next: RightPanels) => {
+    if (next === rightPanelsRef.current) return;
+    rightPanelsRef.current = next;
+    setRightPanels(next);
+  }, []);
+  // Establish the first-use default before child passive effects can start a Terminal.
+  // A missing preference is never reinterpreted when settings or read-only metadata change.
+  useLayoutEffect(() => {
+    if (rightPanelsLoaded) updateRightPanels(ensureRightPanels(rightPanelsRef.current, tabs, fileExplorerOnStart));
+  }, [tabs, rightPanelsLoaded, fileExplorerOnStart, updateRightPanels]);
+  useEffect(() => {
+    if (!rightPanelsLoaded) return;
+    const value = { version: 1, entries: rightPanels };
+    // Serialize saves so an older async load cannot overwrite a later explicit choice.
+    rightPanelSavesRef.current = rightPanelSavesRef.current.then(async () => {
+      const store = await load("settings.json", { defaults: {}, autoSave: true });
+      await store.set(RIGHT_PANELS_SETTING, value);
+    }).catch(() => {});
+  }, [rightPanelsLoaded, rightPanels]);
+  const changeRightPanel = useCallback((tab: Tab, panel: RightPanel) => {
+    updateRightPanels(setRightPanel(rightPanelsRef.current, tab, panel));
+  }, [updateRightPanels]);
+  const forgetInProcessPanels = useCallback((removed: Tab[]) => {
+    const keys = removed.filter(t => !daemonHost(t)).map(rightPanelKey);
+    if (!keys.length) return;
+    const next = { ...rightPanelsRef.current };
+    for (const key of keys) delete next[key];
+    updateRightPanels(next);
+  }, [updateRightPanels]);
   const [contextTreeEnabled, setContextTreeEnabled] = useState(true);
   // Both default to true: setting up the statusline hook is the meaningful gesture, the
   // toggles let the user hide either feature even with stats available.
@@ -404,6 +439,8 @@ export default function App() {
       if (typeof v.rowMetricsCodex === "boolean") setShowSessionRowMetricsCodex(v.rowMetricsCodex);
       if (typeof v.rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(v.rlSidebarCodex);
       if (typeof v.rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(v.rowMetricsOpencode);
+      updateRightPanels(ensureRightPanels(decodeRightPanels(v.storedRightPanels), restored.tabs, typeof v.fileExpOnStart === "boolean" ? v.fileExpOnStart : true));
+      setRightPanelsLoaded(true);
       if (restored.tabs.length) {
         setTabs(restored.tabs);
         setGroups(restored.groups);
@@ -850,6 +887,7 @@ export default function App() {
   // keep running on the Host), its projects are unpinned and its cache is dropped.
   const handleRemoveHost = useCallback(async (id: HostId) => {
     const saved = persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id));
+    if (rightPanelsLoaded) updateRightPanels(removeRightPanelHost(rightPanelsRef.current, id));
     const gone = tabsRef.current.filter(t => t.host === id).map(t => t.id);
     for (const [uuid, p] of pendingOpens) if (p.host === id) pendingOpens.delete(uuid);
     for (const tid of gone) metaSync.forget(tid);
@@ -867,9 +905,10 @@ export default function App() {
     setProjectsByHost(prev => { const n = { ...prev }; delete n[id]; return n; });
     setRecentByHost(prev => { const n = { ...prev }; delete n[id]; return n; });
     delete appliedLiveRef.current[id];
+    adoptedPanelsRef.current.delete(id);
     cache.dropHost(id);
     await saved;
-  }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts]);
+  }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts, rightPanelsLoaded, updateRightPanels]);
 
   // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
   const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
@@ -964,6 +1003,7 @@ export default function App() {
       markClosing(tabsRef.current.filter(t => memberIds.includes(t.id)));
       if (activeTabId === id) setActiveTabId("home");
       setGroups(prev => prev.filter(g => g.id !== id));
+      forgetInProcessPanels(tabsRef.current.filter(t => memberIds.includes(t.id)));
       setTabs(prev => prev.filter(t => !memberIds.includes(t.id)));
       return;
     }
@@ -976,10 +1016,11 @@ export default function App() {
       setActiveTabId(remaining.length > 0 ? remaining[Math.min(idx, remaining.length - 1)]?.id || "home" : "home");
     }
     setTimeout(() => {
+      forgetInProcessPanels(tabsRef.current.filter(t => t.id === id));
       setTabs(prev => prev.filter(t => t.id !== id));
       setClosingTabIds(prev => { const next = new Set(prev); next.delete(id); return next; });
     }, 180);
-  }, [activeTabId]);
+  }, [activeTabId, forgetInProcessPanels]);
 
   const handleReorderProjects = useCallback(async (newPaths: ProjectKey[]) => {
     await persistPaths(newPaths);
@@ -1145,7 +1186,16 @@ export default function App() {
   // session. The pending Tab gives way to that Terminal's Tab, which the user lands on if
   // they were looking at the pending one: now, or once the Host lists it.
   const focusWhenListedRef = useRef<string | null>(null);
+  // Adoption can precede the owner's first list. Do not prune its transferred choice
+  // against an older list until that owner has actually been observed.
+  const adoptedPanelsRef = useRef(new Map<HostId, Set<string>>());
   useEffect(() => remoteTerminals.onAdopted(a => {
+    if (!registry.getSnapshot().live[a.host]?.some(info => info.terminal === a.to)) {
+      const awaiting = adoptedPanelsRef.current.get(a.host) ?? new Set<string>();
+      awaiting.add(a.to);
+      adoptedPanelsRef.current.set(a.host, awaiting);
+    }
+    updateRightPanels(adoptRightPanel(rightPanelsRef.current, a.host, a.from, a.to));
     const r = adoptTab({ tabs: tabsRef.current, groups: groupsRef.current, activeLeafByGroup: activeLeafByGroupRef.current }, activeTabIdRef.current, a.from, a.to);
     remoteTerminals.forget(a.from);
     const removed = r.removed;
@@ -1157,7 +1207,7 @@ export default function App() {
     }
     if (r.focus) applyFocus(r.focus);
     if (r.focusWhenListed) focusWhenListedRef.current = r.focusWhenListed;
-  }), [applyFocus]);
+  }), [applyFocus, updateRightPanels]);
   useEffect(() => {
     const want = focusWhenListedRef.current;
     if (!want) return;
@@ -1179,6 +1229,16 @@ export default function App() {
       fresh.push([host, list]);
     }
     if (fresh.length === 0) return;
+    if (rightPanelsLoaded) {
+      let next = rightPanelsRef.current;
+      for (const [host, list] of fresh) {
+        const awaiting = adoptedPanelsRef.current.get(host);
+        for (const info of list) awaiting?.delete(info.terminal);
+        if (awaiting?.size === 0) adoptedPanelsRef.current.delete(host);
+        next = pruneRightPanels(next, host, list.map(i => i.terminal), new Set([...pendingUuids(), ...(awaiting ?? [])]));
+      }
+      updateRightPanels(next);
+    }
     // Every Host's delta in one transaction (tabs, groups and focus together).
     const r = reconcileHosts(tabsRef.current, listsForReconcile(fresh), {
       pending: pendingUuids(),
@@ -1202,7 +1262,7 @@ export default function App() {
       setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, removed), removed));
       if (removed.includes(activeTabIdRef.current)) setActiveTabId("home");
     }
-  }, [tabsRestored, hostsSnap.live, reconcileTick]);
+  }, [tabsRestored, hostsSnap.live, reconcileTick, rightPanelsLoaded, updateRightPanels]);
 
   // Push local edits of remote Tabs (linked session id, title) to their Terminal's meta.
   // Only while the Host is usable; a failed call is retried once (amendment 17).
@@ -1303,8 +1363,9 @@ export default function App() {
       setGroups(prev => prev.filter(g => g.id !== group.id));
       setActiveLeafByGroup(prev => { const n = { ...prev }; delete n[group.id]; return n; });
     }
+    forgetInProcessPanels(tabsRef.current.filter(t => t.id === tabId));
     setTabs(prev => prev.filter(t => t.id !== tabId));
-  }, []);
+  }, [forgetInProcessPanels]);
 
   // Adjust a split's ratio at the given path in the active group's layout tree.
   const updateGroupRatio = useCallback((groupId: string, path: number[], ratio: number) => {
@@ -1547,7 +1608,7 @@ export default function App() {
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} fileExplorerOnStart={fileExplorerOnStart} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
+            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} rightPanel={rightPanels[rightPanelKey(tab)] ?? defaultRightPanel(tab, fileExplorerOnStart)} onRightPanelChange={panel => changeRightPanel(tab, panel)} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
             host,
             tab.id,
           );

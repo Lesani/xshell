@@ -1,3 +1,4 @@
+import { projectIconContrast } from "../projectIconContrast";
 import { useEffect, useRef, useState, useMemo } from "react";
 import { X, Image as ImageIcon } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -41,7 +42,7 @@ function IconPreview({ mode, letters, emoji, imagePath, name, color, size = 56 }
   else display = deriveInitials(name);
   const isEmoji = mode === "emoji";
   return (
-    <div style={{ width: size, height: size, borderRadius: 14, background: bg, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-primary)", fontSize: isEmoji ? size * 0.5 : size * 0.36, fontWeight: 600 }}>
+    <div style={{ width: size, height: size, borderRadius: 14, background: bg, display: "flex", alignItems: "center", justifyContent: "center", color: (!isEmoji && mode !== "image" ? projectIconContrast(color) : undefined) ?? "var(--text-primary)", fontSize: isEmoji ? size * 0.5 : size * 0.36, fontWeight: 600 }}>
       {display}
     </div>
   );
