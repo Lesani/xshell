@@ -256,6 +256,31 @@ describe("Project ordering pointer gaps", () => {
   ])("pointer midpoint/source-removal from %s to %s (%s)", (source, target, x, expected) => {
     fixture(); down(source as string); move(target as string, x as number); up(); expect(result()).toEqual(expected);
   });
+  it("previews the actual whole-block destination rather than a gap inside the target Project", () => {
+    fixture(); down("a"); move("c", 390);
+    expect(tabEl("d").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("c").querySelector(".tab-drop-line-after")).toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-before")).toBeNull();
+    up(); expect(result()).toEqual(["c", "d", "a", "b"]);
+    down("d"); move("b", 310);
+    expect(tabEl("a").querySelector(".tab-drop-line-before")).not.toBeNull();
+    expect(tabEl("a").querySelector(".tab-drop-line-after")).toBeNull();
+    expect(tabEl("b").querySelector(".tab-drop-line-before")).toBeNull();
+    up(); expect(result()).toEqual(["c", "d", "a", "b"]);
+  });
+  it("keeps raw entry-gap previews for off-mode and within-block moves", () => {
+    fixture(); props = { ...props, groupTabsByProject: false }; render();
+    down("a"); move("c", 390);
+    expect(tabEl("c").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-before")).not.toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-after")).toBeNull();
+    up(); expect(result()).toEqual(["b", "c", "a", "d"]);
+    props = { ...props, groupTabsByProject: true }; render();
+    down("a"); move("b", 390);
+    expect(tabEl("b").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("c").querySelector(".tab-drop-line-before")).not.toBeNull();
+    up(); expect(result()).toEqual(["b", "a", "c", "d"]);
+  });
   it("off-mode moves just one atomic entry; pointercancel and changed entries cancel; outside clears a prior gap", () => {
     fixture(); props = { ...props, groupTabsByProject: false }; render();
     down("a"); move("c", 390); up(); expect(result()).toEqual(["b", "c", "a", "d"]);

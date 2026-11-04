@@ -16,14 +16,15 @@ interface Options<T> {
 
 export function useDragReorder<T>({ items, direction, itemSelector, onReorder, itemKey }: Options<T>) {
   const [dragIdx, setDragIdx] = useState<number | null>(null);
-  const [overIdx, setOverIdx] = useState<number | null>(null);
+  const [drop, setDrop] = useState<ReorderDrop | null>(null);
+  const overIdx = drop?.destinationGap ?? null;
   const current = useRef({ items, direction, itemSelector, onReorder, itemKey });
   current.current = { items, direction, itemSelector, onReorder, itemKey };
   const stateRef = useRef<{ startIdx: number; startX: number; startY: number; dragging: boolean; keys: unknown[]; gap: number | null; target: number | null } | null>(null);
   const reset = () => {
     stateRef.current = null;
     document.body.style.cursor = "";
-    setDragIdx(null); setOverIdx(null);
+    setDragIdx(null); setDrop(null);
   };
   const valid = () => {
     const s = stateRef.current;
@@ -59,7 +60,7 @@ export function useDragReorder<T>({ items, direction, itemSelector, onReorder, i
           s.target = idx; s.gap = p < mid ? idx : idx + 1;
         }
       }
-      setOverIdx(s.gap);
+      setDrop(s.gap !== null && s.target !== null ? { sourceIndex: s.startIdx, destinationGap: s.gap, targetIndex: s.target } : null);
     };
     const onUp = () => {
       const s = stateRef.current;
@@ -85,5 +86,5 @@ export function useDragReorder<T>({ items, direction, itemSelector, onReorder, i
       document.body.style.cursor = "";
     };
   }, []);
-  return { dragIdx, overIdx, onPointerDown };
+  return { dragIdx, overIdx, drop, onPointerDown };
 }

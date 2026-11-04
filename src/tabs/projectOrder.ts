@@ -42,6 +42,19 @@ export function normalizeProjectTabs(tabs: Tab[], groups: Group[]): Tab[] {
   return next.length === tabs.length && next.every((t, i) => t.id === tabs[i].id) ? tabs : next;
 }
 
+// The preview and drop share a boundary in the original atomic-entry sequence.
+// Within-block moves keep the raw gap; cross-block moves snap to the target block edge.
+export function projectDropGap(entries: TabBarEntry[], tabs: Tab[], drop: ReorderDrop): number {
+  const { sourceIndex, destinationGap, targetIndex } = drop;
+  if (!entries[sourceIndex] || !entries[targetIndex]) return destinationGap;
+  const sourceKey = blockKey(entries[sourceIndex], tabs);
+  const targetKey = blockKey(entries[targetIndex], tabs);
+  if (sourceKey === targetKey) return destinationGap;
+  const first = entries.findIndex(e => blockKey(e, tabs) === targetKey);
+  const last = entries.length - 1 - [...entries].reverse().findIndex(e => blockKey(e, tabs) === targetKey);
+  return destinationGap <= targetIndex ? first : last + 1;
+}
+
 // Indices are atomic-entry gaps, never leaf indices. Cross-block drops use the hit
 // entry's midpoint side, then move the whole source block at the target boundary.
 export function projectDrop(entries: TabBarEntry[], tabs: Tab[], drop: ReorderDrop): TabBarEntry[] {
@@ -57,8 +70,7 @@ export function projectDrop(entries: TabBarEntry[], tabs: Tab[], drop: ReorderDr
   }
   const source = entries.filter(e => blockKey(e, tabs) === sourceKey);
   const rest = entries.filter(e => blockKey(e, tabs) !== sourceKey);
-  const first = rest.findIndex(e => blockKey(e, tabs) === targetKey);
-  const last = rest.length - 1 - [...rest].reverse().findIndex(e => blockKey(e, tabs) === targetKey);
-  const boundary = destinationGap <= targetIndex ? first : last + 1;
+  const gap = projectDropGap(entries, tabs, drop);
+  const boundary = entries.slice(0, gap).filter(e => blockKey(e, tabs) !== sourceKey).length;
   return [...rest.slice(0, boundary), ...source, ...rest.slice(boundary)];
 }

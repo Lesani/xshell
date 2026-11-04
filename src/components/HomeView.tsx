@@ -789,7 +789,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
                   <button className="btn btn-ghost" onClick={handleCreateFolder} onMouseEnter={(e) => showTt("Create a folder to group sessions", e.currentTarget)} onMouseLeave={hideTt}><FolderPlus size={12} /> New Folder</button>
                 </div>
               </div>
-              <SearchBar value={search} onChange={setSearch} placeholder={sessionsLoading ? "Loading..." : `Search through ${sortedAll.length} session${sortedAll.length !== 1 ? "s" : ""}...`} />
+              <SearchBar value={search} onChange={setSearch} placeholder={fmt("home.terminals.search")} />
             </div>
 
             <section className="project-open-terminals" aria-label={fmt("home.terminals.heading")}>
@@ -862,7 +862,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
                 {ungrouped.length === 0 && folders.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-state-title">{fmt("home.history.empty")}</div>
-                    <div className="empty-state-desc">Start a new chat to begin.</div>
+                    {projectTerminals.length === 0 && <div className="empty-state-desc">Start a new chat to begin.</div>}
                   </div>
                 ) : (
                   <div className="session-list">

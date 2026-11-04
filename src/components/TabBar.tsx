@@ -1,4 +1,4 @@
-import { flattenEntries, projectDrop, type TabBarEntry } from "../tabs/projectOrder";
+import { flattenEntries, projectDrop, projectDropGap, type TabBarEntry } from "../tabs/projectOrder";
 import type { ReorderDrop } from "../hooks/useDragReorder";
 import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { tabName } from "../tabs/tabName";
@@ -286,13 +286,15 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
     if (next.length === tabs.length) onReorderTabs(next);
   }, [tabs, entries, groupTabsByProject, onReorderTabs]);
 
-  const { dragIdx, overIdx, onPointerDown: onEntryPointerDown } = useDragReorder<TabBarEntry>({
+  const { dragIdx, overIdx, drop, onPointerDown: onEntryPointerDown } = useDragReorder<TabBarEntry>({
     items: entries,
     itemKey: entry => entry.id,
     direction: "horizontal",
     itemSelector: ".tab-item[data-idx]",
     onReorder: handleEntryReorder,
   });
+
+  const insertionGap = groupTabsByProject && drop ? projectDropGap(entries, tabs, drop) : overIdx;
 
   const checkOverflow = () => {
     const el = scrollRef.current;
@@ -344,8 +346,8 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
         <div className="tab-bar-tabs" ref={scrollRef}>
           {entries.map((entry, i) => {
             const isDragging = dragIdx === i;
-            const showDropBefore = dragIdx !== null && overIdx === i && overIdx !== dragIdx && overIdx !== dragIdx + 1;
-            const showDropAfter = dragIdx !== null && overIdx === i + 1 && overIdx !== dragIdx && overIdx !== dragIdx + 1;
+            const showDropBefore = dragIdx !== null && insertionGap === i && insertionGap !== dragIdx && insertionGap !== dragIdx + 1;
+            const showDropAfter = dragIdx !== null && insertionGap === i + 1 && insertionGap !== dragIdx && insertionGap !== dragIdx + 1;
             if (entry.kind === "group") {
               const g = entry.group;
               const leafIds = collectLeafIds(g.layout);

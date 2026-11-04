@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import type { Group, Tab } from "../types";
-import { tabBarEntries, normalizeProjectTabs, projectDrop, flattenEntries, groupTabsSetting } from "./projectOrder";
+import { tabBarEntries, normalizeProjectTabs, projectDrop, projectDropGap, flattenEntries, groupTabsSetting } from "./projectOrder";
 const tab = (id: string, projectPath?: string, extra: Partial<Tab> = {}): Tab => ({ id, type: "terminal", title: id, projectPath, ...extra });
 const group = (id: string, a: string, b: string): Group => ({ id, name: id, layout: { kind: "split", direction: "col", ratio: .5, children: [{ kind: "leaf", tabId: a }, { kind: "leaf", tabId: b }] } });
 const ids = (tabs: Tab[]) => tabs.map(t => t.id);
@@ -33,5 +33,8 @@ it("gap semantics: same-block entry, cross-block whole move before/after, source
   expect(drop(4, 1, 1)).toEqual(["e", "a", "b", "c", "d"]);
   expect(drop(0, 2, 2)).toEqual(["a", "b", "c", "d", "e"]);
   expect(drop(2, 1, 0)).toEqual(["a", "b", "c", "d", "e"]);
+  expect(projectDropGap(entries, tabs, { sourceIndex: 0, destinationGap: 3, targetIndex: 2 })).toBe(4);
+  expect(projectDropGap(entries, tabs, { sourceIndex: 3, destinationGap: 1, targetIndex: 1 })).toBe(0);
+  expect(projectDropGap(entries, tabs, { sourceIndex: 0, destinationGap: 2, targetIndex: 1 })).toBe(2);
   expect(flattenEntries(entries, tabs)).toEqual(tabs);
 });

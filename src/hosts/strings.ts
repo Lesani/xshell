@@ -7,6 +7,7 @@ export const S = {
   "settings.groupTabs.label": "Group Tabs by Project",
   "settings.groupTabs.description": "Keep each Project's Tabs together. Existing split-pane Groups stay intact.",
   "home.terminals.heading": "Open Terminals",
+  "home.terminals.search": "Search open Terminals and past sessions…",
   "home.terminals.empty": "No open Terminals in this Project.",
   "home.terminals.noMatches": "No open Terminals match “{search}”.",
   "home.history.heading": "Past sessions",

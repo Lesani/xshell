@@ -71,3 +71,21 @@ it("distinct empty states and truthful pending/closing/ended text", () => {
   render({ projectTerminals: [ { ...row("pending"), state: "unconfirmed" }, { ...row("ended"), state: "ended" }, { ...row("closing"), state: "closing" }, { ...row("legacy"), state: "status-unavailable" }] });
   expect(container.textContent).toContain("Awaiting Host confirmation"); expect(container.textContent).toContain("Ended"); expect(container.textContent).toContain("Closing…"); expect(container.textContent).toContain("Process status unavailable");
 });
+it.each([false, true])("search copy covers open linked Terminals and past sessions while history loading=%s", sessionsLoading => {
+  render({ projectTerminals: [row("linked", sessionKeyOf(pi))], projectSessions: [pi], sessionsLoading });
+  const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+  expect(input.placeholder).toBe("Search open Terminals and past sessions…");
+  expect(container.querySelectorAll("[data-terminal-tab]")).toHaveLength(1);
+  expect(container.querySelectorAll(".session-item")).toHaveLength(0);
+  expect(container.textContent).not.toContain("Start a new chat to begin.");
+  if (!sessionsLoading) expect(container.textContent).toContain("No past sessions yet.");
+  search("Open linked");
+  expect(container.querySelectorAll("[data-terminal-tab]")).toHaveLength(1);
+});
+it("does not suggest starting a chat when an open row exists but history is empty", () => {
+  render({ projectTerminals: [row("linked", sessionKeyOf(pi))], projectSessions: [pi] });
+  expect(container.textContent).toContain("No past sessions yet.");
+  expect(container.textContent).not.toContain("Start a new chat to begin.");
+  render({ projectTerminals: [], projectSessions: [] });
+  expect(container.textContent).toContain("Start a new chat to begin.");
+});
