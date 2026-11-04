@@ -62,7 +62,20 @@ pub enum ClientMsg {
     #[serde(rename = "term.detach")]
     TermDetach { terminal: Uuid },
     #[serde(rename = "term.input")]
-    TermInput { terminal: Uuid, data: String },
+    TermInput {
+        terminal: Uuid,
+        data: String,
+        #[serde(
+            default,
+            rename = "handledCompletionId",
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_completion_id"
+        )]
+        handled_completion_id: Option<Uuid>,
+    },
+    /// Best-effort shared handling of the exact observed completion, without input or resize.
+    #[serde(rename = "term.input-handled", rename_all = "camelCase")]
+    TermInputHandled { terminal: Uuid, completion_id: Uuid },
     #[serde(rename = "term.resize")]
     TermResize {
         terminal: Uuid,
@@ -211,6 +224,13 @@ pub enum ClientMsg {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
+        #[serde(
+            default,
+            rename = "handledCompletionId",
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_completion_id"
+        )]
+        handled_completion_id: Option<Uuid>,
     },
 }
 
@@ -662,6 +682,7 @@ const CLIENT_TYPES: &[&str] = &[
     "term.attach",
     "term.detach",
     "term.input",
+    "term.input-handled",
     "term.resize",
     "term.close",
     "term.update",
@@ -709,6 +730,19 @@ pub struct OpenSpec {
     pub adopt_existing: bool,
 }
 
+/// Only the current run's last real completion; never persisted or transferred to a successor.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionAttention {
+    pub completion_id: Uuid,
+    pub input_handled: bool,
+}
+
+fn lenient_completion_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalInfo {
@@ -734,6 +768,9 @@ pub struct TerminalInfo {
     /// that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_at_ms: Option<u64>,
+    /// Exact completion identity (capability `term.completion-attention`), independent of clocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_attention: Option<CompletionAttention>,
     /// The newest text message of the agent's session (capability `agent.last-line`).
     /// Absent for Terminals that are not a direct Claude or Codex agent, without a linked
     /// session, before the session has a text message, and from older Daemons.
@@ -1236,6 +1273,7 @@ mod tests {
         assert_eq!(
             inb.msg,
             ClientMsg::TermInput {
+                handled_completion_id: None,
                 terminal: id,
                 data: "x".into()
             }
@@ -1377,6 +1415,7 @@ mod tests {
     fn terminals_roundtrip_skip_permissions() {
         let list = ServerMsg::Terminals {
             list: vec![TerminalInfo {
+                completion_attention: None,
                 terminal: Uuid::new_v4(),
                 spec: LaunchSpec {
                     session_id: Some("s".into()),
@@ -1403,6 +1442,7 @@ mod tests {
         let id = Uuid::new_v4();
         let list = ServerMsg::Terminals {
             list: vec![TerminalInfo {
+                completion_attention: None,
                 terminal: id,
                 spec: LaunchSpec::default(),
                 meta: Map::new(),
@@ -1476,6 +1516,7 @@ mod tests {
 
     fn info_with(status: Option<AgentStatus>) -> TerminalInfo {
         TerminalInfo {
+            completion_attention: None,
             terminal: Uuid::new_v4(),
             spec: LaunchSpec::default(),
             meta: Map::new(),
@@ -2132,6 +2173,7 @@ mod tests {
     fn term_submit_golden_roundtrip() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
         let msg = ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: id,
             text: "fix it\nplease 🦀".into(),
             files: vec![],
@@ -2163,6 +2205,7 @@ mod tests {
     fn term_submit_files_roundtrip_and_default() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
         let msg = ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: id,
             text: String::new(),
             files: vec!["/run/user/1000/xshell/tmp/xshell-clipboard/1-a.jpg".into()],
@@ -2178,6 +2221,7 @@ mod tests {
         assert_eq!(
             decode_inbound(old.to_string().as_bytes()).unwrap().msg,
             ClientMsg::TermSubmit {
+                handled_completion_id: None,
                 terminal: id,
                 text: "x".into(),
                 files: vec![]
@@ -2199,5 +2243,122 @@ mod tests {
             submit_reply(&"x".repeat(SUBMIT_MAX_BYTES + 1), 1),
             Err(TooLong)
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_attention_tests {
+    use super::*;
+
+    #[test]
+    fn completion_attention_wire_and_old_snapshot() {
+        let id = Uuid::new_v4();
+        let raw = serde_json::json!({"terminal":id,"spec":{"cwd":"/p"},"meta":{},"createdAtMs":1,"pid":null,"exitCode":null});
+        let mut info: TerminalInfo = serde_json::from_value(raw).unwrap();
+        assert!(info.completion_attention.is_none());
+        assert!(serde_json::to_value(&info)
+            .unwrap()
+            .get("completionAttention")
+            .is_none());
+        info.completion_attention = Some(CompletionAttention {
+            completion_id: id,
+            input_handled: false,
+        });
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["completionAttention"],
+            serde_json::json!({"completionId":id,"inputHandled":false})
+        );
+        assert_eq!(serde_json::from_value::<TerminalInfo>(value).unwrap(), info);
+        assert!(crate::CAPABILITIES.contains(&crate::cap::TERM_COMPLETION_ATTENTION));
+        assert_eq!(crate::PROTOCOL.min, 1);
+        assert_eq!(crate::PROTOCOL.max, 1);
+    }
+
+    #[test]
+    fn optional_input_metadata_is_lenient_and_preserves_wire_names() {
+        let id = Uuid::new_v4();
+        for method in ["term.input", "term.submit"] {
+            for bad in [
+                Value::Null,
+                Value::Bool(true),
+                serde_json::json!(123),
+                serde_json::json!({}),
+                serde_json::json!([]),
+                serde_json::json!("not-a-uuid"),
+            ] {
+                let raw = serde_json::json!({"t":method,"id":7,"terminal":id,"data":"ö","text":"reply","handledCompletionId":bad});
+                let msg = decode_inbound(raw.to_string().as_bytes()).unwrap().msg;
+                match &msg {
+                    ClientMsg::TermInput {
+                        data,
+                        handled_completion_id,
+                        ..
+                    } => {
+                        assert_eq!(data, "ö");
+                        assert_eq!(*handled_completion_id, None);
+                    }
+                    ClientMsg::TermSubmit {
+                        text,
+                        handled_completion_id,
+                        ..
+                    } => {
+                        assert_eq!(text, "reply");
+                        assert_eq!(*handled_completion_id, None);
+                    }
+                    _ => panic!("wrong message"),
+                }
+                assert!(serde_json::to_value(msg)
+                    .unwrap()
+                    .get("handledCompletionId")
+                    .is_none());
+            }
+        }
+        for msg in [
+            ClientMsg::TermInput {
+                terminal: id,
+                data: "x".into(),
+                handled_completion_id: Some(id),
+            },
+            ClientMsg::TermSubmit {
+                terminal: id,
+                text: "reply".into(),
+                files: vec![],
+                handled_completion_id: Some(id),
+            },
+        ] {
+            let value = serde_json::to_value(&msg).unwrap();
+            assert_eq!(value["handledCompletionId"], id.to_string());
+            assert!(value.get("handled_completion_id").is_none());
+            assert_eq!(
+                decode_inbound(value.to_string().as_bytes()).unwrap().msg,
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_is_strict_id_res_request() {
+        let id = Uuid::new_v4();
+        let msg = ClientMsg::TermInputHandled {
+            terminal: id,
+            completion_id: id,
+        };
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"t":"term.input-handled","terminal":id,"completionId":id})
+        );
+        let mut request = value;
+        request["id"] = 9.into();
+        assert_eq!(
+            decode_inbound(request.to_string().as_bytes()).unwrap(),
+            Inbound { id: Some(9), msg }
+        );
+        request["completionId"] = "invalid".into();
+        assert!(matches!(
+            decode_inbound(request.to_string().as_bytes()),
+            Err(DecodeError::Invalid { id: Some(9), .. })
+        ));
     }
 }

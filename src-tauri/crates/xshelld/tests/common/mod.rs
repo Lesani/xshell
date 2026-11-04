@@ -891,6 +891,7 @@ impl Client {
     pub fn input(&mut self, t: Uuid, data: &str) {
         self.send(
             &ClientMsg::TermInput {
+                handled_completion_id: None,
                 terminal: t,
                 data: data.into(),
             },

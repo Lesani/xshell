@@ -50,3 +50,16 @@ describe("LocalAgentStatusStore", () => {
     expect(store.getSnapshot()).toBe(s);
   });
 });
+
+it("in-process completion observations use accepted change events, never a clock or predecessor run", () => {
+  const store = new LocalAgentStatusStore();
+  store.apply({ id: "t", status: "finished", seq: 1 });
+  expect(store.completionOf("t")).toBe("local:1");
+  store.apply({ id: "t", status: "finished", seq: 2 });
+  expect(store.completionOf("t")).toBe("local:1");
+  store.apply({ id: "t", status: "working", seq: 3 });
+  expect(store.completionOf("t")).toBe("local:1");
+  store.apply({ id: "t", status: null, seq: 5 });
+  store.apply({ id: "t", status: "finished", seq: 4 });
+  expect(store.completionOf("t")).toBeUndefined();
+});

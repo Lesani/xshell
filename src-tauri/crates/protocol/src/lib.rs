@@ -14,6 +14,7 @@ pub mod negotiate;
 pub mod pairing_access;
 #[cfg(feature = "ring")]
 pub mod ring;
+pub mod terminal_input;
 pub mod terminal_meta;
 
 pub use launch::LaunchSpec;
@@ -36,6 +37,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::CALL,
     cap::TERM,
     cap::TERM_CUSTOM_TITLE,
+    cap::TERM_COMPLETION_ATTENTION,
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
     cap::TERM_RELAUNCH,
@@ -64,6 +66,8 @@ pub mod cap {
     pub const CALL: &str = "call";
     /// Terminal requests (`term.*`).
     pub const TERM: &str = "term";
+    /// Exact transient completion tokens, optional input metadata and `term.input-handled`.
+    pub const TERM_COMPLETION_ATTENTION: &str = "term.completion-attention";
     /// Durable custom-name updates and clears through `term.update` (computer Desktop only).
     /// See [`crate::terminal_meta`] for validation. Success confirms the native atomic-state
     /// save: synced file and atomic replacement, plus parent-directory sync on Unix.

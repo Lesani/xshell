@@ -230,8 +230,11 @@ pub fn host_term_input(
     host: String,
     terminal: String,
     data: String,
+    handled_completion_id: Option<String>,
+    input_target: Option<xshell_hostlink::handle::InputTarget>,
 ) -> Result<(), HostError> {
-    handle(&state, &host)?.term_input(uuid(&terminal)?, data)
+    let observed = handled_completion_id.and_then(|id| Uuid::parse_str(&id).ok());
+    handle(&state, &host)?.term_input(uuid(&terminal)?, data, observed, input_target)
 }
 
 #[tauri::command]

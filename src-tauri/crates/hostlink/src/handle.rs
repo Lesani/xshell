@@ -99,6 +99,14 @@ pub struct UpdateTarget {
     pub daemon_build: Option<xshell_protocol::build::BuildId>,
 }
 
+/// The connection observed at a Desktop input action; checked before enqueue, never replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputTarget {
+    pub config_generation: u64,
+    pub link_generation: u64,
+}
+
 pub(crate) struct State {
     pub cfg: HostConfig,
     pub status: HostStatus,
@@ -137,6 +145,8 @@ impl State {
 
 /// What the sync paths need: the link to enqueue on, or why there is none.
 struct Endpoint {
+    input_target: InputTarget,
+    completion_attention: bool,
     link: Option<Arc<Link>>,
     down: HostError,
 }
@@ -260,7 +270,15 @@ impl Shared {
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
             child_pid: AtomicU32::new(0),
-            ep: Mutex::new(Endpoint { link: None, down }),
+            ep: Mutex::new(Endpoint {
+                link: None,
+                down,
+                completion_attention: false,
+                input_target: InputTarget {
+                    config_generation,
+                    link_generation: 0,
+                },
+            }),
             sizes: Mutex::new(HashMap::new()),
         }
     }
@@ -272,6 +290,17 @@ impl Shared {
     fn sync_ep(&self, st: &State) {
         let mut ep = self.ep.lock().unwrap();
         ep.link = st.link.clone();
+        ep.input_target = InputTarget {
+            config_generation: st.status.config_generation,
+            // Adoption exposes this link before publishing its status. The internal
+            // generation already identifies it; status may still name its predecessor.
+            link_generation: st.gen,
+        };
+        ep.completion_attention = st
+            .status
+            .daemon_capabilities
+            .iter()
+            .any(|c| c == xshell_protocol::cap::TERM_COMPLETION_ATTENTION);
         ep.down = unusable(st);
     }
 
@@ -1012,9 +1041,25 @@ impl HostHandle {
     }
 
     /// Sync and non-blocking: enqueues or fails with `offline`, `incompatible` or `busy`.
-    pub fn term_input(&self, t: Uuid, data: String) -> Result<(), HostError> {
-        self.endpoint()?
-            .notify(ClientMsg::TermInput { terminal: t, data })
+    pub fn term_input(
+        &self,
+        t: Uuid,
+        data: String,
+        observed: Option<Uuid>,
+        target: Option<InputTarget>,
+    ) -> Result<(), HostError> {
+        let ep = quick(&self.sh.ep)?;
+        if target.is_some_and(|target| target != ep.input_target) {
+            return Err(HostError::offline("the input connection changed"));
+        }
+        match &ep.link {
+            Some(link) if !link.is_closed() => link.notify(ClientMsg::TermInput {
+                terminal: t,
+                data,
+                handled_completion_id: observed.filter(|_| ep.completion_attention),
+            }),
+            _ => Err(ep.down.clone()),
+        }
     }
 
     /// Sync and non-blocking; the size is remembered for re-attach even when offline.
@@ -1638,6 +1683,7 @@ pub(crate) mod tests {
 
     pub fn info(t: Uuid) -> TerminalInfo {
         TerminalInfo {
+            completion_attention: None,
             terminal: t,
             spec: LaunchSpec::default(),
             meta: Default::default(),
@@ -1755,6 +1801,117 @@ pub(crate) mod tests {
     }
 
     const T5: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn completion_attention_input_captures_token_and_gates_on_exact_link() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let f = Uuid::new_v4();
+        let mut p = connect_capable(
+            &sh,
+            vec![info(t)],
+            &[xshell_protocol::cap::TERM_COMPLETION_ATTENTION],
+        );
+        let h = handle(&sh);
+        let original = sh.ep.lock().unwrap().input_target;
+        // A newer cached completion never replaces the caller's observation.
+        sh.lock().terminals.as_mut().unwrap()[0].completion_attention =
+            Some(xshell_protocol::msg::CompletionAttention {
+                completion_id: Uuid::new_v4(),
+                input_handled: false,
+            });
+        h.term_input(t, "ö".into(), Some(f), Some(original))
+            .unwrap();
+        let raw = p.expect("term.input");
+        assert_eq!(raw["handledCompletionId"], f.to_string());
+        assert_eq!(raw["data"], "ö");
+        let mut old = connect_capable(&sh, vec![info(t)], &[]);
+        assert!(h
+            .term_input(t, "old link".into(), Some(f), Some(original))
+            .is_err());
+        let current = sh.ep.lock().unwrap().input_target;
+        assert!(h
+            .term_input(
+                t,
+                "old config".into(),
+                Some(f),
+                Some(InputTarget {
+                    config_generation: current.config_generation + 1,
+                    ..current
+                })
+            )
+            .is_err());
+        h.term_input(t, "x".into(), Some(f), None).unwrap();
+        assert!(old
+            .expect("term.input")
+            .get("handledCompletionId")
+            .is_none());
+        sh.set_link(&mut sh.lock(), None);
+        assert!(h
+            .term_input(t, "not replayed".into(), Some(f), None)
+            .is_err());
+        let mut back = connect_capable(
+            &sh,
+            vec![info(t)],
+            &[xshell_protocol::cap::TERM_COMPLETION_ATTENTION],
+        );
+        h.term_input(t, "next action".into(), Some(f), None)
+            .unwrap();
+        assert_eq!(back.expect("term.input")["data"], "next action");
+    }
+
+    #[test]
+    fn completion_attention_input_refuses_predecessor_during_successor_adoption() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (_old_peer, _old_link, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let predecessor = sh.ep.lock().unwrap().input_target;
+        let gen = sh.begin_link(None);
+        let (io, mut successor) = pair();
+        let mut greeting = hello_frame(1, 1, "1.5.0");
+        greeting.extend(terminals_frame(vec![info(t)]));
+        successor.write(&greeting);
+        let (link, _, _) = Link::establish(
+            io,
+            ProtocolRange { min: 1, max: 1 },
+            "1.5.0",
+            sh.events(gen),
+            T5,
+        )
+        .unwrap();
+        assert!(sh.wait_first_list(gen, T5));
+        successor.expect("hello");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let adopting = sh.clone();
+        let adoption = std::thread::spawn(move || {
+            adopting.adopt(gen, &link, |st| {
+                // The successor endpoint is installed, State is held, and status has not yet
+                // been published. Input intentionally uses the separate nonblocking endpoint.
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(T5).unwrap();
+                st.status.set_kind(StatusKind::Connected);
+            })
+        });
+        entered_rx.recv_timeout(T5).unwrap();
+        assert!(sh.st.try_lock().is_err());
+        assert_eq!(h.status().link_generation, predecessor.link_generation);
+        let during = h.term_input(t, "obsolete action".into(), None, Some(predecessor));
+        release_tx.send(()).unwrap();
+        assert_eq!(adoption.join().unwrap(), Some(0));
+        assert_eq!(during.unwrap_err().code, HostErrorCode::Offline);
+        let current = InputTarget {
+            config_generation: h.status().config_generation,
+            link_generation: gen,
+        };
+        h.term_input(t, "current action".into(), None, Some(current))
+            .unwrap();
+        // No predecessor bytes may have reached the successor ahead of this action.
+        let next = successor.read_json();
+        assert_eq!(next["t"], "term.input");
+        assert_eq!(next["data"], "current action");
+    }
 
     #[test]
     fn update_reservation_stale_target_and_late_callback_guards() {
@@ -2017,7 +2174,7 @@ pub(crate) mod tests {
         p3.expect("hello");
         p3.expect("term.attach");
         // No second attach was sent: the next message is our probe.
-        h.term_input(t, "probe".into()).unwrap();
+        h.term_input(t, "probe".into(), None, None).unwrap();
         assert_eq!(p3.read_json()["t"], "term.input");
     }
 
@@ -2149,7 +2306,9 @@ pub(crate) mod tests {
             HostErrorCode::Offline
         );
         assert_eq!(
-            h.term_input(Uuid::nil(), "x".into()).unwrap_err().code,
+            h.term_input(Uuid::nil(), "x".into(), None, None)
+                .unwrap_err()
+                .code,
             HostErrorCode::Offline
         );
         {
@@ -2426,7 +2585,7 @@ pub(crate) mod tests {
         assert_eq!(b.wait_text("REPLAY"), "\x1bcREPLAY");
         assert!(sh.lock().atts.contains_key(&t));
         // No detach went out: the next message is our probe.
-        h.term_input(t, "probe".into()).unwrap();
+        h.term_input(t, "probe".into(), None, None).unwrap();
         assert_eq!(peer.read_json()["t"], "term.input");
     }
 

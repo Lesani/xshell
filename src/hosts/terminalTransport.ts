@@ -414,10 +414,34 @@ export function markClosing(tabs: Tab[]) {
   for (const t of tabs) { const h = daemonHost(t); if (h && t.terminal) remoteTerminals.close(h, t.terminal); }
 }
 
-export function writeTerminal(tab: Tab, data: string) {
-  const h = daemonHost(tab);
-  if (h) invoke("host_term_input", { host: h, terminal: tab.terminal, data }).catch(() => {});
-  else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
+// Capture the complete input identity before any clipboard/upload work. Dispatch never
+// consults a newer Tab or connection; ordinary typing captures and writes synchronously.
+export interface TerminalInputAction {
+  readonly tabId: string;
+  readonly host?: HostId;
+  readonly terminal?: string;
+  readonly handledCompletionId?: string | null;
+  readonly inputTarget?: Readonly<{ configGeneration: number; linkGeneration: number }>;
+}
+
+export function captureTerminalInput(tab: Tab, handledCompletionId?: string | null): TerminalInputAction {
+  const host = daemonHost(tab);
+  const status = host ? registry.getStatus(host) : undefined;
+  const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
+    ? Object.freeze({ configGeneration: status.configGeneration, linkGeneration: status.linkGeneration }) : undefined;
+  return Object.freeze({ tabId: tab.id, host: tab.host, terminal: tab.terminal, handledCompletionId, inputTarget });
+}
+
+export function writeTerminalInput(action: TerminalInputAction, data: string) {
+  const host = daemonHost(action);
+  const { handledCompletionId, inputTarget } = action;
+  if (host) {
+    invoke("host_term_input", { host, terminal: action.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
+  } else invoke("write_terminal", { id: action.tabId, data }).catch(() => {});
+}
+
+export function writeTerminal(tab: Tab, data: string, handledCompletionId?: string | null) {
+  writeTerminalInput(captureTerminalInput(tab, handledCompletionId), data);
 }
 
 // Restarts the agent with skipPermissions set to `value`, resuming its session; the Tab keeps
