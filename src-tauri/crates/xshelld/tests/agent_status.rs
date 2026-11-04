@@ -837,6 +837,16 @@ impl Env {
         list.into_iter().find(|i| i.terminal == t).unwrap()
     }
 
+    /// History can arrive before its completion hook; wait for both in one snapshot.
+    fn wait_finished_line(c: &mut Client, t: Uuid, last: &Option<LastLine>) -> TerminalInfo {
+        let list = c.terminals_where(|l| {
+            l.iter().any(|i| {
+                i.terminal == t && i.last_line == *last && i.agent_status == Some(Finished)
+            })
+        });
+        list.into_iter().find(|i| i.terminal == t).unwrap()
+    }
+
     fn link(&mut self, t: Uuid, sid: &str) {
         self.c
             .request(&ClientMsg::TermUpdate {
@@ -993,8 +1003,49 @@ fn codex_last_line_with_linked_session() {
     Env::wait_line(&mut e.c, t, &line(Speaker::User, "build it"));
     append(&rollout, &ev("agent_message", "Built."));
     e.codex_notify_with(r#"{"type":"agent-turn-complete"}"#);
-    let i = Env::wait_line(&mut e.c, t, &line(Speaker::Agent, "Built."));
+    let i = Env::wait_finished_line(&mut e.c, t, &line(Speaker::Agent, "Built."));
     assert_eq!(i.agent_status, Some(Finished));
+}
+
+#[test]
+fn codex_finished_line_skips_a_queued_pre_hook_history_snapshot() {
+    let (mut e, reads) = env_reads();
+    let t = e.open("codex", None);
+    reads.settle(t, 0);
+    let sid = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+    let rollout =
+        e.h.home()
+            .join(".codex/sessions/2026/10/10")
+            .join(format!("rollout-2026-10-10T10-00-00-{sid}.jsonl"));
+    let ev = |kind: &str, text: &str| serde_json::json!({"type":"event_msg","payload":{"type":kind,"message":text}});
+    append(
+        &rollout,
+        &serde_json::json!({"type":"session_meta","payload":{"id":sid}}),
+    );
+    append(&rollout, &ev("user_message", "build it"));
+    // Hold the link's first read after it read the user line. Writing the reply now
+    // guarantees its pending retry sees Built before we deliver the completion hook.
+    let (held_tx, held_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    *reads.hold.lock().unwrap() = Some((held_tx, release_rx));
+    e.link(t, sid);
+    held_rx.recv_timeout(T).unwrap();
+    let mut history = Client::connect(&e.srv.socket);
+    history.hello(range(1, 1));
+    append(&rollout, &ev("agent_message", "Built."));
+    release_tx.send(()).unwrap();
+    Env::wait_line(&mut e.c, t, &line(Speaker::User, "build it"));
+    let built = line(Speaker::Agent, "Built.");
+    let pre_hook = Env::wait_line(&mut history, t, &built);
+    assert_eq!(pre_hook.agent_status, None);
+    e.codex_notify_with(r#"{"type":"agent-turn-complete"}"#);
+    let i = Env::wait_finished_line(&mut e.c, t, &built);
+    assert_eq!(i.last_line, built);
+    assert_eq!(i.agent_status, Some(Finished));
+    assert!(e.c.log.iter().any(|ev| matches!(ev,
+        Ev::Msg(xshell_protocol::msg::ServerMsg::Terminals { list })
+            if list.iter().any(|i| i.terminal == t && i.last_line == built && i.agent_status.is_none())
+    )), "the pre-hook history snapshot must actually be queued before Finished");
 }
 
 #[test]
