@@ -1,3 +1,5 @@
+import { flattenEntries, projectDrop, projectDropGap, type TabBarEntry } from "../tabs/projectOrder";
+import type { ReorderDrop } from "../hooks/useDragReorder";
 import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { tabName } from "../tabs/tabName";
 import { CustomTitleController, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches, type CustomTitleTarget } from "../tabs/customTitle";
@@ -11,7 +13,7 @@ import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { timeAgo, processSessions } from "../utils";
-import type { ProjectInfo, ProjectSettings, SessionInfo, Tab, Group } from "../types";
+import type { ProjectInfo, ProjectSettings, SessionInfo, Tab } from "../types";
 import { getAvailableShells, shellsForPlatform } from "../shells";
 import { registry } from "../hosts/registry";
 import { useHostsSnapshot } from "../hosts/useHosts";
@@ -45,11 +47,12 @@ function TabProjectIcon({ iconValue, color, name, linked, className = "" }: { ic
 
 // Tab bar shows tabs and groups interleaved. A group is one "entry" representing
 // its bundled tabs; the individual tabs inside it don't appear standalone.
-export type TabBarEntry = { kind: "tab"; id: string; tab: Tab } | { kind: "group"; id: string; group: Group };
+export type { TabBarEntry } from "../tabs/projectOrder";
 
 interface TabBarProps {
   tabs: Tab[];
   entries: TabBarEntry[];
+  groupTabsByProject?: boolean;
   closingTabIds: Set<string>;
   activeTabId: string;
   selectedProject: ProjectInfo | null;
@@ -219,7 +222,7 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
@@ -278,36 +281,20 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
   // Reorder tabs/groups within the bar. We reorder at the entry level (treating each
   // group as an atomic slot), then expand back to a flat `tabs` array so the existing
   // entry-derivation in App.tsx reproduces the new order.
-  const handleEntryReorder = useCallback((newEntries: TabBarEntry[]) => {
-    const tabsById = new Map(tabs.map(t => [t.id, t]));
-    const tabsByGroup = new Map<string, Tab[]>();
-    for (const t of tabs) {
-      if (t.groupId) {
-        const list = tabsByGroup.get(t.groupId) || [];
-        list.push(t);
-        tabsByGroup.set(t.groupId, list);
-      }
-    }
-    const next: Tab[] = [];
-    for (const e of newEntries) {
-      if (e.kind === "tab") {
-        const t = tabsById.get(e.id);
-        if (t) next.push(t);
-      } else {
-        // Group entry — splice in all member tabs together (preserves intra-group order).
-        const members = tabsByGroup.get(e.id) || [];
-        for (const t of members) next.push(t);
-      }
-    }
+  const handleEntryReorder = useCallback((newEntries: TabBarEntry[], drop: ReorderDrop) => {
+    const next = flattenEntries(groupTabsByProject ? projectDrop(entries, tabs, drop) : newEntries, tabs);
     if (next.length === tabs.length) onReorderTabs(next);
-  }, [tabs, onReorderTabs]);
+  }, [tabs, entries, groupTabsByProject, onReorderTabs]);
 
-  const { dragIdx, overIdx, onPointerDown: onEntryPointerDown } = useDragReorder<TabBarEntry>({
+  const { dragIdx, overIdx, drop, onPointerDown: onEntryPointerDown } = useDragReorder<TabBarEntry>({
     items: entries,
+    itemKey: entry => entry.id,
     direction: "horizontal",
     itemSelector: ".tab-item[data-idx]",
     onReorder: handleEntryReorder,
   });
+
+  const insertionGap = groupTabsByProject && drop ? projectDropGap(entries, tabs, drop) : overIdx;
 
   const checkOverflow = () => {
     const el = scrollRef.current;
@@ -359,8 +346,8 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
         <div className="tab-bar-tabs" ref={scrollRef}>
           {entries.map((entry, i) => {
             const isDragging = dragIdx === i;
-            const showDropBefore = dragIdx !== null && overIdx === i && overIdx !== dragIdx && overIdx !== dragIdx + 1;
-            const showDropAfter = dragIdx !== null && overIdx === i + 1 && overIdx !== dragIdx && overIdx !== dragIdx + 1;
+            const showDropBefore = dragIdx !== null && insertionGap === i && insertionGap !== dragIdx && insertionGap !== dragIdx + 1;
+            const showDropAfter = dragIdx !== null && insertionGap === i + 1 && insertionGap !== dragIdx && insertionGap !== dragIdx + 1;
             if (entry.kind === "group") {
               const g = entry.group;
               const leafIds = collectLeafIds(g.layout);
@@ -371,7 +358,7 @@ export function TabBar({ tabs, entries, closingTabIds, activeTabId, selectedProj
               const isRenaming = renamingGroupId === g.id;
               const startRename = () => { setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
               return (
-                <div key={g.id} data-idx={i} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
+                <div key={g.id} data-idx={i} data-drag-id={g.id} className={`tab-item tab-group-item ${isActive ? "active" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => onEntryPointerDown(e, i)} onClick={() => { if (!isRenaming) onSelectTab(g.id); }} onDoubleClick={startRename} onContextMenu={(e) => { e.preventDefault(); startRename(); }} onMouseEnter={(e) => { if (!isRenaming) setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() }); }} onMouseLeave={() => setTooltip(null)}>
                   {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
                   <Layers size={13} className="tab-group-icon" />
                   <div className="tab-item-text">

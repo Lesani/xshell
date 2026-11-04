@@ -227,3 +227,85 @@ describe("TabBar Pi leading-icon status", () => {
     tabs[0].agent = "pi"; tabs[0].shellMode = "raw"; render(); expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
   });
 });
+
+describe("Project ordering pointer gaps", () => {
+  const rect = { left: 300, top: 0, width: 100, height: 30, right: 400, bottom: 30, x: 300, y: 0, toJSON() {} };
+  function fixture() {
+    tabs = [
+      { id: "a", type: "terminal", title: "a", projectPath: "/p" },
+      { id: "b", type: "terminal", title: "b", projectPath: "/p" },
+      { id: "c", type: "terminal", title: "c", projectPath: "/q" },
+      { id: "d", type: "terminal", title: "d", projectPath: "/q" },
+    ];
+    props = { ...props, tabs, entries: tabs.map(tab => ({ kind: "tab", id: tab.id, tab })), groupTabsByProject: true };
+    render();
+  }
+  function down(id: string) { act(() => { tabEl(id).dispatchEvent(new PointerEvent("pointerdown", { button: 0, bubbles: true, clientX: 10, clientY: 10 })); }); }
+  function move(target: string, x: number) {
+    vi.spyOn(tabEl(target), "getBoundingClientRect").mockReturnValue(rect);
+    document.elementFromPoint = vi.fn(() => tabEl(target));
+    act(() => { window.dispatchEvent(new PointerEvent("pointermove", { clientX: x, clientY: 10 })); });
+  }
+  function up(type = "pointerup") { act(() => { window.dispatchEvent(new PointerEvent(type)); }); }
+  function result() { const calls = vi.mocked(props.onReorderTabs).mock.calls; return calls[calls.length - 1]?.[0].map(t => t.id); }
+  it.each([
+    ["a", "b", 390, ["b", "a", "c", "d"]],
+    ["a", "c", 390, ["c", "d", "a", "b"]],
+    ["d", "a", 310, ["c", "d", "a", "b"]],
+    ["c", "a", 390, ["a", "b", "c", "d"]],
+  ])("pointer midpoint/source-removal from %s to %s (%s)", (source, target, x, expected) => {
+    fixture(); down(source as string); move(target as string, x as number); up(); expect(result()).toEqual(expected);
+  });
+  it("previews the actual whole-block destination rather than a gap inside the target Project", () => {
+    fixture(); down("a"); move("c", 390);
+    expect(tabEl("d").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("c").querySelector(".tab-drop-line-after")).toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-before")).toBeNull();
+    up(); expect(result()).toEqual(["c", "d", "a", "b"]);
+    down("d"); move("b", 310);
+    expect(tabEl("a").querySelector(".tab-drop-line-before")).not.toBeNull();
+    expect(tabEl("a").querySelector(".tab-drop-line-after")).toBeNull();
+    expect(tabEl("b").querySelector(".tab-drop-line-before")).toBeNull();
+    up(); expect(result()).toEqual(["c", "d", "a", "b"]);
+  });
+  it("keeps raw entry-gap previews for off-mode and within-block moves", () => {
+    fixture(); props = { ...props, groupTabsByProject: false }; render();
+    down("a"); move("c", 390);
+    expect(tabEl("c").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-before")).not.toBeNull();
+    expect(tabEl("d").querySelector(".tab-drop-line-after")).toBeNull();
+    up(); expect(result()).toEqual(["b", "c", "a", "d"]);
+    props = { ...props, groupTabsByProject: true }; render();
+    down("a"); move("b", 390);
+    expect(tabEl("b").querySelector(".tab-drop-line-after")).not.toBeNull();
+    expect(tabEl("c").querySelector(".tab-drop-line-before")).not.toBeNull();
+    up(); expect(result()).toEqual(["b", "a", "c", "d"]);
+  });
+  it("off-mode moves just one atomic entry; pointercancel and changed entries cancel; outside clears a prior gap", () => {
+    fixture(); props = { ...props, groupTabsByProject: false }; render();
+    down("a"); move("c", 390); up(); expect(result()).toEqual(["b", "c", "a", "d"]);
+    vi.mocked(props.onReorderTabs).mockClear();
+    down("a"); move("c", 390); up("pointercancel"); expect(props.onReorderTabs).not.toHaveBeenCalled();
+    down("a"); move("c", 390);
+    props = { ...props, entries: props.entries.slice(1), tabs: tabs.slice(1) }; render(); up();
+    expect(props.onReorderTabs).not.toHaveBeenCalled(); expect(container.querySelector(".tab-dragging")).toBeNull();
+    down("b"); move("c", 390); document.elementFromPoint = vi.fn(() => null);
+    act(() => { window.dispatchEvent(new PointerEvent("pointermove", { clientX: 500, clientY: 500 })); }); up();
+    expect(props.onReorderTabs).not.toHaveBeenCalled();
+  });
+  it("mixed Group is an opaque entry, not a leaf-index source; single-Project Group moves with its block", async () => {
+    const { tabBarEntries } = await import("../tabs/projectOrder");
+    fixture();
+    tabs = [...tabs, { id: "x", type: "terminal", title: "x", projectPath: "/q", groupId: "mix" }, { id: "y", type: "terminal", title: "y", projectPath: "/p", groupId: "mix" }, { id: "p1", type: "terminal", title: "p1", projectPath: "/p", groupId: "pure" }, { id: "p2", type: "terminal", title: "p2", projectPath: "/p", groupId: "pure" }];
+    const group = (id: string, a: string, b: string): import("../types").Group => ({ id, name: id, layout: { kind: "split", direction: "col", ratio: .5, children: [{ kind: "leaf", tabId: a }, { kind: "leaf", tabId: b }] } });
+    const { normalizeProjectTabs } = await import("../tabs/projectOrder");
+    const groups = [group("mix", "x", "y"), group("pure", "p1", "p2")];
+    tabs = normalizeProjectTabs(tabs, groups);
+    props = { ...props, tabs, entries: tabBarEntries(tabs, groups) }; render();
+    expect([...container.querySelectorAll(".tab-item[data-idx]")].map(e => e.getAttribute("data-idx"))).toEqual(["0", "1", "2", "3", "4", "5"]);
+    down("pure"); move("d", 390); up();
+    expect(result()).toEqual(["c", "d", "a", "b", "p1", "p2", "x", "y"]);
+    vi.mocked(props.onReorderTabs).mockClear(); down("mix"); move("a", 310); up();
+    expect(result()).toEqual(["x", "y", "a", "b", "p1", "p2", "c", "d"]);
+  });
+});
