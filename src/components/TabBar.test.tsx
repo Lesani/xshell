@@ -14,7 +14,7 @@ vi.mock("../hosts/registry", async original => ({ ...await original<typeof impor
   getSnapshot: () => store.snap, subscribe: (listener: () => void) => { store.listeners.add(listener); return () => { store.listeners.delete(listener); }; }, getStatus: (host: string) => store.snap.status[host],
 } }));
 vi.mock("../hosts/useHosts", () => ({ useHostsSnapshot: () => useSyncExternalStore(listener => { store.listeners.add(listener); return () => { store.listeners.delete(listener); }; }, () => store.snap) }));
-vi.mock("../tabs/localAgentStatus", () => ({ useLocalAgentStatuses: () => new Map() }));
+vi.mock("../tabs/localAgentStatus", () => ({ useLocalAgentStatuses: () => new Map(), localAgentStatus: { completionOf: () => undefined } }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({}) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -179,14 +179,14 @@ describe("TabBar shared names", () => {
   });
 });
 
-describe("TabBar Pi leading-icon status", () => {
-  function workingPi() {
-    tabs[0].agent = "pi";
-    store.snap.status.local.daemonCapabilities = ["agent.status"];
+describe("TabBar stationary leading-icon attention", () => {
+  function working(agent = "pi") {
+    tabs[0].agent = agent as Tab["agent"];
+    store.snap.status.local.daemonCapabilities = ["agent.status", "term.completion-attention"];
     store.snap.live.local![0].agentStatus = "working";
   }
-  it.each(["initials", "emoji", "image", "dot"])("animates the actual %s identity when selected and inactive", async kind => {
-    workingPi();
+  it.each(["initials", "emoji", "image", "dot"])("rotates only the outer ring of %s identity, selected or inactive", async kind => {
+    working();
     if (kind === "dot") tabs[0].projectName = "";
     if (kind === "emoji") props.projectIcons = { "/p": { icon: "🦀", color: "#123456" } };
     if (kind === "image") {
@@ -194,37 +194,47 @@ describe("TabBar Pi leading-icon status", () => {
       vi.mocked(invoke).mockResolvedValue("data:image/png;base64,aGVsbG8=");
     }
     await act(async () => { root.render(<TabBar {...props} />); });
-    const selector = kind === "dot" ? ".tab-dot" : ".tab-project-icon";
-    const icon = tabEl().querySelector(selector)!;
-    expect(icon.classList.contains("tab-pi-working")).toBe(true);
-    expect(tabEl().querySelector(".tab-item-text")?.classList.contains("tab-pi-working")).toBe(false);
+    const icon = tabEl().querySelector(kind === "dot" ? ".tab-dot" : ".tab-project-icon")!;
+    expect(icon.parentElement?.classList.contains("tab-attention-working")).toBe(true);
+    expect(icon.className).not.toMatch(/working|linked/);
+    expect(tabEl().getAttribute("aria-label")).toContain("Working");
     if (kind === "initials") expect(icon.textContent).toBe("PR");
     if (kind === "emoji") expect(icon.textContent).toBe("🦀");
     if (kind === "image") expect(icon.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,aGVsbG8=");
-    expect(tabEl().querySelector('[aria-label="Agent status: Working"]')).not.toBeNull();
     props.activeTabId = "shell"; render();
     expect(tabEl().classList.contains("active")).toBe(false);
-    expect(tabEl().querySelector(selector)?.classList.contains("tab-pi-working")).toBe(true);
-    expect(tabEl("shell").querySelector(".tab-pi-working")).toBeNull();
-    for (const status of ["finished", "ended", undefined] as const) {
-      store.snap.live.local![0].agentStatus = status; render();
-      expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
-    }
+    expect(tabEl().querySelector(".tab-attention-working")).not.toBeNull();
+    expect(tabEl("shell").querySelector(".tab-attention-working")).toBeNull();
   });
-  it("does not aggregate a working Pi into the group icon", () => {
-    workingPi();
-    props.entries = [{ kind: "group", id: "g", group: { id: "g", name: "Group", layout: { kind: "leaf", tabId: "tab" } } }];
-    render(); expect(container.querySelector(".tab-pi-working")).toBeNull();
-    expect(container.querySelector(".tab-group-icon")).not.toBeNull();
+  it.each(["claude", "codex", "pi"])("%s working ignores read/handled; finished unread is exact; needs-you is static", agent => {
+    working(agent);
+    const id = "00000000-0000-4000-8000-000000000001";
+    const info = store.snap.live.local![0];
+    info.completionAttention = { completionId: id, inputHandled: true };
+    render(); expect(tabEl().querySelector(".tab-attention-working")).not.toBeNull();
+    info.agentStatus = "finished"; render(); expect(tabEl().querySelector(".tab-attention-unread")).toBeNull();
+    info.completionAttention.inputHandled = false; render(); expect(tabEl().querySelector(".tab-attention-unread")).not.toBeNull();
+    props.completionSeen = { [JSON.stringify(["daemon", "local", "uuid"])]: id }; render();
+    expect(tabEl().querySelector(".tab-attention-unread")).toBeNull();
+    props.completionSeen = {}; props.viewingIds = new Set(["tab"]); render();
+    expect(tabEl().querySelector(".tab-attention-unread")).toBeNull();
+    info.agentStatus = "needs-you"; render(); expect(tabEl().querySelector(".tab-attention-needs-you")).not.toBeNull();
+    expect(tabEl().getAttribute("aria-label")).toContain("Needs you");
+    info.agentStatus = "ended"; render(); expect(tabEl().querySelector(".tab-attention-needs-you")).toBeNull();
   });
-  it("stale, closing, raw and other agents never animate", () => {
-    workingPi(); render(); expect(tabEl().querySelector(".tab-pi-working")).not.toBeNull();
-    replaceStatus({ status: "reconnecting" }); expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
+  it("never animates stale, closing, exited or raw; preserves truthful labels and permission tooltip without decorations", () => {
+    working(); tabs[0].skipPermissions = true; render();
+    expect(tabEl().getAttribute("aria-label")).toContain("permission");
+    replaceStatus({ status: "reconnecting" }); expect(tabEl().querySelector(".tab-attention-working")).toBeNull();
     expect(tabEl().getAttribute("aria-label")).toContain("Working (last known)");
     replaceStatus({ status: "connected" }); props.closingTabIds.add("tab"); render();
-    expect(tabEl().querySelector(".tab-pi-working")).toBeNull(); props.closingTabIds.clear();
-    for (const agent of ["claude", "codex"] as const) { tabs[0].agent = agent; render(); expect(tabEl().querySelector(".tab-pi-working")).toBeNull(); }
-    tabs[0].agent = "pi"; tabs[0].shellMode = "raw"; render(); expect(tabEl().querySelector(".tab-pi-working")).toBeNull();
+    expect(tabEl().querySelector(".tab-attention-working")).toBeNull(); props.closingTabIds.clear();
+    store.snap.live.local![0].exitCode = 0; store.snap.live.local![0].agentStatus = "ended"; render();
+    expect(tabEl().getAttribute("aria-label")).toContain("Ended"); expect(tabEl().querySelector(".tab-attention-working")).toBeNull();
+    tabs[0].shellMode = "raw"; render(); expect(tabEl().querySelector(".tab-attention-working")).toBeNull();
+    props.entries = [{ kind: "group", id: "g", group: { id: "g", name: "Group", layout: { kind: "leaf", tabId: "tab" } } }];
+    render(); expect(container.querySelector(".tab-group-icon")).not.toBeNull();
+    expect(container.querySelector(".tab-skip-perms-icon, .tab-agent-status, .tab-project-icon-linked, .tab-pi-working")).toBeNull();
   });
 });
 

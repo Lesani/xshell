@@ -289,6 +289,7 @@ fn unresolved_cleanup_does_not_relaunch() {
     );
     let err = c
         .request(&ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t,
             data: "x".into(),
         })

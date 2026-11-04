@@ -143,6 +143,7 @@ async function saveZoom(tabId: string, size: number) {
 
 interface TerminalTabProps {
   tab: Tab;
+  observedCompletionId?: string;
   isActive: boolean;
   gitLazyPolling: boolean;
   gitChangesTree: boolean;
@@ -218,13 +219,15 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover most of the terminal but stay usable.
 const PANEL_EDGE_RESERVE = 140; // = the CSS max-width reserve on .terminal-side-panel
 
-export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rightPanel, onRightPanelChange, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
+export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPolling, gitChangesTree, rightPanel, onRightPanelChange, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const [_error, setError] = useState<string | null>(null);
   const tabRef = useRef(tab);
+  const observedCompletionRef = useRef(observedCompletionId);
+  observedCompletionRef.current = observedCompletionId;
   // Loading state: true from spawn until the PTY emits its first byte. That window covers
   // Node.js boot + claude TUI first paint — the "blank screen" the user sees before claude
   // is ready. Universal: works for fresh, --resume, and raw shells.
@@ -314,7 +317,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rig
 
   const showTt = useCallback((text: string, el: HTMLElement) => setTooltip({ text, rect: el.getBoundingClientRect() }), []);
   const hideTt = useCallback(() => setTooltip(null), []);
-  const writePathToTerminal = useCallback((data: string) => writeTerminal(tabRef.current, data), []);
+  const writePathToTerminal = useCallback((data: string) => writeTerminal(tabRef.current, data, observedCompletionRef.current), []);
 
   // Delayed-tooltip variant for git-change rows — like the file explorer, it waits ~1s so the
   // hint ("Click to show diff") doesn't flicker as the cursor scans the list.
@@ -433,6 +436,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rig
     // Windows auto-copies on capture), save it to a real file and type its path instead of
     // raw bytes — shells/CLIs take a file path, not an image blob. Falls back to plain text.
     const pasteFromClipboard = async () => {
+      const observed = observedCompletionRef.current;
       try {
         const items = await navigator.clipboard.read();
         for (const item of items) {
@@ -442,14 +446,20 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rig
           if (blob.size > MAX_DROPPED_FILE_BYTES) throw new Error("clipboard image too large");
           const ext = imgType.split("/")[1] || "png";
           const path = await hostInvoke<string>(tabRef.current.host, "save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
-          writeTerminal(tabRef.current, /\s/.test(path) ? `"${path}" ` : `${path} `);
+          writeTerminal(tabRef.current, /\s/.test(path) ? `"${path}" ` : `${path} `, observed);
           return;
         }
       } catch (_) { /* clipboard.read() unsupported/denied, no image item, or too large — fall back to text */ }
       const text = await navigator.clipboard.readText().catch(() => "");
       // term.paste() frames multiline input when the program has enabled DEC2004.
       // Programs that opt out retain xterm's normal unbracketed paste behavior.
-      if (text) term.paste(text);
+      if (text) {
+        // xterm emits paste's complete onData frame synchronously. Keep the observation
+        // from the paste action, not the newer render after clipboard access awaited.
+        const current = observedCompletionRef.current;
+        observedCompletionRef.current = observed;
+        try { term.paste(text); } finally { observedCompletionRef.current = current; }
+      }
     };
 
     // Intercept Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 for zoom, and Ctrl+V for paste
@@ -584,7 +594,7 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rig
       inputDisposable = term.onData((data) => {
         // Remote Terminal while its Host is not usable: input is dropped, with a hint.
         if (remoteHost && !registry.isUsable(remoteHost)) { flashInputPaused(); return; }
-        writeTerminal(tabRef.current, data);
+        writeTerminal(tabRef.current, data, observedCompletionRef.current);
       });
 
       // Debounce the PTY resize (SIGWINCH). xterm reflows visually on every fit(), but Claude
@@ -1204,14 +1214,14 @@ export function TerminalTab({ tab, isActive, gitLazyPolling, gitChangesTree, rig
               Promise.all(images.map(async (f) => {
                 return hostInvoke<string>(tab.host, "save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
               })).then((paths) => {
-                writeTerminal(tab, paths.map(quote).join(" ") + " ");
+                writeTerminal(tab, paths.map(quote).join(" ") + " ", observedCompletionId);
                 terminalRef.current?.focus();
               }).catch(() => {});
               return;
             }
             const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
             if (!p) return;
-            writeTerminal(tab, `${quote(p)} `);
+            writeTerminal(tab, `${quote(p)} `, observedCompletionId);
             terminalRef.current?.focus();
           }}
         >

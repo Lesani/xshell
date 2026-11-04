@@ -230,7 +230,9 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         | ClientMsg::SessionUnsubscribe { .. } => Ok(()),
         // A Mobile answers the prompts of the agent Terminals it sees (`listed`), and replies
         // to their chats.
-        ClientMsg::TermAnswer { .. } | ClientMsg::TermSubmit { .. } => Ok(()),
+        ClientMsg::TermAnswer { .. }
+        | ClientMsg::TermSubmit { .. }
+        | ClientMsg::TermInputHandled { .. } => Ok(()),
     }
 }
 
@@ -925,6 +927,7 @@ pub(crate) mod tests {
             },
             // Replies too.
             ClientMsg::TermSubmit {
+                handled_completion_id: None,
                 terminal: t,
                 text: "fix it".into(),
                 files: vec![],

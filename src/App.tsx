@@ -1,4 +1,7 @@
-import { useLocalAgentStatuses } from "./tabs/localAgentStatus";
+import { attentionKey, decodeCompletionSeen, markCompletionSeen, persistedCompletionSeen, pruneCompletionSeen, removeCompletionSeenHost, visibleTerminalIds, COMPLETION_SEEN_SETTING, type CompletionSeen } from "./tabs/attention";
+import { useDesktopForeground } from "./tabs/useDesktopForeground";
+import { agentStatusOf } from "./tabs/agentStatus";
+import { localAgentStatus, useLocalAgentStatuses } from "./tabs/localAgentStatus";
 import { groupTabsSetting, normalizeProjectTabs, tabBarEntries } from "./tabs/projectOrder";
 import { projectTerminals } from "./tabs/projectTerminals";
 import { adoptRightPanel, decodeRightPanels, defaultRightPanel, ensureRightPanels, pruneRightPanels, removeRightPanelHost, rightPanelKey, setRightPanel, RIGHT_PANELS_SETTING, type RightPanel, type RightPanels } from "./tabs/rightPanel";
@@ -108,7 +111,7 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
 // the result (H: the whole startup is single-flight and its state application fenced).
 async function loadStartup() {
   const store = await load("settings.json", { defaults: {}, autoSave: true });
-  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs] = await Promise.all([
+  const [paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs, storedCompletionSeen] = await Promise.all([
     store.get<string[]>("project_paths"),
     store.get<Record<string, ProjectSettings>>("project_icons"),
     store.get<Tab[]>("open_tabs"),
@@ -140,8 +143,9 @@ async function loadStartup() {
     store.get<HostConfig[]>("hosts"),
     store.get<unknown>(RIGHT_PANELS_SETTING),
     store.get<unknown>("group_tabs_by_project"),
+    store.get<unknown>(COMPLETION_SEEN_SETTING),
   ]);
-  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs };
+  const v = { paths, icons, savedTabs, savedGroups, gitLazy, bgColor, aot, shell, ctxEnabled, defFont, gitTree, fileExpOnStart, storedLayout, rlSidebar, rowMetrics, storedTheme, fsRender, termHeaderStats, projectStatsChart, statsView, syncOut, eagerInit, webgl, fontWeight, defAgent, rowMetricsCodex, rlSidebarCodex, rowMetricsOpencode, storedHosts, storedRightPanels, storedGroupTabs, storedCompletionSeen };
   // Remote Hosts: start the registry (a no-op with none configured) and load the offline
   // cache so their last known Terminals show as Tabs right away. In local Daemon mode the
   // Local Host joins the registry and its cached Tabs restore too.
@@ -246,6 +250,24 @@ export default function App() {
   const [groupTabsByProject, setGroupTabsByProject] = useState(true);
   // When on (default), a newly opened agent terminal shows the file-explorer panel immediately.
   const [fileExplorerOnStart, setFileExplorerOnStart] = useState(true);
+  const { foreground: desktopForeground, isForeground } = useDesktopForeground();
+  const [tabDialogOpen, setTabDialogOpen] = useState(false);
+  const [completionSeen, setCompletionSeen] = useState<CompletionSeen>({});
+  const completionSeenRef = useRef<CompletionSeen>({});
+  const completionSeenSaves = useRef(Promise.resolve());
+  const updateCompletionSeen = useCallback((next: CompletionSeen) => {
+    if (next === completionSeenRef.current) return;
+    const previous = persistedCompletionSeen(completionSeenRef.current);
+    completionSeenRef.current = next;
+    setCompletionSeen(next);
+    const entries = persistedCompletionSeen(next);
+    if (JSON.stringify(entries) !== JSON.stringify(previous)) {
+      completionSeenSaves.current = completionSeenSaves.current.then(async () => {
+        const store = await load("settings.json", { defaults: {}, autoSave: true });
+        await store.set(COMPLETION_SEEN_SETTING, { version: 1, entries });
+      }).catch(() => {});
+    }
+  }, []);
   const [rightPanels, setRightPanels] = useState<RightPanels>({});
   const rightPanelsRef = useRef<RightPanels>({});
   const [rightPanelsLoaded, setRightPanelsLoaded] = useState(false);
@@ -278,7 +300,14 @@ export default function App() {
     const next = { ...rightPanelsRef.current };
     for (const key of keys) delete next[key];
     updateRightPanels(next);
-  }, [updateRightPanels]);
+    const seen = { ...completionSeenRef.current };
+    let changed = false;
+    for (const tab of removed.filter(t => !daemonHost(t))) {
+      const key = attentionKey(tab);
+      if (seen[key] !== undefined) { delete seen[key]; changed = true; }
+    }
+    if (changed) updateCompletionSeen(seen);
+  }, [updateRightPanels, updateCompletionSeen]);
   const [contextTreeEnabled, setContextTreeEnabled] = useState(true);
   // Both default to true: setting up the statusline hook is the meaningful gesture, the
   // toggles let the user hide either feature even with stats available.
@@ -447,6 +476,8 @@ export default function App() {
       if (typeof v.rlSidebarCodex === "boolean") setShowRateLimitInSidebarCodex(v.rlSidebarCodex);
       if (typeof v.rowMetricsOpencode === "boolean") setShowSessionRowMetricsOpencode(v.rowMetricsOpencode);
       updateRightPanels(ensureRightPanels(decodeRightPanels(v.storedRightPanels), restored.tabs, typeof v.fileExpOnStart === "boolean" ? v.fileExpOnStart : true));
+      completionSeenRef.current = decodeCompletionSeen(v.storedCompletionSeen);
+      setCompletionSeen(completionSeenRef.current);
       setRightPanelsLoaded(true);
       if (restored.tabs.length) {
         setTabs(groupTabsSetting(v.storedGroupTabs) ? normalizeProjectTabs(restored.tabs, restored.groups) : restored.tabs);
@@ -898,7 +929,10 @@ export default function App() {
   // keep running on the Host), its projects are unpinned and its cache is dropped.
   const handleRemoveHost = useCallback(async (id: HostId) => {
     const saved = persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id));
-    if (rightPanelsLoaded) updateRightPanels(removeRightPanelHost(rightPanelsRef.current, id));
+    if (rightPanelsLoaded) {
+      updateRightPanels(removeRightPanelHost(rightPanelsRef.current, id));
+      updateCompletionSeen(removeCompletionSeenHost(completionSeenRef.current, id));
+    }
     const gone = tabsRef.current.filter(t => t.host === id).map(t => t.id);
     for (const [uuid, p] of pendingOpens) if (p.host === id) pendingOpens.delete(uuid);
     for (const tid of gone) metaSync.forget(tid);
@@ -919,7 +953,7 @@ export default function App() {
     adoptedPanelsRef.current.delete(id);
     cache.dropHost(id);
     await saved;
-  }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts, rightPanelsLoaded, updateRightPanels]);
+  }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
 
   // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
   const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
@@ -1066,6 +1100,31 @@ export default function App() {
   const MAX_GROUP_LEAVES = 8;
   const [groups, setGroups] = useState<Group[]>([]);
   const showHome = !showSettings && !tabs.find(t => t.id === activeTabId) && !groups.find(g => g.id === activeTabId);
+
+  // Viewing consumes only this Desktop's exact observation, never a Host message.
+  const visibleIds = visibleTerminalIds(tabs, groups, activeTabId);
+  const viewingIds = new Set<string>();
+  if (rightPanelsLoaded && desktopForeground && !tabDialogOpen && !showProjectPicker && !agentPickerProject && !editingProjectKey && !updateDialogOpen) {
+    for (const tab of tabs) {
+      if (!visibleIds.has(tab.id) || closingTabIds.has(tab.id)) continue;
+      const host = daemonHost(tab);
+      const info = host ? hostsSnap.live[host]?.find(i => i.terminal === tab.terminal) : undefined;
+      const status = agentStatusOf(tab, { live: host ? hostsSnap.live[host] : undefined, status: host ? hostsSnap.status[host] : undefined, local: localAgentStatuses });
+      if (status && !status.stale && status.status === "finished" && info?.exitCode == null) viewingIds.add(tab.id);
+    }
+  }
+  useEffect(() => {
+    if (!isForeground()) return;
+    let next = completionSeenRef.current;
+    for (const tab of tabs) {
+      if (!viewingIds.has(tab.id)) continue;
+      const host = daemonHost(tab);
+      const observed = host ? hostsSnap.live[host]?.find(i => i.terminal === tab.terminal)?.completionAttention?.completionId : localAgentStatus.completionOf(tab.id);
+      const current = host ? registry.getSnapshot().live[host]?.find(i => i.terminal === tab.terminal)?.completionAttention?.completionId : localAgentStatus.completionOf(tab.id);
+      next = markCompletionSeen(next, attentionKey(tab), observed, current);
+    }
+    updateCompletionSeen(next);
+  });
 
   // Persist groups whenever they change (after initial restore, same pattern as tabs).
   useEffect(() => {
@@ -1236,6 +1295,7 @@ export default function App() {
         for (const info of list) awaiting?.delete(info.terminal);
         if (awaiting?.size === 0) adoptedPanelsRef.current.delete(host);
         next = pruneRightPanels(next, host, list.map(i => i.terminal), new Set([...pendingUuids(), ...(awaiting ?? [])]));
+        updateCompletionSeen(pruneCompletionSeen(completionSeenRef.current, host, list.map(i => i.terminal)));
       }
       updateRightPanels(next);
     }
@@ -1262,7 +1322,7 @@ export default function App() {
       setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, removed), removed));
       if (removed.includes(activeTabIdRef.current)) setActiveTabId("home");
     }
-  }, [tabsRestored, hostsSnap.live, reconcileTick, rightPanelsLoaded, updateRightPanels]);
+  }, [tabsRestored, hostsSnap.live, reconcileTick, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
 
   // Push local edits of remote Tabs (linked session id, title) to their Terminal's meta.
   // Only while the Host is usable; a failed call is retried once (amendment 17).
@@ -1515,7 +1575,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar groupTabsByProject={groupTabsByProject} tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar onDialogOpenChange={setTabDialogOpen} completionSeen={completionSeen} viewingIds={viewingIds} groupTabsByProject={groupTabsByProject} tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onHoverProject={setHoveredProjectKey} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectKey={activeTabProjectKey} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">
@@ -1607,8 +1667,10 @@ export default function App() {
           // so reordering tabs shuffles which host each portal targets and React remounts
           // the subtree (which kills the PTY in TerminalTab's cleanup). Keying by tab.id
           // makes a reorder a pure move — the TerminalTab instance, xterm, and PTY survive.
+          const wireHost = daemonHost(tab);
+          const observedCompletionId = wireHost ? hostsSnap.live[wireHost]?.find(i => i.terminal === tab.terminal)?.completionAttention?.completionId : undefined;
           return createPortal(
-            <TerminalTab tab={tab} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} rightPanel={rightPanels[rightPanelKey(tab)] ?? defaultRightPanel(tab, fileExplorerOnStart)} onRightPanelChange={panel => changeRightPanel(tab, panel)} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
+            <TerminalTab tab={tab} observedCompletionId={observedCompletionId} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} rightPanel={rightPanels[rightPanelKey(tab)] ?? defaultRightPanel(tab, fileExplorerOnStart)} onRightPanelChange={panel => changeRightPanel(tab, panel)} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
             host,
             tab.id,
           );

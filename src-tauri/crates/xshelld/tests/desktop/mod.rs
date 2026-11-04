@@ -236,7 +236,8 @@ pub fn upgrade(h: &HostHandle) -> Result<Value, HostError> {
 pub fn marker(h: &HostHandle, sink: &VecSink, t: Uuid, word: &str) {
     let from = sink.len();
     let (a, b) = word.split_at(word.len() / 2);
-    h.term_input(t, format!("echo {a}\"\"{b}\n")).unwrap();
+    h.term_input(t, format!("echo {a}\"\"{b}\n"), None, None)
+        .unwrap();
     sink.wait_from(from, word);
 }
 

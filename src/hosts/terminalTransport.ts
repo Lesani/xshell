@@ -414,10 +414,16 @@ export function markClosing(tabs: Tab[]) {
   for (const t of tabs) { const h = daemonHost(t); if (h && t.terminal) remoteTerminals.close(h, t.terminal); }
 }
 
-export function writeTerminal(tab: Tab, data: string) {
+export function writeTerminal(tab: Tab, data: string, handledCompletionId?: string | null) {
   const h = daemonHost(tab);
-  if (h) invoke("host_term_input", { host: h, terminal: tab.terminal, data }).catch(() => {});
-  else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
+  if (h) {
+    // Synchronously capture the action's connection before Tauri dispatch; the input queue
+    // must not retarget it after reconfiguration/reconnect. Older bridges omit generations.
+    const status = registry.getStatus(h);
+    const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
+      ? { configGeneration: status.configGeneration, linkGeneration: status.linkGeneration } : undefined;
+    invoke("host_term_input", { host: h, terminal: tab.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
+  } else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
 }
 
 // Restarts the agent with skipPermissions set to `value`, resuming its session; the Tab keeps

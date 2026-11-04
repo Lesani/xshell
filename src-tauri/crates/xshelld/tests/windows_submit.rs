@@ -772,6 +772,7 @@ impl Probe {
 
     fn submit_files(&mut self, f: &Fake, text: &str, files: &[&str]) -> Result<Value, String> {
         self.c.request(&ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: f.t,
             text: text.into(),
             files: files.iter().map(|s| s.to_string()).collect(),
@@ -1634,6 +1635,7 @@ fn mode_helper_ignores_ctrl_break_and_ends_with_the_console() {
     );
     let f = p.ready("claude");
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: "hi".into(),
         files: vec![],
@@ -1909,6 +1911,7 @@ fn reply_waits_out_output_backpressure() {
     p.c.input(f.t, "x");
     let text = "after the stall\nsecond line";
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: text.into(),
         files: vec![],
@@ -1975,6 +1978,7 @@ fn reply_waits_out_backpressure_mid_paste() {
     f.run("flood 40000");
     let text = long_text(SUBMIT_MAX_BYTES);
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: text.clone(),
         files: vec![],
@@ -2071,6 +2075,7 @@ fn stopped_mid_paste(gate: bool) {
     let text = long_text(SUBMIT_MAX_BYTES);
     let paste = typed(&text);
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: text.clone(),
         files: vec![],
@@ -2235,6 +2240,7 @@ fn daemon_answers_while_a_reply_retries_a_full_pipe() {
     let text = format!("{}\n", "b".repeat(99)).repeat(160);
     let paste = typed(&text);
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: text.clone(),
         files: vec![],
@@ -2354,6 +2360,7 @@ fn mode_helper_under_output_backpressure() {
     let f = p.ready("claude");
     stall_output(&p, &f);
     let id = p.c.send_req(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: f.t,
         text: "during the stall".into(),
         files: vec![],
@@ -2541,6 +2548,7 @@ fn hitl_real_agent_probe() {
     let (rows_before, paste) = screen(&raw);
     fs::write(out.join(format!("{agent}-composer.raw")), &raw).unwrap();
     let r = p.c.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: t,
         text: "Reply with the single word ok.\nThis is the second line.".into(),
         files: vec![],

@@ -312,6 +312,7 @@ fn submit_not_offered_on_windows() {
     c.attach(t);
     c.output_until(t, &word);
     let r = c.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: t,
         text: "hi".into(),
         files: vec![],

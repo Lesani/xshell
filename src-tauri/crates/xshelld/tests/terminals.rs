@@ -308,6 +308,7 @@ fn process_exit_broadcasts_and_stays_listed() {
     // Input to an exited Terminal is refused.
     let err = a
         .request(&ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t,
             data: "x".into(),
         })

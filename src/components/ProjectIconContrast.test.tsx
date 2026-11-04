@@ -13,7 +13,7 @@ import type { ProjectInfo, ProjectSettings, Tab } from "../types";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (command: string) => command === "read_image_base64" ? "data:image/png;base64,fixture" : undefined), Channel: class {} }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({}) }));
-vi.mock("../tabs/localAgentStatus", () => ({ useLocalAgentStatuses: () => new Map() }));
+vi.mock("../tabs/localAgentStatus", () => ({ useLocalAgentStatuses: () => new Map(), localAgentStatus: { completionOf: () => undefined } }));
 
 const project: ProjectInfo = { name: "Project Name", path: "/p", encoded_name: "-p", session_count: 0, last_active: "" };
 const tab: Tab = { id: "t", type: "terminal", title: "Terminal", projectName: project.name, projectPath: project.path };
@@ -62,8 +62,9 @@ describe.each(["light", "dark"])("mounted Project icon foreground (%s)", theme =
     for (const icon of ["AB", undefined]) {
       await renderIcons({ color, icon });
       for (const boundary of textBoundaries()) expect(boundary.style.color).toBe(expected);
-      // Existing selected/linked ring classes remain untouched in this slice.
-      expect(container.querySelector(".tab-project-icon-linked")).not.toBeNull();
+      // Selection remains legible independently of completion attention's outer ring.
+      expect(container.querySelector('[data-boundary="tab"] .tab-item.active')).not.toBeNull();
+      expect(container.querySelector(".tab-project-icon-linked")).toBeNull();
     }
   });
   it.each(["🚀", "🇦🇹", "1️⃣", "img:/fixture.png"])("does not tint or filter artwork %s", async icon => {
