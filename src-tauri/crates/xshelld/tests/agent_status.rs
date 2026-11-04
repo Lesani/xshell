@@ -1827,6 +1827,11 @@ fn completion_attention_exact_shared_handling_and_next_finish() {
 fn completion_attention_raw_controls_text_and_interrupt() {
     let mut e = env();
     let t = e.open("claude", None);
+    // This agent stays alive and reads interrupt bytes, like the real TUI. The generic
+    // shell fixture otherwise has ISIG on and Ctrl-C legitimately kills it with SIGINT.
+    e.run("stty raw -echo; exec 3<&0; cat <&3 > input.bin & attention_reader=$!");
+    let pid = e.pid();
+    let mut expected_input = Vec::new();
     e.status_event(t, Working);
     e.status_event(t, Finished);
     let f = e.attention_info(t).completion_attention.unwrap();
@@ -1847,6 +1852,7 @@ fn completion_attention_raw_controls_text_and_interrupt() {
             handled_completion_id: Some(f.completion_id),
         })
         .unwrap();
+        expected_input.extend_from_slice(data.as_bytes());
         assert!(
             !e.attention_info(t)
                 .completion_attention
@@ -1865,6 +1871,7 @@ fn completion_attention_raw_controls_text_and_interrupt() {
             handled_completion_id: Some(f.completion_id),
         })
         .unwrap();
+        expected_input.extend_from_slice(data.as_bytes());
         assert!(
             e.attention_info(t)
                 .completion_attention
@@ -1880,11 +1887,32 @@ fn completion_attention_raw_controls_text_and_interrupt() {
         handled_completion_id: Some(old.completion_id),
     })
     .unwrap();
+    expected_input.push(3);
+    let input = e.cwd.join("input.bin");
+    let deadline = Instant::now() + T;
+    while fs::read(&input).unwrap_or_default().len() < expected_input.len() {
+        assert!(
+            Instant::now() < deadline,
+            "agent did not read the interrupt byte"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(input).unwrap(), expected_input);
+    e.run(":"); // The same process can still service its control channel after reading Ctrl-C.
     let interrupted = e.attention_info(t);
+    assert_eq!(interrupted.pid, Some(pid as u32));
+    assert_eq!(interrupted.exit_code, None);
+    assert!(alive(pid));
     assert_eq!(interrupted.agent_status, Some(Finished));
     let f = interrupted.completion_attention.unwrap();
     assert_ne!(old.completion_id, f.completion_id);
     assert!(!f.input_handled);
+    // Explicit process exit is distinct from an interrupted turn, and closes the reader.
+    e.send("kill \"$attention_reader\"; wait \"$attention_reader\"; exit 0");
+    let ended = e.wait(t, Some(Ended));
+    assert_eq!(ended.exit_code, Some(0));
+    assert_eq!(ended.completion_attention, Some(f));
+    assert!(!alive(pid));
 }
 
 #[test]
