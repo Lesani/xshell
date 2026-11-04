@@ -13,9 +13,12 @@ describe("pi_status.js embedded extension", () => {
   }, 15000);
 });
 
-it("Pi icon CSS uses compositor properties and disables animation for reduced motion", async () => {
+it("attention rotates only its outer ring and keeps reduced-motion static", async () => {
   const { readFile } = await import("node:fs/promises");
   const css = await readFile(new URL("../App.css", import.meta.url), "utf8");
-  expect(css).toMatch(/@keyframes tab-pi-working\s*\{[\s\S]*?transform: scale\(0\.85\); opacity: 0\.55/);
-  expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.tab-pi-working\s*\{ animation: none;/);
+  expect(css).toMatch(/\.tab-attention-working::after\s*\{[^}]*animation: tab-attention-rotate/);
+  expect(css).toMatch(/@keyframes tab-attention-rotate\s*\{ to \{ transform: rotate\(360deg\);/);
+  expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.tab-attention-working::after\s*\{ animation: none;/);
+  expect(css).not.toMatch(/tab-pi-working|tab-project-icon-linked|tab-dot-active|tab-agent-status/);
+  expect(css.match(/\.tab-attention-icon \{[^}]+/g)?.join("")).not.toMatch(/transform|animation|opacity/);
 });

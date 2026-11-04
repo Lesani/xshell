@@ -126,6 +126,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::TermAttach { .. } => "term.attach",
         ClientMsg::TermDetach { .. } => "term.detach",
         ClientMsg::TermInput { .. } => "term.input",
+        ClientMsg::TermInputHandled { .. } => "term.input-handled",
         ClientMsg::TermResize { .. } => "term.resize",
         ClientMsg::TermClose { .. } => "term.close",
         ClientMsg::TermUpdate { .. } => "term.update",
@@ -759,6 +760,7 @@ mod tests {
 
     fn info(t: Uuid) -> TerminalInfo {
         TerminalInfo {
+            completion_attention: None,
             terminal: t,
             spec: LaunchSpec::default(),
             meta: Default::default(),
@@ -1023,6 +1025,7 @@ mod tests {
         let link = up(io, &Rec::new());
         let t = Uuid::new_v4();
         link.notify(ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t,
             data: "x".into(),
         })
@@ -1069,6 +1072,7 @@ mod tests {
         // with CAPABILITIES.
         let data = |n: u8| format!("{n:03}{}", "-".repeat(1024));
         let input = |n: u8| ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: Uuid::nil(),
             data: data(n),
         };

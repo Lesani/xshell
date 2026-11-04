@@ -23,9 +23,9 @@ use xshell_core::prompt::{composer, composer_images, extract, screen_tail, Scree
 use xshell_core::terminal::replay::ReplayBuffer;
 use xshell_core::terminal::state::{Leader, PersistedTerminal, ProcIdentity};
 use xshell_protocol::msg::{
-    encode_res, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED, SUBMIT_NEEDS_YOU,
-    SUBMIT_NOT_CHAT, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_NO_VT_INPUT, SUBMIT_STUCK,
-    SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
+    encode_res, CompletionAttention, LastLine, ServerMsg, TerminalInfo, PROMPT_ANSWERED,
+    SUBMIT_NEEDS_YOU, SUBMIT_NOT_CHAT, SUBMIT_NOT_READY, SUBMIT_NO_NONBLOCK, SUBMIT_NO_VT_INPUT,
+    SUBMIT_STUCK, SUBMIT_UNCONFIRMED, SUBMIT_UNSUPPORTED,
 };
 
 const READ_BUF: usize = 16 * 1024;
@@ -205,6 +205,8 @@ pub(crate) struct Submit {
     /// typed after each file's.
     pub paste: Vec<u8>,
     frames: Vec<Range<usize>>,
+    text_spans: Vec<Range<usize>>,
+    on_text: Option<Box<dyn FnOnce() + Send>>,
     /// Offsets in `paste` after which `attach` must answer `true` before more is typed.
     waits: Vec<usize>,
     /// Whether the `n`-th file (from 1) shows attached; an `Err` stops the reply. Called
@@ -234,6 +236,8 @@ impl Submit {
         Self {
             paste: typing.bytes,
             frames: typing.frames,
+            text_spans: typing.text_spans,
+            on_text: None,
             waits: typing.waits,
             attach: None,
             attach_timeout: SUBMIT_ATTACH_TIMEOUT,
@@ -372,6 +376,7 @@ fn bracketed(text: &str) -> Vec<u8> {
 pub(crate) struct Typing {
     bytes: Vec<u8>,
     frames: Vec<Range<usize>>,
+    text_spans: Vec<Range<usize>>,
     /// Where a file's paste ends: nothing more is typed until the agent shows that file
     /// attached.
     waits: Vec<usize>,
@@ -387,6 +392,7 @@ impl Typing {
         let mut t = Typing {
             bytes: Vec::new(),
             frames: Vec::new(),
+            text_spans: Vec::new(),
             waits: Vec::new(),
         };
         let paste = |t: &mut Typing, s: &str| {
@@ -400,6 +406,12 @@ impl Typing {
             t.bytes.push(b' ');
         }
         if let Some(text) = text {
+            let body = t.bytes.len() + PASTE_START.len();
+            t.text_spans = text
+                .char_indices()
+                .filter(|(_, c)| !c.is_control())
+                .map(|(i, c)| body + i..body + i + c.len_utf8())
+                .collect();
             paste(&mut t, text);
         }
         t
@@ -703,6 +715,16 @@ pub(crate) fn write_item(
         };
         match gated(&mut s, step, w, &piece)? {
             Step::Wrote(n) => {
+                // The gate has released readiness locks. Only actual user text spans count,
+                // including a positive partial write; never wrappers or attachment paths.
+                if s.text_spans
+                    .iter()
+                    .any(|r| r.start < off + n && off < r.end)
+                {
+                    if let Some(on_text) = s.on_text.take() {
+                        on_text();
+                    }
+                }
                 off += n;
                 s.pasted = true;
                 (waited, stale) = (Duration::ZERO, 0);
@@ -928,6 +950,7 @@ pub(crate) struct StatusCell {
     at_ms: Option<u64>,
     /// Every stamp is above this: the last stamp of the run this one replaced.
     floor: u64,
+    completion_attention: Option<CompletionAttention>,
 }
 
 impl StatusCell {
@@ -936,6 +959,7 @@ impl StatusCell {
             tracker,
             at_ms: None,
             floor,
+            completion_attention: None,
         }
     }
 
@@ -944,9 +968,25 @@ impl StatusCell {
     /// stamps of one Terminal strictly increase.
     pub(crate) fn stamp(&mut self, changed: bool, now: u64) -> bool {
         if changed {
+            if self.tracker.status() == Some(AgentStatus::Finished) {
+                self.completion_attention = Some(CompletionAttention {
+                    completion_id: Uuid::new_v4(),
+                    input_handled: false,
+                });
+            }
             self.at_ms = Some(now.max(self.last_stamp() + 1));
         }
         changed
+    }
+
+    fn handle_completion(&mut self, observed: Uuid) -> bool {
+        match self.completion_attention.as_mut() {
+            Some(c) if c.completion_id == observed && !c.input_handled => {
+                c.input_handled = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Continue after `floor` (the replaced run's last stamp): a stamp made before, with a
@@ -975,7 +1015,7 @@ impl StatusCell {
 const ENTRY_OVERHEAD: usize = 256;
 
 /// Reserved per entry for the fields the Daemon fills in after admission, at their largest
-/// serialized: `agentStatus`, `statusAtMs`, a `lastLine` of [`LAST_LINE_MAX_CHARS`]
+/// serialized: `agentStatus`, `statusAtMs`, `completionAttention`, a `lastLine` of [`LAST_LINE_MAX_CHARS`]
 /// four-byte characters (control characters never reach it; `"` and `\` escape to two bytes)
 /// and a `permissionPrompt` of [`PROMPT_TEXT_MAX_CHARS`] and [`PROMPT_OPTIONS_MAX`] labels
 /// of [`PROMPT_OPTION_MAX_CHARS`] such characters (about 5.9 KB). Counted in every entry's
@@ -1735,6 +1775,7 @@ impl Terminal {
         self: &Arc<Self>,
         d: &Arc<Daemon>,
         typing: Typing,
+        handled_completion_id: Option<Uuid>,
         done: Box<dyn FnOnce(Result<(), String>) + Send>,
     ) -> Result<(), String> {
         if !d.cfg.submit {
@@ -1908,6 +1949,16 @@ impl Terminal {
         let mut item = Submit::new(typing, d.cfg.submit_enter_delay, gate, done)
             .on_stuck(stuck)
             .on_attach(attach);
+        if let Some(observed) = handled_completion_id {
+            let (weak, da) = (Arc::downgrade(self), d.clone());
+            item.on_text = Some(Box::new(move || {
+                if let Some(t) = weak.upgrade() {
+                    if t.handle_completion(observed).unwrap_or(false) {
+                        super::agent::changed(&da, &t);
+                    }
+                }
+            }));
+        }
         item.stall = d.cfg.submit_stall;
         item.attach_timeout = d.cfg.submit_attach_timeout;
         item.markers_alone = d.cfg.submit_markers_alone;
@@ -1991,7 +2042,20 @@ impl Terminal {
         Ok(changed.is_some())
     }
 
-    /// Input just queued (or refused): it may answer a prompt or interrupt a turn.
+    /// Exact-token handling never changes lifecycle. Caller publishes after releasing locks.
+    pub fn handle_completion(&self, observed: Uuid) -> Result<bool, String> {
+        self.reply_life()?;
+        let mut c = self.status.lock().unwrap();
+        if c.tracker.agent().is_none() {
+            return Err("not an agent terminal".into());
+        }
+        if c.tracker.status() == Some(AgentStatus::Ended) {
+            return Err("terminal has exited".into());
+        }
+        Ok(c.handle_completion(observed))
+    }
+
+    /// Successfully queued input may answer a prompt or interrupt a turn.
     pub fn note_input(&self, d: &Daemon, data: &[u8]) {
         let changed = {
             let mut c = self.status.lock().unwrap();
@@ -2374,7 +2438,10 @@ impl Terminal {
         data: String,
         mobile: bool,
         may_answer: bool,
+        handled_completion_id: Option<Uuid>,
     ) -> Result<bool, String> {
+        self.reply_life()?;
+        let bytes = data.as_bytes().to_vec();
         let changed = {
             let mut io = self.io.lock().unwrap();
             match io.arb.on_input(conn, mobile) {
@@ -2400,6 +2467,15 @@ impl Terminal {
         if spent {
             self.publish_prompt(d);
             d.prompts.recheck(self.id);
+        }
+        // Queue/prompt/input locks are released before status (which is always last).
+        self.note_input(d, &bytes);
+        if xshell_protocol::terminal_input::is_text_frame(&bytes) {
+            if let Some(observed) = handled_completion_id {
+                if self.handle_completion(observed).unwrap_or(false) {
+                    super::agent::changed(d, self);
+                }
+            }
         }
         Ok(changed)
     }
@@ -2692,8 +2768,13 @@ impl Terminal {
     pub fn info(&self) -> TerminalInfo {
         let r = self.record.lock().unwrap();
         let exit_code = self.out.lock().unwrap().exit_code;
-        let (agent_status, status_at_ms) = self.status.lock().unwrap().listed();
+        let (agent_status, status_at_ms, completion_attention) = {
+            let c = self.status.lock().unwrap();
+            let (status, at) = c.listed();
+            (status, at, c.completion_attention.clone())
+        };
         TerminalInfo {
+            completion_attention,
             terminal: self.id,
             spec: r.spec.clone(),
             meta: r.meta.clone(),
@@ -3310,6 +3391,86 @@ mod status_tests {
     }
 
     #[test]
+    fn completion_attention_central_transitions_ignore_clock_order() {
+        let mut c = cell(0);
+        assert!(c.completion_attention.is_none());
+        event(&mut c, AgentStatus::Working, 1000);
+        event(&mut c, AgentStatus::Finished, 1000);
+        let f = c.completion_attention.clone().unwrap();
+        assert!(!f.input_handled);
+        assert!(!event(&mut c, AgentStatus::Finished, 2000));
+        assert_eq!(c.completion_attention, Some(f.clone()));
+        assert!(c.handle_completion(f.completion_id));
+        assert!(!c.handle_completion(f.completion_id));
+        event(&mut c, AgentStatus::Working, 10);
+        assert!(c.completion_attention.as_ref().unwrap().input_handled);
+        event(&mut c, AgentStatus::NeedsYou, 9);
+        assert!(c.completion_attention.as_ref().unwrap().input_handled);
+        let changed = c.tracker.on_input(b"\x03");
+        assert!(c.stamp(changed, 8));
+        let g = c.completion_attention.clone().unwrap();
+        assert_ne!(f.completion_id, g.completion_id);
+        assert!(!c.handle_completion(f.completion_id));
+        assert_eq!(c.completion_attention, Some(g));
+        // A fresh process starts empty even with an inherited legacy stamp floor.
+        let mut successor = cell(c.last_stamp());
+        assert!(successor.completion_attention.is_none());
+        event(&mut successor, AgentStatus::Finished, 1);
+        assert!(!successor.handle_completion(f.completion_id));
+        assert!(
+            !successor
+                .completion_attention
+                .as_ref()
+                .unwrap()
+                .input_handled
+        );
+    }
+
+    #[test]
+    fn completion_attention_rejected_raw_queue_neither_notes_lifecycle_nor_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::server::role::tests::daemon(dir.path());
+        let t = unresolved(
+            &d,
+            PersistedTerminal {
+                terminal: Uuid::new_v4(),
+                spec: LaunchSpec {
+                    agent: Some("claude".into()),
+                    ..Default::default()
+                },
+                meta: Map::new(),
+                cols: 80,
+                rows: 24,
+                created_at_ms: 0,
+                leader: None,
+                prompt_id_floor: None,
+            },
+        );
+        t.reset_status_for_test();
+        t.life.lock().unwrap().exited = None;
+        {
+            let mut c = t.status.lock().unwrap();
+            event(&mut c, AgentStatus::Finished, 1);
+        }
+        let f = t.info().completion_attention.unwrap();
+        let (tx, rx) = sync_channel(1);
+        tx.try_send(Input::Bytes(vec![])).unwrap();
+        *t.input.lock().unwrap() = Some(tx);
+        let input =
+            |data: &str| t.write_input(&d, 1, data.into(), false, false, Some(f.completion_id));
+        assert_eq!(input("ö"), Err("input backlog full".into()));
+        assert!(!t.info().completion_attention.unwrap().input_handled);
+        // Regression for note_input after a failed queue: an interrupt cannot manufacture
+        // Finished when its bytes were not admitted.
+        t.on_agent_event(&d, t.run, AgentStatus::Working).unwrap();
+        assert_eq!(input("\x03"), Err("input backlog full".into()));
+        assert_eq!(t.agent_status(), Some(AgentStatus::Working));
+        drop(rx);
+        assert_eq!(input("ö"), Err("terminal has exited".into()));
+        assert!(!t.info().completion_attention.unwrap().input_handled);
+    }
+
+    #[test]
     fn custom_title_candidate_preserves_pending_relaunch_prompt_and_leaders() {
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
@@ -3408,6 +3569,7 @@ mod status_tests {
             PROMPT_OPTION_MAX_CHARS, PROMPT_TEXT_MAX_CHARS,
         };
         let bare = TerminalInfo {
+            completion_attention: None,
             terminal: Uuid::new_v4(),
             spec: LaunchSpec::default(),
             meta: Map::new(),
@@ -3427,6 +3589,10 @@ mod status_tests {
             let full = TerminalInfo {
                 agent_status: Some(AgentStatus::NeedsYou),
                 status_at_ms: Some(u64::MAX),
+                completion_attention: Some(CompletionAttention {
+                    completion_id: Uuid::new_v4(),
+                    input_handled: false,
+                }),
                 last_line: Some(LastLine {
                     from: Speaker::Agent,
                     text,
@@ -3936,6 +4102,71 @@ mod status_tests {
             gate,
             done,
         )))
+    }
+
+    #[test]
+    fn completion_attention_submit_only_after_positive_user_text_not_wrappers_or_paths() {
+        // The actual write loop, including partial/unknown outcomes. Pieces are single
+        // bytes so the acceptance edge cannot hide behind a whole-paste write.
+        for (paths, text, accepted, want) in [
+            (vec![], Some("ö"), 0, false),
+            (vec![], Some("ö"), PASTE_START.len(), false),
+            (vec![], Some("ö"), PASTE_START.len() + 1, true),
+            (vec![], Some("\nö"), PASTE_START.len() + 1, false),
+            (vec!["/d/photo.jpg".into()], None, usize::MAX, false),
+            (vec![], Some("done"), usize::MAX, true),
+        ] {
+            let mut w = Recorder {
+                take: Some(1),
+                ..Default::default()
+            };
+            let out = Outcome::default();
+            let result = out.clone();
+            let handled = Arc::new(AtomicUsize::new(0));
+            let handled_in = handled.clone();
+            let locked = Arc::new(AtomicBool::new(false));
+            let gate_locked = locked.clone();
+            let mut writes = 0usize;
+            let gate: SubmitGate = Box::new(move |step, write| {
+                assert!(!gate_locked.swap(true, Ordering::SeqCst));
+                let r = if step != SubmitStep::Close && writes >= accepted {
+                    Err(SUBMIT_NOT_READY.into())
+                } else {
+                    let r = write();
+                    if let Ok(n) = r {
+                        writes += n;
+                    }
+                    Ok(r)
+                };
+                gate_locked.store(false, Ordering::SeqCst);
+                r
+            });
+            let mut item = Submit::new(
+                Typing::reply(&paths, text),
+                Duration::ZERO,
+                gate,
+                Box::new(move |r| result.lock().unwrap().push(r)),
+            );
+            item.on_text = Some(Box::new(move || {
+                assert!(!locked.load(Ordering::SeqCst));
+                handled_in.fetch_add(1, Ordering::SeqCst);
+            }));
+            write_item(&mut w, Input::Submit(Box::new(item)), &|_| {}).unwrap();
+            assert_eq!(
+                handled.load(Ordering::SeqCst),
+                usize::from(want),
+                "{paths:?} {text:?} {accepted}"
+            );
+            let outcome = out.lock().unwrap();
+            assert_eq!(outcome.len(), 1);
+            if accepted == 0 {
+                assert_eq!(outcome[0], Err(SUBMIT_NOT_READY.into()));
+            } else if accepted != usize::MAX {
+                assert_eq!(outcome[0], Err(SUBMIT_UNCONFIRMED.into()));
+            } else {
+                assert_eq!(outcome[0], Ok(()));
+            }
+        }
     }
 
     #[test]

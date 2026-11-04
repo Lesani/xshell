@@ -16,6 +16,8 @@ export interface LocalAgentStatusEvent {
 
 export class LocalAgentStatusStore {
   private snap: ReadonlyMap<string, AgentStatus> = new Map();
+  private completions = new Map<string, string>();
+  completionOf = (id: string): string | undefined => this.completions.get(id);
   private seqs = new Map<string, number>();
   private listeners = new Set<() => void>();
   private started: Promise<void> | null = null;
@@ -26,6 +28,10 @@ export class LocalAgentStatusStore {
     this.seqs.set(e.id, e.seq);
     const s = asAgentStatus(e.status);
     if ((this.snap.get(e.id) ?? null) === s) return;
+    // Legacy in-process mode has no shared UUID contract. The accepted event sequence is
+    // a truthful, process-local observation only, never persisted or sent to a Host.
+    if (s === "finished") this.completions.set(e.id, `local:${e.seq}`);
+    if (!s || s === "ended") this.completions.delete(e.id);
     const next = new Map(this.snap);
     if (s) next.set(e.id, s); else next.delete(e.id);
     this.snap = next;

@@ -550,7 +550,7 @@ fn stall_delivery(fx: &Fx) -> (Uuid, std::sync::Arc<Gate>) {
     );
     rx.recv_timeout(W).unwrap().unwrap();
     gate.armed.store(true, SeqCst);
-    h.term_input(t, "echo stall\n".into()).unwrap();
+    h.term_input(t, "echo stall\n".into(), None, None).unwrap();
     let deadline = Instant::now() + W;
     while !gate.inside.load(SeqCst) {
         assert!(Instant::now() < deadline, "the delivery never started");
@@ -571,7 +571,7 @@ fn input_never_waits_on_a_blocked_delivery_on(via: Via) {
     let h = fx.a.host();
     for i in 0..20 {
         let start = Instant::now();
-        h.term_input(t, format!("echo {i}\n")).unwrap();
+        h.term_input(t, format!("echo {i}\n"), None, None).unwrap();
         h.term_resize(t, 100, 30 + i).unwrap();
         let _ = h.snapshot();
         fx.a.m.kick_all();

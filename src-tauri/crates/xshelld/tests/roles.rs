@@ -94,6 +94,7 @@ fn per_terminal(t: Uuid) -> Vec<ClientMsg> {
     vec![
         ClientMsg::TermAttach { terminal: t },
         ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t,
             data: "echo hi\n".into(),
         },
@@ -103,7 +104,12 @@ fn per_terminal(t: Uuid) -> Vec<ClientMsg> {
             rows: 30,
         },
         ClientMsg::TermDetach { terminal: t },
+        ClientMsg::TermInputHandled {
+            terminal: t,
+            completion_id: Uuid::new_v4(),
+        },
         ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: t,
             text: "reply".into(),
             files: vec![],
@@ -504,6 +510,7 @@ fn mobile_attach_input_resize_detach_close_agent() {
     e.mob.attach(t);
     e.mob.output_until(t, "args");
     let input = ClientMsg::TermInput {
+        handled_completion_id: None,
         terminal: t,
         data: "typed\r".into(),
     };
@@ -529,6 +536,7 @@ fn mobile_may_submit() {
     let mut e = env();
     let t = e.desk_open(e.claude());
     let submit = ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: t,
         text: "reply".into(),
         files: vec![],

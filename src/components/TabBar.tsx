@@ -7,8 +7,8 @@ import { TabNameMenu } from "./TabNameMenu";
 import { RenameTabDialog } from "./RenameTabDialog";
 import { useState, useEffect, useRef, useLayoutEffect, useCallback, useSyncExternalStore } from "react";
 import { loadProjectSessions } from "../hosts/projectSessions";
-import { keyOf, keyOfTab, lookupKey, sameKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
-import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot, ShieldOff } from "lucide-react";
+import { keyOf, keyOfTab, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
+import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -18,10 +18,10 @@ import { getAvailableShells, shellsForPlatform } from "../shells";
 import { registry } from "../hosts/registry";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
-import { agentStatusAria, agentStatusOf, agentStatusTooltip } from "../tabs/agentStatus";
+import { agentStatusOf, agentStatusTooltip } from "../tabs/agentStatus";
 import { daemonHost } from "../hosts/localHost";
-import { useLocalAgentStatuses } from "../tabs/localAgentStatus";
-import { AgentStatusBadge } from "./AgentStatusBadge";
+import { localAgentStatus, useLocalAgentStatuses } from "../tabs/localAgentStatus";
+import { attentionKey, attentionRing, type CompletionSeen } from "../tabs/attention";
 import { collectLeafIds } from "../layout";
 import { Layers } from "lucide-react";
 import { useDragReorder } from "../hooks/useDragReorder";
@@ -35,14 +35,11 @@ function tabInitials(name: string): string {
   return name.slice(0, 2).toUpperCase();
 }
 
-// A small version of the sidebar's project icon, sized for a tab. Shows the project image when set,
-// otherwise an emoji / initials over the project's custom color. `linked` adds the ring that the old
-// status dot used to convey (this tab's project is the one currently hovered/selected/linked).
-function TabProjectIcon({ iconValue, color, name, linked, className = "" }: { iconValue?: string; color?: string; name: string; linked: boolean; className?: string }) {
+// The icon remains stationary; attention is drawn outside its clipped artwork.
+function TabProjectIcon({ iconValue, color, name }: { iconValue?: string; color?: string; name: string }) {
   const imgSrc = useProjectImage(iconValue);
-  const cls = `tab-project-icon ${linked ? "tab-project-icon-linked" : ""} ${className}`;
-  if (imgSrc) return <div className={cls}><img src={imgSrc} className="tab-project-img" alt="" /></div>;
-  return <div className={cls} style={{ background: color, color: isProjectIconText(iconValue) ? projectIconContrast(color) : undefined }}>{iconValue || tabInitials(name)}</div>;
+  if (imgSrc) return <div className="tab-project-icon"><img src={imgSrc} className="tab-project-img" alt="" /></div>;
+  return <div className="tab-project-icon" style={{ background: color, color: isProjectIconText(iconValue) ? projectIconContrast(color) : undefined }}>{iconValue || tabInitials(name)}</div>;
 }
 
 // Tab bar shows tabs and groups interleaved. A group is one "entry" representing
@@ -50,6 +47,9 @@ function TabProjectIcon({ iconValue, color, name, linked, className = "" }: { ic
 export type { TabBarEntry } from "../tabs/projectOrder";
 
 interface TabBarProps {
+  onDialogOpenChange?: (open: boolean) => void;
+  completionSeen?: CompletionSeen;
+  viewingIds?: ReadonlySet<string>;
   tabs: Tab[];
   entries: TabBarEntry[];
   groupTabsByProject?: boolean;
@@ -222,7 +222,7 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ onDialogOpenChange, completionSeen = {}, viewingIds = new Set(), tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
@@ -244,10 +244,11 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
     closeNameMenu();
     if (names.open(tab, nameMenu?.target) && clear) void names.submit(null);
   };
-  const highlightKey = hoveredProjectKey || linkedProjectKey || (selectedProject ? keyOf(selectedProject) : null);
   const [dropdown, setDropdown] = useState<{ rect: DOMRect; el: HTMLElement } | null>(null);
   const [tooltip, setTooltip] = useState<{ text: string; rect: DOMRect } | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const dialogOpen = !!nameState.dialog || searchOpen;
+  useLayoutEffect(() => { onDialogOpenChange?.(dialogOpen); }, [dialogOpen, onDialogOpenChange]);
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
   const shortcutLabel = isMac ? "⌘ K" : "Ctrl K";
 
@@ -353,7 +354,6 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
               const leafIds = collectLeafIds(g.layout);
               const leafCount = leafIds.length;
               const isActive = g.id === activeTabId;
-              const anySkipPerms = tabs.some(t => t.skipPermissions && leafIds.includes(t.id));
               const tooltipText = `${g.name} — ${leafCount} pane${leafCount === 1 ? "" : "s"}`;
               const isRenaming = renamingGroupId === g.id;
               const startRename = () => { setRenamingGroupId(g.id); setRenameDraft(g.name); setTooltip(null); };
@@ -369,7 +369,6 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
                     )}
                     <span className="tab-item-project">{leafCount} panes</span>
                   </div>
-                  {anySkipPerms && <ShieldOff size={11} className="tab-skip-perms-icon" />}
                   <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(g.id); }}>
                     <X size={11} />
                   </div>
@@ -379,7 +378,6 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
             }
             const tab = entry.tab;
             const tabKey = keyOfTab(tab);
-            const matches = highlightKey && tabKey && sameKey(tabKey, highlightKey);
             const isClosing = closingTabIds.has(tab.id);
             const projectSettings = tabKey ? projectIcons[lookupKey(tabKey)] : undefined;
             const customName = projectSettings?.customName;
@@ -394,8 +392,9 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
               status: liveHost ? hostsSnap.status[liveHost] : undefined,
               local: localAgentStatuses,
             });
-            const piWorking = !isClosing && !isRawShell && tab.agent === "pi" && agentStatus?.status === "working" && !agentStatus.stale;
-            const iconClass = piWorking ? "tab-pi-working" : "";
+            const info = liveHost ? hostsSnap.live[liveHost]?.find(i => i.terminal === tab.terminal) : undefined;
+            const observed = liveHost ? info?.completionAttention?.completionId : localAgentStatus.completionOf(tab.id);
+            const ring = attentionRing(agentStatus, info, completionSeen[attentionKey(tab)], observed, viewingIds.has(tab.id), isClosing);
             const statusHost = tab.host ? hostNameOf(tab.host) : liveHost ? fmt("picker.group.local") : "";
             const tooltipText = agentStatus ? `${permsTooltip}\n${agentStatusTooltip(agentStatus, statusHost)}` : permsTooltip;
             return (
@@ -414,17 +413,17 @@ export function TabBar({ tabs, entries, groupTabsByProject = true, closingTabIds
                   } else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelectTab(tab.id); }
                 }} data-idx={i} data-drag-id={tab.id} className={`tab-item ${tab.id === activeTabId ? "active" : ""} ${isClosing ? "tab-closing" : ""} ${isRawShell ? "tab-raw-shell" : `tab-agent-${tab.agent || "claude"}`} ${tab.skipPermissions ? "tab-skip-perms" : ""} ${isDragging ? "tab-dragging" : ""}`} onPointerDown={(e) => { if (e.button === 0) onEntryPointerDown(e, i); }} onClick={() => { if (!isClosing) onSelectTab(tab.id); }} onMouseEnter={(e) => setTooltip({ text: tooltipText, rect: e.currentTarget.getBoundingClientRect() })} onMouseLeave={() => setTooltip(null)}>
                 {showDropBefore && <div className="tab-drop-line tab-drop-line-before" />}
-                {isRawShell
-                  ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
-                  : projectDisplayName
-                    ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} linked={!!matches} className={iconClass} />
-                    : <div className={`tab-dot ${matches ? "tab-dot-active" : ""} ${iconClass}`} />}
+                <span className={`tab-attention-icon${ring ? ` tab-attention-${ring}` : ""}`} aria-hidden="true">
+                  {isRawShell
+                    ? <ShellIcon id={tab.shellId} size={14} className="tab-shell-icon" />
+                    : projectDisplayName
+                      ? <TabProjectIcon iconValue={projectSettings?.icon} color={projectSettings?.color} name={projectDisplayName} />
+                      : <div className="tab-dot" />}
+                </span>
                 <div className="tab-item-text">
                   <span className="tab-item-title truncate">{displayTitle}</span>
                   {displaySubtitle && <span className="tab-item-project">{displaySubtitle}</span>}
                 </div>
-                {agentStatus && <AgentStatusBadge value={agentStatus} label={agentStatusAria(agentStatus, statusHost)} />}
-                {tab.skipPermissions && <ShieldOff size={11} className="tab-skip-perms-icon" />}
                 <div className="tab-item-close" onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}>
                   <X size={11} />
                 </div>

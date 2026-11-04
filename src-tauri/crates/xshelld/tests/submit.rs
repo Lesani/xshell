@@ -317,6 +317,7 @@ impl Env {
 
 fn submit(c: &mut Client, t: &Term, text: &str) -> Result<Value, String> {
     c.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: t.id,
         text: text.into(),
         files: vec![],
@@ -328,6 +329,7 @@ fn send_submit(c: &mut Client, t: &Term, text: &str) -> u64 {
     let id = c.request_id();
     c.send(
         &ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: t.id,
             text: text.into(),
             files: vec![],
@@ -696,12 +698,14 @@ fn submit_refused_for_shell_and_non_chat() {
     let shell = Uuid::new_v4();
     e.desk.open(shell, sh_spec(&cwd));
     let r = m.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: shell,
         text: "ls".into(),
         files: vec![],
     });
     assert!(r.as_ref().unwrap_err().contains("forbidden"), "{r:?}");
     let r = e.desk.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: shell,
         text: "ls".into(),
         files: vec![],
@@ -722,6 +726,7 @@ fn submit_refused_for_shell_and_non_chat() {
     cursor.expect_input(b"");
     // Unknown Terminals.
     let r = m.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: Uuid::new_v4(),
         text: "hi".into(),
         files: vec![],
@@ -1046,6 +1051,7 @@ fn an_unclosable_paste_makes_replies_stuck() {
     assert_eq!(submit(&mut m, &t, "next"), Err(SUBMIT_STUCK.into()));
     assert_eq!(
         e.desk.request(&ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t.id,
             data: "k".into(),
         }),
@@ -1078,6 +1084,7 @@ fn drop_photo(c: &mut Client, name: &str) -> String {
 
 fn submit_files(c: &mut Client, t: &Term, text: &str, files: &[&str]) -> Result<Value, String> {
     c.request(&ClientMsg::TermSubmit {
+        handled_completion_id: None,
         terminal: t.id,
         text: text.into(),
         files: files.iter().map(|f| f.to_string()).collect(),
@@ -1088,6 +1095,7 @@ fn send_files(c: &mut Client, t: &Term, text: &str, files: &[&str]) -> u64 {
     let id = c.request_id();
     c.send(
         &ClientMsg::TermSubmit {
+            handled_completion_id: None,
             terminal: t.id,
             text: text.into(),
             files: files.iter().map(|f| f.to_string()).collect(),
@@ -1836,6 +1844,7 @@ fn a_removed_chip_does_not_stall_a_later_photo() {
     // A draft with an image (as a Desktop would paste one), not submitted.
     e.desk
         .request(&ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t.id,
             data: String::from_utf8(pasted(&canonical(&a))).unwrap(),
         })
@@ -1846,6 +1855,7 @@ fn a_removed_chip_does_not_stall_a_later_photo() {
     e.hold.at(Some(TestPoint::SubmitPaste));
     e.desk
         .request(&ClientMsg::TermInput {
+            handled_completion_id: None,
             terminal: t.id,
             data: "\u{15}".into(),
         })
@@ -2309,4 +2319,107 @@ mod mode_gate {
             cfg.input_mode
         );
     }
+}
+
+#[test]
+fn completion_attention_submit_keeps_send_time_token_through_queued_readiness() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    e.status(&t, AgentStatus::Finished);
+    let f = e.info(&t).completion_attention.unwrap();
+    e.hold.at(Some(TestPoint::SubmitPaste));
+    let id = m.request_id();
+    m.send(
+        &ClientMsg::TermSubmit {
+            terminal: t.id,
+            text: "ö queued".into(),
+            files: vec![],
+            handled_completion_id: Some(f.completion_id),
+        },
+        Some(id),
+    );
+    e.hold.wait_held();
+    assert!(
+        !e.info(&t).completion_attention.unwrap().input_handled,
+        "admission is not text acceptance"
+    );
+    e.status(&t, AgentStatus::Working);
+    e.status(&t, AgentStatus::Finished);
+    let g = e.info(&t).completion_attention.unwrap();
+    e.hold.at(None);
+    assert_eq!(m.wait_res(id), Ok(Value::Null));
+    t.expect_input(&typed("ö queued"));
+    assert_eq!(e.info(&t).completion_attention, Some(g.clone()));
+    assert_eq!(
+        m.request(&ClientMsg::TermSubmit {
+            terminal: t.id,
+            text: "current".into(),
+            files: vec![],
+            handled_completion_id: Some(g.completion_id)
+        }),
+        Ok(Value::Null)
+    );
+    assert!(e.info(&t).completion_attention.unwrap().input_handled);
+}
+
+#[test]
+fn completion_attention_submit_wrapper_refusal_vs_partial_text() {
+    for (accepted, handled) in [(0, false), (6, false), (7, true)] {
+        let mut e = env_with(|c| {
+            c.submit_probe.stop_after = Some(accepted);
+            c.submit_probe.max_piece = Some(1);
+        });
+        let mut m = e.mobile();
+        let t = e.ready("claude");
+        e.status(&t, AgentStatus::Finished);
+        let f = e.info(&t).completion_attention.unwrap();
+        let outcome = m.request(&ClientMsg::TermSubmit {
+            terminal: t.id,
+            text: "abc".into(),
+            files: vec![],
+            handled_completion_id: Some(f.completion_id),
+        });
+        assert_eq!(
+            outcome,
+            Err(if accepted == 0 {
+                SUBMIT_NOT_READY
+            } else {
+                SUBMIT_UNCONFIRMED
+            }
+            .into())
+        );
+        let c = e.info(&t).completion_attention.unwrap();
+        assert_eq!(c.completion_id, f.completion_id);
+        assert_eq!(c.input_handled, handled, "accepted {accepted}");
+        let expected = if accepted == 0 {
+            vec![]
+        } else if accepted == 6 {
+            pasted("")
+        } else {
+            pasted("a")
+        };
+        t.expect_input(&expected);
+    }
+}
+
+#[test]
+fn completion_attention_malformed_optional_metadata_still_delivers_raw_and_submit() {
+    let mut e = env();
+    let mut m = e.mobile();
+    let t = e.ready("claude");
+    e.status(&t, AgentStatus::Finished);
+    let f = e.info(&t).completion_attention.unwrap();
+    for method in ["term.input", "term.submit"] {
+        let id = m.request_id();
+        let raw = serde_json::json!({"t":method,"id":id,"terminal":t.id,"data":"ö","text":"reply","handledCompletionId":{"bad":true}});
+        m.send_frame(&xshell_protocol::frame::Frame::Json(
+            raw.to_string().into_bytes(),
+        ));
+        assert_eq!(m.wait_res(id), Ok(Value::Null));
+        assert_eq!(e.info(&t).completion_attention, Some(f.clone()));
+    }
+    let mut expected = "ö".as_bytes().to_vec();
+    expected.extend(typed("reply"));
+    t.expect_input(&expected);
 }

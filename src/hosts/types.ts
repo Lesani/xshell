@@ -81,6 +81,11 @@ export interface LaunchSpec {
 // What an agent Terminal is doing, as its agent's hooks report it (Rust `AgentStatus`).
 export type AgentStatus = "working" | "needs-you" | "finished" | "ended";
 
+export interface CompletionAttention {
+  completionId: string;
+  inputHandled: boolean;
+}
+
 export interface TerminalInfo {
   terminal: string;
   spec: LaunchSpec;
@@ -94,6 +99,7 @@ export interface TerminalInfo {
   // Unix ms (the Daemon's clock) of the last Agent Status change. Absent with agentStatus
   // and from older Daemons.
   statusAtMs?: number | null;
+  completionAttention?: CompletionAttention | null;
   // The newest text message of the agent's session (capability `agent.last-line`).
   lastLine?: LastLine | null;
 }

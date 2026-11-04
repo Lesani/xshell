@@ -15,8 +15,10 @@ const ch = <T,>(i: number) => FakeChannel.all[i] as unknown as Ch<T>;
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a), Channel: FakeChannel }));
 
-import { RemoteTerminals, RetryableStartError, localShellOptions, mountTerminal, markClosing, pendingOpens, relaunchTerminal, writeTerminal, resizeTerminal, type StartOptions } from "./terminalTransport";
+import { captureTerminalInput, writeTerminalInput, RemoteTerminals, RetryableStartError, localShellOptions, mountTerminal, markClosing, pendingOpens, relaunchTerminal, writeTerminal, resizeTerminal, type StartOptions } from "./terminalTransport";
 import type { Tab } from "../types";
+import { registry } from "./registry";
+import type { HostStatus } from "./types";
 
 const H = "h_ab12cd34";
 const opts: StartOptions = { cols: 80, rows: 24, shellMode: "claude", shellCommand: null, shellId: null, fullscreenRendering: true, forceSyncOutput: true };
@@ -523,4 +525,23 @@ describe("an open answered with the Terminal that already runs its session (xshe
     }
     expect(adopted).toEqual([]);
   });
+});
+
+it("captured input action owns immutable Tab/Host/Terminal and connection identity", () => {
+  const status = vi.spyOn(registry, "getStatus").mockReturnValue({ configGeneration: 1, linkGeneration: 2 } as HostStatus);
+  try {
+    const tab: Tab = { id: "original-tab", type: "terminal", title: "Original", host: H, terminal: "original-terminal" };
+    const action = captureTerminalInput(tab, "observed-completion");
+    tab.id = "replacement-tab"; tab.host = "h_changed1"; tab.terminal = "replacement-terminal";
+    status.mockReturnValue({ configGeneration: 3, linkGeneration: 4 } as HostStatus);
+    invoke.mockResolvedValue(undefined);
+    writeTerminalInput(action, "delayed input");
+    expect(action.tabId).toBe("original-tab");
+    expect(Object.isFrozen(action)).toBe(true); expect(Object.isFrozen(action.inputTarget)).toBe(true);
+    expect(status).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("host_term_input", {
+      host: H, terminal: "original-terminal", data: "delayed input", handledCompletionId: "observed-completion",
+      inputTarget: { configGeneration: 1, linkGeneration: 2 },
+    });
+  } finally { status.mockRestore(); }
 });

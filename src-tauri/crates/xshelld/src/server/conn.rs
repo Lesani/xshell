@@ -450,7 +450,11 @@ impl Conn {
                 });
                 reply(&self.ob, id, r);
             }
-            ClientMsg::TermInput { terminal, data } => {
+            ClientMsg::TermInput {
+                terminal,
+                data,
+                handled_completion_id,
+            } => {
                 self.touched.insert(terminal);
                 // Not under the registry lock: input is the hot path. Input that reaches a
                 // Terminal a Relaunch is replacing is dropped like input to an ended one.
@@ -465,16 +469,39 @@ impl Conn {
                     // Queued (and the prompt it may answer spent) before the Agent Status
                     // follows it: a status change unlists the prompt, which must already be
                     // recorded as typed at for the recheck.
-                    let bytes = data.as_bytes().to_vec();
                     let mobile = self.role == Role::Mobile;
-                    let written = t.write_input(&d, self.id, data, mobile, may_answer);
-                    t.note_input(&d, &bytes);
+                    let observed = offered(&d.cfg, xshell_protocol::cap::TERM_COMPLETION_ATTENTION)
+                        .then_some(handled_completion_id)
+                        .flatten();
+                    let written = t.write_input(&d, self.id, data, mobile, may_answer, observed);
                     // Typing can hand the size to this connection; persist it like a resize.
                     if written? {
                         t.schedule_persist(&d);
                     }
                     Ok(Value::Null)
                 });
+                reply(&self.ob, id, r);
+            }
+            ClientMsg::TermInputHandled {
+                terminal,
+                completion_id,
+            } => {
+                let r = if !offered(&d.cfg, xshell_protocol::cap::TERM_COMPLETION_ATTENTION) {
+                    Err("completion attention unsupported".into())
+                } else {
+                    // Listed instance/config/run and role visibility stay fenced during CAS.
+                    self.with_listed(&terminal, |t| {
+                        t.handle_completion(completion_id)
+                            .map(|changed| (t.clone(), changed))
+                    })
+                    .and_then(|r| r)
+                    .map(|(t, changed)| {
+                        if changed {
+                            agent::changed(&d, &t);
+                        }
+                        Value::Null
+                    })
+                };
                 reply(&self.ob, id, r);
             }
             ClientMsg::TermResize {
@@ -576,6 +603,7 @@ impl Conn {
                 terminal,
                 text,
                 files,
+                handled_completion_id,
             } => {
                 // Everything is checked before anything is queued: the text, the Terminal
                 // (visible to this connection), then the files.
@@ -595,7 +623,11 @@ impl Conn {
                             reply(&ob, id, r.map(|()| Value::Null));
                             drop(held);
                         });
-                        t.submit(&d, typing, done)
+                        let observed =
+                            offered(&d.cfg, xshell_protocol::cap::TERM_COMPLETION_ATTENTION)
+                                .then_some(handled_completion_id)
+                                .flatten();
+                        t.submit(&d, typing, observed, done)
                     });
                 if let Err(e) = r {
                     reply(&self.ob, id, Err(e));

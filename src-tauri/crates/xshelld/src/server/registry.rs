@@ -156,7 +156,17 @@ impl Daemon {
     }
 
     pub fn list(&self, reg: &Registry) -> Vec<TerminalInfo> {
-        reg.terminals.values().map(|t| t.info()).collect()
+        reg.terminals
+            .values()
+            .map(|t| {
+                let mut info = t.info();
+                if !super::conn::offered(&self.cfg, xshell_protocol::cap::TERM_COMPLETION_ATTENTION)
+                {
+                    info.completion_attention = None;
+                }
+                info
+            })
+            .collect()
     }
 
     /// The `terminals` frame for a connection of `role`: the Terminals it [`sees`](role::sees).
