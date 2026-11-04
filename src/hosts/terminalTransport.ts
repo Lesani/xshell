@@ -414,16 +414,34 @@ export function markClosing(tabs: Tab[]) {
   for (const t of tabs) { const h = daemonHost(t); if (h && t.terminal) remoteTerminals.close(h, t.terminal); }
 }
 
+// Capture the complete input identity before any clipboard/upload work. Dispatch never
+// consults a newer Tab or connection; ordinary typing captures and writes synchronously.
+export interface TerminalInputAction {
+  readonly tabId: string;
+  readonly host?: HostId;
+  readonly terminal?: string;
+  readonly handledCompletionId?: string | null;
+  readonly inputTarget?: Readonly<{ configGeneration: number; linkGeneration: number }>;
+}
+
+export function captureTerminalInput(tab: Tab, handledCompletionId?: string | null): TerminalInputAction {
+  const host = daemonHost(tab);
+  const status = host ? registry.getStatus(host) : undefined;
+  const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
+    ? Object.freeze({ configGeneration: status.configGeneration, linkGeneration: status.linkGeneration }) : undefined;
+  return Object.freeze({ tabId: tab.id, host: tab.host, terminal: tab.terminal, handledCompletionId, inputTarget });
+}
+
+export function writeTerminalInput(action: TerminalInputAction, data: string) {
+  const host = daemonHost(action);
+  const { handledCompletionId, inputTarget } = action;
+  if (host) {
+    invoke("host_term_input", { host, terminal: action.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
+  } else invoke("write_terminal", { id: action.tabId, data }).catch(() => {});
+}
+
 export function writeTerminal(tab: Tab, data: string, handledCompletionId?: string | null) {
-  const h = daemonHost(tab);
-  if (h) {
-    // Synchronously capture the action's connection before Tauri dispatch; the input queue
-    // must not retarget it after reconfiguration/reconnect. Older bridges omit generations.
-    const status = registry.getStatus(h);
-    const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
-      ? { configGeneration: status.configGeneration, linkGeneration: status.linkGeneration } : undefined;
-    invoke("host_term_input", { host: h, terminal: tab.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
-  } else invoke("write_terminal", { id: tab.id, data }).catch(() => {});
+  writeTerminalInput(captureTerminalInput(tab, handledCompletionId), data);
 }
 
 // Restarts the agent with skipPermissions set to `value`, resuming its session; the Tab keeps

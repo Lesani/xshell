@@ -292,7 +292,9 @@ impl Shared {
         ep.link = st.link.clone();
         ep.input_target = InputTarget {
             config_generation: st.status.config_generation,
-            link_generation: st.status.link_generation,
+            // Adoption exposes this link before publishing its status. The internal
+            // generation already identifies it; status may still name its predecessor.
+            link_generation: st.gen,
         };
         ep.completion_attention = st
             .status
@@ -1856,6 +1858,59 @@ pub(crate) mod tests {
         h.term_input(t, "next action".into(), Some(f), None)
             .unwrap();
         assert_eq!(back.expect("term.input")["data"], "next action");
+    }
+
+    #[test]
+    fn completion_attention_input_refuses_predecessor_during_successor_adoption() {
+        let sh = shared();
+        let t = Uuid::new_v4();
+        let (_old_peer, _old_link, _) = connect(&sh, vec![info(t)]);
+        let h = handle(&sh);
+        let predecessor = sh.ep.lock().unwrap().input_target;
+        let gen = sh.begin_link(None);
+        let (io, mut successor) = pair();
+        let mut greeting = hello_frame(1, 1, "1.5.0");
+        greeting.extend(terminals_frame(vec![info(t)]));
+        successor.write(&greeting);
+        let (link, _, _) = Link::establish(
+            io,
+            ProtocolRange { min: 1, max: 1 },
+            "1.5.0",
+            sh.events(gen),
+            T5,
+        )
+        .unwrap();
+        assert!(sh.wait_first_list(gen, T5));
+        successor.expect("hello");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let adopting = sh.clone();
+        let adoption = std::thread::spawn(move || {
+            adopting.adopt(gen, &link, |st| {
+                // The successor endpoint is installed, State is held, and status has not yet
+                // been published. Input intentionally uses the separate nonblocking endpoint.
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(T5).unwrap();
+                st.status.set_kind(StatusKind::Connected);
+            })
+        });
+        entered_rx.recv_timeout(T5).unwrap();
+        assert!(sh.st.try_lock().is_err());
+        assert_eq!(h.status().link_generation, predecessor.link_generation);
+        let during = h.term_input(t, "obsolete action".into(), None, Some(predecessor));
+        release_tx.send(()).unwrap();
+        assert_eq!(adoption.join().unwrap(), Some(0));
+        assert_eq!(during.unwrap_err().code, HostErrorCode::Offline);
+        let current = InputTarget {
+            config_generation: h.status().config_generation,
+            link_generation: gen,
+        };
+        h.term_input(t, "current action".into(), None, Some(current))
+            .unwrap();
+        // No predecessor bytes may have reached the successor ahead of this action.
+        let next = successor.read_json();
+        assert_eq!(next["t"], "term.input");
+        assert_eq!(next["data"], "current action");
     }
 
     #[test]

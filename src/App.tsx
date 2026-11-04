@@ -5,7 +5,7 @@ import { localAgentStatus, useLocalAgentStatuses } from "./tabs/localAgentStatus
 import { groupTabsSetting, normalizeProjectTabs, tabBarEntries } from "./tabs/projectOrder";
 import { projectTerminals } from "./tabs/projectTerminals";
 import { adoptRightPanel, decodeRightPanels, defaultRightPanel, ensureRightPanels, pruneRightPanels, removeRightPanelHost, rightPanelKey, setRightPanel, RIGHT_PANELS_SETTING, type RightPanel, type RightPanels } from "./tabs/rightPanel";
-import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
@@ -20,7 +20,7 @@ import { TabBar } from "./components/TabBar";
 import { HomeView } from "./components/HomeView";
 import { HostUpdateBanner } from "./components/HostUpdateBanner";
 import { HostUpdateConfirmation } from "./components/HostUpdateAction";
-import { activeUpdateHost } from "./hosts/hostUpdate";
+import { activeUpdateHost, hostUpdates } from "./hosts/hostUpdate";
 import { TerminalTab } from "./components/TerminalTab";
 import { SettingsView, type ThemeMode } from "./components/SettingsView";
 import { DARK_TERM_BG, LIGHT_TERM_BG } from "./components/TerminalTab";
@@ -252,6 +252,7 @@ export default function App() {
   const [fileExplorerOnStart, setFileExplorerOnStart] = useState(true);
   const { foreground: desktopForeground, isForeground } = useDesktopForeground();
   const [tabDialogOpen, setTabDialogOpen] = useState(false);
+  const hostUpdateConfirmation = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot).confirmation;
   const [completionSeen, setCompletionSeen] = useState<CompletionSeen>({});
   const completionSeenRef = useRef<CompletionSeen>({});
   const completionSeenSaves = useRef(Promise.resolve());
@@ -1104,7 +1105,7 @@ export default function App() {
   // Viewing consumes only this Desktop's exact observation, never a Host message.
   const visibleIds = visibleTerminalIds(tabs, groups, activeTabId);
   const viewingIds = new Set<string>();
-  if (rightPanelsLoaded && desktopForeground && !tabDialogOpen && !showProjectPicker && !agentPickerProject && !editingProjectKey && !updateDialogOpen) {
+  if (rightPanelsLoaded && desktopForeground && !hostUpdateConfirmation && !tabDialogOpen && !showProjectPicker && !agentPickerProject && !editingProjectKey && !updateDialogOpen) {
     for (const tab of tabs) {
       if (!visibleIds.has(tab.id) || closingTabIds.has(tab.id)) continue;
       const host = daemonHost(tab);
@@ -1114,7 +1115,7 @@ export default function App() {
     }
   }
   useEffect(() => {
-    if (!isForeground()) return;
+    if (!isForeground() || hostUpdates.getSnapshot().confirmation) return;
     let next = completionSeenRef.current;
     for (const tab of tabs) {
       if (!viewingIds.has(tab.id)) continue;

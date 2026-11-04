@@ -5,7 +5,7 @@ import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
-import { localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { captureTerminalInput, writeTerminalInput, type TerminalInputAction, localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
 import { usesClaudeBranchDetection } from "../tabs/sessionBranch";
 import { sessionKeyOf, sessionKeyOfTab } from "../hosts/projectKey";
 import { skipPermsOn, skipPermsState } from "../tabs/skipPermissions";
@@ -435,8 +435,9 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     // Ctrl+V / right-click paste: if the clipboard holds an image (e.g. a screenshot, which
     // Windows auto-copies on capture), save it to a real file and type its path instead of
     // raw bytes — shells/CLIs take a file path, not an image blob. Falls back to plain text.
+    let pasteAction: TerminalInputAction | undefined;
     const pasteFromClipboard = async () => {
-      const observed = observedCompletionRef.current;
+      const action = captureTerminalInput(tabRef.current, observedCompletionRef.current);
       try {
         const items = await navigator.clipboard.read();
         for (const item of items) {
@@ -445,8 +446,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
           const blob = await item.getType(imgType);
           if (blob.size > MAX_DROPPED_FILE_BYTES) throw new Error("clipboard image too large");
           const ext = imgType.split("/")[1] || "png";
-          const path = await hostInvoke<string>(tabRef.current.host, "save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
-          writeTerminal(tabRef.current, /\s/.test(path) ? `"${path}" ` : `${path} `, observed);
+          const path = await hostInvoke<string>(action.host, "save_dropped_file", { bytesBase64: await blobToBase64(blob), name: `clipboard.${ext}` });
+          writeTerminalInput(action, /\s/.test(path) ? `"${path}" ` : `${path} `);
           return;
         }
       } catch (_) { /* clipboard.read() unsupported/denied, no image item, or too large — fall back to text */ }
@@ -454,11 +455,11 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
       // term.paste() frames multiline input when the program has enabled DEC2004.
       // Programs that opt out retain xterm's normal unbracketed paste behavior.
       if (text) {
-        // xterm emits paste's complete onData frame synchronously. Keep the observation
-        // from the paste action, not the newer render after clipboard access awaited.
-        const current = observedCompletionRef.current;
-        observedCompletionRef.current = observed;
-        try { term.paste(text); } finally { observedCompletionRef.current = current; }
+        // xterm synchronously emits the complete paste frame. Carry its original action,
+        // including connection identity, without changing ordinary typing's observation.
+        const previous = pasteAction;
+        pasteAction = action;
+        try { term.paste(text); } finally { pasteAction = previous; }
       }
     };
 
@@ -593,8 +594,10 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     async function spawnBackend(term: Terminal, _fitAddon: FitAddon) {
       inputDisposable = term.onData((data) => {
         // Remote Terminal while its Host is not usable: input is dropped, with a hint.
-        if (remoteHost && !registry.isUsable(remoteHost)) { flashInputPaused(); return; }
-        writeTerminal(tabRef.current, data, observedCompletionRef.current);
+        const inputHost = pasteAction ? daemonHost(pasteAction) : remoteHost;
+        if (inputHost && !registry.isUsable(inputHost)) { flashInputPaused(); return; }
+        if (pasteAction) writeTerminalInput(pasteAction, data);
+        else writeTerminal(tabRef.current, data, observedCompletionRef.current);
       });
 
       // Debounce the PTY resize (SIGWINCH). xterm reflows visually on every fit(), but Claude
@@ -1200,6 +1203,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
           onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_PATH_MIME) || e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
           onDrop={(e) => {
             e.preventDefault();
+            const action = captureTerminalInput(tab, observedCompletionId);
             // Quote paths with spaces (common on Windows); trailing space lets the user keep typing.
             const quote = (p: string) => (/\s/.test(p) ? `"${p}"` : p);
             if (e.dataTransfer.files.length > 0) {
@@ -1212,16 +1216,16 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
               const images = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/") && f.size <= MAX_DROPPED_FILE_BYTES);
               if (images.length === 0) return;
               Promise.all(images.map(async (f) => {
-                return hostInvoke<string>(tab.host, "save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
+                return hostInvoke<string>(action.host, "save_dropped_file", { bytesBase64: await blobToBase64(f), name: f.name });
               })).then((paths) => {
-                writeTerminal(tab, paths.map(quote).join(" ") + " ", observedCompletionId);
+                writeTerminalInput(action, paths.map(quote).join(" ") + " ");
                 terminalRef.current?.focus();
               }).catch(() => {});
               return;
             }
             const p = e.dataTransfer.getData(DRAG_PATH_MIME) || e.dataTransfer.getData("text/plain");
             if (!p) return;
-            writeTerminal(tab, `${quote(p)} `, observedCompletionId);
+            writeTerminalInput(action, `${quote(p)} `);
             terminalRef.current?.focus();
           }}
         >

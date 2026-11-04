@@ -7,7 +7,7 @@ import { load } from "@tauri-apps/plugin-store";
 import type { HostConfig, HostStatus, TerminalInfo } from "./hosts/types";
 import type { RightPanel, RightPanels } from "./tabs/rightPanel";
 
-const xterms = vi.hoisted(() => [] as { dispose: ReturnType<typeof vi.fn>; onInput?: (data: string) => void; el?: HTMLElement }[]);
+const xterms = vi.hoisted(() => [] as { dispose: ReturnType<typeof vi.fn>; onInput?: (data: string) => void; keyHandler?: (e: KeyboardEvent) => boolean; el?: HTMLElement }[]);
 const native = vi.hoisted(() => ({ focused: false, minimized: false, changed: null as null | ((event: { payload: boolean }) => void) }));
 vi.mock("@tauri-apps/api/core", async original => ({ ...await original<typeof import("@tauri-apps/api/core")>(), invoke: vi.fn(), Channel: class {} }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -24,7 +24,11 @@ vi.mock("@xterm/xterm", () => ({ Terminal: class {
   cols = 80; rows = 24; dispose = vi.fn();
   constructor() { xterms.push(this); }
   el?: HTMLElement; onInput?: (data: string) => void;
-  open(el: HTMLElement) { this.el = el; } loadAddon() {} focus() {} write() {} attachCustomKeyEventHandler() {}
+  keyHandler?: (e: KeyboardEvent) => boolean;
+  open(el: HTMLElement) { this.el = el; } loadAddon() {} focus() {} write() {}
+  attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean) { this.keyHandler = cb; }
+  // Installed xterm synchronously emits its complete generated bracketed-paste frame.
+  paste(text: string) { this.onInput?.(`\u001b[200~${text}\u001b[201~`); }
   onData(cb: (data: string) => void) { this.onInput = cb; return { dispose() {} }; }
   onResize() { return { dispose() {} }; }
 } }));
@@ -234,5 +238,89 @@ it("document-hidden and the actual Quick Actions overlay do not consume a visibl
   await publish([finished("a", f)]); expect(seen()[key("a")]).toBe(g); expect(unread("a")).toBe(true);
   await act(async () => { container.querySelector<HTMLInputElement>(".ts-search-input")!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
   expect(seen()[key("a")]).toBe(f); expect(unread("a")).toBe(false);
+  expect(inputCommands()).toEqual([]); expect(unexpected).toEqual([]);
+});
+
+async function startMountedXterm() {
+  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(800);
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(600);
+  for (let round = 0; round < 4; round++) {
+    const callbacks = vi.mocked(requestAnimationFrame).mock.calls.splice(0);
+    await act(async () => { callbacks.forEach(([cb]) => cb(0)); });
+  }
+  const term = xterms.find(t => t.onInput)!; expect(term).toBeTruthy(); return term;
+}
+
+it.each([
+  { configGeneration: 1, linkGeneration: 3 },
+  { configGeneration: 2, linkGeneration: 4 },
+])("delayed clipboard paste keeps its complete input action across $configGeneration/$linkGeneration", async successor => {
+  await setup({}, ["a"]); await mount(); await publish([finished("a")]);
+  const term = await startMountedXterm();
+  let release!: (text: string) => void;
+  vi.spyOn(navigator.clipboard, "read").mockResolvedValue([]);
+  vi.spyOn(navigator.clipboard, "readText").mockReturnValue(new Promise(r => { release = r; }));
+  await act(async () => { term.keyHandler!(new KeyboardEvent("keydown", { key: "v", ctrlKey: true })); });
+  expect(invoke).not.toHaveBeenCalledWith("host_term_input", expect.anything());
+  await act(async () => {
+    registry.applyStatus({ ...status(host.id), ...successor });
+    registry.applyTerminals(host.id, [finished("a", g)]);
+  });
+  await act(async () => { release("ö\nlate clipboard"); });
+  expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === "host_term_input")).toEqual([["host_term_input", {
+    host: host.id, terminal: "a", data: "\u001b[200~ö\nlate clipboard\u001b[201~",
+    handledCompletionId: f, inputTarget: { configGeneration: 1, linkGeneration: 2 },
+  }]]);
+  // Ordinary input after the asynchronous action still captures its own current target.
+  await act(async () => { term.onInput!("next"); });
+  expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === "host_term_input")[1][1]).toMatchObject({ handledCompletionId: g, inputTarget: successor });
+  expect(unexpected).toEqual([]);
+});
+
+it.each(["clipboard image", "image drop"])("delayed %s upload keeps the action from before the upload", async source => {
+  await setup({}, ["a"]); await mount(); await publish([finished("a")]);
+  const term = await startMountedXterm();
+  let release!: (path: string) => void;
+  const upload = new Promise<string>(resolve => { release = resolve; });
+  let uploadStarted!: () => void;
+  const started = new Promise<void>(resolve => { uploadStarted = resolve; });
+  const baseInvoke = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "host_call" && (args as { method?: string }).method === "save_dropped_file") { uploadStarted(); return upload; }
+    return baseInvoke(command, args);
+  });
+  if (source === "clipboard image") {
+    vi.spyOn(navigator.clipboard, "read").mockResolvedValue([{ types: ["image/png"], getType: async () => new Blob(["image"], { type: "image/png" }) }] as unknown as ClipboardItem[]);
+    await act(async () => { term.keyHandler!(new KeyboardEvent("keydown", { key: "v", ctrlKey: true })); await started; });
+  } else {
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", { value: { files: [new File(["image"], "image.png", { type: "image/png" })] } });
+    await act(async () => { term.el!.dispatchEvent(event); await started; });
+  }
+  await act(async () => {
+    registry.applyStatus({ ...status(host.id), configGeneration: 2, linkGeneration: 4 });
+    registry.applyTerminals(host.id, [finished("a", g)]);
+  });
+  await act(async () => { release("/tmp/late image.png"); });
+  expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === "host_term_input")).toEqual([["host_term_input", {
+    host: host.id, terminal: "a", data: '\"/tmp/late image.png\" ',
+    handledCompletionId: f, inputTarget: { configGeneration: 1, linkGeneration: 2 },
+  }]]);
+  expect(unexpected).toEqual([]);
+});
+
+it("actual Host update confirmation keeps a covered completion unread and unsaved until close", async () => {
+  await setup({}, ["a"]); await mount(); await publish([finished("a")]); await select("a"); await focus(true);
+  expect(seen()[key("a")]).toBe(f);
+  await act(async () => { registry.applyStatus({ ...status(host.id), status: "build-differs", updateAction: "replace" }); });
+  await click(container.querySelector<HTMLButtonElement>(".host-update-banner .host-update-action button"));
+  expect(container.querySelector(".settings-overlay .host-confirm-panel")).not.toBeNull();
+  await act(async () => { registry.applyTerminals(host.id, [finished("a", g)]); });
+  expect(unread("a")).toBe(true);
+  expect(seen()[key("a")]).toBe(f);
+  await click(container.querySelector<HTMLButtonElement>(".host-confirm-panel .btn-ghost"));
+  expect(container.querySelector(".host-confirm-panel")).toBeNull();
+  expect(unread("a")).toBe(false);
+  expect(seen()[key("a")]).toBe(g);
   expect(inputCommands()).toEqual([]); expect(unexpected).toEqual([]);
 });
