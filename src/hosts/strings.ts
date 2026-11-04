@@ -4,6 +4,21 @@
 // system and this module does not introduce one. `{param}` placeholders are filled by fmt().
 
 export const S = {
+  "settings.groupTabs.label": "Group Tabs by Project",
+  "settings.groupTabs.description": "Keep each Project's Tabs together. Existing split-pane Groups stay intact.",
+  "home.terminals.heading": "Open Terminals",
+  "home.terminals.search": "Search open Terminals and past sessions…",
+  "home.terminals.empty": "No open Terminals in this Project.",
+  "home.terminals.noMatches": "No open Terminals match “{search}”.",
+  "home.history.heading": "Past sessions",
+  "home.history.empty": "No past sessions yet.",
+  "home.terminals.focusA11y": "Focus {title} on {host}",
+  "home.terminals.lastKnown": "Last known · {host} offline",
+  "home.terminals.statusUnavailable": "Process status unavailable",
+  "home.terminals.unconfirmed": "Awaiting Host confirmation",
+  "home.terminals.ended": "Ended",
+  "home.terminals.closing": "Closing…",
+
   "tab.rename.action": "Rename Tab…",
   "tab.rename.automatic": "Use automatic name",
   "tab.rename.title": "Rename Tab",
