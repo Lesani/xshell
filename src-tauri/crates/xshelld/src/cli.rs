@@ -34,6 +34,7 @@ pub enum Command {
         sha256: String,
         length: u64,
     },
+    Maintenance(crate::maintenance::Cleanup),
     Version,
     Help,
 }
@@ -76,6 +77,9 @@ commands:
   serve       run the Daemon in the foreground
   pair        add this computer to your devices: shows a code to enter in xshell
               on another computer (Settings → Mobile → Add a computer)
+  maintenance cleanup-installs --home ABS [--reference-home ABS]... [--keep DIR]...
+              [--delete --confirm-quiescent]
+              Linux only, dry-run by default; see docs/host-daemon-updates.md
   event       report an agent's status (run by agent hooks inside Terminals)
   --version   print name, version and protocol range as one line of JSON
 
@@ -159,6 +163,7 @@ pub fn parse(
                     .ok_or("invalid decoded length")?,
             });
         }
+        "maintenance" => return crate::maintenance::parse(args).map(Command::Maintenance),
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
         "console-mode" => return parse_console_mode(args),

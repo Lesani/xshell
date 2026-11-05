@@ -116,3 +116,104 @@ The separate VM walkthrough must still prove actual Update and same-version repl
 Terminal restoration, default-profile nonmutation, owner-close/offline/no-SSH-autostart/
 reopen lifetime, and representative failure-before-stop paths. Do not change the profile's
 ownership/DACLs or override HOME to obtain acceptance.
+
+## Explicit Linux install maintenance (partial #50)
+
+Updates still **do not automatically remove old installs**. Linux offers a separate,
+manual, dry-run-default maintenance command for existing obsolete keyed installs:
+
+```sh
+xshelld maintenance cleanup-installs --home /absolute/home \
+  --reference-home /absolute/other-served-home --keep 1.5.0+0123456789ab
+# Only during the exclusive interval described below:
+xshelld maintenance cleanup-installs --home /absolute/home \
+  --reference-home /absolute/other-served-home --keep 1.5.0+0123456789ab \
+  --delete --confirm-quiescent
+```
+
+`--home` is mandatory: ambient `HOME` and `XSHELLD_HOME` never choose the cleanup
+root. Reference homes supplement it; `--keep DIR` only adds protection. Both destructive
+flags are required together. Duplicates and unsupported options are invocation errors.
+The command does not start/stop anything, create state, repair permissions, acquire a
+launcher lock, or change selection. Dry-run writes nothing. macOS and Windows explicitly
+refuse maintenance without touching the filesystem; this is not full #50 support.
+
+### Operator-coordinated quiescence is required
+
+Before deletion, arrange an **exclusive maintenance interval for the UID and filesystem**:
+
+- Stop all relevant Desktops, reconnect workers, connectors, installers, Daemons, agents
+  and detached hook consumers externally. Include every machine, user, service and
+  container that can use or mutate these installs. Shared/network HOMEs and incomplete
+  process/user namespace views are unsupported.
+- Ensure queued SSH commands, cached Desktop dials, suspended connectors, scheduled
+  jobs and other delayed launchers cannot resume until this command exits. A process
+  snapshot cannot find an invisible pending launch or cached hook path.
+- Supply **every served reference HOME**, including cross-HOME `serve --home` and
+  `XSHELLD_HOME` use. Hooks in B can name a binary installed in A; protection applies to A.
+- Account for custom wrappers/settings and references stored elsewhere. Protect exact
+  known targets with `--keep`. If the target set or reference-home coverage is uncertain,
+  **do not delete**. Confirmation and keep flags never override a refusal.
+- Use only an operator-controlled, non-consuming invocation ancestry. A parent shell or
+  launcher must not hold pending product launches or cached hook consumers. Maintain all
+  these conditions through command exit.
+
+`--confirm-quiescent` attests those obligations; it is **not** distributed-quiescence
+detection. The command cannot prove the operator's view covers every relevant process or
+filesystem consumer. It checks for detectable namespace/mapping/mount restrictions;
+normal unprivileged denial of root PID1's namespace link alone is not proof of an
+incomplete same-UID inventory. Other denied/truncated relevant process data, contradictory
+namespace observations, `hidepid`, `subset`, noninitial UID mapping and unresolved
+identities still refuse cleanup. No privilege, global policy or account changes are needed
+by the product. An ordinary active account will generally remain blocked.
+
+### What is retained, and what can be removed
+
+Only immediate, private, same-UID directories under `HOME/.xshell/server` with exactly
+one private, regular, singly-linked executable `xshelld` are eligible. Its bounded,
+non-executed known build stamp must reconstruct the semver-plus-build directory name.
+No marker is required: existing keyed installs qualify. Legacy version-only installs,
+unknown builds, stamp mismatches, extra/nested leaves, links, foreign ownership and
+ambiguous layouts are kept, not repaired. The raw selected target (even an older or
+nonexecutable one), invoking executable's install/inode, explicit keeps and recognized
+generated Claude hooks in all declared HOMEs survive. Unreadable/malformed selection or
+settings, custom/unrecognized commands and unresolved hook aliases block all deletion.
+
+Every observed same-UID Daemon/connector/installer/hook consumer blocks **all** deletion.
+Unknown same-UID processes outside the verified invocation ancestry also block it; a
+shell, editor, `node`, `ssh` or `sleep` is not assumed harmless. Process argv/environment
+are inspected without logging them. The actual process credentials are read, rather than
+trusting `/proc/PID` ownership (nondumpable processes may have root-owned proc entries).
+Only explicitly resolved exits before credentials can be read are skipped; failed reads
+of a still-present or already relevant process block cleanup.
+
+The full inventory and then a complete recheck precede any deletion. Each traversal
+below the validated root uses Linux `openat2` with `RESOLVE_BENEATH`,
+`RESOLVE_NO_SYMLINKS` and **`RESOLVE_NO_XDEV`** before unlink, including the final
+reopen. Bind mounts, even on the same filesystem, cannot become deletion targets.
+Unsupported kernels/filesystems or boundary errors refuse cleanup: there is **no unsafe
+fallback** to device-number or symlink checks. Supported filesystem types are ext*, XFS,
+Btrfs, tmpfs, ZFS and overlayfs; type detection does not override the operator's obligation
+to exclude shared storage. Directory components are opened without following symlinks.
+
+Inspection is bounded: 256 root children/leaves per directory, 4,096 processes, 128 MiB
+per binary, 1 MiB per settings/process record, 512 MiB total reads over inventory and
+recheck, 128 invocation ancestors, and a 30-second inspection budget checked between I/O.
+Exhaustion refuses deletion rather than trusting a partial inventory.
+
+Output distinguishes `keep`, `would-remove`, `removed` and `blocked`. A failed recheck
+makes earlier `would-remove` entries **tentative**, not permission to delete. Exit codes:
+**0** completed assessment/deletion, **2** invalid invocation, **1** blocked or I/O failure.
+Removal unlinks only `xshelld`, then removes that now-empty directory. It stops at the
+first error; `removed-executable` plus a partial-removal error means the binary is gone but
+the directory remains. Earlier completed removals are reported truthfully. There is no
+rollback or automatic retry. An interrupted empty/partial directory is ambiguous and is
+kept on a subsequent run.
+
+Focused tests use deterministic fault observations plus real CLI/process/filesystem
+fixtures. The numeric-UID CLI fixtures are explicitly ignored by default because they
+need `sudo` solely to change ownership/identity inside owned temporary fixtures (no
+accounts, PAM, SSH or owner Hosts). Run them explicitly on an owned Linux development
+host with `cargo test -p xshelld --test install_cleanup -- --ignored`. Native release,
+macOS/Windows refusal and a privileged isolated real bind-mount scenario remain separate
+validation gates; mocked EXDEV/unsupported-open tests are not native bind-mount proof.
