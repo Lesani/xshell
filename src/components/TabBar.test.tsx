@@ -422,3 +422,138 @@ describe("Project ordering pointer gaps", () => {
     expect(result()).toEqual(["x", "y", "a", "b", "p1", "p2", "c", "d"]);
   });
 });
+
+describe("TabBar attention motion", () => {
+  let visibility: string | undefined;
+  const completionId = "00000000-0000-4000-8000-000000000001";
+  const motionPaused = () => container.querySelector(".tab-bar")!.getAttribute("data-attention-motion-paused");
+  const changeVisibility = (value: string | undefined) => act(() => {
+    visibility = value;
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  beforeEach(() => {
+    visibility = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility as DocumentVisibilityState);
+    store.snap.status.local = { ...status, daemonCapabilities: ["agent.status", "term.completion-attention"] };
+    store.snap.live.local![0] = { ...store.snap.live.local![0], agentStatus: "working",
+      completionAttention: { completionId, inputHandled: false } };
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("working_ring_pauses_only_on_positive_document_hidden", () => {
+    render();
+    const tab = tabEl(), icon = tab.querySelector(".tab-attention-icon")!, glyph = icon.firstChild;
+    const markup = tab.outerHTML, snapshot = JSON.stringify(store.snap);
+    expect(icon.classList.contains("tab-attention-working")).toBe(true);
+    expect(tab.getAttribute("aria-label")).toContain("Working");
+    expect(motionPaused()).toBe("false");
+    for (const [state, paused] of [["hidden", "true"], ["visible", "false"]]) {
+      changeVisibility(state);
+      expect(motionPaused()).toBe(paused);
+      expect(tabEl()).toBe(tab);
+      expect(tab.querySelector(".tab-attention-icon")).toBe(icon);
+      expect(icon.firstChild).toBe(glyph);
+      expect(tab.outerHTML).toBe(markup);
+    }
+    expect(JSON.stringify(store.snap)).toBe(snapshot);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(settingsStore.set).not.toHaveBeenCalled();
+    expect(settingsStore.save).not.toHaveBeenCalled();
+    for (const callback of [props.onSelectTab, props.onCloseTab, props.onReorderTabs]) expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("visible_unfocused_working_ring_is_not_paused", () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    render();
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+      document.dispatchEvent(new Event("blur"));
+    });
+    expect(document.hasFocus()).toBe(false);
+    expect(motionPaused()).toBe("false");
+    act(() => window.dispatchEvent(new Event("focus")));
+    expect(motionPaused()).toBe("false");
+    expect(tabEl().querySelector(".tab-attention-working")).not.toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "unknown"])("unknown_visibility_defaults_to_bounded_motion (%s)", value => {
+    visibility = value;
+    render();
+    expect(motionPaused()).toBe("false");
+    changeVisibility("hidden"); expect(motionPaused()).toBe("true");
+    changeVisibility(value); expect(motionPaused()).toBe("false");
+  });
+
+  it("initially_hidden_document_pauses_without_waiting_for_an_event", () => {
+    visibility = "hidden";
+    render();
+    expect(motionPaused()).toBe("true");
+    changeVisibility("visible"); expect(motionPaused()).toBe("false");
+  });
+
+  it("refreshes_visibility_after_subscribing_to_cover_mount_timing", () => {
+    visibility = "hidden";
+    vi.spyOn(document, "visibilityState", "get").mockImplementationOnce(() => "visible").mockImplementation(() => visibility as DocumentVisibilityState);
+    render();
+    expect(motionPaused()).toBe("true");
+    changeVisibility("visible"); expect(motionPaused()).toBe("false");
+  });
+
+  it.each([
+    { name: "working", status: "working", ring: "working" },
+    { name: "needs-you", status: "needs-you", ring: "needs-you" },
+    { name: "unread", status: "finished", ring: "unread" },
+    { name: "stale", status: "working", stale: true, ring: null },
+    { name: "closing", status: "working", closing: true, ring: null },
+    { name: "exited", status: "working", exited: true, ring: null },
+  ] as const)("motion_pause_preserves_status_and_stationary_icon ($name)", row => {
+    const c = { stale: false, closing: false, exited: false, ...row };
+    store.snap.live.local![0] = { ...store.snap.live.local![0], agentStatus: c.status, exitCode: c.exited ? 0 : null };
+    if (c.stale) store.snap.status.local = { ...store.snap.status.local, status: "offline" };
+    if (c.closing) props.closingTabIds = new Set(["tab"]);
+    render();
+    const tab = tabEl(), icon = tab.querySelector(".tab-attention-icon")!, glyph = icon.firstChild;
+    expect(icon.className).toBe(`tab-attention-icon${c.ring ? ` tab-attention-${c.ring}` : ""}`);
+    const markup = tab.outerHTML, snapshot = JSON.stringify(store.snap);
+    for (const state of ["hidden", "visible"]) {
+      changeVisibility(state);
+      expect(motionPaused()).toBe(String(state === "hidden"));
+      expect(tabEl()).toBe(tab);
+      expect(tab.outerHTML).toBe(markup);
+      expect(tab.querySelector(".tab-attention-icon")).toBe(icon);
+      expect(icon.firstChild).toBe(glyph);
+    }
+    expect(JSON.stringify(store.snap)).toBe(snapshot);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(settingsStore.set).not.toHaveBeenCalled();
+    expect(settingsStore.save).not.toHaveBeenCalled();
+  });
+
+  it("visibility_listener_is_removed_on_unmount_and_strictmode_remount", () => {
+    const add = vi.spyOn(document, "addEventListener"), remove = vi.spyOn(document, "removeEventListener");
+    const interval = vi.spyOn(window, "setInterval"), raf = vi.spyOn(window, "requestAnimationFrame");
+    const listeners = () => add.mock.calls.filter(([event]) => event === "visibilitychange").map(([, listener]) => listener);
+    const removed = () => remove.mock.calls.filter(([event]) => event === "visibilitychange").map(([, listener]) => listener);
+    const mount = () => act(() => root.render(<StrictMode><TabBar {...props} /></StrictMode>));
+    mount();
+    expect(listeners()).toHaveLength(2);
+    expect(removed()).toEqual([listeners()[0]]);
+    changeVisibility("hidden"); expect(motionPaused()).toBe("true");
+    act(() => root.unmount());
+    expect(removed()).toEqual(listeners());
+    const error = vi.spyOn(console, "error");
+    changeVisibility("visible");
+    expect(container.childElementCount).toBe(0);
+    expect(error).not.toHaveBeenCalled();
+    root = createRoot(container);
+    mount();
+    expect(listeners()).toHaveLength(4);
+    expect(removed()).toEqual(listeners().slice(0, 3));
+    expect(motionPaused()).toBe("false");
+    act(() => root.unmount());
+    expect(removed()).toEqual(listeners());
+    expect(interval).not.toHaveBeenCalled();
+    expect(raf).not.toHaveBeenCalled();
+  });
+});

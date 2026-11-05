@@ -16,9 +16,23 @@ describe("pi_status.js embedded extension", () => {
 it("attention rotates only its outer ring and keeps reduced-motion static", async () => {
   const { readFile } = await import("node:fs/promises");
   const css = await readFile(new URL("../App.css", import.meta.url), "utf8");
-  expect(css).toMatch(/\.tab-attention-working::after\s*\{[^}]*animation: tab-attention-rotate/);
+  const workingRules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selector]) => selector.includes(".tab-attention-working::after"))
+    .map(([, selector, declarations]) => [selector.trim(), declarations.trim()]);
+  expect(workingRules).toEqual([
+    [".tab-attention-working::after", "border: 2px solid #ef921c; border-top-color: #ffe073; border-right-color: #ffba38; animation: tab-attention-rotate 1.2s steps(12, end) infinite;"],
+    ['.tab-bar[data-attention-motion-paused="true"] .tab-attention-working::after', "animation-play-state: paused;"],
+    [".tab-attention-working::after", "animation: none;"],
+  ]);
+  expect(css).toMatch(/\.tab-attention-unread::after\s*\{ border: 2px solid var\(--success\); \}/);
+  expect(css).toMatch(/\.tab-attention-needs-you::after\s*\{ border: 2px solid #e5a50a; \}/);
   expect(css).toMatch(/@keyframes tab-attention-rotate\s*\{ to \{ transform: rotate\(360deg\);/);
   expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.tab-attention-working::after\s*\{ animation: none;/);
   expect(css).not.toMatch(/tab-pi-working|tab-project-icon-linked|tab-dot-active|tab-agent-status/);
-  expect(css.match(/\.tab-attention-icon \{[^}]+/g)?.join("")).not.toMatch(/transform|animation|opacity/);
+  for (const selector of ["tab-attention-icon", "tab-project-icon", "tab-project-img", "tab-dot", "tab-bar"]) {
+    const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .filter(([, s]) => new RegExp(`\\.${selector}(?:\\s|,|$)`).test(s.trim()))
+      .map(([, , declarations]) => declarations).join("");
+    expect(rules, selector).not.toMatch(/(?:^|[;\s])(?:transform|animation(?:-[\w-]+)?|opacity)\s*:/);
+  }
 });

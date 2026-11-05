@@ -225,6 +225,13 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
 
 export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSeen = {}, viewingIds = new Set(), tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
+  const [attentionMotionPaused, setAttentionMotionPaused] = useState(() => document.visibilityState === "hidden");
+  useEffect(() => {
+    const updateAttentionMotionPaused = () => setAttentionMotionPaused(document.visibilityState === "hidden");
+    document.addEventListener("visibilitychange", updateAttentionMotionPaused);
+    updateAttentionMotionPaused();
+    return () => document.removeEventListener("visibilitychange", updateAttentionMotionPaused);
+  }, []);
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const closingRef = useRef(closingTabIds);
@@ -346,7 +353,7 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
   const hideTooltip = () => setTooltip(null);
 
   return (
-    <div className="tab-bar">
+    <div className="tab-bar" data-attention-motion-paused={attentionMotionPaused}>
       <button className="tb-sidebar-toggle" onClick={onToggleSidebar} onMouseEnter={(e) => showTooltip(sidebarCollapsed ? "Show sidebar" : "Hide sidebar", e.currentTarget)} onMouseLeave={hideTooltip} aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}>
         {sidebarCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
       </button>
