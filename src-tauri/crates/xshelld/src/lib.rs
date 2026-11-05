@@ -10,6 +10,7 @@ pub mod console_mode;
 pub mod env;
 pub mod job_exec;
 pub mod log;
+pub mod maintenance;
 #[cfg(unix)]
 pub mod pair;
 pub mod paths;
@@ -29,6 +30,7 @@ pub fn main_entry() -> i32 {
         }
     };
     let (opts, serve) = match cmd {
+        Command::Maintenance(opts) => return maintenance::run(opts),
         Command::StageBuild {
             dir,
             sha256,
