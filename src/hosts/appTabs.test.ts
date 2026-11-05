@@ -134,3 +134,29 @@ describe("shared names in cached/reconnect reconstruction", () => {
     expect(restore()).toEqual(current);
   });
 });
+
+describe("in-process custom name persistence round trip", () => {
+  it("eligible_agents_keep_independent_custom_and_automatic_names_and_group_identity", () => {
+    const agent = { ...inproc, title: "Latest automatic", customTitle: "Local custom", groupId: "g" };
+    const second = { ...inproc, id: "second", sessionId: "s2", groupId: "g" };
+    const group = split("g", agent.id, second.id, "Personal split");
+    const shell: Tab = { id: "raw", type: "terminal", title: "Bash", customTitle: "Named raw", shellMode: "raw", projectPath: "/p" };
+    const newChat: Tab = { id: "new", type: "terminal", title: "New", customTitle: "Named new", projectPath: "/p" };
+    const daemon: Tab = { ...inproc, id: "remote-local", terminal: "local", customTitle: "Never persist Daemon cache here" };
+    const saved: Tab[] = JSON.parse(JSON.stringify(persistableTabs([agent, second, shell, newChat, daemon])));
+    expect(saved.map(t => t.id)).toEqual([agent.id, second.id, "raw", "new"]);
+    const restored = restoreGroups(restorableTabs({ saved, hosts: [], localDaemon: false, cached: () => null }), JSON.parse(JSON.stringify([group])));
+    expect(restored.tabs).toEqual([agent, second]); expect(restored.groups).toEqual([group]);
+    const cleared: Tab = { ...agent }; delete cleared.customTitle;
+    const reload = restorableTabs({ saved: JSON.parse(JSON.stringify(persistableTabs([cleared]))), hosts: [], localDaemon: false, cached: () => null });
+    expect(reload[0]).not.toHaveProperty("customTitle"); expect(reload[0].title).toBe("Latest automatic");
+  });
+  it("live_list_name_or_clear_overrides_cached_daemon_custom_name", () => {
+    const cached = { ...info("local", 1), meta: { title: "Auto", customTitle: "Old cache" } };
+    for (const value of ["New live", undefined]) {
+      const live = { ...cached, meta: { title: "Latest auto", customTitle: value } };
+      const restored = restorableTabs({ saved: [], hosts: [], localDaemon: true, cached: () => [cached], migrated: [live] });
+      expect(restored[0].customTitle).toBe(value); expect(restored[0].title).toBe("Latest auto");
+    }
+  });
+});

@@ -1,11 +1,12 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { load } from "@tauri-apps/plugin-store";
 import type { Group, Tab } from "../types";
-import { registry } from "./registry";
+import { registry, isUsableStatus } from "./registry";
 import { cache } from "./cache";
 import { LOCAL_HOST } from "./localHost";
 import { READY_MS, type Journal, type MigrationDeps } from "./localMigration";
 import { MIGRATION_NS, uuidV5 } from "./uuidV5";
+import { CUSTOM_TITLE_CAPABILITY } from "../tabs/customTitle";
 import type { TerminalInfo } from "./types";
 
 // The real dependencies of `migrateLocalTabs`: the settings store, the migration lock,
@@ -79,6 +80,18 @@ export const localMigrationDeps: MigrationDeps = {
   cached: () => cache.terminals(LOCAL_HOST),
   async listed(uuid, ms) {
     return (await waitForRegistry(() => (localList()?.some(i => i.terminal === uuid) ? true : null), ms)) === true;
+  },
+  async updateName(terminal, value) {
+    const before = registry.getSnapshot();
+    const status = before.status[LOCAL_HOST];
+    const config = JSON.stringify(before.configs.find(c => c.id === LOCAL_HOST) ?? null);
+    if (!isUsableStatus(status) || !status?.daemonCapabilities?.includes(CUSTOM_TITLE_CAPABILITY)
+      || !before.live[LOCAL_HOST]?.some(t => t.terminal === terminal)) throw new Error("Local Daemon naming is unavailable");
+    await invoke("host_term_update", { host: LOCAL_HOST, terminal, meta: { customTitle: value } });
+    const after = registry.getSnapshot();
+    if (after.status[LOCAL_HOST]?.configGeneration !== status.configGeneration
+      || JSON.stringify(after.configs.find(c => c.id === LOCAL_HOST) ?? null) !== config
+      || !after.live[LOCAL_HOST]?.some(t => t.terminal === terminal)) throw new Error("Local Daemon changed during name handoff");
   },
   async open(op) {
     // Throwaway sinks: the Tab attaches its own once it is shown.

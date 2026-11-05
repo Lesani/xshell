@@ -305,7 +305,7 @@ export interface Tab {
   id: string;
   type: 'home' | 'terminal';
   title: string; // automatic title, independent of the observed shared name
-  customTitle?: string; // observed Daemon-owned display override; never a local edit
+  customTitle?: string; // Daemon-observed override, or Desktop-owned for an in-process Terminal
   sessionId?: string;
   projectPath?: string;
   projectName?: string;

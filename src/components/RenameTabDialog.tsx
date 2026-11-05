@@ -4,6 +4,7 @@ import { customTitleError } from "../tabs/customTitle";
 
 interface Props {
   returnFocus: HTMLElement;
+  inProcess?: boolean;
   seed: string;
   operation: "save" | "clear" | null;
   error: string | null;
@@ -13,7 +14,7 @@ interface Props {
   onClose: () => void;
 }
 
-export function RenameTabDialog({ returnFocus, seed, operation, error, unavailable, hasCustomTitle, onSubmit, onClose }: Props) {
+export function RenameTabDialog({ inProcess, returnFocus, seed, operation, error, unavailable, hasCustomTitle, onSubmit, onClose }: Props) {
   const [draft, setDraft] = useState(seed);
   const [validation, setValidation] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -49,7 +50,7 @@ export function RenameTabDialog({ returnFocus, seed, operation, error, unavailab
       <h2 id={`${id}-title`}>{fmt("tab.rename.title")}</h2>
       <label htmlFor={`${id}-input`}>{fmt("tab.rename.label")}</label>
       <input id={`${id}-input`} ref={input} value={draft} disabled={busy} aria-invalid={!!validation} aria-describedby={message ? `${id}-error` : undefined} onChange={e => { setDraft(e.target.value); setValidation(null); }} />
-      <p id={`${id}-help`}>{fmt("tab.rename.help")}</p>
+      <p id={`${id}-help`}>{fmt(inProcess ? "tab.rename.localHelp" : "tab.rename.help")}</p>
       {message && <p id={`${id}-error`} role="alert">{message}</p>}
       {busy && <p role="status">{fmt(operation === "clear" ? "tab.rename.clearing" : "tab.rename.saving")}</p>}
       <div className="modal-actions">

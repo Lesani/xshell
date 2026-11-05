@@ -1,14 +1,18 @@
 // @vitest-environment happy-dom
-import { act, useSyncExternalStore } from "react";
+import { act, StrictMode, useState, useSyncExternalStore } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RegistrySnapshot } from "../hosts/registry";
 import type { HostStatus } from "../hosts/types";
 import type { Tab } from "../types";
+import { useOpenTabsPersistence } from "../tabs/openTabsPersistence";
+import { NO_MIGRATION } from "../hosts/localMigration";
 import { TabBar } from "./TabBar";
 import { AGENT_IDS, type AgentId } from "../agents";
 import { invoke } from "@tauri-apps/api/core";
 
+const settingsStore = vi.hoisted(() => ({ set: vi.fn(), save: vi.fn() }));
+vi.mock("@tauri-apps/plugin-store", () => ({ load: vi.fn(async () => settingsStore) }));
 const store = vi.hoisted(() => ({ snap: null as unknown as RegistrySnapshot, listeners: new Set<() => void>() }));
 vi.mock("../hosts/registry", async original => ({ ...await original<typeof import("../hosts/registry")>(), registry: {
   getSnapshot: () => store.snap, subscribe: (listener: () => void) => { store.listeners.add(listener); return () => { store.listeners.delete(listener); }; }, getStatus: (host: string) => store.snap.status[host],
@@ -25,6 +29,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
   Element.prototype.scrollIntoView = vi.fn();
+  settingsStore.set.mockReset().mockResolvedValue(undefined); settingsStore.save.mockReset().mockResolvedValue(undefined);
   vi.mocked(invoke).mockReset().mockResolvedValue(undefined);
   tabs = [{ id: "tab", type: "terminal", title: "Auto agent", customTitle: "Shared agent", projectName: "Project", projectPath: "/p", terminal: "uuid" }, { id: "shell", type: "terminal", title: "Bash", customTitle: "Shared shell", shellMode: "raw", terminal: "shell-uuid", projectName: "Project", projectPath: "/p" }];
   store.snap = { configs: [], status: { local: { ...status } }, live: { local: tabs.map(t => ({ terminal: t.terminal!, meta: { title: t.title, customTitle: t.customTitle }, spec: { cwd: "/p" }, createdAtMs: 0, pid: 1, exitCode: null })) }, agents: {}, epochs: {} };
@@ -40,7 +45,105 @@ function replaceStatus(change: Partial<HostStatus>) {
   act(() => { store.snap = { ...store.snap, status: { local: { ...store.snap.status.local, ...change } } }; for (const l of store.listeners) l(); });
 }
 
+let updateLocalTabs: (update: (tabs: Tab[]) => Tab[]) => void;
+function LocalNamingHarness() {
+  const [localTabs, setLocalTabs] = useState(tabs);
+  updateLocalTabs = setLocalTabs;
+  const save = useOpenTabsPersistence({ tabs: localTabs, closing: props.closingTabIds, enabled: true, localDaemon: false, migration: NO_MIGRATION }, setLocalTabs);
+  return <TabBar {...props} tabs={localTabs} entries={localTabs.map(tab => ({ kind: "tab", id: tab.id, tab }))} onSaveInProcessTitle={save} />;
+}
+function editDraft(value: string) {
+  act(() => {
+    const input = container.querySelector("[role=dialog] input")!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+const submitName = () => act(() => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+
 describe("TabBar shared names", () => {
+  it.each(["agent", "raw"])("in_process_context_menu_dialog_save_persists_without_host_update (%s)", async mode => {
+    tabs = [{ id: "tab", type: "terminal", title: "Auto agent", agent: "pi", projectPath: "/p", projectName: "Project", createdAt: 123,
+      ...(mode === "raw" ? { shellMode: "raw", shellId: "bash" } as const : {}) }];
+    await act(async () => root.render(<StrictMode><LocalNamingHarness /></StrictMode>));
+    context(); expect(button("Rename Tab…").disabled).toBe(false);
+    act(() => button("Rename Tab…").click());
+    expect(container.querySelector("[role=dialog]")).not.toBeNull();
+    expect(container.querySelector("[role=dialog]")!.textContent).toContain("Saved on this Desktop");
+    editDraft("\u2003Local 📝\u2003");
+    submitName();
+    expect(container.querySelector("[role=status]")?.textContent).toBe("Saving…");
+    await act(async () => {});
+    expect(tabEl().querySelector(".tab-item-title")?.textContent).toBe("Local 📝");
+    expect(settingsStore.set).toHaveBeenLastCalledWith("open_tabs", [expect.objectContaining({ id: "tab", customTitle: "Local 📝", title: "Auto agent" })]);
+    expect(settingsStore.save).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("local_migration_sync_settings");
+    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(document.activeElement).toBe(tabEl());
+  });
+  it.each(["set", "save", "sync"] as const)("in_process_%s_failure_retains_draft_and_explicit_equal_value_retry", async stage => {
+    tabs = [{ id: "tab", type: "terminal", title: "Auto", projectPath: "/p", createdAt: 123 }];
+    await act(async () => root.render(<LocalNamingHarness />));
+    if (stage === "sync") vi.mocked(invoke).mockRejectedValueOnce(new Error("disk fault"));
+    else settingsStore[stage].mockRejectedValueOnce(new Error("disk fault"));
+    context(); act(() => button("Rename Tab…").click()); editDraft("Draft");
+    await act(async () => submitName());
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("Couldn’t confirm");
+    expect(container.querySelector("input")!.value).toBe("Draft");
+    expect(tabEl().textContent).toContain("Draft");
+    await act(async () => {}); // background writes cannot turn a failed action into success
+    expect(container.querySelector("[role=dialog]")).not.toBeNull();
+    await act(async () => submitName());
+    expect(container.querySelector("[role=dialog]")).toBeNull();
+    context();
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("clear sync"));
+    await act(async () => button("Use automatic name").click());
+    expect(tabEl().textContent).toContain("Auto");
+    expect(button("Use automatic name").disabled).toBe(false);
+    await act(async () => button("Use automatic name").click());
+    expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(settingsStore.set.mock.calls[settingsStore.set.mock.calls.length - 1]?.[1][0]).not.toHaveProperty("customTitle");
+    expect(vi.mocked(invoke).mock.calls.every(c => c[0] === "local_migration_sync_settings")).toBe(true);
+  });
+  it("in_process_custom_survives_title_and_session_discovery_clear_uses_latest_and_invalid_draft_never_writes", async () => {
+    tabs = [{ id: "tab", type: "terminal", title: "Automatic", projectPath: "/p", createdAt: 123 }];
+    await act(async () => root.render(<LocalNamingHarness />));
+    context(); act(() => button("Rename Tab…").click());
+    const sets = settingsStore.set.mock.calls.length;
+    editDraft("📝".repeat(257)); await act(async () => submitName());
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("256 characters");
+    expect(settingsStore.set).toHaveBeenCalledTimes(sets); expect(settingsStore.save).not.toHaveBeenCalled();
+    editDraft("Local custom"); await act(async () => submitName());
+    await act(async () => updateLocalTabs(tabs => tabs.map(t => ({ ...t, title: "Latest automatic", sessionId: "discovered", lastActiveAt: 999 }))));
+    expect(tabEl().textContent).toContain("Local custom"); expect(tabEl().getAttribute("aria-label")).toContain("Local custom");
+    context(); await act(async () => button("Use automatic name").click());
+    expect(tabEl().textContent).toContain("Latest automatic");
+    expect(settingsStore.set).toHaveBeenLastCalledWith("open_tabs", [expect.objectContaining({ title: "Latest automatic", sessionId: "discovered", lastActiveAt: 999 })]);
+    expect(settingsStore.set.mock.calls[settingsStore.set.mock.calls.length - 1][1][0]).not.toHaveProperty("customTitle");
+  });
+  it.each(["closing", "replacement", "daemon"])("in_process_%s_invalidates_captured_menu_before_submit", async change => {
+    tabs = [{ id: "tab", type: "terminal", title: "Auto", createdAt: 1 }];
+    await act(async () => root.render(<LocalNamingHarness />)); context();
+    await act(async () => {
+      if (change === "closing") { props.closingTabIds = new Set(["tab"]); root.render(<LocalNamingHarness />); }
+      else updateLocalTabs(tabs => [{ ...tabs[0], ...(change === "daemon" ? { terminal: "uuid" } : { createdAt: 2 }) }]);
+    });
+    expect(container.querySelector("[role=menu]")).toBeNull(); expect(container.querySelector("[role=dialog]")).toBeNull();
+    expect(settingsStore.save).not.toHaveBeenCalled(); expect(invoke).not.toHaveBeenCalled();
+  });
+  it.each(["success", "failure"])("in_process_close_during_save_cannot_revive_dialog_after_late_%s", async result => {
+    tabs = [{ id: "tab", type: "terminal", title: "Auto", createdAt: 1 }];
+    await act(async () => root.render(<LocalNamingHarness />));
+    let resolve!: () => void, reject!: (error: unknown) => void;
+    settingsStore.save.mockReturnValueOnce(new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+    context(); act(() => button("Rename Tab…").click()); editDraft("Pending");
+    await act(async () => { submitName(); submitName(); }); expect(settingsStore.save).toHaveBeenCalledTimes(1);
+    await act(async () => updateLocalTabs(() => [{ id: "replacement", type: "terminal", title: "Other", createdAt: 2 }]));
+    expect(container.querySelector("[role=dialog]")).toBeNull();
+    await act(async () => { if (result === "success") resolve(); else reject(new Error("late disk failure")); });
+    expect(container.querySelector("[role=dialog]")).toBeNull(); expect(tabEl("replacement").textContent).toContain("Other");
+    expect(settingsStore.set).toHaveBeenLastCalledWith("open_tabs", [expect.objectContaining({ id: "replacement", title: "Other" })]);
+  });
   it("custom_name_shows_in_shell_and_agent_tab_tooltips_and_accessible_names", () => {
     render();
     expect(tabEl().querySelector(".tab-item-title")?.textContent).toBe("Shared agent");

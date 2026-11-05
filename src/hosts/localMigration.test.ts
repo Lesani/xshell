@@ -282,6 +282,7 @@ function instance(name: string, disk: Disk, d: FakeDaemon, over: Partial<Migrati
     live: () => d.live(),
     listed: d.listed,
     open: d.open,
+    updateName: async (uuid, value) => { d.list.find(t => t.terminal === uuid)!.meta.customTitle = value; },
     uuid: async (id) => `u-${id}`,
     now: () => 1,
     ...over,
@@ -700,5 +701,143 @@ describe("Pi project-scoped migration identity", () => {
     expect(dedupeBySession([w, d]).dups).toEqual([d]);
     expect(dedupeBySession([tabs[0], { ...tabs[0], id: "case", projectPath: "/a" }]).keep).toHaveLength(2);
     expect(planLocalMigration({ saved: [w], live: [info("w", 1, { agent: "pi", sessionId: "custom", cwd: "c:/work/proj/" })], uuidOf: uuidOf([w]), now: 1, ...settings }).target.windows).toBe("w");
+  });
+});
+
+describe("named in-process migration ownership handoff", () => {
+  beforeEach(() => { lockState.holder = null; });
+  const named = () => legacy("a", "s1", { customTitle: "\u2003Saved 📝\u2003", createdAt: 3 });
+  it("new_open_lists_then_updates_and_journals_durable_name_before_layout_and_settlement", async () => {
+    const disk: Disk = { open_tabs: [named(), legacy("b", "s2")], open_groups: [split("g", "a", "b")], terminal_zoom: { a: 1.25 } };
+    const daemon = new FakeDaemon(), order: string[] = [];
+    const i = instance("one", disk, daemon);
+    const open = i.deps.open, listed = i.deps.listed, update = i.deps.updateName, journal = i.deps.writeJournal, write = i.deps.write;
+    i.deps.open = async op => { expect(op.meta).not.toHaveProperty("customTitle"); order.push(`open ${op.uuid}`); await open(op); };
+    i.deps.listed = async (uuid, ms) => { order.push(`list ${uuid}`); return listed(uuid, ms); };
+    i.deps.writeJournal = async j => { order.push(`journal ${j.names?.a?.state ?? "base"}`); await journal(j); };
+    i.deps.updateName = async (uuid, value) => {
+      expect(disk.journal?.names?.a).toEqual({ terminal: uuid, value, state: "attempted" });
+      order.push(`update ${uuid}`); await update(uuid, value);
+    };
+    i.deps.write = async layout => { expect(disk.journal?.names?.a.state).toBe("acknowledged"); order.push("layout"); await write(layout); };
+    const out = await i.start();
+    expect(order).toEqual(["journal base", "open u-a", "list u-a", "open u-b", "list u-b", "journal attempted", "update u-a", "journal acknowledged", "layout"]);
+    expect(out.heldBack).toEqual([]); expect(disk.open_tabs).toEqual([]);
+    const restored = restoreFrom(out, []);
+    expect(restored.tabs.find(t => t.terminal === "u-a")).toMatchObject({ id: "remote-u-a", customTitle: "Saved 📝", title: "T a", groupId: "g" });
+    expect(disk.terminal_zoom).toEqual({ "remote-u-a": 1.25 });
+    await out.settle(); expect(disk.journal).toBeUndefined(); expect(lockState.holder).toBeNull();
+    daemon.list[0].meta.customTitle = "Newer broadcast";
+    expect(restorableTabs({ saved: [], hosts: [], localDaemon: true, cached: () => daemon.list })[0].customTitle).toBe("Newer broadcast");
+    delete daemon.list[0].meta.customTitle;
+    expect(restorableTabs({ saved: [], hosts: [], localDaemon: true, cached: () => daemon.list })[0].customTitle).toBeUndefined();
+  });
+  it.each(["remote", "timeout", "indeterminate", "unsupported"])("post_open_%s_retains_named_source_and_never_replays_over_newer_name_or_clear", async code => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    const updateName = vi.fn(async () => { throw hostErr(code === "unsupported" ? "invalid" : code as HostError["code"]); });
+    const first = await instance("one", disk, daemon, { updateName }).start();
+    expect(first.inProcess).toEqual([]); expect(first.heldBack).toEqual([source]); expect(first.migrated).toHaveLength(1);
+    expect(first.pendingNames).toBe(1); expect(migrationNotice(first.failed, first.pendingNames)).toContain("Daemon’s name remains authoritative");
+    expect(disk.open_tabs).toEqual([source]); await first.settle();
+    expect(disk.journal?.base).toBeUndefined(); expect(disk.open_tabs).toEqual([source]); expect(disk.journal?.names?.a.state).toBe("attempted");
+    for (const value of ["Newer Desktop", undefined]) {
+      daemon.list[0].meta.customTitle = value; lockState.holder = null;
+      const next = await instance("two", disk, daemon, { updateName }).start(); await next.settle();
+      expect(next.heldBack).toEqual([source]); expect(daemon.list[0].meta.customTitle).toBe(value);
+    }
+    expect(updateName).toHaveBeenCalledTimes(1); expect(daemon.opened).toEqual(["u-a"]);
+  });
+  it("pre_open_refusal_keeps_name_in_process_and_can_retry_migration_next_start", async () => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    daemon.behave["u-a"] = { error: hostErr("remote", "no launch") };
+    const updateName = vi.fn();
+    const first = await instance("one", disk, daemon, { updateName }).start();
+    expect(first.inProcess).toEqual([source]); expect(first.heldBack).toEqual([]); expect(updateName).not.toHaveBeenCalled();
+    await first.settle(); expect(disk.journal).toBeUndefined();
+    daemon.behave = {}; lockState.holder = null;
+    const next = await instance("two", disk, daemon).start(); await next.settle();
+    expect(next.heldBack).toEqual([]); expect(daemon.list[0].meta.customTitle).toBe("Saved 📝");
+  });
+  it.each(["existing-uuid", "session-owner", "raced-owner", "attach-error", "equal-list"])("%s_is_not_permission_to_send_a_name", async mode => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    const owner = "0f0e0d0c-0000-4000-8000-000000000001";
+    if (["existing-uuid", "equal-list"].includes(mode)) daemon.list.push(info("u-a", 1, { sessionId: "s1" }));
+    if (mode === "session-owner") daemon.list.push(info(owner, 1, { sessionId: "s1" }));
+    if (mode === "raced-owner") {
+      daemon.behave["u-a"] = { error: hostErr("remote", `${SESSION_OPEN}: ${owner}`) };
+    }
+    if (mode === "attach-error") daemon.behave["u-a"] = { error: hostErr("timeout"), create: true };
+    if (mode === "equal-list") daemon.list[0].meta.customTitle = "Saved 📝";
+    const updateName = vi.fn();
+    const i = instance("one", disk, daemon, { updateName });
+    if (mode === "raced-owner") i.deps.open = async op => { daemon.list.push(info(owner, 1, { sessionId: "s1" })); await daemon.open(op); };
+    const out = await i.start(); await out.settle();
+    expect(out.heldBack).toEqual([source]); expect(out.inProcess).toEqual([]); expect(updateName).not.toHaveBeenCalled();
+    expect(disk.journal?.base).toBeUndefined(); expect(disk.open_tabs).toEqual([source]);
+  });
+  it.each(["before-update", "after-update", "acknowledged"])("restart_%s_preserves_authority_and_uses_only_a_durable_receipt", async stage => {
+    const source = named(), base = { openTabs: [source], openGroups: [], zoom: {} };
+    const names: Journal["names"] = stage === "before-update" ? undefined : {
+      a: { terminal: "u-a", value: "Saved 📝", state: stage === "acknowledged" ? "acknowledged" : "attempted" },
+    };
+    const disk: Disk = { open_tabs: [source], journal: { version: 1, base, sent: ["a"], ...(names ? { names } : {}) } };
+    const daemon = new FakeDaemon(); daemon.list.push(info("u-a", 1, { sessionId: "s1" })); // absent customTitle: another Desktop cleared it
+    const updateName = vi.fn(); const out = await instance("one", disk, daemon, { updateName }).start(); await out.settle();
+    expect(updateName).not.toHaveBeenCalled(); expect(daemon.list[0].meta.customTitle).toBeUndefined();
+    expect(out.heldBack).toEqual(stage === "acknowledged" ? [] : [source]);
+    expect(disk.open_tabs).toEqual(stage === "acknowledged" ? [] : [source]);
+    if (stage === "acknowledged") expect(disk.journal).toBeUndefined();
+    else { expect(disk.journal?.base).toBeUndefined(); expect(disk.open_tabs).toEqual([source]); }
+  });
+  it.each(["attempted", "acknowledged"])("%s_journal_write_failure_does_not_lose_the_source_or_retry_an_uncertain_update", async stage => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    const i = instance("one", disk, daemon), writeJournal = i.deps.writeJournal, updateName = vi.fn(i.deps.updateName);
+    i.deps.updateName = updateName;
+    i.deps.writeJournal = async j => { if (j.names?.a.state === stage) throw new Error("journal disk fault"); await writeJournal(j); };
+    const out = await i.start(); expect(out.heldBack).toEqual([source]); expect(disk.open_tabs).toEqual([source]);
+    expect(updateName).toHaveBeenCalledTimes(stage === "attempted" ? 0 : 1);
+    // Simulate crash, without settle. Disk has the original base and at most an attempt.
+    lockState.holder = null;
+    const retry = vi.fn(); const next = await instance("two", disk, daemon, { updateName: retry }).start(); await next.settle();
+    expect(next.heldBack).toEqual([source]); expect(retry).not.toHaveBeenCalled(); expect(daemon.opened).toEqual(["u-a"]);
+    expect(disk.journal?.base).toBeUndefined(); expect(disk.open_tabs).toEqual([source]);
+  });
+  it("crash_after_ack_before_layout_uses_receipt_even_if_daemon_name_changed", async () => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    const first = await instance("one", disk, daemon, { write: async () => { throw new Error("layout fault"); } }).start();
+    expect(first.writesLayout).toBe(false); expect(disk.journal?.names?.a.state).toBe("acknowledged");
+    daemon.list[0].meta.customTitle = "Newer name"; lockState.holder = null;
+    const updateName = vi.fn(), next = await instance("two", disk, daemon, { updateName }).start(); await next.settle();
+    expect(next.heldBack).toEqual([]); expect(disk.open_tabs).toEqual([]); expect(updateName).not.toHaveBeenCalled();
+    expect(next.migrated[0].meta.customTitle).toBe("Newer name");
+  });
+  it("one_new_open_hands_off_once_matching_alias_retires_and_conflicting_alias_remains_held", async () => {
+    const a = named(), same = { ...a, id: "same", customTitle: "Saved 📝" }, conflict = { ...a, id: "conflict", customTitle: "Different" };
+    const disk: Disk = { open_tabs: [a, same, conflict] }, daemon = new FakeDaemon();
+    const i = instance("one", disk, daemon), updateName = vi.fn(i.deps.updateName); i.deps.updateName = updateName;
+    const out = await i.start(); await out.settle();
+    expect(updateName).toHaveBeenCalledExactlyOnceWith("u-a", "Saved 📝"); expect(daemon.opened).toEqual(["u-a"]);
+    expect(out.heldBack).toEqual([conflict]); expect(out.inProcess).toEqual([]); expect(disk.open_tabs).toEqual([conflict]);
+    expect(disk.journal?.base).toBeUndefined(); expect(disk.open_tabs).toEqual([conflict]);
+    lockState.holder = null; const next = await instance("two", disk, daemon, { updateName }).start(); await next.settle();
+    expect(next.heldBack).toEqual([conflict]); expect(updateName).toHaveBeenCalledTimes(1);
+  });
+  it("settled_pending_name_journal_does_not_mask_later_saved_tabs_or_layout_edits", async () => {
+    const source = named(), disk: Disk = { open_tabs: [source] }, daemon = new FakeDaemon();
+    const updateName = vi.fn(async () => { throw hostErr("timeout"); });
+    const first = await instance("one", disk, daemon, { updateName }).start(); await first.settle();
+    expect(disk.journal?.base).toBeUndefined();
+    const added = legacy("new", "s-new", { customTitle: "New local" });
+    disk.open_tabs = [source, added]; disk.open_groups = [split("new-group", "a", "new")]; disk.terminal_zoom = { new: 1.5 };
+    lockState.holder = null;
+    const next = await instance("two", disk, daemon).start(); await next.settle();
+    expect(next.heldBack).toEqual([source]); expect(daemon.opened).toEqual(["u-a", "u-new"]);
+    expect(daemon.list.find(t => t.terminal === "u-new")?.meta.customTitle).toBe("New local");
+    expect(disk.open_groups?.[0].id).toBe("new-group"); expect(disk.terminal_zoom?.["remote-u-new"]).toBe(1.5);
+  });
+  it("offline_named_sent_source_is_held_with_notice_not_run_twice", async () => {
+    const source = named(), disk: Disk = { open_tabs: [source], journal: { version: 1, sent: ["a"] } };
+    const out = await instance("one", disk, new FakeDaemon(), { ready: async () => null }).start();
+    expect(out.heldBack).toEqual([source]); expect(out.inProcess).toEqual([]); expect(out.pendingNames).toBe(1);
   });
 });

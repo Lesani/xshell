@@ -1,3 +1,4 @@
+import { useOpenTabsPersistence } from "./tabs/openTabsPersistence";
 import { attentionKey, decodeCompletionSeen, markCompletionSeen, persistedCompletionSeen, pruneCompletionSeen, removeCompletionSeenHost, visibleTerminalIds, COMPLETION_SEEN_SETTING, type CompletionSeen } from "./tabs/attention";
 import { useDesktopForeground } from "./tabs/useDesktopForeground";
 import { agentStatusOf } from "./tabs/agentStatus";
@@ -44,12 +45,12 @@ import { localEdits, metaSync } from "./hosts/metaSync";
 import { refusal, planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
 import { daemonHost, type LocalHostInfo } from "./hosts/localHost";
-import { isRemoteDataHost, listsForReconcile, needsCache, persistableTabs, restorableTabs, restoreGroups, withHostData } from "./hosts/appTabs";
+import { isRemoteDataHost, listsForReconcile, needsCache, restorableTabs, restoreGroups, withHostData } from "./hosts/appTabs";
 import { mergeRecent } from "./hosts/aggregate";
 import { statusLabel, useHostsSnapshot } from "./hosts/useHosts";
 import type { HostConfig, HostId, TerminalInfo } from "./hosts/types";
 import { AppNotice } from "./components/AppNotice";
-import { NO_MIGRATION, groupsToPersist, migrateLocalTabsOnce, migrationNotice, openTabsToPersist, renderedGroups, type MigrationOutcome } from "./hosts/localMigration";
+import { NO_MIGRATION, groupsToPersist, migrateLocalTabsOnce, migrationNotice, renderedGroups, type MigrationOutcome } from "./hosts/localMigration";
 import { localMigrationDeps } from "./hosts/localMigrationDeps";
 import { applyFenced, singleFlight } from "./hosts/startup";
 import { restorePendingCopies } from "./files/syncBackDeps";
@@ -436,7 +437,7 @@ export default function App() {
       configuredHostsRef.current = hostConfigs;
       migrationRef.current = migration;
       durableGroupsRef.current = durableGroups;
-      const notice = migrationNotice(migration.failed);
+      const notice = migrationNotice(migration.failed, migration.pendingNames);
       if (notice) showNotice(notice);
       // Layout: prefer the explicit `sidebar_layout` if present; otherwise migrate
       // from the flat `project_paths` list by wrapping each path in a project item.
@@ -549,22 +550,6 @@ export default function App() {
       await store.set("last_seen_update_version", v);
     } catch (_) {}
   }, [updateInfo.latestVersion]);
-
-  // ── Persist tabs whenever they change (after initial restore) ─────
-  useEffect(() => {
-    if (!tabsRestored) return;
-    (async () => {
-      try {
-        const store = await load("settings.json", { defaults: {}, autoSave: true });
-        // Daemon Tabs are mirrored from their Daemon, never persisted here. In local Daemon
-        // mode only the instance holding the migration lock writes `open_tabs` (its
-        // in-process Tabs and the held-back ones); in-process mode writes as always.
-        const persistable = persistableTabs(tabs);
-        const next = localDaemonRef.current ? openTabsToPersist(persistable, migrationRef.current) : persistable;
-        if (next) await store.set("open_tabs", next);
-      } catch (_) {}
-    })();
-  }, [tabs, tabsRestored]);
 
   // ── Derive user projects ──────────────────────────────────────────
   useEffect(() => {
@@ -1039,6 +1024,8 @@ export default function App() {
   }, [applyPlan, openContext]);
 
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(new Set());
+  const saveInProcessTitle = useOpenTabsPersistence({ tabs, closing: closingTabIds, enabled: tabsRestored,
+    localDaemon: localDaemonRef.current, migration: migrationRef.current }, setTabs);
 
   const handleCloseTab = useCallback((id: string) => {
     // Group close: drop the group entry + all tabs that belong to it.
@@ -1576,7 +1563,7 @@ export default function App() {
           <span>Loading...</span>
         </div>
       )}
-      <TabBar onDialogOpenChange={setTabDialogOpen} completionSeen={completionSeen} viewingIds={viewingIds} groupTabsByProject={groupTabsByProject} tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
+      <TabBar onSaveInProcessTitle={saveInProcessTitle} onDialogOpenChange={setTabDialogOpen} completionSeen={completionSeen} viewingIds={viewingIds} groupTabsByProject={groupTabsByProject} tabs={tabs} entries={entries} onRenameGroup={(id, name) => setGroups(prev => prev.map(g => g.id === id ? { ...g, name } : g))} closingTabIds={closingTabIds} activeTabId={activeTabId} selectedProject={selectedProject} hoveredProjectKey={hoveredProjectKey} linkedProjectKey={activeTabProjectKey} activeTabProject={contextProject} openSessionIds={new Set(tabs.map(sessionKeyOfTab).filter(Boolean) as string[])} projectIcons={projectIcons} pinnedProjects={userProjects} sidebarCollapsed={sidebarCollapsed} defaultShell={defaultShell} installedAgents={installedAgentsFor(contextProject?.host)} updateAvailable={updateInfo.updateAvailable} onExpandSidebar={() => setSidebarCollapsed(false)} onSelectTab={handleSelectTab} onCloseTab={handleCloseTab} onReorderTabs={handleReorderTabs} onNewChat={handleNewChat} onNewChatInActive={handleNewChatInActive} onNewShellInContext={handleNewShellInContext} onOpenSession={handleOpenSession} onNewShell={handleNewShell} onGoHome={handleGoHome} onOpenSettings={() => setActiveTabId("settings")} onToggleSidebar={() => setSidebarCollapsed(c => !c)} />
       <div className="app-body">
       <Sidebar projects={userProjects} projectIcons={projectIcons} selectedProject={selectedProject} activeCountByProject={activeCountByProject} sidebarLayout={sidebarLayout} onLayoutChange={persistSidebarLayout} onSelectProject={handleSelectProject} onGoHome={handleGoHome} onRemoveProject={handleRemoveProject} onEditProject={(k) => setEditingProjectKey(k)} onHoverProject={setHoveredProjectKey} onOpenSettings={() => setActiveTabId("settings")} onAddProject={() => setShowProjectPicker(true)} onCollapse={() => setSidebarCollapsed(true)} activeTabId={activeTabId} linkedProjectKey={activeTabProjectKey} showRateLimit={showRateLimitInSidebar} showRateLimitCodex={showRateLimitInSidebarCodex} updateAvailable={updateInfo.updateAvailable} />
       <div className="main-content">

@@ -2,7 +2,7 @@ import { flattenEntries, projectDrop, projectDropGap, type TabBarEntry } from ".
 import type { ReorderDrop } from "../hooks/useDragReorder";
 import { projectIconContrast, isProjectIconText } from "../projectIconContrast";
 import { tabName } from "../tabs/tabName";
-import { CustomTitleController, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches, type CustomTitleTarget } from "../tabs/customTitle";
+import { CustomTitleController, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches, type CustomTitleTarget, type SaveInProcessTitle } from "../tabs/customTitle";
 import { TabNameMenu } from "./TabNameMenu";
 import { RenameTabDialog } from "./RenameTabDialog";
 import { useState, useEffect, useRef, useLayoutEffect, useCallback, useSyncExternalStore } from "react";
@@ -50,6 +50,7 @@ interface TabBarProps {
   onDialogOpenChange?: (open: boolean) => void;
   completionSeen?: CompletionSeen;
   viewingIds?: ReadonlySet<string>;
+  onSaveInProcessTitle?: SaveInProcessTitle;
   tabs: Tab[];
   entries: TabBarEntry[];
   groupTabsByProject?: boolean;
@@ -222,11 +223,20 @@ function TabTooltip({ text, rect }: { text: string; rect: DOMRect }) {
   return <div className="tab-tooltip" ref={ref} style={style}>{text}</div>;
 }
 
-export function TabBar({ onDialogOpenChange, completionSeen = {}, viewingIds = new Set(), tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
+export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSeen = {}, viewingIds = new Set(), tabs, entries, groupTabsByProject = true, closingTabIds, activeTabId, selectedProject, hoveredProjectKey, linkedProjectKey, activeTabProject, openSessionIds, projectIcons, pinnedProjects, sidebarCollapsed, defaultShell, installedAgents, updateAvailable, onExpandSidebar, onSelectTab, onCloseTab, onReorderTabs, onNewChat, onNewChatInActive, onNewShellInContext, onOpenSession, onNewShell, onRenameGroup, onGoHome, onOpenSettings, onToggleSidebar }: TabBarProps) {
   const appWindow = getCurrentWindow();
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
-  const [names] = useState(() => new CustomTitleController(() => tabsRef.current, registry.getSnapshot));
+  const closingRef = useRef(closingTabIds);
+  closingRef.current = closingTabIds;
+  const saveLocalRef = useRef(onSaveInProcessTitle);
+  saveLocalRef.current = onSaveInProcessTitle;
+  const [names] = useState(() => new CustomTitleController(
+    () => tabsRef.current.filter(t => !closingRef.current.has(t.id)), registry.getSnapshot, undefined,
+    (target, value) => {
+      if (!saveLocalRef.current) return Promise.reject(new Error("Local name saving is unavailable"));
+      return saveLocalRef.current(target, value);
+    }));
   const nameState = useSyncExternalStore(names.subscribe, names.getSnapshot);
   const [nameMenu, setNameMenu] = useState<{ tabId: string; target: CustomTitleTarget | null; anchor: HTMLElement; x: number; y: number } | null>(null);
   const nameTrigger = useRef<HTMLElement | null>(null);
@@ -234,7 +244,7 @@ export function TabBar({ onDialogOpenChange, completionSeen = {}, viewingIds = n
   const hostsSnap = useHostsSnapshot();
   const hostNameOf = (h: string) => hostsSnap.configs.find(c => c.id === h)?.name || h;
   const localAgentStatuses = useLocalAgentStatuses();
-  useEffect(() => { names.invalidate(); }, [names, tabs, hostsSnap]);
+  useEffect(() => { names.invalidate(); }, [names, tabs, hostsSnap, closingTabIds]);
   const menuTab = nameMenu ? tabs.find(t => t.id === nameMenu.tabId && (!nameMenu.target || customTitleTargetMatches(nameMenu.target, t, hostsSnap)) && !t.groupId && !closingTabIds.has(t.id)) : undefined;
   useEffect(() => { if (nameMenu && !menuTab) closeNameMenu(); }, [nameMenu, menuTab, closeNameMenu]);
   const dialogTab = nameState.dialog ? tabs.find(t => t.id === nameState.dialog!.target.tabId && !closingTabIds.has(t.id)) : undefined;
@@ -484,7 +494,7 @@ export function TabBar({ onDialogOpenChange, completionSeen = {}, viewingIds = n
       {nameMenu && menuTab && <TabNameMenu anchor={nameMenu.anchor} x={nameMenu.x} y={nameMenu.y}
         unavailable={customTitleUnavailable(menuTab, hostsSnap)} hasCustomTitle={!!menuTab.customTitle} busy={nameState.pending}
         onRename={() => openNameDialog(menuTab, false)} onAutomatic={() => openNameDialog(menuTab, true)} onClose={closeNameMenu} />}
-      {nameState.dialog && dialogTab && nameTrigger.current && <RenameTabDialog returnFocus={nameTrigger.current}
+      {nameState.dialog && dialogTab && nameTrigger.current && <RenameTabDialog inProcess={nameState.dialog.target.kind === "in-process"} returnFocus={nameTrigger.current}
         seed={nameState.dialog.seed} operation={nameState.dialog.operation} error={nameState.dialog.error}
         unavailable={customTitleUnavailable(dialogTab, hostsSnap)} hasCustomTitle={!!dialogTab.customTitle || nameState.dialog.retryClear}
         onSubmit={names.submit} onClose={names.dismiss} />}
