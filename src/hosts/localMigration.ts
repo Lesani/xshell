@@ -1,3 +1,4 @@
+import { customTitleError, normalizeCustomTitle } from "../tabs/customTitleValidation";
 import type { Group, LayoutNode, Tab } from "../types";
 import { scopedSessionKey } from "./projectKey";
 import { collectLeafIds } from "../layout";
@@ -91,6 +92,7 @@ export interface ApplyInput {
   plan: MigrationPlan;
   results: Record<string, OpResult>;   // by UUID
   live: TerminalInfo[];                // the confirmed "local" list after the run
+  heldNames?: ReadonlySet<string>;      // created/adopted, but name handoff is not durable
 }
 
 export interface Applied {
@@ -131,6 +133,7 @@ export function applyLocalMigration(i: ApplyInput): Applied {
     if (listed.has(uuid)) {
       newId[t.id] = remoteTabId(uuid);
       firstOf.add(uuid);
+      if (i.heldNames?.has(t.id)) { delete newId[t.id]; heldBack.push(t); }
       continue;
     }
     // Only a refused Tab whose own open was refused runs in-process: a duplicate of another
@@ -201,7 +204,7 @@ export function sessionConflict(e: unknown): { owner: string | null } | null {
 // Opens one after another, in saved order. An open that cannot be confirmed stops the rest:
 // they were never sent, so they cannot exist and count as refused. `owners` gets, by UUID, the
 // listed Terminal that runs a "held" open's session.
-export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps, owners: Record<string, string> = {}): Promise<Record<string, OpResult>> {
+export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps, owners: Record<string, string> = {}, opened: Set<string> = new Set()): Promise<Record<string, OpResult>> {
   const results: Record<string, OpResult> = {};
   let stopped = false;
   for (const op of ops) {
@@ -209,6 +212,7 @@ export async function runLocalMigration(ops: MigrationOp[], deps: RunDeps, owner
     let r: OpResult;
     try {
       await deps.open(op);
+      opened.add(op.uuid);
       // OK means the Daemon saved it (xshelld persists before answering); wait for the list.
       r = (await deps.listed(op.uuid, CONFIRM_MS)) ? "ok" : "unresolved";
     } catch (e) {
@@ -246,6 +250,8 @@ export interface Journal {
   version: 1;
   base?: SavedLayout;
   sent: string[];
+  // Never replay an attempted-but-unacknowledged update: it may have reached the Daemon.
+  names?: Record<string, { terminal: string; value: string; state: "attempted" | "acknowledged" }>;
 }
 
 export interface StoreState {
@@ -255,6 +261,7 @@ export interface StoreState {
 }
 
 export interface MigrationDeps extends RunDeps {
+  updateName(terminal: string, value: string): Promise<void>;
   lock(waitMs: number): Promise<boolean>;
   unlock(): Promise<void>;
   // This instance does not hold the lock: its store saves keep the disk's open_tabs,
@@ -288,6 +295,7 @@ export interface MigrationOutcome {
   writesLayout: boolean;
   // Refused Tabs (for the notice).
   failed: number;
+  pendingNames?: number;
   // Call once restore has applied the outcome: retires (or narrows) the journal.
   settle(): Promise<void>;
 }
@@ -364,19 +372,52 @@ async function migrate(settings: MigrationSettings, deps: MigrationDeps): Promis
     const mayExist = (t: Tab) => sent.has(t.id) || running.has(sessionOf(t));
     const { keep, dups } = dedupeBySession(legacy.filter(t => !mayExist(t)));
     const heldBack = legacy.filter(t => mayExist(t) || dups.includes(t));
-    return { ...NO_MIGRATION, inProcess: keep, heldBack, groups: base.openGroups, ownsOpenTabs: true };
+    return { ...NO_MIGRATION, inProcess: keep, heldBack, groups: base.openGroups, ownsOpenTabs: true,
+      ...(heldBack.some(t => t.customTitle) ? { pendingNames: heldBack.filter(t => t.customTitle).length } : {}) };
   }
   // Write-ahead: from here on these Tabs' Terminals may exist.
-  await deps.writeJournal({ version: 1, base, sent: [...new Set([...sent, ...legacy.map(t => t.id)])] });
+  const names: NonNullable<Journal["names"]> = { ...journal?.names };
+  const writeAhead: Journal = { version: 1, base, sent: [...new Set([...sent, ...legacy.map(t => t.id)])],
+    ...(Object.keys(names).length ? { names } : {}) };
+  await deps.writeJournal(writeAhead);
   const uuidOf: Record<string, string> = {};
   for (const t of legacy) uuidOf[t.id] = await deps.uuid(t.id);
   const plan = planLocalMigration({ saved: legacy, live: ready, uuidOf, now: deps.now(), ...settings });
   const owners: Record<string, string> = {};
-  const results = await runLocalMigration(plan.ops, deps, owners);
+  const opened = new Set<string>();
+  const results = await runLocalMigration(plan.ops, deps, owners, opened);
   // A session another client opened meanwhile: its Tabs become that Terminal's.
   for (const [id, uuid] of Object.entries(plan.target)) if (owners[uuid]) plan.target[id] = owners[uuid];
+  // Only an acknowledged new open from this attempt can transfer a name. Existing owners,
+  // attach errors and crash recovery are not permission to overwrite the Daemon's metadata.
+  const heldNames = new Set<string>();
+  for (const tab of legacy) {
+    if (!tab.customTitle) continue;
+    const uuid = plan.target[tab.id];
+    if (!deps.live().some(t => t.terminal === uuid)) continue;
+    const value = normalizeCustomTitle(tab.customTitle);
+    const receipt = names[tab.id];
+    if (receipt?.state === "acknowledged" && receipt.terminal === uuid && receipt.value === value) continue;
+    // Aliases may share a durable receipt, but never issue competing updates.
+    const acknowledgedAlias = Object.values(names).some(n => n.terminal === uuid && n.value === value && n.state === "acknowledged");
+    const op = plan.ops.find(o => o.fromId === tab.id && o.uuid === uuid);
+    if (!customTitleError(tab.customTitle) && (acknowledgedAlias || (op && opened.has(uuid) && !receipt))) {
+      try {
+        if (!acknowledgedAlias) {
+          names[tab.id] = { terminal: uuid, value, state: "attempted" };
+          await deps.writeJournal({ ...writeAhead, names }); // durable before sending
+          await deps.updateName(uuid, value);
+        }
+        const acknowledged = { ...names, [tab.id]: { terminal: uuid, value, state: "acknowledged" as const } };
+        await deps.writeJournal({ ...writeAhead, names: acknowledged });
+        Object.assign(names, acknowledged); // only install after the receipt is durable
+        continue;
+      } catch (_) { /* Keep source and name; the already-open Terminal must not run twice. */ }
+    }
+    heldNames.add(tab.id);
+  }
   const live = deps.live();
-  const applied = applyLocalMigration({ saved: legacy, groups: base.openGroups, zoom: base.zoom, plan, results, live });
+  const applied = applyLocalMigration({ saved: legacy, groups: base.openGroups, zoom: base.zoom, plan, results, live, heldNames });
   const keep = new Set([...applied.inProcess, ...applied.heldBack].map(t => t.id));
   // A re-application of the journal: the same base and list give the same state. Durable
   // (fsynced) before the journal can be retired.
@@ -392,9 +433,11 @@ async function migrate(settings: MigrationSettings, deps: MigrationDeps): Promis
     ownsOpenTabs: owns,
     writesLayout: true,
     failed: applied.inProcess.length,
+    ...(heldNames.size ? { pendingNames: heldNames.size } : {}),
     // Held-back Tabs may still have a Terminal: only they stay marked. Once.
     settle: () => (settling ??= (async () => {
-      if (heldIds.length) await deps.writeJournal({ version: 1, sent: heldIds });
+      if (heldIds.length) await deps.writeJournal({ version: 1, sent: heldIds,
+        ...(heldNames.size ? { names } : {}) });
       else await deps.clearJournal();
       if (!owns) await deps.unlock();
     })()),
@@ -488,7 +531,8 @@ export function groupsToPersist(shown: Group[], tabs: Tab[], saved: Group[], o: 
 }
 
 // The notice after a start where some saved Tabs could not move, or null.
-export function migrationNotice(failed: number): string | null {
+export function migrationNotice(failed: number, pendingNames = 0): string | null {
+  if (pendingNames > 0) return fmt("notice.localMigration.pendingNames");
   if (failed <= 0) return null;
   return failed === 1 ? fmt("notice.localMigration.partialOne") : fmt("notice.localMigration.partial", { count: failed });
 }

@@ -4,20 +4,15 @@ import { daemonHost } from "../hosts/localHost";
 import { isUsableStatus, type RegistrySnapshot } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
 import { isHostError } from "../hosts/types";
+import { customTitleError, normalizeCustomTitle } from "./customTitleValidation";
+export { customTitleError, normalizeCustomTitle } from "./customTitleValidation";
 
 export const CUSTOM_TITLE_CAPABILITY = "term.custom-title";
 
-// Convenience validation matches protocol Unicode White_Space, not JS trim's BOM rule.
-export function customTitleError(text: string): string | null {
-  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(text)) return fmt("tab.rename.controls");
-  const normalized = text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-  if (!normalized) return fmt("tab.rename.blank");
-  return [...normalized].length > 256 ? fmt("tab.rename.tooLong") : null;
-}
-
 export function customTitleUnavailable(tab: Tab, snap: RegistrySnapshot): string | null {
+  if (isInProcessTitleTab(tab)) return null;
   const host = daemonHost(tab);
-  if (!host) return fmt("tab.rename.inProcess");
+  if (tab.type !== "terminal" || !host) return fmt("tab.rename.gone");
   const status = snap.status[host];
   if (!isUsableStatus(status)) return fmt("tab.rename.offline");
   if (!status?.daemonCapabilities?.includes(CUSTOM_TITLE_CAPABILITY)) return fmt("tab.rename.unsupported");
@@ -25,12 +20,30 @@ export function customTitleUnavailable(tab: Tab, snap: RegistrySnapshot): string
   return null;
 }
 
-export interface CustomTitleTarget {
+export const isInProcessTitleTab = (tab: Tab): boolean => tab.type === "terminal" && !tab.host && !tab.terminal;
+export interface InProcessTitleTarget {
+  kind: "in-process";
+  tabId: string;
+  createdAt: Tab["createdAt"];
+  projectPath: Tab["projectPath"];
+  agent: Tab["agent"];
+  shellMode: Tab["shellMode"];
+  shellId: Tab["shellId"];
+}
+export interface DaemonTitleTarget {
+  kind: "daemon";
   tabId: string;
   host: string;
   terminal: string;
   configGeneration: number | undefined;
   config: string;
+}
+export type CustomTitleTarget = InProcessTitleTarget | DaemonTitleTarget;
+export type SaveInProcessTitle = (target: InProcessTitleTarget, value: string | null) => Promise<void>;
+export function inProcessTitleTargetMatches(target: InProcessTitleTarget, tab: Tab): boolean {
+  return isInProcessTitleTab(tab) && tab.id === target.tabId && tab.createdAt === target.createdAt
+    && tab.projectPath === target.projectPath && tab.agent === target.agent
+    && tab.shellMode === target.shellMode && tab.shellId === target.shellId;
 }
 interface DialogState {
   target: CustomTitleTarget;
@@ -43,17 +56,20 @@ interface State { dialog: DialogState | null; pending: boolean }
 const configOf = (snap: RegistrySnapshot, host: string) => JSON.stringify(snap.configs.find(c => c.id === host) ?? null);
 
 export function captureCustomTitleTarget(tab: Tab, snap: RegistrySnapshot): CustomTitleTarget | null {
+  if (isInProcessTitleTab(tab)) return { kind: "in-process", tabId: tab.id, createdAt: tab.createdAt,
+    projectPath: tab.projectPath, agent: tab.agent, shellMode: tab.shellMode, shellId: tab.shellId };
   const host = daemonHost(tab);
-  return host ? { tabId: tab.id, host, terminal: tab.terminal!, configGeneration: snap.status[host]?.configGeneration, config: configOf(snap, host) } : null;
+  return tab.type === "terminal" && host ? { kind: "daemon", tabId: tab.id, host, terminal: tab.terminal!, configGeneration: snap.status[host]?.configGeneration, config: configOf(snap, host) } : null;
 }
 
 export function customTitleTargetMatches(target: CustomTitleTarget, tab: Tab, snap: RegistrySnapshot): boolean {
+  if (target.kind === "in-process") return inProcessTitleTargetMatches(target, tab);
   return tab.id === target.tabId && tab.terminal === target.terminal && daemonHost(tab) === target.host
     && snap.status[target.host]?.configGeneration === target.configGeneration && configOf(snap, target.host) === target.config;
 }
 
-// One explicit action, no outbox/retry and no Tab setter. List reconciliation alone owns
-// displayed values, including an echo preceding an error or a newer writer preceding success.
+// One explicit action, no outbox or automatic retry. Daemon replies never install values;
+// only the local persistence boundary may patch Desktop-owned in-process names.
 export class CustomTitleController {
   private state: State = { dialog: null, pending: false };
   private listeners = new Set<() => void>();
@@ -61,6 +77,7 @@ export class CustomTitleController {
     private tabs: () => Tab[],
     private snapshot: () => RegistrySnapshot,
     private send: (command: string, args: Record<string, unknown>) => Promise<unknown> = invoke,
+    private saveLocal: SaveInProcessTitle = async () => { throw new Error("Local name saving is unavailable"); },
   ) {}
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   getSnapshot = () => this.state;
@@ -81,7 +98,7 @@ export class CustomTitleController {
   private current(target: CustomTitleTarget): Tab | undefined {
     const snap = this.snapshot();
     const tab = this.tabs().find(t => customTitleTargetMatches(target, t, snap));
-    if (!tab || (snap.live[target.host] && !snap.live[target.host]!.some(t => t.terminal === target.terminal))) return undefined;
+    if (!tab || (target.kind === "daemon" && snap.live[target.host] && !snap.live[target.host]!.some(t => t.terminal === target.terminal))) return undefined;
     return tab;
   }
 
@@ -101,9 +118,11 @@ export class CustomTitleController {
     this.emit({ pending: true, dialog: pending });
     let failure: string | null = null;
     try {
-      await this.send("host_term_update", { host: dialog.target.host, terminal: dialog.target.terminal, meta: { customTitle: value } });
+      const normalized = value === null ? null : normalizeCustomTitle(value);
+      if (dialog.target.kind === "in-process") await this.saveLocal(dialog.target, normalized);
+      else await this.send("host_term_update", { host: dialog.target.host, terminal: dialog.target.terminal, meta: { customTitle: normalized } });
     } catch (e) {
-      failure = isHostError(e) && (e.code === "indeterminate" || e.code === "timeout")
+      failure = dialog.target.kind === "in-process" ? fmt("tab.rename.localFailed", { error: e instanceof Error ? e.message : String(e) }) : isHostError(e) && (e.code === "indeterminate" || e.code === "timeout")
         ? fmt("tab.rename.notConfirmed")
         : fmt("tab.rename.failed", { error: isHostError(e) || e instanceof Error ? e.message : String(e) });
     }

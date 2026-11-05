@@ -40,3 +40,14 @@ it("legacy in-process Tabs are open inventory, not proof of a running process; o
   expect(rows.map(row => row.state)).toEqual(["status-unavailable", "status-unavailable", "ended"]);
   expect(rows.every(row => row.agentStatus === null)).toBe(true);
 });
+
+it("in_process_split_leaf_custom_name_and_latest_automatic_fallback_keep_project_and_group_identity", () => {
+  const leaf = tab("in-process", { title: "Old automatic", customTitle: "Local custom", groupId: "personal" });
+  const groups = [{ id: "personal", name: "Personal split", layout: { kind: "leaf" as const, tabId: leaf.id } }];
+  const before = projectTerminals([leaf], groups, hosts, new Set())[0];
+  const updated = projectTerminals([{ ...leaf, title: "Latest automatic", sessionId: "discovered" }], groups, hosts, new Set())[0];
+  const cleared = projectTerminals([{ ...leaf, title: "Latest automatic", customTitle: undefined }], groups, hosts, new Set())[0];
+  expect(before.title).toBe("Local custom"); expect(updated.title).toBe("Local custom"); expect(cleared.title).toBe("Latest automatic");
+  expect(cleared.terminalKey).toBe(before.terminalKey); expect(cleared.projectKey).toBe(before.projectKey);
+  expect(cleared.groupName).toBe("Personal split"); expect(cleared.state).toBe("status-unavailable");
+});

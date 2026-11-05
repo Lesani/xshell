@@ -61,7 +61,9 @@ agent harness. It is not an agent or an agent session, and is unavailable to a
 **Tab**:
 A **Desktop**'s view of one **Terminal**. A custom Tab name belongs to the owning
 **Daemon**'s Terminal record, survives restore, and is shared with other updated
-**Desktops** and **Mobile**. It overrides presentation only: the automatic title and
+**Desktops** and **Mobile**. For an in-process Local Host Terminal, the **Desktop**
+owns the custom name in its saved Tabs; it survives existing eligible session restore
+and is not shared until successfully transferred to a Daemon. It overrides presentation only: the automatic title and
 agent session history remain independent. Only a computer **Desktop** may set or clear it.
 
 **Attach**:

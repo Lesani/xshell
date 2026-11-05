@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { CustomTitleController, customTitleError, customTitleUnavailable, captureCustomTitleTarget } from "./customTitle";
+import { CustomTitleController, customTitleError, customTitleUnavailable, captureCustomTitleTarget, customTitleTargetMatches } from "./customTitle";
 import type { RegistrySnapshot } from "../hosts/registry";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
 import type { Tab } from "../types";
@@ -36,7 +36,7 @@ describe("CustomTitleController", () => {
     await f.controller.submit(null);
     expect(f.send).toHaveBeenCalledExactlyOnceWith("host_term_update", { host: "h_other", terminal: "uuid", meta: { customTitle: null } });
   });
-  it("incapable_offline_in_process_or_unlisted_target_is_refused", async () => {
+  it("incapable_offline_or_unlisted_target_is_refused", async () => {
     const f = fixture();
     f.snap.status.local.daemonCapabilities = [];
     expect(customTitleUnavailable(f.tabs[0], f.snap)).toBe(fmt("tab.rename.unsupported"));
@@ -44,7 +44,8 @@ describe("CustomTitleController", () => {
     f.snap.status.local = { ...status, status: "offline" };
     expect(customTitleUnavailable(f.tabs[0], f.snap)).toBe(fmt("tab.rename.offline"));
     expect(f.controller.open(f.tabs[0])).toBe(false);
-    expect(customTitleUnavailable({ ...f.tabs[0], terminal: undefined }, f.snap)).toBe(fmt("tab.rename.inProcess"));
+    expect(customTitleUnavailable({ ...f.tabs[0], terminal: undefined }, f.snap)).toBeNull();
+    expect(customTitleUnavailable({ ...f.tabs[0], terminal: undefined, host: "remote" }, f.snap)).toBe(fmt("tab.rename.gone"));
     f.snap.status.local = { ...status };
     f.snap.live.local = [];
     expect(f.controller.open(f.tabs[0])).toBe(false);
@@ -115,6 +116,40 @@ describe("CustomTitleController", () => {
     const request = f.controller.submit("One"); await f.controller.submit(null);
     expect(f.controller.getSnapshot().dialog?.operation).toBe("save");
     expect(f.send).toHaveBeenCalledTimes(1); d.resolve(); await request;
+  });
+  it("in_process_route_captures_launch_identity_not_mutable_automatic_metadata", async () => {
+    let tabs: Tab[] = [{ id: "local", type: "terminal", title: "Auto", projectPath: "/p", createdAt: 7, agent: "pi" }];
+    const f = fixture(), save = vi.fn(async () => {});
+    const controller = new CustomTitleController(() => tabs, () => f.snap, f.send, save);
+    const target = captureCustomTitleTarget(tabs[0], f.snap)!;
+    expect(target).toMatchObject({ kind: "in-process", tabId: "local", createdAt: 7 });
+    controller.open(tabs[0], target);
+    tabs = [{ ...tabs[0], title: "New auto", sessionId: "discovered", lastActiveAt: 99, groupId: "g" }];
+    f.snap.status.local.configGeneration = 77; controller.invalidate();
+    expect(controller.getSnapshot().dialog).not.toBeNull();
+    await controller.submit("\u2003e\u0301 📝\ufeff\u2003");
+    expect(save).toHaveBeenCalledExactlyOnceWith(target, "e\u0301 📝\ufeff"); expect(f.send).not.toHaveBeenCalled();
+    expect(tabs[0]).toMatchObject({ title: "New auto", sessionId: "discovered" });
+    for (const change of [{ createdAt: 8 }, { agent: "codex" as const }, { shellMode: "raw" as const }, { shellId: "zsh" }, { projectPath: "/other" }, { terminal: "uuid" }, { host: "other" }]) {
+      expect(customTitleTargetMatches(target, { ...tabs[0], ...change }, f.snap)).toBe(false);
+    }
+  });
+  it.each(["closed", "replacement", "daemon"])("in_process_%s_before_submit_never_calls_local_or_daemon_writer", async change => {
+    let tabs: Tab[] = [{ id: "local", type: "terminal", title: "Auto", createdAt: 7 }];
+    const f = fixture(), save = vi.fn(); const c = new CustomTitleController(() => tabs, () => f.snap, f.send, save);
+    c.open(tabs[0]);
+    tabs = change === "closed" ? [] : [{ ...tabs[0], ...(change === "daemon" ? { terminal: "uuid" } : { createdAt: 8 }) }];
+    await c.submit("No"); expect(save).not.toHaveBeenCalled(); expect(f.send).not.toHaveBeenCalled(); expect(c.getSnapshot().dialog).toBeNull();
+  });
+  it("in_process_invalid_drafts_never_save_double_submit_is_one_and_late_error_cannot_revive", async () => {
+    const tab: Tab = { id: "local", type: "terminal", title: "Auto" }, f = fixture(), d = deferred();
+    const save = vi.fn().mockReturnValueOnce(d.promise);
+    const c = new CustomTitleController(() => [tab], () => f.snap, f.send, save); c.open(tab);
+    for (const value of ["", "\u2003", "📝".repeat(257), "name\u2028", "\tname", "name\x9f"]) await c.submit(value);
+    expect(save).not.toHaveBeenCalled();
+    const first = c.submit("📝".repeat(256)); await c.submit("Second"); expect(save).toHaveBeenCalledTimes(1);
+    c.dismiss(); d.reject(new Error("late failure")); await first;
+    expect(c.getSnapshot()).toEqual({ dialog: null, pending: false }); expect(f.send).not.toHaveBeenCalled();
   });
   it("validation_counts_scalars_and_uses_protocol_whitespace_not_BOM", () => {
     expect(customTitleError("📝".repeat(256))).toBeNull();
