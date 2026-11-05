@@ -1973,13 +1973,11 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 /* Only the outer attention ring moves; clipped glyph/image/background stay stationary. */
 .tab-attention-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .tab-attention-icon::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; pointer-events: none; }
-.tab-attention-working::after { border: 2px solid #ef921c; border-top-color: #ffe073; border-right-color: #ffba38; animation: tab-attention-rotate 1.2s steps(12, end) infinite; }
-.tab-bar[data-attention-motion-paused="true"] .tab-attention-working::after { animation-play-state: paused; }
+.tab-attention-working::after { border: 2px solid #ef921c; border-top-color: #ffe073; border-right-color: #ffba38; animation: none; transition: none; transform: rotate(var(--tab-attention-angle, 0deg)); }
 .tab-attention-unread::after { border: 2px solid var(--success); }
 .tab-attention-needs-you::after { border: 2px solid #e5a50a; }
-@keyframes tab-attention-rotate { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
-  .tab-attention-working::after { animation: none; }
+  .tab-attention-working::after { transform: none; }
 }
 
 /* Live Terminal inventory is independent of history/folder loading and collapse. */
