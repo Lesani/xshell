@@ -40,6 +40,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::TERM_COMPLETION_ATTENTION,
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
+    cap::DAEMON_DESKTOP_OWNED,
     cap::TERM_RELAUNCH,
     cap::LAUNCH_PREFIX,
     cap::AGENT_STATUS,
@@ -76,6 +77,9 @@ pub mod cap {
     /// `daemon.upgrade` (Desktop only).
     pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
     pub const DAEMON_UPGRADE_SELECTED: &str = "daemon.upgrade-selected";
+    /// Positive lifecycle ownership, not a blanket update prohibition: a Windows owner
+    /// may also support `DAEMON_UPGRADE_SELECTED`. Absence leaves ownership unknown.
+    pub const DAEMON_DESKTOP_OWNED: &str = "daemon.desktop-owned";
     /// `term.relaunch`.
     pub const TERM_RELAUNCH: &str = "term.relaunch";
     /// Launch prefixes in `term.open`.
@@ -156,6 +160,11 @@ pub const OPEN_INDETERMINATE: &str = "open-indeterminate:";
 /// ssh failures are recognized by ("No such file", "Connection refused").
 pub const NOT_RUNNING_MESSAGE: &str =
     "xshell is not running here; terminals are reachable only while xshell is open";
+
+/// The unchanged ordinary-upgrade refusal from a Desktop-owned Daemon, including legacy
+/// peers. Exact equality permits diagnosis without interpreting arbitrary remote errors.
+pub const DESKTOP_OWNED_UPGRADE_REFUSED: &str =
+    "xshell on this machine runs these terminals; update xshell there instead";
 
 #[cfg(test)]
 mod tests {

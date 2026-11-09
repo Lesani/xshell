@@ -861,6 +861,157 @@ pub(crate) mod tests {
         m.shutdown();
     }
 
+    /// A simulated Windows transport, but the real supervisor/Hello adoption, public
+    /// action, staging and selected RPC. No Windows machine or service is contacted.
+    #[cfg(unix)]
+    #[test]
+    fn desktop_owned_windows_selected_capability_preserves_update_authority() {
+        use crate::link::testpeer::{msg_frame, res_frame, terminals_frame};
+        use crate::status::{UpdateAction, UpdateUnavailable};
+        use crate::transport::sh_quote;
+        use xshell_protocol::msg::{encode_msg, ClientMsg, Hello, ServerMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let build = xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        for selected in [false, true] {
+            let mut caps = vec![xshell_protocol::cap::DAEMON_DESKTOP_OWNED.into()];
+            if selected {
+                caps.push(xshell_protocol::cap::DAEMON_UPGRADE_SELECTED.into());
+            }
+            let mut frames = msg_frame(&ServerMsg::Hello(Hello {
+                protocol: xshell_protocol::PROTOCOL,
+                version: "1.5.0".into(),
+                capabilities: caps,
+                build: None,
+            }));
+            frames.extend(terminals_frame(vec![]));
+            let hello = encode_msg(
+                &ClientMsg::Hello(Hello {
+                    protocol: xshell_protocol::PROTOCOL,
+                    version: "1.5.0".into(),
+                    capabilities: xshell_protocol::CAPABILITIES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    build: Some(build.clone()),
+                }),
+                None,
+            )
+            .unwrap();
+            let selected_request = encode_msg(
+                &ClientMsg::DaemonUpgradeSelected {
+                    version: "1.5.0".into(),
+                    build: build.clone(),
+                },
+                Some(1),
+            )
+            .unwrap();
+            let sent = dir.path().join("sent");
+            let received = dir.path().join("received");
+            let response = dir.path().join("response");
+            let staged = dir.path().join("staged");
+            std::fs::write(&sent, frames).unwrap();
+            std::fs::write(&response, res_frame(1, Ok(serde_json::Value::Null))).unwrap();
+            let connect = format!(
+                "cat {}; dd bs=1 count={} of={} 2>/dev/null; cat {}; exec sleep 1000",
+                sh_quote(sent.to_str().unwrap()),
+                hello.len() + selected_request.len(),
+                sh_quote(received.to_str().unwrap()),
+                sh_quote(response.to_str().unwrap())
+            );
+            struct NativeTransport {
+                commands: Arc<Mutex<Vec<String>>>,
+                connect: String,
+                staged: String,
+            }
+            impl TransportFactory for NativeTransport {
+                fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+                    struct T(Arc<Mutex<Vec<String>>>, String, String);
+                    impl Transport for T {
+                        fn command(&self, remote: &str) -> CommandSpec {
+                            self.0.lock().unwrap().push(remote.into());
+                            let script = if remote == "native --version" {
+                                r#"echo '{"name":"xshelld","version":"1.5.0","protocol":{"min":1,"max":1},"os":"windows","arch":"x86_64"}'"#.into()
+                            } else if remote.starts_with("native stage-build ") {
+                                format!("cat > {}", self.2)
+                            } else {
+                                assert_eq!(remote, "native connect");
+                                self.1.clone()
+                            };
+                            LocalShellTransport::default().command(&script)
+                        }
+                        fn describe(&self) -> String {
+                            "simulated Windows".into()
+                        }
+                    }
+                    Box::new(T(
+                        self.commands.clone(),
+                        self.connect.clone(),
+                        self.staged.clone(),
+                    ))
+                }
+            }
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let rec = Recorder::new();
+            let mut cfg = test_config(rec.clone());
+            cfg.desktop_build = Some(build.clone());
+            cfg.binaries = Arc::new(crate::install::testutil::Bytes(
+                b"PE fixture @@XSHELL-BUILD-V1:85ee920a1b2c:7@@".to_vec(),
+            ));
+            cfg.transports = Arc::new(NativeTransport {
+                commands: commands.clone(),
+                connect,
+                staged: sh_quote(staged.to_str().unwrap()),
+            });
+            let manager = Manager::new(cfg);
+            let mut config = test_host("h_aaaaaaaa", "windows-target");
+            config.daemon_command = Some("native".into());
+            manager.configure(vec![config]).unwrap();
+            let status = rec.wait_status(|s| s.status == StatusKind::BuildDiffers);
+            assert_eq!(status.daemon_build, None, "explicit unknown-build fixture");
+            assert_eq!(status.update_action, Some(UpdateAction::Replace));
+            assert_eq!(
+                status.update_unavailable,
+                (!selected).then_some(UpdateUnavailable::WindowsOwner)
+            );
+            let before = commands.lock().unwrap().len();
+            let (tx, rx) = std::sync::mpsc::channel();
+            manager
+                .host("h_aaaaaaaa")
+                .unwrap()
+                .upgrade(Box::new(move |r| {
+                    tx.send(r).unwrap();
+                }));
+            let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if selected {
+                result.unwrap();
+                let bytes = std::fs::read(&received).unwrap();
+                assert_eq!(&bytes[hello.len()..], selected_request);
+                assert_eq!(
+                    std::fs::read_to_string(&staged).unwrap(),
+                    "UEUgZml4dHVyZSBAQFhTSEVMTC1CVUlMRC1WMTo4NWVlOTIwYTFiMmM6N0BA"
+                );
+                assert!(commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.starts_with("native stage-build ")));
+            } else {
+                assert_eq!(result.unwrap_err().code, crate::HostErrorCode::Offline);
+                assert_eq!(commands.lock().unwrap().len(), before);
+            }
+            assert!(!commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("kill") || c.contains("sh -c") || c.contains("/selected")));
+            manager.shutdown();
+        }
+    }
+
     /// A Daemon that completes the handshake and hangs up at once, every time.
     #[cfg(unix)]
     #[test]

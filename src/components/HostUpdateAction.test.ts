@@ -24,7 +24,7 @@ describe("shared Host update action", () => {
   });
   it("has no operative update for an old Windows owner, even during reconnect", () => {
     for (const kind of ["build-differs", "reconnecting"] as const) {
-      const html = render({ status: kind, updateUnavailable: "old owner" });
+      const html = render({ status: kind, updateUnavailable: "windows-owner" });
       expect(html).toContain("first update and reopen xshell");
       expect(html).not.toContain("<button");
     }

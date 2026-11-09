@@ -69,13 +69,18 @@ async function click(selector: string) {
   await act(async () => { element!.click(); });
 }
 const banner = () => container.querySelector(".main-content > .host-update-banner");
-function expectNotice(host: HostConfig) {
+function expectNotice(host: HostConfig, owned = false) {
   // Soft assertions let the rest of the navigation controls execute on the RED tree.
   expect.soft(banner()?.textContent ?? "", `${host.name} notice in production App banner`).toContain(host.name);
-  expect.soft(banner()?.querySelector("button")?.textContent ?? "", `${host.name} replacement action`).toBe("Use this Desktop’s build");
+  if (owned) {
+    expect.soft(banner()?.textContent).toContain("different build of xshell");
+    expect.soft(banner()?.textContent).toContain(`Update xshell on ${host.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
+    expect.soft(banner()?.querySelector("button")).toBeNull();
+    expect.soft(container.querySelector(".host-confirm-panel")).toBeNull();
+  } else expect.soft(banner()?.querySelector("button")?.textContent ?? "", `${host.name} replacement action`).toBe("Use this Desktop’s build");
 }
 
-it("scopes the production App notice to the selected Remote Project, not stale Project context under other views", async () => {
+it("scopes production App update actions and Desktop-owned guidance to the selected Remote Project", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   // The updater's optional changelog fetch must not use the network.
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
@@ -149,7 +154,7 @@ it("scopes the production App notice to the selected Remote Project, not stale P
   // tree, isolating the omission to the Project navigation/wiring boundary.
   await click('[data-drag-id="remote-terminal-a"]');
   expect(banner()?.textContent).toContain(hostA.name);
-  expect(banner()?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
+  expectNotice(hostA);
 
   // A different Terminal overrides the retained Project A selection.
   await click('[data-drag-id="remote-terminal-b"]');
@@ -179,6 +184,29 @@ it("scopes the production App notice to the selected Remote Project, not stale P
 
   // Eligibility remains authoritative in the existing Host status / Action seam.
   await click(`[data-drop-path='${keyOf(projectA)}']`);
+  // A positively identified Desktop-owned target keeps build eligibility, but neither
+  // production surface may open a confirmation or invoke a native update.
+  for (const status of ["build-differs", "incompatible", "reconnecting"] as const) {
+    await act(async () => { registry.applyStatus({ ...eligibleStatus(hostA.id), status, updateUnavailable: "desktop-owned" }); });
+    expectNotice(hostA, true);
+    expect(banner()?.textContent).not.toContain("Windows");
+    hostUpdates.ask(hostA, registry.getStatus(hostA.id)!);
+    expect(hostUpdates.getSnapshot().confirmation).toBeNull();
+  }
+  // An old target's exact refusal stays visible, alongside ownership-specific guidance.
+  const legacyRefusal = "xshell on this machine runs these terminals; update xshell there instead";
+  await act(async () => { registry.applyStatus({ ...eligibleStatus(hostA.id), updateUnavailable: "desktop-owned", errorHint: "update-failed", lastError: legacyRefusal }); });
+  expect(banner()?.textContent).toContain(legacyRefusal);
+  await click('[aria-label="Settings"]');
+  const hostsTab = [...container.querySelectorAll<HTMLElement>(".settings-nav-item")].find(b => b.textContent === "Hosts");
+  expect(hostsTab).toBeDefined();
+  await act(async () => { hostsTab!.click(); });
+  const row = [...container.querySelectorAll(".host-row")].find(r => r.textContent?.includes(hostA.name));
+  expect.soft(row?.textContent).toContain(`Update xshell on ${hostA.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
+  expect.soft(row?.querySelector(".host-update-action button")).toBeNull();
+  await click(`[data-drop-path='${keyOf(projectB)}']`);
+  expectNotice(hostB);
+  await click(`[data-drop-path='${keyOf(projectA)}']`);
   const matching = eligibleStatus(hostA.id);
   await act(async () => {
     registry.applyStatus({ ...matching, status: "connected", updateAction: null, daemonBuild: matching.desktopBuild });
@@ -195,5 +223,6 @@ it("scopes the production App notice to the selected Remote Project, not stale P
   expect(banner()).toBeNull();
   // No replacement is invoked by navigation or rendering an eligible action.
   expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "host_upgrade")).toBe(false);
+  expect(vi.mocked(invoke).mock.calls.some(([command, args]) => command === "host_call" && /prepare|upgrade|update/.test(String((args as { method?: string })?.method)))).toBe(false);
   expect(unexpectedNativeCalls).toEqual([]);
 });
