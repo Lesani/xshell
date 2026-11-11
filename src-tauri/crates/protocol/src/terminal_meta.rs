@@ -64,6 +64,23 @@ pub fn normalize_custom_title_patch(
     }
 }
 
+/// Whether a Mobile may send a `term.update` of this shape (capability
+/// [`crate::cap::TERM_CUSTOM_TITLE_MOBILE`]): no session id, and `meta` holding exactly one
+/// key, [`CUSTOM_TITLE_KEY`], set to a string (rename) or null (clear). The value itself is
+/// validated afterwards like a Desktop's, by [`normalize_custom_title_patch`].
+pub fn is_mobile_custom_title_update(
+    session_id: Option<&str>,
+    meta: Option<&Map<String, Value>>,
+) -> bool {
+    let Some(meta) = meta else { return false };
+    session_id.is_none()
+        && meta.len() == 1
+        && matches!(
+            meta.get(CUSTOM_TITLE_KEY),
+            Some(Value::String(_) | Value::Null)
+        )
+}
+
 /// Stored records never contain null or a noncanonical custom name.
 pub fn validate_custom_title_record(meta: &Map<String, Value>) -> Result<(), CustomTitleError> {
     match meta.get(CUSTOM_TITLE_KEY) {
@@ -104,6 +121,37 @@ pub fn sanitize_restored_custom_title(meta: &mut Map<String, Value>) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mobile_custom_title_update_shape() {
+        let m = |v: Value| v.as_object().unwrap().clone();
+        for v in [json!("name"), json!(""), Value::Null] {
+            assert!(is_mobile_custom_title_update(
+                None,
+                Some(&m(json!({ CUSTOM_TITLE_KEY: v })))
+            ));
+        }
+        assert!(!is_mobile_custom_title_update(None, None));
+        assert!(!is_mobile_custom_title_update(
+            Some("sid"),
+            Some(&m(json!({"customTitle":"name"})))
+        ));
+        for bad in [
+            json!({}),
+            json!({"title":"name"}),
+            json!({"customTitle":"name","title":"x"}),
+            json!({"customTitle":"name","other":null}),
+            json!({"customTitle":7}),
+            json!({"customTitle":false}),
+            json!({"customTitle":["a"]}),
+            json!({"customTitle":{}}),
+        ] {
+            assert!(
+                !is_mobile_custom_title_update(None, Some(&m(bad.clone()))),
+                "{bad}"
+            );
+        }
+    }
 
     #[test]
     fn custom_title_normalization_and_scalar_limits() {

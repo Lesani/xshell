@@ -37,6 +37,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::CALL,
     cap::TERM,
     cap::TERM_CUSTOM_TITLE,
+    cap::TERM_CUSTOM_TITLE_MOBILE,
     cap::TERM_COMPLETION_ATTENTION,
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
@@ -73,6 +74,12 @@ pub mod cap {
     /// save: synced file and atomic replacement, plus parent-directory sync on Unix.
     /// An installed but unconfirmed save returns [`crate::CUSTOM_TITLE_NOT_DURABLE`].
     pub const TERM_CUSTOM_TITLE: &str = "term.custom-title";
+    /// A Mobile may rename a Terminal it sees: `term.update` with no session id and `meta`
+    /// holding only `customTitle` (string or null), see
+    /// [`crate::terminal_meta::is_mobile_custom_title_update`]. Validation, durable save,
+    /// errors and the resulting `terminals` broadcast are those of [`TERM_CUSTOM_TITLE`]. Any
+    /// other `term.update` from a Mobile, and one for a Terminal it does not see, is refused.
+    pub const TERM_CUSTOM_TITLE_MOBILE: &str = "term.custom-title.mobile";
     /// `daemon.upgrade` (Desktop only).
     pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
     pub const DAEMON_UPGRADE_SELECTED: &str = "daemon.upgrade-selected";
@@ -164,6 +171,7 @@ mod tests {
     #[test]
     fn capabilities_include_term_custom_title() {
         assert!(CAPABILITIES.contains(&cap::TERM_CUSTOM_TITLE));
+        assert!(CAPABILITIES.contains(&"term.custom-title.mobile"));
     }
 
     #[test]

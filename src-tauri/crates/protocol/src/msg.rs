@@ -85,8 +85,10 @@ pub enum ClientMsg {
     #[serde(rename = "term.close")]
     TermClose { terminal: Uuid },
     /// Patch metadata; null removes a key. Reserved `customTitle` is validated and durably
-    /// saved, including equal-value retries. It is refused on `term.open` and for Mobile.
-    /// See [`crate::terminal_meta`] and [`crate::CUSTOM_TITLE_NOT_DURABLE`].
+    /// saved, including equal-value retries. It is refused on `term.open`. A Mobile may send
+    /// only a rename or clear of a Terminal it sees (no session id, `meta` exactly
+    /// `{customTitle: string|null}`, capability `term.custom-title.mobile`); anything else is
+    /// refused for Mobile. See [`crate::terminal_meta`] and [`crate::CUSTOM_TITLE_NOT_DURABLE`].
     #[serde(rename = "term.update", rename_all = "camelCase")]
     TermUpdate {
         terminal: Uuid,

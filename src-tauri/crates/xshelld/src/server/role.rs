@@ -39,7 +39,7 @@ pub enum Role {
 /// The start of every refusal's `err`.
 pub(crate) const FORBIDDEN: &str = "forbidden for mobile";
 
-fn forbidden(what: impl std::fmt::Display) -> String {
+pub(crate) fn forbidden(what: impl std::fmt::Display) -> String {
     format!("{FORBIDDEN}: {what}")
 }
 
@@ -212,7 +212,18 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         | ClientMsg::TermResize { .. }
         | ClientMsg::TermClose { .. }
         | ClientMsg::TermRelaunch { .. } => Ok(()),
-        // Desktop bookkeeping; a session id set here would reach a later Relaunch.
+        // Otherwise Desktop bookkeeping: a session id set here would reach a later Relaunch.
+        // A Mobile may only rename or clear the name (`customTitle` alone); the Terminal is
+        // judged in `listed` under the update's lock, and the name like a Desktop's.
+        ClientMsg::TermUpdate {
+            session_id, meta, ..
+        } if xshell_protocol::terminal_meta::is_mobile_custom_title_update(
+            session_id.as_deref(),
+            meta.as_ref(),
+        ) =>
+        {
+            Ok(())
+        }
         ClientMsg::TermUpdate { .. } => Err(forbidden("term.update")),
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
         ClientMsg::DaemonUpgradeSelected { .. } => Err(forbidden("daemon.upgrade-selected")),
@@ -855,6 +866,39 @@ pub(crate) mod tests {
         ClientMsg::Call {
             method: method.into(),
             params,
+        }
+    }
+
+    #[test]
+    fn mobile_term_update_only_renames_or_clears() {
+        let ctx = HostCtx::with_home("/nonexistent-home", "/tmp");
+        let upd = |session_id: Option<&str>, meta: Option<Value>| ClientMsg::TermUpdate {
+            terminal: Uuid::new_v4(),
+            session_id: session_id.map(String::from),
+            meta: meta.map(|m| m.as_object().unwrap().clone()),
+        };
+        // Rename (the name is validated later, like a Desktop's) and clear.
+        for v in [json!("Review queue"), json!("  "), Value::Null] {
+            let m = upd(None, Some(json!({ "customTitle": v })));
+            assert_eq!(check(Role::Mobile, &ctx, &m), Ok(()));
+        }
+        for m in [
+            upd(None, None),
+            upd(None, Some(json!({}))),
+            upd(None, Some(json!({"title":"auto"}))),
+            upd(None, Some(json!({"customTitle":"n", "title":"auto"}))),
+            upd(None, Some(json!({"customTitle":"n", "other":null}))),
+            upd(None, Some(json!({"customTitle":7}))),
+            upd(None, Some(json!({"customTitle":["n"]}))),
+            upd(Some("-cx"), Some(json!({"customTitle":"n"}))),
+            upd(Some("-cx"), None),
+        ] {
+            assert_eq!(
+                check(Role::Mobile, &ctx, &m),
+                Err(forbidden("term.update")),
+                "{m:?}"
+            );
+            assert_eq!(check(Role::Desktop, &ctx, &m), Ok(()));
         }
     }
 

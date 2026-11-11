@@ -335,13 +335,44 @@ fn mobile_unknown_call_forbidden() {
 fn mobile_refuses_term_update_desktop_updates() {
     let mut e = env();
     let t = e.desk_open(e.claude());
-    let upd = ClientMsg::TermUpdate {
-        terminal: t,
-        session_id: Some("-cx".into()),
-        meta: None,
-    };
-    refused(e.mob.request(&upd));
-    assert_eq!(e.desk.request(&upd), Ok(Value::Null));
+    // Anything but a rename (`mobile_renames_and_clears_agents_it_sees_not_shells`).
+    let mut title = serde_json::Map::new();
+    title.insert("title".into(), json!("auto"));
+    for (session_id, meta) in [(Some("-cx".to_string()), None), (None, Some(title))] {
+        let upd = ClientMsg::TermUpdate {
+            terminal: t,
+            session_id,
+            meta,
+        };
+        refused(e.mob.request(&upd));
+        assert_eq!(e.desk.request(&upd), Ok(Value::Null));
+    }
+}
+
+#[test]
+fn mobile_rename_refused_when_capability_hidden() {
+    let h = TestHome::new();
+    let cwd = h.project("app");
+    claude_history(&h, &cwd, SID);
+    let fake = Fake::in_dir(&cwd);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let srv = start(&h, |c| {
+        c.hide_capabilities
+            .push(xshell_protocol::cap::TERM_CUSTOM_TITLE_MOBILE.into())
+    });
+    let s = srv.connect_in_process(Role::Mobile).unwrap();
+    let mut mob = Client::from_io(s.try_clone().unwrap(), s);
+    assert!(!mob
+        .hello(range(1, 1))
+        .0
+        .capabilities
+        .iter()
+        .any(|c| c == xshell_protocol::cap::TERM_CUSTOM_TITLE_MOBILE));
+    let mut desk = Client::in_process(&srv, Role::Desktop);
+    let t = Uuid::new_v4();
+    desk.open(t, claude_spec(&cwd, Some(SID)));
+    refused(mob.request(&name_msg(t, json!("name"))));
+    assert_eq!(desk.request(&name_msg(t, json!("name"))), Ok(Value::Null));
 }
 
 #[test]
@@ -1164,40 +1195,113 @@ fn mobile_answer_refused_for_hidden_terminal() {
     }
 }
 
+fn name_msg(t: Uuid, v: Value) -> ClientMsg {
+    ClientMsg::TermUpdate {
+        terminal: t,
+        session_id: None,
+        meta: Some(json!({ "customTitle": v }).as_object().unwrap().clone()),
+    }
+}
+
+fn named(list: &[xshell_protocol::msg::TerminalInfo], t: Uuid, name: Option<&str>) -> bool {
+    list.iter()
+        .any(|i| i.terminal == t && i.meta.get("customTitle").and_then(Value::as_str) == name)
+}
+
+/// The custom name of `t` in the saved state file.
+fn saved_name(h: &TestHome, t: Uuid) -> Option<String> {
+    h.state_json()["terminals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["terminal"] == json!(t.to_string()))
+        .unwrap_or_else(|| panic!("{t} saved"))["meta"]["customTitle"]
+        .as_str()
+        .map(String::from)
+}
+
 #[test]
-fn mobile_cannot_write_custom_title_but_observes_named_agents_not_shells() {
+fn mobile_renames_and_clears_agents_it_sees_not_shells() {
+    use xshell_protocol::terminal_meta::{normalize_custom_title, CustomTitleError};
     let mut e = env();
     let agent = e.desk_open(e.claude());
     let shell = e.desk_open(e.shell());
-    for t in [agent, shell] {
-        e.desk
-            .request(&ClientMsg::TermUpdate {
-                terminal: t,
-                session_id: None,
-                meta: Some(
-                    json!({"customTitle":"Shared name"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            })
-            .unwrap();
-        for v in [json!("Mobile name"), Value::Null] {
-            refused(e.mob.request(&ClientMsg::TermUpdate {
-                terminal: t,
-                session_id: None,
-                meta: Some(json!({"customTitle":v}).as_object().unwrap().clone()),
-            }));
-        }
+    assert_eq!(
+        e.desk.request(&name_msg(shell, json!("Shared name"))),
+        Ok(Value::Null)
+    );
+    // A Mobile renames an agent Terminal: same normalization, durable save and broadcast as a
+    // Desktop's, seen by both.
+    assert_eq!(
+        e.mob.request(&name_msg(agent, json!("  Phone  name 🦀 "))),
+        Ok(Value::Null)
+    );
+    e.desk
+        .terminals_where(|l| named(l, agent, Some("Phone  name 🦀")));
+    e.mob
+        .terminals_where(|l| named(l, agent, Some("Phone  name 🦀")));
+    assert_eq!(saved_name(&e.h, agent).as_deref(), Some("Phone  name 🦀"));
+    // Clear, and an equal-value retry of the clear.
+    for _ in 0..2 {
+        assert_eq!(
+            e.mob.request(&name_msg(agent, Value::Null)),
+            Ok(Value::Null)
+        );
     }
-    let list = e.mob.terminals_where(|l| {
-        l.iter().any(|i| {
-            i.terminal == agent && i.meta.get("customTitle") == Some(&json!("Shared name"))
-        })
-    });
+    e.desk.terminals_where(|l| named(l, agent, None));
+    assert_eq!(saved_name(&e.h, agent), None);
+    // Invalid names: the Desktop's errors, nothing changed.
+    assert_eq!(
+        e.mob.request(&name_msg(agent, json!("kept"))),
+        Ok(Value::Null)
+    );
+    for (bad, err) in [
+        ("  ".to_string(), CustomTitleError::Blank),
+        ("a\nb".to_string(), CustomTitleError::Controls),
+        ("x".repeat(257), CustomTitleError::TooLong),
+    ] {
+        assert_eq!(normalize_custom_title(&bad), Err(err));
+        let m = e.mob.request(&name_msg(agent, json!(bad))).unwrap_err();
+        assert_eq!(m, err.to_string());
+        assert_eq!(e.desk.request(&name_msg(agent, json!(bad))).unwrap_err(), m);
+    }
+    assert_eq!(saved_name(&e.h, agent).as_deref(), Some("kept"));
+    // Any other shape stays refused: other keys, the automatic title, a session id, a
+    // non-string value.
+    for (sid, meta) in [
+        (None, json!({"customTitle":"x", "title":"y"})),
+        (None, json!({"title":"y"})),
+        (None, json!({"customTitle":7})),
+        (Some("-cx"), json!({"customTitle":"x"})),
+    ] {
+        refused(e.mob.request(&ClientMsg::TermUpdate {
+            terminal: agent,
+            session_id: sid.map(String::from),
+            meta: Some(meta.as_object().unwrap().clone()),
+        }));
+    }
+    assert_eq!(saved_name(&e.h, agent).as_deref(), Some("kept"));
+    // A Terminal the Mobile does not see: the refusal its attach gets, the Desktop's name kept.
+    let attach = e
+        .mob
+        .request(&ClientMsg::TermAttach { terminal: shell })
+        .unwrap_err();
+    for v in [json!("Mobile name"), Value::Null] {
+        let r = e.mob.request(&name_msg(shell, v));
+        assert_eq!(r, Err(attach.clone()));
+        refused(r);
+    }
+    assert_eq!(saved_name(&e.h, shell).as_deref(), Some("Shared name"));
+    // An unknown one: what any other request about it gets.
+    let gone = Uuid::new_v4();
+    assert_eq!(
+        e.mob.request(&name_msg(gone, json!("x"))),
+        Err(format!("unknown terminal {gone}"))
+    );
+    // The Mobile is never told about the shell or its name.
+    let list = e.mob.terminals_where(|l| named(l, agent, Some("kept")));
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].terminal, agent);
-    assert_eq!(list[0].meta["customTitle"], "Shared name");
     let before = e.h.state_ids();
     for v in [json!("Mobile name"), Value::Null, json!(7)] {
         let mut msg = open_msg(Uuid::new_v4(), e.claude());
