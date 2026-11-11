@@ -177,7 +177,7 @@ A **Desktop**'s personal arrangement of pinned **Projects** into folders, with t
 - A **Remote Host** joins its **Desktop**'s **Ring** automatically when that **Desktop** installs its **Daemon** over SSH; a headless **Daemon** can also pair with `xshelld pair`
 - Standalone headless `xshelld pair` uses the same eight-word **Device Code** format and enrolls only the **Daemon**; its code is valid only while the command runs, for at most 10 minutes, and is invalidated on exit. The settings-screen lifetime rule applies to GUI **Pairing**
 - An unpaired computer **Desktop** offers a **Device Code** to join an existing **Ring** on Windows, Linux, and macOS; QR-based approval by a **Mobile** is planned after the **Device Code** flow
-- **Pairing** controls and an optional custom **Relay** URL belong in the **Desktop**'s Hosts settings; a configured URL is used for **Pairing**, otherwise the **Hosted Relay** is used
+- **Pairing** controls (Pair a phone) and an optional custom **Relay** URL belong in the **Desktop**'s Mobile settings; a configured URL is used for **Pairing**, otherwise the **Hosted Relay** is used
 - An unpaired computer **Desktop** offers explicit Create ring and Join ring actions in Hosts; no **Ring** is created automatically, and normal local use requires neither action
 - Join ring opens the **Device Code** screen; Create ring enrolls this **Computer Device** as the first full member
 - **Pairing** does not discover other **Relays** or provide a special self-hosted setup flow; a code offered on another **Relay** produces the normal device-not-found result
