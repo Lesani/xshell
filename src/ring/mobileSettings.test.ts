@@ -3,7 +3,7 @@ import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTim
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
-const HOSTED = "wss://xshell-relay-hosted.m-roither.workers.dev";
+const HOSTED = "wss://relay.xshell.sh";
 
 function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
@@ -94,11 +94,11 @@ describe("quota notice (#42)", () => {
 
 describe("connection line", () => {
   it("says how the Relay connection stands", () => {
-    expect(connectionLine(status())).toBe("Connected to xshell-relay-hosted.m-roither.workers.dev");
+    expect(connectionLine(status())).toBe("Connected to relay.xshell.sh");
     expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
-    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to xshell-relay-hosted.m-roither.workers.dev…");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach xshell-relay-hosted.m-roither.workers.dev. Retrying in 4s");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach xshell-relay-hosted.m-roither.workers.dev. Retrying in 1s");
+    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to relay.xshell.sh…");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach relay.xshell.sh. Retrying in 4s");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach relay.xshell.sh. Retrying in 1s");
     expect(connectionLine(status({ connection: "stopped" }))).toBe(fmt("mobile.conn.stopped"));
     expect(connectionLine(status({ connection: "off", enabled: false }))).toBeNull();
     expect(connectionLine(status({ connection: "other-window" }))).toBe("Another xshell window manages the connection to your devices.");

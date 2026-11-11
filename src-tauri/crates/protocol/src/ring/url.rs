@@ -7,9 +7,9 @@ use super::RingId;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// The Hosted Relay, preset when a Ring is created and the default of `xshelld pair`. Its
-/// workers.dev address for now; `wss://relay.xshell.sh` once xshell.sh is on Cloudflare.
-pub const HOSTED_RELAY_URL: &str = "wss://xshell-relay-hosted.m-roither.workers.dev";
+/// The Hosted Relay, preset when a Ring is created and the default of `xshelld pair`:
+/// relay.xshell.sh, routed to the xshell-relay-hosted Worker via Cloudflare for SaaS.
+pub const HOSTED_RELAY_URL: &str = "wss://relay.xshell.sh";
 
 /// A Roster's `relayUrl` is at most this long.
 pub const MAX_RELAY_URL_LEN: usize = 512;

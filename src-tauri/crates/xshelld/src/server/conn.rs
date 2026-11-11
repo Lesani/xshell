@@ -47,6 +47,8 @@ pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
         xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
+        // A Mobile rename is a custom-name update: never without the base capability.
+        "term.custom-title.mobile" => !offered(cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE),
         _ => false,
     };
     !off && !cfg.hide_capabilities.iter().any(|h| h == c)
@@ -551,6 +553,22 @@ impl Conn {
                 session_id,
                 mut meta,
             } => {
+                // `role::check` let a Mobile's rename through; a Daemon told to hide the
+                // capability refuses it as before.
+                debug_assert!(
+                    self.role != Role::Mobile
+                        || xshell_protocol::terminal_meta::is_mobile_custom_title_update(
+                            session_id.as_deref(),
+                            meta.as_ref(),
+                        ),
+                    "role::check admits only a Mobile rename"
+                );
+                if self.role == Role::Mobile
+                    && !offered(&d.cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE_MOBILE)
+                {
+                    reply(&self.ob, id, Err(role::forbidden("term.update")));
+                    return;
+                }
                 let touched = match meta
                     .as_mut()
                     .map(xshell_protocol::terminal_meta::normalize_custom_title_patch)
@@ -563,9 +581,10 @@ impl Conn {
                     }
                 };
                 let reg = d.reg.lock().unwrap();
-                let r = match reg.terminals.get(&terminal) {
-                    None => Err(format!("unknown terminal {terminal}")),
-                    Some(t) => match (session_id.as_deref(), t.agent_session()) {
+                // Lookup and visibility on one lock: the instance judged is the one updated.
+                let r = match role::listed(&reg, self.role, &terminal) {
+                    Err(e) => Err(e),
+                    Ok(t) => match (session_id.as_deref(), t.agent_session()) {
                         // The agent's own report wins: an update naming another session is
                         // refused as a whole, its metadata (a wrong session's title) too.
                         (Some(s), Some(a)) if s != a => Err(format!(
