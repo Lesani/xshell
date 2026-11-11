@@ -3,7 +3,9 @@
 //! remote shell (ADR-0004): it may open, attach to, type into, resize, close and Relaunch
 //! agent Terminals and read session data, but never open a shell Terminal, pass a shell
 //! command or launch prefix, use the file, git or host-probe methods of `call`, edit a
-//! Terminal's record or upgrade the Daemon.
+//! Terminal's record (beyond setting or clearing the custom name of an agent Terminal it
+//! sees: `term.update` with `customTitle` alone, capability `term.custom-title.mobile`) or
+//! upgrade the Daemon.
 //!
 //! Message-level rules run in [`check`], before anything is looked up or locked. Rules about a
 //! Terminal run in [`listed`], on the exact instance the handler then acts on, under the same

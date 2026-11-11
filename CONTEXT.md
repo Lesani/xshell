@@ -64,7 +64,8 @@ A **Desktop**'s view of one **Terminal**. A custom Tab name belongs to the ownin
 **Desktops** and **Mobile**. For an in-process Local Host Terminal, the **Desktop**
 owns the custom name in its saved Tabs; it survives existing eligible session restore
 and is not shared until successfully transferred to a Daemon. It overrides presentation only: the automatic title and
-agent session history remain independent. Only a computer **Desktop** may set or clear it.
+agent session history remain independent. A computer **Desktop** may set or clear it on
+any Terminal; a **Mobile** only on the agent Terminals it sees, and nothing else in the record.
 
 **Attach**:
 To bind a **Tab** to a live **Terminal** and replay the output it has not yet shown.

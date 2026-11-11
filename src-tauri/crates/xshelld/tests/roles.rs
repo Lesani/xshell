@@ -350,6 +350,25 @@ fn mobile_refuses_term_update_desktop_updates() {
 }
 
 #[test]
+fn mobile_rename_capability_needs_the_custom_title_capability() {
+    use xshell_protocol::cap::{TERM_CUSTOM_TITLE, TERM_CUSTOM_TITLE_MOBILE};
+    let caps = |hide: Option<&str>| {
+        let h = TestHome::new();
+        let srv = start(&h, |c| c.hide_capabilities.extend(hide.map(String::from)));
+        let s = srv.connect_in_process(Role::Mobile).unwrap();
+        let mut c = Client::from_io(s.try_clone().unwrap(), s);
+        c.hello(range(1, 1)).0.capabilities
+    };
+    let all = caps(None);
+    assert!(all.iter().any(|c| c == TERM_CUSTOM_TITLE_MOBILE), "{all:?}");
+    let base_hidden = caps(Some(TERM_CUSTOM_TITLE));
+    assert!(
+        !base_hidden.iter().any(|c| c == TERM_CUSTOM_TITLE_MOBILE),
+        "{base_hidden:?}"
+    );
+}
+
+#[test]
 fn mobile_rename_refused_when_capability_hidden() {
     let h = TestHome::new();
     let cwd = h.project("app");
@@ -1203,9 +1222,15 @@ fn name_msg(t: Uuid, v: Value) -> ClientMsg {
     }
 }
 
+/// Whether `t` is listed with custom name `name`; `None`: listed without the key at all.
 fn named(list: &[xshell_protocol::msg::TerminalInfo], t: Uuid, name: Option<&str>) -> bool {
-    list.iter()
-        .any(|i| i.terminal == t && i.meta.get("customTitle").and_then(Value::as_str) == name)
+    list.iter().any(|i| {
+        i.terminal == t
+            && match name {
+                Some(n) => i.meta.get("customTitle") == Some(&json!(n)),
+                None => !i.meta.contains_key("customTitle"),
+            }
+    })
 }
 
 /// The custom name of `t` in the saved state file.
@@ -1226,10 +1251,30 @@ fn mobile_renames_and_clears_agents_it_sees_not_shells() {
     let mut e = env();
     let agent = e.desk_open(e.claude());
     let shell = e.desk_open(e.shell());
+    let wrapped = e.desk_open(wrapped(&e));
+    // A name the Desktop sets on an agent reaches the Mobile's list, and so does its clear.
     assert_eq!(
-        e.desk.request(&name_msg(shell, json!("Shared name"))),
+        e.desk.request(&name_msg(agent, json!("Desk name"))),
         Ok(Value::Null)
     );
+    let list = e
+        .mob
+        .terminals_where(|l| named(l, agent, Some("Desk name")));
+    let info = list.iter().find(|i| i.terminal == agent).unwrap();
+    assert_eq!(info.meta["customTitle"], "Desk name");
+    assert_eq!(
+        e.desk.request(&name_msg(agent, Value::Null)),
+        Ok(Value::Null)
+    );
+    let list = e.mob.terminals_where(|l| named(l, agent, None));
+    let info = list.iter().find(|i| i.terminal == agent).unwrap();
+    assert!(!info.meta.contains_key("customTitle"), "{:?}", info.meta);
+    for t in [shell, wrapped] {
+        assert_eq!(
+            e.desk.request(&name_msg(t, json!("Shared name"))),
+            Ok(Value::Null)
+        );
+    }
     // A Mobile renames an agent Terminal: same normalization, durable save and broadcast as a
     // Desktop's, seen by both.
     assert_eq!(
@@ -1281,17 +1326,20 @@ fn mobile_renames_and_clears_agents_it_sees_not_shells() {
         }));
     }
     assert_eq!(saved_name(&e.h, agent).as_deref(), Some("kept"));
-    // A Terminal the Mobile does not see: the refusal its attach gets, the Desktop's name kept.
-    let attach = e
-        .mob
-        .request(&ClientMsg::TermAttach { terminal: shell })
-        .unwrap_err();
-    for v in [json!("Mobile name"), Value::Null] {
-        let r = e.mob.request(&name_msg(shell, v));
-        assert_eq!(r, Err(attach.clone()));
-        refused(r);
+    // Terminals the Mobile does not see (a shell, an agent wrapped in a shell): the refusal
+    // its attach gets, the Desktop's name kept.
+    for t in [shell, wrapped] {
+        let attach = e
+            .mob
+            .request(&ClientMsg::TermAttach { terminal: t })
+            .unwrap_err();
+        for v in [json!("Mobile name"), Value::Null] {
+            let r = e.mob.request(&name_msg(t, v));
+            assert_eq!(r, Err(attach.clone()));
+            refused(r);
+        }
+        assert_eq!(saved_name(&e.h, t).as_deref(), Some("Shared name"));
     }
-    assert_eq!(saved_name(&e.h, shell).as_deref(), Some("Shared name"));
     // An unknown one: what any other request about it gets.
     let gone = Uuid::new_v4();
     assert_eq!(

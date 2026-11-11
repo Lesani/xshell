@@ -47,6 +47,8 @@ pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
         }
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
+        // A Mobile rename is a custom-name update: never without the base capability.
+        "term.custom-title.mobile" => !offered(cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE),
         _ => false,
     };
     !off && !cfg.hide_capabilities.iter().any(|h| h == c)
@@ -553,6 +555,14 @@ impl Conn {
             } => {
                 // `role::check` let a Mobile's rename through; a Daemon told to hide the
                 // capability refuses it as before.
+                debug_assert!(
+                    self.role != Role::Mobile
+                        || xshell_protocol::terminal_meta::is_mobile_custom_title_update(
+                            session_id.as_deref(),
+                            meta.as_ref(),
+                        ),
+                    "role::check admits only a Mobile rename"
+                );
                 if self.role == Role::Mobile
                     && !offered(&d.cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE_MOBILE)
                 {
