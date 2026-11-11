@@ -177,3 +177,11 @@ drops envelopes from senders not in its head).
 A Daemon wakes a Mobile through the Push Gateway with a payload sealed to that Mobile's
 seal key, registered over the session (`push.register`). The registration, the sealed
 payload, the freshness rule and the limits are in `PUSH.md`.
+
+Format-v2 membership does not add another session protocol. Computer identities keep
+separate existing keys/Noise sessions. Whole-unit removal disconnects both member
+keys. Independently verified terminal activity can also change effective authority
+without rewriting the signed head: `RosterChain::authorized_member`, same-head
+Connector evidence merging and `Sessions::sweep_chain` fence pending/live sessions.
+The client refuses traffic to/from a terminal unit it has learned about; unseen
+activity cannot be inferred from presence alone. See RELAY.md's v2 substrate.

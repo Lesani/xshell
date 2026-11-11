@@ -1767,6 +1767,16 @@ impl Conn {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        if candidate.iter().any(|r| r.roster().v == 2) {
+            self.error(
+                ErrorCode::Unsupported,
+                None,
+                None,
+                Some("membership-v2 requires workerd"),
+            );
+            self.close(close::REFUSED);
+            return;
+        }
         let mut rings = self.shared.rings.lock().unwrap_or_else(|e| e.into_inner());
         // The candidate: a full chain for a new Ring, or an extension of the stored head.
         let result = match rings.get(&ring) {
@@ -1934,6 +1944,18 @@ impl Conn {
             return;
         }
         match frame {
+            ClientFrame::ActivityKey { id }
+            | ClientFrame::ActivityGet { id }
+            | ClientFrame::ActivityPreview { id, .. }
+            | ClientFrame::LeaveSync { id, .. }
+            | ClientFrame::LeavePut { id, .. } => {
+                self.error(
+                    ErrorCode::Unsupported,
+                    Some(id),
+                    None,
+                    Some("membership-v2 requires the workerd contract target"),
+                );
+            }
             ClientFrame::Env { to, payload } => {
                 if self.shared.recording.load(Ordering::Acquire) {
                     let bytes = super::super::b64::decode(&payload).unwrap_or_default();
@@ -1996,6 +2018,15 @@ impl Conn {
                         return;
                     }
                 };
+                if r.roster().v == 2 {
+                    self.error(
+                        ErrorCode::Unsupported,
+                        Some(id),
+                        None,
+                        Some("membership-v2 requires workerd"),
+                    );
+                    return;
+                }
                 let mut rings = self.shared.rings.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(s) = rings.get_mut(&ring) else {
                     return;

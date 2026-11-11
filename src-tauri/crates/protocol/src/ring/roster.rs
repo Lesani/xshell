@@ -48,7 +48,7 @@ pub struct Member {
     pub noise_key: NoiseKey,
     /// Unix seconds.
     pub added_at: u64,
-    /// Fields from newer versions, kept so a re-signed Roster does not drop them.
+    /// Legacy v1 extensions are retained; v2 refuses unknown member fields.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -70,7 +70,7 @@ impl Member {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Roster {
-    /// Format version, always 1.
+    /// Signed format: legacy 1, or strict membership format 2.
     pub v: u32,
     pub ring_id: RingId,
     /// 1 for the genesis version, then +1 per change.
@@ -79,7 +79,7 @@ pub struct Roster {
     pub prev: Option<String>,
     /// The Ring's one Relay.
     pub relay_url: String,
-    /// Who signed this version; a Desktop of the previous version (of this one, for v1).
+    /// The signer; v1 requires a previous Desktop, v2 checks the typed operation scope.
     pub signed_by: SignKey,
     /// Unix seconds.
     pub issued_at: u64,
@@ -231,8 +231,11 @@ fn check_int(what: &str, n: u64) -> Result<(), RosterError> {
 impl Roster {
     /// The rules every version must meet on its own.
     pub fn validate(&self) -> Result<(), RosterError> {
-        if self.v != 1 {
+        if self.v != 1 && self.v != 2 {
             return Err(invalid("unsupported roster format"));
+        }
+        if self.v == 2 && (self.extra.len() != 1 || !self.extra.contains_key("membership")) {
+            return Err(invalid("unknown or missing v2 field"));
         }
         if self.version == 0 {
             return Err(invalid("version must be at least 1"));
@@ -243,7 +246,7 @@ impl Roster {
             b64::decode_array::<32>(prev).map_err(|_| invalid("prev is not a SHA-256"))?;
         }
         RelayUrl::parse(&self.relay_url).map_err(|e| invalid(e.to_string()))?;
-        if self.members.is_empty() || self.members.len() > MAX_MEMBERS {
+        if (self.v == 1 && self.members.is_empty()) || self.members.len() > MAX_MEMBERS {
             return Err(invalid("a roster has 1 to 64 members"));
         }
         let mut signs = HashSet::new();
@@ -258,8 +261,14 @@ impl Roster {
                 return Err(invalid("duplicate noiseKey"));
             }
         }
-        if !self.members.iter().any(|m| m.role == Role::Desktop) {
+        if self.v == 1 && !self.members.iter().any(|m| m.role == Role::Desktop) {
             return Err(invalid("a roster needs at least one desktop"));
+        }
+        if self.v == 2 {
+            if self.members.iter().any(|m| !m.extra.is_empty()) {
+                return Err(invalid("unknown v2 member field"));
+            }
+            self.membership()?.validate(self)?;
         }
         Ok(())
     }
@@ -274,15 +283,21 @@ impl Roster {
     pub fn sign(&self, signer: &dyn Signer) -> Result<SignedRoster, RingError> {
         let json = serde_json::to_vec(self).map_err(|e| RingError::Invalid(e.to_string()))?;
         let payload = b64::encode(&json);
-        let sig = signer.sign(&signed_bytes(&payload))?;
-        let token = format!("{ROSTER_PREFIX}{payload}.{}", b64::encode(&sig));
+        let sig = signer.sign(&signed_bytes(&payload, self.v))?;
+        let prefix = if self.v == 2 { "xro2." } else { ROSTER_PREFIX };
+        let token = format!("{prefix}{payload}.{}", b64::encode(&sig));
         Ok(SignedRoster::parse(&token)?)
     }
 }
 
-fn signed_bytes(payload_part: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(ROSTER_CONTEXT.len() + payload_part.len());
-    v.extend_from_slice(ROSTER_CONTEXT.as_bytes());
+fn signed_bytes(payload_part: &str, format: u32) -> Vec<u8> {
+    let context = if format == 2 {
+        "xshell-roster-v2\n"
+    } else {
+        ROSTER_CONTEXT
+    };
+    let mut v = Vec::with_capacity(context.len() + payload_part.len());
+    v.extend_from_slice(context.as_bytes());
     v.extend_from_slice(payload_part.as_bytes());
     v
 }
@@ -323,9 +338,13 @@ impl SignedRoster {
             return Err(RosterError::TooLarge);
         }
         let malformed = |m: &str| RosterError::Malformed(m.to_string());
-        let rest = token
-            .strip_prefix(ROSTER_PREFIX)
-            .ok_or_else(|| malformed("no xro1. prefix"))?;
+        let (rest, format) = if let Some(rest) = token.strip_prefix(ROSTER_PREFIX) {
+            (rest, 1)
+        } else if let Some(rest) = token.strip_prefix("xro2.") {
+            (rest, 2)
+        } else {
+            return Err(malformed("unsupported roster prefix"));
+        };
         let (payload_part, sig_part) = rest
             .split_once('.')
             .ok_or_else(|| malformed("not payload.signature"))?;
@@ -348,9 +367,19 @@ impl SignedRoster {
         }
         let roster: Roster = serde_json::from_value(Value::Object(obj))
             .map_err(|e| RosterError::Malformed(e.to_string()))?;
+        if roster.v != format {
+            return Err(if format == 2 {
+                malformed("prefix/format mismatch")
+            } else {
+                invalid("prefix/format mismatch")
+            });
+        }
         roster.validate()?;
-        if !verify(&roster.signed_by, &signed_bytes(payload_part), &sig) {
+        if !verify(&roster.signed_by, &signed_bytes(payload_part, format), &sig) {
             return Err(RosterError::BadSignature);
+        }
+        if roster.v == 2 {
+            super::membership::verify_embedded_signatures(&roster)?;
         }
         Ok(SignedRoster {
             token: token.to_string(),
@@ -392,6 +421,11 @@ impl SignedRoster {
         now: u64,
         edit: impl FnOnce(&mut RosterDraft),
     ) -> Result<Self, RingError> {
+        if self.roster.v != 1 {
+            return Err(RingError::Invalid(
+                "v2 requires a typed membership change".into(),
+            ));
+        }
         let mut draft = RosterDraft {
             relay_url: self.roster.relay_url.clone(),
             members: self.roster.members.clone(),

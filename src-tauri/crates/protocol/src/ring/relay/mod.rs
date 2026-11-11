@@ -22,12 +22,14 @@ pub mod contract;
 #[cfg(feature = "test-relay")]
 pub mod fake_gateway;
 #[cfg(feature = "test-relay")]
+pub mod membership_contract;
+#[cfg(feature = "test-relay")]
 pub mod test_relay;
 
 #[cfg(feature = "relay-client")]
 pub use client::{
-    ChainPin, MemberStatus, PushRequest, RingClient, RingClientConfig, RingEvents, RingLimits,
-    RingTimeouts, Ticket,
+    ActivityReport, ChainPin, DepartureClient, DepartureStatus, MemberStatus, PolicyPreview,
+    PushRequest, RingClient, RingClientConfig, RingEvents, RingLimits, RingTimeouts, Ticket,
 };
 #[cfg(feature = "relay-client")]
 pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState};

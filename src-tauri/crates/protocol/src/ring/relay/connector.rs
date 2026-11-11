@@ -208,13 +208,16 @@ pub(super) fn lock(m: &Mutex<St>) -> MutexGuard<'_, St> {
 
 /// The chain `theirs` makes of `ours` if it is newer and extends it.
 pub(super) fn merge(ours: &RosterChain, theirs: &RosterChain) -> Option<RosterChain> {
-    if theirs.ring_id() != ours.ring_id() || theirs.head().version() <= ours.head().version() {
+    if theirs.ring_id() != ours.ring_id() {
         return None;
     }
-    match ours.extended(theirs.since(ours.head().version())) {
-        Ok((c, a)) if a.added > 0 => Some(c),
-        _ => None,
-    }
+    let mut result = if theirs.head().version() > ours.head().version() {
+        ours.extended(theirs.since(ours.head().version())).ok()?.0
+    } else {
+        ours.clone()
+    };
+    let learned = result.merge_terminal_from(theirs);
+    (learned || result.head().version() > ours.head().version()).then_some(result)
 }
 
 /// The newest version of `chain` that names `relay`.
@@ -1208,6 +1211,75 @@ mod tests {
     use crate::ring::relay::test_relay::{TestRelay, TestRelayOptions};
     use crate::ring::relay::wire::{ClientFrame, RelayFrame};
     use std::sync::mpsc;
+
+    #[test]
+    fn same_head_terminal_evidence_merges_without_rewriting_roster() {
+        use crate::ring::{
+            activity::{policy_hash, ActivityEvidence, UnitActivity},
+            b64,
+            membership::{Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange},
+            DeviceKeys,
+        };
+        let keys = DeviceKeys::from_seeds(&[1; 32], &[2; 32]);
+        let source = DeviceKeys::from_seeds(&[3; 32], &[4; 32]);
+        let g = SignedRoster::genesis(
+            &keys,
+            keys.noise_key(),
+            "retained",
+            "ws://127.0.0.1:8787",
+            100,
+        )
+        .unwrap();
+        let mut r = g.roster().clone();
+        r.v = 2;
+        r.version = 2;
+        r.prev = Some(g.hash());
+        r.issued_at = 101;
+        let unit = Enrollment {
+            id: b64::encode(&[7; 32]),
+            kind: EnrollmentKind::LegacyDesktop,
+            members: vec![keys.sign_key()],
+            enrolled_at: 101,
+        };
+        let policy = RingPolicy {
+            inactivity_seconds: Some(30),
+            activity_key: source.sign_key(),
+        };
+        r.set_membership(&Membership {
+            enrollments: vec![unit.clone()],
+            retired: vec![],
+            policy: policy.clone(),
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let u = r.sign(&keys).unwrap();
+        let ours = RosterChain::from_chain(vec![g, u]).unwrap();
+        let mut learned = ours.clone();
+        let report = ActivityEvidence {
+            ring_id: ours.ring_id().clone(),
+            relay_url: r.relay_url,
+            policy_head_hash: ours.head().hash(),
+            policy_hash: policy_hash(&policy),
+            observed_at: 140,
+            units: vec![UnitActivity {
+                enrollment_id: unit.id,
+                member_keys: unit.members,
+                online: false,
+                last_active: 101,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&source)
+        .unwrap();
+        learned.observe_activity(&report).unwrap();
+        let merged =
+            merge(&ours, &learned).expect("same-head evidence is a new authorization observation");
+        assert_eq!(merged.head(), ours.head());
+        assert!(merged.authorized_member(&keys.sign_key()).is_none());
+        assert!(
+            merge(&merged, &ours).is_none(),
+            "an older observation cannot resurrect authority"
+        );
+    }
 
     #[derive(Default)]
     struct Errors(Mutex<Vec<(ErrorCode, Option<SignKey>)>>);

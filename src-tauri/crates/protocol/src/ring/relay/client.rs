@@ -3,6 +3,10 @@
 //! thread owns the socket and delivers [`RingEvents`]. There is no automatic reconnect: the
 //! caller's supervisor decides when to dial again.
 
+#[path = "membership.rs"]
+mod membership;
+pub use membership::{ActivityReport, DepartureClient, DepartureStatus, PolicyPreview};
+
 use super::super::chain::RosterChain;
 use super::super::url::RelayUrl;
 use super::super::{b64, Member, RingError, RosterError, SignKey, Signature, SignedRoster, Signer};
@@ -137,6 +141,8 @@ enum Kind {
     Request,
     /// A probe's `roster.get`: answered by `roster.chain`.
     Probe,
+    ActivityEvidence,
+    PolicyPreview,
 }
 
 /// A request awaiting its answer.
@@ -155,6 +161,7 @@ struct State {
     entitlement: Option<String>,
     limited: bool,
     waiting: HashMap<u64, Pending>,
+    replies: HashMap<u64, RelayFrame>,
     last_error: Option<ErrorCode>,
     closed: bool,
 }
@@ -612,7 +619,7 @@ impl RingClient {
         let deadline = Instant::now() + cfg.timeouts.connect;
         let mut chain = cfg.chain.clone();
         let me = cfg.signer.sign_key();
-        if chain.head().member(&me).is_none() {
+        if chain.authorized_member(&me).is_none() {
             return Err(RingError::Invalid(
                 "this device is not in its Roster".into(),
             ));
@@ -690,6 +697,7 @@ impl RingClient {
             entitlement,
             limited,
             waiting: HashMap::new(),
+            replies: HashMap::new(),
             last_error: None,
             closed: false,
         }));
@@ -737,6 +745,7 @@ impl RingClient {
             .roster()
             .members
             .iter()
+            .filter(|m| st.chain.authorized_member(&m.sign_key).is_some())
             .map(|m| MemberStatus {
                 member: m.clone(),
                 presence: if m.sign_key == self.me && !st.closed {
@@ -789,6 +798,18 @@ impl RingClient {
     /// Sends one envelope (at most 64 KiB) to `to`. Delivery failures come back as
     /// [`RingEvents::error`].
     pub fn send(&self, to: &SignKey, payload: &[u8]) -> Result<(), RingError> {
+        {
+            let st = lock(&self.state);
+            if (st.chain.head().member(&self.me).is_some()
+                && st.chain.authorized_member(&self.me).is_none())
+                || (st.chain.head().member(to).is_some()
+                    && st.chain.authorized_member(to).is_none())
+            {
+                return Err(RingError::Invalid(
+                    "terminal or absent Ring enrollment".into(),
+                ));
+            }
+        }
         if payload.len() > MAX_ENVELOPE_PAYLOAD {
             return Err(RingError::Invalid("envelope payload over 64 KiB".into()));
         }
@@ -1072,11 +1093,48 @@ impl Handler for ClientHandler {
             return;
         };
         match frame {
+            RelayFrame::ActivityKey { .. } => {}
+            f @ RelayFrame::ActivityPreview { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::PolicyPreview) {
+                    lock(&self.state).replies.insert(id, f);
+                    let _ = p.waiter.send(Ok(()));
+                }
+            }
+            f @ RelayFrame::ActivityEvidence { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::ActivityEvidence) {
+                    let result = (|| {
+                        let RelayFrame::ActivityEvidence {
+                            ref snapshot,
+                            ref evidence,
+                            ..
+                        } = f
+                        else {
+                            unreachable!()
+                        };
+                        let mut st = lock(&self.state);
+                        let mut chain = st.chain.clone();
+                        chain.observe_activity(snapshot)?;
+                        for token in evidence {
+                            chain.observe_activity(token)?;
+                        }
+                        st.chain = chain.clone();
+                        st.replies.insert(id, f);
+                        drop(st);
+                        self.events.chain(&chain);
+                        Ok(())
+                    })();
+                    let _ = p.waiter.send(result);
+                }
+            }
             RelayFrame::Env { from, payload } => {
                 if check_payload(&payload).is_err() {
                     return;
                 }
-                let member = lock(&self.state).chain.head().member(&from).is_some();
+                let member = {
+                    let st = lock(&self.state);
+                    st.chain.authorized_member(&self.me).is_some()
+                        && st.chain.authorized_member(&from).is_some()
+                };
                 if !member || from == self.me {
                     return;
                 }
@@ -1091,7 +1149,7 @@ impl Handler for ClientHandler {
                 }
                 {
                     let mut st = lock(&self.state);
-                    if st.chain.head().member(&key).is_none() {
+                    if st.chain.authorized_member(&key).is_none() {
                         return;
                     }
                     st.presence.insert(key, p.clone());

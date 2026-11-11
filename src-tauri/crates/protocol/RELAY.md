@@ -884,3 +884,125 @@ one machine than the default 10 opens a minute allows. A runner therefore config
 Relay it runs pairing scenarios on with a raised limit (at least 100 opens a minute; the
 `xshell-remote` runner uses 10000), except the Relay for `PAIR_RATE_SCENARIOS`. The test
 Relay has no rate limit unless configured with one.
+
+## Format-v2 membership substrate
+
+The v1 wire/token rules above remain the historical contract. New security-bearing
+membership is a strict `xro2.<payload>.<signature>` token, signed over
+`xshell-roster-v2\n` plus the encoded payload. Prefix/format substitution is refused.
+The ordinary payload fields and limits are unchanged; `v` is 2 and a mandatory,
+strictly decoded `membership` object carries `enrollments`, cumulative `retired`
+enrollment IDs, `policy` and a typed `change`. Unknown v2 top-level, membership,
+member, operation and proof fields are refused, not silently granted authority.
+Unsupported legacy extensions must be handled explicitly by a migration caller;
+there is no reset or lossy automatic conversion. Existing v1 creation/edit helpers
+remain legacy-only; production callers switch to typed v2 in the adoption slice.
+
+`ring/membership.rs` is the canonical representation and verifier. Computer units
+contain distinct role-correct Desktop and Daemon identities, standalone Daemon and
+Mobile units contain one identity, and `legacyDesktop` is introduced only by an
+Upgrade preserving an actual v1 Desktop. Units and their enrollment IDs are
+immutable. `CompleteComputer` replaces only explicitly referenced Desktop/Daemon
+singletons with a fresh Computer ID and fresh consent/possession proofs, preserving
+retained public identities. Removal never splits a Computer; terminal empty heads
+are valid. A retired ID cannot be reused, including after the same public keys
+are enrolled again. Existing token/count/chain/frame caps still apply; tombstones
+are not an exemption from the 64-KiB token limit.
+
+Typed changes are `genesis`, `upgrade`, `enroll`, `completeComputer`, `remove`,
+`expire` and `setPolicy`. Previous Desktop and Mobile identities administer
+membership/policy. Daemons can remove their own whole unit or publish independently
+proven expiry, not enroll peers, regroup arbitrary units or change policy. Fresh
+Mobile native confirmation and actual local Desktop consent are controller gates
+in later slices, not properties inferred from a Roster row.
+
+Each consent proof signs a domain-separated exact-proposal digest, approving
+identity, expiry and required flow-tagged context hash. The proposal digest excludes
+proofs/signatures/context self-reference, and includes the predecessor, operation,
+fresh enrollment nonce, full keyset/roles/names, policy and retained-unit descriptors.
+Local genesis/upgrade/completion contexts are derived through the separately
+domain-separated local transcript helper; they do not pretend to have a Noise
+session. Enrollment uses the Pairing context derived from the actual authenticated
+Noise transcript plus exact proposal. The Slice1 verifier checks representation,
+signature and allowed-flow mapping; the real Pairing controller must compare its
+independently derived expected transcript before consent/signing in Slice2. Test
+transcripts in contract fixtures do not claim to exercise that native operation.
+
+### Activity and terminal authority
+
+The creating/upgrading Desktop discovers `activity.key` at the configured Ring
+WebSocket endpoint and pins it in signed policy. Discovery uses the existing
+`RelayUrl` transport policy: authenticated non-loopback `wss://`, permitted
+loopback-only `ws://`, normalized origin/path and no redirect discovery. The Worker
+persists its private activity key. A missing v2 key is unavailable, never an
+opportunistic new pin. A mismatch is `activity_unavailable`.
+
+Activity tokens use `xae2` and `xshell-ring-activity-v2\n`; `ring/activity.rs`
+defines their strict signed fields. They bind Ring, Relay, verified policy-head
+hash, deterministic policy hash, observation time and complete target-unit keysets.
+A signed offline snapshot alone cannot authorize expiry: independently verified
+terminal evidence must establish elapsed finite timeout, no online half and the
+same immutable unit under an actual ancestor policy. The activity key never signs
+Roster tokens or grants membership. The documented compromised-Relay availability
+risk is not membership-granting or session-decryption authority.
+
+The active Worker finalizes elapsed expiry durably before reconnect activity or
+any candidate mutation. Every transition of a staged candidate is checked in order,
+including intermediate policies, not merely the authenticating final key or final
+head. Terminal signers cannot grant a new member through another transporter,
+complete a Computer or increase/disable policy. Narrow self-removal and proven
+expiry cleanup remain possible. Either genuinely live Computer half prevents
+expiry. Legacy unknown activity starts from its signed Upgrade baseline once;
+restarts do not refresh that baseline. Live activity is checkpointed by the existing
+Ring alarm (30 seconds), so a crash retains the last durably observed activity,
+not an invented crash/restart timestamp.
+
+`activity.preview` is nonterminal. Its signed snapshot binds the exact head,
+proposed policy and affected set. The confirmed `setPolicy` carries that preview;
+the Worker recomputes the set before mutation and conflicts if time/activity changed
+it, even when the head did not change. On commit it immediately terminal-blocks
+eligible units under the accepted policy before further admission/traffic, then
+`activity.get` supplies terminal evidence bound to that accepted head. Ordinary
+exact-head `expire` cleanup can follow; a policy increase/Never cannot resurrect
+already-final expiry. Reports include bounded, target-scoped historical terminal
+proofs for currently present units, not unbounded history in one frame.
+
+`RosterChain::observe_activity` retains independently verified terminal IDs;
+`authorized_member` is its effective membership view without rewriting the signed
+head. Candidate verification, the client send/receive path and Sessions sweeps
+honor learned terminal evidence, including same-head Connector updates. Consumers
+cannot infer evidence never supplied to them. Durable application-store integration
+of learned evidence and Pending Leave is a later-slice obligation.
+
+### Restricted departure
+
+`leave.sync` signs a fresh challenge under `xshell-ring-leave-query-v2` and binds
+origin, Ring, historical enrollment descriptor, signer, exact trusted head pin and
+pagination position. It returns bounded signed-chain pages, not a Relay-signed
+membership receipt. This lane cannot authenticate normally, refresh activity, route
+envelopes or publish arbitrary changes. `leave.put` accepts only the historical
+signer's ordinary exact-head self-`remove` for that exact enrollment, through the
+same chain verifier. The Worker never rewrites or re-signs a successor.
+
+`DepartureClient` fetches/verifies, signs locally, retries a concurrent-head conflict
+with a new signature (at most five attempts) and verifies signed-chain absence
+before completion. Absence is terminal by the never-reuse-ID invariant; old cleanup
+cannot remove a replacement enrollment even when it retains the same keys. Empty
+Rings remain readable through this historical cleanup lane. Missing/malformed chain
+proof, timeout or a bare acknowledgment cannot complete departure. Persistence of
+its old scoped signer/chain outside optional current membership remains Slice5 work.
+
+### Executable contracts and development pins
+
+`testdata/ring/membership-v2.json` is generated and checked by the canonical Rust
+`tests/ring_membership.rs` signed-token tests, then copied unchanged to the Worker's
+vectors. `relay/membership_contract.rs` runs real Rust clients against workerd,
+including policy evidence, terminal/absent cleanup, concurrent re-signing and reused
+keys. Controlled-clock workerd tests exercise admission bypass counterexamples.
+The older in-process `TestRelay` explicitly refuses v2 with `unsupported`; its v1
+passes are not v2 conformance evidence. V2 conformance comes from the active Worker.
+
+During uncommitted cross-source development an explicit temporary local Cargo patch
+may validate the real source pair. Delivery requires the parent's reviewed,
+published exact core revision in every remote manifest/lock and freshly synchronized
+vectors. No local patch or unpushed/fictitious SHA is a delivery pin.

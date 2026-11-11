@@ -196,12 +196,28 @@ struct St {
     /// The newest head [`Sessions::sweep`] saw: a session is installed only if this head
     /// (and the Connector's) still lists its peer as the handshake found it.
     swept: Option<SignedRoster>,
+    terminal: std::collections::HashSet<String>,
 }
 
 /// Whether `head` lists `m` with the same keys and role.
 fn listed(head: &SignedRoster, m: &Member) -> bool {
     head.member(&m.sign_key)
         .is_some_and(|x| x.noise_key == m.noise_key && x.role == m.role)
+}
+
+fn effective_member(
+    head: &SignedRoster,
+    member: &Member,
+    terminal: &std::collections::HashSet<String>,
+) -> bool {
+    listed(head, member)
+        && (head.roster().v != 2
+            || head
+                .roster()
+                .membership()
+                .ok()
+                .and_then(|m| m.unit_for(&member.sign_key).cloned())
+                .is_some_and(|u| !terminal.contains(&u.id)))
 }
 
 struct Inner {
@@ -234,10 +250,15 @@ impl Inner {
     /// is checked against are updated before every sweep takes this lock, so an install
     /// either sees the newer head or is swept after it.
     fn may_install(&self, st: &St, m: &Member) -> bool {
-        let connector_ok = self
-            .connector()
-            .is_some_and(|c| listed(c.chain().head(), m));
-        let swept_ok = st.swept.as_ref().is_none_or(|h| listed(h, m));
+        let connector_ok = self.connector().is_some_and(|c| {
+            c.chain()
+                .authorized_member(&m.sign_key)
+                .is_some_and(|member| member.noise_key == m.noise_key && member.role == m.role)
+        });
+        let swept_ok = st
+            .swept
+            .as_ref()
+            .is_none_or(|h| effective_member(h, m, &st.terminal));
         connector_ok && swept_ok
     }
 
@@ -513,6 +534,23 @@ impl Sessions {
         }
     }
 
+    /// Same-head terminal observations are authorization changes, not a fabricated Roster.
+    pub fn sweep_chain(&self, chain: &RosterChain) {
+        {
+            let mut st = lk(&self.inner.st);
+            if st
+                .swept
+                .as_ref()
+                .is_some_and(|h| h.ring_id() != chain.ring_id())
+            {
+                st.terminal.clear();
+            }
+            st.terminal
+                .extend(chain.terminal_enrollments().iter().cloned());
+        }
+        self.sweep(chain.head());
+    }
+
     /// A head this device adopted: sessions with peers it no longer lists (with the same
     /// keys and role) die.
     pub fn sweep(&self, head: &SignedRoster) {
@@ -525,16 +563,17 @@ impl Sessions {
             {
                 st.swept = Some(head.clone());
             }
+            let terminal = st.terminal.clone();
             // Handshakes in flight with a peer the head no longer lists as they began: an
             // answer that arrives later never becomes a session.
             for p in st.pending.values_mut() {
-                if p.done.is_none() && !listed(head, &p.member) {
+                if p.done.is_none() && !effective_member(head, &p.member, &terminal) {
                     p.done = Some(Err(SessionError::NotMember));
                 }
             }
             st.live
                 .values()
-                .filter(|s| !listed(head, &s.member))
+                .filter(|s| !effective_member(head, &s.member, &terminal))
                 .cloned()
                 .collect()
         };
@@ -564,8 +603,7 @@ impl Sessions {
             }
             let chain: RosterChain = c.chain();
             let member = chain
-                .head()
-                .member(peer)
+                .authorized_member(peer)
                 .cloned()
                 .ok_or(SessionError::NotMember)?;
             let ts = lk(&inner.st).fresh_out.next(*peer, now_ms());
@@ -821,7 +859,7 @@ impl ConnectorEvents for SessionEvents {
     }
 
     fn roster(&self, chain: &RosterChain) {
-        self.sessions.sweep(chain.head());
+        self.sessions.sweep_chain(chain);
         if let Some(n) = &self.next {
             n.roster(chain);
         }

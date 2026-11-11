@@ -15,12 +15,14 @@
 //! assertions; the Noise sessions ([`noise`], `relay::sessions`) authenticate peers and
 //! payloads end to end and bind `from` into each handshake.
 
+pub mod activity;
 pub mod b64;
 pub mod chain;
 pub mod entitlement;
 mod error;
 mod json;
 pub mod keys;
+pub mod membership;
 pub mod noise;
 pub mod pairing;
 pub mod push;

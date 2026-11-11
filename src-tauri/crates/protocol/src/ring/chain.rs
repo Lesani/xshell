@@ -5,7 +5,7 @@
 //! device back.
 
 use super::roster::{Role, RosterError, SignedRoster};
-use super::{RingId, SignKey};
+use super::{Member, RingId, SignKey};
 
 /// A chain is at most this many versions long.
 pub const MAX_CHAIN_LEN: usize = 4096;
@@ -22,6 +22,7 @@ pub fn verify_genesis(g: &SignedRoster) -> Result<(), RosterError> {
     match r.member(&r.signed_by) {
         None => Err(RosterError::SignerNotMember),
         Some(m) if m.role != Role::Desktop => Err(RosterError::SignerNotDesktop),
+        Some(_) if r.v == 2 => super::membership::verify_genesis(r),
         Some(_) => Ok(()),
     }
 }
@@ -41,11 +42,37 @@ pub fn verify_successor(prev: &SignedRoster, next: &SignedRoster) -> Result<(), 
     if n.prev.as_deref() != Some(prev.hash().as_str()) {
         return Err(RosterError::PrevMismatch);
     }
+    if p.v == 2 || n.v == 2 {
+        super::membership::verify_transition(prev, next)?;
+        return super::activity::verify_transition(std::slice::from_ref(prev), next);
+    }
     match p.member(&n.signed_by) {
         None => Err(RosterError::SignerNotMember),
         Some(m) if m.role != Role::Desktop => Err(RosterError::SignerNotDesktop),
         Some(_) => Ok(()),
     }
+}
+
+fn verify_with_history(history: &[SignedRoster], next: &SignedRoster) -> Result<(), RosterError> {
+    let prev = history.last().ok_or(RosterError::NotGenesis)?;
+    if prev.roster().v == 1 && next.roster().v == 1 {
+        return verify_successor(prev, next);
+    }
+    let (p, n) = (prev.roster(), next.roster());
+    if n.ring_id != p.ring_id {
+        return Err(RosterError::RingMismatch);
+    }
+    if n.version <= p.version {
+        return Err(RosterError::Stale);
+    }
+    if n.version != p.version + 1 {
+        return Err(RosterError::Gap);
+    }
+    if n.prev.as_deref() != Some(prev.hash().as_str()) {
+        return Err(RosterError::PrevMismatch);
+    }
+    super::membership::verify_transition(prev, next)?;
+    super::activity::verify_transition(history, next)
 }
 
 /// What [`RosterChain::accept`] changed.
@@ -61,6 +88,7 @@ pub struct Accepted {
 #[derive(Clone, PartialEq, Debug)]
 pub struct RosterChain {
     chain: Vec<SignedRoster>,
+    terminal: super::activity::TerminalEnrollments,
 }
 
 impl RosterChain {
@@ -71,10 +99,12 @@ impl RosterChain {
             return Err(RosterError::TooLarge);
         }
         verify_genesis(first)?;
-        for w in chain.windows(2) {
-            verify_successor(&w[0], &w[1])?;
-        }
-        Ok(RosterChain { chain })
+        let mut result = RosterChain {
+            chain: vec![first.clone()],
+            terminal: Default::default(),
+        };
+        result.extend(&chain[1..])?;
+        Ok(result)
     }
 
     /// Parses and verifies a chain of tokens from version 1.
@@ -87,6 +117,41 @@ impl RosterChain {
             .map(|t| SignedRoster::parse(t.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         Self::from_chain(chain)
+    }
+
+    /// Retains independently verified terminal evidence; later candidates cannot use that
+    /// enrollment's stale head authority. This does not infer unseen Relay activity.
+    pub fn observe_activity(&mut self, token: &str) -> Result<(), RosterError> {
+        self.terminal.observe(&self.chain, token)
+    }
+
+    /// Effective authorization after independently verified terminal evidence, even while
+    /// signed cleanup has not yet removed the immutable unit from the head.
+    pub fn authorized_member(&self, key: &SignKey) -> Option<&Member> {
+        let head = self.head();
+        if head.roster().v == 2 {
+            let membership = head.roster().membership().ok()?;
+            let unit = membership.unit_for(key)?;
+            if self.terminal.ids.contains(&unit.id) {
+                return None;
+            }
+        }
+        head.member(key)
+    }
+
+    pub fn terminal_enrollments(&self) -> &std::collections::HashSet<String> {
+        &self.terminal.ids
+    }
+
+    #[cfg(feature = "relay-client")]
+    pub(crate) fn merge_terminal_from(&mut self, other: &Self) -> bool {
+        let overlap = self.head().version().min(other.head().version());
+        if self.ring_id() != other.ring_id() || self.get(overlap) != other.get(overlap) {
+            return false;
+        }
+        let before = self.terminal.ids.len();
+        self.terminal.ids.extend(other.terminal.ids.iter().cloned());
+        self.terminal.ids.len() != before
     }
 
     pub fn genesis(&self) -> &SignedRoster {
@@ -158,7 +223,15 @@ impl RosterChain {
             if self.chain.len() >= MAX_CHAIN_LEN {
                 return Err(RosterError::TooLarge);
             }
-            verify_successor(self.head(), r)?;
+            verify_with_history(&self.chain, r)?;
+            super::membership::verify_terminal_authority(self.head(), r, &self.terminal.ids)?;
+            if r.roster().v == 2 {
+                if let super::membership::RosterChange::Expire { evidence, .. } =
+                    r.roster().membership()?.change
+                {
+                    self.terminal.observe(&self.chain, &evidence)?;
+                }
+            }
             self.chain.push(r.clone());
             added += 1;
         }
