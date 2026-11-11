@@ -1197,9 +1197,12 @@ fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
     .unwrap();
     let old_pid = owner.ensure_spawned().unwrap();
     let mut c = Client::connect(&h.pipe);
-    assert!(c
-        .hello()
-        .0
+    let hello = c.hello().0;
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|s| s == xshell_protocol::cap::DAEMON_DESKTOP_OWNED));
+    assert!(hello
         .capabilities
         .iter()
         .any(|s| s == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED));

@@ -43,6 +43,36 @@ pub enum UpdateAction {
     Replace,
 }
 
+/// Evidence that this Host cannot accept the remote update path. Not a connectivity error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateUnavailable {
+    WindowsOwner,
+    DesktopOwned,
+}
+
+impl UpdateUnavailable {
+    pub(crate) fn from_hello(
+        os: Option<&str>,
+        hello: &xshell_protocol::msg::Hello,
+    ) -> Option<Self> {
+        let has = |cap| hello.capabilities.iter().any(|c| c == cap);
+        if os == Some("windows") {
+            // Selected restart is explicitly authorized by the owning Windows Desktop.
+            return (!has(xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
+                .then_some(Self::WindowsOwner);
+        }
+        has(xshell_protocol::cap::DAEMON_DESKTOP_OWNED).then_some(Self::DesktopOwned)
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::DesktopOwned => "The Desktop on this Host manages its Daemon; update xshell there instead.",
+            Self::WindowsOwner => "To update this Host remotely, first update and reopen xshell on that Windows Host. Its owning Desktop must support Daemon updates.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
@@ -74,7 +104,7 @@ pub struct HostStatus {
     /// names it ([`crate::HostHandle::ring_identity`]), including a bound update confirmation.
     pub link_generation: u64,
     /// Retained during reconnect: capability absence alone is not an old-owner diagnosis.
-    pub update_unavailable: Option<String>,
+    pub update_unavailable: Option<UpdateUnavailable>,
     pub update_action: Option<UpdateAction>,
 }
 

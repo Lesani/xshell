@@ -29,8 +29,7 @@ use xshell_protocol::ring::Member;
 use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE};
 
 /// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
-pub(crate) const UPGRADE_REFUSED: &str =
-    "xshell on this machine runs these terminals; update xshell there instead";
+use xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED as UPGRADE_REFUSED;
 
 pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     if let Some(id) = id {
@@ -45,6 +44,7 @@ pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
         "daemon.upgrade-selected" => {
             !(cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
         }
+        xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
         // A Mobile rename is a custom-name update: never without the base capability.

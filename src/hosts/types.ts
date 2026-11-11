@@ -48,7 +48,7 @@ export interface HostStatus {
   os: "linux" | "macos" | "windows" | null;
   linkGeneration?: number;
   updateAction?: "update" | "replace" | null;
-  updateUnavailable?: string | null;
+  updateUnavailable?: "windows-owner" | "desktop-owned" | null;
   arch: string | null;
   incompatibleReason: "daemon-older" | "daemon-newer" | null;
   nextRetryAt: number | null; // ms epoch

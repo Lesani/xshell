@@ -1262,6 +1262,17 @@ impl HostHandle {
                     ));
                 }
             }
+            if !(mode_switch && st.cfg.id == crate::LOCAL_HOST_ID) {
+                if let Some(reason) = st.status.update_unavailable {
+                    return Err(
+                        if reason == crate::status::UpdateUnavailable::DesktopOwned {
+                            HostError::invalid(reason.message())
+                        } else {
+                            HostError::offline(reason.message())
+                        },
+                    );
+                }
+            }
             if !mode_switch
                 && self
                     .sh
@@ -1287,9 +1298,6 @@ impl HostHandle {
                     crate::HostErrorCode::Invalid,
                     "this Host does not need this Desktop's build",
                 ));
-            }
-            if let Some(reason) = &st.status.update_unavailable {
-                return Err(HostError::offline(reason.clone()));
             }
             let windows = st.status.os.as_deref() == Some("windows");
             let stop = match Shared::usable_link(&st) {
@@ -1623,7 +1631,18 @@ fn request_upgrade(
         if let Some(sh) = weak.upgrade() {
             match &r {
                 Ok(_) => accept_upgrade(&sh, op, original_gen, true),
-                Err(e) => finish_upgrade(&sh, op, Some(e)),
+                Err(e) => {
+                    if e.code == crate::HostErrorCode::Remote
+                        && e.message == xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED
+                    {
+                        let mut st = sh.lock();
+                        if st.gen == original_gen && st.upgrade_operation == Some(op) {
+                            st.status.update_unavailable =
+                                Some(crate::status::UpdateUnavailable::DesktopOwned);
+                        }
+                    }
+                    finish_upgrade(&sh, op, Some(e));
+                }
             }
         }
         o.call(r);
@@ -2015,6 +2034,44 @@ pub(crate) mod tests {
         assert!(st.upgrading && st.upgrade_expect);
         assert_eq!(st.status.phase, Some(Phase::Upgrading));
         assert!(st.upgrade_complete_deadline.unwrap() > Instant::now() + Duration::from_secs(119));
+    }
+
+    #[test]
+    fn legacy_ownership_refusal_is_exact_and_preserves_the_remote_error() {
+        for message in [
+            xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED.to_string(),
+            format!(
+                "{} (different error)",
+                xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED
+            ),
+            "cannot save the Terminal list".into(),
+        ] {
+            let sh = shared();
+            let (mut peer, link, generation) = connect(&sh, vec![]);
+            {
+                let mut st = sh.lock();
+                st.upgrading = true;
+                st.upgrade_operation = Some(7);
+            }
+            let (waiter, reply) = res_slot();
+            request_upgrade(&sh, &link, 7, generation, false, Once::new(waiter));
+            let id = peer.expect("daemon.upgrade")["id"].as_u64().unwrap();
+            peer.write(&res_frame(id, Err(message.clone())));
+            let error = reply.recv_timeout(T5).unwrap().unwrap_err();
+            assert_eq!(error, HostError::remote(message.clone()));
+            let st = sh.lock();
+            assert_eq!(st.status.last_error.as_deref(), Some(message.as_str()));
+            assert_eq!(
+                st.status.error_hint,
+                Some(crate::HostErrorHint::UpdateFailed)
+            );
+            assert_eq!(
+                st.status.update_unavailable,
+                (message == xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED)
+                    .then_some(crate::status::UpdateUnavailable::DesktopOwned)
+            );
+            assert!(!st.upgrading);
+        }
     }
 
     #[test]

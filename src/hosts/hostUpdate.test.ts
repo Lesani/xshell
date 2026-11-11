@@ -11,7 +11,7 @@ describe("Host update targeting and eligibility", () => {
     expect(updateAction(status())).toBe("update");
     expect(updateAction(status({ updateAction: "replace" }))).toBe("replace");
     expect(updateAction(status({ updateAction: null, status: "incompatible", incompatibleReason: "daemon-older" }))).toBeNull();
-    expect(updateAction(status({ os: "windows", updateUnavailable: "old owner" }))).toBeNull();
+    expect(updateAction(status({ os: "windows", updateUnavailable: "windows-owner" }))).toBeNull();
     expect(updateAction(status({ status: "offline" }))).toBeNull();
   });
   it("targets the selected Project's Host on Home, never global Home or Settings", () => {
