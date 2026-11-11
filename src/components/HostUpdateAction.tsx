@@ -13,12 +13,12 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
   const busy = !healthy && (!!state.invoking[host.id] || status?.phase === "upgrading" || status?.phase === "preparing");
   const replace = (action ?? status?.updateAction) === "replace";
   const error = healthy ? null : state.errors[host.id] || (status?.errorHint === "update-failed" ? status.lastError : null);
-  const oldOwner = !!status?.updateUnavailable && !!status.updateAction;
-  const visible = action || busy || oldOwner || error;
+  const unavailable = status?.updateUnavailable && !!status.updateAction ? status.updateUnavailable : null;
+  const visible = action || busy || unavailable || error;
   if (!visible) return null;
   return <div className="host-update-action">
-    {oldOwner ? <span>{fmt("hosts.update.oldOwner", { host: host.name })}</span> : <>
-      {description && !busy && status && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
+    {description && !busy && status && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
+    {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? (replace ? "hosts.update.switching" : "hosts.update.waiting") : "hosts.update.preparing", { host: host.name })}</span> : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(replace ? "hosts.update.replace" : "hosts.update.action")}</button>}
     </>}
     {error && <span className="host-row-error" role="alert">{fmt(replace ? "hosts.update.replaceFailed" : "hosts.update.failed", { host: host.name, error })}</span>}

@@ -53,6 +53,7 @@ export const S = {
   "hosts.update.switching": "Switching {host} to this Desktop’s build. Waiting for its Daemon to reconnect…",
   "hosts.update.failed": "Couldn’t update {host}: {error}",
   "hosts.update.replaceFailed": "Couldn’t switch the build on {host}: {error}",
+  "hosts.update.desktopOwned": "Update xshell on {host}. The Desktop there manages this Daemon, so its build cannot be replaced from here.",
   "hosts.update.oldOwner": "To update {host} remotely, first update and reopen xshell on that Windows Host. Its owning Desktop must support Daemon updates.",
   "settings.nav.hosts": "Hosts",
   "hosts.section.title": "Remote hosts",

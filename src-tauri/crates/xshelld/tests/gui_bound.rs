@@ -219,14 +219,26 @@ fn loses_lock_to_running_daemon_exit_3() {
 #[test]
 fn refuses_daemon_upgrade() {
     let h = TestHome::new();
-    let parent = GuiParent::start(&h, &[]);
+    let fake = soft_agent(&h);
+    let _reap = FakeReaper(fake.pids_log.clone());
+    let (parent, terminal, pid) = with_terminal(&h, &fake, &[]);
     let mut c = Client::connect(&h.paths().socket);
-    c.hello(range(1, 1));
+    let (hello, _) = c.hello(range(1, 1));
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|c| c == xshell_protocol::cap::DAEMON_DESKTOP_OWNED));
     let e = c.request(&ClientMsg::DaemonUpgrade).unwrap_err();
+    assert_eq!(e, xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED);
     assert!(e.contains("update xshell"), "{e}");
     assert!(!e.contains("Daemon"), "{e}");
     std::thread::sleep(Duration::from_millis(300));
     assert!(alive(parent.daemon_pid()));
+    assert!(alive(pid));
+    let (_, list) = Client::connect(&h.paths().socket).hello(range(1, 1));
+    assert!(list
+        .iter()
+        .any(|t| t.terminal == terminal && t.pid == Some(pid as u32)));
 }
 
 /// The parent watch is armed before the login shell runs: a parent death while it stalls

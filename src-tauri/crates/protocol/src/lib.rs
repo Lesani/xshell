@@ -37,9 +37,11 @@ pub const CAPABILITIES: &[&str] = &[
     cap::CALL,
     cap::TERM,
     cap::TERM_CUSTOM_TITLE,
+    cap::TERM_CUSTOM_TITLE_MOBILE,
     cap::TERM_COMPLETION_ATTENTION,
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
+    cap::DAEMON_DESKTOP_OWNED,
     cap::TERM_RELAUNCH,
     cap::LAUNCH_PREFIX,
     cap::AGENT_STATUS,
@@ -73,9 +75,18 @@ pub mod cap {
     /// save: synced file and atomic replacement, plus parent-directory sync on Unix.
     /// An installed but unconfirmed save returns [`crate::CUSTOM_TITLE_NOT_DURABLE`].
     pub const TERM_CUSTOM_TITLE: &str = "term.custom-title";
+    /// A Mobile may rename a Terminal it sees: `term.update` with no session id and `meta`
+    /// holding only `customTitle` (string or null), see
+    /// [`crate::terminal_meta::is_mobile_custom_title_update`]. Validation, durable save,
+    /// errors and the resulting `terminals` broadcast are those of [`TERM_CUSTOM_TITLE`]. Any
+    /// other `term.update` from a Mobile, and one for a Terminal it does not see, is refused.
+    pub const TERM_CUSTOM_TITLE_MOBILE: &str = "term.custom-title.mobile";
     /// `daemon.upgrade` (Desktop only).
     pub const DAEMON_UPGRADE: &str = "daemon.upgrade";
     pub const DAEMON_UPGRADE_SELECTED: &str = "daemon.upgrade-selected";
+    /// Positive lifecycle ownership, not a blanket update prohibition: a Windows owner
+    /// may also support `DAEMON_UPGRADE_SELECTED`. Absence leaves ownership unknown.
+    pub const DAEMON_DESKTOP_OWNED: &str = "daemon.desktop-owned";
     /// `term.relaunch`.
     pub const TERM_RELAUNCH: &str = "term.relaunch";
     /// Launch prefixes in `term.open`.
@@ -157,6 +168,11 @@ pub const OPEN_INDETERMINATE: &str = "open-indeterminate:";
 pub const NOT_RUNNING_MESSAGE: &str =
     "xshell is not running here; terminals are reachable only while xshell is open";
 
+/// The unchanged ordinary-upgrade refusal from a Desktop-owned Daemon, including legacy
+/// peers. Exact equality permits diagnosis without interpreting arbitrary remote errors.
+pub const DESKTOP_OWNED_UPGRADE_REFUSED: &str =
+    "xshell on this machine runs these terminals; update xshell there instead";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +180,7 @@ mod tests {
     #[test]
     fn capabilities_include_term_custom_title() {
         assert!(CAPABILITIES.contains(&cap::TERM_CUSTOM_TITLE));
+        assert!(CAPABILITIES.contains(&"term.custom-title.mobile"));
     }
 
     #[test]

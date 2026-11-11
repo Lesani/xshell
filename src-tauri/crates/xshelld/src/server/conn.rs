@@ -29,8 +29,7 @@ use xshell_protocol::ring::Member;
 use xshell_protocol::{CAPABILITIES, OPEN_INDETERMINATE};
 
 /// The answer to `daemon.upgrade` on a GUI-bound Daemon. A remote Desktop shows it.
-pub(crate) const UPGRADE_REFUSED: &str =
-    "xshell on this machine runs these terminals; update xshell there instead";
+use xshell_protocol::DESKTOP_OWNED_UPGRADE_REFUSED as UPGRADE_REFUSED;
 
 pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     if let Some(id) = id {
@@ -45,8 +44,11 @@ pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
         "daemon.upgrade-selected" => {
             !(cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
         }
+        xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
+        // A Mobile rename is a custom-name update: never without the base capability.
+        "term.custom-title.mobile" => !offered(cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE),
         _ => false,
     };
     !off && !cfg.hide_capabilities.iter().any(|h| h == c)
@@ -551,6 +553,22 @@ impl Conn {
                 session_id,
                 mut meta,
             } => {
+                // `role::check` let a Mobile's rename through; a Daemon told to hide the
+                // capability refuses it as before.
+                debug_assert!(
+                    self.role != Role::Mobile
+                        || xshell_protocol::terminal_meta::is_mobile_custom_title_update(
+                            session_id.as_deref(),
+                            meta.as_ref(),
+                        ),
+                    "role::check admits only a Mobile rename"
+                );
+                if self.role == Role::Mobile
+                    && !offered(&d.cfg, xshell_protocol::cap::TERM_CUSTOM_TITLE_MOBILE)
+                {
+                    reply(&self.ob, id, Err(role::forbidden("term.update")));
+                    return;
+                }
                 let touched = match meta
                     .as_mut()
                     .map(xshell_protocol::terminal_meta::normalize_custom_title_patch)
@@ -563,9 +581,10 @@ impl Conn {
                     }
                 };
                 let reg = d.reg.lock().unwrap();
-                let r = match reg.terminals.get(&terminal) {
-                    None => Err(format!("unknown terminal {terminal}")),
-                    Some(t) => match (session_id.as_deref(), t.agent_session()) {
+                // Lookup and visibility on one lock: the instance judged is the one updated.
+                let r = match role::listed(&reg, self.role, &terminal) {
+                    Err(e) => Err(e),
+                    Ok(t) => match (session_id.as_deref(), t.agent_session()) {
                         // The agent's own report wins: an update naming another session is
                         // refused as a whole, its metadata (a wrong session's title) too.
                         (Some(s), Some(a)) if s != a => Err(format!(

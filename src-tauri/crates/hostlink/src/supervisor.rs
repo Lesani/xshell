@@ -9,7 +9,7 @@ use crate::handle::Shared;
 use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name, selected_remote};
 use crate::link::{Link, LinkError};
 use crate::process::run_script;
-use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind};
+use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind, UpdateUnavailable};
 use crate::transport::{connect_command, sh_wrap, Transport};
 use crate::version::{self, classify, Classified};
 use std::sync::atomic::Ordering;
@@ -484,6 +484,10 @@ impl Sup {
                     build_differs,
                 } => (negotiated, upgrade_pending, build_differs),
                 Classified::Incompatible { reason, message } => {
+                    let mut st = self.sh.lock();
+                    st.status.update_unavailable =
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                    drop(st);
                     link.close();
                     return Attempt::Failed(Failure {
                         message,
@@ -522,8 +526,7 @@ impl Sup {
                 StatusKind::Connected
             });
             st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
-            st.status.update_unavailable = (st.status.os.as_deref() == Some("windows") && !hello.capabilities.iter().any(|c| c == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
-                .then(|| "To update this Host remotely, first update and reopen xshell on that Windows Host. Its owning Desktop must support Daemon updates.".into());
+            st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
             st.status.daemon_version = Some(hello.version.clone());
             st.status.daemon_build = hello.build.clone();
             st.status.protocol = Some(negotiated);
@@ -584,10 +587,10 @@ impl Sup {
     fn link_failure(&self, conn: &dyn Connection, e: LinkError) -> Failure {
         match e {
             LinkError::Incompatible { hello, message } => {
-                if self.sh.lock().status.os.as_deref() == Some("windows") {
+                {
                     let mut st = self.sh.lock();
-                    st.status.update_unavailable = (!hello.capabilities.iter().any(|c| c == xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
-                        .then(|| "Its Windows owning Desktop must be updated and reopened to support Daemon updates.".into());
+                    st.status.update_unavailable =
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
                 }
                 let reason = match version::classify(
                     &self.sh.mc.desktop_version,
