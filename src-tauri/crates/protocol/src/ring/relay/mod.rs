@@ -1,5 +1,6 @@
 #![doc = include_str!("../../../RELAY.md")]
 
+pub mod proposal;
 pub mod wire;
 
 #[cfg(feature = "relay-client")]
@@ -29,7 +30,8 @@ pub mod test_relay;
 #[cfg(feature = "relay-client")]
 pub use client::{
     ActivityReport, ChainPin, DepartureClient, DepartureStatus, MemberStatus, PolicyPreview,
-    PushRequest, RingClient, RingClientConfig, RingEvents, RingLimits, RingTimeouts, Ticket,
+    ProposalReader, PushRequest, RingClient, RingClientConfig, RingEvents, RingLimits,
+    RingTimeouts, Ticket, VerifiedProposal,
 };
 #[cfg(feature = "relay-client")]
 pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState};

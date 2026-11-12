@@ -597,3 +597,7 @@ pub fn terminal_evidence_survives_policy_increase(t: &RelayTarget) {
         .unit(&id(5))
         .is_none());
 }
+
+#[path = "proposal_contract.rs"]
+mod proposals;
+pub use proposals::{QUOTA_SCENARIOS as PROPOSAL_QUOTA_SCENARIOS, SCENARIOS as PROPOSAL_SCENARIOS};

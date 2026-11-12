@@ -8,6 +8,9 @@
 //! through UniFFI.
 #![doc = include_str!("../../SESSIONS.md")]
 
+#[path = "adoption.rs"]
+pub mod adoption;
+
 use super::json::strict_object;
 use super::url::RelayUrl;
 use super::{
@@ -513,6 +516,9 @@ fn role_name(r: Role) -> &'static str {
 
 /// The joining device's side (a phone, or `xshelld pair`): the Noise initiator.
 pub struct Guest {
+    final_hash: Option<[u8; 32]>,
+    send_nonce: u64,
+    recv_nonce: u64,
     hs: Option<HandshakeState>,
     transport: Option<StatelessTransportState>,
     pin: Option<NoiseKey>,
@@ -521,6 +527,40 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// The actual final XXpsk3 hash, available only after message 3 succeeded.
+    pub fn final_handshake_hash(&self) -> Result<[u8; 32], PairError> {
+        self.final_hash.ok_or(PairError::Cancelled)
+    }
+    /// Ordered transport messages; nonces never reset between proposal, consent and ack.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, PairError> {
+        if plaintext.len() > MAX_PAIR_MESSAGE - 16 {
+            return Err(PairError::Payload("message too long".into()));
+        }
+        let t = self.transport.as_ref().ok_or(PairError::Cancelled)?;
+        let mut buf = vec![0; plaintext.len() + 16];
+        let next = self.send_nonce.checked_add(1).ok_or(PairError::Crypto)?;
+        let n = t
+            .write_message(self.send_nonce, plaintext, &mut buf)
+            .map_err(|_| PairError::Crypto)?;
+        self.send_nonce = next;
+        buf.truncate(n);
+        Ok(buf)
+    }
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, PairError> {
+        if ciphertext.len() > MAX_PAIR_MESSAGE {
+            return Err(PairError::Payload("message too long".into()));
+        }
+        let t = self.transport.as_ref().ok_or(PairError::Cancelled)?;
+        let mut buf = Zeroizing::new(vec![0; MAX_PAIR_MESSAGE]);
+        let next = self.recv_nonce.checked_add(1).ok_or(PairError::Crypto)?;
+        let n = t
+            .read_message(self.recv_nonce, ciphertext, &mut buf)
+            .map_err(|_| PairError::Crypto)?;
+        self.recv_nonce = next;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     /// Message 1. `pin`: the Desktop's Noise key from the QR payload (`None` for a code).
     pub fn start(
         keys: &DeviceKeys,
@@ -531,6 +571,9 @@ impl Guest {
         let msg = write(&mut hs, &[])?;
         Ok((
             Guest {
+                final_hash: None,
+                send_nonce: 0,
+                recv_nonce: 0,
                 hs: Some(hs),
                 transport: None,
                 pin,
@@ -591,6 +634,11 @@ impl Guest {
         })
         .to_string();
         let msg = write(&mut hs, body.as_bytes())?;
+        self.final_hash = Some(
+            hs.get_handshake_hash()
+                .try_into()
+                .map_err(|_| PairError::Crypto)?,
+        );
         self.transport = Some(
             hs.into_stateless_transport_mode()
                 .map_err(|_| PairError::Crypto)?,
@@ -600,15 +648,8 @@ impl Guest {
 
     /// Message 4, the Desktop's answer: the first message that proves it knows the secret.
     pub fn finish(&mut self, msg4: &[u8]) -> Result<Joined, PairError> {
-        let t = self.transport.take().ok_or(PairError::Cancelled)?;
-        if msg4.len() > MAX_PAIR_MESSAGE {
-            return Err(PairError::Payload("message too long".into()));
-        }
-        let mut buf = vec![0u8; MAX_PAIR_MESSAGE];
-        let n = t
-            .read_message(0, msg4, &mut buf)
-            .map_err(|_| PairError::Crypto)?;
-        let o = object(&buf[..n])?;
+        let buf = self.decrypt(msg4)?;
+        let o = object(&buf)?;
         match o.get("ok") {
             Some(Value::Bool(true)) => {}
             Some(Value::Bool(false)) => {
@@ -641,6 +682,9 @@ impl Guest {
 
 /// The Desktop's side: the Noise responder.
 pub struct Host {
+    final_hash: Option<[u8; 32]>,
+    send_nonce: u64,
+    recv_nonce: u64,
     hs: Option<HandshakeState>,
     transport: Option<StatelessTransportState>,
     h2: Option<Vec<u8>>,
@@ -648,8 +692,45 @@ pub struct Host {
 }
 
 impl Host {
+    /// The actual final XXpsk3 hash, available only after message 3 succeeded.
+    pub fn final_handshake_hash(&self) -> Result<[u8; 32], PairError> {
+        self.final_hash.ok_or(PairError::Cancelled)
+    }
+    /// Ordered transport messages; nonces never reset between proposal, consent and ack.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, PairError> {
+        if plaintext.len() > MAX_PAIR_MESSAGE - 16 {
+            return Err(PairError::Payload("message too long".into()));
+        }
+        let t = self.transport.as_ref().ok_or(PairError::Cancelled)?;
+        let mut buf = vec![0; plaintext.len() + 16];
+        let next = self.send_nonce.checked_add(1).ok_or(PairError::Crypto)?;
+        let n = t
+            .write_message(self.send_nonce, plaintext, &mut buf)
+            .map_err(|_| PairError::Crypto)?;
+        self.send_nonce = next;
+        buf.truncate(n);
+        Ok(buf)
+    }
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, PairError> {
+        if ciphertext.len() > MAX_PAIR_MESSAGE {
+            return Err(PairError::Payload("message too long".into()));
+        }
+        let t = self.transport.as_ref().ok_or(PairError::Cancelled)?;
+        let mut buf = Zeroizing::new(vec![0; MAX_PAIR_MESSAGE]);
+        let next = self.recv_nonce.checked_add(1).ok_or(PairError::Crypto)?;
+        let n = t
+            .read_message(self.recv_nonce, ciphertext, &mut buf)
+            .map_err(|_| PairError::Crypto)?;
+        self.recv_nonce = next;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     pub fn start(keys: &DeviceKeys, secret: &PairSecret) -> Result<Host, PairError> {
         Ok(Host {
+            final_hash: None,
+            send_nonce: 0,
+            recv_nonce: 0,
             hs: Some(handshake(keys, secret, false)?),
             transport: None,
             h2: None,
@@ -718,6 +799,11 @@ impl Host {
             "computer"
         };
         let name = member_name(field(&o, "name").unwrap_or(""), fallback);
+        self.final_hash = Some(
+            hs.get_handshake_hash()
+                .try_into()
+                .map_err(|_| PairError::Crypto)?,
+        );
         self.transport = Some(
             hs.into_stateless_transport_mode()
                 .map_err(|_| PairError::Crypto)?,
@@ -733,7 +819,6 @@ impl Host {
 
     /// Message 4: the answer.
     pub fn answer(&mut self, result: &JoinResult) -> Result<Vec<u8>, PairError> {
-        let t = self.transport.take().ok_or(PairError::Cancelled)?;
         let body = match result {
             Ok(j) => json!({
                 "v": 1,
@@ -747,12 +832,7 @@ impl Host {
             Err(r) => json!({ "v": 1, "ok": false, "error": r.as_code() }),
         }
         .to_string();
-        let mut buf = vec![0u8; body.len() + 64];
-        let n = t
-            .write_message(0, body.as_bytes(), &mut buf)
-            .map_err(|_| PairError::Crypto)?;
-        buf.truncate(n);
-        Ok(buf)
+        self.encrypt(body.as_bytes())
     }
 }
 

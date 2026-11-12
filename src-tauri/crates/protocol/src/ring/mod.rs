@@ -18,6 +18,7 @@
 pub mod activity;
 pub mod b64;
 pub mod chain;
+pub mod device_code;
 pub mod entitlement;
 mod error;
 mod json;

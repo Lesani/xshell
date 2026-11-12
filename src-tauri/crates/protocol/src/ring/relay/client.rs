@@ -5,7 +5,10 @@
 
 #[path = "membership.rs"]
 mod membership;
+#[path = "proposal_client.rs"]
+mod proposal_client;
 pub use membership::{ActivityReport, DepartureClient, DepartureStatus, PolicyPreview};
+pub use proposal_client::{ProposalReader, VerifiedProposal};
 
 use super::super::chain::RosterChain;
 use super::super::url::RelayUrl;
@@ -143,6 +146,7 @@ enum Kind {
     Probe,
     ActivityEvidence,
     PolicyPreview,
+    ProposalCreated,
 }
 
 /// A request awaiting its answer.
@@ -1093,6 +1097,13 @@ impl Handler for ClientHandler {
             return;
         };
         match frame {
+            f @ RelayFrame::ProposalCreated { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::ProposalCreated) {
+                    lock(&self.state).replies.insert(id, f);
+                    let _ = p.waiter.send(Ok(()));
+                }
+            }
+            RelayFrame::ProposalReady { .. } | RelayFrame::ProposalPage { .. } => {}
             RelayFrame::ActivityKey { .. } => {}
             f @ RelayFrame::ActivityPreview { id, .. } => {
                 if let Some(p) = self.take_waiter(id, Kind::PolicyPreview) {

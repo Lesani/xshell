@@ -59,7 +59,7 @@ pub fn client_frame_cap(t: &str) -> usize {
     match t {
         "auth.chain" => MAX_FRAME,
         "env" => MAX_ENV_FRAME,
-        "roster.put" | "leave.put" => MAX_ROSTER_PUT_FRAME,
+        "proposal.create" | "roster.put" | "leave.put" => MAX_ROSTER_PUT_FRAME,
         _ => MAX_CONTROL_FRAME,
     }
 }
@@ -369,7 +369,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// Every wire integer is at most 2^53−1, so JavaScript reads it exactly.
-mod safe {
+pub(super) mod safe {
     use crate::ring::MAX_SAFE_INT;
     use serde::{Deserialize, Deserializer};
 
@@ -393,6 +393,34 @@ mod safe {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "t")]
 pub enum ClientFrame {
+    #[serde(rename = "proposal.create", rename_all = "camelCase")]
+    ProposalCreate {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        operation: String,
+        head: String,
+        guest: SignKey,
+        context: String,
+        #[serde(deserialize_with = "safe::int")]
+        expires_at: u64,
+        proposal: String,
+    },
+    #[serde(rename = "proposal.read")]
+    ProposalRead {
+        handle: super::proposal::ProposalHandle,
+        sig: Signature,
+    },
+    #[serde(rename = "proposal.get")]
+    ProposalGet {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+    },
+    #[serde(rename = "proposal.cancel")]
+    ProposalCancel {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        grant: String,
+    },
     #[serde(rename = "activity.key")]
     ActivityKey {
         #[serde(deserialize_with = "safe::int")]
@@ -481,6 +509,10 @@ pub enum ClientFrame {
 }
 
 const CLIENT_TYPES: &[&str] = &[
+    "proposal.create",
+    "proposal.read",
+    "proposal.get",
+    "proposal.cancel",
     "activity.key",
     "activity.get",
     "activity.preview",
@@ -502,6 +534,25 @@ const CLIENT_TYPES: &[&str] = &[
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "t")]
 pub enum RelayFrame {
+    #[serde(rename = "proposal.created")]
+    ProposalCreated {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        handle: super::proposal::ProposalHandle,
+    },
+    #[serde(rename = "proposal.ready")]
+    ProposalReady {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+        pages: Vec<[u64; 2]>,
+    },
+    #[serde(rename = "proposal.page")]
+    ProposalPage {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+        chain: Vec<String>,
+        proposal: Option<String>,
+    },
     #[serde(rename = "activity.key")]
     ActivityKey {
         #[serde(deserialize_with = "safe::int")]
@@ -593,6 +644,9 @@ pub enum RelayFrame {
 }
 
 const RELAY_TYPES: &[&str] = &[
+    "proposal.created",
+    "proposal.ready",
+    "proposal.page",
     "activity.key",
     "activity.evidence",
     "activity.preview",

@@ -256,7 +256,7 @@ parsing; every byte limit in this document counts UTF-8 bytes):
 |---|---|
 | `auth.chain` | 1 MiB |
 | `env` | 96 KiB (and its decoded `payload` at most 64 KiB) |
-| `roster.put` | 72 KiB |
+| `roster.put`, `leave.put`, `proposal.create` | 72 KiB |
 | every other frame | 8 KiB |
 | any Relay to client frame (`roster.chain` included) | 1 MiB |
 
@@ -1006,3 +1006,131 @@ During uncommitted cross-source development an explicit temporary local Cargo pa
 may validate the real source pair. Delivery requires the parent's reviewed,
 published exact core revision in every remote manifest/lock and freshly synchronized
 vectors. No local patch or unpushed/fictitious SHA is a delivery pin.
+
+## Computer adoption proposal continuation (development v2)
+
+This is an additive metadata-only lane at the **existing Ring endpoint**, not a
+provisional membership, a new Relay, a generic upload/capability service or a new
+trust anchor. Controller/local IPC/UI adoption and application pin migration are
+not provided by this protocol substrate.
+
+### Credential and encrypted exchange
+
+`ring::device_code::DeviceCode` version1 maps12 random bytes to eight12-bit indices
+in the frozen4096-word asset. All96 bits are used without modulo bias. Parsing
+normalizes ASCII case and space/hyphen separators. Credentials and formatted words
+are wiping/redacted and memory-only. The EFF/Joseph Bonneau subset, original source,
+source/subset SHA256, selection rule and CC-BY-4.0 attribution are under
+`ring/device_code/`; code remains MIT. `THIRD_PARTY_NOTICES.txt` is also a Desktop
+bundle resource. No separate frontend dictionary exists.
+
+The pair pipe keeps its existing eight messages/direction,8192 decoded bytes/message,
+16KiB frame and600-second slot limits, including all anonymous, prefix, global and
+Mobile restrictions. Computer/headless adoption uses the same XXpsk3 handshake:
+
+| Guest sends | Approving Desktop sends |
+|---|---|
+| message1 | message2 |
+| message3: complete public target/operation/deadline and independent possession proofs | encrypted frozen proposal handle |
+| encrypted explicit consent (or cancellation) | encrypted commit acknowledgment |
+
+`JoinTarget` is either a standalone Daemon or a Computer with public Desktop and
+Daemon identities. The Computer's initiator/read principal is its Desktop; a
+standalone uses its Daemon. Both Computer keys prove possession of the exact intent
+and message2 transcript; no seed leaves its owner. The **actual final** handshake
+hash is captured after message3, before consuming Noise handshake state. Transport
+nonces increase monotonically and separately per direction. A final-hash/target/
+approver mismatch or replay fails before consent.
+
+Ordinary network steps retain15-second default deadlines. Human consent uses the
+original absolute operation/code deadline, cancellable reads and ordinary ping/pong,
+never periodic encrypted wait messages, page chains in the pair pipe, renewed
+credentials or derived slots. The callbacks in `relay::pair` separate preparation,
+local consent, publication and read-grant cancellation. Possession alone does not
+produce consent signatures. `apply_consent` checks both genuine signatures, exact
+proposal, original expiry and actual final Noise context before the approver signs.
+A commit acknowledgment is not membership installation: the guest independently
+fetches/verifies the accepted signed head before returning it to its controller.
+
+### Frozen resource and frames
+
+`proposal.create` is authenticated and72KiB-capped, like `roster.put`. Fields:
+`id, operation, head, guest, context, expiresAt, proposal`. `operation`, `head` and
+`context` are canonical32-byte base64url values; `context` is the actual final Noise
+hash; `proposal` is the exact **unsigned JSON string**, not a signed Roster token.
+Only a currently authorized Computer/LegacyDesktop Desktop may create it. The
+Worker rechecks exact accepted predecessor, signer authority/terminal state,
+Ring/Relay, valid Enroll delta and exact proposed unit/read principal. It grants no
+membership and allows no new Mobile/Daemon creation authority.
+
+`proposal.created { id, handle }` returns a random32-byte grant and resource digest.
+The handle contains exactly `ringId, relayUrl, operation, head, version, guest,
+context, expiresAt, grant, resource`. It travels only inside the real encrypted pair
+session. The guest compares every binding and original expiry before reading.
+
+The resource digest is SHA256 over the exact UTF-8 serialization
+`{"chain":[accepted tokens through head],"proposal":unsignedString,"pages":[cuts]}`
+with those field names/order and JSON serialization. Cuts are zero-based inclusive
+first/exclusive last chain indices. Fixed pages use at most768KiB of quoted token
+data, leaving room for metadata/proposal overhead; every complete response is also
+checked against1MiB. The proposal appears only on the last page. Storage references
+immutable accepted-chain versions instead of copying the full chain per grant.
+Unsigned proposal data uses the existing96KiB chunk utility in a distinct namespace,
+with bounded manifests/accounting and a separate absolute deadline/sweeper.
+
+Each token is at most64KiB. The **final** chain may have4096 versions, not4097.
+Candidate accounting includes the completed proposed token with actual encoded
+proof/signature widths, and is at most16MiB. Aggregate additional serialized staging
+is at most16MiB+64KiB and4096 physical chunks (including bounded grant manifests).
+There is at most one live grant per approver, guest or operation, and64 per Ring;
+capacity admission fails explicitly with `too_many`, never evicting another grant.
+
+On a fresh ordinary preauth socket the guest sends `proposal.read { handle, sig }`
+against the existing fresh challenge. The distinct signed bytes are:
+
+```text
+xshell-proposal-read-v2\n
+{normalizedOrigin}\n{ringId}\n{relayUrl}\n{grant}\n{resource}\n{operation}\n
+{head}\n{version}\n{guest}\n{context}\n{expiresAt}\n{freshChallenge}
+```
+
+(The display line breaks above are only formatting; fields are newline-separated,
+without a final newline.) Descriptor/deadline/possession failures close4003 without
+resource metadata. A leaked handle cannot read, and every reconnect requires a new
+challenge/signature. The successful phase is **read-only**, with
+`proposal.ready { cursor, pages }`; it never runs ordinary authentication, changes
+member generations/index/presence/activity, evicts a member socket, routes envelopes
+or Sessions, calls Hosts, or gains `auth.chain`, `roster.get/put` or departure-lane
+authority. At most one reader socket per grant is admitted; another is refused.
+
+`proposal.get { cursor }` returns `proposal.page { cursor, chain, proposal }`, with
+`proposal:null` except on the final page. Requests/read/cancel remain8KiB-capped.
+The persisted cursor admits its next page or the immediately preceding page for
+bounded recovery; arbitrary ranges/skips/older pages are refused. Page-data bytes
+(the exact JSON `{chain,proposal}`) are limited to twice resource length and page
+responses to twice the manifest page count, **across reconnects/hibernation**. Each
+socket's queue serializes page handling. The guest independently checks the digest,
+full signed chain, predecessor, approving Desktop, exact target/delta and final
+Noise context; the handle alone proves none of these.
+
+`proposal.cancel { id, grant }` is allowed only on the creating approver's current
+authenticated connection. It deletes the resource and closes readers; guest
+cancellation closes its own reader/operation, not somebody else's grant. The
+approver driver invokes read-grant cleanup on success/failure/decline after a handle
+was created. Any changed/publication head, creating-connection loss/replacement,
+revocation, terminal expiry or fixed absolute expiry also invalidates it. The
+maximum lifetime is600 seconds, never renewed. Alarm and every admitted read
+recheck authority/deadline; a process restart with a lost creator cannot revive it.
+
+Read-only traffic remains in RingCore's bounded **preauth** queue pool and uses its
+two verification slots, but is not subject to the short ordinary-auth deadline
+after successful possession admission. Creating authenticated frames and admitted
+read requests count against the existing Ring daily-frame quota, with the same
+32-refusal close rule and no activity refresh by readers. Reader accounting is
+flushed durably; cursor/replay/manifest/quota-refusal state survives hibernation.
+Exact auto-answered pings keep their existing exemption. Other anonymous/Mobile
+budgets do not change.
+
+Production-workerd Rust contracts are exported as `PROPOSAL_SCENARIOS` alongside
+membership contracts; controlled-clock workerd tests exercise hibernation, process
+restart, expiry, quotas and invalidation. TestRelay remains explicitly legacy-only.

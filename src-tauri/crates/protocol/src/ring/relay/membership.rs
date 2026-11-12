@@ -36,7 +36,7 @@ impl RingClient {
             _ => Err(RingError::Protocol("expected activity.key".into())),
         }
     }
-    fn membership_request(
+    pub(super) fn membership_request(
         &self,
         kind: Kind,
         frame: impl FnOnce(u64) -> ClientFrame,
@@ -128,7 +128,7 @@ impl RingClient {
     }
 }
 
-fn open_membership(
+pub(super) fn open_membership(
     relay: &str,
     ring: &RingId,
     tls: Option<Arc<ClientConfig>>,

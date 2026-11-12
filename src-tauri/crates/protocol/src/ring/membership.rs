@@ -414,7 +414,14 @@ pub fn verify_genesis(r: &Roster) -> Result<(), RosterError> {
 /// Checks the full allowed delta and scoped previous-head authority. Expiry evidence is
 /// verified separately with chain history, not trusted merely because a signer supplied it.
 pub fn verify_transition(prev: &SignedRoster, next: &SignedRoster) -> Result<(), RosterError> {
-    let (p, n) = (prev.roster(), next.roster());
+    verify_transition_roster(prev, next.roster(), false)
+}
+fn verify_transition_roster(
+    prev: &SignedRoster,
+    n: &Roster,
+    unsigned_enroll: bool,
+) -> Result<(), RosterError> {
+    let p = prev.roster();
     if n.v != 2 || p.v > n.v || p.relay_url != n.relay_url || n.issued_at < p.issued_at {
         return Err(invalid("format downgrade, Relay move or clock rollback"));
     }
@@ -552,7 +559,9 @@ pub fn verify_transition(prev: &SignedRoster, next: &SignedRoster) -> Result<(),
         {
             return Err(invalid("retained counterpart changed"));
         }
-        proofs(n, &e.members, ps.unwrap())?;
+        if !unsigned_enroll {
+            proofs(n, &e.members, ps.unwrap())?;
+        }
     }
     let expected_keys = survivors
         .iter()
@@ -629,4 +638,22 @@ pub(crate) fn verify_embedded_signatures(r: &Roster) -> Result<(), RosterError> 
 
 fn required_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     Option::<u64>::deserialize(d)
+}
+
+/// Structural verification of an honestly unsigned Enroll; this never verifies or creates
+/// consent. Callers must verify final Noise context and obtain real proofs before signing.
+pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), RosterError> {
+    n.validate()?;
+    let m = n.membership()?;
+    if !matches!(&m.change, RosterChange::Enroll { proofs, .. } if proofs.is_empty())
+        || n.ring_id != *prev.ring_id()
+        || n.version != prev.version() + 1
+        || n.prev.as_deref() != Some(&prev.hash())
+        || prev
+            .member(&n.signed_by)
+            .is_none_or(|a| a.role != Role::Desktop)
+    {
+        return Err(invalid("not an unsigned Desktop Enroll"));
+    }
+    verify_transition_roster(prev, n, true)
 }

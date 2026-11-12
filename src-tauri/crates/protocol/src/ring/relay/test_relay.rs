@@ -2220,6 +2220,17 @@ impl Conn {
             ClientFrame::AuthChain { .. } | ClientFrame::Auth { .. } => {
                 self.error(ErrorCode::BadRequest, None, None, None);
             }
+            ClientFrame::ProposalCreate { .. }
+            | ClientFrame::ProposalRead { .. }
+            | ClientFrame::ProposalGet { .. }
+            | ClientFrame::ProposalCancel { .. } => {
+                self.error(
+                    ErrorCode::Unsupported,
+                    None,
+                    None,
+                    Some("proposal requires workerd"),
+                );
+            }
             ClientFrame::Ping => {}
         }
     }
