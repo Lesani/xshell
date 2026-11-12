@@ -6,6 +6,8 @@ use crate::config::{validate, validate_one, HostConfig};
 use crate::handle::HostHandle;
 use crate::install::{probe_override, probe_script, run_probe, target_triple, BinarySource};
 use crate::link::LinkLimits;
+use crate::ring::dial::RelayDialer;
+use crate::ring::hosts::{AvailableHost, Reachability, RingHosts, RouteKind, VerifiedRingHost};
 use crate::status::{HostSnapshot, HostStatus, HostTestResult};
 use crate::transport::TransportFactory;
 use std::collections::HashMap;
@@ -24,6 +26,8 @@ pub trait Observer: Send + Sync {
     /// connection. Called outside any Host's lock; must not block or call back into the
     /// manager either.
     fn renamed(&self, _host: &str) {}
+    /// Effective availability changed. Called outside Host/Connector locks.
+    fn available(&self, _hosts: &[AvailableHost]) {}
 }
 
 pub struct ManagerConfig {
@@ -86,12 +90,23 @@ impl ManagerConfig {
 /// already killed by the cancel).
 const STOP_DEADLINE: Duration = Duration::from_secs(3);
 
+#[derive(Clone)]
+struct HostAlias {
+    host: String,
+    daemon_key: Option<xshell_protocol::ring::SignKey>,
+}
+
 pub struct Manager {
     mc: Arc<ManagerConfig>,
     hosts: Mutex<Vec<Arc<HostHandle>>>,
     /// The Local Host when its Terminals run in a Daemon ([`Manager::set_local`]). Outside
     /// `configure`: the frontend's Host list never names it.
     local: Mutex<Option<Arc<HostHandle>>>,
+    ring: Mutex<Option<RingHosts>>,
+    ring_generation: AtomicU64,
+    relay: Mutex<Vec<Arc<HostHandle>>>,
+    available: Mutex<Vec<AvailableHost>>,
+    aliases: Mutex<HashMap<String, HostAlias>>,
     configure_lock: Mutex<()>,
     config_gen: AtomicU64,
     shut: AtomicBool,
@@ -110,12 +125,27 @@ fn join_all(joins: Vec<JoinHandle<()>>, deadline: Instant) {
     }
 }
 
+/// A retained association is corroboration only for the exact saved target. Names and
+/// paths are never identity, and changing the command invalidates the association too.
+fn saved_alias_matches(
+    association: &crate::ring::HostMember,
+    key: &xshell_protocol::ring::SignKey,
+    cfg: &HostConfig,
+) -> bool {
+    association.sign_key == *key && association.target == crate::ring::sync::target_of(cfg)
+}
+
 impl Manager {
     pub fn new(cfg: ManagerConfig) -> Self {
         Self {
             mc: Arc::new(cfg),
             hosts: Mutex::new(Vec::new()),
             local: Mutex::new(None),
+            ring: Mutex::new(None),
+            ring_generation: AtomicU64::new(0),
+            relay: Mutex::new(Vec::new()),
+            available: Mutex::new(Vec::new()),
+            aliases: Mutex::new(HashMap::new()),
             configure_lock: Mutex::new(()),
             config_gen: AtomicU64::new(0),
             shut: AtomicBool::new(false),
@@ -143,17 +173,36 @@ impl Manager {
             .iter()
             .map(|h| (h.id().to_string(), h.clone()))
             .collect();
+        // Retargeting invalidates a retained Ring association before any successor run
+        // starts. A delayed r_ lookup must not reach the new, unverified SSH target.
+        let unchanged: std::collections::HashSet<_> = current
+            .iter()
+            .filter_map(|(id, h)| {
+                hosts
+                    .iter()
+                    .find(|cfg| cfg.id == *id)
+                    .filter(|cfg| {
+                        !cfg.connection_differs(&h.saved_config().expect("configured route"))
+                    })
+                    .map(|_| id.clone())
+            })
+            .collect();
+        // A Host callback may hold its State indefinitely. Never read it while holding
+        // aliases: shutdown must remain independent of blocked deliveries/configure.
+        self.aliases.lock().unwrap().retain(|_, representative| {
+            unchanged.contains(&representative.host) || representative.host == crate::LOCAL_HOST_ID
+        });
         let mut joins = Vec::new();
         let mut replaced = Vec::new();
         let mut next = Vec::new();
         for cfg in &hosts {
             match current.get(&cfg.id) {
                 Some(h) => {
-                    if cfg.connection_differs(&h.config()) {
+                    if cfg.connection_differs(&h.saved_config().expect("configured route")) {
                         joins.extend(h.stop_begin());
                         replaced.push((h.clone(), cfg.clone()));
                     } else {
-                        let before = h.config().name;
+                        let before = h.saved_config().expect("configured route").name;
                         h.set_display(cfg.clone());
                         if before != cfg.name {
                             self.mc.observer.renamed(&cfg.id);
@@ -186,15 +235,9 @@ impl Manager {
         if self.shut.load(Ordering::SeqCst) {
             return Ok(());
         }
-        for (h, _) in &replaced {
-            h.start();
-        }
-        for h in &next {
-            if !current.contains_key(h.id()) {
-                h.start();
-            }
-        }
         *hs = next;
+        drop(hs);
+        self.reconcile_available();
         Ok(())
     }
 
@@ -209,6 +252,9 @@ impl Manager {
         let h = Arc::new(HostHandle::new(cfg, self.mc.clone(), self.next_gen()));
         h.start();
         *local = Some(h);
+        drop(local);
+        let _one = self.configure_lock.lock().unwrap();
+        self.reconcile_available();
     }
 
     fn local(&self) -> Option<Arc<HostHandle>> {
@@ -216,15 +262,39 @@ impl Manager {
     }
 
     pub fn host(&self, id: &str) -> Option<Arc<HostHandle>> {
-        if let Some(l) = self.local().filter(|l| l.id() == id) {
-            return Some(l);
+        let resolved = self.aliases.lock().unwrap().get(id).cloned();
+        let target = resolved
+            .as_ref()
+            .map(|alias| alias.host.as_str())
+            .unwrap_or(id);
+        let handle = self
+            .local()
+            .filter(|local| local.id() == target)
+            .or_else(|| {
+                self.hosts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|h| h.id() == target)
+                    .cloned()
+            })
+            .or_else(|| {
+                self.relay
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|h| h.id() == target)
+                    .cloned()
+            })?;
+        if id != target {
+            if let Some(key) = resolved.and_then(|alias| alias.daemon_key) {
+                if !handle.allows_ring_identity(&key) {
+                    return None;
+                }
+                return Some(HostHandle::for_identity(handle, key));
+            }
         }
-        self.hosts
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|h| h.id() == id)
-            .cloned()
+        Some(handle)
     }
 
     /// The Local Host first, then the configured Hosts in their order.
@@ -234,8 +304,246 @@ impl Manager {
 
     fn all(&self) -> Vec<Arc<HostHandle>> {
         let mut all: Vec<_> = self.local().into_iter().collect();
-        all.extend(self.hosts.lock().unwrap().iter().cloned());
+        let aliases = self.aliases.lock().unwrap().clone();
+        all.extend(
+            self.hosts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|h| aliases.get(h.id()).is_none_or(|alias| alias.host == h.id()))
+                .cloned(),
+        );
+        all.extend(self.relay.lock().unwrap().iter().cloned());
         all
+    }
+
+    /// Trusted Desktop projection only: callers cannot authorize a Host with a display row.
+    pub(crate) fn set_ring_hosts(&self, hosts: Option<RingHosts>) {
+        let _one = self.configure_lock.lock().unwrap();
+        {
+            let mut ring = self.ring.lock().unwrap();
+            *ring = hosts;
+            self.ring_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.reconcile_available();
+    }
+
+    /// The owner generation was already fenced. Do not wait on configure: a saved SSH
+    /// delivery may hold its State while another thread reconfigures it. Retire just the
+    /// Relay handles, independently of those callbacks, before releasing the election.
+    pub(crate) fn retire_ring_hosts(&self) {
+        let mut relay = self.relay.lock().unwrap();
+        {
+            let mut ring = self.ring.lock().unwrap();
+            *ring = None;
+            self.ring_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        let retired = std::mem::take(&mut *relay);
+        let rows = {
+            let mut available = self.available.lock().unwrap();
+            available.retain(|row| row.active_route != RouteKind::Relay);
+            for row in available.iter_mut() {
+                row.routes.retain(|route| *route != RouteKind::Relay);
+            }
+            available.clone()
+        };
+        self.aliases
+            .lock()
+            .unwrap()
+            .retain(|_, id| rows.iter().any(|row| row.id == id.host));
+        drop(relay);
+        let mut joins = Vec::new();
+        for host in retired {
+            host.retire();
+            joins.extend(host.stop_begin());
+        }
+        join_all(joins, Instant::now() + STOP_DEADLINE);
+        self.mc.observer.available(&rows);
+    }
+
+    pub fn available_hosts(&self) -> Vec<AvailableHost> {
+        self.available.lock().unwrap().clone()
+    }
+
+    // Called on the routing worker/configure thread, never a Connector callback.
+    fn reconcile_available(&self) {
+        if self.shut.load(Ordering::SeqCst) {
+            return;
+        }
+        let saved = self.hosts.lock().unwrap().clone();
+        let local = self.local();
+        let (ring, ring_generation) = {
+            let ring = self.ring.lock().unwrap();
+            (ring.clone(), self.ring_generation.load(Ordering::SeqCst))
+        };
+        let mut rows: Vec<AvailableHost> = local
+            .iter()
+            .chain(saved.iter())
+            .map(|h| {
+                let cfg = h.saved_config().expect("configured route");
+                let kind = if h.id() == crate::LOCAL_HOST_ID {
+                    RouteKind::Local
+                } else {
+                    RouteKind::Ssh
+                };
+                AvailableHost {
+                    id: h.id().into(),
+                    aliases: vec![h.id().into()],
+                    name: cfg.name,
+                    color: cfg.color,
+                    daemon_key: None,
+                    routes: vec![kind],
+                    active_route: kind,
+                    reachability: Reachability::Unknown,
+                }
+            })
+            .collect();
+        let mut desired = Vec::new();
+        if let Some(ring) = ring {
+            for descriptor in VerifiedRingHost::project(&ring.state.chain) {
+                if ring
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !owner.authorized(&descriptor))
+                {
+                    continue;
+                }
+                let relay_id = descriptor.id();
+                let mut equivalent = Vec::new();
+                if local
+                    .as_ref()
+                    .is_some_and(|host| host.allows_ring_identity(&descriptor.sign_key))
+                    && ring.state.local_member == Some(descriptor.sign_key)
+                {
+                    equivalent.push(crate::LOCAL_HOST_ID.to_string());
+                }
+                for h in &saved {
+                    let cfg = h.saved_config().expect("configured route");
+                    if ring
+                        .state
+                        .host_members
+                        .get(h.id())
+                        .is_some_and(|m| saved_alias_matches(m, &descriptor.sign_key, &cfg))
+                        && h.allows_ring_identity(&descriptor.sign_key)
+                    {
+                        equivalent.push(h.id().to_string());
+                    }
+                }
+                let representative = equivalent
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| relay_id.clone());
+                let presence = ring
+                    .owner
+                    .as_ref()
+                    .map(|o| o.reachability(&descriptor))
+                    .unwrap_or(Reachability::Unknown);
+                if equivalent.is_empty() {
+                    rows.push(AvailableHost {
+                        id: relay_id.clone(),
+                        aliases: vec![relay_id.clone()],
+                        name: descriptor.name.clone(),
+                        color: None,
+                        daemon_key: Some(descriptor.sign_key),
+                        routes: vec![RouteKind::Relay],
+                        active_route: RouteKind::Relay,
+                        reachability: presence,
+                    });
+                    if let Some(owner) = &ring.owner {
+                        if owner.authorized(&descriptor) {
+                            desired.push(RelayDialer {
+                                host: descriptor,
+                                owner: owner.clone(),
+                            });
+                        }
+                    }
+                } else {
+                    let mut aliases = equivalent.clone();
+                    aliases.push(relay_id);
+                    rows.retain(|row| row.id == representative || !equivalent.contains(&row.id));
+                    if let Some(row) = rows.iter_mut().find(|row| row.id == representative) {
+                        row.aliases = aliases;
+                        row.daemon_key = Some(descriptor.sign_key);
+                        row.routes.push(RouteKind::Relay);
+                        row.reachability = presence;
+                    }
+                }
+            }
+        }
+        let aliases: HashMap<_, _> = rows
+            .iter()
+            .flat_map(|row| {
+                row.aliases.iter().map(|alias| {
+                    (
+                        alias.clone(),
+                        HostAlias {
+                            host: row.id.clone(),
+                            daemon_key: row.daemon_key,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let current = std::mem::take(&mut *self.relay.lock().unwrap());
+        let mut next = Vec::new();
+        let mut joins = Vec::new();
+        for dialer in desired {
+            if let Some(h) = current
+                .iter()
+                .find(|h| h.relay_route().is_some_and(|old| old.same_route(&dialer)))
+            {
+                next.push(h.clone());
+            } else {
+                next.push(Arc::new(HostHandle::new_relay(
+                    dialer,
+                    self.mc.clone(),
+                    self.next_gen(),
+                )));
+            }
+        }
+        for old in &current {
+            if !next.iter().any(|h| Arc::ptr_eq(old, h)) {
+                old.retire();
+                joins.extend(old.stop_begin());
+            }
+        }
+        // Keep only the representative's saved route running for a verified alias group.
+        for h in &saved {
+            if aliases
+                .get(h.id())
+                .is_some_and(|alias| alias.host != h.id())
+            {
+                joins.extend(h.stop_begin());
+            } else {
+                h.start();
+            }
+        }
+        join_all(joins, Instant::now() + STOP_DEADLINE);
+        let mut relay = self.relay.lock().unwrap();
+        if self.shut.load(Ordering::SeqCst)
+            || self.ring_generation.load(Ordering::SeqCst) != ring_generation
+        {
+            for host in next {
+                host.retire();
+                let _ = host.stop_begin();
+            }
+            return;
+        }
+        for h in &next {
+            h.start();
+        }
+        *relay = next;
+        *self.aliases.lock().unwrap() = aliases;
+        let changed = {
+            let mut available = self.available.lock().unwrap();
+            let changed = *available != rows;
+            *available = rows.clone();
+            changed
+        };
+        drop(relay);
+        if changed {
+            self.mc.observer.available(&rows);
+        }
     }
 
     pub fn kick_all(&self) {
@@ -314,6 +622,9 @@ impl Manager {
         self.cancel.cancel();
         let mut hosts: Vec<Arc<HostHandle>> = std::mem::take(&mut *self.hosts.lock().unwrap());
         hosts.extend(self.local.lock().unwrap().take());
+        hosts.extend(std::mem::take(&mut *self.relay.lock().unwrap()));
+        self.available.lock().unwrap().clear();
+        self.aliases.lock().unwrap().clear();
         let mut joins = Vec::new();
         for h in &hosts {
             h.retire();
@@ -429,6 +740,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn saved_alias_matches_rejects_retarget_command_and_key_changes() {
+        let key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let mut cfg = test_host("h_aaaaaaaa", "old-target");
+        let association = crate::ring::HostMember {
+            sign_key: key,
+            target: "old-target|".into(),
+        };
+        assert!(saved_alias_matches(&association, &key, &cfg));
+        cfg.name = "same display name".into();
+        cfg.ssh_target = "new-target".into();
+        assert!(!saved_alias_matches(&association, &key, &cfg));
+        cfg.ssh_target = "old-target".into();
+        cfg.daemon_command = Some("other-command".into());
+        assert!(!saved_alias_matches(&association, &key, &cfg));
+        cfg.daemon_command = None;
+        let replaced_key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        assert!(!saved_alias_matches(&association, &replaced_key, &cfg));
+    }
+
+    #[test]
     fn configure_validates_and_diffs() {
         let rec = Recorder::new();
         let m = Manager::new(test_config(rec.clone()));
@@ -447,11 +782,14 @@ pub(crate) mod tests {
         b2.ssh_target = "b2".into();
         m.configure(vec![b2.clone(), a2.clone()]).unwrap();
         assert!(Arc::ptr_eq(&ha, &m.host("h_aaaaaaaa").unwrap()));
-        assert_eq!(ha.config().name, "renamed");
+        assert_eq!(ha.saved_config().expect("configured route").name, "renamed");
         assert_eq!(ha.status().config_generation, gen_a);
         let hb = m.host("h_bbbbbbbb").unwrap();
         assert!(hb.status().config_generation > gen_b);
-        assert_eq!(hb.config().ssh_target, "b2");
+        assert_eq!(
+            hb.saved_config().expect("configured route").ssh_target,
+            "b2"
+        );
         let order: Vec<String> = m.snapshot().iter().map(|s| s.status.host.clone()).collect();
         assert_eq!(order, ["h_bbbbbbbb", "h_aaaaaaaa"]);
         // Removing stops it.
@@ -1608,7 +1946,14 @@ pub(crate) mod tests {
         assert!(m.configure(vec![local_host()]).is_err());
         // Set once.
         m.set_local(test_host(crate::LOCAL_HOST_ID, "elsewhere"));
-        assert_eq!(m.host("local").unwrap().config().ssh_target, "sock");
+        assert_eq!(
+            m.host("local")
+                .unwrap()
+                .saved_config()
+                .expect("configured route")
+                .ssh_target,
+            "sock"
+        );
         m.shutdown();
     }
 

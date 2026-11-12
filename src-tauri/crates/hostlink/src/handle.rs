@@ -12,7 +12,7 @@
 //! Stopping never takes `State` either (see `stop_begin`).
 
 use crate::cancel::CancelToken;
-use crate::config::HostConfig;
+use crate::config::{HostConfig, HostDefinition, HostRoute};
 use crate::errors::{HostError, HostErrorCode};
 use crate::link::{Link, LinkEvents, Waiter};
 use crate::manager::ManagerConfig;
@@ -63,14 +63,47 @@ const FILE_TRANSFER_METHODS: &[&str] = &[
     "upload_abort",
 ];
 
+/// A Ring alias is access to an identity on this configured route, not unrestricted
+/// access to every later Daemon reached by that route.
+#[derive(Clone, Copy)]
+struct IdentityTarget {
+    daemon_key: xshell_protocol::ring::SignKey,
+    config_generation: u64,
+}
+impl IdentityTarget {
+    fn matches(
+        self,
+        config_generation: u64,
+        identity: Option<xshell_protocol::ring::SignKey>,
+    ) -> bool {
+        self.config_generation == config_generation && identity == Some(self.daemon_key)
+    }
+    fn check(
+        self,
+        config_generation: u64,
+        identity: Option<xshell_protocol::ring::SignKey>,
+    ) -> Result<(), HostError> {
+        self.matches(config_generation, identity)
+            .then_some(())
+            .ok_or_else(|| {
+                HostError::offline("this Ring alias is not verified on the current Host connection")
+            })
+    }
+}
+
 pub(crate) struct SinkSlot {
     sink: Arc<dyn TermSink>,
     bytes: u64,
+    identity: Option<IdentityTarget>,
 }
 
 impl SinkSlot {
-    fn new(sink: Arc<dyn TermSink>) -> Self {
-        Self { sink, bytes: 0 }
+    fn new(sink: Arc<dyn TermSink>, identity: Option<IdentityTarget>) -> Self {
+        Self {
+            sink,
+            bytes: 0,
+            identity,
+        }
     }
 }
 
@@ -108,7 +141,7 @@ pub struct InputTarget {
 }
 
 pub(crate) struct State {
-    pub cfg: HostConfig,
+    pub cfg: HostDefinition,
     pub status: HostStatus,
     published: Option<HostStatus>,
     pub terminals: Option<Vec<TerminalInfo>>,
@@ -116,6 +149,8 @@ pub(crate) struct State {
     pub gen: u64,
     /// The usable link; always of generation `gen`. Change it only through `set_link`.
     link: Option<Arc<Link>>,
+    /// Proof for exactly `gen`, cleared before a different Link can be selected.
+    identity: Option<xshell_protocol::ring::SignKey>,
     pub link_closed: bool,
     pub close_reason: Option<String>,
     /// The generation of the newest `terminals` list.
@@ -146,6 +181,7 @@ impl State {
 /// What the sync paths need: the link to enqueue on, or why there is none.
 struct Endpoint {
     input_target: InputTarget,
+    identity: Option<xshell_protocol::ring::SignKey>,
     completion_attention: bool,
     link: Option<Arc<Link>>,
     down: HostError,
@@ -161,6 +197,10 @@ pub(crate) struct Shared {
     /// The current transport process (0: none), for tests.
     child_pid: AtomicU32,
     ep: Mutex<Endpoint>,
+    relay: Option<crate::ring::dial::RelayDialer>,
+    /// Last identity accepted on a current link for this configured target. A contradiction
+    /// survives reconnects until new current proof; retarget/reset clears it.
+    observed_identity: Mutex<Option<xshell_protocol::ring::SignKey>>,
     /// The last size this Desktop set per Terminal, re-sent after a re-attach.
     sizes: Mutex<HashMap<Uuid, (u16, u16)>>,
     /// The latest status and list, for `snapshot`.
@@ -235,14 +275,27 @@ enum Done<'a> {
 
 impl Shared {
     pub(crate) fn new(cfg: HostConfig, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
-        let status = HostStatus::initial(
+        Self::new_definition(cfg.into(), mc, config_generation)
+    }
+
+    fn new_definition(cfg: HostDefinition, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
+        let mut status = HostStatus::initial(
             &cfg.id,
             &mc.desktop_version,
             mc.desktop_build.clone(),
             config_generation,
         );
+        if matches!(cfg.route, HostRoute::Relay(_)) {
+            status.route_update_unavailable =
+                Some(crate::status::RouteUpdateUnavailable::RelayOnly);
+        }
         let down = HostError::offline(format!("{} is reconnecting", cfg.name));
         Self {
+            observed_identity: Mutex::new(None),
+            relay: match &cfg.route {
+                HostRoute::Relay(d) => Some(d.clone()),
+                _ => None,
+            },
             id: cfg.id.clone(),
             mc,
             snap: Mutex::new(HostSnapshot {
@@ -255,6 +308,7 @@ impl Shared {
                 published: None,
                 terminals: None,
                 gen: 0,
+                identity: None,
                 link: None,
                 link_closed: false,
                 close_reason: None,
@@ -271,6 +325,7 @@ impl Shared {
             kick: AtomicBool::new(false),
             child_pid: AtomicU32::new(0),
             ep: Mutex::new(Endpoint {
+                identity: None,
                 link: None,
                 down,
                 completion_attention: false,
@@ -290,6 +345,7 @@ impl Shared {
     fn sync_ep(&self, st: &State) {
         let mut ep = self.ep.lock().unwrap();
         ep.link = st.link.clone();
+        ep.identity = st.identity;
         ep.input_target = InputTarget {
             config_generation: st.status.config_generation,
             // Adoption exposes this link before publishing its status. The internal
@@ -335,6 +391,9 @@ impl Shared {
                     UpdateAction::Replace
                 }
             });
+        if st.status.route_update_unavailable.is_some() {
+            st.status.update_action = None;
+        }
         if st.published.as_ref() != Some(&st.status) {
             st.published = Some(st.status.clone());
             self.snap.lock().unwrap().status = st.status.clone();
@@ -351,12 +410,32 @@ impl Shared {
     pub(crate) fn begin_link(&self, child_pid: Option<u32>) -> u64 {
         let mut st = self.lock();
         st.gen += 1;
+        st.identity = None;
         self.set_link(&mut st, None);
         st.link_closed = false;
         st.close_reason = None;
         self.child_pid
             .store(child_pid.unwrap_or(0), Ordering::SeqCst);
         st.gen
+    }
+
+    fn observe_identity(self: &Arc<Self>, gen: u64, key: xshell_protocol::ring::SignKey) -> bool {
+        let mut st = self.lock();
+        if st.gen != gen || st.link_closed || st.link().is_none_or(|link| link.is_closed()) {
+            return false;
+        }
+        *self.observed_identity.lock().unwrap() = Some(key);
+        st.identity = Some(key);
+        self.sync_ep(&st);
+        if let Some(link) = st.link().cloned() {
+            if self.reattach_locked(&mut st, gen, &link) > 0 {
+                // Adoption may have skipped these while identity was unknown. Reuse the
+                // supervisor's bounded retry loop if proof arrives under queue pressure.
+                self.kick.store(true, Ordering::SeqCst);
+                self.cv.notify_all();
+            }
+        }
+        true
     }
 
     pub(crate) fn events(self: &Arc<Self>, gen: u64) -> Arc<dyn LinkEvents> {
@@ -373,7 +452,7 @@ impl Shared {
             if st.list_gen == gen {
                 return true;
             }
-            if st.gen != gen || st.link_closed {
+            if st.gen != gen || st.link_closed || !st.cfg.authorized() {
                 return false;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -395,7 +474,7 @@ impl Shared {
         set: impl FnOnce(&mut State),
     ) -> Option<usize> {
         let mut st = self.lock();
-        if st.gen != gen || st.link_closed {
+        if st.gen != gen || st.link_closed || !st.cfg.authorized() {
             return None;
         }
         self.set_link(&mut st, Some(link.clone()));
@@ -430,6 +509,16 @@ impl Shared {
         let mut left = 0;
         let ids: Vec<Uuid> = st.atts.keys().copied().collect();
         for t in ids {
+            let desired = st
+                .atts
+                .get(&t)
+                .and_then(|a| a.pending.as_ref().map(|p| &p.1).or(a.sink.as_ref()));
+            if desired.is_none_or(|slot| {
+                slot.identity
+                    .is_some_and(|target| !target.matches(st.status.config_generation, st.identity))
+            }) {
+                continue;
+            }
             match st.atts.get_mut(&t) {
                 // An explicit attach on this link already replayed into the newest sink.
                 None => continue,
@@ -484,6 +573,16 @@ impl Shared {
             if st.gen != gen {
                 return;
             }
+            let desired = st
+                .atts
+                .get(&t)
+                .and_then(|a| a.pending.as_ref().map(|p| &p.1).or(a.sink.as_ref()));
+            if desired.is_some_and(|slot| {
+                slot.identity
+                    .is_some_and(|target| !target.matches(st.status.config_generation, st.identity))
+            }) {
+                return;
+            }
             let Some(a) = st.atts.get_mut(&t) else {
                 return;
             };
@@ -525,6 +624,9 @@ impl Shared {
     }
 
     fn usable_link(st: &State) -> Result<(Arc<Link>, u64), HostError> {
+        if !st.cfg.authorized() {
+            return Err(HostError::offline("the Ring Host authorization changed"));
+        }
         match &st.link {
             Some(l) if !l.is_closed() => Ok((l.clone(), st.gen)),
             _ => Err(unusable(st)),
@@ -537,6 +639,7 @@ impl Shared {
         st: &mut State,
         (link, gen): (&Arc<Link>, u64),
         (t, sink): (Uuid, Arc<dyn TermSink>),
+        identity: Option<IdentityTarget>,
         done: Callback<Reply>,
     ) -> Result<(), HostError> {
         let epoch = st.next_epoch();
@@ -545,7 +648,7 @@ impl Shared {
             st.atts.insert(
                 t,
                 Attachment {
-                    sink: Some(SinkSlot::new(sink)),
+                    sink: Some(SinkSlot::new(sink, identity)),
                     pending: None,
                     attached_gen: gen,
                     epoch,
@@ -554,7 +657,7 @@ impl Shared {
             );
         } else {
             let a = st.atts.get_mut(&t).expect("exists");
-            a.pending = Some((epoch, SinkSlot::new(sink)));
+            a.pending = Some((epoch, SinkSlot::new(sink, identity)));
             a.attached_gen = gen;
             a.epoch = epoch;
             a.inflight.insert(epoch);
@@ -616,6 +719,8 @@ impl LinkEvents for LinkObs {
         if st.gen != self.gen {
             return;
         }
+        let config_generation = st.status.config_generation;
+        let identity = st.identity;
         let Some(a) = st.atts.get_mut(&t) else {
             return;
         };
@@ -624,6 +729,12 @@ impl LinkEvents for LinkObs {
             // this output belongs to the previous attach.
             return;
         };
+        if slot
+            .identity
+            .is_some_and(|target| !target.matches(config_generation, identity))
+        {
+            return;
+        }
         if slot.sink.data(data) {
             slot.bytes += data.len() as u64;
         } else if a.pending.is_some() {
@@ -659,7 +770,11 @@ impl LinkEvents for LinkObs {
         }
         // The Terminal stays listed, so the attachment stays too.
         if let Some(Some(s)) = st.atts.get(&t).map(|a| a.sink.as_ref()) {
-            s.sink.exit(code, s.bytes);
+            if s.identity
+                .is_none_or(|target| target.matches(st.status.config_generation, st.identity))
+            {
+                s.sink.exit(code, s.bytes);
+            }
         }
     }
 
@@ -681,10 +796,17 @@ struct Running {
     join: JoinHandle<()>,
 }
 
-/// A configured Host. Lives as long as its id stays configured; a replaced configuration
-/// restarts the supervisor but keeps the handle and its attachments.
+struct IdentityAccess {
+    owner: Arc<HostHandle>,
+    target: IdentityTarget,
+}
+
+/// Host access. The canonical instance owns its supervisor; an identity-bound alias view
+/// shares its State and owner lifetime, but carries its own immutable admission target.
+/// Replacing a configuration restarts the canonical supervisor, not its alias views.
 pub struct HostHandle {
     pub(crate) sh: Arc<Shared>,
+    identity_access: Option<IdentityAccess>,
     run: Mutex<Option<Running>>,
     /// Shut down for good: `start` does nothing any more.
     retired: AtomicBool,
@@ -707,8 +829,58 @@ impl HostHandle {
     pub(crate) fn new(cfg: HostConfig, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
         Self {
             sh: Arc::new(Shared::new(cfg, mc, config_generation)),
+            identity_access: None,
             run: Mutex::new(None),
             retired: AtomicBool::new(false),
+        }
+    }
+
+    /// An identity-bound view shares the owner Link/attachments, never another supervisor.
+    pub(crate) fn for_identity(
+        owner: Arc<Self>,
+        daemon_key: xshell_protocol::ring::SignKey,
+    ) -> Arc<Self> {
+        let config_generation = owner.sh.ep.lock().unwrap().input_target.config_generation;
+        Arc::new(Self {
+            sh: owner.sh.clone(),
+            identity_access: Some(IdentityAccess {
+                owner,
+                target: IdentityTarget {
+                    daemon_key,
+                    config_generation,
+                },
+            }),
+            run: Mutex::new(None),
+            retired: AtomicBool::new(true),
+        })
+    }
+
+    fn identity_target(&self) -> Option<IdentityTarget> {
+        self.identity_access.as_ref().map(|access| access.target)
+    }
+
+    fn usable_link(&self, st: &State) -> Result<(Arc<Link>, u64), HostError> {
+        if let Some(target) = self.identity_target() {
+            target.check(st.status.config_generation, st.identity)?;
+        }
+        Shared::usable_link(st)
+    }
+
+    fn usable_endpoint(&self, ep: &Endpoint) -> Result<Arc<Link>, HostError> {
+        if let Some(target) = self.identity_target() {
+            target.check(ep.input_target.config_generation, ep.identity)?;
+        }
+        if self
+            .sh
+            .relay
+            .as_ref()
+            .is_some_and(|dialer| !dialer.authorized())
+        {
+            return Err(HostError::offline("the Ring Host authorization changed"));
+        }
+        match &ep.link {
+            Some(link) if !link.is_closed() => Ok(link.clone()),
+            _ => Err(ep.down.clone()),
         }
     }
 
@@ -746,6 +918,9 @@ impl HostHandle {
 
     /// The running supervisor's token, for helper work such as the upgrade kill script.
     fn cancel_token(&self) -> CancelToken {
+        if let Some(access) = &self.identity_access {
+            return access.owner.cancel_token();
+        }
         self.run
             .lock()
             .unwrap()
@@ -760,7 +935,9 @@ impl HostHandle {
             let mut st = self.sh.lock();
             st.gen += 1;
             let link = st.link.take();
-            st.cfg = cfg;
+            st.cfg = cfg.into();
+            st.identity = None;
+            *self.sh.observed_identity.lock().unwrap() = None;
             st.terminals = None;
             st.list_gen = 0;
             st.link_closed = false;
@@ -795,25 +972,76 @@ impl HostHandle {
         &self.sh.id
     }
 
-    pub fn config(&self) -> HostConfig {
-        self.sh.lock().cfg.clone()
+    /// Saved/configured route only; discovered Relay Hosts have no SSH configuration.
+    pub fn saved_config(&self) -> Option<HostConfig> {
+        self.sh.lock().cfg.configured().cloned()
+    }
+
+    pub fn display_name(&self) -> String {
+        self.sh.lock().cfg.name.clone()
+    }
+
+    pub(crate) fn allows_ring_identity(&self, key: &xshell_protocol::ring::SignKey) -> bool {
+        self.sh
+            .observed_identity
+            .lock()
+            .unwrap()
+            .is_none_or(|observed| observed == *key)
+    }
+
+    pub(crate) fn relay_route(&self) -> Option<crate::ring::dial::RelayDialer> {
+        self.sh.relay.clone()
+    }
+
+    pub(crate) fn new_relay(
+        dialer: crate::ring::dial::RelayDialer,
+        mc: Arc<ManagerConfig>,
+        generation: u64,
+    ) -> Self {
+        let sh = Shared::new_definition(
+            HostDefinition {
+                id: dialer.host.id(),
+                name: dialer.host.name.clone(),
+                route: HostRoute::Relay(dialer),
+            },
+            mc,
+            generation,
+        );
+        Self {
+            sh: Arc::new(sh),
+            identity_access: None,
+            run: Mutex::new(None),
+            retired: AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn set_display(&self, cfg: HostConfig) {
-        self.sh.lock().cfg = cfg;
+        self.sh.lock().cfg = cfg.into();
     }
 
     pub fn status(&self) -> HostStatus {
-        self.sh.snapshot().status
+        self.snapshot().status
     }
 
     pub fn terminals(&self) -> Option<Vec<TerminalInfo>> {
-        self.sh.snapshot().terminals
+        self.snapshot().terminals
     }
 
     /// The latest status and list. Never waits on deliveries.
     pub fn snapshot(&self) -> HostSnapshot {
-        self.sh.snapshot()
+        let mut snapshot = self.sh.snapshot();
+        if self.identity_access.is_some() {
+            snapshot.status.route_update_unavailable =
+                Some(crate::status::RouteUpdateUnavailable::IdentityBoundAlias);
+            snapshot.status.update_action = None;
+            let admitted = quick(&self.sh.ep).and_then(|ep| self.usable_endpoint(&ep));
+            if let Err(error) = admitted {
+                snapshot.status.set_kind(StatusKind::Offline);
+                snapshot.status.last_error = Some(error.message);
+                snapshot.terminals = None;
+            }
+        }
+        snapshot
     }
 
     /// The pid of the current transport process (ssh), for tests.
@@ -838,7 +1066,7 @@ impl HostHandle {
         let once = Once::new(w);
         let sent = {
             let st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(l, _)| {
+            self.usable_link(&st).and_then(|(l, _)| {
                 let o = once.clone();
                 l.request(
                     msg,
@@ -852,12 +1080,30 @@ impl HostHandle {
         }
     }
 
+    fn configured_lifecycle_refusal(&self) -> Option<HostError> {
+        self.identity_access.as_ref().map(|_| HostError::invalid(
+            "Identity-bound alias access cannot manage the Daemon or Ring; use the explicitly configured Host"))
+    }
+
     pub fn call(&self, method: String, params: Value, w: Waiter) {
+        if method.starts_with("daemon.") || method.starts_with("ring.") {
+            if let Some(error) = self.configured_lifecycle_refusal() {
+                w(Err(error));
+                return;
+            }
+        }
+        if self.sh.relay.is_some() && (method.starts_with("daemon.") || method.starts_with("ring."))
+        {
+            w(Err(HostError::invalid(
+                "Relay-only access cannot change Daemon lifecycle or Ring membership",
+            )));
+            return;
+        }
         // An older Daemon would answer "unknown method": refuse with the remedy instead.
         if FILE_TRANSFER_METHODS.contains(&method.as_str()) {
             let lacking = {
                 let st = self.sh.lock();
-                Shared::usable_link(&st).is_ok()
+                self.usable_link(&st).is_ok()
                     && !st
                         .status
                         .daemon_capabilities
@@ -912,6 +1158,7 @@ impl HostHandle {
         let finish = {
             let once = once.clone();
             let sh = Arc::downgrade(&self.sh);
+            let identity = self.identity_target();
             move |open: Option<Reply>, attach: Reply| {
                 let open = open.map(|r| r.map(|v| open_reply(&v)));
                 let r = match (open, attach) {
@@ -919,8 +1166,12 @@ impl HostHandle {
                     (Some(Ok(o)), _) if o.existed && o.terminal.is_some_and(|o| o != t) => {
                         if let Some(sh) = sh.upgrade() {
                             let mut st = sh.lock();
-                            Shared::detach_locked(&mut st, t, &sh.sizes);
-                            sh.sizes.lock().unwrap().remove(&t);
+                            if identity.is_none_or(|target| {
+                                target.matches(st.status.config_generation, st.identity)
+                            }) {
+                                Shared::detach_locked(&mut st, t, &sh.sizes);
+                                sh.sizes.lock().unwrap().remove(&t);
+                            }
                         }
                         Ok(o)
                     }
@@ -952,7 +1203,7 @@ impl HostHandle {
         let mut spec = spec;
         let sent = {
             let mut st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(link, gen)| {
+            self.usable_link(&st).and_then(|(link, gen)| {
                 // The Host's configuration decides the prefix, never the request. A Daemon
                 // that predates prefixes would drop it and run the agent bare, so it is
                 // refused instead.
@@ -989,7 +1240,13 @@ impl HostHandle {
                 // outside the lock.
                 Ok(self
                     .sh
-                    .begin_attach(&mut st, (&link, gen), (t, sink), done)
+                    .begin_attach(
+                        &mut st,
+                        (&link, gen),
+                        (t, sink),
+                        self.identity_target(),
+                        done,
+                    )
                     .err())
             })
         };
@@ -1015,8 +1272,14 @@ impl HostHandle {
         });
         let sent = {
             let mut st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(link, gen)| {
-                self.sh.begin_attach(&mut st, (&link, gen), (t, sink), done)
+            self.usable_link(&st).and_then(|(link, gen)| {
+                self.sh.begin_attach(
+                    &mut st,
+                    (&link, gen),
+                    (t, sink),
+                    self.identity_target(),
+                    done,
+                )
             })
         };
         if let Err(e) = sent {
@@ -1024,23 +1287,19 @@ impl HostHandle {
         }
     }
 
-    /// Forget the sink. Never fails: offline, there is nothing to tell the Daemon.
+    /// Forget the sink. Independent configured access can detach offline; an alias must
+    /// still prove its current identity before changing shared attachments or notifying.
     pub fn term_detach(&self, t: Uuid) -> Result<(), HostError> {
         let mut st = self.sh.lock();
+        if self.identity_access.is_some() {
+            self.usable_link(&st)?;
+        }
         Shared::detach_locked(&mut st, t, &self.sh.sizes);
         Ok(())
     }
 
-    /// The current link for the sync paths, or why there is none. Never waits on `State`.
-    fn endpoint(&self) -> Result<Arc<Link>, HostError> {
-        let ep = quick(&self.sh.ep)?;
-        match &ep.link {
-            Some(l) if !l.is_closed() => Ok(l.clone()),
-            _ => Err(ep.down.clone()),
-        }
-    }
-
-    /// Sync and non-blocking: enqueues or fails with `offline`, `incompatible` or `busy`.
+    /// Sync paths check identity and enqueue under the same Endpoint lock that Link
+    /// changes/proof observations update. They never wait for a sink's Host State lock.
     pub fn term_input(
         &self,
         t: Uuid,
@@ -1052,20 +1311,25 @@ impl HostHandle {
         if target.is_some_and(|target| target != ep.input_target) {
             return Err(HostError::offline("the input connection changed"));
         }
-        match &ep.link {
-            Some(link) if !link.is_closed() => link.notify(ClientMsg::TermInput {
-                terminal: t,
-                data,
-                handled_completion_id: observed.filter(|_| ep.completion_attention),
-            }),
-            _ => Err(ep.down.clone()),
-        }
+        self.usable_endpoint(&ep)?.notify(ClientMsg::TermInput {
+            terminal: t,
+            data,
+            handled_completion_id: observed.filter(|_| ep.completion_attention),
+        })
     }
 
-    /// Sync and non-blocking; the size is remembered for re-attach even when offline.
+    /// The size is remembered offline for independent configured access, never from a
+    /// refused identity-bound alias that could otherwise resize a different Daemon later.
     pub fn term_resize(&self, t: Uuid, cols: u16, rows: u16) -> Result<(), HostError> {
-        quick(&self.sh.sizes)?.insert(t, (cols, rows));
-        self.endpoint()?.notify(ClientMsg::TermResize {
+        if self.identity_access.is_none() {
+            quick(&self.sh.sizes)?.insert(t, (cols, rows));
+        }
+        let ep = quick(&self.sh.ep)?;
+        let link = self.usable_endpoint(&ep)?;
+        if self.identity_access.is_some() {
+            quick(&self.sh.sizes)?.insert(t, (cols, rows));
+        }
+        link.notify(ClientMsg::TermResize {
             terminal: t,
             cols,
             rows,
@@ -1122,7 +1386,7 @@ impl HostHandle {
             // The capability and the link are checked and used under one lock: `adopt`
             // replaces both together.
             let st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(l, _)| {
+            self.usable_link(&st).and_then(|(l, _)| {
                 if !st
                     .status
                     .daemon_capabilities
@@ -1166,7 +1430,7 @@ impl HostHandle {
             // The capability, the generation and the link are checked and used under one
             // lock: `adopt` replaces them together.
             let st = self.sh.lock();
-            Shared::usable_link(&st).and_then(|(l, gen)| {
+            self.usable_link(&st).and_then(|(l, gen)| {
                 if link_gen.is_some_and(|g| g != gen) {
                     return Err(HostError::offline(format!("{} reconnected", st.cfg.name)));
                 }
@@ -1192,7 +1456,19 @@ impl HostHandle {
             &[RING_CAPABILITY],
             RING_REFUSED,
             Some(link_gen),
-            w,
+            Box::new({
+                let sh = self.sh.clone();
+                move |reply| {
+                    // Identity contradictions are routing evidence, not enrollment results.
+                    // Record before a caller can reject a foreign Ring or a refused join.
+                    if let Ok(value) = &reply {
+                        if let Ok(identity) = crate::ring::LocalIdentity::from_json(value) {
+                            sh.observe_identity(link_gen, identity.sign_key);
+                        }
+                    }
+                    w(reply);
+                }
+            }),
         );
     }
 
@@ -1206,6 +1482,17 @@ impl HostHandle {
         link_gen: u64,
         w: Waiter,
     ) {
+        if let Some(error) = self.configured_lifecycle_refusal() {
+            w(Err(error));
+            return;
+        }
+        if self.sh.relay.is_some() {
+            w(Err(HostError::invalid(
+                "discovered Relay Hosts cannot be automatically enrolled",
+            )));
+            return;
+        }
+
         let caps: &[&str] = if expect.is_some() {
             &[RING_CAPABILITY, RING_CJOIN_CAPABILITY]
         } else {
@@ -1241,9 +1528,16 @@ impl HostHandle {
     }
 
     fn upgrade_inner(&self, target: Option<UpdateTarget>, mode_switch: bool, w: Waiter) {
+        if let Some(error) = self.configured_lifecycle_refusal() {
+            w(Err(error));
+            return;
+        }
         let once = Once::new(w);
         let reservation = (|| {
             let mut st = self.sh.lock();
+            if st.status.route_update_unavailable.is_some() {
+                return Err(HostError::invalid("Relay-only access cannot update or stop the Daemon; use its owning Desktop or an independent SSH route"));
+            }
             if st.upgrading {
                 return Err(HostError::new(
                     crate::HostErrorCode::Busy,
@@ -1278,7 +1572,7 @@ impl HostHandle {
                     .sh
                     .mc
                     .transports
-                    .direct(&st.cfg)
+                    .direct(st.cfg.configured().expect("configured update route"))
                     .is_some_and(|d| !d.upgradable())
             {
                 return Err(HostError::new(
@@ -1300,7 +1594,7 @@ impl HostHandle {
                 ));
             }
             let windows = st.status.os.as_deref() == Some("windows");
-            let stop = match Shared::usable_link(&st) {
+            let stop = match self.usable_link(&st) {
                 Ok((link, _)) => {
                     if windows
                         && !st
@@ -1321,14 +1615,18 @@ impl HostHandle {
                                     .sh
                                     .mc
                                     .transports
-                                    .direct(&st.cfg)
+                                    .direct(st.cfg.configured().expect("configured update route"))
                                     .is_some_and(|d| d.upgradable()))) =>
                 {
                     Stop::Script
                 }
                 Err(e) => return Err(e),
             };
-            let cfg = st.cfg.clone();
+            let cfg = st
+                .cfg
+                .configured()
+                .expect("configured update route")
+                .clone();
             let gen = st.gen;
             let op = st.next_epoch();
             st.upgrade_operation = Some(op);
@@ -1804,9 +2102,45 @@ pub(crate) mod tests {
     fn handle(sh: &Arc<Shared>) -> HostHandle {
         HostHandle {
             sh: sh.clone(),
+            identity_access: None,
             run: Mutex::new(None),
             retired: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn identity_observations_are_link_bound_and_stale_results_cannot_restore_aliases() {
+        let sh = shared();
+        let (_old_peer, _old_link, old_gen) = connect(&sh, vec![]);
+        let original = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let changed = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let h = handle(&sh);
+        assert!(sh.observe_identity(old_gen, original));
+        let (_new_peer, _new_link, current_gen) = connect(&sh, vec![]);
+        assert!(sh.observe_identity(current_gen, changed));
+        assert!(!sh.observe_identity(old_gen, original));
+        assert!(
+            !h.allows_ring_identity(&original),
+            "stale original proof restored a contradictory alias"
+        );
+        assert!(sh.observe_identity(current_gen, original));
+        assert!(!sh.observe_identity(old_gen, changed));
+        assert!(
+            h.allows_ring_identity(&original),
+            "stale contradiction invalidated current proof"
+        );
+        h.reset(crate::config::test_host("h_ab12cd34", "new-target"), 2);
+        let (_retarget_peer, _retarget_link, retarget_gen) = connect(&sh, vec![]);
+        assert!(sh.observe_identity(retarget_gen, original));
+        assert!(!sh.observe_identity(current_gen, changed));
+        assert!(
+            h.allows_ring_identity(&original),
+            "pre-retarget proof changed the new target's association"
+        );
     }
 
     fn res_slot<T: Send + 'static>() -> (Box<dyn FnOnce(T) + Send>, mpsc::Receiver<T>) {
@@ -1820,6 +2154,406 @@ pub(crate) mod tests {
     }
 
     const T5: Duration = Duration::from_secs(5);
+
+    fn assert_identity_access_refused(access: &HostHandle, terminal: Uuid) {
+        let (waiter, receiver) = slot();
+        access.call("list_dir".into(), json!({"path":"/"}), waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (waiter, receiver) = res_slot();
+        access.term_open(
+            OpenSpec {
+                terminal,
+                launch: LaunchSpec::default(),
+                cols: 80,
+                rows: 24,
+                meta: Default::default(),
+                first_message: None,
+                adopt_existing: false,
+            },
+            Arc::new(VecSink::default()),
+            waiter,
+        );
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (waiter, receiver) = res_slot();
+        access.term_attach(terminal, Arc::new(VecSink::default()), waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (waiter, receiver) = res_slot();
+        access.term_relaunch(terminal, true, waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (waiter, receiver) = slot();
+        access.term_close(terminal, waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        let (waiter, receiver) = slot();
+        access.term_update(terminal, Some("session".into()), None, waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        assert_eq!(
+            access
+                .term_input(terminal, "must not send".into(), None, None)
+                .unwrap_err()
+                .code,
+            HostErrorCode::Offline
+        );
+        assert_eq!(
+            access.term_resize(terminal, 1, 1).unwrap_err().code,
+            HostErrorCode::Offline
+        );
+        assert_eq!(
+            access.term_detach(terminal).unwrap_err().code,
+            HostErrorCode::Offline
+        );
+    }
+
+    #[test]
+    fn identity_bound_access_admits_only_current_proven_links_and_keeps_direct_access() {
+        let sh = shared();
+        let terminal = Uuid::new_v4();
+        let (mut first, _first_link, first_gen) = connect(&sh, vec![info(terminal)]);
+        let owner = Arc::new(handle(&sh));
+        let original = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let changed = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let access = HostHandle::for_identity(owner.clone(), original);
+        assert!(Arc::ptr_eq(&access.sh, &owner.sh));
+        assert!(Arc::ptr_eq(
+            &access.identity_access.as_ref().unwrap().owner,
+            &owner
+        ));
+        assert!(
+            access.run.lock().unwrap().is_none(),
+            "an alias view owns no second supervisor"
+        );
+        assert_identity_access_refused(&access, terminal);
+        assert!(!access.status().usable());
+        owner
+            .term_input(terminal, "direct unknown".into(), None, None)
+            .unwrap();
+        assert_eq!(
+            first.read_json()["data"],
+            "direct unknown",
+            "refused alias work escaped to the peer"
+        );
+        assert!(sh.observe_identity(first_gen, original));
+        let (waiter, receiver) = slot();
+        access.call("get_home_dir".into(), json!({}), waiter);
+        let request = first.read_json();
+        assert_eq!(request["t"], "call");
+        first.reply(request["id"].as_u64().unwrap(), Ok(json!("original home")));
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap(),
+            json!("original home")
+        );
+        {
+            let _blocked_delivery = sh.lock();
+            let bounded_view = HostHandle::for_identity(owner.clone(), original);
+            bounded_view
+                .term_input(terminal, "identity proven".into(), None, None)
+                .unwrap();
+            bounded_view.term_resize(terminal, 100, 40).unwrap();
+        }
+        assert_eq!(first.read_json()["data"], "identity proven");
+        assert_eq!(first.read_json()["cols"], 100);
+        let (mut replacement, _replacement_link, replacement_gen) =
+            connect(&sh, vec![info(terminal)]);
+        assert!(
+            !sh.observe_identity(first_gen, original),
+            "old positive proof was accepted"
+        );
+        assert_identity_access_refused(&access, terminal);
+        assert_eq!(
+            sh.sizes.lock().unwrap().get(&terminal),
+            Some(&(100, 40)),
+            "refused Resize changed later replay state"
+        );
+        assert!(sh.observe_identity(replacement_gen, changed));
+        assert_identity_access_refused(&access, terminal);
+        owner
+            .term_input(terminal, "independent changed identity".into(), None, None)
+            .unwrap();
+        assert_eq!(
+            replacement.read_json()["data"],
+            "independent changed identity",
+            "alias request/notification reached replacement"
+        );
+        assert!(owner.status().usable());
+        assert!(!access.status().usable());
+        owner.reset(crate::config::test_host("h_ab12cd34", "retargeted"), 2);
+        let (mut retargeted, _retargeted_link, retargeted_gen) = connect(&sh, vec![info(terminal)]);
+        assert!(sh.observe_identity(retargeted_gen, original));
+        assert_identity_access_refused(&access, terminal);
+        owner
+            .term_input(terminal, "independent retarget".into(), None, None)
+            .unwrap();
+        assert_eq!(retargeted.read_json()["data"], "independent retarget");
+    }
+
+    #[test]
+    fn identity_bound_attachments_wait_for_current_proof_without_replaying_to_another_daemon() {
+        let sh = shared();
+        let terminal = Uuid::new_v4();
+        let (mut first, _first_link, first_gen) = connect(&sh, vec![info(terminal)]);
+        let owner = Arc::new(handle(&sh));
+        let original = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let changed = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        assert!(sh.observe_identity(first_gen, original));
+        let access = HostHandle::for_identity(owner.clone(), original);
+        let sink = Arc::new(VecSink::default());
+        let (waiter, receiver) = res_slot();
+        access.term_attach(terminal, sink.clone(), waiter);
+        let request = first.read_json();
+        assert_eq!(request["t"], "term.attach");
+        first.reply(
+            request["id"].as_u64().unwrap(),
+            Ok(json!({"exitCode":null})),
+        );
+        receiver.recv_timeout(T5).unwrap().unwrap();
+        access.term_resize(terminal, 100, 40).unwrap();
+        assert_eq!(first.read_json()["t"], "term.resize");
+        let (mut replacement, _replacement_link, replacement_gen) =
+            connect(&sh, vec![info(terminal)]);
+        replacement.write(&out_frame(terminal, b"UNPROVEN OUTPUT"));
+        assert!(sh.observe_identity(replacement_gen, changed));
+        replacement.write(&out_frame(terminal, b"FOREIGN OUTPUT"));
+        let (waiter, receiver) = slot();
+        owner.call("get_home_dir".into(), json!({}), waiter);
+        let request = replacement.read_json();
+        assert_eq!(
+            request["t"], "call",
+            "automatic Attach/Resize escaped before proof or to K2"
+        );
+        replacement.reply(
+            request["id"].as_u64().unwrap(),
+            Ok(json!("replacement home")),
+        );
+        receiver.recv_timeout(T5).unwrap().unwrap();
+        assert_eq!(
+            sink.text(),
+            "",
+            "a retained identity-bound sink received another Daemon's output"
+        );
+        let (mut returning, _returning_link, returning_gen) = connect(&sh, vec![info(terminal)]);
+        owner
+            .term_input(terminal, "unknown again".into(), None, None)
+            .unwrap();
+        assert_eq!(returning.read_json()["t"], "term.input");
+        assert!(sh.observe_identity(returning_gen, original));
+        let attach = returning.read_json();
+        assert_eq!(attach["t"], "term.attach");
+        assert_eq!(returning.read_json()["cols"], 100);
+        returning.reply(attach["id"].as_u64().unwrap(), Ok(json!({"exitCode":null})));
+        returning.write(&out_frame(terminal, b"ORIGINAL OUTPUT"));
+        sink.wait_text("ORIGINAL OUTPUT");
+    }
+
+    #[test]
+    fn identity_proof_under_backpressure_requests_bounded_attachment_retry() {
+        let sh = shared();
+        let terminals = [Uuid::new_v4(), Uuid::new_v4()];
+        let (mut first, _first_link, first_gen) =
+            connect(&sh, terminals.iter().copied().map(info).collect());
+        let owner = Arc::new(handle(&sh));
+        let key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        assert!(sh.observe_identity(first_gen, key));
+        let access = HostHandle::for_identity(owner.clone(), key);
+        for terminal in terminals {
+            let (waiter, receiver) = res_slot();
+            access.term_attach(terminal, Arc::new(VecSink::default()), waiter);
+            let request = first.read_json();
+            first.reply(
+                request["id"].as_u64().unwrap(),
+                Ok(json!({"exitCode":null})),
+            );
+            receiver.recv_timeout(T5).unwrap().unwrap();
+        }
+        let (mut returning, _returning_link, returning_gen, left) = connect_with(
+            &sh,
+            terminals.iter().copied().map(info).collect(),
+            crate::link::LinkLimits {
+                max_pending: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            left, 0,
+            "unknown identity does not start an attachment retry/reconnect loop"
+        );
+        assert!(sh.observe_identity(returning_gen, key));
+        assert!(
+            sh.kick.load(Ordering::SeqCst),
+            "proof-time backpressure did not wake bounded retries"
+        );
+        let request = returning.read_json();
+        assert_eq!(request["t"], "term.attach");
+        returning.reply(
+            request["id"].as_u64().unwrap(),
+            Ok(json!({"exitCode":null})),
+        );
+        let until = Instant::now() + T5;
+        loop {
+            let mut state = sh.lock();
+            let link = state.link().unwrap().clone();
+            if sh.reattach_locked(&mut state, returning_gen, &link) == 0 {
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(returning.read_json()["t"], "term.attach");
+    }
+
+    #[test]
+    fn identity_bound_alias_lifecycle_limitation_is_typed_and_has_no_transport_effects() {
+        use std::sync::atomic::AtomicUsize;
+        struct NoLifecycle(Arc<AtomicUsize>);
+        impl crate::TransportFactory for NoLifecycle {
+            fn for_host(&self, _: &HostConfig) -> Box<dyn crate::Transport> {
+                panic!("alias must not probe/stage/select/stop via SSH")
+            }
+            fn direct(&self, _: &HostConfig) -> Option<Box<dyn crate::Dialer>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                struct NotUpgradable;
+                impl crate::Dialer for NotUpgradable {
+                    fn dial(&self, _: &CancelToken) -> Result<crate::Dialed, crate::DialError> {
+                        panic!("no extra supervisor")
+                    }
+                    fn describe(&self) -> String {
+                        "independent configured control".into()
+                    }
+                    fn select_build(&self, _: &str) -> Option<Result<(), String>> {
+                        panic!("alias must not select")
+                    }
+                    fn stop_incompatible(&self, _: &CancelToken) -> Option<Result<(), HostError>> {
+                        panic!("alias must not stop")
+                    }
+                }
+                Some(Box::new(NotUpgradable))
+            }
+        }
+        impl crate::BinarySource for NoLifecycle {
+            fn fetch(&self, _: &crate::Wanted, _: &CancelToken) -> Result<crate::Fetched, String> {
+                panic!("alias must not fetch or stage a Daemon");
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sh = shared_with(|config| {
+            config.transports = Arc::new(NoLifecycle(calls.clone()));
+            config.binaries = Arc::new(NoLifecycle(calls.clone()));
+        });
+        let (_peer, _link, gen) = connect(&sh, vec![]);
+        let owner = Arc::new(handle(&sh));
+        let key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        assert!(sh.observe_identity(gen, key));
+        {
+            let mut state = sh.lock();
+            state.status.daemon_version = Some("1.4.0".into());
+            state.status.update_unavailable = Some(crate::status::UpdateUnavailable::DesktopOwned);
+            sh.publish(&mut state);
+        }
+        let access = HostHandle::for_identity(owner.clone(), key);
+        let status = access.status();
+        assert_eq!(
+            status.route_update_unavailable,
+            Some(crate::status::RouteUpdateUnavailable::IdentityBoundAlias)
+        );
+        assert_eq!(
+            serde_json::to_value(status.route_update_unavailable).unwrap(),
+            json!("identity-bound-alias")
+        );
+        assert_eq!(
+            status.update_unavailable,
+            owner.status().update_unavailable,
+            "ownership diagnosis is independent"
+        );
+        assert_eq!(status.update_action, None);
+        for reason in [
+            crate::status::UpdateUnavailable::DesktopOwned,
+            crate::status::UpdateUnavailable::WindowsOwner,
+        ] {
+            let mut state = sh.lock();
+            state.status.update_unavailable = Some(reason);
+            sh.publish(&mut state);
+            drop(state);
+            assert_eq!(access.status().update_unavailable, Some(reason));
+            assert_eq!(
+                access.status().route_update_unavailable,
+                Some(crate::status::RouteUpdateUnavailable::IdentityBoundAlias)
+            );
+        }
+        assert_eq!(owner.status().route_update_unavailable, None);
+        assert!(owner.status().update_action.is_some());
+        for mode in [false, true] {
+            let (waiter, receiver) = slot();
+            if mode {
+                access.restart_for_mode(waiter);
+            } else {
+                access.upgrade(waiter);
+            }
+            assert_eq!(
+                receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+                HostErrorCode::Invalid
+            );
+        }
+        for method in ["daemon.upgrade", "daemon.upgrade-selected", "ring.join"] {
+            let (waiter, receiver) = slot();
+            access.call(method.into(), json!({}), waiter);
+            assert_eq!(
+                receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+                HostErrorCode::Invalid
+            );
+        }
+        let (waiter, receiver) = slot();
+        access.ring_join(vec![], None, gen, waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Invalid
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        {
+            let mut state = sh.lock();
+            state.status.update_unavailable = None;
+            sh.publish(&mut state);
+        }
+        let (waiter, receiver) = slot();
+        owner.upgrade(waiter);
+        assert_eq!(
+            receiver.recv_timeout(T5).unwrap().unwrap_err().code,
+            HostErrorCode::Incompatible
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "independent configured lifecycle policy was globally disabled"
+        );
+    }
 
     #[test]
     fn completion_attention_input_captures_token_and_gates_on_exact_link() {
@@ -2769,10 +3503,10 @@ pub(crate) mod tests {
 
     fn prefixed_shared() -> Arc<Shared> {
         let sh = shared();
-        sh.lock()
-            .cfg
-            .launch_prefixes
-            .insert("claude".into(), "wrap --x".into());
+        if let HostRoute::Configured(cfg) = &mut sh.lock().cfg.route {
+            cfg.launch_prefixes
+                .insert("claude".into(), "wrap --x".into());
+        }
         sh
     }
 

@@ -147,6 +147,9 @@ impl HostSync {
     /// From the Observer, under the Host's lock: records the Host's connection and queues a
     /// job when a usable one is new or changed. Never blocks.
     pub fn observe(&self, s: &HostStatus) {
+        if s.route_update_unavailable.is_some() {
+            return;
+        }
         let seen = Seen::of(s);
         let mut st = self.lock();
         let st = &mut *st;
@@ -289,7 +292,7 @@ fn observed_ring(v: &Value) -> Option<(String, Option<u64>)> {
 }
 
 /// Where a Remote Host is reached: a new key at the same place is a reinstall.
-fn target_of(cfg: &crate::HostConfig) -> String {
+pub(crate) fn target_of(cfg: &crate::HostConfig) -> String {
     format!(
         "{}|{}",
         cfg.ssh_target,
@@ -375,7 +378,7 @@ impl SyncWorker {
             .filter_map(|(host, state, error)| {
                 let h = (self.host)(&host)?;
                 Some(HostRingState {
-                    name: h.config().name,
+                    name: h.display_name(),
                     host,
                     state,
                     error,
@@ -405,7 +408,13 @@ impl SyncWorker {
             }),
         );
         match rx.recv_timeout(IDENTITY_TIMEOUT).ok()? {
-            Ok(v) => LocalIdentity::from_json(&v).ok(),
+            Ok(v) => {
+                let identity = LocalIdentity::from_json(&v).ok();
+                if identity.is_some() {
+                    self.ring.host_identity_observed();
+                }
+                identity
+            }
             Err(e) => {
                 eprintln!("xshell: ring.identity on {host} failed: {}", e.message);
                 None
@@ -631,6 +640,7 @@ impl SyncWorker {
                     continue;
                 }
             };
+            self.ring.host_identity_observed();
             let observed = observed_ring(&v);
             if let Some((rid, version)) = &observed {
                 if rid != ours.as_str() {
@@ -699,7 +709,7 @@ impl SyncWorker {
                 target: String::new(),
             });
         }
-        let cfg = (self.host)(host)?.config();
+        let cfg = (self.host)(host)?.saved_config()?;
         Some(HostRef {
             id: host.to_string(),
             name: cfg.name.clone(),
@@ -768,6 +778,7 @@ impl SyncWorker {
                     Some("its key is already one of your devices, with another role".into()),
                     None,
                 ),
+                Some(HostOutcome::Revoked) => self.note(id, "revoked", None, None),
                 Some(HostOutcome::Full) => self.note(id, "full", None, None),
                 // Decided for a Ring that is gone: look again, against the new one.
                 Some(HostOutcome::RingChanged) => {
@@ -1159,6 +1170,117 @@ mod tests {
         std::thread::sleep(BATCH_WINDOW * 2);
         assert_eq!(d.ring_messages(), 0);
         assert_eq!(f.ring.chain().unwrap().head().version(), 1);
+    }
+
+    #[test]
+    fn contradictory_foreign_identity_withdraws_retained_alias_before_enrollment() {
+        let f = fx();
+        f.ring.attach_manager(&f.m).unwrap();
+        f.ring.enable(None, false).unwrap();
+        let original = FakeDaemon::start(Opts::default());
+        let changed = FakeDaemon::start(Opts {
+            ring: serde_json::json!({"ringId":"foreign", "version":3}),
+            ..Default::default()
+        });
+        let id = "h_aaaaaaaa";
+        f.serve(id, &original);
+        let worker = f.worker();
+        worker.start().unwrap();
+        f.m.configure(vec![host_cfg(id, "Saved")]).unwrap();
+        let alias = crate::ring::hosts::relay_host_id(&original.keys.sign_key());
+        wait("retained alias established by HostSync", || {
+            f.m.host(&alias).is_some_and(|h| h.id() == id)
+        });
+        let configured = f.m.host(id).unwrap();
+        f.serve(id, &changed);
+        if let Some(join) = configured.stop_begin() {
+            join.join().unwrap();
+        }
+        configured.start();
+        wait("foreign identity observed", || {
+            worker.state_of(id) == Some("other-ring")
+        });
+        assert!(
+            f.m.host(&alias).is_none_or(|h| h.id() != configured.id()),
+            "r_K resolved to the configured handle now serving K2"
+        );
+        assert!(
+            f.m.host(id).unwrap().status().usable(),
+            "independent saved access must survive"
+        );
+        assert!(
+            changed.joins().is_empty(),
+            "foreign membership must not be replaced"
+        );
+        assert!(f
+            .ring
+            .chain()
+            .unwrap()
+            .authorized_member(&changed.keys.sign_key())
+            .is_none());
+    }
+
+    #[test]
+    fn contradictory_identity_withdraws_retained_alias_when_enrollment_commit_fails() {
+        struct Restore(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if self.1.exists() {
+                    std::fs::remove_dir(&self.0).unwrap();
+                    std::fs::rename(&self.1, &self.0).unwrap();
+                }
+            }
+        }
+        let f = fx();
+        f.ring.attach_manager(&f.m).unwrap();
+        f.ring.enable(None, false).unwrap();
+        let original = FakeDaemon::start(Opts::default());
+        let changed = FakeDaemon::start(Opts::default());
+        let id = "h_aaaaaaaa";
+        f.serve(id, &original);
+        let worker = f.worker();
+        worker.start().unwrap();
+        f.m.configure(vec![host_cfg(id, "Saved")]).unwrap();
+        let alias = crate::ring::hosts::relay_host_id(&original.keys.sign_key());
+        wait("retained alias established", || {
+            f.m.host(&alias).is_some_and(|h| h.id() == id)
+        });
+        joined_with(&original, 2);
+        let path = f._dir.path().join("ring/ring.json");
+        let backup = path.with_extension("held");
+        let _restore = Restore(path.clone(), backup.clone());
+        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *worker.before_commit.lock().unwrap() = Some(Box::new({
+            let installed = installed.clone();
+            move || {
+                if !installed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::fs::rename(&path, &backup).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+            }
+        }));
+        let configured = f.m.host(id).unwrap();
+        f.serve(id, &changed);
+        if let Some(join) = configured.stop_begin() {
+            join.join().unwrap();
+        }
+        configured.start();
+        wait("enrollment commit failed after current identity", || {
+            installed.load(std::sync::atomic::Ordering::SeqCst)
+                && worker.state_of(id) == Some("failed")
+        });
+        assert!(
+            f.m.host(&alias).is_none_or(|h| h.id() != configured.id()),
+            "failed enrollment retained r_K pointing at K2"
+        );
+        assert!(configured.status().usable());
+        assert!(changed.joins().is_empty());
+        assert!(f
+            .ring
+            .chain()
+            .unwrap()
+            .authorized_member(&changed.keys.sign_key())
+            .is_none());
     }
 
     #[test]

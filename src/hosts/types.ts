@@ -49,6 +49,7 @@ export interface HostStatus {
   linkGeneration?: number;
   updateAction?: "update" | "replace" | null;
   updateUnavailable?: "windows-owner" | "desktop-owned" | null;
+  routeUpdateUnavailable?: "relay-only" | "identity-bound-alias" | null;
   arch: string | null;
   incompatibleReason: "daemon-older" | "daemon-newer" | null;
   nextRetryAt: number | null; // ms epoch

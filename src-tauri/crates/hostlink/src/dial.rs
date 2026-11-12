@@ -59,6 +59,11 @@ pub trait Dialer: Send + Sync {
     fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError>;
     fn describe(&self) -> String;
 
+    /// Current effective authorization, checked again before installing a Link.
+    fn authorized(&self) -> bool {
+        true
+    }
+
     /// Whether the Desktop upgrades the Daemon this reaches (ADR-0003), although it is not
     /// installed over a transport: an older one is reported as upgrade pending. Read at each
     /// check, so it may change while the Host runs.

@@ -51,6 +51,14 @@ pub enum UpdateUnavailable {
     DesktopOwned,
 }
 
+/// Access-route limitation, independent of evidence about who owns this Daemon (#102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteUpdateUnavailable {
+    RelayOnly,
+    IdentityBoundAlias,
+}
+
 impl UpdateUnavailable {
     pub(crate) fn from_hello(
         os: Option<&str>,
@@ -106,6 +114,7 @@ pub struct HostStatus {
     /// Retained during reconnect: capability absence alone is not an old-owner diagnosis.
     pub update_unavailable: Option<UpdateUnavailable>,
     pub update_action: Option<UpdateAction>,
+    pub route_update_unavailable: Option<RouteUpdateUnavailable>,
 }
 
 impl HostStatus {
@@ -136,6 +145,7 @@ impl HostStatus {
             link_generation: 0,
             update_unavailable: None,
             update_action: None,
+            route_update_unavailable: None,
         }
     }
 
@@ -201,7 +211,7 @@ mod tests {
                 "errorHint":"host-key","daemonVersion":null,"desktopVersion":"1.5.0",
                 "daemonBuild":null,"desktopBuild":null,"protocol":null,
                 "daemonCapabilities":[],"os":null,"arch":null,"incompatibleReason":"daemon-older","nextRetryAt":null,
-                "sinceMs":1,"configGeneration":7,"linkGeneration":0,"updateUnavailable":null,"updateAction":null
+                "sinceMs":1,"configGeneration":7,"linkGeneration":0,"updateUnavailable":null,"updateAction":null,"routeUpdateUnavailable":null
             })
         );
         s.set_kind(StatusKind::UpgradePending);

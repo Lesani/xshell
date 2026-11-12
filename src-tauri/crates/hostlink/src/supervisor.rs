@@ -85,7 +85,7 @@ struct Sup {
     cancel: CancelToken,
     /// Install and the upgrade kill script; also what `dialer` runs `connect` through,
     /// unless the Host is reached directly.
-    transport: Arc<dyn Transport>,
+    transport: Option<Arc<dyn Transport>>,
     dialer: Box<dyn Dialer>,
     /// Installed over the transport (no Daemon command, not direct).
     managed: bool,
@@ -104,17 +104,37 @@ struct Sup {
 
 pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let cfg = sh.lock().cfg.clone();
-    let transport: Arc<dyn Transport> = sh.mc.transports.for_host(&cfg).into();
-    let direct = sh.mc.transports.direct(&cfg);
-    let override_ = cfg.daemon_override();
-    let scripted = direct.is_none();
-    let managed = override_.is_none() && scripted;
-    let dialer = direct.unwrap_or_else(|| {
-        Box::new(CommandDialer {
-            transport: transport.clone(),
-            remote_cmd: connect_command(override_, &sh.mc.install_dir()),
-        })
-    });
+    let (transport, dialer, managed, scripted, override_) = match &cfg.route {
+        crate::config::HostRoute::Relay(d) => (
+            None,
+            Box::new(d.clone()) as Box<dyn Dialer>,
+            false,
+            false,
+            None,
+        ),
+        crate::config::HostRoute::Configured(cfg) => {
+            let direct = sh.mc.transports.direct(cfg);
+            let override_ = cfg.daemon_override().map(String::from);
+            match direct {
+                Some(d) => (None, d, false, false, override_),
+                None => {
+                    let transport: Arc<dyn Transport> = sh.mc.transports.for_host(cfg).into();
+                    let dialer = Box::new(CommandDialer {
+                        transport: transport.clone(),
+                        remote_cmd: connect_command(override_.as_deref(), &sh.mc.install_dir()),
+                    });
+                    let managed = override_.is_none();
+                    (
+                        Some(transport),
+                        dialer as Box<dyn Dialer>,
+                        managed,
+                        true,
+                        override_,
+                    )
+                }
+            }
+        }
+    };
     let mut s = Sup {
         sh,
         cancel,
@@ -122,7 +142,7 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
         dialer,
         managed,
         scripted,
-        override_: override_.map(String::from),
+        override_,
         backoff: Backoff::default(),
         install_verified: false,
         last_gen: 0,
@@ -203,7 +223,10 @@ impl Sup {
                                 Some("linux" | "macos")
                             )
                         {
-                            let _ = kill_daemon(&*self.transport, &self.cancel);
+                            let _ = kill_daemon(
+                                self.transport.as_deref().expect("scripted route"),
+                                &self.cancel,
+                            );
                         } else if self.dialer.upgradable() && cfg!(unix) {
                             let _ = self.dialer.stop_incompatible(&self.cancel);
                         }
@@ -338,8 +361,14 @@ impl Sup {
                         .unwrap_or_else(|| "connection lost".into()),
                 );
             }
-            // Connected: a kick has nothing to retry.
-            self.sh.kick.store(false, Ordering::SeqCst);
+            // Fresh identity proof may make previously gated attachments eligible.
+            // Preserve the same bounded backpressure retries as ordinary adoption.
+            if self.sh.kick.swap(false, Ordering::SeqCst) {
+                left = self.sh.reattach_locked(&mut st, c.gen, &c.link);
+                retries = 0;
+                retry_delay = Duration::from_millis(10);
+                retry_at = Instant::now() + retry_delay;
+            }
             let now = Instant::now();
             if left > 0 && retry_at <= now {
                 left = self.sh.reattach_locked(&mut st, c.gen, &c.link);
@@ -377,7 +406,7 @@ impl Sup {
             self.set_phase(Some(Phase::Probing));
             let on_upload = || self.set_phase(Some(Phase::Installing));
             match ensure_installed(
-                &*self.transport,
+                self.transport.as_deref().expect("scripted route"),
                 &*mc.binaries,
                 &version,
                 mc.desktop_build.as_ref(),
@@ -408,7 +437,12 @@ impl Sup {
             // Each attempt: the selected build may have changed since (an upgrade, another
             // Desktop). A host that refuses the script keeps the plain command.
             // Platform probe is the exact configured command, before any POSIX script.
-            let probe = crate::install::probe_override(&*self.transport, cmd, &self.cancel).ok();
+            let probe = crate::install::probe_override(
+                self.transport.as_deref().expect("scripted route"),
+                cmd,
+                &self.cancel,
+            )
+            .ok();
             let platform = probe
                 .as_ref()
                 .and_then(|p| p.os.as_deref())
@@ -422,7 +456,11 @@ impl Sup {
                 self.sh.publish(&mut st);
             }
             let dir = if matches!(platform.as_deref(), Some("linux" | "macos")) {
-                selected_remote(&*self.transport, cmd, &self.cancel)
+                selected_remote(
+                    self.transport.as_deref().expect("scripted route"),
+                    cmd,
+                    &self.cancel,
+                )
             } else {
                 None
             };
@@ -430,7 +468,7 @@ impl Sup {
                 return Attempt::Cancelled;
             }
             self.dialer = Box::new(CommandDialer {
-                transport: self.transport.clone(),
+                transport: self.transport.clone().expect("scripted route"),
                 remote_cmd: match &dir {
                     Some(d) => connect_command(None, d),
                     None => connect_command(Some(cmd), ""),
@@ -473,6 +511,10 @@ impl Sup {
                 self.sh.id,
                 n.trim()
             );
+        }
+        if self.cancel.is_cancelled() || !self.dialer.authorized() {
+            link.close();
+            return Attempt::Cancelled;
         }
         let upgradable = self.upgradable();
         let ours_build = mc.desktop_build.as_ref();
@@ -648,7 +690,7 @@ mod tests {
         let supervisor = Sup {
             sh: sh.clone(),
             cancel: CancelToken::new(),
-            transport: transport.clone(),
+            transport: Some(transport.clone()),
             dialer: Box::new(CommandDialer {
                 transport,
                 remote_cmd: "unused".into(),

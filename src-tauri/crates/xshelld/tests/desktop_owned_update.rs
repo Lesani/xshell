@@ -234,7 +234,7 @@ fn authoritative_reconnect_and_config_generation_replace_ownership_evidence() {
         serde_json::to_value(&first).unwrap()["updateUnavailable"],
         "desktop-owned"
     );
-    let mut config = desk.host().config();
+    let mut config = desk.host().saved_config().expect("configured route");
     config.ssh_target = "different-target".into();
     let from = desk.rec.count();
     desk.m.configure(vec![config]).unwrap();

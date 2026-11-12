@@ -43,6 +43,7 @@
 //! changes, the notice is the old Relay's and is cleared; the Connector reports nothing about
 //! an old Relay's quota (a farewell's refusals are its own).
 
+use super::hosts::{OwnerRouting, RingHosts};
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
 use serde::Serialize;
@@ -61,6 +62,7 @@ use xshell_protocol::ring::pairing::{
 use xshell_protocol::ring::relay::pair::{
     host_pairing, Cancel, HostRequest, PairOptions, PairPipe, PairingHost,
 };
+use xshell_protocol::ring::relay::sessions::{SessionEvents, Sessions, SessionsConfig};
 use xshell_protocol::ring::relay::wire::QUOTA_REFUSALS_BEFORE_CLOSE;
 use xshell_protocol::ring::relay::{
     ByeReason, Connector, ConnectorConfig, ConnectorEvents, ErrorCode, Farewell, FarewellState,
@@ -114,6 +116,8 @@ pub enum HostOutcome {
     Joined,
     /// Its key is in the Ring with another role: refused for this Host only.
     OtherRole,
+    /// Previously enrolled, now removed or terminal: reconnect must not enroll it again.
+    Revoked,
     /// The Roster has no room for it.
     Full,
     /// Its identity was for a connection that is no longer current: discarded.
@@ -177,6 +181,15 @@ fn plan_hosts(s: &RingState, batch: &[&(HostRef, LocalIdentity)], now: u64) -> H
     let mut outcomes = Vec::new();
     let mut candidates = Vec::new();
     for (id, e) in &want {
+        if s.chain.authorized_member(&e.1.sign_key).is_none()
+            && s.chain
+                .versions()
+                .iter()
+                .any(|r| r.member(&e.1.sign_key).is_some())
+        {
+            outcomes.push((id.to_string(), HostOutcome::Revoked));
+            continue;
+        }
         match head.member(&e.1.sign_key) {
             Some(m) if m.role != Role::Daemon => {
                 outcomes.push((id.to_string(), HostOutcome::OtherRole))
@@ -598,7 +611,10 @@ struct EnrollmentOperation {
 #[derive(Default)]
 struct Live {
     state: Option<RingState>,
+    /// Changes on every accepted adoption/departure, including same-head metadata changes.
+    state_revision: u64,
     connector: Option<Arc<Connector>>,
+    routing: Option<Arc<OwnerRouting>>,
     /// `ring-connector.lock`, held while this instance runs the Connector.
     owner: Option<std::fs::File>,
     /// Another instance holds the owner lock: this one shows the state from disk.
@@ -631,6 +647,8 @@ pub struct DesktopRing {
     pub(super) adoption_cancel: Mutex<Option<Weak<AtomicBool>>>,
     observer: Arc<dyn RingObserver>,
     live: Mutex<Live>,
+    routing_manager: Mutex<Option<Weak<crate::Manager>>>,
+    routing_tx: std::sync::mpsc::SyncSender<()>,
     /// Serializes every commit with the adoption of its result (into `live` and the
     /// Connector), so results are adopted in commit order.
     commit: Mutex<()>,
@@ -641,6 +659,9 @@ pub struct DesktopRing {
     /// A view emission asked for while this thread held `commit`: made once the commit scope
     /// ends.
     deferred_emit: AtomicBool,
+    /// Test hook: pauses a fresh election reload after the store read, outside Live.
+    #[cfg(test)]
+    after_owner_load: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Test hook: runs between a commit and the adoption of its result.
     #[cfg(test)]
     after_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -722,12 +743,25 @@ impl ConnectorEvents for Events {
                 }
                 l.link = Some(s.clone());
             }
+            r.queue_routing();
             r.emit();
         }
     }
 
     fn roster(&self, chain: &RosterChain) {
         if let Some(r) = self.ring.upgrade() {
+            {
+                let l = r.lock();
+                if l.epoch != self.epoch {
+                    return;
+                }
+                if let Some(owner) = &l.routing {
+                    owner.adopt(chain);
+                }
+            }
+            // Fence effective authorization before disk I/O; a failed save cannot keep a
+            // removed/terminal member's live Link authorized.
+            r.queue_routing();
             r.persist_newer(chain);
             r.emit();
         }
@@ -735,6 +769,10 @@ impl ConnectorEvents for Events {
 
     fn presence(&self, _key: SignKey, _p: &MemberPresence) {
         if let Some(r) = self.ring.upgrade() {
+            if r.lock().epoch != self.epoch {
+                return;
+            }
+            r.queue_routing();
             r.emit();
         }
     }
@@ -786,6 +824,7 @@ impl DesktopRing {
     /// also retries taking it over.
     pub fn open(cfg: DesktopRingConfig, observer: Arc<dyn RingObserver>) -> Arc<DesktopRing> {
         let store = Store::new(cfg.dir.clone());
+        let (routing_tx, routing_rx) = std::sync::mpsc::sync_channel(1);
         let ring = Arc::new_cyclic(|me| DesktopRing {
             cfg,
             store,
@@ -793,10 +832,14 @@ impl DesktopRing {
             adoption_cancel: Mutex::new(None),
             observer,
             live: Mutex::new(Live::default()),
+            routing_manager: Mutex::new(None),
+            routing_tx,
             commit: Mutex::new(()),
             me: me.clone(),
             configured: Mutex::new(Arc::new(|_: &str| true)),
             deferred_emit: AtomicBool::new(false),
+            #[cfg(test)]
+            after_owner_load: Mutex::new(None),
             #[cfg(test)]
             after_commit: Mutex::new(None),
             #[cfg(test)]
@@ -810,6 +853,21 @@ impl DesktopRing {
             #[cfg(test)]
             probe_results: Mutex::new(Vec::new()),
         });
+        let weak = Arc::downgrade(&ring);
+        std::thread::Builder::new()
+            .name("ring-hosts".into())
+            .spawn(move || {
+                while routing_rx.recv().is_ok() {
+                    let Some(r) = weak.upgrade() else {
+                        return;
+                    };
+                    if r.lock().quitting {
+                        return;
+                    }
+                    r.project_hosts();
+                }
+            })
+            .expect("spawn Ring Host projection");
         let mut seen = ring.store.signature();
         ring.reload();
         let weak = Arc::downgrade(&ring);
@@ -835,6 +893,60 @@ impl DesktopRing {
                 r.quota_tick();
             });
         ring
+    }
+
+    /// Bind the backend Manager to this profile. Only the elected Connector owner can
+    /// create Relay handles; followers receive availability, not a second Connector.
+    pub fn attach_manager(&self, manager: &Arc<crate::Manager>) -> Result<(), String> {
+        let mut bound = self.routing_manager.lock().unwrap();
+        if bound
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|old| !Arc::ptr_eq(&old, manager))
+        {
+            return Err("this Ring already has an owner Host Manager".into());
+        }
+        *bound = Some(Arc::downgrade(manager));
+        drop(bound);
+        self.queue_routing();
+        Ok(())
+    }
+
+    pub(super) fn host_identity_observed(&self) {
+        self.queue_routing();
+    }
+
+    fn queue_routing(&self) {
+        let _ = self.routing_tx.try_send(());
+    }
+
+    fn project_hosts(&self) {
+        let Some(manager) = self
+            .routing_manager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        else {
+            return;
+        };
+        let projection = {
+            let l = self.lock();
+            if l.quitting {
+                None
+            } else {
+                l.state.clone().map(|mut state| {
+                    if let Some(owner) = &l.routing {
+                        state.chain = owner.chain();
+                    }
+                    RingHosts {
+                        state,
+                        owner: l.routing.clone(),
+                    }
+                })
+            }
+        };
+        manager.set_ring_hosts(projection);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
@@ -911,9 +1023,14 @@ impl DesktopRing {
                     Some(p) => {
                         l.problem = Some(("recovered".to_string(), p.display().to_string()));
                         l.state = None;
+                        l.state_revision += 1;
                         l.farewells.clear();
                         l.link = None;
                         l.quota.retire();
+                        if let Some(owner) = l.routing.take() {
+                            owner.stop();
+                        }
+                        self.queue_routing();
                         l.connector.take()
                     }
                     None => {
@@ -984,7 +1101,16 @@ impl DesktopRing {
             let other_relay = l.state.as_ref().is_some_and(|c| {
                 c.chain.head().roster().relay_url != s.chain.head().roster().relay_url
             });
+            if other_ring {
+                if let Some(owner) = l.routing.take() {
+                    owner.stop();
+                }
+            } else if let Some(owner) = &l.routing {
+                owner.adopt(&s.chain);
+            }
+            self.queue_routing();
             l.state = Some(s.clone());
+            l.state_revision += 1;
             // Reports about farewells no longer owed are of no use.
             l.farewells
                 .retain(|source, _| s.farewells.iter().any(|f| &f.source == source));
@@ -1025,20 +1151,21 @@ impl DesktopRing {
     /// just won the owner lock, it re-reads the state from disk first: the previous owner
     /// may have committed since this instance last looked.
     fn ensure_connector(&self) {
-        let fresh = {
+        let (fresh, revision) = {
             let mut l = self.lock();
             if l.connector.is_some() || l.quitting {
                 return;
             }
+            let revision = l.state_revision;
             if l.owner.is_some() {
-                false
+                (false, revision)
             } else {
                 let lock = super::store::open_lock(&self.cfg.dir.join("ring-connector.lock"));
                 match lock.map(|f| f.try_lock().map(|_| f)) {
                     Ok(Ok(f)) => {
                         l.owner = Some(f);
                         l.other_window = false;
-                        true
+                        (true, revision)
                     }
                     Ok(Err(std::fs::TryLockError::WouldBlock)) => {
                         l.other_window = true;
@@ -1054,16 +1181,29 @@ impl DesktopRing {
             }
         };
         if fresh {
-            if let Ok((Some(disk), _)) = self.store.load() {
-                let mut l = self.lock();
-                let newer = l.state.as_ref().is_none_or(|cur| {
-                    cur.chain.ring_id() != disk.chain.ring_id()
-                        || disk.chain.head().version() >= cur.chain.head().version()
-                });
-                if newer {
-                    l.state = Some(disk);
+            let loaded = self.store.load();
+            #[cfg(test)]
+            if let Some(hook) = self.after_owner_load.lock().unwrap().as_ref() {
+                hook();
+            }
+            let mut l = self.lock();
+            // A public owner admission can read outside `commit`. Install only while
+            // the exact adoption/departure state we elected for is still current. Even
+            // a missing/error result must not erase an intervening accepted membership.
+            if l.quitting || l.connector.is_some() || l.state_revision != revision {
+                return;
+            }
+            l.state_revision += 1;
+            match loaded {
+                Ok((state, _)) => l.state = state,
+                Err(error) => {
+                    l.problem = Some(("unreadable".into(), error));
+                    l.state = None;
+                    self.queue_routing();
+                    return;
                 }
             }
+            self.queue_routing();
         }
         let mut l = self.lock();
         if l.connector.is_some() || l.quitting {
@@ -1084,8 +1224,20 @@ impl DesktopRing {
             ring: self.me.clone(),
             epoch: l.epoch,
         };
-        match Connector::start(cfg, Arc::new(events)) {
-            Ok(c) => l.connector = Some(Arc::new(c)),
+        let sessions = Sessions::new(SessionsConfig::new(s.keys.clone()), None);
+        let routing = OwnerRouting::new(sessions.clone(), l.epoch, s.chain.clone());
+        let session_events = SessionEvents {
+            sessions,
+            next: Some(Arc::new(events)),
+        };
+        match Connector::start(cfg, Arc::new(session_events)) {
+            Ok(c) => {
+                let connector = Arc::new(c);
+                routing.attach(&connector);
+                l.connector = Some(connector);
+                l.routing = Some(routing);
+                self.queue_routing();
+            }
             Err(e) => {
                 l.link = Some(LinkState::Stopped {
                     error: Some(format!("cannot start the relay connection: {e}")),
@@ -1385,7 +1537,14 @@ impl DesktopRing {
                 let mut outcomes = Vec::new();
                 let mut live = Vec::new();
                 for e in batch {
-                    if valid(&e.0.id) {
+                    if self
+                        .lock()
+                        .routing
+                        .as_ref()
+                        .is_some_and(|owner| owner.revoked_key(&e.1.sign_key))
+                    {
+                        outcomes.push((e.0.id.clone(), HostOutcome::Revoked));
+                    } else if valid(&e.0.id) {
                         live.push(e);
                     } else {
                         outcomes.push((e.0.id.clone(), HostOutcome::Stale));
@@ -2631,8 +2790,22 @@ impl DesktopRing {
             let mut l = self.lock();
             l.quitting = true;
             l.quota.retire();
+            if let Some(owner) = l.routing.take() {
+                owner.stop();
+            }
             l.connector.take()
         };
+        // Drain owner handles outside callback/commit locks, before election is released.
+        if let Some(manager) = self
+            .routing_manager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            manager.retire_ring_hosts();
+        }
+        self.queue_routing();
         if let Some(c) = c {
             c.stop(ByeReason::quit());
         }
@@ -2768,6 +2941,134 @@ mod tests {
 
     fn connected(v: &RingView) -> bool {
         v.connection == "connected"
+    }
+
+    fn fresh_owner_reload_race(intervene: impl FnOnce(&Arc<DesktopRing>), initial: bool) {
+        fresh_owner_reload_race_with_setup(intervene, initial, |_| {});
+    }
+
+    fn fresh_owner_reload_race_with_setup(
+        intervene: impl FnOnce(&Arc<DesktopRing>),
+        initial: bool,
+        before_load: impl FnOnce(&Arc<DesktopRing>),
+    ) {
+        let relay = relay();
+        let t = tempfile::tempdir().unwrap();
+        let mut config = cfg(t.path(), &relay.url());
+        config.owner_retry = Duration::from_secs(60);
+        let store = Store::new(config.dir.clone());
+        store.retained_keys().unwrap();
+        let election =
+            super::super::store::open_lock(&config.dir.join("ring-connector.lock")).unwrap();
+        election.lock().unwrap();
+        let (ring, _) = open(config);
+        if initial {
+            ring.enable(None, false).unwrap();
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *ring.after_owner_load.lock().unwrap() = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        before_load(&ring);
+        election.unlock().unwrap();
+        std::thread::scope(|scope| {
+            struct ReleaseLoad(Option<std::sync::mpsc::SyncSender<()>>);
+            impl Drop for ReleaseLoad {
+                fn drop(&mut self) {
+                    if let Some(sender) = self.0.take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+            let acquiring = scope.spawn(|| ring.pairing_ipc_owner());
+            let mut release = ReleaseLoad(Some(release_tx));
+            entered_rx.recv_timeout(WAIT).unwrap();
+            intervene(&ring);
+            let expected = ring.chain();
+            release.0.take().unwrap().send(()).unwrap();
+            assert!(acquiring.join().unwrap());
+            let live = ring.lock();
+            assert_eq!(
+                live.state.as_ref().map(|s| &s.chain),
+                expected.as_ref(),
+                "fresh reload overwrote intervening adoption/departure"
+            );
+            assert_eq!(
+                live.connector.as_ref().map(|c| c.chain()),
+                expected,
+                "Connector disagrees with accepted Live membership"
+            );
+            assert_eq!(
+                live.routing.as_ref().map(|r| r.chain()),
+                expected,
+                "routing disagrees with accepted Live membership"
+            );
+        });
+        ring.quit();
+    }
+
+    #[test]
+    fn fresh_owner_reload_does_not_overwrite_newer_adoption() {
+        let successor = relay();
+        fresh_owner_reload_race(
+            |ring| {
+                ring.set_relay_url(&successor.url()).unwrap();
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn fresh_owner_reload_does_not_restore_recovered_departure() {
+        fresh_owner_reload_race(
+            |ring| {
+                std::fs::write(ring.cfg.dir.join("ring.json"), b"broken membership").unwrap();
+                ring.reload();
+                assert!(ring.chain().is_none());
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn fresh_owner_reload_does_not_overwrite_replacement_membership() {
+        fresh_owner_reload_race(
+            |ring| {
+                let previous = ring.chain().unwrap().ring_id().clone();
+                std::fs::write(ring.cfg.dir.join("ring.json"), b"broken membership").unwrap();
+                ring.reload();
+                ring.enable(None, true).unwrap();
+                assert_ne!(ring.chain().unwrap().ring_id(), &previous);
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn fresh_owner_missing_snapshot_does_not_erase_new_membership() {
+        fresh_owner_reload_race(
+            |ring| {
+                ring.enable(None, false).unwrap();
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn fresh_owner_error_snapshot_does_not_erase_intervening_membership() {
+        fresh_owner_reload_race_with_setup(
+            |ring| {
+                std::fs::remove_dir(ring.cfg.dir.join("ring.json")).unwrap();
+                ring.enable(None, false).unwrap();
+            },
+            false,
+            |ring| {
+                std::fs::remove_file(ring.cfg.dir.join("ring.json")).unwrap();
+                std::fs::create_dir(ring.cfg.dir.join("ring.json")).unwrap();
+            },
+        );
     }
 
     #[test]
@@ -3617,6 +3918,25 @@ mod tests {
         assert_eq!(s.host_members["h_aaaaaaaa"].sign_key, a.sign_key);
         assert_eq!(s.host_members["h_bbbbbbbb"].target, "b|");
         assert_eq!(s.local_member, None);
+        ring.quit();
+    }
+
+    #[test]
+    fn revoked_saved_daemon_is_not_automatically_enrolled_on_reconnect() {
+        let t = tempfile::tempdir().unwrap();
+        let ring = quiet(&t);
+        let (_, daemon) = identity();
+        let batch = [(href("h_aaaaaaaa", "Host", "target|"), daemon.clone())];
+        ensure(&ring, &batch);
+        ring.set_configured_hosts(Arc::new(|_| false));
+        ring.remove_member(&daemon.sign_key).unwrap();
+        let before = ring.chain().unwrap().head().hash();
+        let (chain, _) = ensure(&ring, &batch);
+        assert!(
+            chain.authorized_member(&daemon.sign_key).is_none(),
+            "reconnect re-enrolled a removed Daemon"
+        );
+        assert_eq!(chain.head().hash(), before);
         ring.quit();
     }
 

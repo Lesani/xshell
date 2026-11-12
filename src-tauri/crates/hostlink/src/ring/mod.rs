@@ -6,6 +6,8 @@
 pub mod adoption;
 pub mod companion_ipc;
 pub mod desktop;
+pub(crate) mod dial;
+pub mod hosts;
 pub mod store;
 pub mod sync;
 

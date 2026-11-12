@@ -549,3 +549,188 @@ fn session_events_forward_entitlement_to_next() {
     assert_eq!(connector.entitlement().as_deref(), Some(second.as_str()));
     connector.abandon();
 }
+
+#[test]
+fn cancelled_open_discards_late_answer_without_closing_another_peer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use xshell_protocol::ring::relay::sessions::SessionError;
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let second = contract::keys();
+    ring.next(|draft| draft.add(contract::member(&second, "second", Role::Daemon)));
+    let _daemon = side(&r, &ring, &ring.daemon, true);
+    let _second = side(&r, &ring, &second, true);
+    let mobile = side(&r, &ring, &ring.mobile, false);
+    let mut surviving = mobile.sessions.open(&second.sign_key()).unwrap();
+    let held: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let h = held.clone();
+    let peer = ring.daemon.sign_key();
+    r.tamper(
+        &ring.ring_id(),
+        &ring.mobile.sign_key(),
+        Some(Box::new(move |from, p| {
+            if *from == peer && Header::parse(&p).is_ok_and(|(header, _)| header.kind == Kind::Hs2)
+            {
+                h.lock().unwrap().push(p);
+                return Verdict::Deliver(vec![]);
+            }
+            Verdict::Deliver(vec![p])
+        })),
+    );
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    let sessions = mobile.sessions.clone();
+    let open = std::thread::spawn(move || {
+        sessions.open_cancellable(&peer, &|| flag.load(Ordering::Acquire))
+    });
+    wait_until("real Noise answer held", || {
+        !held.lock().unwrap().is_empty()
+    });
+    let at = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    assert!(matches!(open.join().unwrap(), Err(SessionError::Cancelled)));
+    assert!(at.elapsed() < Duration::from_millis(500));
+    for p in held.lock().unwrap().drain(..) {
+        r.inject(
+            &ring.ring_id(),
+            &ring.mobile.sign_key(),
+            &RelayFrame::Env {
+                from: peer,
+                payload: b64::encode(&p),
+            }
+            .encode(),
+        );
+    }
+    echo_round(
+        &mut surviving,
+        b"still alive after cancellation and late answer",
+    );
+    assert_eq!(mobile.sessions.peers(), vec![second.sign_key()]);
+    r.tamper(&ring.ring_id(), &ring.mobile.sign_key(), None);
+    let mut retry = mobile.sessions.open(&peer).unwrap();
+    echo_round(&mut retry, b"explicit later Open is independent");
+}
+
+#[test]
+fn cancelled_open_while_relay_is_down_returns_without_an_abandoned_worker() {
+    use xshell_protocol::ring::relay::sessions::SessionError;
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let mobile = side(&r, &ring, &ring.mobile, false);
+    mobile.connector.abandon();
+    let at = Instant::now();
+    let result = mobile
+        .sessions
+        .open_cancellable(&ring.daemon.sign_key(), &|| {
+            at.elapsed() >= Duration::from_millis(30)
+        });
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(at.elapsed() < Duration::from_millis(500));
+    assert!(mobile.sessions.peers().is_empty());
+}
+
+#[test]
+fn cancelled_open_polls_handshake_send_backpressure() {
+    use xshell_protocol::ring::relay::sessions::SessionError;
+    use xshell_protocol::ring::RingError;
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let daemon = side(&r, &ring, &ring.daemon, true);
+    let sessions = Sessions::new(cfg(&ring.mobile), None);
+    let mut config = contract::config(&r.target(), &ring.chain, ring.mobile.clone());
+    // Enough for control requests, smaller than an envelope carrying HS1. This forces
+    // actual Connector::send admission backpressure deterministically, not a sleep race.
+    config.limits.queue_bytes = 128;
+    let connector = Arc::new(
+        Connector::start(
+            ConnectorConfig::new(config),
+            Arc::new(SessionEvents {
+                sessions: sessions.clone(),
+                next: None,
+            }),
+        )
+        .unwrap(),
+    );
+    sessions.attach(&connector);
+    wait_until("small-queue Connector routing", || connector.routing());
+    assert!(matches!(
+        connector.send(&ring.daemon.sign_key(), &[0; 128]),
+        Err(RingError::Backpressure)
+    ));
+    let at = Instant::now();
+    let result = sessions.open_cancellable(&ring.daemon.sign_key(), &|| {
+        at.elapsed() >= Duration::from_millis(30)
+    });
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert!(at.elapsed() < Duration::from_millis(500));
+    assert!(sessions.peers().is_empty());
+    assert!(
+        daemon.accepted.lock().unwrap().is_empty(),
+        "HS1 must not have escaped the admission cap"
+    );
+    connector.abandon();
+}
+
+#[test]
+fn abort_interrupts_a_stream_writer_waiting_for_send_admission() {
+    let r = relay();
+    let ring = TestRing::new(&r.url());
+    let _daemon = side(&r, &ring, &ring.daemon, true);
+    let mut session_config = cfg(&ring.mobile);
+    session_config.write_stall = Duration::from_secs(30);
+    let sessions = Sessions::new(session_config, None);
+    let mut config = contract::config(&r.target(), &ring.chain, ring.mobile.clone());
+    config.limits.queue_bytes = 1024;
+    let connector = Arc::new(
+        Connector::start(
+            ConnectorConfig::new(config),
+            Arc::new(SessionEvents {
+                sessions: sessions.clone(),
+                next: None,
+            }),
+        )
+        .unwrap(),
+    );
+    sessions.attach(&connector);
+    wait_until("Connector routing", || connector.routing());
+    let stream = sessions.open(&ring.daemon.sign_key()).unwrap();
+    let mut writer = stream.try_clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        tx.send(writer.write_all(&vec![7; 10_000])).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "large encrypted write must wait on the small queue cap"
+    );
+    let at = Instant::now();
+    stream.abort("transport cancelled");
+    assert!(rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap()
+        .is_err());
+    join.join().unwrap();
+    assert!(at.elapsed() < Duration::from_millis(500));
+    assert!(sessions.peers().is_empty());
+    connector.abandon();
+}
+
+#[test]
+fn session_events_forward_counted_acceptance_to_next() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use xshell_protocol::ring::relay::ConnectorEvents;
+    #[derive(Default)]
+    struct Accepted(AtomicUsize);
+    impl ConnectorEvents for Accepted {
+        fn accepted(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let accepted = Arc::new(Accepted::default());
+    let events = SessionEvents {
+        sessions: Sessions::new(cfg(&contract::keys()), None),
+        next: Some(accepted.clone()),
+    };
+    events.accepted();
+    assert_eq!(accepted.0.load(Ordering::SeqCst), 1);
+}
