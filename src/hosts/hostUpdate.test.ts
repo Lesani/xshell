@@ -102,3 +102,14 @@ describe("Host update targeting and eligibility", () => {
   });
 
 });
+
+it("route limitation blocks updates independently of Desktop/Windows ownership, leaving a real SSH control eligible", () => {
+  const eligible = { status: "build-differs", updateAction: "replace", phase: null } as HostStatus;
+  for (const routeUpdateUnavailable of ["relay-only", "identity-bound-alias"] as const) {
+    expect(updateAction({ ...eligible, routeUpdateUnavailable })).toBeNull();
+    for (const updateUnavailable of ["desktop-owned", "windows-owner"] as const) {
+      expect(updateAction({ ...eligible, routeUpdateUnavailable, updateUnavailable })).toBeNull();
+    }
+  }
+  expect(updateAction(eligible)).toBe("replace");
+});

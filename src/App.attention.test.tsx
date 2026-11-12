@@ -90,6 +90,7 @@ async function setup(panels: Record<string, unknown>, cachedIds = ["files", "git
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return [host, otherHost].map(h => ({ status: status(h.id, "offline"), terminals: null }));
       case "list_claude_projects": case "list_pi_projects": case "get_all_recent_sessions": case "get_sessions": case "open_copies_pending": case "get_git_log": case "list_dir": case "list_project_session_ids": return [];

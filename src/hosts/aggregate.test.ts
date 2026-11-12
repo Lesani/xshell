@@ -66,3 +66,19 @@ describe("usage counter sources", () => {
     expect(liveRecentSessions(byHost, () => false)).toBe(local);
   });
 });
+
+import { registry } from "./registry";
+import type { HostStatus } from "./types";
+it("aggregate uses effective Ring representatives exactly once and never double-counts verified Local", async () => {
+  const r = `r_${"f".repeat(64)}`, local = `r_${"e".repeat(64)}`;
+  registry.applyAvailable({ sequence: 1, hosts: [
+    { id: r, aliases: [r], name: "Ring", color: null, daemonKey: "key", routes: ["relay"], activeRoute: "relay", reachability: { kind: "online" } },
+    { id: "local", aliases: ["local", local], name: "Local", color: null, daemonKey: "local-key", routes: ["local", "relay"], activeRoute: "local", reachability: { kind: "online" } },
+  ] });
+  invoke.mockReset(); invoke.mockResolvedValue({ installed: false });
+  registry.applyStatus({ host: r, status: "connected" } as HostStatus);
+  registry.applyStatus({ host: "local", status: "connected" } as HostStatus);
+  invoke.mockClear();
+  await fanOutSourced("get_codex_usage");
+  expect(invoke.mock.calls).toEqual([["get_codex_usage"], ["host_call", { host: r, method: "get_codex_usage", params: {} }]]);
+});

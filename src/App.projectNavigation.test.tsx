@@ -83,6 +83,7 @@ async function setup(panels: Record<string, unknown>, cachedIds = ["files", "git
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return [host, otherHost].map(h => ({ status: status(h.id, "offline"), terminals: null }));
       case "get_sessions": return fixtureHistory;

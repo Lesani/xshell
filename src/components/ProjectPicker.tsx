@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { buildProjectRows, loadPickerProjects, type AgentProjectLists, type PickerRow } from "../hosts/hostProjects";
 import { isPinned, toProjectKey, type ProjectKey } from "../hosts/projectKey";
 import { isUsableStatus } from "../hosts/registry";
-import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
+import { remoteHosts, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import type { HostId } from "../hosts/types";
+import { cache } from "../hosts/cache";
 import { HostBadge } from "./HostBadge";
 import { Check, FolderPlus, Search } from "lucide-react";
 import type { ProjectInfo } from "../types";
@@ -32,7 +33,8 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
   const [filter, setFilter] = useState("");
   const { tt, Tooltip } = useTooltip();
   const hostsSnap = useHostsSnapshot();
-  const hosts = hostsSnap.configs;
+  const hosts = useMemo(() => remoteHosts(hostsSnap), [hostsSnap.available, hostsSnap.configs]);
+  const sourceKey = (host: HostId) => JSON.stringify([host, cache.dataIdentity(host)]);
   const [hostLists, setHostLists] = useState<Record<HostId, HostLists>>({});
 
   // Refresh every agent's list when the dialog opens so directories used since app start
@@ -49,12 +51,13 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
   useEffect(() => {
     let alive = true;
     for (const h of hosts) {
+      const key = sourceKey(h.id), generation = cache.capture(h.id);
       loadPickerProjects(h.id).then(r => {
-        if (!alive) return;
-        setHostLists(prev => ({ ...prev, [h.id]: {
-          lists: { ...prev[h.id]?.lists, ...r.lists },
-          stale: r.stale || (!r.loaded && !!prev[h.id]?.loaded),
-          loaded: r.loaded || !!prev[h.id]?.loaded,
+        if (!alive || !cache.isCurrent(h.id, generation)) return;
+        setHostLists(prev => ({ ...prev, [key]: {
+          lists: { ...prev[key]?.lists, ...r.lists },
+          stale: r.stale || (!r.loaded && !!prev[key]?.loaded),
+          loaded: r.loaded || !!prev[key]?.loaded,
         } }));
       });
     }
@@ -75,7 +78,7 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
 
   const rows = useMemo(() => buildProjectRows(localLists, filter), [localLists, filter]);
   const hostRows = useMemo(() => Object.fromEntries(hosts.map(h => {
-    const l = hostLists[h.id];
+    const l = hostLists[sourceKey(h.id)];
     return [h.id, l ? buildProjectRows(l.lists, filter) : []];
   })) as Record<HostId, PickerRow[]>, [hosts, hostLists, filter]);
   const totalRows = rows.length + Object.values(hostRows).reduce((n, r) => n + r.length, 0);
@@ -133,7 +136,7 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
             )}
             {hosts.map(h => {
               const st = hostsSnap.status[h.id];
-              const l = hostLists[h.id];
+              const l = hostLists[sourceKey(h.id)];
               const hr = hostRows[h.id] ?? [];
               const neverConnected = !l?.loaded && hostsSnap.live[h.id] == null;
               return (

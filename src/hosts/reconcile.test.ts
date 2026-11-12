@@ -400,3 +400,14 @@ describe("shared custom title observation", () => {
     for (const value of [undefined, null, 42, {}, ""]) expect(tabFromTerminal(H, info("u", {}, { customTitle: value })).customTitle).toBeUndefined();
   });
 });
+
+import { registry } from "./registry";
+it("reconcile matches a verified alias without rebinding its transport or deleting its group layout", () => {
+  const r = `r_${"a".repeat(64)}`;
+  registry.applyAvailable({ sequence: 1, hosts: [{ id: H, aliases: [H, r], name: "Host", color: null, daemonKey: "key", activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "unknown" } }] });
+  const tab = { ...tabFromTerminal(r, info("retained")), groupId: "personal" };
+  const delta = reconcile([tab], H, [info("retained")], new Set());
+  expect(delta.add).toEqual([]);
+  expect(delta.remove).toEqual([]);
+  expect(delta.update).toEqual([]);
+});

@@ -180,6 +180,7 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
       case "local_host_info": return localInfo;
       // Daemon startup reads this even with no legacy Tabs. Keep migration real.
       case "local_migration_journal_read": return null;
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(LOCAL_HOST).desktopBuild };

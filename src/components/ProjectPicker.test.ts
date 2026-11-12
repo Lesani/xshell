@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
-vi.mock("../hosts/useHosts", () => ({ useHostsSnapshot: () => ({ configs: [], status: {}, live: {} }) }));
+vi.mock("../hosts/useHosts", async original => ({ ...await original<typeof import("../hosts/useHosts")>(), useHostsSnapshot: () => ({ configs: [], available: [], status: {}, live: {} }) }));
 import { ProjectPicker } from "./ProjectPicker";
 
 it("parent-merged ProjectPicker input never fabricates Claude discovery before raw lists load", () => {

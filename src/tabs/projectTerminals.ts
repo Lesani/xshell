@@ -1,7 +1,7 @@
 import type { AgentId } from "../agents";
 import type { Group, Tab } from "../types";
 import { daemonHost } from "../hosts/localHost";
-import { isUsableStatus, type RegistrySnapshot } from "../hosts/registry";
+import { isUsableStatus, resolveHostAlias, type RegistrySnapshot } from "../hosts/registry";
 import { runtimeTabProjectKey } from "../hosts/projectRuntime";
 import { sessionKeyOfTab } from "../hosts/projectKey";
 import { tabName } from "./tabName";
@@ -28,7 +28,8 @@ export function projectTerminals(tabs: Tab[], groups: Group[], hosts: RegistrySn
   return tabs.flatMap(tab => {
     const projectKey = runtimeTabProjectKey(tab);
     if (tab.type !== "terminal" || !projectKey) return [];
-    const wireHost = daemonHost(tab);
+    const originalHost = daemonHost(tab);
+    const wireHost = originalHost ? resolveHostAlias(hosts, originalHost) : null;
     const info = wireHost ? hosts.live[wireHost]?.find(t => t.terminal === tab.terminal) : undefined;
     const current = !!wireHost && isUsableStatus(hosts.status[wireHost]) && !!info;
     // A legacy in-process Tab alone cannot establish whether its process still runs.

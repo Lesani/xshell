@@ -1,3 +1,4 @@
+import { registry } from "./registry";
 import type { Group, Tab } from "../types";
 import { removeLeaf, collectLeafIds } from "../layout";
 import { getShellById } from "../shells";
@@ -60,8 +61,9 @@ export function reconcile(
   pending: ReadonlySet<string>,
   isDirty: (tabId: string, field: "title" | "sessionId") => boolean = () => false,
 ): ReconcileDelta {
+  host = registry.dataHost(host);
   const listed = new Map(list.map(i => [i.terminal, i]));
-  const mine = tabs.filter(t => t.host === host && t.terminal);
+  const mine = tabs.filter(t => registry.dataHost(t.host) === host && t.terminal);
   const have = new Set(mine.map(t => t.terminal!));
   const remove: string[] = [];
   const update: Tab[] = [];
@@ -71,7 +73,7 @@ export function reconcile(
       if (!pending.has(t.terminal!)) remove.push(t.id);
       continue;
     }
-    let next = t;
+    let next = t; // retain the original alias; its access remains identity-bound
     const observed = tabFromTerminal(host, info);
     const title = observed.title;
     if (title !== t.title && !isDirty(t.id, "title")) next = { ...next, title };

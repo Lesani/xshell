@@ -545,3 +545,130 @@ it("captured input action owns immutable Tab/Host/Terminal and connection identi
     });
   } finally { status.mockRestore(); }
 });
+
+it("a Ring Close with indeterminate dispatch is never automatically replayed", async () => {
+  const rt = new RemoteTerminals();
+  const r = `r_${"b".repeat(64)}`;
+  invoke.mockRejectedValue({ code: "indeterminate", message: "owner lost after dispatch" });
+  const failures: unknown[] = [];
+  const unlisten = rt.onCloseFailed(f => failures.push(f));
+  await rt.close(r, "retained");
+  await flush();
+  expect(calls("host_term_close")).toEqual([["host_term_close", { host: r, terminal: "retained" }]]);
+  expect(failures).toHaveLength(1);
+  unlisten();
+});
+
+it("identity rebind fences late live output, waits for Attach then Detach, and can only reattach the original UUID", async () => {
+  const r = `r_${"a".repeat(64)}`, uuid = "identity-rebind-inflight";
+  const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: async () => {} });
+  const attached = deferred<{ exitCode: null }>();
+  invoke.mockImplementation(async command => command === "host_term_attach" && calls("host_term_attach").length === 1 ? attached.p : { exitCode: null });
+  const old = sinks();
+  const gen = rt.mount(H, uuid, old.s);
+  const initial = rt.start(H, uuid, gen, opts);
+  const preparing = rt.prepareIdentityRebind(H, r, [uuid]);
+  ch<number[]>(0).emit([75, 50]);
+  expect(old.data).toEqual([]);
+  expect(calls("host_term_detach")).toEqual([]);
+  expect(rt.inputBlocked(uuid, H)).toBe(true);
+  attached.resolve({ exitCode: null });
+  await initial; await preparing;
+  expect(calls("host_term_detach")).toEqual([["host_term_detach", { host: H, terminal: uuid }]]);
+  expect(rt.inputBlocked(uuid, r)).toBe(true);
+  rt.finishIdentityRebind(r, [uuid]);
+  const next = sinks(), nextGen = rt.mount(r, uuid, next.s);
+  await rt.start(r, uuid, nextGen, opts);
+  ch<number[]>(0).emit([88]); // old generation cannot reach either sink
+  ch<number[]>(2).emit([75]);
+  expect(old.data).toEqual([]);
+  expect(next.data.map(bytes => [...bytes])).toEqual([[75]]);
+  expect(calls("host_term_attach").map(([, args]) => (args as { host: string }).host)).toEqual([H, r]);
+  expect(calls("host_term_open")).toEqual([]);
+  expect(calls("host_term_close")).toEqual([]);
+});
+
+it("captureTerminalInput carries only a positively verified stable alias before delayed clipboard/upload work", () => {
+  const r = `r_${"c".repeat(64)}`;
+  registry.applyAvailable({ sequence: 100, hosts: [{ id: H, aliases: [H, r], name: "Verified K", color: null, daemonKey: "K-key", activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "online" } }] });
+  registry.applyStatus({ host: H, status: "connected", configGeneration: 10, linkGeneration: 11 } as HostStatus);
+  const action = captureTerminalInput({ id: "capture", type: "terminal", title: "K", host: H, terminal: "same-uuid" });
+  expect(action).toMatchObject({ host: r, terminal: "same-uuid", inputTarget: { configGeneration: 10, linkGeneration: 11 } });
+  registry.applyAvailable({ sequence: 101, hosts: [] });
+  expect(action.host).toBe(r); // a later h_ retarget cannot recapture the action's authority
+});
+
+it.each(["retained", "unsent", "sent", "indeterminate"] as const)("guarded original-alias start waits for release without consuming or replaying intent (%s)", async disposition => {
+  const r = `r_${"d".repeat(64)}`, uuid = `guarded-${disposition}`;
+  registry.applyAvailable({ sequence: 1000, hosts: [{ id: H, aliases: [H, r], name: "Original", color: null, daemonKey: "original-key", activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "online" } }] });
+  const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: async () => {} });
+  invoke.mockResolvedValue({ exitCode: null, pid: 42 });
+  if (disposition !== "retained") pendingOpens.set(uuid, { host: r, spec: { cwd: "/p" }, meta: {}, state: disposition === "unsent" ? "opening" : disposition === "sent" ? "sent" : "failed", ...(disposition === "indeterminate" ? { error: "Open dispatch is indeterminate" } : {}) });
+  const gen = rt.mount(r, uuid, sinks().s);
+  registry.beginRetarget(H);
+  let settled = false;
+  const started = rt.start(r, uuid, gen, opts).then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
+  try {
+    await flush();
+    expect(settled).toBe(false);
+    expect(calls("host_term_open")).toEqual([]); expect(calls("host_term_attach")).toEqual([]);
+  } finally { registry.endRetarget(H); }
+  const result = await started;
+  if (disposition === "indeterminate") {
+    expect(result).toEqual({ error: "Open dispatch is indeterminate" }); expect(calls("host_term_open")).toEqual([]); expect(calls("host_term_attach")).toEqual([]);
+  } else {
+    expect(result).toHaveProperty("value.kind", disposition === "unsent" ? "opened" : "attached");
+    expect(calls("host_term_open")).toHaveLength(disposition === "unsent" ? 1 : 0);
+    expect(calls("host_term_attach")).toHaveLength(disposition === "unsent" ? 0 : 1);
+    expect(calls(disposition === "unsent" ? "host_term_open" : "host_term_attach")[0][1]).toMatchObject({ host: r, terminal: uuid });
+  }
+  expect(calls("host_term_close")).toEqual([]);
+});
+
+it.each(["retained", "unsent", "sent", "indeterminate", "abort"] as const)("a replacement retarget guard keeps the original alias start pending (%s)", async disposition => {
+  const r = `r_${"d".repeat(64)}`, uuid = `replacement-guard-${disposition}`, ac = new AbortController();
+  registry.applyAvailable({ sequence: 2000, hosts: [{ id: H, aliases: [H, r], name: "Original", color: null, daemonKey: "original-key", activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "online" } }] });
+  const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: async () => {} });
+  invoke.mockResolvedValue({ exitCode: null, pid: 42 });
+  if (disposition !== "retained") pendingOpens.set(uuid, { host: r, spec: { cwd: "/p" }, meta: {}, state: disposition === "sent" ? "sent" : disposition === "indeterminate" ? "failed" : "opening", ...(disposition === "indeterminate" ? { error: "Open dispatch is indeterminate" } : {}) });
+  const gen = rt.mount(r, uuid, sinks().s);
+  registry.beginRetarget(H);
+  let settled = false;
+  const started = rt.start(r, uuid, gen, opts, ac.signal).then(value => { settled = true; return { value }; }, error => { settled = true; return { error }; });
+  try {
+    await flush();
+    expect(settled).toBe(false);
+    registry.endRetarget(H);
+    registry.beginRetarget(H); // replace the guard before the awaiting microtask runs
+    await flush();
+    expect(settled).toBe(false);
+    expect(calls("host_term_open")).toEqual([]); expect(calls("host_term_attach")).toEqual([]);
+    if (disposition === "abort") {
+      ac.abort();
+      expect(await started).toMatchObject({ error: { name: "AbortError" } });
+    }
+  } finally { registry.endRetarget(H); }
+  const result = await started;
+  if (disposition === "indeterminate") expect(result).toEqual({ error: "Open dispatch is indeterminate" });
+  else if (disposition !== "abort") {
+    expect(result).toHaveProperty("value.kind", disposition === "unsent" ? "opened" : "attached");
+    expect(calls(disposition === "unsent" ? "host_term_open" : "host_term_attach")[0][1]).toMatchObject({ host: r, terminal: uuid });
+  }
+  expect(calls("host_term_open")).toHaveLength(disposition === "unsent" ? 1 : 0);
+  expect(calls("host_term_attach")).toHaveLength(disposition === "retained" || disposition === "sent" ? 1 : 0);
+  expect(calls("host_term_close")).toEqual([]);
+});
+
+it.each(["abort", "unmount"])("a guard-waiting unsent Open is cancelled before dispatch on %s", async cancel => {
+  const r = `r_${"d".repeat(64)}`, uuid = `cancel-guard-${cancel}`, ac = new AbortController();
+  const rt = new RemoteTerminals({ isUsable: () => true, waitUsable: async () => {} });
+  pendingOpens.set(uuid, { host: r, spec: { cwd: "/p" }, meta: {}, state: "opening" });
+  const gen = rt.mount(r, uuid, sinks().s);
+  registry.beginRetarget(H);
+  const started = rt.start(r, uuid, gen, opts, cancel === "abort" ? ac.signal : undefined).catch(error => error);
+  if (cancel === "abort") ac.abort(); else rt.unmount(uuid, gen);
+  registry.endRetarget(H);
+  const result = await started;
+  if (cancel === "abort") expect(result).toMatchObject({ name: "AbortError" }); else expect(result).toBeNull();
+  expect(calls("host_term_open")).toEqual([]); expect(calls("host_term_attach")).toEqual([]);
+});

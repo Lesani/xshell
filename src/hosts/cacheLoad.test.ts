@@ -38,3 +38,16 @@ describe("delayed cache load (amendment 21)", () => {
     expect(cache.terminals("h_zz12cd34")?.map(t => t.terminal)).toEqual(["z"]);
   });
 });
+
+it("stable verified provenance restores retained Ring cache after process restart without persisting route generations", async () => {
+  cache._reset();
+  const host = `r_${"d".repeat(64)}`;
+  disk.value = { version: 1, hosts: { "daemon:key": { provenance: { daemonKey: "key", host }, terminals: [term("retained")], terminalsAt: 1, calls: { "list_claude_projects:{}": { v: ["offline project"], at: 2 } } } } };
+  await cache.load();
+  expect(cache.retainedHosts()).toEqual([host]);
+  expect(cache.terminals(host)?.[0].terminal).toBe("retained");
+  cache.bindHosts([{ id: host, aliases: [host], name: "Member", color: null, daemonKey: "key", activeRoute: "relay", routes: ["relay"], reachability: { kind: "unknown" } }], [], {});
+  expect(cache.get(host, "list_claude_projects")?.v).toEqual(["offline project"]);
+  expect(JSON.stringify(cache.getState())).not.toContain("generation");
+  cache._reset();
+});

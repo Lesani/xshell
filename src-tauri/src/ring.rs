@@ -113,6 +113,11 @@ pub fn setup(app: &AppHandle) {
     let mut cfg = DesktopRingConfig::new(dir, host_name());
     cfg.default_relay_url = default_relay_url(&|k| std::env::var(k).ok());
     let ring = DesktopRing::open(cfg, Arc::new(TauriRingObserver(app.clone())));
+    if let Some(hosts) = app.try_state::<crate::hosts::Hosts>() {
+        if let Err(e) = ring.attach_manager(&hosts.manager) {
+            eprintln!("xshell: cannot attach Ring Host routing: {e}");
+        }
+    }
     let (a, b) = (app.clone(), app.clone());
     let worker = SyncWorker::new(
         ring,

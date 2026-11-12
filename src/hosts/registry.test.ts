@@ -25,12 +25,14 @@ beforeEach(() => {
 });
 
 describe("registry", () => {
-  it("stays dormant with no hosts: no listeners, no Tauri calls", async () => {
+  it("starts discovery with no saved hosts", async () => {
+    invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : cmd === "hosts_available" ? { sequence: 0, hosts: [] } : undefined);
     const r = new HostRegistry();
     await r.init([]);
-    expect(invoke).not.toHaveBeenCalled();
-    expect(Object.keys(handlers)).toEqual([]);
-    expect(r.initialized).toBe(false);
+    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_available", "hosts_status"]);
+    expect(Object.keys(handlers).sort()).toEqual(["hosts:available", "hosts:status", "hosts:terminals"]);
+    expect(r.initialized).toBe(true);
+    r._dispose();
   });
 
   it("init is single-flight (StrictMode-safe) and orders listen → configure → status", async () => {
@@ -40,9 +42,9 @@ describe("registry", () => {
     const p2 = r.init([cfg]);
     expect(p1).toBe(p2);
     await p1;
-    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_status"]);
+    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_available", "hosts_status"]);
     expect(invoke.mock.calls[0][1]).toEqual({ hosts: [cfg] });
-    expect(Object.keys(handlers).sort()).toEqual(["hosts:status", "hosts:terminals"]);
+    expect(Object.keys(handlers).sort()).toEqual(["hosts:available", "hosts:status", "hosts:terminals"]);
     r._dispose();
   });
 
@@ -148,12 +150,12 @@ describe("registry", () => {
     r._dispose();
   });
 
-  it("configure on a dormant registry starts it", async () => {
+  it("configure reuses zero-SSH discovery listeners", async () => {
     invoke.mockImplementation(async (cmd: string) => (cmd === "hosts_status" ? [] : undefined));
     const r = new HostRegistry();
     await r.init([]);
     await r.configure([cfg]);
-    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_status"]);
+    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_available", "hosts_status", "hosts_configure"]);
     await r.configure([cfg, { ...cfg, id: "h_zz12cd34" }]);
     expect(invoke.mock.calls[invoke.mock.calls.length - 1]).toEqual(["hosts_configure", { hosts: [cfg, { ...cfg, id: "h_zz12cd34" }] }]);
     r._dispose();
@@ -271,9 +273,10 @@ describe("the Local Host (local Daemon mode)", () => {
     await r.init([]);
     expect(r.isConfigured(L)).toBe(false);
     await r.setLocal(true);
-    expect(r.isConfigured(L)).toBe(true);
+    expect(r.isConfigured(L)).toBe(false);
+    expect(r.isAvailable(L)).toBe(true);
     expect(r.getSnapshot().configs).toEqual([]);
-    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_status"]);
+    expect(invoke.mock.calls.map(c => c[0])).toEqual(["hosts_configure", "hosts_available", "hosts_status", "hosts_status"]);
     expect(invoke.mock.calls[0][1]).toEqual({ hosts: [] });
     handlers["hosts:status"]({ payload: lstatus("connected") });
     handlers["hosts:terminals"]({ payload: { host: L, list: [] } });
@@ -293,7 +296,8 @@ describe("the Local Host (local Daemon mode)", () => {
     handlers["hosts:status"]({ payload: lstatus("connected") });
     handlers["hosts:terminals"]({ payload: { host: L, list: [] } });
     await r.configure([]);
-    expect(r.isConfigured(L)).toBe(true);
+    expect(r.isConfigured(L)).toBe(false);
+    expect(r.isAvailable(L)).toBe(true);
     expect(r.isUsable(L)).toBe(true);
     expect(r.getSnapshot().live[L]).toEqual([]);
     const configures = invoke.mock.calls.filter(c => c[0] === "hosts_configure");
@@ -327,4 +331,162 @@ describe("the Local Host (local Daemon mode)", () => {
     await expect(r.waitUsable(L)).rejects.toMatchObject({ code: "unknown-host" });
     r._dispose();
   });
+});
+
+import type { AvailableHost } from "./types";
+import { cache } from "./cache";
+const R = `r_${"a".repeat(64)}`;
+const ringHost = (over: Partial<AvailableHost> = {}): AvailableHost => ({
+  id: R, aliases: [R], name: "Ring machine", color: null, daemonKey: "verified-key-a",
+  routes: ["relay"], activeRoute: "relay", reachability: { kind: "unknown" }, ...over,
+});
+
+describe("registry effective Ring Hosts", () => {
+  it("listens before hosts_available; a discovery event wins over the delayed command at zero SSH", async () => {
+    const available = deferred<{ sequence: number; hosts: AvailableHost[] }>();
+    invoke.mockImplementation(async cmd => cmd === "hosts_available" ? available.p : cmd === "hosts_status" ? [] : undefined);
+    const r = new HostRegistry();
+    const init = r.init([]);
+    await flush();
+    expect(Object.keys(handlers).sort()).toEqual(["hosts:available", "hosts:status", "hosts:terminals"]);
+    handlers["hosts:available"]({ payload: { sequence: 2, hosts: [ringHost()] } });
+    available.resolve({ sequence: 1, hosts: [] });
+    await init;
+    expect(r.getSnapshot().configs).toEqual([]);
+    expect(r.isConfigured(R)).toBe(false);
+    expect(r.isAvailable(R)).toBe(true);
+    expect(r.hostName(R)).toBe("Ring machine");
+    await r.configure([]);
+    expect(r.getSnapshot().available).toEqual([ringHost()]);
+    r._dispose();
+  });
+
+  it("buffers status and Terminals emitted before discovery, then accepts only newer per-field snapshots", async () => {
+    const available = deferred<{ sequence: number; hosts: AvailableHost[] }>();
+    invoke.mockImplementation(async cmd => cmd === "hosts_available" ? available.p : cmd === "hosts_status" ? [{ status: status("offline", { host: R }), terminals: null }] : { installed: false });
+    const r = new HostRegistry();
+    const init = r.init([]);
+    await flush();
+    handlers["hosts:status"]({ payload: status("connected", { host: R, configGeneration: 2 }) });
+    handlers["hosts:terminals"]({ payload: { host: R, list: [] } });
+    available.resolve({ sequence: 1, hosts: [ringHost()] });
+    await init;
+    expect(r.isUsable(R)).toBe(true);
+    await expect(r.waitUsable(R)).resolves.toBeUndefined();
+    expect(r.getSnapshot().live[R]).toEqual([]);
+    r._dispose();
+  });
+
+  it("discovery fences an in-flight status snapshot; revocation keeps cache but withdraws usable access", async () => {
+    cache._reset();
+    const oldStatus = deferred<HostSnapshot[]>();
+    let fetches = 0;
+    invoke.mockImplementation(async cmd => {
+      if (cmd === "hosts_available") return { sequence: 1, hosts: [ringHost()] };
+      if (cmd === "hosts_status") return ++fetches === 1 ? oldStatus.p : [];
+      return { installed: false };
+    });
+    const r = new HostRegistry();
+    const init = r.init([]);
+    await flush();
+    r.applyStatus(status("connected", { host: R, configGeneration: 1 }));
+    cache.put(R, "get_all_recent_sessions", { limit: 100 }, ["personal history"]);
+    handlers["hosts:available"]({ payload: { sequence: 2, hosts: [] } });
+    oldStatus.resolve([{ status: status("connected", { host: R, configGeneration: 1 }), terminals: [] }]);
+    await init;
+    expect(r.isAvailable(R)).toBe(false);
+    expect(r.isUsable(R)).toBe(false);
+    await expect(r.waitUsable(R)).rejects.toMatchObject({ code: "unknown-host" });
+    expect(cache.get(R, "get_all_recent_sessions", { limit: 100 })?.v).toEqual(["personal history"]);
+    r._dispose();
+    cache._reset();
+  });
+
+  it("uses only verified backend aliases, deduplicates Local and ignores stopped saved-alias status", async () => {
+    invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : undefined);
+    const r = new HostRegistry();
+    await r.init([cfg, { ...cfg, id: "h_zz12cd34" }]);
+    r.applyAvailable({ sequence: 1, hosts: [ringHost({ id: H, aliases: [H, R], activeRoute: "ssh", routes: ["ssh", "relay"] })] });
+    r.applyStatus(status("connected"));
+    expect(r.resolveAlias(R)).toBe(H);
+    expect(r.isUsable(R)).toBe(true);
+    expect(r.resolveAlias("h_zz12cd34")).toBe("h_zz12cd34");
+    await r.configure([{ ...cfg, sshTarget: "new-target" }]);
+    expect(r.resolveAlias(R)).toBe(R);
+    expect(r.isUsable(H)).toBe(false);
+    r.applyAvailable({ sequence: 2, hosts: [ringHost({ id: "local", aliases: ["local", H, R], activeRoute: "local", routes: ["local", "relay"] })] });
+    r.applyStatus(status("connected", { host: "local" }));
+    r.applyStatus(status("offline"));
+    expect(r.dataHost(R)).toBeUndefined();
+    expect(r.getStatus(H)?.host).toBe("local");
+    expect(r.isUsable(R)).toBe(true);
+    r._dispose();
+  });
+});
+
+it("retargeting fences old status, Terminal lists and agent replies until the new config generation", async () => {
+  invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined);
+  const r = new HostRegistry();
+  await r.init([cfg]);
+  r.applyStatus(status("connected", { configGeneration: 10 }));
+  await r.configure([{ ...cfg, sshTarget: "different-daemon" }]);
+  r.applyStatus(status("connected", { configGeneration: 10 }));
+  r.applyTerminals(H, []);
+  expect(r.isUsable(H)).toBe(false);
+  expect(r.getSnapshot().live[H]).toBeUndefined();
+  r.applySnapshot([{ status: status("connected", { configGeneration: 10 }), terminals: [] }], { status: {}, live: {} });
+  expect(r.isUsable(H)).toBe(false);
+  r.applyStatus(status("connected", { configGeneration: 11 }));
+  r.applyTerminals(H, []);
+  expect(r.isUsable(H)).toBe(true);
+  expect(r.getSnapshot().live[H]).toEqual([]);
+  r._dispose();
+});
+
+it("waitUsable retains the original verified alias across representative changes and versions do not move backwards", async () => {
+  invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined);
+  const r = new HostRegistry();
+  await r.init([cfg]);
+  r.applyAvailable({ sequence: 1, hosts: [ringHost({ id: H, aliases: [H, R], activeRoute: "ssh", routes: ["ssh", "relay"] })] });
+  r.applyStatus(status("offline", { configGeneration: 10 }));
+  const after = r.statusVersion(R);
+  const waiting = r.waitUsable(R, undefined, after);
+  // The saved route is retargeted; only original K's new Relay representative may wake R.
+  r.applyAvailable({ sequence: 2, hosts: [ringHost()] });
+  r.applyStatus(status("connected", { configGeneration: 11 }));
+  expect(r.isUsable(R)).toBe(false);
+  r.applyStatus(status("connected", { host: R, configGeneration: 12 }));
+  await expect(waiting).resolves.toBeUndefined();
+  expect(r.statusVersion(R)).toBeGreaterThan(after);
+  r._dispose();
+});
+
+it("retarget admission guard is synchronous, covers verified aliases and leaves unrelated configured access available", async () => {
+  invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined);
+  const r = new HostRegistry(), other = "h_zz12cd34";
+  await r.init([cfg, { ...cfg, id: other }]);
+  r.applyAvailable({ sequence: 1, hosts: [ringHost({ id: H, aliases: [H, R], activeRoute: "ssh", routes: ["ssh", "relay"] })] });
+  r.applyStatus(status("connected", { host: other }));
+  r.beginRetarget(H);
+  expect(r.isRetargeting(H)).toBe(true);
+  expect(r.isRetargeting(R)).toBe(true);
+  expect(r.isRetargeting(other)).toBe(false);
+  expect(r.isUsable(other)).toBe(true);
+  r.endRetarget(H);
+  expect(r.isRetargeting(H)).toBe(false);
+  expect(r.isRetargeting(R)).toBe(false);
+  r._dispose();
+});
+
+it("publishes available descriptors and cache provenance atomically to registry subscribers", async () => {
+  cache._reset();
+  invoke.mockImplementation(async cmd => cmd === "hosts_status" ? [] : cmd === "host_call" ? { installed: false } : undefined);
+  const r = new HostRegistry(); await r.init([cfg]);
+  r.applyAvailable({ sequence: 1, hosts: [ringHost({ id: H, aliases: [H, R] })] });
+  const observed: string[] = [];
+  const off = r.subscribe(() => { if (r.availableHost(H)?.daemonKey === "replacement") observed.push(cache.dataIdentity(H)); });
+  r.applyAvailable({ sequence: 2, hosts: [ringHost({ id: H, aliases: [H], daemonKey: "replacement" })] });
+  expect(observed.length).toBeGreaterThan(0);
+  expect(observed.every(identity => identity === "daemon:replacement")).toBe(true);
+  off(); r._dispose(); cache._reset();
 });

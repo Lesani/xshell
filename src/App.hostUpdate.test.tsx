@@ -113,6 +113,7 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(hostA.id).desktopBuild };

@@ -396,6 +396,7 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
 const HOST_LINK_COMMANDS: &[&str] = &[
     "hosts_configure",
     "hosts_status",
+    "hosts_available",
     "hosts_kick",
     "host_call",
     "host_term_open",
@@ -806,6 +807,7 @@ pub fn run() {
             relaunch_terminal,
             hosts::commands::hosts_configure,
             hosts::commands::hosts_status,
+            hosts::available::hosts_available,
             hosts::commands::hosts_kick,
             hosts::commands::host_call,
             hosts::commands::host_term_open,
@@ -915,7 +917,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 102);
+        assert_eq!(registered.len(), 103);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

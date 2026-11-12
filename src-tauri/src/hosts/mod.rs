@@ -3,6 +3,7 @@
 //! Terminals use. The Local Host is one of the Manager's Hosts too (id `local`) when its
 //! Terminals run in a Daemon ([`local::LocalMode::Daemon`]), GUI-bound or Persistent.
 
+pub mod available;
 pub mod binaries;
 pub mod commands;
 pub mod local;
@@ -19,6 +20,7 @@ use xshell_protocol::msg::TerminalInfo;
 
 pub struct Hosts {
     pub manager: Arc<Manager>,
+    pub available: Arc<available::AvailableState>,
     /// How local Tabs run, as resolved at startup.
     pub local_mode: local::LocalMode,
     /// The Daemon this app may start for the Local Host (Daemon mode only).
@@ -99,14 +101,16 @@ impl Hosts {
         let factory = SshFactory {
             local: local_daemon.clone(),
         };
+        let available = Arc::new(available::AvailableState::default());
         let mut cfg = ManagerConfig::new(
             version,
             Arc::new(factory),
             Arc::new(binaries::production_source(exe_dir, cache_dir)),
-            Arc::new(TauriObserver(app.clone())),
+            Arc::new(TauriObserver(app.clone(), available.clone())),
         );
         cfg.desktop_build = crate::build_id::BUILD.clone();
         let manager = Arc::new(Manager::new(cfg));
+        available.bind_manager(&manager);
         if local_daemon.is_some() {
             manager.set_local(HostConfig {
                 id: LOCAL_HOST_ID.into(),
@@ -119,6 +123,7 @@ impl Hosts {
         }
         Self {
             manager,
+            available,
             local_mode,
             local_daemon,
             store,
@@ -200,9 +205,14 @@ struct TerminalsEvent<'a> {
     list: &'a [TerminalInfo],
 }
 
-struct TauriObserver(AppHandle);
+struct TauriObserver(AppHandle, Arc<available::AvailableState>);
 
 impl Observer for TauriObserver {
+    fn available(&self, hosts: &[xshell_hostlink::ring::hosts::AvailableHost]) {
+        self.1.publish(hosts, |snapshot| {
+            let _ = self.0.emit("hosts:available", snapshot);
+        });
+    }
     fn status(&self, s: &HostStatus) {
         // Records the Host's connection for the Ring; the work runs elsewhere.
         crate::ring::observe(&crate::ring::HOST_SYNC, s);

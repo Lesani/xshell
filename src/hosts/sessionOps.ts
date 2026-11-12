@@ -18,7 +18,7 @@ export interface OpenContext {
   fullscreenRendering: boolean;
   forceSyncOutput: boolean;
   isUsable: (host: HostId) => boolean;
-  isConfigured: (host: HostId) => boolean;
+  isAvailable: (host: HostId) => boolean;
   status: (host: HostId) => HostStatus | undefined;
   hostName: (host: HostId) => string;
   statusLabel: (s: HostStatus | undefined) => string;
@@ -34,7 +34,7 @@ export type Plan =
 
 // The refusal notice for a Host that cannot start Terminals right now, or null when it can.
 export function refusal(host: HostId, ctx: OpenContext): string | null {
-  if (!ctx.isConfigured(host)) return fmt("notice.unknownHost");
+  if (!ctx.isAvailable(host)) return fmt("notice.unknownHost");
   if (ctx.isUsable(host)) return null;
   const s = ctx.status(host);
   const name = ctx.hostName(host);

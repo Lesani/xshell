@@ -1,3 +1,4 @@
+import { resolveHostAlias } from "../hosts/registry";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { LOCAL_HOST } from "../hosts/localHost";
 import { fmt } from "../hosts/strings";
@@ -15,7 +16,7 @@ export function HostUpdateBanner({ host: id }: { host: string | undefined }) {
       <span>{fmt("local.daemon.settingsHint")}</span>
     </div></div>;
   }
-  const host = snap.configs.find(h => h.id === id);
-  if (!host) return null;
-  return <div className="host-update-banner"><HostUpdateAction host={host} status={snap.status[host.id]} description /></div>;
+  const host = snap.available?.find(h => h.id === id || h.aliases.includes(id ?? "")) ?? snap.configs.find(h => h.id === id);
+  if (!host || !id) return null;
+  return <div className="host-update-banner"><HostUpdateAction host={{ id, name: host.name }} status={snap.status[resolveHostAlias(snap, id)]} description /></div>;
 }

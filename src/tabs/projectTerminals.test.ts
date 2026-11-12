@@ -8,7 +8,7 @@ import { projectTerminals } from "./projectTerminals";
 const status = (state = "connected") => ({ status: state } as HostStatus);
 const info = (terminal: string, fields: Partial<TerminalInfo> = {}): TerminalInfo => ({ terminal, spec: { cwd: "/p" }, meta: {}, createdAtMs: 0, pid: 1, exitCode: null, agentStatus: "working", ...fields });
 const tab = (id: string, fields: Partial<Tab> = {}): Tab => ({ id, title: id, type: "terminal", projectPath: "/p", ...fields });
-const hosts: RegistrySnapshot = { configs: [], status: { local: status(), h_a: status(), h_off: status("offline") }, live: { local: [info("local")], h_a: [info("agent"), info("ended", { exitCode: 0 })], h_off: [info("offline")] }, epochs: {}, agents: {} };
+const hosts: RegistrySnapshot = { configs: [], available: [], status: { local: status(), h_a: status(), h_off: status("offline") }, live: { local: [info("local")], h_a: [info("agent"), info("ended", { exitCode: 0 })], h_off: [info("offline")] }, epochs: {}, agents: {} };
 it("projects unlinked agents and raw Shells without history, effective custom titles and split provenance", () => {
   const tabs = [tab("agent", { terminal: "agent", host: "h_a", customTitle: "Named", groupId: "g" }), tab("shell", { shellMode: "raw", title: "Bash", projectName: "Project" }), tab("local", { terminal: "local" })];
   const rows = projectTerminals(tabs, [{ id: "g", name: "Split", layout: { kind: "leaf", tabId: "agent" } }], hosts, new Set());

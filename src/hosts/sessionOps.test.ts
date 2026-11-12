@@ -16,7 +16,7 @@ function ctx(over: Partial<OpenContext> & { usable?: boolean; st?: HostStatus["s
     fullscreenRendering: true,
     forceSyncOutput: true,
     isUsable: () => usable,
-    isConfigured: (h) => h === H,
+    isAvailable: (h) => h === H,
     status: () => ({ status: over.st ?? (usable ? "connected" : "offline") } as HostStatus),
     hostName: () => "Dev",
     statusLabel: (s) => (s?.status === "offline" ? "Offline" : "Connected"),
@@ -125,7 +125,7 @@ describe("skip permissions is never part of a remote open", () => {
 describe("local Daemon mode (ADR-0005): new Local Tabs are Daemon Terminals", () => {
   const UUID = "11111111-2222-3333-4444-555555555555";
   // The Local Host is never refused, whatever its status: the Tab waits while it starts.
-  const lctx = (over: Partial<OpenContext> = {}) => ctx({ localDaemon: true, usable: false, isConfigured: () => false, ...over });
+  const lctx = (over: Partial<OpenContext> = {}) => ctx({ localDaemon: true, usable: false, isAvailable: () => false, ...over });
 
   it("open session: remote-<uuid> id, no host, pending on \"local\", agent spec without a wrapper", () => {
     const plan = planOpenSession(session(), project, [], lctx());

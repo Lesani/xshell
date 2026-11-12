@@ -11,7 +11,7 @@ it("active case-distinct Unix project opens Shell in its own cwd", () => {
   const lower = project("/work/p", "h_test");
   const selected = resolveTabProject([upper, lower], { host: "h_test", projectPath: lower.path, projectName: "P" });
   expect(selected).toBe(lower);
-  const context: OpenContext = { now: 1, uuid: () => "shell-terminal", fullscreenRendering: true, forceSyncOutput: true, isUsable: () => true, isConfigured: () => true, status: () => undefined, hostName: h => h, statusLabel: () => "connected" };
+  const context: OpenContext = { now: 1, uuid: () => "shell-terminal", fullscreenRendering: true, forceSyncOutput: true, isUsable: () => true, isAvailable: () => true, status: () => undefined, hostName: h => h, statusLabel: () => "connected" };
   const plan = planNewShell(selected, "bash", "Bash", context);
   expect(plan.kind).toBe("create");
   if (plan.kind === "create") expect(plan.pending?.open.spec.cwd).toBe(lower.path);

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Tab } from "../types";
 import { daemonHost } from "../hosts/localHost";
-import { isUsableStatus, type RegistrySnapshot } from "../hosts/registry";
+import { isUsableStatus, resolveHostAlias, type RegistrySnapshot } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
 import { isHostError } from "../hosts/types";
 import { customTitleError, normalizeCustomTitle } from "./customTitleValidation";
@@ -13,10 +13,10 @@ export function customTitleUnavailable(tab: Tab, snap: RegistrySnapshot): string
   if (isInProcessTitleTab(tab)) return null;
   const host = daemonHost(tab);
   if (tab.type !== "terminal" || !host) return fmt("tab.rename.gone");
-  const status = snap.status[host];
+  const status = snap.status[resolveHostAlias(snap, host)];
   if (!isUsableStatus(status)) return fmt("tab.rename.offline");
   if (!status?.daemonCapabilities?.includes(CUSTOM_TITLE_CAPABILITY)) return fmt("tab.rename.unsupported");
-  if (!snap.live[host]?.some(t => t.terminal === tab.terminal)) return fmt("tab.rename.gone");
+  if (!snap.live[resolveHostAlias(snap, host)]?.some(t => t.terminal === tab.terminal)) return fmt("tab.rename.gone");
   return null;
 }
 
@@ -53,19 +53,19 @@ interface DialogState {
   retryClear: boolean;
 }
 interface State { dialog: DialogState | null; pending: boolean }
-const configOf = (snap: RegistrySnapshot, host: string) => JSON.stringify(snap.configs.find(c => c.id === host) ?? null);
+const configOf = (snap: RegistrySnapshot, host: string) => JSON.stringify([snap.configs.find(c => c.id === host) ?? null, snap.available?.find(h => h.id === host || h.aliases.includes(host))?.daemonKey ?? null]);
 
 export function captureCustomTitleTarget(tab: Tab, snap: RegistrySnapshot): CustomTitleTarget | null {
   if (isInProcessTitleTab(tab)) return { kind: "in-process", tabId: tab.id, createdAt: tab.createdAt,
     projectPath: tab.projectPath, agent: tab.agent, shellMode: tab.shellMode, shellId: tab.shellId };
   const host = daemonHost(tab);
-  return tab.type === "terminal" && host ? { kind: "daemon", tabId: tab.id, host, terminal: tab.terminal!, configGeneration: snap.status[host]?.configGeneration, config: configOf(snap, host) } : null;
+  return tab.type === "terminal" && host ? { kind: "daemon", tabId: tab.id, host, terminal: tab.terminal!, configGeneration: snap.status[resolveHostAlias(snap, host)]?.configGeneration, config: configOf(snap, host) } : null;
 }
 
 export function customTitleTargetMatches(target: CustomTitleTarget, tab: Tab, snap: RegistrySnapshot): boolean {
   if (target.kind === "in-process") return inProcessTitleTargetMatches(target, tab);
   return tab.id === target.tabId && tab.terminal === target.terminal && daemonHost(tab) === target.host
-    && snap.status[target.host]?.configGeneration === target.configGeneration && configOf(snap, target.host) === target.config;
+    && snap.status[resolveHostAlias(snap, target.host)]?.configGeneration === target.configGeneration && configOf(snap, target.host) === target.config;
 }
 
 // One explicit action, no outbox or automatic retry. Daemon replies never install values;
@@ -98,7 +98,7 @@ export class CustomTitleController {
   private current(target: CustomTitleTarget): Tab | undefined {
     const snap = this.snapshot();
     const tab = this.tabs().find(t => customTitleTargetMatches(target, t, snap));
-    if (!tab || (target.kind === "daemon" && snap.live[target.host] && !snap.live[target.host]!.some(t => t.terminal === target.terminal))) return undefined;
+    if (!tab || (target.kind === "daemon" && snap.live[resolveHostAlias(snap, target.host)] && !snap.live[resolveHostAlias(snap, target.host)]!.some(t => t.terminal === target.terminal))) return undefined;
     return tab;
   }
 

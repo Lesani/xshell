@@ -7,11 +7,11 @@ import { FolderEditorDialog } from "./FolderEditorDialog";
 import { RateLimitIndicator } from "./RateLimitIndicator";
 import { HostBadge } from "./HostBadge";
 import { useHostsSnapshot, statusLabel } from "../hosts/useHosts";
-import { isUsableStatus } from "../hosts/registry";
+import { isUsableStatus, resolveHostAlias } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SidebarItem, SidebarFolder } from "../types";
-import { asProjectKey, keyBasename, keyOf, lookupKey, parseProjectKey, sameKey, type ProjectKey } from "../hosts/projectKey";
+import { lookupProjectValue, asProjectKey, keyBasename, keyOf, lookupKey, parseProjectKey, sameKey, type ProjectKey } from "../hosts/projectKey";
 
 interface SidebarProps {
   projects: ProjectInfo[];
@@ -104,7 +104,7 @@ function FolderMiniGrid({ paths, projectIcons, projects }: { paths: ProjectKey[]
     <div className="ds-folder-grid">
       {first4.map(p => {
         const pl = lookupKey(p);
-        const settings = projectIcons[pl];
+        const settings = lookupProjectValue(projectIcons, pl);
         const proj = byPath.get(pl);
         const raw = parseProjectKey(p).path;
         const displayName = settings?.customName || proj?.name || raw.split(/[\\/]/).pop() || raw;
@@ -420,19 +420,19 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
   // `path` is the item's ProjectKey (the bare path for a Local Project).
   const renderProject = (path: ProjectKey, idx: number, parentFolderId: string | null) => {
     const pl = lookupKey(path);
-    const proj = projectsByPath.get(pl);
+    const proj = projectsByPath.get(pl) ?? projects.find(p => sameKey(keyOf(p), pl));
     const name = proj?.name || keyBasename(path);
-    const settings = projectIcons[pl];
+    const settings = lookupProjectValue(projectIcons, pl);
     const displayName = settings?.customName || name;
     const customIcon = settings?.icon;
-    const isSelected = !isInTerminal && !!selectedProject && lookupKey(keyOf(selectedProject)) === pl;
-    const isLinked = isInTerminal && !!linkedProjectKey && lookupKey(linkedProjectKey) === pl;
+    const isSelected = !isInTerminal && !!selectedProject && sameKey(keyOf(selectedProject), path);
+    const isLinked = isInTerminal && !!linkedProjectKey && sameKey(linkedProjectKey, path);
     const highlighted = isSelected || isLinked;
-    const activeCount = activeCountByProject.get(pl) || 0;
+    const activeCount = activeCountByProject.get(pl) ?? [...activeCountByProject].find(([key]) => sameKey(key, path))?.[1] ?? 0;
     // Remote Project: Host badge; dimmed with a status dot while its Host is not usable.
     const host = proj?.host ?? parseProjectKey(path).host;
-    const hostName = host ? (hostsSnap.configs.find(c => c.id === host)?.name || host) : "";
-    const hostStatus = host ? hostsSnap.status[host] : undefined;
+    const hostName = host ? (hostsSnap.available.find(h => h.id === host || h.aliases.includes(host))?.name || hostsSnap.configs.find(c => c.id === host)?.name || host) : "";
+    const hostStatus = host ? hostsSnap.status[resolveHostAlias(hostsSnap, host)] : undefined;
     const stale = !!host && !isUsableStatus(hostStatus);
     const tooltipText = !host ? displayName
       : stale ? `${fmt("sidebar.project.hostTooltip", { project: displayName, host: hostName })} · ${fmt("sidebar.project.staleTooltip", { host: hostName, status: statusLabel(hostStatus) })}`
@@ -560,8 +560,8 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
         const commonProps = { ref: ghostRef, className: "ds-drag-ghost" } as const;
         if (drag.source.kind === "project") {
           const pl = lookupKey(drag.source.path);
-          const proj = projectsByPath.get(pl);
-          const settings = projectIcons[pl];
+          const proj = projectsByPath.get(pl) ?? projects.find(p => sameKey(keyOf(p), pl));
+          const settings = lookupProjectValue(projectIcons, pl);
           const displayName = settings?.customName || proj?.name || parseProjectKey(drag.source.path).path.split(/[\\/]/).pop() || "Project";
           return (
             <div {...commonProps}>

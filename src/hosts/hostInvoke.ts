@@ -53,8 +53,10 @@ function localInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
 async function remoteCall<T>(host: HostId, cmd: HostMethod, args: Record<string, unknown> | undefined, allowCache: boolean): Promise<Provenanced<T>> {
   const cacheable = CACHEABLE_METHODS.has(cmd);
   const sk = `${host}|${callKey(cmd, args)}`;
+  const generation = cache.capture(host);
   try {
     const value = await invoke<T>("host_call", { host, method: cmd, params: args ?? {} });
+    if (cacheable && !cache.isCurrent(host, generation)) throw new HostUnavailableError(host, "offline", "Host route changed during read");
     if (cacheable) {
       cache.put(host, cmd, args, value);
       setStale(sk, false);

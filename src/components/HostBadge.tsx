@@ -7,9 +7,9 @@ import type { TtFns } from "./Tooltip";
 // between a remote and a local Project/Tab. `tooltip` is the full hover text.
 export function HostBadge({ host, tooltip, tt, size = "sm", className = "" }: { host: HostId; tooltip?: string; tt?: TtFns | null; size?: "sm" | "md"; className?: string }) {
   const snap = useHostsSnapshot();
-  const cfg = snap.configs.find(c => c.id === host);
+  const cfg = snap.available?.find(h => h.id === host || h.aliases.includes(host)) ?? snap.configs.find(c => c.id === host);
   const name = cfg?.name || host;
-  const stale = !isUsableStatus(snap.status[host]);
+  const stale = !isUsableStatus(snap.status[cfg?.id ?? host]);
   const hover = tooltip && tt ? { onMouseEnter: (e: React.MouseEvent<HTMLElement>) => tt.showTt(tooltip, e.currentTarget), onMouseLeave: () => tt.hideTt() } : {};
   return (
     <span className={`host-badge host-badge-${size} ${stale ? "host-badge-stale" : ""} ${className}`} style={cfg?.color ? { background: cfg.color } : undefined} {...hover} aria-label={tooltip || name}>

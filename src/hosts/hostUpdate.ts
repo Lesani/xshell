@@ -11,7 +11,7 @@ export type UpdateAction = "update" | "replace";
 // Semver/build eligibility comes from the backend, including incompatible Daemons. A
 // protocol-range direction is not a version ordering. Reconnect retains owner diagnosis.
 export function updateAction(status: HostStatus | undefined): UpdateAction | null {
-  if (!status || status.updateUnavailable || !["connected", "upgrade-pending", "build-differs", "incompatible"].includes(status.status)) return null;
+  if (!status || status.updateUnavailable || status.routeUpdateUnavailable || !["connected", "upgrade-pending", "build-differs", "incompatible"].includes(status.status)) return null;
   return status.updateAction ?? null;
 }
 
@@ -36,7 +36,7 @@ export function exactUpdateConnected(status: HostStatus | undefined): boolean {
     && status.daemonVersion === status.desktopVersion && sameBuild(status.daemonBuild, status.desktopBuild);
 }
 
-type Confirmation = { host: HostConfig; action: UpdateAction; target: UpdateTarget; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
+type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
 type Invocation = { confirmation: Confirmation; succeeded: boolean };
 type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, boolean>; errors: Record<string, string> };
 
@@ -50,9 +50,9 @@ export class HostUpdates {
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private set(patch: Partial<Snapshot>) { this.state = { ...this.state, ...patch }; for (const listener of this.listeners) listener(); }
-  ask(host: HostConfig, status: HostStatus) {
+  ask(host: Pick<HostConfig, "id" | "name">, status: HostStatus) {
     const action = updateAction(status);
-    if (!action || (status.phase === "upgrading" || status.phase === "preparing") || this.state.confirmation || this.state.invoking[host.id]) return;
+    if (status.host !== host.id || !action || (status.phase === "upgrading" || status.phase === "preparing") || this.state.confirmation || this.state.invoking[host.id]) return;
     this.set({ confirmation: { host: { ...host }, action, target: updateTarget(status), expectedVersion: status.desktopVersion, expectedBuild: status.desktopBuild ? { ...status.desktopBuild } : null } });
   }
   reconcile(status: HostStatus | undefined) {

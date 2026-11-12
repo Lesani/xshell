@@ -2,7 +2,8 @@ import { useSyncExternalStore } from "react";
 import { AGENT_IDS, type AgentId } from "../agents";
 import { registry, isUsableStatus, type RegistrySnapshot } from "./registry";
 import { fmt } from "./strings";
-import type { HostConfig, HostId, HostStatus, TerminalInfo } from "./types";
+import { LOCAL_HOST } from "./localHost";
+import type { AvailableHost, HostConfig, HostId, HostStatus, TerminalInfo } from "./types";
 
 export function useHostsSnapshot(): RegistrySnapshot {
   return useSyncExternalStore(registry.subscribe, registry.getSnapshot);
@@ -12,25 +13,31 @@ export function useHostConfigs(): HostConfig[] {
   return useHostsSnapshot().configs;
 }
 
+export function remoteHosts(snap: RegistrySnapshot): (AvailableHost | HostConfig)[] {
+  const available = snap.available ?? [];
+  const represented = new Set(available.flatMap(h => [h.id, ...h.aliases]));
+  return [...available.filter(h => h.id !== LOCAL_HOST), ...snap.configs.filter(c => !represented.has(c.id))];
+}
+
 export function useHostStatus(id: HostId | undefined): HostStatus | undefined {
   const snap = useHostsSnapshot();
-  return id ? snap.status[id] : undefined;
+  return id ? snap.status[registry.resolveAlias(id)] : undefined;
 }
 
 export function useHostLive(id: HostId | undefined): TerminalInfo[] | null | undefined {
   const snap = useHostsSnapshot();
-  return id ? snap.live[id] : undefined;
+  return id ? snap.live[registry.resolveAlias(id)] : undefined;
 }
 
 const NO_AGENTS = Object.fromEntries(AGENT_IDS.map(a => [a, false])) as Record<AgentId, boolean>;
 
 export function useHostAgents(id: HostId | undefined): Record<AgentId, boolean> {
   const snap = useHostsSnapshot();
-  return (id && snap.agents[id]) || NO_AGENTS;
+  return (id && snap.agents[registry.resolveAlias(id)]) || NO_AGENTS;
 }
 
 export function usableHosts(snap: RegistrySnapshot = registry.getSnapshot()): HostId[] {
-  return snap.configs.filter(c => isUsableStatus(snap.status[c.id])).map(c => c.id);
+  return remoteHosts(snap).filter(c => isUsableStatus(snap.status[c.id])).map(c => c.id);
 }
 
 // "Connected", "Reconnecting · Checking…" … — the chip text used everywhere.

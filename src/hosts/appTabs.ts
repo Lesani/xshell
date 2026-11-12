@@ -1,3 +1,4 @@
+import { registry } from "./registry";
 import type { Group, Tab } from "../types";
 import { collectLeafIds } from "../layout";
 import { restoreGroupIds, tabFromTerminal } from "./reconcile";
@@ -36,7 +37,16 @@ export interface RestoreInput {
 // cached "local" list is kept but its Tabs are not mounted.
 export function restorableTabs(r: RestoreInput): Tab[] {
   const saved = (r.saved ?? []).filter(isLegacyLocal);
-  const remote = r.hosts.flatMap(h => byCreated(r.cached(h) ?? []).map(info => tabFromTerminal(h, info)));
+  const hosts = new Map<HostId | undefined, HostId>();
+  for (const host of r.hosts) {
+    const canonical = registry.dataHost(host);
+    if (canonical) {
+      const row = registry.availableHost(host);
+      const identity = row?.daemonKey ? row.aliases.find(alias => /^r_[0-9a-f]{64}$/.test(alias)) : undefined;
+      hosts.set(canonical, identity ?? host);
+    }
+  }
+  const remote = [...hosts].flatMap(([canonical, original]) => byCreated(r.cached(canonical!) ?? r.cached(original) ?? []).map(info => tabFromTerminal(original, info)));
   let local: Tab[] = [];
   if (r.localDaemon) {
     const merged = new Map((r.cached(LOCAL_HOST) ?? []).map(i => [i.terminal, i]));
@@ -59,10 +69,6 @@ export function restoreGroups(restorable: Tab[], saved: Group[] | null | undefin
   const tabs = restoreGroupIds(restorable, groups).map(t => (t.groupId && !valid.has(t.groupId)) ? { ...t, groupId: undefined } : t);
   return { tabs, groups };
 }
-
-// The offline cache is needed with Remote Hosts and in local Daemon mode (its cached Local
-// Daemon Tabs keep their groups across a restart).
-export const needsCache = (hostCount: number, localDaemon: boolean): boolean => hostCount > 0 || localDaemon;
 
 // The registry's lists by wire id, as reconcile wants them: "local" is the Tab host undefined.
 export function listsForReconcile(fresh: readonly [HostId, TerminalInfo[]][]): [HostId | undefined, TerminalInfo[]][] {

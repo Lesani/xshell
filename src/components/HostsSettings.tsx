@@ -244,13 +244,24 @@ export function HostsSettings({ onSave, onRemove }: Props) {
         <button className="btn btn-primary settings-action-btn" onClick={() => setEditing("new")}><Plus size={11} /> {fmt("hosts.add")}</button>
       </div>
       <div className="settings-section-body">
-        {hosts.length === 0 ? (
+        {hosts.length === 0 && !snap.available.some(h => h.activeRoute === "relay") ? (
           <div className="host-empty">
             <div className="host-empty-title">{fmt("hosts.empty.title")}</div>
             <div className="host-empty-body">{fmt("hosts.empty.body")}</div>
           </div>
         ) : hosts.map(h => (
           <HostRow key={h.id} host={h} now={now} onEdit={() => setEditing(h)} onRemove={() => setRemoving(h)} />
+        ))}
+        {snap.available.filter(h => h.activeRoute === "relay").map(h => (
+          <div key={h.id} className="host-row" data-ring-host={h.id}>
+            <div className="host-row-name">{h.name}</div>
+            <div className="host-row-target">Ring · Relay</div>
+            <div className="host-row-status">{statusLabel(snap.status[h.id])} · {h.reachability.kind === "closed" ? `Closed: ${h.reachability.reason}` : h.reachability.kind}</div>
+            {snap.status[h.id]?.lastError && <div className="host-row-error">{snap.status[h.id]?.lastError}</div>}
+            <div className="host-row-detail">Relay access does not install or update the Daemon. Manage its build on the Host.</div>
+            {snap.status[h.id]?.updateUnavailable && <div className="host-row-detail">{fmt(snap.status[h.id]?.updateUnavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: h.name })}</div>}
+            <button className="btn btn-ghost settings-action-btn" onClick={() => invoke("hosts_kick", { host: h.id }).catch(() => {})}>Reconnect</button>
+          </div>
         ))}
       </div>
       {editing && <HostForm initial={editing === "new" ? null : editing} onSave={save} onCancel={() => setEditing(null)} />}

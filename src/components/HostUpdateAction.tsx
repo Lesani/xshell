@@ -6,18 +6,20 @@ import { buildText } from "../buildId";
 import type { HostConfig, HostStatus } from "../hosts/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 
-export function HostUpdateAction({ host, status, description = false }: { host: HostConfig; status: HostStatus | undefined; description?: boolean }) {
+export function HostUpdateAction({ host, status, description = false }: { host: Pick<HostConfig, "id" | "name">; status: HostStatus | undefined; description?: boolean }) {
   const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
   const healthy = exactUpdateConnected(status);
-  const action = updateAction(status);
+  const action = status?.host === host.id ? updateAction(status) : null;
   const busy = !healthy && (!!state.invoking[host.id] || status?.phase === "upgrading" || status?.phase === "preparing");
   const replace = (action ?? status?.updateAction) === "replace";
   const error = healthy ? null : state.errors[host.id] || (status?.errorHint === "update-failed" ? status.lastError : null);
-  const unavailable = status?.updateUnavailable && !!status.updateAction ? status.updateUnavailable : null;
-  const visible = action || busy || unavailable || error;
+  const unavailable = status?.updateUnavailable && (!!status.updateAction || !!status.routeUpdateUnavailable) ? status.updateUnavailable : null;
+  const routeUnavailable = status?.routeUpdateUnavailable;
+  const visible = action || busy || unavailable || routeUnavailable || error;
   if (!visible) return null;
   return <div className="host-update-action">
     {description && !busy && status && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
+    {routeUnavailable && <span>{routeUnavailable === "relay-only" ? "Relay access cannot install or update the Daemon. Manage its build on the Host." : "This identity-bound alias cannot update the Daemon. Use its configured SSH route."}</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? (replace ? "hosts.update.switching" : "hosts.update.waiting") : "hosts.update.preparing", { host: host.name })}</span> : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(replace ? "hosts.update.replace" : "hosts.update.action")}</button>}
     </>}

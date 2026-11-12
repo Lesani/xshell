@@ -44,7 +44,7 @@ describe("shared Host update action", () => {
       let reject!: (reason: Error) => void;
       vi.mocked(invoke).mockImplementation(command => command === "host_upgrade"
         ? new Promise<never>((_, fail) => { reject = fail; })
-        : Promise.resolve([]));
+        : Promise.resolve(command === "hosts_available" ? { sequence: 0, hosts: [] } : []));
       await registry.init([host]);
       const build = { commit: "85ee920a1b2c", dirty: null, time: 7 };
       const initial = { ...status, desktopBuild: build, configGeneration: 7, linkGeneration: 12 };
@@ -70,4 +70,11 @@ describe("shared Host update action", () => {
     });
   }
 
+});
+
+it("keeps Relay transport limits and Desktop-owner diagnosis independently visible with no build action", () => {
+  const html = render({ routeUpdateUnavailable: "relay-only", updateUnavailable: "desktop-owned", updateAction: null });
+  expect(html).toContain("Relay access cannot install or update");
+  expect(html).toContain("Desktop there manages this Daemon");
+  expect(html).not.toContain("<button");
 });

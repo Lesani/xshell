@@ -161,6 +161,50 @@ export class RemoteTerminals {
   // A pending open was answered with another Terminal: its Tab should give way to that one's.
   onAdopted(cb: (a: Adoption) => void): () => void { this.adoptedListeners.add(cb); return () => { this.adoptedListeners.delete(cb); }; }
 
+  private identityRebinds = new Map<string, { host: HostId; ready: boolean }>();
+
+  hasIdentityRebind(uuid: string): boolean { return this.identityRebinds.has(uuid); }
+  identityHost(uuid: string, fallback: HostId): HostId { return this.identityRebinds.get(uuid)?.host ?? fallback; }
+  inputBlocked(uuid: string, host: HostId): boolean {
+    const binding = this.identityRebinds.get(uuid);
+    return registry.isRetargeting(host) || (!!binding && (!binding.ready || binding.host !== host || !this.deps.isUsable(host)));
+  }
+
+  // A positively verified old identity is retained through explicit SSH retarget. Fence
+  // bytes/input first, then await Detach (never Close) before configure may replace h_.
+  async prepareIdentityRebind(host: HostId, identity: HostId, uuids: string[]): Promise<void> {
+    const old = uuids.map(uuid => {
+      this.identityRebinds.set(uuid, { host: identity, ready: false });
+      const entry = this.entries.get(uuid);
+      if (entry) { entry.epoch++; entry.sinks = null; entry.gone = true; }
+      return { uuid, entry };
+    });
+    const results = await Promise.allSettled(old.map(async ({ uuid, entry }) => {
+      try {
+        if (entry?.inflight) await entry.inflight.catch(() => {});
+        await invoke("host_term_detach", { host, terminal: uuid });
+      } finally {
+        if (this.entries.get(uuid) === entry) this.entries.delete(uuid);
+        pendingOpens.delete(uuid); // commit and recovery only Attach, never replay Open
+      }
+    }));
+    // A late successful Detach must not tear down a subscription already recovered after
+    // another UUID failed. Wait for every disposition before exposing commit or abort.
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+  abortIdentityRebind(identity: HostId, uuids: string[]) {
+    // Old channel generations remain retired. Mounted transports recover fresh sinks via
+    // the original r_ identity; this never restores the saved-h access or replays Open.
+    this.finishIdentityRebind(identity, uuids);
+  }
+  finishIdentityRebind(identity: HostId, uuids: string[]) {
+    for (const uuid of uuids) {
+      const binding = this.identityRebinds.get(uuid);
+      if (binding?.host === identity) binding.ready = true;
+    }
+  }
+
   private entry(host: HostId, uuid: string): Entry {
     let e = this.entries.get(uuid);
     if (!e) {
@@ -183,8 +227,12 @@ export class RemoteTerminals {
   // Opens (pending) or attaches the Terminal. Concurrent starts for one uuid share one call.
   // Returns null when the mount went stale, the signal aborted or the Tab is being closed.
   async start(host: HostId, uuid: string, gen: number, o: StartOptions, signal?: AbortSignal): Promise<RemoteStartResult | null> {
+    // A deferred, already-admitted start is still pending, not cancelled. Continue on
+    // its original host after commit/abort; doStart alone decides Open versus Attach.
+    while (registry.isRetargeting(host)) await registry.waitRetarget(host, signal);
+    if (this.inputBlocked(uuid, host)) return null;
     const e = this.entry(host, uuid);
-    if (signal?.aborted || e.closeIntent || e.mountGen !== gen) return null;
+    if (signal?.aborted || e.closeIntent || e.mountGen !== gen || !e.sinks) return null;
     if (!e.inflight) {
       const p = this.doStart(e, o);
       e.inflight = p;
@@ -213,7 +261,7 @@ export class RemoteTerminals {
     const epoch = ++e.epoch;
     let received = 0;
     let pendingExit: RemoteExit | null = null;
-    const current = () => e.epoch === epoch;
+    const current = () => !e.gone && e.epoch === epoch;
     const fireExit = (code: number) => { if (current()) e.sinks?.exit(code); };
     const onData = new Channel<ArrayBuffer>();
     onData.onmessage = (buf) => {
@@ -234,7 +282,7 @@ export class RemoteTerminals {
   }
 
   private async doStart(e: Entry, o: StartOptions): Promise<RemoteStartResult> {
-    const pending = pendingOpens.get(e.uuid);
+    const pending = this.identityRebinds.has(e.uuid) ? undefined : pendingOpens.get(e.uuid);
     const { onData, onExit } = this.channels(e);
     if (pending && pending.state === "opening") {
       pending.state = "sent";
@@ -302,6 +350,7 @@ export class RemoteTerminals {
   // usable (with backoff while it stays busy). A close the Host rejects for good restores the
   // Tab (attachable again) and reports the error through onCloseFailed.
   close(host: HostId, uuid: string): Promise<void> {
+    host = this.identityHost(uuid, host);
     const e = this.entry(host, uuid);
     e.closeIntent = true;
     if (e.closing) return e.closing;
@@ -356,7 +405,7 @@ export class RemoteTerminals {
   // so their close intent is retired (a close waiting to be retried stops).
   forgetUnlisted(host: HostId, listed: readonly string[]) {
     const keep = new Set(listed);
-    for (const [uuid, e] of [...this.entries]) if (e.host === host && e.closeIntent && !keep.has(uuid) && !pendingOpens.has(uuid)) this.forget(uuid);
+    for (const [uuid, e] of [...this.entries]) if (registry.resolveAlias(e.host) === registry.resolveAlias(host) && e.closeIntent && !keep.has(uuid) && !pendingOpens.has(uuid)) this.forget(uuid);
   }
 
   // Host removed from settings: drop every attachment without ending anything.
@@ -375,14 +424,22 @@ export interface MountedTerminal {
   end(): void;
 }
 
-export function mountTerminal(tab: Tab, sinks: TerminalSinks): MountedTerminal {
+export function mountTerminal(tab: Tab, sinks: TerminalSinks, currentTab: () => Tab = () => tab): MountedTerminal {
   const dh = daemonHost(tab);
   if (dh && tab.terminal) {
-    const host = dh, uuid = tab.terminal;
-    const gen = remoteTerminals.mount(host, uuid, sinks);
+    const uuid = tab.terminal;
+    let host = dh, gen = remoteTerminals.mount(host, uuid, sinks);
+    const bind = () => {
+      const next = remoteTerminals.identityHost(uuid, daemonHost(currentTab()) ?? host);
+      if (next !== host) {
+        remoteTerminals.unmount(uuid, gen);
+        host = next;
+        gen = remoteTerminals.mount(host, uuid, sinks);
+      }
+    };
     return {
-      start: (o, signal) => remoteTerminals.start(host, uuid, gen, o, signal),
-      reattach: (o, signal) => remoteTerminals.reattach(host, uuid, gen, o, signal),
+      start: (o, signal) => { bind(); return remoteTerminals.start(host, uuid, gen, o, signal); },
+      reattach: (o, signal) => { bind(); return remoteTerminals.reattach(host, uuid, gen, o, signal); },
       end: () => {
         // A close intent was already acted on by markClosing; otherwise this detaches.
         remoteTerminals.unmount(uuid, gen);
@@ -429,13 +486,18 @@ export function captureTerminalInput(tab: Tab, handledCompletionId?: string | nu
   const status = host ? registry.getStatus(host) : undefined;
   const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
     ? Object.freeze({ configGeneration: status.configGeneration, linkGeneration: status.linkGeneration }) : undefined;
-  return Object.freeze({ tabId: tab.id, host: tab.host, terminal: tab.terminal, handledCompletionId, inputTarget });
+  // Capture a positively verified stable alias before clipboard/upload work. A delayed
+  // action must not acquire the replacement target's authority through a saved h_ ID.
+  const available = tab.host ? registry.availableHost(tab.host) : undefined;
+  const identity = available?.daemonKey ? available.aliases.find(alias => /^r_[0-9a-f]{64}$/.test(alias)) : undefined;
+  return Object.freeze({ tabId: tab.id, host: identity ?? tab.host, terminal: tab.terminal, handledCompletionId, inputTarget });
 }
 
 export function writeTerminalInput(action: TerminalInputAction, data: string) {
   const host = daemonHost(action);
   const { handledCompletionId, inputTarget } = action;
   if (host) {
+    if (action.terminal && remoteTerminals.inputBlocked(action.terminal, host)) return;
     invoke("host_term_input", { host, terminal: action.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
   } else invoke("write_terminal", { id: action.tabId, data }).catch(() => {});
 }
@@ -451,6 +513,7 @@ export function writeTerminal(tab: Tab, data: string, handledCompletionId?: stri
 export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> {
   const h = daemonHost(tab);
   if (h) {
+    if (tab.terminal && remoteTerminals.inputBlocked(tab.terminal, h)) throw new Error("Terminal identity is changing");
     await invoke("host_term_relaunch", { host: h, terminal: tab.terminal, skipPermissions: value });
   } else {
     await invoke("relaunch_terminal", { id: tab.id, skipPermissions: value, sessionId: tab.sessionId || null, agent: tab.agent || null });
@@ -459,6 +522,7 @@ export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> 
 
 export function resizeTerminal(tab: Tab, cols: number, rows: number) {
   const h = daemonHost(tab);
+  if (h && tab.terminal && remoteTerminals.inputBlocked(tab.terminal, h)) return;
   if (h) invoke("host_term_resize", { host: h, terminal: tab.terminal, cols, rows }).catch(() => {});
   else invoke("resize_terminal", { id: tab.id, cols, rows }).catch(() => {});
 }

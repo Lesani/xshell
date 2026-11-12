@@ -1,9 +1,10 @@
 import { load } from "@tauri-apps/plugin-store";
-import type { HostId, TerminalInfo } from "./types";
+import type { AvailableHost, HostConfig, HostStatus, HostId, TerminalInfo } from "./types";
 
 // Offline cache for Remote Hosts: the last `terminals` list per Host plus the last result of
 // each cacheable read call. Kept in its own store file so list churn never rewrites
-// settings.json. Loaded only when at least one Host is configured.
+// settings.json. Loaded at startup even without saved SSH: retained Ring data is stale,
+// personal data, never membership or route authorization.
 
 export const CACHE_FILE = "hosts-cache.json";
 const CACHE_KEY = "cache";
@@ -13,6 +14,7 @@ const WRITE_DEBOUNCE_MS = 1000;
 
 export interface CachedCall { v: unknown; at: number }
 export interface HostCacheEntry {
+  provenance?: { daemonKey?: string; savedTarget?: string; host?: HostId };
   terminals: TerminalInfo[];
   terminalsAt: number;
   calls: Record<string, CachedCall>;
@@ -83,6 +85,40 @@ export function dropHost(state: CacheState, host: HostId): CacheState {
 // ── Runtime cache (module singleton) ────────────────────────────────
 
 let state: CacheState = emptyCache();
+type Binding = { key: string; daemonKey?: string; savedTarget?: string; generation: string; aliases: string[] };
+let bindings: Record<string, Binding> = {};
+const retiredTargets = new Set<string>();
+function binding(host: string): Binding {
+  return bindings[host] ?? { key: host, generation: "", aliases: [host] };
+}
+function cachedEntry(host: string, field: string): HostCacheEntry | undefined {
+  const hasField = (entry: HostCacheEntry) => field === "terminals" ? entry.terminalsAt > 0 : field in entry.calls;
+  const b = binding(host);
+  if (!bindings[host]) {
+    const retained = Object.values(state.hosts).find(e => e.provenance?.host === host && hasField(e));
+    if (retained) return retained;
+  }
+  if (!b.daemonKey && b.savedTarget) {
+    const sameTarget = Object.values(state.hosts).find(e => e.provenance?.host === host && e.provenance?.savedTarget === b.savedTarget && hasField(e));
+    if (sameTarget) return sameTarget;
+  }
+  for (const key of [b.key, ...b.aliases]) {
+    const entry = state.hosts[key];
+    if (!entry || !hasField(entry)) continue;
+    if (entry.provenance?.daemonKey) {
+      if (entry.provenance.daemonKey === b.daemonKey) return entry;
+    } else if (entry.provenance?.savedTarget) {
+      if (entry.provenance.savedTarget === b.savedTarget && !b.daemonKey) return entry;
+    } else if (!b.daemonKey && !retiredTargets.has(host) && key === host) return entry;
+  }
+  return undefined;
+}
+function stamp(host: string) {
+  const b = binding(host);
+  const entry = state.hosts[b.key];
+  const retainedHost = b.daemonKey ? b.aliases.find(alias => /^r_[0-9a-f]{64}$/.test(alias)) ?? host : host;
+  if (entry) entry.provenance = { daemonKey: b.daemonKey, savedTarget: b.savedTarget, host: retainedHost };
+}
 let loaded = false;
 let loadPromise: Promise<CacheState> | null = null;
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -105,6 +141,29 @@ function scheduleWrite() {
 }
 
 export const cache = {
+  bindHosts(hosts: AvailableHost[], configs: HostConfig[], status: Record<string, HostStatus>) {
+    const next: Record<string, Binding> = {};
+    const ids = new Set([...hosts.flatMap(h => [h.id, ...h.aliases]), ...configs.map(c => c.id)]);
+    for (const id of ids) {
+      const row = hosts.find(h => h.id === id || h.aliases.includes(id));
+      const config = configs.find(c => c.id === id);
+      const savedTarget = config ? JSON.stringify([config.sshTarget, config.daemonCommand ?? ""]) : undefined;
+      const old = bindings[id];
+      if (old?.savedTarget && old.savedTarget !== savedTarget) retiredTargets.add(id);
+      const daemonKey = row?.daemonKey ?? undefined;
+      const s = status[row?.id ?? id];
+      next[id] = { key: daemonKey ? `daemon:${daemonKey}` : savedTarget ? `saved:${id}:${savedTarget}` : id, daemonKey, savedTarget,
+        aliases: row?.aliases ?? [id],
+        generation: JSON.stringify([daemonKey, savedTarget, s?.configGeneration, s?.linkGeneration]) };
+    }
+    for (const [id, old] of Object.entries(bindings)) {
+      if (!next[id]) next[id] = { ...old, generation: `withdrawn:${old.daemonKey ?? old.savedTarget ?? id}` };
+    }
+    bindings = next;
+  },
+  dataIdentity: (host: string): string => binding(host).key,
+  capture: (host: string): string => binding(host).generation,
+  isCurrent: (host: string, token: string): boolean => binding(host).generation === token,
   // Loads the cache file once. Merges anything written before the load finished.
   load(): Promise<CacheState> {
     if (!loadPromise) {
@@ -123,29 +182,39 @@ export const cache = {
     return loadPromise;
   },
   isLoaded: () => loaded,
+  retainedHosts(): HostId[] {
+    return [...new Set(Object.entries(state.hosts).map(([key, entry]) => entry.provenance?.host ?? key)
+      .filter(id => id === "local" || /^(?:h_[a-z0-9]{8}|r_[0-9a-f]{64})$/.test(id)))];
+  },
   getState: () => state,
   get(host: HostId, method: string, args?: Record<string, unknown>): CachedCall | undefined {
-    return getCall(state, host, callKey(method, args));
+    return cachedEntry(host, callKey(method, args))?.calls[callKey(method, args)];
   },
   put(host: HostId, method: string, args: Record<string, unknown> | undefined, v: unknown) {
-    state = putCall(state, host, callKey(method, args), v, Date.now());
+    state = putCall(state, binding(host).key, callKey(method, args), v, Date.now());
+    stamp(host);
     scheduleWrite();
   },
   putTerminals(host: HostId, list: TerminalInfo[]) {
-    state = putTerminals(state, host, list, Date.now());
+    state = putTerminals(state, binding(host).key, list, Date.now());
+    stamp(host);
     scheduleWrite();
   },
   terminals(host: HostId): TerminalInfo[] | null {
-    return state.hosts[host]?.terminals ?? null;
+    return cachedEntry(host, "terminals")?.terminals ?? null;
   },
   dropHost(host: HostId) {
-    state = dropHost(state, host);
+    for (const [key, entry] of Object.entries(state.hosts)) {
+      if (key === host || entry.provenance?.host === host) state = dropHost(state, key);
+    }
     scheduleWrite();
   },
   // Tests only.
   _reset() {
     state = emptyCache();
     loaded = false;
+    bindings = {};
+    retiredTargets.clear();
     loadPromise = null;
     if (writeTimer) clearTimeout(writeTimer);
     writeTimer = null;

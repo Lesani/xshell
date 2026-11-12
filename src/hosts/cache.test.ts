@@ -61,3 +61,41 @@ describe("cache at startup", () => {
     expect(tabs[1]).toMatchObject({ host: H, terminal: "a", title: "Agent", projectName: "p", projectPath: "/p" });
   });
 });
+
+import { cache } from "./cache";
+import type { AvailableHost, HostStatus } from "./types";
+const R = `r_${"a".repeat(64)}`;
+const available = (key: string, id = R, aliases = [R]): AvailableHost => ({ id, aliases, name: "Host", color: null, daemonKey: key, routes: ["relay"], activeRoute: "relay", reachability: { kind: "unknown" } });
+
+describe("cache verified provenance", () => {
+  it("shares data only across corroborated aliases and preserves identity data across transient generations", () => {
+    cache._reset();
+    cache.bindHosts([available("key", H, [H, R])], [], { [H]: { configGeneration: 1, linkGeneration: 2 } as HostStatus });
+    cache.put(H, "list_claude_projects", undefined, ["verified"]);
+    cache.putTerminals(H, [term("retained")]);
+    const token = cache.capture(H);
+    cache.bindHosts([available("key")], [], { [R]: { configGeneration: 99, linkGeneration: 100 } as HostStatus });
+    expect(cache.get(R, "list_claude_projects")?.v).toEqual(["verified"]);
+    expect(cache.terminals(R)?.[0].terminal).toBe("retained");
+    expect(cache.isCurrent(H, token)).toBe(false);
+    cache.bindHosts([], [], {});
+    expect(cache.get(R, "list_claude_projects")?.v).toEqual(["verified"]);
+    expect(Object.keys(cache.getState().hosts)).toEqual(["daemon:key"]);
+    cache._reset();
+  });
+
+  it("retargeting never serves the previous identity, but does not destroy its stale personal cache", () => {
+    cache._reset();
+    const config = { id: H, name: "Host", sshTarget: "old" };
+    cache.bindHosts([available("old-key", H, [H, R])], [config], {});
+    cache.put(H, "list_claude_projects", undefined, ["old-data"]);
+    cache.bindHosts([], [{ ...config, sshTarget: "new" }], {});
+    expect(cache.get(H, "list_claude_projects")).toBeUndefined();
+    cache.bindHosts([available("new-key", H, [H])], [{ ...config, sshTarget: "new" }], {});
+    expect(cache.get(H, "list_claude_projects")).toBeUndefined();
+    cache.bindHosts([available("old-key")], [], {});
+    expect(cache.get(R, "list_claude_projects")?.v).toEqual(["old-data"]);
+    expect(cache.retainedHosts()).toEqual([R]);
+    cache._reset();
+  });
+});
