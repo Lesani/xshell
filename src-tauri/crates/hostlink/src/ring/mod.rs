@@ -4,6 +4,8 @@
 //! Daemon in the Ring ([`sync`]).
 
 pub mod adoption;
+pub mod broker;
+pub(crate) mod broker_ipc;
 pub mod companion_ipc;
 pub mod desktop;
 pub(crate) mod dial;

@@ -270,6 +270,65 @@ mod unix {
         write(&mut stream, request)?;
         read(&mut stream)
     }
+    /// A persistent user-private endpoint. The caller must hold its process-owner lock.
+    /// This shares only protection with companion IPC, not its five-second request budget.
+    pub struct ProtectedListener {
+        listener: UnixListener,
+        path: PathBuf,
+        identity: (u64, u64),
+    }
+    impl ProtectedListener {
+        pub fn bind(path: PathBuf) -> io::Result<Self> {
+            private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
+            check_path(&path)?;
+            if std::fs::symlink_metadata(&path).is_ok() {
+                let old = socket_identity(&path)?;
+                match dial(&path, Instant::now() + IO) {
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            "IPC endpoint is live or ambiguous",
+                        ))
+                    }
+                }
+                if socket_identity(&path)? != old {
+                    return Err(denied("stale IPC endpoint changed"));
+                }
+                std::fs::remove_file(&path)?;
+            }
+            let listener = UnixListener::bind(&path)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            let identity = socket_identity(&path)?;
+            listener.set_nonblocking(true)?;
+            Ok(Self {
+                listener,
+                path,
+                identity,
+            })
+        }
+        pub fn accept(&self) -> io::Result<UnixStream> {
+            let (stream, _) = self.listener.accept()?;
+            peer(&stream)?;
+            Ok(stream)
+        }
+    }
+    impl Drop for ProtectedListener {
+        fn drop(&mut self) {
+            if socket_identity(&self.path).ok() == Some(self.identity) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+    pub fn protected_connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+        let before = socket_identity(path)?;
+        let stream = dial(path, Instant::now() + timeout)?;
+        peer(&stream)?;
+        if socket_identity(path)? != before {
+            return Err(denied("IPC endpoint replaced during connect"));
+        }
+        Ok(stream)
+    }
     pub struct Server {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -293,28 +352,7 @@ mod unix {
         path: PathBuf,
         handler: impl Fn(Q, RequestBudget) -> R + Send + Sync + 'static,
     ) -> io::Result<Server> {
-        private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
-        check_path(&path)?;
-        if std::fs::symlink_metadata(&path).is_ok() {
-            let old = socket_identity(&path)?;
-            match dial(&path, Instant::now() + IO) {
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        "IPC endpoint is live or ambiguous",
-                    ))
-                }
-            }
-            if socket_identity(&path)? != old {
-                return Err(denied("stale IPC endpoint changed"));
-            }
-            std::fs::remove_file(&path)?;
-        }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let bound = socket_identity(&path)?;
-        listener.set_nonblocking(true)?;
+        let listener = ProtectedListener::bind(path)?;
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
         let handler = Arc::new(handler);
@@ -332,7 +370,7 @@ mod unix {
                             index += 1;
                         }
                     }
-                    if let Ok((stream, _)) = listener.accept() {
+                    if let Ok(stream) = listener.accept() {
                         if workers.len() < 4 && peer(&stream).is_ok() {
                             let Ok(shutdown) = stream.try_clone() else {
                                 continue;
@@ -364,9 +402,6 @@ mod unix {
                 }
                 for (worker, _) in workers {
                     let _ = worker.join();
-                }
-                if socket_identity(&path).ok() == Some(bound) {
-                    let _ = std::fs::remove_file(&path);
                 }
             })?;
         Ok(Server {
@@ -440,4 +475,6 @@ mod unix {
     }
 }
 #[cfg(unix)]
-pub use unix::{check_path, exchange, private_dir, serve, Server};
+pub use unix::{
+    check_path, exchange, private_dir, protected_connect, serve, ProtectedListener, Server,
+};

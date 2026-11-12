@@ -62,7 +62,13 @@ impl Seen {
             usable,
             ring: has(RING_CAPABILITY),
             cjoin: has(RING_CJOIN_CAPABILITY),
-            link_gen: if usable { s.link_generation } else { 0 },
+            link_gen: if usable {
+                s.raw_action_target
+                    .map(|target| target.link_generation)
+                    .unwrap_or(s.link_generation)
+            } else {
+                0
+            },
         }
     }
 }

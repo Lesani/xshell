@@ -1,7 +1,7 @@
 //! Verified Daemon identity and the elected Desktop's private routing generation.
 use super::store::RingState;
 use crate::cancel::CancelToken;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, Weak};
 use xshell_protocol::ring::relay::sessions::Sessions;
 use xshell_protocol::ring::relay::{Connector, MemberPresence};
@@ -68,14 +68,14 @@ impl VerifiedRingHost {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteKind {
     Local,
     Ssh,
     Relay,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Reachability {
     Unknown,
@@ -98,7 +98,7 @@ impl From<&MemberPresence> for Reachability {
     }
 }
 /// Effective availability, independent of the saved SSH schema and Link usability.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableHost {
     pub id: String,

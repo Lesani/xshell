@@ -449,6 +449,7 @@ impl Conn {
                 }
             }
             ClientMsg::TermAttach { terminal } => {
+                d.test_point(terminal, TestPoint::AttachDecide);
                 let r =
                     self.with_listed(&terminal, |t| (t.clone(), t.attach(self.id, &self.ob, id)));
                 match r {

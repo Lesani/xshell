@@ -34,6 +34,29 @@ pub trait TermSink: Send + Sync {
     /// The Terminal ended. `bytes` is everything this sink received through `data`, so the
     /// receiver can apply the exit only after that much output (the exit watermark).
     fn exit(&self, code: i32, bytes: u64);
+    /// Before replay from a replacement Link; byte watermarks remain cumulative.
+    fn generation_reset(&self) {}
+    /// This viewer exceeded its output budget and must explicitly reattach.
+    fn resync_required(&self) {
+        self.generation_reset();
+    }
+    /// A shared physical sink may reattach only while at least one viewer still proves
+    /// its identity/configuration. Plain low-level sinks retain their existing behavior.
+    fn can_reattach(&self) -> bool {
+        true
+    }
+    fn reset_for_generation(&self, _generation: u64) {
+        self.generation_reset();
+    }
+    /// Supply a replay cut to a Direct viewer joining an already attached broker sink.
+    fn replay_snapshot(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// `None` uses the low-level remembered size; `Some(None)` deliberately sends no
+    /// resize because no currently authorized shared viewer has actually interacted.
+    fn reattach_size(&self) -> Option<Option<(u16, u16)>> {
+        None
+    }
 }
 
 const SAVE_FILE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -123,7 +146,7 @@ pub(crate) struct Attachment {
 }
 
 /// Identity of the connection shown when the user confirmed. Never retarget a queued action.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTarget {
     pub config_generation: u64,
@@ -133,7 +156,7 @@ pub struct UpdateTarget {
 }
 
 /// The connection observed at a Desktop input action; checked before enqueue, never replayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputTarget {
     pub config_generation: u64,
@@ -205,6 +228,9 @@ pub(crate) struct Shared {
     sizes: Mutex<HashMap<Uuid, (u16, u16)>>,
     /// The latest status and list, for `snapshot`.
     snap: Mutex<HostSnapshot>,
+    hubs: Mutex<HashMap<Uuid, Arc<crate::attachments::Hub>>>,
+    direct_viewer: Uuid,
+    facade_lock: Mutex<()>,
 }
 
 type Callback<T> = Box<dyn FnOnce(T) + Send>;
@@ -279,6 +305,7 @@ impl Shared {
     }
 
     fn new_definition(cfg: HostDefinition, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
+        mc.action_targets.register(&cfg.id, config_generation);
         let mut status = HostStatus::initial(
             &cfg.id,
             &mc.desktop_version,
@@ -298,6 +325,9 @@ impl Shared {
             },
             id: cfg.id.clone(),
             mc,
+            hubs: Mutex::new(HashMap::new()),
+            direct_viewer: Uuid::new_v4(),
+            facade_lock: Mutex::new(()),
             snap: Mutex::new(HostSnapshot {
                 status: status.clone(),
                 terminals: None,
@@ -412,6 +442,9 @@ impl Shared {
         st.gen += 1;
         st.identity = None;
         self.set_link(&mut st, None);
+        for hub in self.hubs.lock().unwrap().values() {
+            hub.reset_for_generation(st.gen);
+        }
         st.link_closed = false;
         st.close_reason = None;
         self.child_pid
@@ -425,8 +458,16 @@ impl Shared {
             return false;
         }
         *self.observed_identity.lock().unwrap() = Some(key);
+        if st.identity.is_some_and(|previous| previous != key) {
+            for hub in self.hubs.lock().unwrap().values() {
+                hub.generation_reset();
+            }
+        }
         st.identity = Some(key);
         self.sync_ep(&st);
+        for hub in self.hubs.lock().unwrap().values() {
+            hub.refresh_proof();
+        }
         if let Some(link) = st.link().cloned() {
             if self.reattach_locked(&mut st, gen, &link) > 0 {
                 // Adoption may have skipped these while identity was unknown. Reuse the
@@ -478,6 +519,9 @@ impl Shared {
             return None;
         }
         self.set_link(&mut st, Some(link.clone()));
+        for hub in self.hubs.lock().unwrap().values() {
+            hub.refresh_proof();
+        }
         let listed: HashSet<Uuid> = st
             .terminals
             .as_deref()
@@ -514,8 +558,10 @@ impl Shared {
                 .get(&t)
                 .and_then(|a| a.pending.as_ref().map(|p| &p.1).or(a.sink.as_ref()));
             if desired.is_none_or(|slot| {
-                slot.identity
-                    .is_some_and(|target| !target.matches(st.status.config_generation, st.identity))
+                !slot.sink.can_reattach()
+                    || slot.identity.is_some_and(|target| {
+                        !target.matches(st.status.config_generation, st.identity)
+                    })
             }) {
                 continue;
             }
@@ -525,6 +571,13 @@ impl Shared {
                 Some(a) if a.attached_gen == gen => continue,
                 // Requests of older links can no longer complete (they are fenced).
                 Some(a) => a.inflight.clear(),
+            }
+            if let Some(slot) = st
+                .atts
+                .get(&t)
+                .and_then(|a| a.pending.as_ref().map(|p| &p.1).or(a.sink.as_ref()))
+            {
+                slot.sink.reset_for_generation(gen);
             }
             let epoch = st.next_epoch();
             let sh = Arc::downgrade(self);
@@ -548,7 +601,11 @@ impl Shared {
                     a.attached_gen = gen;
                     a.epoch = epoch;
                     a.inflight.insert(epoch);
-                    let size = self.sizes.lock().unwrap().get(&t).copied();
+                    let size = a
+                        .sink
+                        .as_ref()
+                        .and_then(|slot| slot.sink.reattach_size())
+                        .unwrap_or_else(|| self.sizes.lock().unwrap().get(&t).copied());
                     if let Some((cols, rows)) = size {
                         let _ = link.notify(ClientMsg::TermResize {
                             terminal: t,
@@ -807,6 +864,7 @@ struct IdentityAccess {
 pub struct HostHandle {
     pub(crate) sh: Arc<Shared>,
     identity_access: Option<IdentityAccess>,
+    generation_access: Option<InputTarget>,
     run: Mutex<Option<Running>>,
     /// Shut down for good: `start` does nothing any more.
     retired: AtomicBool,
@@ -830,6 +888,7 @@ impl HostHandle {
         Self {
             sh: Arc::new(Shared::new(cfg, mc, config_generation)),
             identity_access: None,
+            generation_access: None,
             run: Mutex::new(None),
             retired: AtomicBool::new(false),
         }
@@ -850,6 +909,21 @@ impl HostHandle {
                     config_generation,
                 },
             }),
+            generation_access: None,
+            run: Mutex::new(None),
+            retired: AtomicBool::new(true),
+        })
+    }
+
+    /// A dispatch view checks the expected connection under the actual admission lock.
+    pub(crate) fn for_generation(owner: Arc<Self>, target: InputTarget) -> Arc<Self> {
+        Arc::new(Self {
+            sh: owner.sh.clone(),
+            identity_access: owner.identity_access.as_ref().map(|access| IdentityAccess {
+                owner: access.owner.clone(),
+                target: access.target,
+            }),
+            generation_access: Some(target),
             run: Mutex::new(None),
             retired: AtomicBool::new(true),
         })
@@ -863,10 +937,22 @@ impl HostHandle {
         if let Some(target) = self.identity_target() {
             target.check(st.status.config_generation, st.identity)?;
         }
+        if self.generation_access.is_some_and(|target| {
+            target.config_generation != st.status.config_generation
+                || target.link_generation != st.gen
+        }) {
+            return Err(HostError::offline("the broker connection changed"));
+        }
         Shared::usable_link(st)
     }
 
     fn usable_endpoint(&self, ep: &Endpoint) -> Result<Arc<Link>, HostError> {
+        if self
+            .generation_access
+            .is_some_and(|target| target != ep.input_target)
+        {
+            return Err(HostError::offline("the broker connection changed"));
+        }
         if let Some(target) = self.identity_target() {
             target.check(ep.input_target.config_generation, ep.identity)?;
         }
@@ -931,6 +1017,10 @@ impl HostHandle {
 
     /// After a stop: take the new configuration, fence the old links, keep attachments.
     pub(crate) fn reset(&self, cfg: HostConfig, config_generation: u64) {
+        self.sh
+            .mc
+            .action_targets
+            .register(&self.sh.id, config_generation);
         let closing = {
             let mut st = self.sh.lock();
             st.gen += 1;
@@ -1010,6 +1100,7 @@ impl HostHandle {
         Self {
             sh: Arc::new(sh),
             identity_access: None,
+            generation_access: None,
             run: Mutex::new(None),
             retired: AtomicBool::new(false),
         }
@@ -1044,6 +1135,17 @@ impl HostHandle {
         snapshot
     }
 
+    pub(crate) fn access_snapshot(&self) -> HostSnapshot {
+        let mut snapshot = self.snapshot();
+        if let Some(status) = self.sh.mc.action_targets.direct_status(&snapshot.status) {
+            snapshot.status = status;
+        } else {
+            snapshot.status.set_kind(StatusKind::Offline);
+            snapshot.status.config_generation = 0;
+            snapshot.status.link_generation = 0;
+        }
+        snapshot
+    }
     /// The pid of the current transport process (ssh), for tests.
     #[doc(hidden)]
     pub fn child_pid(&self) -> Option<u32> {
@@ -1064,6 +1166,7 @@ impl HostHandle {
         in_flight: fn(HostError) -> HostError,
     ) {
         let once = Once::new(w);
+        let broker_mutation = self.generation_access.is_some();
         let sent = {
             let st = self.sh.lock();
             self.usable_link(&st).and_then(|(l, _)| {
@@ -1071,7 +1174,16 @@ impl HostHandle {
                 l.request(
                     msg,
                     timeout,
-                    Box::new(move |r| o.call(r.map_err(in_flight))),
+                    Box::new(move |r| {
+                        o.call(r.map_err(|e| {
+                            let e = in_flight(e);
+                            if broker_mutation {
+                                e.mutation_outcome()
+                            } else {
+                                e
+                            }
+                        }))
+                    }),
                 )
             })
         };
@@ -1138,6 +1250,291 @@ impl HostHandle {
         self.request_mapped(ClientMsg::Call { method, params }, timeout, w, in_flight);
     }
 
+    pub(crate) fn direct_viewer(&self) -> Uuid {
+        self.sh.direct_viewer
+    }
+
+    fn register_viewer(
+        &self,
+        terminal: Uuid,
+        key: Uuid,
+        sink: Arc<dyn TermSink>,
+        opening: bool,
+    ) -> Result<
+        (
+            Arc<crate::attachments::Hub>,
+            crate::attachments::Registration,
+        ),
+        HostError,
+    > {
+        let mut hubs = self.sh.hubs.lock().unwrap();
+        hubs.retain(|_, hub| !hub.empty());
+        if !hubs.contains_key(&terminal) && hubs.len() >= 64 {
+            return Err(HostError::busy());
+        }
+        let hub = hubs
+            .entry(terminal)
+            .or_insert_with(|| crate::attachments::Hub::new(self.sh.mc.replay_budget.clone()))
+            .clone();
+        let direct = key == self.sh.direct_viewer;
+        let sink = if direct {
+            crate::ring::broker::queued_sink(sink, self.sh.mc.output_bytes.clone())
+        } else {
+            sink
+        };
+        let config = self.sh.ep.lock().unwrap().input_target.config_generation;
+        let sh = Arc::downgrade(&self.sh);
+        let identity = self.identity_target();
+        let resize: crate::attachments::ScopedResize = Box::new(move |cols, rows| {
+            let sh = sh
+                .upgrade()
+                .ok_or_else(|| HostError::offline("Host retired"))?;
+            let ep = quick(&sh.ep)?;
+            if ep.input_target.config_generation != config
+                || identity.is_some_and(|target| {
+                    !target.matches(ep.input_target.config_generation, ep.identity)
+                })
+                || sh.relay.as_ref().is_some_and(|route| !route.authorized())
+            {
+                return Err(HostError::offline("attachment connection changed"));
+            }
+            ep.link
+                .as_ref()
+                .filter(|link| !link.is_closed())
+                .ok_or_else(|| HostError::offline("Host offline"))?
+                .notify(ClientMsg::TermResize {
+                    terminal,
+                    cols,
+                    rows,
+                })?;
+            quick(&sh.sizes)?.insert(terminal, (cols, rows));
+            Ok(())
+        });
+        let first = hub.register(
+            key,
+            sink,
+            crate::attachments::ViewerAccess {
+                fence: self.attachment_fence(),
+                config,
+                resize,
+                direct,
+            },
+            opening,
+        )?;
+        Ok((hub, first))
+    }
+    fn attachment_fence(&self) -> crate::attachments::Fence {
+        let sh = Arc::downgrade(&self.sh);
+        let identity = self.identity_target();
+        let config = self.sh.ep.lock().unwrap().input_target.config_generation;
+        Box::new(move || {
+            let Some(sh) = sh.upgrade() else {
+                return false;
+            };
+            let ep = sh.ep.lock().unwrap();
+            ep.input_target.config_generation == config
+                && ep.link.as_ref().is_some_and(|l| !l.is_closed())
+                && identity.is_none_or(|target| {
+                    target.matches(ep.input_target.config_generation, ep.identity)
+                })
+                && sh.relay.as_ref().is_none_or(|route| route.authorized())
+        })
+    }
+    pub(crate) fn access_term_open(
+        &self,
+        key: Uuid,
+        spec: OpenSpec,
+        sink: Arc<dyn TermSink>,
+        w: Box<dyn FnOnce(Result<OpenReply, HostError>) + Send>,
+    ) {
+        let admission = self.sh.facade_lock.lock().unwrap();
+        let (hub, registration) = match self.register_viewer(spec.terminal, key, sink, true) {
+            Ok(hub) => hub,
+            Err(error) => {
+                drop(admission);
+                w(Err(error));
+                return;
+            }
+        };
+        let _ = hub.interaction(key, Some((spec.cols, spec.rows)));
+        let terminal = spec.terminal;
+        let done = hub.clone();
+        self.term_open_slot(
+            spec,
+            hub,
+            Box::new(move |result| {
+                done.complete(
+                    registration.epoch,
+                    result.as_ref().map(|_| None).map_err(Clone::clone),
+                );
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.code != HostErrorCode::Indeterminate)
+                    || result
+                        .as_ref()
+                        .is_ok_and(|r| r.existed && r.terminal.is_some_and(|id| id != terminal))
+                {
+                    done.remove_current(registration.epoch, key);
+                }
+                w(result);
+            }),
+            true,
+            Some(admission),
+        );
+    }
+    pub(crate) fn access_term_attach(
+        &self,
+        key: Uuid,
+        terminal: Uuid,
+        sink: Arc<dyn TermSink>,
+        w: Box<dyn FnOnce(Result<Option<i32>, HostError>) + Send>,
+    ) {
+        let admission = self.sh.facade_lock.lock().unwrap();
+        let (hub, registration) = match self.register_viewer(terminal, key, sink, false) {
+            Ok(result) => result,
+            Err(e) => {
+                drop(admission);
+                w(Err(e));
+                return;
+            }
+        };
+        if registration.physical {
+            let done = hub.clone();
+            self.term_attach_slot(
+                terminal,
+                hub,
+                Box::new(move |result| {
+                    // Joining error callbacks may retry before this callback returns.
+                    if result.is_err() {
+                        done.remove_current(registration.epoch, key);
+                    }
+                    done.complete(registration.epoch, result.clone());
+                    w(result);
+                }),
+                true,
+                Some(admission),
+            );
+        } else {
+            drop(admission);
+            let done = hub.clone();
+            hub.wait(
+                registration.epoch,
+                Box::new(move |result| {
+                    if result.is_err() {
+                        done.remove_current(registration.epoch, key);
+                    }
+                    w(result);
+                }),
+            );
+        }
+    }
+    pub(crate) fn access_term_detach(&self, key: Uuid, terminal: Uuid) -> Result<(), HostError> {
+        let _admission = self.sh.facade_lock.lock().unwrap();
+        let hub = self.sh.hubs.lock().unwrap().get(&terminal).cloned();
+        if let Some(hub) = hub {
+            let (empty, _) = hub.remove(key);
+            if empty {
+                self.sh.hubs.lock().unwrap().remove(&terminal);
+                let mut st = self.sh.lock();
+                // Forgetting an invalid alias's own subscription is local, not permission
+                // to notify a different Daemon. Independent Direct access remains valid.
+                if self.usable_link(&st).is_ok() {
+                    Shared::detach_locked(&mut st, terminal, &self.sh.sizes);
+                } else {
+                    st.atts.remove(&terminal);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn restore_viewer_size(
+        &self,
+        key: Uuid,
+        terminal: Uuid,
+        size: (u16, u16),
+        sequence: u64,
+    ) {
+        if let Some(hub) = self.sh.hubs.lock().unwrap().get(&terminal).cloned() {
+            hub.restore_viewer_size(key, size, sequence);
+        }
+    }
+    pub(crate) fn access_term_input(
+        &self,
+        key: Uuid,
+        terminal: Uuid,
+        data: String,
+        observed: Option<Uuid>,
+        target: Option<InputTarget>,
+    ) -> Result<u64, HostError> {
+        let hub = self.sh.hubs.lock().unwrap().get(&terminal).cloned();
+        let dispatch = |size: Option<(u16, u16)>, config: Option<u64>| {
+            let ep = quick(&self.sh.ep)?;
+            let target = target
+                .map(|target| {
+                    if key == self.sh.direct_viewer {
+                        self.sh
+                            .mc
+                            .action_targets
+                            .direct(&self.sh.id, target, ep.input_target)
+                    } else {
+                        Ok(target)
+                    }
+                })
+                .transpose()?;
+            if target.is_some_and(|target| target != ep.input_target)
+                || config.is_some_and(|config| config != ep.input_target.config_generation)
+            {
+                return Err(HostError::offline("the input connection changed"));
+            }
+            let link = self.usable_endpoint(&ep)?;
+            if let Some((cols, rows)) = size {
+                link.notify(ClientMsg::TermResize {
+                    terminal,
+                    cols,
+                    rows,
+                })?;
+                quick(&self.sh.sizes)?.insert(terminal, (cols, rows));
+            }
+            link.notify(ClientMsg::TermInput {
+                terminal,
+                data,
+                handled_completion_id: observed.filter(|_| ep.completion_attention),
+            })
+        };
+        if let Some(hub) = hub {
+            hub.perform(key, None, dispatch)
+        } else {
+            dispatch(None, None).map(|_| crate::attachments::interaction())
+        }
+    }
+    pub(crate) fn access_term_resize(
+        &self,
+        key: Uuid,
+        terminal: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<u64, HostError> {
+        let hub = self.sh.hubs.lock().unwrap().get(&terminal).cloned();
+        let dispatch = |_: Option<(u16, u16)>, config: Option<u64>| {
+            let ep = quick(&self.sh.ep)?;
+            if config.is_some_and(|config| config != ep.input_target.config_generation) {
+                return Err(HostError::offline("the resize connection changed"));
+            }
+            self.usable_endpoint(&ep)?.notify(ClientMsg::TermResize {
+                terminal,
+                cols,
+                rows,
+            })?;
+            quick(&self.sh.sizes)?.insert(terminal, (cols, rows));
+            Ok(())
+        };
+        if let Some(hub) = hub {
+            hub.perform(key, Some((cols, rows)), dispatch)
+        } else {
+            dispatch(None, None).map(|_| crate::attachments::interaction())
+        }
+    }
+
     /// `term.open`, then `term.attach` with `sink` installed first. Answers the open's reply.
     ///
     /// `spec.adopt_existing` is the caller's wish; it is sent only to a Daemon with capability
@@ -1150,17 +1547,45 @@ impl HostHandle {
         sink: Arc<dyn TermSink>,
         w: Box<dyn FnOnce(Result<OpenReply, HostError>) + Send>,
     ) {
+        self.term_open_slot(spec, sink, w, false, None);
+    }
+
+    fn term_open_slot(
+        &self,
+        spec: OpenSpec,
+        sink: Arc<dyn TermSink>,
+        w: Box<dyn FnOnce(Result<OpenReply, HostError>) + Send>,
+        shared: bool,
+        admission: Option<MutexGuard<'_, ()>>,
+    ) {
         let once = Once::new(w);
         let t = spec.terminal;
         let size = (spec.cols, spec.rows);
         // Both replies are joined; the second one to finish answers.
         let joined: Joined = Arc::new(Mutex::new((0, None)));
+        let broker_mutation = self.generation_access.is_some();
         let finish = {
             let once = once.clone();
             let sh = Arc::downgrade(&self.sh);
             let identity = self.identity_target();
             move |open: Option<Reply>, attach: Reply| {
-                let open = open.map(|r| r.map(|v| open_reply(&v)));
+                let open = open.map(|r| {
+                    r.map_err(|e| {
+                        if broker_mutation {
+                            e.mutation_outcome()
+                        } else {
+                            e
+                        }
+                    })
+                    .map(|v| open_reply(&v))
+                });
+                let attach = attach.map_err(|e| {
+                    if broker_mutation {
+                        e.mutation_outcome()
+                    } else {
+                        e
+                    }
+                });
                 let r = match (open, attach) {
                     // Another Terminal runs the session: nothing listens on `t`.
                     (Some(Ok(o)), _) if o.existed && o.terminal.is_some_and(|o| o != t) => {
@@ -1244,12 +1669,13 @@ impl HostHandle {
                         &mut st,
                         (&link, gen),
                         (t, sink),
-                        self.identity_target(),
+                        if shared { None } else { self.identity_target() },
                         done,
                     )
                     .err())
             })
         };
+        drop(admission);
         match sent {
             Err(e) => once.call(Err(e)),
             Ok(Some(e)) => on_attach(Err(e)),
@@ -1265,6 +1691,17 @@ impl HostHandle {
         sink: Arc<dyn TermSink>,
         w: Box<dyn FnOnce(Result<Option<i32>, HostError>) + Send>,
     ) {
+        self.term_attach_slot(t, sink, w, false, None);
+    }
+
+    fn term_attach_slot(
+        &self,
+        t: Uuid,
+        sink: Arc<dyn TermSink>,
+        w: Box<dyn FnOnce(Result<Option<i32>, HostError>) + Send>,
+        shared: bool,
+        admission: Option<MutexGuard<'_, ()>>,
+    ) {
         let once = Once::new(w);
         let o = once.clone();
         let done: Callback<Reply> = Box::new(move |r| {
@@ -1277,11 +1714,12 @@ impl HostHandle {
                     &mut st,
                     (&link, gen),
                     (t, sink),
-                    self.identity_target(),
+                    if shared { None } else { self.identity_target() },
                     done,
                 )
             })
         };
+        drop(admission);
         if let Err(e) = sent {
             once.call(Err(e));
         }
@@ -1382,6 +1820,7 @@ impl HostHandle {
         w: Box<dyn FnOnce(Result<Option<u32>, HostError>) + Send>,
     ) {
         let once = Once::new(w);
+        let broker_mutation = self.generation_access.is_some();
         let sent = {
             // The capability and the link are checked and used under one lock: `adopt`
             // replaces both together.
@@ -1404,7 +1843,18 @@ impl HostHandle {
                         skip_permissions: skip,
                     },
                     self.sh.mc.term_timeout,
-                    Box::new(move |r: Reply| o.call(r.map(|v| opt_u32(&v, "pid")))),
+                    Box::new(move |r: Reply| {
+                        o.call(
+                            r.map_err(|e| {
+                                if broker_mutation {
+                                    e.mutation_outcome()
+                                } else {
+                                    e
+                                }
+                            })
+                            .map(|v| opt_u32(&v, "pid")),
+                        )
+                    }),
                 )
             })
         };
@@ -1426,6 +1876,7 @@ impl HostHandle {
         w: Waiter,
     ) {
         let once = Once::new(w);
+        let broker_mutation = self.generation_access.is_some();
         let sent = {
             // The capability, the generation and the link are checked and used under one
             // lock: `adopt` replaces them together.
@@ -1439,7 +1890,19 @@ impl HostHandle {
                     return Err(HostError::invalid(refusal));
                 }
                 let o = once.clone();
-                l.request(msg, self.sh.mc.term_timeout, Box::new(move |r| o.call(r)))
+                l.request(
+                    msg,
+                    self.sh.mc.term_timeout,
+                    Box::new(move |r| {
+                        o.call(r.map_err(|e| {
+                            if broker_mutation {
+                                e.mutation_outcome()
+                            } else {
+                                e
+                            }
+                        }))
+                    }),
+                )
             })
         };
         if let Err(e) = sent {
@@ -1519,15 +1982,24 @@ impl HostHandle {
     }
 
     pub fn upgrade_target(&self, target: Option<UpdateTarget>, w: Waiter) {
-        self.upgrade_inner(target, false, w);
+        self.upgrade_inner(target, false, false, w);
     }
 
     /// Explicit local mode switches may restart the same exact build; not a remote update.
     pub(crate) fn restart_for_mode(&self, w: Waiter) {
-        self.upgrade_inner(None, true, w);
+        self.upgrade_inner(None, true, false, w);
     }
 
-    fn upgrade_inner(&self, target: Option<UpdateTarget>, mode_switch: bool, w: Waiter) {
+    pub(crate) fn access_upgrade_target(&self, target: Option<UpdateTarget>, w: Waiter) {
+        self.upgrade_inner(target, false, true, w);
+    }
+    fn upgrade_inner(
+        &self,
+        target: Option<UpdateTarget>,
+        mode_switch: bool,
+        public: bool,
+        w: Waiter,
+    ) {
         if let Some(error) = self.configured_lifecycle_refusal() {
             w(Err(error));
             return;
@@ -1543,6 +2015,31 @@ impl HostHandle {
                     crate::HostErrorCode::Busy,
                     "a Host update is already in progress",
                 ));
+            }
+            let mut target = target;
+            if public {
+                if let Some(t) = &mut target {
+                    let raw = self
+                        .sh
+                        .mc
+                        .action_targets
+                        .direct(
+                            &self.sh.id,
+                            InputTarget {
+                                config_generation: t.config_generation,
+                                link_generation: t.link_generation,
+                            },
+                            InputTarget {
+                                config_generation: st.status.config_generation,
+                                link_generation: st.status.link_generation,
+                            },
+                        )
+                        .map_err(|_| {
+                            HostError::invalid("the Host update target changed; review it again")
+                        })?;
+                    t.config_generation = raw.config_generation;
+                    t.link_generation = raw.link_generation;
+                }
             }
             if let Some(t) = &target {
                 if t.config_generation != st.status.config_generation
@@ -2103,6 +2600,7 @@ pub(crate) mod tests {
         HostHandle {
             sh: sh.clone(),
             identity_access: None,
+            generation_access: None,
             run: Mutex::new(None),
             retired: AtomicBool::new(false),
         }

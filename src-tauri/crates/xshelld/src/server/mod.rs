@@ -245,6 +245,8 @@ pub enum TestPoint {
     /// A `term.open` passed its own checks and is about to lock the registry to look for the
     /// Terminal that holds its agent session (no lock held; a hook may block).
     OpenDecide,
+    /// A `term.attach` before registry admission (no locks held; tests may order attempts).
+    AttachDecide,
     /// A `term.open` that resumes an agent session found no Terminal holding it and is about
     /// to start its own (registry locked: do not block on the Daemon).
     OpenLooked,

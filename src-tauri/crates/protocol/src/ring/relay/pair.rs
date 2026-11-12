@@ -263,6 +263,17 @@ pub fn pair_as_guest(
     pair_as_guest_pinned(req, opts, cancel, None)
 }
 
+/// Calls `ready` only after the Relay has registered this guest's slot. A caller that
+/// advertises its code earlier can make a fast approver arrive first and reject it.
+pub fn pair_as_guest_with_ready(
+    req: &GuestRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    ready: impl FnOnce(),
+) -> Result<RosterChain, PairError> {
+    pair_as_guest_pinned_with_joined_ready(req, opts, cancel, None, ready).map(|(chain, _)| chain)
+}
+
 /// QR/enrollment callers pin the approving signer in addition to the Noise key. Scope
 /// checks precede any authentication or chain fetch at a message-4 Relay address.
 pub fn pair_as_guest_pinned(
@@ -282,8 +293,19 @@ pub fn pair_as_guest_pinned_with_joined(
     cancel: Option<&Cancel>,
     approver: Option<SignKey>,
 ) -> Result<(RosterChain, Joined), PairError> {
+    pair_as_guest_pinned_with_joined_ready(req, opts, cancel, approver, || {})
+}
+
+fn pair_as_guest_pinned_with_joined_ready(
+    req: &GuestRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    approver: Option<SignKey>,
+    ready: impl FnOnce(),
+) -> Result<(RosterChain, Joined), PairError> {
     let expected_relay = RelayUrl::parse(req.relay_url).map_err(|_| PairError::Pin)?;
     let mut pipe = PairPipe::open(req.relay_url, &req.secret.slot(), opts)?;
+    ready();
     if !pipe.has_peer() {
         if req.wait.is_zero() {
             pipe.close();

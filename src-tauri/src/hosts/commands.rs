@@ -12,13 +12,13 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use xshell_core::LaunchSpec;
 use xshell_hostlink::config::validate_one;
-use xshell_hostlink::{HostConfig, HostError, HostHandle, HostSnapshot, HostTestResult};
+use xshell_hostlink::{HostAccess, HostConfig, HostError, HostSnapshot, HostTestResult};
 use xshell_protocol::msg::OpenSpec;
 
-pub(crate) fn handle(state: &Hosts, host: &str) -> Result<Arc<HostHandle>, HostError> {
+pub(crate) fn handle(state: &Hosts, host: &str) -> Result<HostAccess, HostError> {
     state
         .manager
-        .host(host)
+        .access(host)
         .ok_or_else(|| HostError::unknown_host(host))
 }
 
@@ -111,7 +111,7 @@ pub fn hosts_status(state: State<'_, Hosts>) -> Vec<HostSnapshot> {
 pub fn hosts_kick(state: State<'_, Hosts>, host: Option<String>) {
     match host {
         Some(h) => {
-            if let Some(h) = state.manager.host(&h) {
+            if let Some(h) = state.manager.access(&h) {
                 h.kick();
             }
         }

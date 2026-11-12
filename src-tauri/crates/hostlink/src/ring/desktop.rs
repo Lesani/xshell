@@ -639,6 +639,15 @@ struct Live {
     conn_epoch: u64,
 }
 
+#[cfg(unix)]
+struct HostBrokerBinding {
+    generation: Option<u64>,
+    server: Option<super::broker::Server>,
+    client: Arc<super::broker::BrokerClient>,
+    path: PathBuf,
+    profile: String,
+}
+
 pub struct DesktopRing {
     pub(super) cfg: DesktopRingConfig,
     pub(super) store: Store,
@@ -649,6 +658,8 @@ pub struct DesktopRing {
     live: Mutex<Live>,
     routing_manager: Mutex<Option<Weak<crate::Manager>>>,
     routing_tx: std::sync::mpsc::SyncSender<()>,
+    #[cfg(unix)]
+    host_broker: Mutex<Option<HostBrokerBinding>>,
     /// Serializes every commit with the adoption of its result (into `live` and the
     /// Connector), so results are adopted in commit order.
     commit: Mutex<()>,
@@ -834,6 +845,8 @@ impl DesktopRing {
             live: Mutex::new(Live::default()),
             routing_manager: Mutex::new(None),
             routing_tx,
+            #[cfg(unix)]
+            host_broker: Mutex::new(None),
             commit: Mutex::new(()),
             me: me.clone(),
             configured: Mutex::new(Arc::new(|_: &str| true)),
@@ -856,15 +869,35 @@ impl DesktopRing {
         let weak = Arc::downgrade(&ring);
         std::thread::Builder::new()
             .name("ring-hosts".into())
-            .spawn(move || {
-                while routing_rx.recv().is_ok() {
-                    let Some(r) = weak.upgrade() else {
-                        return;
-                    };
-                    if r.lock().quitting {
-                        return;
-                    }
+            .spawn(move || loop {
+                let received = routing_rx.recv_timeout(Duration::from_millis(100));
+                if matches!(
+                    received,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                ) {
+                    return;
+                }
+                let Some(r) = weak.upgrade() else {
+                    return;
+                };
+                if r.lock().quitting {
+                    return;
+                }
+                if received.is_ok() {
                     r.project_hosts();
+                } else {
+                    #[cfg(unix)]
+                    let manager = r
+                        .routing_manager
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(Weak::upgrade);
+                    #[cfg(unix)]
+                    if let Some(manager) = manager {
+                        let generation = r.lock().routing.as_ref().map(|owner| owner.generation);
+                        r.maintain_host_broker(&manager, generation);
+                    }
                 }
             })
             .expect("spawn Ring Host projection");
@@ -898,6 +931,20 @@ impl DesktopRing {
     /// Bind the backend Manager to this profile. Only the elected Connector owner can
     /// create Relay handles; followers receive availability, not a second Connector.
     pub fn attach_manager(&self, manager: &Arc<crate::Manager>) -> Result<(), String> {
+        if !cfg!(unix) {
+            return Err(
+                "persistent protected Host broker adapter is not implemented on this platform"
+                    .into(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            super::store::ensure_private_dir(&self.cfg.dir).map_err(|e| e.to_string())?;
+            let dir = self.cfg.dir.canonicalize().map_err(|e| e.to_string())?;
+            xshell_core::local_ipc::private_dir(&dir).map_err(|e| e.to_string())?;
+            xshell_core::local_ipc::check_path(&dir.join("host-broker.sock"))
+                .map_err(|e| e.to_string())?;
+        }
         let mut bound = self.routing_manager.lock().unwrap();
         if bound
             .as_ref()
@@ -946,7 +993,59 @@ impl DesktopRing {
                 })
             }
         };
+        #[cfg(unix)]
+        let owner_generation = projection
+            .as_ref()
+            .and_then(|p| p.owner.as_ref().map(|o| o.generation));
         manager.set_ring_hosts(projection);
+        #[cfg(unix)]
+        self.maintain_host_broker(&manager, owner_generation);
+    }
+
+    #[cfg(unix)]
+    fn maintain_host_broker(&self, manager: &Arc<crate::Manager>, generation: Option<u64>) {
+        use sha2::{Digest, Sha256};
+        let mut binding = self.host_broker.lock().unwrap();
+        if self.lock().quitting {
+            return;
+        }
+        if binding.is_none() {
+            let Ok(dir) = self.cfg.dir.canonicalize() else {
+                return;
+            };
+            if xshell_core::local_ipc::private_dir(&dir).is_err() {
+                return;
+            }
+            let profile = format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()));
+            let client = super::broker::BrokerClient::new(profile.clone(), manager);
+            *binding = Some(HostBrokerBinding {
+                generation: None,
+                server: None,
+                client,
+                path: dir.join("host-broker.sock"),
+                profile,
+            });
+        }
+        let binding = binding.as_mut().expect("initialized");
+        if binding.generation != generation {
+            binding.server.take();
+            binding.generation = generation;
+        }
+        manager.set_broker(binding.client.clone(), generation.is_none());
+        if generation.is_some() && binding.server.is_none() {
+            let broker = super::broker::Broker::new(binding.profile.clone(), manager);
+            if let Ok(server) = super::broker::Server::bind(binding.path.clone(), broker) {
+                binding.server = Some(server);
+            }
+        }
+        if !binding.client.has_transport() {
+            if let Some(server) = &binding.server {
+                let _ = server.local(&binding.client);
+            } else if generation.is_none() {
+                let _ = binding.client.connect(&binding.path);
+            }
+        }
+        binding.client.tick();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
@@ -2795,6 +2894,11 @@ impl DesktopRing {
             }
             l.connector.take()
         };
+        #[cfg(unix)]
+        if let Some(binding) = self.host_broker.lock().unwrap().take() {
+            binding.client.stop();
+            drop(binding.server);
+        }
         // Drain owner handles outside callback/commit locks, before election is released.
         if let Some(manager) = self
             .routing_manager

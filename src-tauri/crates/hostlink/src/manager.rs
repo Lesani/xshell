@@ -30,6 +30,7 @@ pub trait Observer: Send + Sync {
     fn available(&self, _hosts: &[AvailableHost]) {}
 }
 
+#[derive(Clone)]
 pub struct ManagerConfig {
     pub desktop_version: String,
     /// This Desktop's build (#49); `None` when unknown. It keys the install directory, is
@@ -53,6 +54,10 @@ pub struct ManagerConfig {
     /// `term.open`, `term.attach`, `term.close`, `term.update` and `daemon.upgrade`.
     pub term_timeout: Duration,
     pub link_limits: LinkLimits,
+    pub(crate) replay_budget: crate::attachments::ReplayBudget,
+    pub(crate) action_targets: crate::action_targets::ActionTargets,
+    pub(crate) user_observer: Arc<dyn Observer>,
+    pub(crate) output_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ManagerConfig {
@@ -68,7 +73,9 @@ impl ManagerConfig {
             ours: xshell_protocol::PROTOCOL,
             transports,
             binaries,
+            user_observer: observer.clone(),
             observer,
+            action_targets: Default::default(),
             backoff_unit: Duration::from_secs(1),
             stable_after: Duration::from_secs(10),
             hello_timeout: Duration::from_secs(30),
@@ -77,6 +84,8 @@ impl ManagerConfig {
             upgrade_close_timeout: Duration::from_secs(15),
             term_timeout: Duration::from_secs(30),
             link_limits: LinkLimits::default(),
+            replay_budget: Default::default(),
+            output_bytes: Default::default(),
         }
     }
 
@@ -96,8 +105,19 @@ struct HostAlias {
     daemon_key: Option<xshell_protocol::ring::SignKey>,
 }
 
+// Relay status/output is exposed through the broker facade even in the owner process.
+// Raw owner generations must not race facade generations on the UI Observer.
+struct OwnerRelayObserver;
+impl Observer for OwnerRelayObserver {
+    fn status(&self, _: &HostStatus) {}
+    fn terminals(&self, _: &str, _: &[TerminalInfo]) {}
+}
+
 pub struct Manager {
     mc: Arc<ManagerConfig>,
+    broker: Mutex<Option<Arc<crate::ring::broker::BrokerClient>>>,
+    broker_follower: AtomicBool,
+    action_refresh: Mutex<()>,
     hosts: Mutex<Vec<Arc<HostHandle>>>,
     /// The Local Host when its Terminals run in a Daemon ([`Manager::set_local`]). Outside
     /// `configure`: the frontend's Host list never names it.
@@ -136,9 +156,19 @@ fn saved_alias_matches(
 }
 
 impl Manager {
-    pub fn new(cfg: ManagerConfig) -> Self {
+    pub fn new(mut cfg: ManagerConfig) -> Self {
+        // A cloned configuration must not share another Manager's public action tokens.
+        cfg.action_targets = Default::default();
+        cfg.user_observer = cfg.observer.clone();
+        cfg.observer = Arc::new(crate::action_targets::PublicObserver {
+            targets: cfg.action_targets.clone(),
+            inner: cfg.user_observer.clone(),
+        });
         Self {
             mc: Arc::new(cfg),
+            broker: Mutex::new(None),
+            broker_follower: AtomicBool::new(false),
+            action_refresh: Mutex::new(()),
             hosts: Mutex::new(Vec::new()),
             local: Mutex::new(None),
             ring: Mutex::new(None),
@@ -151,6 +181,10 @@ impl Manager {
             shut: AtomicBool::new(false),
             cancel: CancelToken::new(),
         }
+    }
+
+    pub(crate) fn replay_budget(&self) -> crate::attachments::ReplayBudget {
+        self.mc.replay_budget.clone()
     }
 
     fn next_gen(&self) -> u64 {
@@ -297,9 +331,164 @@ impl Manager {
         Some(handle)
     }
 
+    /// UI/transfer lookup. Independent configured routes remain explicit direct access;
+    /// Relay and identity aliases never expose the owner's private handle.
+    pub fn access(&self, id: &str) -> Option<crate::HostAccess> {
+        let broker = self.broker.lock().unwrap().clone();
+        let explicit_saved = self.hosts.lock().unwrap().iter().any(|h| h.id() == id)
+            || (id == crate::LOCAL_HOST_ID && self.local().is_some());
+        if !explicit_saved {
+            if let Some(client) = broker {
+                let proxy = client.proxy(id)?;
+                let authorized = self.ring.lock().unwrap().as_ref().is_some_and(|ring| {
+                    VerifiedRingHost::project(&ring.state.chain)
+                        .iter()
+                        .any(|host| host.sign_key == proxy.canonical())
+                });
+                if !authorized {
+                    return None;
+                }
+                return Some(crate::HostAccess::Broker(proxy));
+            }
+        }
+        self.host(id).map(crate::HostAccess::Direct)
+    }
+
+    /// Enrollment lookup must never enroll a Relay discovery or an identity-bound alias.
+    pub fn sync_host(&self, id: &str) -> Option<Arc<HostHandle>> {
+        let h = self.host(id)?;
+        let cfg = h.saved_config().filter(|cfg| cfg.id == id)?;
+        if self.ring.lock().unwrap().as_ref().is_some_and(|ring| {
+            ring.state.host_members.get(id).is_some_and(|member| {
+                saved_alias_matches(member, &member.sign_key, &cfg)
+                    && (ring
+                        .state
+                        .chain
+                        .authorized_member(&member.sign_key)
+                        .is_none()
+                        || ring
+                            .owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.revoked_key(&member.sign_key)))
+            })
+        }) {
+            return None;
+        }
+        Some(h)
+    }
+
+    pub(crate) fn set_broker(
+        &self,
+        client: Arc<crate::ring::broker::BrokerClient>,
+        follower: bool,
+    ) {
+        self.broker_follower.store(follower, Ordering::Release);
+        *self.broker.lock().unwrap() = Some(client);
+    }
+
+    fn refresh_action_targets(
+        &self,
+        client: &crate::ring::broker::BrokerClient,
+    ) -> (Vec<AvailableHost>, crate::ring::broker::BrokerPublication) {
+        let _refresh = self.action_refresh.lock().unwrap();
+        let publication = client.publication();
+        let rows = self.available_hosts();
+        let roots = self
+            .hosts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot())
+            .chain(self.local().iter().map(|h| h.snapshot()))
+            .chain(self.relay.lock().unwrap().iter().map(|h| h.snapshot()))
+            .collect::<Vec<_>>();
+        self.mc.action_targets.reconcile(&rows, &roots);
+        let keys: std::collections::HashSet<_> =
+            rows.iter().filter_map(|row| row.daemon_key).collect();
+        let broker_rows: Vec<_> = publication
+            .hosts
+            .iter()
+            .filter(|row| row.daemon_key.is_some_and(|key| keys.contains(&key)))
+            .cloned()
+            .collect();
+        self.mc
+            .action_targets
+            .broker(publication.epoch, &broker_rows, &publication.snapshots);
+        (rows, publication)
+    }
+    pub(crate) fn broker_changed(&self) {
+        let client = self.broker.lock().unwrap().clone();
+        if let Some(client) = client {
+            let (rows, publication) = self.refresh_action_targets(&client);
+            for snapshot in publication.snapshots {
+                if let Some(row) = rows.iter().find(|row| row.id == snapshot.status.host) {
+                    if row.active_route != RouteKind::Relay {
+                        if let Some(direct) = self.host(&row.id) {
+                            self.mc.observer.status(&direct.status());
+                            continue;
+                        }
+                    }
+                    let key = publication
+                        .hosts
+                        .iter()
+                        .find(|h| h.id == snapshot.status.host)
+                        .and_then(|h| h.daemon_key);
+                    if let Some(status) = key.and_then(|key| {
+                        self.mc.action_targets.broker_status(
+                            &snapshot.status,
+                            publication.epoch,
+                            key,
+                        )
+                    }) {
+                        self.mc.user_observer.status(&status);
+                        if let Some(terminals) = snapshot.terminals {
+                            self.mc
+                                .user_observer
+                                .terminals(&snapshot.status.host, &terminals);
+                        }
+                    }
+                }
+            }
+            self.mc.user_observer.available(&rows);
+        }
+    }
+    pub(crate) fn action_targets(&self) -> crate::action_targets::ActionTargets {
+        self.mc.action_targets.clone()
+    }
+
     /// The Local Host first, then the configured Hosts in their order.
     pub fn snapshot(&self) -> Vec<HostSnapshot> {
-        self.all().iter().map(|h| h.snapshot()).collect()
+        let client = self.broker.lock().unwrap().clone();
+        if let Some(client) = &client {
+            self.refresh_action_targets(client);
+        }
+        let mut snapshots: Vec<_> = self.all().iter().map(|h| h.access_snapshot()).collect();
+        if let Some(client) = client {
+            let hosts = self.available_hosts();
+            let broker_snapshots = client.snapshots();
+            for row in hosts.iter().filter(|h| {
+                h.active_route == RouteKind::Relay
+                    || (self.broker_follower.load(Ordering::Acquire) && self.host(&h.id).is_none())
+            }) {
+                snapshots.retain(|s| s.status.host != row.id);
+                snapshots.push(
+                    broker_snapshots
+                        .iter()
+                        .find(|s| s.status.host == row.id)
+                        .cloned()
+                        .unwrap_or_else(|| HostSnapshot {
+                            status: HostStatus::initial(
+                                &row.id,
+                                &self.mc.desktop_version,
+                                self.mc.desktop_build.clone(),
+                                0,
+                            ),
+                            terminals: None,
+                        }),
+                );
+            }
+        }
+        snapshots
     }
 
     fn all(&self) -> Vec<Arc<HostHandle>> {
@@ -362,7 +551,33 @@ impl Manager {
     }
 
     pub fn available_hosts(&self) -> Vec<AvailableHost> {
-        self.available.lock().unwrap().clone()
+        let mut rows = self.available.lock().unwrap().clone();
+        if self.broker_follower.load(Ordering::Acquire) {
+            if let Some(client) = self.broker.lock().unwrap().clone() {
+                let keys: std::collections::HashSet<_> = self
+                    .ring
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|ring| {
+                        VerifiedRingHost::project(&ring.state.chain)
+                            .into_iter()
+                            .map(|h| h.sign_key)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for row in client.hosts() {
+                    if row.daemon_key.is_some_and(|key| keys.contains(&key)) {
+                        rows.retain(|existing| {
+                            existing.daemon_key != row.daemon_key
+                                && !row.aliases.contains(&existing.id)
+                        });
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+        rows
     }
 
     // Called on the routing worker/configure thread, never a Connector callback.
@@ -494,9 +709,11 @@ impl Manager {
             {
                 next.push(h.clone());
             } else {
+                let mut mc = (*self.mc).clone();
+                mc.observer = Arc::new(OwnerRelayObserver);
                 next.push(Arc::new(HostHandle::new_relay(
                     dialer,
-                    self.mc.clone(),
+                    Arc::new(mc),
                     self.next_gen(),
                 )));
             }
@@ -529,6 +746,12 @@ impl Manager {
             }
             return;
         }
+        let roots = saved
+            .iter()
+            .chain(local.iter())
+            .chain(next.iter())
+            .map(|h| h.snapshot())
+            .collect::<Vec<_>>();
         for h in &next {
             h.start();
         }
@@ -541,14 +764,25 @@ impl Manager {
             changed
         };
         drop(relay);
+        let client = self.broker.lock().unwrap().clone();
+        if let Some(client) = client {
+            self.refresh_action_targets(&client);
+        } else {
+            let _refresh = self.action_refresh.lock().unwrap();
+            self.mc
+                .action_targets
+                .reconcile(&self.available_hosts(), &roots);
+        }
         if changed {
             self.mc.observer.available(&rows);
         }
     }
 
     pub fn kick_all(&self) {
-        for h in self.all() {
-            h.kick();
+        for row in self.available_hosts() {
+            if let Some(access) = self.access(&row.id) {
+                access.kick();
+            }
         }
     }
 
@@ -620,10 +854,15 @@ impl Manager {
         let deadline = Instant::now() + STOP_DEADLINE;
         self.shut.store(true, Ordering::SeqCst);
         self.cancel.cancel();
+        let client = self.broker.lock().unwrap().take();
+        if let Some(client) = client {
+            client.stop();
+        }
         let mut hosts: Vec<Arc<HostHandle>> = std::mem::take(&mut *self.hosts.lock().unwrap());
         hosts.extend(self.local.lock().unwrap().take());
         hosts.extend(std::mem::take(&mut *self.relay.lock().unwrap()));
         self.available.lock().unwrap().clear();
+        self.mc.action_targets.reconcile(&[], &[]);
         self.aliases.lock().unwrap().clear();
         let mut joins = Vec::new();
         for h in &hosts {
@@ -2187,6 +2426,71 @@ pub(crate) mod tests {
         assert_eq!(s.phase, None);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*peer.events.lock().unwrap(), ["select 1.5.0+85ee920a1b2c"]);
+        m.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod sync_lookup_tests {
+    use super::*;
+    use crate::config::test_host;
+    use crate::manager::tests::{test_config, NullObserver};
+    use xshell_protocol::ring::{DeviceKeys, Member, Role, RosterChain, SignedRoster};
+    #[test]
+    fn revoked_saved_association_suppresses_sync_without_disabling_independent_direct_access() {
+        let m = Manager::new(test_config(Arc::new(NullObserver)));
+        let mut cfg = test_host("h_abcdefgh", "original");
+        m.configure(vec![cfg.clone()]).unwrap();
+        let keys = Arc::new(DeviceKeys::generate().unwrap());
+        let daemon = DeviceKeys::generate().unwrap();
+        let first = SignedRoster::genesis(
+            keys.as_ref(),
+            keys.noise_key(),
+            "Desktop",
+            "ws://127.0.0.1:9",
+            1,
+        )
+        .unwrap();
+        let joined = first
+            .next(keys.as_ref(), 2, |r| {
+                r.add(Member::new(
+                    "Host",
+                    Role::Daemon,
+                    daemon.sign_key(),
+                    daemon.noise_key(),
+                    2,
+                ));
+            })
+            .unwrap();
+        let removed = joined
+            .next(keys.as_ref(), 3, |r| {
+                r.remove(&daemon.sign_key());
+            })
+            .unwrap();
+        let state = crate::ring::store::RingState {
+            keys,
+            chain: RosterChain::from_chain(vec![first, joined, removed]).unwrap(),
+            local_member: None,
+            farewells: Vec::new(),
+            held_relays: Default::default(),
+            host_members: std::collections::BTreeMap::from([(
+                cfg.id.clone(),
+                crate::ring::HostMember {
+                    sign_key: daemon.sign_key(),
+                    target: crate::ring::sync::target_of(&cfg),
+                },
+            )]),
+        };
+        m.set_ring_hosts(Some(RingHosts { state, owner: None }));
+        assert!(m.sync_host(&cfg.id).is_none());
+        assert!(matches!(
+            m.access(&cfg.id),
+            Some(crate::HostAccess::Direct(_))
+        ));
+        assert!(m.host(&cfg.id).is_some());
+        cfg.ssh_target = "independently-retargeted".into();
+        m.configure(vec![cfg.clone()]).unwrap();
+        assert!(m.sync_host(&cfg.id).is_some());
         m.shutdown();
     }
 }

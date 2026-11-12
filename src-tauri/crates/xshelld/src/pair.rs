@@ -22,7 +22,7 @@ use std::time::Duration;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
 use xshell_protocol::msg::{decode_server, encode_msg, ClientMsg, Hello, JoinExpect, ServerMsg};
 use xshell_protocol::ring::pairing::{PairCode, PairError, PAIR_TTL_SECS};
-use xshell_protocol::ring::relay::pair::{pair_as_guest, GuestRequest, PairOptions};
+use xshell_protocol::ring::relay::pair::{pair_as_guest_with_ready, GuestRequest, PairOptions};
 use xshell_protocol::ring::url::{RelayUrl, HOSTED_RELAY_URL};
 use xshell_protocol::ring::{member_name, Role, RosterChain};
 use xshell_protocol::PROTOCOL;
@@ -107,16 +107,8 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
     };
 
     let code = PairCode::generate().map_err(|e| e.to_string())?;
-    say(out, &format!("Pairing code: {}", code.format()));
-    say(
-        out,
-        "In xshell, open Settings -> Mobile -> Add a computer and enter this code.",
-    );
-    say(out, "It works once, for 10 minutes.");
-    say(out, &format!("Relay: {relay}"));
-
     let secret = code.secret();
-    let fetched = pair_as_guest(
+    let fetched = pair_as_guest_with_ready(
         &GuestRequest {
             relay_url: &relay,
             secret: &secret,
@@ -129,6 +121,15 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
         },
         &PairOptions::default(),
         None,
+        || {
+            say(out, &format!("Pairing code: {}", code.format()));
+            say(
+                out,
+                "In xshell, open Settings -> Mobile -> Add a computer and enter this code.",
+            );
+            say(out, "It works once, for 10 minutes.");
+            say(out, &format!("Relay: {relay}"));
+        },
     )
     .map_err(|e| match e {
         PairError::Expired => Failure::Expired,

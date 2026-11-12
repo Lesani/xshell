@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tauri::State;
 use xshell_core::transfer::{OnClash, Transferred};
-use xshell_hostlink::{HostError, HostHandle};
+use xshell_hostlink::{HostAccess, HostError};
 
 /// `file_read` calls in flight per Host, across every pump.
 pub const READS_PER_HOST: usize = 4;
@@ -137,7 +137,7 @@ fn gated<'a, E>(
 /// Host's link.
 enum Target {
     Local,
-    Remote(Arc<HostHandle>),
+    Remote(HostAccess),
 }
 
 impl Target {

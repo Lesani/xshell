@@ -1,12 +1,12 @@
 //! The values the frontend sees: `hosts:status` payloads, snapshots and test results.
 
 use crate::errors::HostErrorHint;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xshell_protocol::build::BuildId;
 use xshell_protocol::msg::TerminalInfo;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusKind {
     Reconnecting,
@@ -20,7 +20,7 @@ pub enum StatusKind {
     Incompatible,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     Probing,
@@ -29,14 +29,14 @@ pub enum Phase {
     Preparing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatibleReason {
     DaemonOlder,
     DaemonNewer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateAction {
     Update,
@@ -44,7 +44,7 @@ pub enum UpdateAction {
 }
 
 /// Evidence that this Host cannot accept the remote update path. Not a connectivity error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateUnavailable {
     WindowsOwner,
@@ -52,7 +52,7 @@ pub enum UpdateUnavailable {
 }
 
 /// Access-route limitation, independent of evidence about who owns this Daemon (#102).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteUpdateUnavailable {
     RelayOnly,
@@ -81,9 +81,12 @@ impl UpdateUnavailable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
+    /// Transport-only hint for internal HostSync observers; never serialized as authority.
+    #[serde(skip)]
+    pub(crate) raw_action_target: Option<crate::handle::InputTarget>,
     pub host: String,
     pub status: StatusKind,
     pub phase: Option<Phase>,
@@ -125,6 +128,7 @@ impl HostStatus {
         config_generation: u64,
     ) -> Self {
         Self {
+            raw_action_target: None,
             host: host.into(),
             status: StatusKind::Reconnecting,
             phase: None,
@@ -165,7 +169,7 @@ impl HostStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSnapshot {
     pub status: HostStatus,
@@ -173,7 +177,7 @@ pub struct HostSnapshot {
     pub terminals: Option<Vec<TerminalInfo>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostTestResult {
     pub ok: bool,

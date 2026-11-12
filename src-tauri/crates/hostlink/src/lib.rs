@@ -2,6 +2,9 @@
 //! link, managed install, per-Host supervision and the attachment table. The Desktop wraps
 //! [`Manager`] in Tauri commands and events; tests drive it against a real `xshelld`.
 
+pub mod access;
+mod action_targets;
+mod attachments;
 pub mod cancel;
 pub mod config;
 pub mod dial;
@@ -19,6 +22,7 @@ pub mod supervisor;
 pub mod transport;
 pub mod version;
 
+pub use access::HostAccess;
 pub use cancel::CancelToken;
 pub use config::{HostConfig, HOST_ID_PATTERN, LOCAL_HOST_ID};
 #[cfg(windows)]

@@ -247,6 +247,7 @@ fn launch_prefix_wraps_agent_and_survives_relaunch_on(via: Via) {
     shared_fake_agents();
     let fx = Fx::via(via);
     let first = fx.a.wait_usable();
+    let private_generation = fx.a.host().status().config_generation;
     assert!(first
         .daemon_capabilities
         .iter()
@@ -297,8 +298,13 @@ fn launch_prefix_wraps_agent_and_survives_relaunch_on(via: Via) {
         )
     );
     // The prefix change was applied without a reconnect.
+    assert_eq!(fx.a.host().status().config_generation, private_generation);
     assert_eq!(
-        fx.a.host().status().config_generation,
+        fx.a.m
+            .access(fx.a.host().id())
+            .unwrap()
+            .status()
+            .config_generation,
         first.config_generation
     );
 }

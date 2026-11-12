@@ -59,6 +59,13 @@ impl HostError {
     pub fn timeout(m: impl Into<String>) -> Self {
         Self::new(HostErrorCode::Timeout, m)
     }
+    pub(crate) fn mutation_outcome(self) -> Self {
+        match self.code {
+            HostErrorCode::Offline | HostErrorCode::Timeout => Self::new(HostErrorCode::Indeterminate,
+                format!("Host mutation outcome unknown; reconcile actual Terminals before another action: {}", self.message)),
+            _ => self,
+        }
+    }
     pub fn unknown_host(id: &str) -> Self {
         Self::new(HostErrorCode::UnknownHost, format!("unknown host {id}"))
     }
