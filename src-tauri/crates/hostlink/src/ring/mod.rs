@@ -3,6 +3,7 @@
 //! the Ring's members ([`desktop::DesktopRing`]); and the worker that keeps every Host's
 //! Daemon in the Ring ([`sync`]).
 
+pub mod administration;
 pub mod adoption;
 pub mod broker;
 pub(crate) mod broker_ipc;

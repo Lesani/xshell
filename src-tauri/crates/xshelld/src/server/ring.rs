@@ -59,10 +59,73 @@ struct RosterFile {
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Stored objects have different semantic sizes; none is implicitly one Host frame.
+#[derive(Clone, Copy)]
+pub(crate) enum PrivateRingFile {
+    Keys,
+    RosterHistory,
+    PushRegistrations,
+    #[cfg(unix)]
+    CompanionPolicy,
+    #[cfg(unix)]
+    StandaloneJournal,
+    #[cfg(unix)]
+    CompletionMailbox,
+}
+#[cfg(unix)]
+const MAX_STORED_TOKEN_ARRAY_JSON_BYTES: usize = xshell_protocol::ring::chain::MAX_CHAIN_LEN
+    .checked_mul(
+        xshell_protocol::ring::roster::MAX_ROSTER_TOKEN
+            .checked_add(3)
+            .expect("token delimiters"),
+    )
+    .expect("stored token history")
+    .checked_add(2)
+    .expect("array framing");
+#[cfg(unix)]
+impl PrivateRingFile {
+    fn maximum(self) -> usize {
+        match self {
+            // Two canonical base64url32-byte seeds, u32 version and fixed JSON labels.
+            Self::Keys => 512,
+            // Tokens' ASCII base64url/prefix alphabet needs no JSON escaping. Account
+            // for every supported token, quotes/comma, and the normal writer's wrapper.
+            Self::RosterHistory => MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                .checked_add(br#"{"v":4294967295,"rosters":}"#.len())
+                .expect("roster file framing"),
+            // on_head prunes to at most64 roster members; each registration has a
+            // MAX_BLOB ASCII value, fixed keys/triggers/counters and bounded dormant code.
+            Self::PushRegistrations => xshell_protocol::ring::roster::MAX_MEMBERS
+                .checked_mul(
+                    xshell_protocol::ring::push::MAX_BLOB
+                        .checked_add(512)
+                        .expect("push registration framing"),
+                )
+                .expect("push member storage")
+                .checked_add(512)
+                .expect("push file framing"),
+            Self::CompanionPolicy => {
+                xshell_core::companion_reservation::MAX_COMPANION_POLICY_JSON_BYTES
+            }
+            // Standalone stores full proposal-predecessor and accepted histories.
+            // Completion stores full initial/accepted histories plus a prepared proposal
+            // (whose additional predecessor is bounded by the companion envelope).
+            Self::StandaloneJournal | Self::CompletionMailbox => MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                .checked_mul(2)
+                .expect("journal histories")
+                .checked_add(xshell_core::companion_reservation::MAX_COMPANION_POLICY_JSON_BYTES)
+                .expect("journal metadata/proposal framing"),
+        }
+    }
+}
+
 /// Opens `path` for reading if it is a regular file of ours (not a symlink); tightens a mode
 /// broader than 0600. `None`: it does not exist.
 #[cfg(windows)]
-pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+pub(crate) fn read_private(
+    path: &Path,
+    _kind: PrivateRingFile,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let Some(f) = xshell_core::private_fs::open_read(path)? else {
         return Ok(None);
     };
@@ -73,10 +136,13 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<
 }
 
 #[cfg(unix)]
-pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+pub(crate) fn read_private(
+    path: &Path,
+    kind: PrivateRingFile,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let f = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -110,9 +176,20 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<
     if meta.mode() & 0o077 != 0 {
         f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    let maximum = kind.maximum();
+    if meta.len() > maximum as u64 {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     // Sized up front, so no reallocation leaves a copy of a secret behind.
     let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(meta.len() as usize + 1));
-    (&f).read_to_end(&mut buf)?;
+    (&f).take(maximum as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > maximum {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     Ok(Some(buf))
 }
 
@@ -138,7 +215,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -172,7 +249,8 @@ pub(crate) fn host_name() -> String {
 
 /// A stopped or unreadable registration is still a binding, never headless permission.
 pub(crate) fn companion_registered(dir: &Path) -> bool {
-    !matches!(fs::symlink_metadata(dir.join("companion.json")), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    ["companion.json", "companion-pending.json"].iter().any(|name|
+        !matches!(fs::symlink_metadata(dir.join(name)), Err(error) if error.kind() == io::ErrorKind::NotFound))
 }
 
 /// The files in the ring directory.
@@ -224,7 +302,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path);
         let f = f.map_err(|e| format!("cannot open {name}: {e}"))?;
         #[cfg(unix)]
@@ -350,7 +428,8 @@ impl Store {
         }
         self.ensure_dir().map_err(|e| e.to_string())?;
         let p = self.keys_path();
-        let Some(bytes) = read_private(&p).map_err(|e| e.to_string())? else {
+        let Some(bytes) = read_private(&p, PrivateRingFile::Keys).map_err(|e| e.to_string())?
+        else {
             return Ok(None);
         };
         let bad = || {
@@ -396,7 +475,9 @@ impl Store {
     /// unreadable or does not verify.
     pub fn read_chain(&self) -> Result<Option<RosterChain>, String> {
         let p = self.roster_path();
-        let Some(bytes) = read_private(&p).map_err(|e| e.to_string())? else {
+        let Some(bytes) =
+            read_private(&p, PrivateRingFile::RosterHistory).map_err(|e| e.to_string())?
+        else {
             return Ok(None);
         };
         serde_json::from_slice::<RosterFile>(&bytes)
@@ -414,7 +495,7 @@ impl Store {
     /// and logged: this Host is then in no Ring until a Desktop sends `ring.join` again.
     fn load_chain(&self) -> Option<RosterChain> {
         let p = self.roster_path();
-        match read_private(&p) {
+        match read_private(&p, PrivateRingFile::RosterHistory) {
             Ok(Some(_)) => {}
             Ok(None) => return None,
             Err(e) => {
@@ -1133,13 +1214,175 @@ pub(crate) fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
         .is_some_and(|m| m.role == Role::Daemon)
 }
 
+/// Signed historical-format data for storage compatibility tests only, not an adoption
+/// fixture or a principal/counterpart authorization receipt.
+#[cfg(test)]
+pub(super) fn historical_storage_chain(daemon: &DeviceKeys) -> (DeviceKeys, RosterChain) {
+    use xshell_protocol::ring::{Member, SignedRoster};
+    let signer = DeviceKeys::generate().unwrap();
+    let genesis = SignedRoster::genesis(
+        &signer,
+        signer.noise_key(),
+        "historical Desktop",
+        "ws://127.0.0.1:9",
+        1,
+    )
+    .unwrap();
+    let mut versions = vec![genesis];
+    for version in 2..=1401 {
+        let next = versions
+            .last()
+            .unwrap()
+            .next(&signer, version, |draft| {
+                if version == 2 {
+                    draft.add(Member::new(
+                        "historical Daemon",
+                        Role::Daemon,
+                        daemon.sign_key(),
+                        daemon.noise_key(),
+                        2,
+                    ));
+                    draft.extra.insert(
+                        "historicalStoragePadding".into(),
+                        serde_json::Value::String("x".repeat(40 * 1024)),
+                    );
+                }
+            })
+            .unwrap();
+        assert!(next.token().len() <= xshell_protocol::ring::roster::MAX_ROSTER_TOKEN);
+        versions.push(next);
+    }
+    assert!(versions.len() <= xshell_protocol::ring::chain::MAX_CHAIN_LEN);
+    (signer, RosterChain::from_chain(versions).unwrap())
+}
+#[cfg(test)]
+pub(super) fn storage_test_directory() -> tempfile::TempDir {
+    let scratch = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    tempfile::Builder::new()
+        .prefix("signed-history-storage-")
+        .tempdir_in(scratch)
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    /// Historical v1 storage compatibility, not a new adoption/bootstrap authority.
+    #[test]
+    fn valid_signed_roster_history_larger_than_a_host_frame_survives_storage_restart() {
+        let temp = storage_test_directory();
+        let store = Store::new(temp.path().join("ring"));
+        let daemon = store.load_or_create_keys().unwrap();
+        let (_, chain) = historical_storage_chain(&daemon);
+        {
+            let _lock = store.lock().unwrap();
+            store.write_chain(&chain).unwrap();
+        }
+        let stored_bytes = fs::metadata(store.roster_path()).unwrap().len();
+        assert!(
+            stored_bytes > xshell_protocol::frame::MAX_FRAME_LEN as u64,
+            "fixture must exceed the old Host-frame cap"
+        );
+        eprintln!(
+            "STORAGE_COMPAT roster.json bytes={stored_bytes} signed_versions={}",
+            chain.versions().len()
+        );
+        let readback = store
+            .read_chain()
+            .expect("valid signed retained history must be readable")
+            .unwrap();
+        assert!(
+            readback == chain,
+            "exact verified historical tokens must survive readback"
+        );
+        drop(readback);
+        drop(store);
+        let restarted_store = Store::new(temp.path().join("ring"));
+        // This is the same retained-trust loader used by Ring::resume; no Relay is dialed.
+        let restarted = restarted_store
+            .load_chain()
+            .expect("restart must retain valid signed history");
+        assert!(
+            restarted == chain,
+            "restart must retain exact history, not truncate or replace it"
+        );
+        assert_eq!(
+            restarted_store.load_keys().unwrap().unwrap().sign_key(),
+            daemon.sign_key()
+        );
+        assert_eq!(
+            fs::metadata(restarted_store.roster_path()).unwrap().len(),
+            stored_bytes
+        );
+        assert!(!fs::read_dir(&restarted_store.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".bad-")));
+    }
     #[cfg(unix)]
+    #[test]
+    fn stored_object_bounds_cover_histories_and_reject_each_sparse_oversize() {
+        let temp = storage_test_directory();
+        for kind in [
+            PrivateRingFile::Keys,
+            PrivateRingFile::RosterHistory,
+            PrivateRingFile::PushRegistrations,
+            PrivateRingFile::CompanionPolicy,
+            PrivateRingFile::StandaloneJournal,
+            PrivateRingFile::CompletionMailbox,
+        ] {
+            let path = temp.path().join("object.json");
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let limit = kind.maximum();
+            file.set_len(limit as u64 + 1).unwrap();
+            assert!(read_private(&path, kind).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().len(), limit as u64 + 1);
+        }
+        let history = PrivateRingFile::RosterHistory.maximum();
+        assert!(history > xshell_protocol::frame::MAX_FRAME_LEN as usize);
+        assert!(
+            PrivateRingFile::StandaloneJournal.maximum() >= 2 * MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+        );
+        assert!(
+            PrivateRingFile::CompletionMailbox.maximum()
+                >= 2 * MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                    + xshell_protocol::ring::companion::MAX_COMPANION_FRAME
+        );
+        assert!(PrivateRingFile::Keys.maximum() < 1024);
+        assert!(PrivateRingFile::PushRegistrations.maximum() < 1024 * 1024);
+        assert_eq!(
+            PrivateRingFile::CompanionPolicy.maximum(),
+            xshell_core::companion_reservation::MAX_COMPANION_POLICY_JSON_BYTES
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_ring_file_size_bound_rejects_sparse_oversize_before_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("keys.json");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let length = PrivateRingFile::Keys.maximum() as u64 + 1;
+        file.set_len(length).unwrap();
+        assert!(read_private(&path, PrivateRingFile::Keys).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), length);
+    }
     #[test]
     fn private_files_refuse_symlinks_and_tighten_modes() {
         let t = tempfile::tempdir().unwrap();
@@ -1148,14 +1391,20 @@ mod tests {
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            read_private(&p).unwrap().as_deref().map(|v| v.as_slice()),
+            read_private(&p, PrivateRingFile::Keys)
+                .unwrap()
+                .as_deref()
+                .map(|v| v.as_slice()),
             Some(&b"x"[..])
         );
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
         let link = t.path().join("link.json");
         symlink(&p, &link).unwrap();
-        assert!(read_private(&link).is_err());
-        assert_eq!(read_private(&t.path().join("none")).unwrap(), None);
+        assert!(read_private(&link, PrivateRingFile::Keys).is_err());
+        assert_eq!(
+            read_private(&t.path().join("none"), PrivateRingFile::Keys).unwrap(),
+            None
+        );
         // Only the target is left: no temp files.
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
     }

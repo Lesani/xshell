@@ -156,6 +156,8 @@ pub struct LocalDaemon {
     keeper: Mutex<mpsc::Sender<(Command, SpawnReply)>>,
     child: Mutex<Option<Spawned>>,
     quitting: AtomicBool,
+    #[cfg(unix)]
+    registration_child: Mutex<Option<std::sync::Weak<Mutex<Child>>>>,
     /// Windows: the kill-on-close job every GUI-bound Daemon joins (`--job`), held for this
     /// value's life: when the Desktop ends, the OS ends the Daemon and its Terminals.
     #[cfg(windows)]
@@ -197,6 +199,8 @@ impl LocalDaemon {
             keeper: Mutex::new(tx),
             child: Mutex::new(None),
             quitting: AtomicBool::new(false),
+            #[cfg(unix)]
+            registration_child: Mutex::new(None),
             #[cfg(windows)]
             job,
             #[cfg(all(test, unix))]
@@ -261,6 +265,124 @@ impl LocalDaemon {
         };
         *cache = Some((id, r.clone()));
         r.map_err(io::Error::other)
+    }
+
+    /// Runs only the bounded registration child when normal serve is absent. The Daemon
+    /// process owns its Store/keys; Desktop receives public receipts over protected IPC.
+    #[cfg(unix)]
+    pub fn with_registration_endpoint<T>(
+        &self,
+        desktop_store: &Path,
+        action: impl FnOnce(&crate::ring::companion_ipc::CompanionClient) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use std::io::Write;
+        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+        let home = self.home.canonicalize().map_err(|e| e.to_string())?;
+        let directory = xshell_core::companion_reservation::reserve(&home, desktop_store)
+            .map_err(|e| e.to_string())?;
+        let endpoint = directory.join("companion.sock");
+        let client = crate::ring::companion_ipc::CompanionClient::new(endpoint);
+        let reserve = || {
+            client.request(CompanionRequest::ReserveRegistration {
+                desktop_store: desktop_store
+                    .to_str()
+                    .ok_or("Desktop store path is not UTF-8")?
+                    .into(),
+            })
+        };
+        if matches!(reserve(), Ok(CompanionResponse::Descriptor { .. })) {
+            return action(&client);
+        }
+        self.check_bin().map_err(|e| e.to_string())?;
+        if self.quitting.load(Ordering::Acquire) {
+            return Err("Desktop is quitting".into());
+        }
+        struct RegistrationChild(Arc<Mutex<Child>>);
+        impl Drop for RegistrationChild {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().stdin.take();
+                // Give EOF shutdown a bounded drain, then reap our child even on error.
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until {
+                    if self.0.lock().unwrap().try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut child = self.0.lock().unwrap();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let mut command = Command::new(&self.bin);
+        command
+            .args(["companion-registration", "--home"])
+            .arg(&self.home)
+            .arg("--socket")
+            .arg(&self.socket)
+            .envs(self.env.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = {
+            let mut owned = self.registration_child.lock().unwrap();
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            if owned.as_ref().and_then(std::sync::Weak::upgrade).is_some() {
+                return Err("another registration child is active".into());
+            }
+            let child = Arc::new(Mutex::new(command.spawn().map_err(|e| e.to_string())?));
+            *owned = Some(Arc::downgrade(&child));
+            RegistrationChild(child)
+        };
+        let input = serde_json::to_vec(
+            &desktop_store
+                .to_str()
+                .ok_or("Desktop store path is not UTF-8")?,
+        )
+        .map_err(|e| e.to_string())?;
+        if input.len() > 4096 {
+            return Err("Desktop store path too long".into());
+        }
+        {
+            let mut process = child.0.lock().unwrap();
+            let stdin = process
+                .stdin
+                .as_mut()
+                .ok_or("registration child stdin unavailable")?;
+            stdin
+                .write_all(&input)
+                .and_then(|()| stdin.write_all(b"\n"))
+                .map_err(|e| e.to_string())?;
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            if matches!(reserve(), Ok(CompanionResponse::Descriptor { .. })) {
+                return action(&client);
+            }
+            if child
+                .0
+                .lock()
+                .unwrap()
+                .try_wait()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                // A live serve may have won the owner lock. Never steal its endpoint.
+                return match reserve()? {
+                    CompanionResponse::Descriptor { .. } => action(&client),
+                    _ => Err("counterpart reservation unavailable".into()),
+                };
+            }
+            if Instant::now() >= until {
+                return Err("counterpart registration pending: helper deadline".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Before an upgrade or a replacement stops the running Persistent Daemon (#49, C1):
@@ -443,6 +565,19 @@ impl LocalDaemon {
     pub fn hang_up(&self) {
         let mut slot = self.child.lock().unwrap();
         self.quitting.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        if let Some(child) = self
+            .registration_child
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(|c| c.upgrade())
+        {
+            let mut child = child.lock().unwrap();
+            child.stdin.take();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         match slot.take() {
             Some(mut s) if s.kind == Kind::GuiBound => {
                 if matches!(s.child.try_wait(), Ok(None)) {

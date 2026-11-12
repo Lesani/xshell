@@ -181,6 +181,19 @@ impl Outbox {
         }
     }
 }
+/// Small synchronous control sender using exactly the persistent broker framing.
+pub(crate) fn write_control(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker control frame bounds",
+        ));
+    }
+    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    writer.write_all(&0u64.to_be_bytes())?;
+    writer.write_all(&bytes)
+}
 pub(crate) fn read<T: DeserializeOwned>(
     reader: &mut impl Read,
     assembly: &Arc<Assembly>,
@@ -234,7 +247,37 @@ pub(crate) fn read_limited<T: DeserializeOwned>(
 
 #[cfg(unix)]
 pub(crate) mod native {
+    use std::io::{self, Read, Write};
     pub use std::os::unix::net::UnixStream as Stream;
+    use std::time::Instant;
+    /// One absolute control-request budget, including partial reads/writes and snapshots.
+    pub struct DeadlineStream<'a> {
+        pub stream: &'a mut Stream,
+        pub until: Instant,
+    }
+    impl DeadlineStream<'_> {
+        fn left(&self) -> io::Result<std::time::Duration> {
+            self.until
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "broker control deadline"))
+        }
+    }
+    impl Read for DeadlineStream<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.stream.set_read_timeout(Some(self.left()?))?;
+            self.stream.read(bytes)
+        }
+    }
+    impl Write for DeadlineStream<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.stream.set_write_timeout(Some(self.left()?))?;
+            self.stream.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
     pub use xshell_core::local_ipc::{protected_connect as connect, ProtectedListener as Listener};
 }
 // Windows' protected named-pipe implementation remains in core::pipe. There is deliberately

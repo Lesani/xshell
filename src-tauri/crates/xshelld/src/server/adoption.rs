@@ -1,6 +1,6 @@
 //! Explicit command-scoped standalone adoption. No Host RPC can invoke or confirm this
 //! controller; registration (including a stopped Desktop) always excludes it.
-use super::ring::{read_private, write_private, Store};
+use super::ring::{read_private, write_private, PrivateRingFile, Store};
 use super::ServerHandle;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,14 +31,16 @@ struct StandaloneJournal {
     installed: bool,
 }
 fn load_journal(store: &Store) -> Result<Option<StandaloneJournal>, String> {
-    read_private(&store.dir.join("standalone-adoption.json"))
-        .map_err(|e| e.to_string())?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|e| {
-                format!("reconciliation_required: unreadable standalone obligation: {e}")
-            })
-        })
-        .transpose()
+    read_private(
+        &store.dir.join("standalone-adoption.json"),
+        PrivateRingFile::StandaloneJournal,
+    )
+    .map_err(|e| e.to_string())?
+    .map(|bytes| {
+        serde_json::from_slice(&bytes)
+            .map_err(|e| format!("reconciliation_required: unreadable standalone obligation: {e}"))
+    })
+    .transpose()
 }
 fn accepted_record(store: &Store, record: &StandaloneJournal) -> Result<RosterChain, String> {
     record.intent.validate().map_err(|e| e.to_string())?;

@@ -7,6 +7,7 @@ pub mod antigravity;
 pub mod chat;
 pub mod claude;
 pub mod codex;
+pub mod companion_reservation;
 pub mod ctx;
 pub mod cursor;
 pub mod direct_exec;
