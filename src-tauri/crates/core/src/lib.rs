@@ -17,6 +17,7 @@ pub mod git;
 pub mod job;
 pub mod last_line;
 pub mod launch;
+pub mod local_ipc;
 pub mod memories;
 pub mod opencode;
 pub mod past;

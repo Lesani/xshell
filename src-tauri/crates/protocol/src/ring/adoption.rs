@@ -117,7 +117,7 @@ struct JoinPayload {
     intent: AdoptionIntent,
     proofs: Vec<Possession>,
 }
-fn possession_message(intent: &AdoptionIntent, h2: &[u8]) -> Vec<u8> {
+pub fn possession_message(intent: &AdoptionIntent, h2: &[u8]) -> Vec<u8> {
     let bytes = serde_json::to_vec(intent).expect("intent serializes");
     format!(
         "xshell-adoption-possession-v2\n{}\n{}",

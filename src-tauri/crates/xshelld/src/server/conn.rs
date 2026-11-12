@@ -63,6 +63,15 @@ fn push_error(ob: &Outbox, code: &str, message: String) {
     }
 }
 
+/// Assigned by the accepting server, never decoded from a Host request. The user socket
+/// is also the SSH bridge and is deliberately not evidence of GUI confirmation authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ingress {
+    LocalOrSsh,
+    Relay,
+    InProcess,
+}
+
 struct Conn {
     d: Arc<Daemon>,
     id: ConnId,
@@ -71,6 +80,7 @@ struct Conn {
     /// The Ring member a Relay session came from, as the head listed it; `None` for the
     /// local socket and SSH.
     peer: Option<Member>,
+    ingress: Ingress,
     ob: Arc<Outbox>,
     /// Terminals this connection attached to or sized; all are released on disconnect.
     touched: HashSet<Uuid>,
@@ -79,7 +89,17 @@ struct Conn {
     carry: HashMap<Uuid, InputCarry>,
 }
 
-pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer: Option<Member>) {
+pub(crate) fn handle(
+    d: Arc<Daemon>,
+    sock: Stream,
+    id: ConnId,
+    role: Role,
+    peer: Option<Member>,
+    ingress: Ingress,
+) {
+    if (ingress == Ingress::Relay) != peer.is_some() {
+        return;
+    }
     let (wsock, asock) = match (sock.try_clone(), sock.try_clone()) {
         (Ok(w), Ok(a)) => (w, a),
         _ => return,
@@ -170,6 +190,7 @@ pub(crate) fn handle(d: Arc<Daemon>, sock: Stream, id: ConnId, role: Role, peer:
         id,
         role,
         peer,
+        ingress,
         ob: ob.clone(),
         touched: HashSet::new(),
         inflight: Arc::new(AtomicUsize::new(0)),
@@ -733,9 +754,17 @@ impl Conn {
                 reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
             }
             ClientMsg::RingIdentity => reply(&self.ob, id, d.ring.identity()),
-            // Never blocks: leaving another Ring says goodbye on a thread of its own.
             ClientMsg::RingJoin { rosters, expect } => {
-                reply(&self.ob, id, d.ring.join(&rosters, expect.as_ref()))
+                // A Relay session can synchronize retained membership, not establish local
+                // provenance or bootstrap an unpaired counterpart.
+                let result = if super::ring::companion_registered(&d.cfg.paths.ring_dir) {
+                    Err("protected_counterpart_required: registered Computer installation is not a Host RPC".into())
+                } else if self.ingress == Ingress::Relay && d.ring.trusted_chain().is_none() {
+                    Err("leave_required: Relay ingress has no retained local membership".into())
+                } else {
+                    d.ring.join(&rosters, expect.as_ref())
+                };
+                reply(&self.ob, id, result)
             }
             // Only from a Mobile's session: the registration is bound to its Roster entry.
             ClientMsg::PushRegister {

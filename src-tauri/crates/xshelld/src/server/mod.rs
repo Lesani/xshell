@@ -21,6 +21,8 @@
 mod agent;
 mod calls;
 mod codex_link;
+#[cfg(unix)]
+mod companion;
 mod conn;
 mod drops;
 mod last_line;
@@ -196,7 +198,7 @@ pub struct Config {
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
-    /// Test hook: runs at the [`TestPoint`]s of a Terminal's start, exit and Relaunch.
+    /// Test hook: runs at the documented Terminal, Ring and counterpart [`TestPoint`]s.
     #[doc(hidden)]
     pub test_hook: Option<TestHook>,
 }
@@ -206,6 +208,13 @@ pub struct Config {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPoint {
+    /// Ordinary Host RingJoin before store admission (Ring lifecycle/state locked).
+    /// May coordinate registration, but must not re-enter Ring methods.
+    BeforeHostRingJoinCommit,
+    /// Decoded companion request before store admission; no handler locks held.
+    CompanionRequestAdmitted,
+    /// Actual roster write after prerequisite reads (ring.lock held); true injects a write error.
+    BeforeRingRosterWrite,
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
     /// Selected-update commit has been acknowledged; on its worker, outside all locks.
@@ -686,6 +695,9 @@ impl Server {
             cfg.ring_timeouts,
             cfg.write_stall_timeout,
         );
+        if let Some(hook) = &cfg.test_hook {
+            ring.set_test_hook(hook.clone());
+        }
         let push = Arc::new(push::Push::new(
             paths.ring_dir.clone(),
             push::PushConfig {
@@ -718,6 +730,8 @@ impl Server {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(starting.lock.take()),
+            #[cfg(unix)]
+            companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks,
             // Runs are told apart across restarts too: a hook of the previous Daemon's
@@ -742,6 +756,20 @@ impl Server {
             crate::log!("INFO", "stopped while restoring Terminals; exiting");
             d.exit(ExitReason::Shutdown);
             return Err(StartError::Aborted);
+        }
+        // The existing Daemon owner lock also owns the distinct private counterpart
+        // endpoint. Bind before resuming any Relay client; a second owner fails closed.
+        #[cfg(unix)]
+        let companion = match companion::serve(Arc::downgrade(&d)) {
+            Ok(server) => server,
+            Err(error) => {
+                d.exit(ExitReason::Shutdown);
+                return Err(error.into());
+            }
+        };
+        #[cfg(unix)]
+        {
+            *d.companion.lock().unwrap() = companion;
         }
         // A member of a Ring connects to its Relay; the Relay socket is not a connection for
         // idle tracking.
@@ -824,6 +852,29 @@ impl Stopper {
 }
 
 impl ServerHandle {
+    /// Runtime1 Unix counterpart endpoint. Windows protected-pipe wiring is not present.
+    pub fn companion_endpoint(&self) -> io::Result<PathBuf> {
+        #[cfg(unix)]
+        {
+            let path = self
+                .d
+                .cfg
+                .paths
+                .ring_dir
+                .canonicalize()?
+                .join("companion.sock");
+            xshell_core::local_ipc::check_path(&path)?;
+            Ok(path)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "counterpart IPC is not implemented on this platform",
+            ))
+        }
+    }
+
     pub fn wait(self) -> ExitReason {
         let mut g = self.d.exit.lock().unwrap();
         loop {
@@ -906,7 +957,7 @@ impl ServerHandle {
         let d = self.d.clone();
         std::thread::Builder::new()
             .name(format!("conn-{id}-r"))
-            .spawn(move || conn::handle(d, server, id, role, None))?;
+            .spawn(move || conn::handle(d, server, id, role, None, conn::Ingress::InProcess))?;
         Ok(client)
     }
 

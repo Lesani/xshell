@@ -102,7 +102,7 @@ fn bridge(d: Arc<Daemon>, inc: Incoming) -> io::Result<()> {
         .name(format!("conn-{id}-r"))
         .spawn({
             let d = d.clone();
-            move || conn::handle(d, theirs, id, role, Some(peer))
+            move || conn::handle(d, theirs, id, role, Some(peer), conn::Ingress::Relay)
         })
         .and_then(|_| {
             std::thread::Builder::new()

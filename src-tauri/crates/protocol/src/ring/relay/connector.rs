@@ -1398,3 +1398,188 @@ mod tests {
         assert_eq!(*rec.0.lock().unwrap(), vec!["ws://127.0.0.1:1".to_string()]);
     }
 }
+
+/// A frozen proposal belongs to one authenticated creator connection. Unlike ordinary
+/// Connector publication this lane never reconnects, rebases, or stages a candidate.
+pub struct ProposalConnection {
+    inner: Weak<Inner>,
+    generation: u64,
+    client: Arc<RingClient>,
+    predecessor: SignedRoster,
+    frozen: Mutex<Option<crate::ring::Roster>>,
+    grant: Mutex<Option<super::proposal::ProposalHandle>>,
+    created: std::sync::atomic::AtomicBool,
+    published: std::sync::atomic::AtomicBool,
+}
+
+impl Connector {
+    pub fn proposal_connection(&self) -> Result<ProposalConnection, RingError> {
+        let st = lock(&self.inner.st);
+        let client = st
+            .client
+            .as_ref()
+            .filter(|c| !c.is_closed())
+            .ok_or(RingError::Closed(CloseReason::Local))?;
+        if st.stop.is_some()
+            || client.roster().hash() != st.chain.head().hash()
+            || !st
+                .chain
+                .authorized_member(&self.inner.base.signer.sign_key())
+                .is_some_and(|m| m.role == crate::ring::Role::Desktop)
+        {
+            return Err(RingError::Invalid(
+                "proposal connection is not at the accepted head".into(),
+            ));
+        }
+        Ok(ProposalConnection {
+            inner: Arc::downgrade(&self.inner),
+            generation: st.gen,
+            client: client.clone(),
+            predecessor: st.chain.head().clone(),
+            frozen: Mutex::new(None),
+            grant: Mutex::new(None),
+            created: std::sync::atomic::AtomicBool::new(false),
+            published: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+impl ProposalConnection {
+    fn current(&self) -> Result<(), RingError> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or(RingError::Closed(CloseReason::Local))?;
+        let st = lock(&inner.st);
+        if st.stop.is_some()
+            || st.gen != self.generation
+            || self.client.is_closed()
+            || !st
+                .client
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(c, &self.client))
+            || st.chain.head().hash() != self.predecessor.hash()
+            || self.client.roster().hash() != self.predecessor.hash()
+            || !st
+                .chain
+                .authorized_member(&inner.base.signer.sign_key())
+                .is_some_and(|m| m.role == crate::ring::Role::Desktop)
+        {
+            return Err(RingError::Invalid(
+                "proposal creator connection or predecessor changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn create(
+        &self,
+        intent: &crate::ring::pairing::adoption::AdoptionIntent,
+        final_noise_hash: [u8; 32],
+        proposal: &crate::ring::Roster,
+    ) -> Result<super::proposal::ProposalHandle, RingError> {
+        self.current()?;
+        intent
+            .validate()
+            .map_err(|e| RingError::Invalid(e.to_string()))?;
+        intent
+            .target
+            .matches_proposal(proposal)
+            .map_err(|e| RingError::Invalid(e.to_string()))?;
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or(RingError::Closed(CloseReason::Local))?;
+        if proposal.signed_by != inner.base.signer.sign_key() {
+            return Err(RingError::Invalid(
+                "proposal signer is not the captured creator".into(),
+            ));
+        }
+        if self.created.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(RingError::Invalid("proposal creation is one-shot".into()));
+        }
+        *self.frozen.lock().unwrap_or_else(|e| e.into_inner()) = Some(proposal.clone());
+        let result = self.client.create_proposal(
+            intent.operation.clone(),
+            intent.target.principal().sign_key,
+            final_noise_hash,
+            intent.expires_at,
+            proposal,
+        );
+        match result {
+            Ok(handle) => {
+                if let Err(error) = self.current() {
+                    let _ = self.client.cancel_proposal(&handle);
+                    return Err(error);
+                }
+                *self.grant.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
+                Ok(handle)
+            }
+            Err(error) => {
+                // A lost create reply does not reveal a grant to cancel. Ending precisely
+                // its creator connection invalidates it; never guess/retry another create.
+                self.client.shutdown();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn cancel(&self, handle: &super::proposal::ProposalHandle) -> Result<(), RingError> {
+        // Cleanup deliberately uses the old captured client, not a replacement connection.
+        if self
+            .grant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            != Some(handle)
+        {
+            return Err(RingError::Invalid(
+                "not this operation's proposal grant".into(),
+            ));
+        }
+        self.client.cancel_proposal(handle)
+    }
+
+    pub fn publish_once(&self, next: &SignedRoster) -> Result<(), RingError> {
+        self.current()?;
+        if !self.created.load(std::sync::atomic::Ordering::Acquire)
+            || next.roster().prev != Some(self.predecessor.hash())
+            || next.version() != self.predecessor.version() + 1
+        {
+            return Err(RingError::Invalid(
+                "publication is not the frozen proposal successor".into(),
+            ));
+        }
+        let mut unsigned = next.roster().clone();
+        let mut membership = unsigned.membership()?;
+        let crate::ring::membership::RosterChange::Enroll { proofs, .. } = &mut membership.change
+        else {
+            return Err(RingError::Invalid(
+                "proposal publication must be Enroll".into(),
+            ));
+        };
+        proofs.clear();
+        unsigned.set_membership(&membership);
+        if self
+            .frozen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            != Some(&unsigned)
+        {
+            return Err(RingError::Invalid(
+                "publication differs from frozen proposal".into(),
+            ));
+        }
+        crate::ring::verify_successor(&self.predecessor, next)?;
+        if self
+            .published
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RingError::Invalid(
+                "proposal publication is one-shot; reconcile instead".into(),
+            ));
+        }
+        self.client.publish_roster(next)
+    }
+}

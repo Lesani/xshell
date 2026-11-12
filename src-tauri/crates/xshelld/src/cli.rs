@@ -63,7 +63,7 @@ pub struct Opts {
     pub relay: Option<String>,
     /// `pair --name`: this computer's name in the Roster (default: the hostname).
     pub name: Option<String>,
-    /// `pair --force`: pair again although this computer is in a Ring already.
+    /// Legacy `pair --force`; retained membership still requires an explicit Leave.
     pub force: bool,
 }
 
@@ -98,7 +98,7 @@ serve options:
 pair options:
   --relay URL   the relay your xshell uses (default: the hosted relay)
   --name NAME   this computer's name on your other devices (default: hostname)
-  --force       pair again although this computer is paired already
+  --force       legacy option; cannot replace a retained Ring (Leave required)
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`

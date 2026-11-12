@@ -388,6 +388,9 @@ fn proofs(r: &Roster, required: &[SignKey], proofs: &[ConsentProof]) -> Result<(
     Ok(())
 }
 pub fn verify_genesis(r: &Roster) -> Result<(), RosterError> {
+    verify_genesis_roster(r, false)
+}
+fn verify_genesis_roster(r: &Roster, unsigned: bool) -> Result<(), RosterError> {
     let m = r.membership()?;
     let RosterChange::Genesis { proofs: ps } = &m.change else {
         return Err(invalid("v2 genesis change"));
@@ -405,6 +408,9 @@ pub fn verify_genesis(r: &Roster) -> Result<(), RosterError> {
     if creator.kind != EnrollmentKind::Computer {
         return Err(invalid("genesis requires Computer"));
     }
+    if unsigned {
+        return Ok(());
+    }
     proofs(
         r,
         &r.members.iter().map(|m| m.sign_key).collect::<Vec<_>>(),
@@ -419,7 +425,7 @@ pub fn verify_transition(prev: &SignedRoster, next: &SignedRoster) -> Result<(),
 fn verify_transition_roster(
     prev: &SignedRoster,
     n: &Roster,
-    unsigned_enroll: bool,
+    unsigned_proposal: bool,
 ) -> Result<(), RosterError> {
     let p = prev.roster();
     if n.v != 2 || p.v > n.v || p.relay_url != n.relay_url || n.issued_at < p.issued_at {
@@ -446,7 +452,11 @@ fn verify_transition_roster(
             .filter(|e| e.kind == EnrollmentKind::Computer)
             .flat_map(|e| e.members.clone())
             .collect::<Vec<_>>();
-        return proofs(n, &required, ps);
+        return if unsigned_proposal {
+            Ok(())
+        } else {
+            proofs(n, &required, ps)
+        };
     }
     let old = p.membership()?;
     if m.policy.activity_key != old.policy.activity_key {
@@ -559,7 +569,7 @@ fn verify_transition_roster(
         {
             return Err(invalid("retained counterpart changed"));
         }
-        if !unsigned_enroll {
+        if !unsigned_proposal {
             proofs(n, &e.members, ps.unwrap())?;
         }
     }
@@ -656,4 +666,50 @@ pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), Ros
         return Err(invalid("not an unsigned Desktop Enroll"));
     }
     verify_transition_roster(prev, n, true)
+}
+
+/// Checks an honestly unsigned local Genesis/Upgrade/CompleteComputer with the same
+/// structural rules as the final verifier. This creates no proof or membership authority;
+/// the protected local controller must obtain real consent and verify the signed chain.
+pub fn verify_local_proposal(prev: Option<&SignedRoster>, n: &Roster) -> Result<(), RosterError> {
+    n.validate()?;
+    let m = n.membership()?;
+    if !matches!(&m.change,
+        RosterChange::Genesis { proofs } | RosterChange::Upgrade { proofs }
+        | RosterChange::CompleteComputer { proofs, .. } if proofs.is_empty())
+    {
+        return Err(invalid("not an unsigned local consent proposal"));
+    }
+    match prev {
+        None => {
+            if n.version != 1
+                || n.prev.is_some()
+                || n.ring_id != super::RingId::derive(&n.signed_by)
+            {
+                return Err(invalid("local genesis identity or predecessor"));
+            }
+            if !n
+                .member(&n.signed_by)
+                .is_some_and(|m| m.role == Role::Desktop)
+            {
+                return Err(RosterError::SignerNotDesktop);
+            }
+            verify_genesis_roster(n, true)
+        }
+        Some(prev) => {
+            if !prev
+                .member(&n.signed_by)
+                .is_some_and(|member| member.role == Role::Desktop)
+            {
+                return Err(RosterError::SignerNotDesktop);
+            }
+            if n.ring_id != *prev.ring_id()
+                || n.version != prev.version() + 1
+                || n.prev != Some(prev.hash())
+            {
+                return Err(invalid("local proposal predecessor"));
+            }
+            verify_transition_roster(prev, n, true)
+        }
+    }
 }

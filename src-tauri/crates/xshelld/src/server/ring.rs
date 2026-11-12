@@ -170,6 +170,11 @@ pub(crate) fn host_name() -> String {
     member_name(&raw, FALLBACK_NAME)
 }
 
+/// A stopped or unreadable registration is still a binding, never headless permission.
+pub(crate) fn companion_registered(dir: &Path) -> bool {
+    !matches!(fs::symlink_metadata(dir.join("companion.json")), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
 /// The files in the ring directory.
 pub(crate) struct Store {
     pub dir: PathBuf,
@@ -207,9 +212,9 @@ impl Store {
 
     /// Takes `ring.lock`, waiting for another process (or thread) that holds it. Never
     /// nested: every caller takes it once around one read-modify-write.
-    pub fn lock(&self) -> Result<StoreLock, String> {
+    fn open_lock(&self, name: &str) -> Result<fs::File, String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
-        let path = self.dir.join("ring.lock");
+        let path = self.dir.join(name);
         #[cfg(windows)]
         let f = xshell_core::private_fs::open_or_create(&path);
         #[cfg(unix)]
@@ -221,10 +226,76 @@ impl Store {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path);
-        let f = f.map_err(|e| format!("cannot open the ring lock: {e}"))?;
-        f.lock()
+        let f = f.map_err(|e| format!("cannot open {name}: {e}"))?;
+        #[cfg(unix)]
+        {
+            let metadata = f.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("foreign or nonregular Ring lock".into());
+            }
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(f)
+    }
+    pub fn lock(&self) -> Result<StoreLock, String> {
+        let file = self.open_lock("ring.lock")?;
+        file.lock()
             .map_err(|e| format!("cannot take the ring lock: {e}"))?;
-        Ok(StoreLock(f))
+        Ok(StoreLock(file))
+    }
+    pub(super) fn lock_until(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<StoreLock, String> {
+        budget.check().map_err(|e| e.to_string())?;
+        let file = self.open_lock("ring.lock")?;
+        loop {
+            budget.check().map_err(|e| e.to_string())?;
+            match file.try_lock() {
+                Ok(()) => return Ok(StoreLock(file)),
+                Err(fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+                Err(fs::TryLockError::Error(error)) => return Err(error.to_string()),
+            }
+        }
+    }
+    #[cfg(unix)]
+    fn offer_lock(&self) -> Result<StoreLock, String> {
+        let file = self.open_lock("ring-legacy-offer.lock")?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => {
+                "legacy_offer_active: a legacy pairing offer is still open".into()
+            }
+            fs::TryLockError::Error(error) => error.to_string(),
+        })?;
+        Ok(StoreLock(file))
+    }
+    /// A nonblocking, process-lifetime admission lease. The Ring transaction lock is
+    /// released before the legacy offer waits for a person/network; process death closes it.
+    #[cfg(unix)]
+    pub(crate) fn reserve_legacy_offer(&self) -> Result<StoreLock, String> {
+        let offer = self.offer_lock()?;
+        let _ring = self.lock()?;
+        self.refuse_registered_join()?;
+        Ok(offer)
+    }
+    /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
+    #[cfg(unix)]
+    pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
+        self.offer_lock()
+    }
+    pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
+        if companion_registered(&self.dir) {
+            return Err("protected_counterpart_required: registered Computer installation is not a legacy/Host commit".into());
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    pub(super) fn keys_locked(&self) -> Result<DeviceKeys, String> {
+        match self.load_keys()? {
+            Some(keys) => Ok(keys),
+            None => self.create_keys(),
+        }
     }
 
     /// The stored keys, or new ones, under the lock: a key file another process wrote
@@ -366,14 +437,40 @@ impl Store {
     /// Ring the stored chain must accept `chain` by the chain rules
     /// ([`RosterChain::extended`]): versions it holds are skipped, so a newer stored head
     /// (another process saved it meanwhile) wins. A fork of the stored chain is a trust
-    /// conflict: nothing is written and the stored chain stays the trusted one. Another Ring
-    /// (an explicit replacement), or no readable file: `chain` is the one. A write that fails
+    /// conflict: nothing is written and the stored chain stays the trusted one. Foreign Ring
+    /// replacement requires Leave. A write that fails
     /// is reported apart: the settled chain is trusted all the same.
     pub fn save_chain(&self, chain: &RosterChain) -> Saved {
         let _l = match self.lock() {
             Ok(l) => l,
             Err(e) => return Saved::new(chain.clone(), Some(e)),
         };
+        self.settle_locked(chain, None)
+    }
+    fn save_join_chain(
+        &self,
+        chain: &RosterChain,
+        origin: &JoinOrigin,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+        hook: Option<&super::TestHook>,
+    ) -> Result<Saved, String> {
+        let _lock = match budget {
+            Some(budget) => self.lock_until(budget)?,
+            None => self.lock()?,
+        };
+        match origin {
+            JoinOrigin::Host => self.refuse_registered_join()?,
+            #[cfg(unix)]
+            JoinOrigin::Companion { operation } => {
+                super::companion::validate_install_locked(self, operation, chain)?
+            }
+        }
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
+        Ok(self.settle_locked(chain, hook))
+    }
+    fn settle_locked(&self, chain: &RosterChain, hook: Option<&super::TestHook>) -> Saved {
         let next = match self.read_chain() {
             Ok(Some(disk)) if disk.ring_id() == chain.ring_id() => {
                 match disk.extended(chain.versions()) {
@@ -391,14 +488,31 @@ impl Store {
                     }
                 }
             }
+            Ok(Some(disk)) => {
+                return Saved {
+                    trusted: disk,
+                    conflict: Some("leave_required: this Host already retains another Ring".into()),
+                    write_error: None,
+                }
+            }
             _ => chain.clone(),
         };
-        let err = self.write_chain(&next).err();
+        let err = match hook {
+            Some(hook) => self.write_chain_inner(&next, Some(hook)).err(),
+            None => self.write_chain(&next).err(),
+        };
         Saved::new(next, err)
     }
 
     /// Writes `chain` as it is; only with the lock held.
     pub fn write_chain(&self, chain: &RosterChain) -> Result<(), String> {
+        self.write_chain_inner(chain, None)
+    }
+    fn write_chain_inner(
+        &self,
+        chain: &RosterChain,
+        hook: Option<&super::TestHook>,
+    ) -> Result<(), String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
         let f = RosterFile {
             v: 1,
@@ -409,6 +523,11 @@ impl Store {
                 .collect(),
         };
         let json = serde_json::to_vec(&f).map_err(|e| e.to_string())?;
+        if hook.is_some_and(|hook| {
+            (hook.0)(uuid::Uuid::nil(), super::TestPoint::BeforeRingRosterWrite)
+        }) {
+            return Err("injected roster write failure after prerequisite reads".into());
+        }
         write_private(&self.roster_path(), &json).map_err(|e| e.to_string())
     }
 }
@@ -535,8 +654,17 @@ struct Life {
     retiring: Vec<JoinHandle<()>>,
 }
 
+enum JoinOrigin {
+    Host,
+    #[cfg(unix)]
+    Companion {
+        operation: String,
+    },
+}
+
 /// This Host's Ring membership.
 pub(crate) struct Ring {
+    test_hook: std::sync::OnceLock<super::TestHook>,
     persist: Arc<Persist>,
     keys: Mutex<Option<Arc<DeviceKeys>>>,
     life: Mutex<Life>,
@@ -567,6 +695,7 @@ impl Ring {
         write_stall: Duration,
     ) -> Ring {
         Ring {
+            test_hook: std::sync::OnceLock::new(),
             persist: Arc::new(Persist {
                 store: Store { dir },
                 chain: Mutex::new(None),
@@ -582,6 +711,10 @@ impl Ring {
             #[cfg(test)]
             install_hook: Mutex::new(None),
         }
+    }
+
+    pub(super) fn set_test_hook(&self, hook: super::TestHook) {
+        let _ = self.test_hook.set(hook);
     }
 
     pub fn hub(&self) -> &super::relay_conn::Hub {
@@ -754,15 +887,56 @@ impl Ring {
     /// `expect`, only while this Host's membership (as `ring.identity` reports it) is still
     /// the expected one, checked under the same locks as the commit.
     pub fn join(&self, tokens: &[String], expect: Option<&JoinExpect>) -> Result<Value, String> {
+        self.join_inner(tokens, expect, JoinOrigin::Host, None)
+    }
+    #[cfg(unix)]
+    pub(super) fn join_accepted_companion(
+        &self,
+        tokens: &[String],
+        operation: &str,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(
+            tokens,
+            None,
+            JoinOrigin::Companion {
+                operation: operation.into(),
+            },
+            Some(budget),
+        )
+    }
+    fn join_inner(
+        &self,
+        tokens: &[String],
+        expect: Option<&JoinExpect>,
+        origin: JoinOrigin,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+    ) -> Result<Value, String> {
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
         let refused = |e: RosterError| format!("roster refused: {}", e.as_code());
         let chain = RosterChain::from_tokens(tokens).map_err(refused)?;
-        let keys = self.keys(true)?.ok_or("no keys")?;
+        let keys = match budget {
+            Some(budget) => {
+                let mut cached = budget.lock(&self.keys).map_err(|e| e.to_string())?;
+                if cached.is_none() {
+                    *cached = self.persist.store.load_keys()?.map(Arc::new);
+                }
+                cached.clone()
+            }
+            None => self.keys(false)?,
+        }
+        .ok_or("no retained Daemon identity; request ring.identity first")?;
         if !is_daemon_member(&chain, &keys) {
             return Err("not a member of this Roster".into());
         }
         // The lifecycle lock for the whole commit and install (never taken by the Connector's
         // callbacks), then the persisted chain's: the Connector's own saves wait.
-        let mut life = self.lock_life();
+        let mut life = match budget {
+            Some(budget) => budget.lock(&self.life).map_err(|e| e.to_string())?,
+            None => self.lock_life(),
+        };
         if life.stopped {
             return Err("xshelld is exiting".into());
         }
@@ -770,11 +944,24 @@ impl Ring {
         if let Some(h) = self.install_hook.lock().unwrap().as_ref() {
             h();
         }
-        let mut cur = self.persist.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cur = match budget {
+            Some(budget) => budget
+                .lock(&self.persist.chain)
+                .map_err(|e| e.to_string())?,
+            None => self.persist.chain.lock().unwrap_or_else(|e| e.into_inner()),
+        };
         if let Some(x) = expect {
             if !expected(x, membership(cur.as_ref(), &life)) {
                 return Err(MEMBERSHIP_CHANGED.into());
             }
+        }
+        if cur
+            .as_ref()
+            .is_some_and(|c| c.ring_id() != chain.ring_id() || !is_daemon_member(c, &keys))
+        {
+            return Err(
+                "leave_required: retained foreign or terminal membership cannot be replaced".into(),
+            );
         }
         let same_ring = cur.as_ref().is_some_and(|c| c.ring_id() == chain.ring_id());
         let next = match cur.as_ref() {
@@ -789,12 +976,18 @@ impl Ring {
         };
         // Settled against the store first (under ring.lock): a newer stored head wins, and a
         // fork of the stored chain is refused, leaving the established trust in force.
-        let changed = cur.as_ref() != Some(&next);
-        let saved = if changed {
-            self.persist.store.save_chain(&next)
-        } else {
-            Saved::new(next, None)
-        };
+        if matches!(origin, JoinOrigin::Host) {
+            if let Some(hook) = self.test_hook.get() {
+                (hook.0)(
+                    uuid::Uuid::nil(),
+                    super::TestPoint::BeforeHostRingJoinCommit,
+                );
+            }
+        }
+        let saved =
+            self.persist
+                .store
+                .save_join_chain(&next, &origin, budget, self.test_hook.get())?;
         let trusted = saved.trusted;
         // Then in force at once, whether or not the write succeeded: in memory, in the
         // Connector (whose head new handshakes are checked against), and in the sweep.
@@ -874,8 +1067,7 @@ fn expected(x: &JoinExpect, now: Option<(String, u64)>) -> bool {
 
 pub(crate) fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
     chain
-        .head()
-        .member(&keys.sign_key())
+        .authorized_member(&keys.sign_key())
         .is_some_and(|m| m.role == Role::Daemon)
 }
 
@@ -1097,7 +1289,7 @@ mod tests {
         assert!(e.contains("conflicts"), "{e}");
         assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
         assert_eq!(ring.identity().unwrap()["ring"]["version"], 5);
-        // Another Ring is an explicit replacement, not a fork.
+        // Foreign membership requires an explicit Leave, even with a matching expected head.
         let desk2 = DeviceKeys::generate().unwrap();
         let g2 =
             SignedRoster::genesis(&desk2, desk2.noise_key(), "d2", "ws://127.0.0.1:9", 1).unwrap();
@@ -1107,8 +1299,25 @@ mod tests {
             })
             .unwrap();
         let other_ring = RosterChain::from_chain(vec![g2, v2b]).unwrap();
-        assert_eq!(ring.join(&tokens(&other_ring), None).unwrap()["version"], 2);
-        assert_eq!(store.read_chain().unwrap().unwrap(), other_ring);
+        assert!(ring
+            .join(&tokens(&other_ring), None)
+            .unwrap_err()
+            .starts_with("leave_required:"));
+        let expect = JoinExpect {
+            ring_id: Some(upto(5).ring_id().to_string()),
+            version: Some(5),
+        };
+        assert!(ring
+            .join(&tokens(&other_ring), Some(&expect))
+            .unwrap_err()
+            .starts_with("leave_required:"));
+        let refused = store.save_chain(&other_ring);
+        assert!(refused
+            .conflict
+            .as_ref()
+            .is_some_and(|e| e.starts_with("leave_required:")));
+        assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
+        assert_eq!(ring.identity().unwrap()["ring"]["version"], 5);
         ring.stop(ByeReason::quit());
     }
 

@@ -54,6 +54,262 @@ pub struct RingState {
     pub host_members: BTreeMap<String, HostMember>,
 }
 
+/// Retained identity and reconciliation state, including before the first membership.
+/// Credentials and live authorization leases must never be stored here.
+#[derive(Clone)]
+pub struct ProfileState {
+    pub keys: Arc<DeviceKeys>,
+    pub membership: Option<RingState>,
+    pub journal: Option<AdoptionJournal>,
+    pub companion: Option<xshell_protocol::ring::companion::CompanionProfile>,
+}
+
+/// A conservative durable obligation, not permission to replay a signed mutation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionJournal {
+    pub intent: xshell_protocol::ring::pairing::adoption::AdoptionIntent,
+    pub predecessor: Vec<String>,
+    pub proposal: xshell_protocol::ring::Roster,
+    pub context: xshell_protocol::ring::membership::ConsentContext,
+    pub transcript: xshell_protocol::ring::companion::ConsentTranscript,
+    pub phase: AdoptionPhase,
+    pub signed_candidate: Option<String>,
+    pub accepted: Vec<String>,
+    pub desktop_installed: bool,
+    pub daemon_installed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AdoptionPhase {
+    Prepared,
+    ConsentMayHaveLeft,
+    PublicationUncertain,
+    Accepted,
+    Installed,
+    Cancelled,
+}
+
+impl AdoptionJournal {
+    fn validate(&self) -> Result<(), String> {
+        self.intent.validate().map_err(|e| e.to_string())?;
+        if self.predecessor.len() > 4096
+            || self.accepted.len() > 4096
+            || self
+                .predecessor
+                .iter()
+                .chain(&self.accepted)
+                .map(String::len)
+                .sum::<usize>()
+                > 32 * 1024 * 1024
+        {
+            return Err("adoption journal bounds".into());
+        }
+        let chain = if self.predecessor.is_empty() {
+            None
+        } else {
+            Some(RosterChain::from_tokens(&self.predecessor).map_err(|e| e.to_string())?)
+        };
+        if self.proposal.v != 2
+            || self.proposal.version != chain.as_ref().map_or(1, |c| c.head().version() + 1)
+            || self.proposal.prev != chain.as_ref().map(|c| c.head().hash())
+        {
+            return Err("adoption journal predecessor".into());
+        }
+        let proposal = xshell_protocol::ring::companion::CompanionProposal {
+            operation: self.intent.operation.clone(),
+            predecessor: self.predecessor.clone(),
+            proposal: self.proposal.clone(),
+            transcript: self.transcript.clone(),
+        };
+        if proposal.context()? != self.context {
+            return Err("adoption journal context mismatch".into());
+        }
+        match self.transcript {
+            xshell_protocol::ring::companion::ConsentTranscript::Pairing { .. } => {
+                let predecessor = chain
+                    .as_ref()
+                    .ok_or("pairing journal missing predecessor")?;
+                xshell_protocol::ring::membership::verify_enroll_proposal(
+                    predecessor.head(),
+                    &self.proposal,
+                )
+                .map_err(|e| e.to_string())?;
+                self.intent
+                    .target
+                    .matches_proposal(&self.proposal)
+                    .map_err(|e| e.to_string())?;
+            }
+            xshell_protocol::ring::companion::ConsentTranscript::Local => {
+                xshell_protocol::ring::membership::verify_local_proposal(
+                    chain.as_ref().map(RosterChain::head),
+                    &self.proposal,
+                )
+                .map_err(|e| e.to_string())?;
+                let xshell_protocol::ring::pairing::adoption::JoinTarget::Computer {
+                    desktop,
+                    daemon,
+                } = &self.intent.target
+                else {
+                    return Err("local adoption journal requires a Computer".into());
+                };
+                let membership = self.proposal.membership().map_err(|e| e.to_string())?;
+                let unit = membership
+                    .unit_for(&desktop.sign_key)
+                    .ok_or("local journal Computer missing")?;
+                if unit.id != self.intent.operation
+                    || unit.kind != xshell_protocol::ring::membership::EnrollmentKind::Computer
+                    || unit.members.len() != 2
+                    || !unit.members.contains(&daemon.sign_key)
+                    || self
+                        .intent
+                        .target
+                        .identities()
+                        .iter()
+                        .any(|(identity, role)| {
+                            self.proposal
+                                .member(&identity.sign_key)
+                                .is_none_or(|member| {
+                                    member.role != *role
+                                        || member.noise_key != identity.noise_key
+                                        || member.name != identity.name
+                                })
+                        })
+                {
+                    return Err("local journal counterpart mismatch".into());
+                }
+            }
+        }
+        if let Some(token) = &self.signed_candidate {
+            let signed =
+                xshell_protocol::ring::SignedRoster::parse(token).map_err(|e| e.to_string())?;
+            self.matches_signed(&signed)?;
+            match &chain {
+                Some(chain) => {
+                    chain
+                        .extended(std::slice::from_ref(&signed))
+                        .map_err(|e| e.to_string())?;
+                }
+                None => {
+                    RosterChain::from_chain(vec![signed]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if !self.accepted.is_empty() {
+            let accepted = RosterChain::from_tokens(&self.accepted).map_err(|e| e.to_string())?;
+            if self.predecessor.iter().enumerate().any(|(i, token)| {
+                accepted.versions().get(i).map(|r| r.token()) != Some(token.as_str())
+            }) {
+                return Err("adoption journal accepted predecessor mismatch".into());
+            }
+            self.matches_signed(
+                accepted
+                    .get(self.proposal.version)
+                    .ok_or("accepted transition missing")?,
+            )?;
+            if self.signed_candidate.as_ref().is_some_and(|candidate| {
+                accepted
+                    .get(self.proposal.version)
+                    .map(|signed| signed.token())
+                    != Some(candidate.as_str())
+            }) {
+                return Err("accepted transition differs from exact signed candidate".into());
+            }
+        }
+        if (matches!(
+            self.phase,
+            AdoptionPhase::Accepted | AdoptionPhase::Installed
+        ) || self.desktop_installed
+            || self.daemon_installed)
+            && self.accepted.is_empty()
+        {
+            return Err("installation receipt without verified accepted bytes".into());
+        }
+        if self.phase == AdoptionPhase::Installed
+            && !(self.desktop_installed && self.daemon_installed)
+        {
+            return Err("installed journal missing store receipt".into());
+        }
+        Ok(())
+    }
+    fn may_replace_with(&self, new: Option<&Self>) -> Result<(), String> {
+        let terminal = matches!(
+            self.phase,
+            AdoptionPhase::Installed | AdoptionPhase::Cancelled
+        );
+        let Some(new) = new else {
+            return if terminal {
+                Ok(())
+            } else {
+                Err("adoption reconciliation journal cannot be discarded".into())
+            };
+        };
+        if new.intent.operation != self.intent.operation {
+            return if terminal {
+                Ok(())
+            } else {
+                Err("adoption operation still requires reconciliation".into())
+            };
+        }
+        if self.intent != new.intent
+            || self.predecessor != new.predecessor
+            || self.proposal != new.proposal
+            || self.context != new.context
+            || self.transcript != new.transcript
+            || (self.signed_candidate.is_some() && self.signed_candidate != new.signed_candidate)
+            || (self.desktop_installed && !new.desktop_installed)
+            || (self.daemon_installed && !new.daemon_installed)
+            || !new.accepted.starts_with(&self.accepted)
+        {
+            return Err("frozen adoption obligation cannot be changed or rolled back".into());
+        }
+        let rank = |phase: &AdoptionPhase| match phase {
+            AdoptionPhase::Prepared => 0,
+            AdoptionPhase::ConsentMayHaveLeft => 1,
+            AdoptionPhase::PublicationUncertain => 2,
+            AdoptionPhase::Accepted => 3,
+            AdoptionPhase::Installed => 4,
+            AdoptionPhase::Cancelled => 5,
+        };
+        if rank(&new.phase) < rank(&self.phase)
+            || (new.phase == AdoptionPhase::Cancelled
+                && !matches!(
+                    self.phase,
+                    AdoptionPhase::Prepared | AdoptionPhase::Cancelled
+                ))
+        {
+            return Err("possible consent/publication cannot be cancelled as nonmembership".into());
+        }
+        Ok(())
+    }
+
+    fn matches_signed(&self, signed: &xshell_protocol::ring::SignedRoster) -> Result<(), String> {
+        let mut unsigned = signed.roster().clone();
+        let mut membership = unsigned.membership().map_err(|e| e.to_string())?;
+        use xshell_protocol::ring::membership::RosterChange;
+        let proofs = match &mut membership.change {
+            RosterChange::Genesis { proofs }
+            | RosterChange::Upgrade { proofs }
+            | RosterChange::Enroll { proofs, .. }
+            | RosterChange::CompleteComputer { proofs, .. } => proofs,
+            _ => return Err("accepted transition is not consented adoption".into()),
+        };
+        if proofs
+            .iter()
+            .any(|p| p.context != self.context || p.expires_at != self.intent.expires_at)
+        {
+            return Err("accepted transition consent mismatch".into());
+        }
+        proofs.clear();
+        unsigned.set_membership(&membership);
+        if unsigned != self.proposal {
+            return Err("accepted transition differs from exact proposal".into());
+        }
+        Ok(())
+    }
+}
+
 /// A Remote Host's Daemon in the Roster.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -113,6 +369,10 @@ struct File {
     held_relays: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     host_members: BTreeMap<String, HostMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adoption: Option<AdoptionJournal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    companion: Option<xshell_protocol::ring::companion::CompanionProfile>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -167,6 +427,55 @@ impl Store {
         &self,
         f: impl FnOnce(Option<RingState>, &Loaded) -> Result<(Option<RingState>, R), String>,
     ) -> (Result<R, String>, Option<Loaded>) {
+        self.transact_profile_full(|profile, loaded| {
+            let state = profile.as_ref().and_then(|p| p.membership.clone());
+            let (new, result) = f(state, loaded)?;
+            let new = match new {
+                None => None,
+                Some(state) => {
+                    if profile
+                        .as_ref()
+                        .and_then(|p| p.journal.as_ref())
+                        .is_some_and(|j| {
+                            !matches!(j.phase, AdoptionPhase::Installed | AdoptionPhase::Cancelled)
+                        })
+                    {
+                        return Err(
+                            "adoption reconciliation required before legacy Ring mutation".into(),
+                        );
+                    }
+                    if profile.as_ref().is_some_and(|p| {
+                        p.keys.sign_key() != state.keys.sign_key()
+                            || p.keys.noise_key() != state.keys.noise_key()
+                    }) {
+                        return Err("retained Desktop identity cannot be replaced".into());
+                    }
+                    Some(ProfileState {
+                        keys: state.keys.clone(),
+                        membership: Some(state),
+                        journal: profile.as_ref().and_then(|p| p.journal.clone()),
+                        companion: profile.and_then(|p| p.companion),
+                    })
+                }
+            };
+            Ok((new, result))
+        })
+    }
+
+    pub fn transact_profile<R>(
+        &self,
+        f: impl FnOnce(Option<ProfileState>, &Loaded) -> Result<(Option<ProfileState>, R), String>,
+    ) -> Result<(R, Loaded), String> {
+        match self.transact_profile_full(f) {
+            (Ok(result), loaded) => Ok((result, loaded.unwrap_or_default())),
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    fn transact_profile_full<R>(
+        &self,
+        f: impl FnOnce(Option<ProfileState>, &Loaded) -> Result<(Option<ProfileState>, R), String>,
+    ) -> (Result<R, String>, Option<Loaded>) {
         let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = ensure_private_dir(&self.dir) {
             return (Err(e.to_string()), None);
@@ -181,8 +490,35 @@ impl Store {
         let out = match self.load_locked() {
             Err(e) => (Err(e), None),
             Ok((state, loaded)) => {
+                let retained = state
+                    .as_ref()
+                    .map(|s| (s.keys.sign_key(), s.keys.noise_key()));
+                let journal = state.as_ref().and_then(|s| s.journal.clone());
+                let companion = state.as_ref().and_then(|s| s.companion.clone());
+                let membership = state
+                    .as_ref()
+                    .and_then(|s| s.membership.as_ref())
+                    .map(|s| s.chain.clone());
                 let r = f(state, &loaded).and_then(|(new, out)| {
                     if let Some(n) = new {
+                        if retained.is_some_and(|(sign, noise)| {
+                            sign != n.keys.sign_key() || noise != n.keys.noise_key()
+                        }) {
+                            return Err("retained profile identity cannot be replaced".into());
+                        }
+                        if companion.as_ref().is_some_and(|registered| n.companion.as_ref() != Some(registered)) {
+                            return Err("retained companion registration cannot be replaced".into());
+                        }
+                        if let Some(journal) = &journal {
+                            journal.may_replace_with(n.journal.as_ref())?;
+                        }
+                        if let Some(old) = &membership {
+                            let next = n.membership.as_ref().ok_or("leave_required: retained membership cannot be discarded")?;
+                            if old.ring_id() != next.chain.ring_id()
+                                || old.extended(next.chain.versions()).map_err(|e| e.to_string())?.0 != next.chain {
+                                return Err("leave_required: retained membership cannot be replaced or rolled back".into());
+                            }
+                        }
                         self.save_locked(&n)?;
                         self.notify();
                     }
@@ -226,7 +562,7 @@ impl Store {
         self.transact(|s, _| Ok((None, s)))
     }
 
-    fn load_locked(&self) -> Result<(Option<RingState>, Loaded), String> {
+    fn load_locked(&self) -> Result<(Option<ProfileState>, Loaded), String> {
         let p = self.file();
         let bytes = match read_private(&p) {
             Ok(Some(b)) => b,
@@ -242,7 +578,10 @@ impl Store {
             // A symlink or another user's file: refuse, leave it where it is.
             Err(e) => return Err(format!("cannot read {}: {e}", p.display())),
         };
-        match parse(&bytes) {
+        match parse(&bytes).and_then(|profile| {
+            self.validate_association(&profile)?;
+            Ok(profile)
+        }) {
             Ok(s) => Ok((Some(s), Loaded::default())),
             Err(why) => {
                 let aside = self.dir.join(format!(
@@ -289,23 +628,85 @@ impl Store {
         bad.pop()
     }
 
-    fn save_locked(&self, s: &RingState) -> Result<(), String> {
-        let (sign, noise) = s.keys.seeds();
+    /// Creates only a missing identity, never a genesis or a replacement after quarantine.
+    pub fn retained_keys(&self) -> Result<Arc<DeviceKeys>, String> {
+        self.transact_profile(|profile, loaded| {
+            if let Some(profile) = profile {
+                return Ok((None, profile.keys));
+            }
+            if loaded.moved_aside.is_some() {
+                return Err("unreadable retained Ring profile; explicit recovery required".into());
+            }
+            let keys = Arc::new(DeviceKeys::generate().map_err(|e| e.to_string())?);
+            Ok((
+                Some(ProfileState {
+                    keys: keys.clone(),
+                    membership: None,
+                    journal: None,
+                    companion: None,
+                }),
+                keys,
+            ))
+        })
+        .map(|(keys, _)| keys)
+    }
+
+    pub fn load_profile(&self) -> Result<(Option<ProfileState>, Loaded), String> {
+        self.transact_profile(|profile, _| Ok((None, profile)))
+    }
+
+    fn validate_association(&self, profile: &ProfileState) -> Result<(), String> {
+        if let Some(companion) = &profile.companion {
+            companion.validate()?;
+            if Path::new(&companion.desktop_store)
+                != self.dir.canonicalize().map_err(|e| e.to_string())?
+                || companion.desktop.sign_key != profile.keys.sign_key()
+                || companion.desktop.noise_key != profile.keys.noise_key()
+            {
+                return Err("retained Desktop companion profile association mismatch".into());
+            }
+        }
+        Ok(())
+    }
+    fn save_locked(&self, profile: &ProfileState) -> Result<(), String> {
+        self.validate_association(profile)?;
+        if let Some(journal) = &profile.journal {
+            journal.validate()?;
+        }
+        let state = profile.membership.as_ref();
+        if state.is_some_and(|s| {
+            s.keys.sign_key() != profile.keys.sign_key()
+                || s.keys.noise_key() != profile.keys.noise_key()
+        }) {
+            return Err("profile membership identity mismatch".into());
+        }
+        let (sign, noise) = profile.keys.seeds();
         let f = File {
-            v: 1,
+            v: if state.is_some() && profile.journal.is_none() && profile.companion.is_none() {
+                1
+            } else {
+                2
+            },
             sign_seed: SecretSeed::new(&sign),
             noise_seed: SecretSeed::new(&noise),
-            rosters: s
-                .chain
-                .versions()
-                .iter()
-                .map(|r| r.token().to_string())
-                .collect(),
-            local_member: s.local_member,
+            rosters: state
+                .map(|s| {
+                    s.chain
+                        .versions()
+                        .iter()
+                        .map(|r| r.token().to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            local_member: state.and_then(|s| s.local_member),
             pending_move: None,
-            farewells: s.farewells.iter().map(FarewellFile::from).collect(),
-            held_relays: Some(s.held_relays.clone()),
-            host_members: s.host_members.clone(),
+            farewells: state
+                .map(|s| s.farewells.iter().map(FarewellFile::from).collect())
+                .unwrap_or_default(),
+            held_relays: Some(state.map(|s| s.held_relays.clone()).unwrap_or_default()),
+            host_members: state.map(|s| s.host_members.clone()).unwrap_or_default(),
+            adoption: profile.journal.clone(),
+            companion: profile.companion.clone(),
         };
         let json = encode(&f)?;
         write_private(&self.file(), &json).map_err(|e| e.to_string())
@@ -317,7 +718,20 @@ impl Store {
 fn capacity(f: &File) -> usize {
     let esc = |s: &str| 6 * s.len() + 2;
     // The keys, the seeds, `localMember`, the numbers and the punctuation.
-    1024 + f.rosters.iter().map(|t| t.len() + 3).sum::<usize>()
+    1024 + f
+        .companion
+        .as_ref()
+        .map(|profile| {
+            serde_json::to_vec(profile)
+                .expect("profile serializes")
+                .len()
+        })
+        .unwrap_or(0)
+        + f.adoption
+            .as_ref()
+            .map(|a| serde_json::to_vec(a).expect("journal serializes").len())
+            .unwrap_or(0)
+        + f.rosters.iter().map(|t| t.len() + 3).sum::<usize>()
         + f.farewells
             .iter()
             .map(|p| esc(&p.source) + 64)
@@ -341,12 +755,33 @@ fn encode(f: &File) -> Result<Zeroizing<Vec<u8>>, String> {
     Ok(json)
 }
 
-fn parse(bytes: &[u8]) -> Result<RingState, String> {
+fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
     let f: File = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if f.v != 1 {
-        return Err(format!("unknown format {}", f.v));
+    if (f.v != 1 && f.v != 2) || (f.v == 1 && (f.adoption.is_some() || f.companion.is_some())) {
+        return Err(format!("unsupported profile format {}", f.v));
     }
     let keys = DeviceKeys::from_seeds(&f.sign_seed.0, &f.noise_seed.0);
+    let keys = Arc::new(keys);
+    if let Some(journal) = &f.adoption {
+        journal.validate()?;
+    }
+    if f.rosters.is_empty() {
+        if f.v != 2
+            || f.local_member.is_some()
+            || !f.farewells.is_empty()
+            || f.pending_move.is_some()
+            || !f.host_members.is_empty()
+            || f.held_relays.as_ref().is_some_and(|r| !r.is_empty())
+        {
+            return Err("pre-membership profile has membership metadata".into());
+        }
+        return Ok(ProfileState {
+            keys,
+            membership: None,
+            journal: f.adoption,
+            companion: f.companion,
+        });
+    }
     let chain = RosterChain::from_tokens(&f.rosters).map_err(|e| e.to_string())?;
     let placeholder = normalize_origin(super::LEGACY_PLACEHOLDER_RELAY_URL).ok();
     let is_placeholder =
@@ -370,13 +805,19 @@ fn parse(bytes: &[u8]) -> Result<RingState, String> {
         .into_values()
         .filter(|w| !is_placeholder(&w.source) && w.still_owed(&chain))
         .collect();
-    Ok(RingState {
-        keys: Arc::new(keys),
+    let membership = RingState {
+        keys: keys.clone(),
         chain,
         local_member: f.local_member,
         farewells,
         held_relays,
         host_members: f.host_members.clone(),
+    };
+    Ok(ProfileState {
+        keys,
+        membership: Some(membership),
+        journal: f.adoption,
+        companion: f.companion,
     })
 }
 
@@ -629,6 +1070,8 @@ mod tests {
             farewells: Vec::new(),
             held_relays: None,
             host_members: BTreeMap::new(),
+            adoption: None,
+            companion: None,
         };
         let mut v = serde_json::to_value(&f).unwrap();
         let o = v.as_object_mut().unwrap();
@@ -886,6 +1329,8 @@ mod tests {
             farewells: st.farewells.iter().map(FarewellFile::from).collect(),
             held_relays: Some(st.held_relays.clone()),
             host_members: st.host_members.clone(),
+            adoption: None,
+            companion: None,
         };
         let cap = capacity(&f);
         let json = encode(&f).unwrap();
@@ -976,5 +1421,292 @@ mod tests {
         assert_eq!(s.load().unwrap().1.moved_aside, Some(aside));
         s.transact(|_, _| Ok((Some(state()), ()))).unwrap();
         assert_eq!(s.load().unwrap().1.moved_aside, None);
+    }
+}
+
+#[cfg(test)]
+mod adoption_profile_tests {
+    use super::*;
+
+    #[test]
+    fn pre_membership_keys_survive_cancel_restart_without_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("desktop"));
+        let first = store.retained_keys().unwrap();
+        assert!(store.load().unwrap().0.is_none());
+        let reopened = Store::new(store.dir().to_path_buf());
+        let second = reopened.retained_keys().unwrap();
+        assert_eq!(first.sign_key(), second.sign_key());
+        assert_eq!(first.noise_key(), second.noise_key());
+        assert!(reopened.load().unwrap().0.is_none());
+    }
+
+    #[test]
+    fn unreadable_profile_never_generates_replacement_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        store.retained_keys().unwrap();
+        fs::write(store.file(), b"{broken").unwrap();
+        assert!(store.retained_keys().is_err());
+        assert!(
+            store.retained_keys().is_err(),
+            "quarantine is not permission to regenerate"
+        );
+    }
+    fn genesis_journal_with_daemon(keys: &DeviceKeys) -> (AdoptionJournal, DeviceKeys) {
+        use xshell_protocol::ring::membership::{
+            Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+        };
+        use xshell_protocol::ring::pairing::adoption::{
+            AdoptionIntent, JoinTarget, PublicIdentity,
+        };
+        use xshell_protocol::ring::{b64, Member, RingId, Role, Roster};
+        let daemon = DeviceKeys::generate().unwrap();
+        let identity = |keys: &DeviceKeys| PublicIdentity {
+            name: "computer".into(),
+            sign_key: keys.sign_key(),
+            noise_key: keys.noise_key(),
+        };
+        let target = JoinTarget::Computer {
+            desktop: identity(keys),
+            daemon: identity(&daemon),
+        };
+        let mut proposal = Roster {
+            v: 2,
+            ring_id: RingId::derive(&keys.sign_key()),
+            version: 1,
+            prev: None,
+            relay_url: "ws://127.0.0.1:7777".into(),
+            signed_by: keys.sign_key(),
+            issued_at: 1000,
+            members: vec![
+                Member::new(
+                    "computer",
+                    Role::Desktop,
+                    keys.sign_key(),
+                    keys.noise_key(),
+                    1000,
+                ),
+                Member::new(
+                    "computer",
+                    Role::Daemon,
+                    daemon.sign_key(),
+                    daemon.noise_key(),
+                    1000,
+                ),
+            ],
+            extra: Default::default(),
+        };
+        proposal.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: b64::encode(&[52; 32]),
+                kind: EnrollmentKind::Computer,
+                members: vec![keys.sign_key(), daemon.sign_key()],
+                enrolled_at: 1000,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: Some(2592000),
+                activity_key: keys.sign_key(),
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        });
+        let journal = AdoptionJournal {
+            intent: AdoptionIntent {
+                operation: b64::encode(&[52; 32]),
+                expires_at: 1600,
+                target,
+            },
+            predecessor: vec![],
+            context: xshell_protocol::ring::membership::local_consent_context(&proposal).unwrap(),
+            transcript: xshell_protocol::ring::companion::ConsentTranscript::Local,
+            proposal,
+            phase: AdoptionPhase::Prepared,
+            signed_candidate: None,
+            accepted: vec![],
+            desktop_installed: false,
+            daemon_installed: false,
+        };
+        (journal, daemon)
+    }
+
+    fn genesis_journal(keys: &DeviceKeys) -> AdoptionJournal {
+        genesis_journal_with_daemon(keys).0
+    }
+
+    #[test]
+    fn pre_membership_journal_round_trip_never_manufactures_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let keys = store.retained_keys().unwrap();
+        let journal = genesis_journal(&keys);
+        store
+            .transact_profile(|profile, _| {
+                let mut profile = profile.unwrap();
+                profile.journal = Some(journal.clone());
+                Ok((Some(profile), ()))
+            })
+            .unwrap();
+        let profile = Store::new(dir.path().to_path_buf())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(profile.keys.sign_key(), keys.sign_key());
+        assert_eq!(profile.keys.noise_key(), keys.noise_key());
+        assert!(profile.membership.is_none());
+        assert_eq!(profile.journal, Some(journal));
+        assert!(store.load().unwrap().0.is_none());
+    }
+
+    #[test]
+    fn invalid_journal_and_identity_replacement_do_not_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let keys = store.retained_keys().unwrap();
+        let original = fs::read(store.file()).unwrap();
+        assert!(store
+            .transact_profile(|profile, _| {
+                let mut profile = profile.unwrap();
+                let mut journal = genesis_journal(&keys);
+                journal.context.hash = xshell_protocol::ring::b64::encode(&[99; 32]);
+                profile.journal = Some(journal);
+                Ok((Some(profile), ()))
+            })
+            .is_err());
+        assert!(store
+            .transact_profile(|profile, _| {
+                let mut profile = profile.unwrap();
+                profile.keys = Arc::new(DeviceKeys::generate().unwrap());
+                Ok((Some(profile), ()))
+            })
+            .is_err());
+        assert_eq!(fs::read(store.file()).unwrap(), original);
+    }
+
+    #[test]
+    fn journal_write_failure_is_reported_without_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let keys = store.retained_keys().unwrap();
+        let backup = dir.path().join("backup.json");
+        let result = store.transact_profile(|profile, _| {
+            let mut profile = profile.unwrap();
+            profile.journal = Some(genesis_journal(&keys));
+            fs::rename(store.file(), &backup).unwrap();
+            fs::create_dir(store.file()).unwrap();
+            Ok((Some(profile), ()))
+        });
+        assert!(result.is_err());
+        fs::remove_dir(store.file()).unwrap();
+        fs::rename(backup, store.file()).unwrap();
+        let profile = store.load_profile().unwrap().0.unwrap();
+        assert!(profile.journal.is_none());
+        assert_eq!(profile.keys.sign_key(), keys.sign_key());
+    }
+
+    #[test]
+    fn possible_consent_cannot_be_erased_or_relabelled_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let keys = store.retained_keys().unwrap();
+        let mut journal = genesis_journal(&keys);
+        journal.phase = AdoptionPhase::ConsentMayHaveLeft;
+        store
+            .transact_profile(|profile, _| {
+                let mut profile = profile.unwrap();
+                profile.journal = Some(journal.clone());
+                Ok((Some(profile), ()))
+            })
+            .unwrap();
+        for cancel in [false, true] {
+            assert!(store
+                .transact_profile(|profile, _| {
+                    let mut profile = profile.unwrap();
+                    if cancel {
+                        profile.journal.as_mut().unwrap().phase = AdoptionPhase::Cancelled;
+                    } else {
+                        profile.journal = None;
+                    }
+                    Ok((Some(profile), ()))
+                })
+                .is_err());
+        }
+        assert!(
+            store
+                .transact(|_, _| {
+                    let genesis = xshell_protocol::ring::SignedRoster::genesis(
+                        &*keys,
+                        keys.noise_key(),
+                        "computer",
+                        "ws://127.0.0.1:7777",
+                        1000,
+                    )
+                    .unwrap();
+                    Ok((
+                        Some(RingState {
+                            keys: keys.clone(),
+                            chain: RosterChain::from_chain(vec![genesis]).unwrap(),
+                            local_member: None,
+                            farewells: vec![],
+                            held_relays: BTreeSet::new(),
+                            host_members: BTreeMap::new(),
+                        }),
+                        (),
+                    ))
+                })
+                .is_err(),
+            "legacy mutation cannot bypass reconciliation"
+        );
+        assert_eq!(
+            store.load_profile().unwrap().0.unwrap().journal,
+            Some(journal)
+        );
+    }
+    #[test]
+    fn known_candidate_requires_exact_accepted_token_not_an_equivalent_proof_order_fork() {
+        use xshell_protocol::ring::membership::{consent_message, ConsentProof, RosterChange};
+        use xshell_protocol::ring::{Signature, Signer};
+        let keys = DeviceKeys::generate().unwrap();
+        let (mut journal, daemon) = genesis_journal_with_daemon(&keys);
+        let message = consent_message(
+            &journal.proposal,
+            journal.intent.expires_at,
+            &journal.context,
+        )
+        .unwrap();
+        let proofs: Vec<_> = [&keys, &daemon]
+            .into_iter()
+            .map(|key| ConsentProof {
+                key: key.sign_key(),
+                expires_at: journal.intent.expires_at,
+                context: journal.context.clone(),
+                signature: Signature::from_bytes(key.sign(&message).unwrap()),
+            })
+            .collect();
+        let sign = |mut proofs: Vec<ConsentProof>, reverse: bool| {
+            if reverse {
+                proofs.reverse();
+            }
+            let mut roster = journal.proposal.clone();
+            let mut membership = roster.membership().unwrap();
+            membership.change = RosterChange::Genesis { proofs };
+            roster.set_membership(&membership);
+            roster.sign(&keys).unwrap()
+        };
+        let first = sign(proofs.clone(), false);
+        let fork = sign(proofs, true);
+        RosterChain::from_chain(vec![first.clone()]).unwrap();
+        RosterChain::from_chain(vec![fork.clone()]).unwrap();
+        assert_ne!(first.hash(), fork.hash());
+        journal.signed_candidate = Some(first.token().into());
+        journal.accepted = vec![first.token().into()];
+        journal.phase = AdoptionPhase::Accepted;
+        journal.validate().unwrap();
+        journal.accepted = vec![fork.token().into()];
+        assert!(
+            journal.validate().is_err(),
+            "accepted proof-order fork must not match known candidate"
+        );
     }
 }

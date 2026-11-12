@@ -31,6 +31,8 @@ pub(crate) struct Daemon {
     pub exit: Mutex<Option<ExitReason>>,
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
+    #[cfg(unix)]
+    pub companion: Mutex<Option<xshell_core::local_ipc::Server>>,
     pub next_conn: AtomicU64,
     /// How agents report their Agent Status; `None` when they launch without hooks.
     pub hooks: Option<xshell_core::agent_status::AgentHooks>,
@@ -560,7 +562,16 @@ impl Daemon {
                     // The socket carries Desktops only: local ones and `xshelld connect`.
                     let r = std::thread::Builder::new()
                         .name(format!("conn-{id}-r"))
-                        .spawn(move || conn::handle(d, sock, id, Role::Desktop, None));
+                        .spawn(move || {
+                            conn::handle(
+                                d,
+                                sock,
+                                id,
+                                Role::Desktop,
+                                None,
+                                conn::Ingress::LocalOrSsh,
+                            )
+                        });
                     if let Err(e) = r {
                         crate::log!("ERROR", "cannot start connection thread: {e}");
                     }
@@ -631,6 +642,15 @@ impl Daemon {
     pub fn exit(self: &Arc<Self>, reason: ExitReason) {
         if self.exiting.swap(true, Ordering::SeqCst) {
             return;
+        }
+        // No registry/Ring/handler lock is held while cancellation drains workers. The
+        // endpoint and all admitted requests end before the elected owner can transfer.
+        #[cfg(unix)]
+        {
+            let endpoint = { self.companion.lock().unwrap().take() };
+            if let Some(mut endpoint) = endpoint {
+                endpoint.shutdown();
+            }
         }
         self.push.stop();
         self.last_lines.stop();

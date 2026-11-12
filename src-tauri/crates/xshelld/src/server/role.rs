@@ -995,6 +995,8 @@ pub(crate) mod tests {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
+            #[cfg(unix)]
+            companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks: None,
             next_run: AtomicU64::new(1),
@@ -1080,7 +1082,14 @@ pub(crate) mod tests {
             .unwrap();
         let d2 = d.clone();
         let thread = std::thread::spawn(move || {
-            crate::server::conn::handle(d2, server, 1, Role::Desktop, None)
+            crate::server::conn::handle(
+                d2,
+                server,
+                1,
+                Role::Desktop,
+                None,
+                crate::server::conn::Ingress::InProcess,
+            )
         });
         let read = |client: &mut crate::server::transport::Stream| {
             let Frame::Json(j) = read_frame(client, MAX_FRAME_LEN).unwrap().unwrap() else {

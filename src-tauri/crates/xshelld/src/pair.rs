@@ -7,7 +7,7 @@
 //!
 //! Trust on disk is never rolled back: under `ring.lock` (shared with `serve`) the fetched
 //! chain must extend the stored one of the same Ring, which a newer stored head wins over;
-//! another Ring replaces it only with `--force`, and then through the running `serve`.
+//! foreign or terminal membership requires explicit Leave; `--force` cannot replace it.
 //!
 //! Exit codes: 0 paired, 1 an error, 5 the code expired.
 
@@ -20,9 +20,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
-use xshell_protocol::msg::{
-    decode_server, encode_msg, ClientMsg, Hello, JoinExpect, ServerMsg, MEMBERSHIP_CHANGED,
-};
+use xshell_protocol::msg::{decode_server, encode_msg, ClientMsg, Hello, JoinExpect, ServerMsg};
 use xshell_protocol::ring::pairing::{PairCode, PairError, PAIR_TTL_SECS};
 use xshell_protocol::ring::relay::pair::{pair_as_guest, GuestRequest, PairOptions};
 use xshell_protocol::ring::url::{RelayUrl, HOSTED_RELAY_URL};
@@ -72,6 +70,7 @@ fn ttl() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(PAIR_TTL_SECS))
+        .min(Duration::from_secs(PAIR_TTL_SECS))
 }
 
 fn say(out: &mut dyn Write, line: &str) {
@@ -81,13 +80,19 @@ fn say(out: &mut dyn Write, line: &str) {
 
 fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
     let store = Store::new(paths.ring_dir.clone());
-    let keys = Arc::new(store.load_or_create_keys()?);
+    let _offer = store.reserve_legacy_offer()?;
+    if crate::server::ring::companion_registered(&paths.ring_dir) {
+        return Err(Failure::Other(
+            "protected_counterpart_required: registered GUI pairing must use its local controller"
+                .into(),
+        ));
+    }
     let stored = store
         .read_chain()
         .map_err(|e| format!("the stored ring is unreadable ({e})"))?;
-    if !opts.force && stored.as_ref().is_some_and(|c| is_daemon_member(c, &keys)) {
+    if stored.is_some() {
         return Err(Failure::Other(
-            "This computer is already paired. Use --force to pair it again.".into(),
+            "leave_required: this computer retains a Ring; --force cannot replace retained membership".into(),
         ));
     }
     let relay = opts
@@ -95,6 +100,7 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
         .clone()
         .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
     RelayUrl::parse(&relay).map_err(|e| e.to_string())?;
+    let keys = Arc::new(store.load_or_create_keys()?);
     let name = match &opts.name {
         Some(n) => member_name(n, "this computer"),
         None => host_name(),
@@ -134,7 +140,7 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
         ));
     }
 
-    let chain = adopt(&store, fetched, &keys, opts.force, paths)?;
+    let chain = adopt(&store, fetched, &keys)?;
     say(out, &format!("Paired as {name}"));
     match join_running(paths, &chain, None) {
         Ok(true) => {}
@@ -159,108 +165,44 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
     Ok(())
 }
 
-/// Stores `fetched` under `ring.lock`, merged with what is stored: the same Ring must
-/// extend (a newer stored head is kept), a fork is refused, and another Ring only replaces
-/// the stored one with `force`, through the running `serve` when there is one (its
-/// `ring.join` conditional on the membership it reported). Whenever the lock was let go,
-/// the stored chain is read again and the decision made again. Returns the chain this
-/// computer now trusts.
+/// Stores only an initial membership or an authorized extension of the retained Ring.
+/// Foreign/terminal membership is never a force-replacement or a new enrollment attempt.
 fn adopt(
     store: &Store,
     fetched: RosterChain,
     keys: &xshell_protocol::ring::DeviceKeys,
-    force: bool,
-    paths: &Paths,
 ) -> Result<RosterChain, Failure> {
-    for _ in 0..5 {
-        let lock = store.lock()?;
-        let disk = store
-            .read_chain()
-            .map_err(|e| format!("the stored ring is unreadable ({e})"))?;
-        let other = match disk {
-            None => {
-                store.write_chain(&fetched)?;
-                return Ok(fetched);
+    let _lock = store.lock()?;
+    store.refuse_registered_join()?;
+    let disk = store
+        .read_chain()
+        .map_err(|e| format!("the stored ring is unreadable ({e})"))?;
+    let next = match disk {
+        None => fetched,
+        Some(disk) => {
+            if disk.ring_id() != fetched.ring_id() || !is_daemon_member(&disk, keys) {
+                return Err(Failure::Other(
+                    "leave_required: retained foreign or terminal membership cannot be replaced"
+                        .into(),
+                ));
             }
-            Some(d) if d.ring_id() == fetched.ring_id() => {
-                let (merged, _) = d.extended(fetched.versions()).map_err(|e| {
+            disk.extended(fetched.versions())
+                .map_err(|e| {
                     format!(
                         "the relay's roster conflicts with the one stored here ({})",
                         e.as_code()
                     )
-                })?;
-                if !is_daemon_member(&merged, keys) {
-                    return Err(Failure::Other(
-                        "the ring stored here is newer and does not list this computer".into(),
-                    ));
-                }
-                if merged != d {
-                    store.write_chain(&merged)?;
-                }
-                return Ok(merged);
-            }
-            Some(_) if !force => {
-                return Err(Failure::Other(
-                    "This computer is paired with another set of devices.\nUse --force to replace that pairing.".into(),
-                ))
-            }
-            Some(d) => d,
-        };
-        drop(lock);
-        #[cfg(test)]
-        probe_hook();
-        // A running `serve` replaces its Ring itself (and saves it under the lock), but only
-        // while its membership is still the one it reports now.
-        match membership(paths).map_err(Failure::Other)? {
-            Some(expect) => match join_running(paths, &fetched, Some(expect)) {
-                Ok(true) => return Ok(fetched),
-                // It stopped meanwhile, or its membership changed: decide again.
-                Ok(false) => continue,
-                Err(e) if e == MEMBERSHIP_CHANGED => continue,
-                Err(e) => {
-                    return Err(Failure::Other(format!(
-                        "the running xshelld serve refused the new ring: {e}"
-                    )))
-                }
-            },
-            None => {
-                let _l = store.lock()?;
-                // Unchanged since the decision: replace it. Changed: decide again.
-                if store.read_chain().ok().flatten().as_ref() == Some(&other) {
-                    store.write_chain(&fetched)?;
-                    return Ok(fetched);
-                }
-            }
+                })?
+                .0
         }
-    }
-    Err(Failure::Other(
-        "the ring stored here kept changing; try again".into(),
-    ))
-}
-
-#[cfg(test)]
-static PROBE_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
-
-/// Test hook: runs once where `adopt` has let the lock go to probe for a `serve`.
-#[cfg(test)]
-fn probe_hook() {
-    let h = PROBE_HOOK.lock().unwrap().take();
-    if let Some(h) = h {
-        h();
-    }
-}
-
-/// The `serve` on this machine's membership, as `ring.identity` reports it (the Ring and
-/// its head version while connected): `None` when no `serve` runs.
-fn membership(paths: &Paths) -> Result<Option<JoinExpect>, String> {
-    let Some(v) = request(paths, &ClientMsg::RingIdentity)? else {
-        return Ok(None);
     };
-    let ring = &v["ring"];
-    Ok(Some(JoinExpect {
-        ring_id: ring["ringId"].as_str().map(str::to_string),
-        version: ring["version"].as_u64(),
-    }))
+    if !is_daemon_member(&next, keys) {
+        return Err(Failure::Other(
+            "the retained Ring does not authorize this computer".into(),
+        ));
+    }
+    store.write_chain(&next)?;
+    Ok(next)
 }
 
 /// Sends `ring.join` with `chain` (conditional on `expect`) to the `serve` on this machine.
@@ -329,9 +271,6 @@ mod tests {
     use super::*;
     use xshell_protocol::ring::{DeviceKeys, Member, SignedRoster};
 
-    /// The tests that reach the probe hook run one at a time.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn paths(t: &tempfile::TempDir) -> Paths {
         crate::paths::resolve(t.path(), Some(&t.path().join("run")), None)
     }
@@ -379,48 +318,44 @@ mod tests {
         let (_, full) = chain(&me);
         store.write_chain(&full).unwrap();
         // The Relay showed only up to v2 (it hid v3): the stored v3 stays.
-        let kept = adopt(&store, prefix(&full, 2), &me, false, &p)
-            .ok()
-            .unwrap();
+        let kept = adopt(&store, prefix(&full, 2), &me).ok().unwrap();
         assert_eq!(kept, full);
         assert_eq!(store.read_chain().unwrap().unwrap(), full);
         // A newer one extends what is stored.
         store.write_chain(&prefix(&full, 2)).unwrap();
-        assert_eq!(
-            adopt(&store, full.clone(), &me, false, &p).ok().unwrap(),
-            full
-        );
+        assert_eq!(adopt(&store, full.clone(), &me).ok().unwrap(), full);
         assert_eq!(store.read_chain().unwrap().unwrap(), full);
     }
 
     #[test]
-    fn a_change_while_probing_for_serve_is_decided_again() {
-        // The stored ring is another one; while `adopt` probes for a `serve` (none runs),
-        // something stores a newer version of the very Ring being joined: it must be kept,
-        // not replaced by the older fetched chain.
-        let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fn terminal_membership_is_not_automatically_reenrolled() {
+        // Historical v1 file fixture: the local key has already been removed.
         let t = tempfile::tempdir().unwrap();
         let p = paths(&t);
         let store = Store::new(p.ring_dir.clone());
         let me = store.load_or_create_keys().unwrap();
-        let (_, theirs) = chain(&me);
-        let (_, ours) = chain(&me);
-        store.write_chain(&theirs).unwrap();
-        let dir = p.ring_dir.clone();
-        let newer = ours.clone();
-        *PROBE_HOOK.lock().unwrap() = Some(Box::new(move || {
-            let s = Store::new(dir);
-            let _l = s.lock().unwrap();
-            s.write_chain(&newer).unwrap();
-        }));
-        let fetched = prefix(&ours, 2);
-        assert_eq!(adopt(&store, fetched, &me, true, &p).ok().unwrap(), ours);
-        assert_eq!(store.read_chain().unwrap().unwrap(), ours);
+        let (desktop, full) = chain(&me);
+        let removed = full
+            .head()
+            .next(&desktop, 4, |draft| {
+                draft.remove(&me.sign_key());
+            })
+            .unwrap();
+        let mut terminal = full.clone();
+        terminal.accept(&[removed]).unwrap();
+        store.write_chain(&terminal).unwrap();
+        assert!(
+            matches!(adopt(&store, full, &me), Err(Failure::Other(message)) if message.starts_with("leave_required:"))
+        );
+        assert_eq!(store.read_chain().unwrap().unwrap(), terminal);
+        assert_eq!(
+            store.load_keys().unwrap().unwrap().sign_key(),
+            me.sign_key()
+        );
     }
 
     #[test]
     fn forks_and_other_rings_are_refused() {
-        let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let t = tempfile::tempdir().unwrap();
         let p = paths(&t);
         let store = Store::new(p.ring_dir.clone());
@@ -449,19 +384,93 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(adopt(&store, fork, &me, false, &p), Err(Failure::Other(m)) if m.contains("conflicts"))
+            matches!(adopt(&store, fork, &me), Err(Failure::Other(m)) if m.contains("conflicts"))
         );
         assert_eq!(store.read_chain().unwrap().unwrap(), full);
-        // Another Ring: only with --force (and with no serve running, stored here).
+        // `--force` is not a Leave and cannot bypass retained foreign membership.
         let (_, theirs) = chain(&me);
         assert!(
-            matches!(adopt(&store, theirs.clone(), &me, false, &p), Err(Failure::Other(m)) if m.contains("--force"))
+            matches!(adopt(&store, theirs.clone(), &me), Err(Failure::Other(m)) if m.starts_with("leave_required:"))
         );
         assert_eq!(store.read_chain().unwrap().unwrap(), full);
-        assert_eq!(
-            adopt(&store, theirs.clone(), &me, true, &p).ok().unwrap(),
-            theirs
+        assert!(
+            matches!(adopt(&store, theirs, &me), Err(Failure::Other(m)) if m.starts_with("leave_required:"))
         );
-        assert_eq!(store.read_chain().unwrap().unwrap(), theirs);
+        assert_eq!(store.read_chain().unwrap().unwrap(), full);
+    }
+    #[test]
+    fn force_pair_refuses_before_offer_and_preserves_retained_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = paths(&t);
+        let store = Store::new(paths.ring_dir.clone());
+        let keys = store.load_or_create_keys().unwrap();
+        let (_, retained) = chain(&keys);
+        store.write_chain(&retained).unwrap();
+        for force in [false, true] {
+            let mut output = Vec::new();
+            let options = Opts {
+                force,
+                ..Default::default()
+            };
+            assert!(
+                matches!(pair(&options, &paths, &mut output), Err(Failure::Other(message)) if message.starts_with("leave_required:"))
+            );
+            assert!(
+                output.is_empty(),
+                "no code or network offer before the membership fence"
+            );
+            assert_eq!(store.read_chain().unwrap().unwrap(), retained);
+            assert_eq!(
+                store.load_keys().unwrap().unwrap().sign_key(),
+                keys.sign_key()
+            );
+        }
+    }
+    #[test]
+    fn stopped_or_unreadable_registration_never_falls_back_to_headless_offer() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let store = Store::new(paths.ring_dir.clone());
+        store.ensure_dir().unwrap();
+        std::fs::write(paths.ring_dir.join("companion.json"), b"{unreadable").unwrap();
+        for force in [false, true] {
+            let mut output = Vec::new();
+            let options = Opts {
+                force,
+                ..Default::default()
+            };
+            assert!(
+                matches!(pair(&options, &paths, &mut output), Err(Failure::Other(message)) if message.starts_with("protected_counterpart_required:"))
+            );
+            assert!(output.is_empty());
+            assert!(
+                !paths.ring_dir.join("keys.json").exists(),
+                "refusal must not create replacement identities"
+            );
+        }
+    }
+    #[test]
+    fn legacy_adopt_rechecks_effective_binding_under_ring_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let store = Store::new(paths.ring_dir.clone());
+        let keys = store.load_or_create_keys().unwrap();
+        let (_, fetched) = chain(&keys); // Historical v1 legacy negative, not v2 bootstrap.
+        {
+            let _lock = store.lock().unwrap();
+            crate::server::ring::write_private(
+                &paths.ring_dir.join("companion.json"),
+                b"retained binding",
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(adopt(&store, fetched, &keys), Err(Failure::Other(message)) if message.starts_with("protected_counterpart_required:"))
+        );
+        assert!(store.read_chain().unwrap().is_none());
+        assert_eq!(
+            store.load_keys().unwrap().unwrap().sign_key(),
+            keys.sign_key()
+        );
     }
 }

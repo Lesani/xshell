@@ -1994,3 +1994,38 @@ fn a_quota_close_during_a_farewell_backs_off() {
     assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
     desk.stop(ByeReason::quit());
 }
+
+/// Legacy transport control only: TestRelay does not implement v2 proposals.
+#[test]
+fn proposal_connection_capture_does_not_replace_the_creator_socket() {
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let events = Rec::new();
+    let connector =
+        Connector::start(cfg(&relay, &chain, ring.desktop.clone()), events.clone()).unwrap();
+    assert!(events.connected());
+    let before = connector.connection().unwrap();
+    let captured = connector.proposal_connection().unwrap();
+    assert_eq!(connector.connection(), Some(before));
+    connector.stop(ByeReason::quit());
+    assert!(connector.proposal_connection().is_err());
+    let guest = keys();
+    let intent = xshell_protocol::ring::pairing::adoption::AdoptionIntent {
+        operation: xshell_protocol::ring::b64::encode(&[31; 32]),
+        expires_at: now() + 600,
+        target: xshell_protocol::ring::pairing::adoption::JoinTarget::StandaloneDaemon {
+            daemon: xshell_protocol::ring::pairing::adoption::PublicIdentity {
+                name: "computer".into(),
+                sign_key: guest.sign_key(),
+                noise_key: guest.noise_key(),
+            },
+        },
+    };
+    let error = captured
+        .create(&intent, [32; 32], chain.head().roster())
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("creator connection or predecessor changed"));
+}

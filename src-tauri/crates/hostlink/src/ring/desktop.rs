@@ -624,8 +624,10 @@ struct Live {
 }
 
 pub struct DesktopRing {
-    cfg: DesktopRingConfig,
-    store: Store,
+    pub(super) cfg: DesktopRingConfig,
+    pub(super) store: Store,
+    /// Nonblocking admission for one local adoption; never a filesystem lock.
+    pub(super) adoption: Mutex<()>,
     observer: Arc<dyn RingObserver>,
     live: Mutex<Live>,
     /// Serializes every commit with the adoption of its result (into `live` and the
@@ -786,6 +788,7 @@ impl DesktopRing {
         let ring = Arc::new_cyclic(|me| DesktopRing {
             cfg,
             store,
+            adoption: Mutex::new(()),
             observer,
             live: Mutex::new(Live::default()),
             commit: Mutex::new(()),
@@ -878,7 +881,7 @@ impl DesktopRing {
 
     /// Re-reads the state from disk and adopts it (under the commit lock, fenced), then
     /// tries to run the Connector.
-    fn reload(&self) {
+    pub(super) fn reload(&self) {
         {
             let _c = self.lock_commit();
             if let Ok(Some(s)) = self.tx(|cur, _| Ok((None, cur))) {
@@ -1217,6 +1220,7 @@ impl DesktopRing {
         local: Option<LocalIdentity>,
         start_over: bool,
     ) -> Result<RingView, String> {
+        let retained = self.store.load_profile()?.0.map(|profile| profile.keys);
         {
             let _c = self.lock_commit();
             let (s, created) = self.tx(|cur, loaded| {
@@ -1226,7 +1230,7 @@ impl DesktopRing {
                 if loaded.moved_aside.is_some() && !start_over {
                     return Err(START_OVER_REQUIRED.to_string());
                 }
-                let s = self.genesis(local.as_ref())?;
+                let s = self.genesis(local.as_ref(), retained.clone())?;
                 Ok((Some(s.clone()), (s, true)))
             })?;
             if created {
@@ -1239,8 +1243,15 @@ impl DesktopRing {
         Ok(self.view())
     }
 
-    fn genesis(&self, local: Option<&LocalIdentity>) -> Result<RingState, String> {
-        let keys = Arc::new(DeviceKeys::generate().map_err(|e| e.to_string())?);
+    fn genesis(
+        &self,
+        local: Option<&LocalIdentity>,
+        retained: Option<Arc<DeviceKeys>>,
+    ) -> Result<RingState, String> {
+        let keys = match retained {
+            Some(keys) => keys,
+            None => Arc::new(DeviceKeys::generate().map_err(|e| e.to_string())?),
+        };
         let t = now();
         let url = &self.cfg.default_relay_url;
         let genesis = match local {
@@ -5465,6 +5476,23 @@ mod tests {
             ring.view().quota_reset_at,
             Some(next_utc_midnight(now())),
             "the new Relay's report"
+        );
+        ring.quit();
+    }
+    /// Legacy v1 control only; this is not the new consented Computer Create flow.
+    #[test]
+    fn legacy_enable_preserves_a_retained_pre_membership_identity() {
+        let relay = relay();
+        let dir = tempfile::tempdir().unwrap();
+        let (ring, _) = open(cfg(dir.path(), &relay.url()));
+        let retained = ring.store.retained_keys().unwrap();
+        assert!(ring.chain().is_none());
+        ring.enable(None, false).unwrap();
+        let chain = ring.chain().unwrap();
+        assert_eq!(chain.head().roster().signed_by, retained.sign_key());
+        assert_eq!(
+            chain.head().member(&retained.sign_key()).unwrap().noise_key,
+            retained.noise_key()
         );
         ring.quit();
     }
