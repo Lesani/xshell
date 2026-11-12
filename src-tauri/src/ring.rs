@@ -124,7 +124,7 @@ pub fn setup(app: &AppHandle) {
         &HOST_SYNC,
         Box::new(move |id| {
             a.try_state::<crate::hosts::Hosts>()
-                .and_then(|h| h.manager.host(id))
+                .and_then(|h| h.manager.sync_host(id))
         }),
         Box::new(move || {
             if let Some(r) = b.try_state::<RingState>() {
@@ -390,6 +390,20 @@ pub async fn ring_pair_cancel(app: AppHandle, operation: uuid::Uuid) -> Result<(
 #[cfg(test)]
 mod pairing_tests {
     use super::*;
+
+    #[test]
+    fn sync_worker_uses_enrollment_lookup() {
+        let source = include_str!("ring.rs");
+        let lookup = source
+            .split("let worker = SyncWorker::new(")
+            .nth(1)
+            .unwrap()
+            .split("Box::new(move ||")
+            .next()
+            .unwrap();
+        assert!(lookup.contains("h.manager.sync_host(id)"));
+        assert!(!lookup.contains("h.manager.host(id)"));
+    }
 
     #[test]
     fn qr_rows_are_square_bits() {

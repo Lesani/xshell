@@ -240,6 +240,7 @@ pub struct RemoteExit {
 pub struct ChannelSink {
     pub data: Channel<Response>,
     pub exit: Channel<RemoteExit>,
+    pub resync: Option<Channel<()>>,
 }
 
 impl TermSink for ChannelSink {
@@ -248,6 +249,11 @@ impl TermSink for ChannelSink {
     }
     fn exit(&self, code: i32, bytes: u64) {
         let _ = self.exit.send(RemoteExit { code, bytes });
+    }
+    fn resync_required(&self) {
+        if let Some(channel) = &self.resync {
+            let _ = channel.send(());
+        }
     }
 }
 
@@ -267,5 +273,66 @@ impl TransportFactory for SshFactory {
         }
         let daemon = self.local.clone()?;
         Some(Box::new(xshell_hostlink::LocalDialer { daemon }))
+    }
+}
+
+#[cfg(test)]
+mod channel_sink_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tauri::ipc::InvokeResponseBody;
+
+    #[test]
+    fn resync_is_a_scoped_null_callback_not_output_or_exit() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let channel = |name: &'static str| {
+            let messages = messages.clone();
+            move |body| {
+                messages.lock().unwrap().push((name, body));
+                Ok(())
+            }
+        };
+        let first = ChannelSink {
+            data: Channel::new(channel("data")),
+            exit: Channel::new(channel("exit")),
+            resync: Some(Channel::new(channel("resync"))),
+        };
+        let other = ChannelSink {
+            data: Channel::new(channel("other-data")),
+            exit: Channel::new(channel("other-exit")),
+            resync: Some(Channel::new(channel("other-resync"))),
+        };
+        let sink: &dyn TermSink = &first;
+        assert!(sink.data(&[0, 128, 255]));
+        sink.resync_required();
+        // The other viewer remains independently usable.
+        assert!(other.data(&[7]));
+        other.exit(3, 1);
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].0, "data");
+        assert!(matches!(&messages[0].1, InvokeResponseBody::Raw(bytes) if bytes == &[0, 128, 255]));
+        assert_eq!(messages[1].0, "resync");
+        assert!(matches!(&messages[1].1, InvokeResponseBody::Json(body) if body == "null"));
+        assert_eq!(messages[2].0, "other-data");
+        assert!(matches!(&messages[2].1, InvokeResponseBody::Raw(bytes) if bytes == &[7]));
+        assert_eq!(messages[3].0, "other-exit");
+        match &messages[3].1 {
+            InvokeResponseBody::Json(body) => assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                serde_json::json!({"code": 3, "bytes": 1})
+            ),
+            _ => panic!("exit must retain its JSON watermark payload"),
+        }
+    }
+
+    #[test]
+    fn older_callers_may_omit_the_resync_channel() {
+        let sink = ChannelSink {
+            data: Channel::new(|_| panic!("resync must not fabricate data")),
+            exit: Channel::new(|_| panic!("resync must not fabricate exit")),
+            resync: None,
+        };
+        sink.resync_required();
     }
 }

@@ -513,6 +513,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     const signal = abort.signal;
     // The Terminal's output sink, registered before anything starts.
     const conn: MountedTerminal = mountTerminal(tabRef.current, {
+      // RIS must share xterm's write queue: synchronous reset leaves queued bytes/parser state.
+      reset: () => term.write(new Uint8Array([0x1b, 0x63])),
       data: (bytes) => {
         if (!sawFirstOutputRef.current) {
           sawFirstOutputRef.current = true;
@@ -671,8 +673,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     // once usable. Rust re-attaches on its own; this is the fallback.
     const reattach = () => {
       const host = daemonHost(tabRef.current);
-      if (!host || signal.aborted || (tabRef.current.terminal && remoteTerminals.inputBlocked(tabRef.current.terminal, host))) return;
-      if (!startedRef.current || !startOptsRef.current) {
+      if (!host || signal.aborted || (tabRef.current.terminal && remoteTerminals.inputBlocked(tabRef.current.terminal, host) && !remoteTerminals.needsResync(tabRef.current.terminal))) return;
+      if (!startOptsRef.current || (!startedRef.current && !(tabRef.current.terminal && remoteTerminals.needsResync(tabRef.current.terminal)))) {
         if (tabRef.current.terminal && remoteTerminals.identityHost(tabRef.current.terminal, host) !== remoteHost) void spawnBackend(term, fitAddon);
         return;
       }
@@ -687,7 +689,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     };
     const offReattach = remoteHost ? registry.onReattach(h => { if (matches(h)) reattach(); }) : null;
     const offUsable = remoteHost ? registry.onUsable(h => {
-      if (matches(h) && ((tabRef.current.terminal && remoteTerminals.hasIdentityRebind(tabRef.current.terminal)) || registry.resolveAlias(h) !== selectedHost)) reattach();
+      if (matches(h) && ((tabRef.current.terminal && (remoteTerminals.hasIdentityRebind(tabRef.current.terminal) || remoteTerminals.needsResync(tabRef.current.terminal))) || registry.resolveAlias(h) !== selectedHost)) reattach();
     }) : null;
 
     const containerEl = containerRef.current;

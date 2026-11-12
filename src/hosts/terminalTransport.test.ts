@@ -141,7 +141,7 @@ describe("remote terminal lifecycle (amendment 16)", () => {
     expect(calls("host_term_attach")).toHaveLength(2);
     // output on the replaced (old) channel is ignored
     ch<ArrayBuffer>(0).emit(new Uint8Array([9]).buffer);
-    ch<ArrayBuffer>(2).emit(new Uint8Array([7]).buffer);
+    ch<ArrayBuffer>(3).emit(new Uint8Array([7]).buffer);
     expect(s.data.map(b => [...b])).toEqual([[7]]);
   });
 });
@@ -580,7 +580,7 @@ it("identity rebind fences late live output, waits for Attach then Detach, and c
   const next = sinks(), nextGen = rt.mount(r, uuid, next.s);
   await rt.start(r, uuid, nextGen, opts);
   ch<number[]>(0).emit([88]); // old generation cannot reach either sink
-  ch<number[]>(2).emit([75]);
+  ch<number[]>(3).emit([75]);
   expect(old.data).toEqual([]);
   expect(next.data.map(bytes => [...bytes])).toEqual([[75]]);
   expect(calls("host_term_attach").map(([, args]) => (args as { host: string }).host)).toEqual([H, r]);

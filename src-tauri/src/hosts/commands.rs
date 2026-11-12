@@ -6,7 +6,7 @@ use super::{ChannelSink, Hosts, RemoteExit};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::sync::Arc;
-use tauri::ipc::{Channel, Response};
+use tauri::ipc::{Channel, JavaScriptChannelId, Response};
 use tauri::State;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -156,6 +156,7 @@ pub struct AttachResult {
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn host_term_open(
+    webview: tauri::Webview,
     state: State<'_, Hosts>,
     host: String,
     terminal: String,
@@ -165,6 +166,7 @@ pub async fn host_term_open(
     rows: u16,
     on_data: Channel<Response>,
     on_exit: Channel<RemoteExit>,
+    on_resync: Option<JavaScriptChannelId>,
     adopt: Option<bool>,
 ) -> Result<OpenResult, HostError> {
     let h = handle(&state, &host)?;
@@ -182,6 +184,7 @@ pub async fn host_term_open(
     let sink = Arc::new(ChannelSink {
         data: on_data,
         exit: on_exit,
+        resync: on_resync.map(|id| id.channel_on(webview)),
     });
     let r = reply(|w| h.term_open(open, sink, w)).await?;
     Ok(OpenResult {
@@ -193,17 +196,20 @@ pub async fn host_term_open(
 
 #[tauri::command]
 pub async fn host_term_attach(
+    webview: tauri::Webview,
     state: State<'_, Hosts>,
     host: String,
     terminal: String,
     on_data: Channel<Response>,
     on_exit: Channel<RemoteExit>,
+    on_resync: Option<JavaScriptChannelId>,
 ) -> Result<AttachResult, HostError> {
     let h = handle(&state, &host)?;
     let t = uuid(&terminal)?;
     let sink = Arc::new(ChannelSink {
         data: on_data,
         exit: on_exit,
+        resync: on_resync.map(|id| id.channel_on(webview)),
     });
     let exit_code = reply(|w| h.term_attach(t, sink, w)).await?;
     Ok(AttachResult { exit_code })
