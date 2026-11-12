@@ -289,7 +289,7 @@ mod tests {
             terminals: None,
         };
         map.register("local", 23);
-        map.reconcile(&rows, &[root.clone()]);
+        map.reconcile(&rows, std::slice::from_ref(&root));
         let mut owner = raw.clone();
         owner.config_generation = 7;
         owner.link_generation = 3;
@@ -399,7 +399,7 @@ mod publication_tests {
         };
         map.register("local", 1);
         map.reconcile(
-            &[row.clone()],
+            std::slice::from_ref(&row),
             &[HostSnapshot {
                 status: raw.clone(),
                 terminals: None,

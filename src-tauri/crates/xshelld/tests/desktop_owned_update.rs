@@ -134,13 +134,16 @@ fn check_update_policy(incompatible: bool, ownership: Ownership, check_diagnosis
     }
     let before = commands.lock().unwrap().clone();
     let handle = desk.host();
+    let access = desk.m.access(ID).expect("public configured access");
     for bound in [false, true] {
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = Box::new(move |r| {
             tx.send(r).unwrap();
         });
         if bound {
-            handle.upgrade_target(
+            // Observer generations belong to the public facade. The low-level
+            // handle deliberately retains its independent raw target domain.
+            access.upgrade_target(
                 Some(xshell_hostlink::handle::UpdateTarget {
                     config_generation: status.config_generation,
                     link_generation: status.link_generation,
@@ -234,12 +237,15 @@ fn authoritative_reconnect_and_config_generation_replace_ownership_evidence() {
         serde_json::to_value(&first).unwrap()["updateUnavailable"],
         "desktop-owned"
     );
+    let raw_initial_config = desk.host().status().config_generation;
     let mut config = desk.host().saved_config().expect("configured route");
     config.ssh_target = "different-target".into();
     let from = desk.rec.count();
     desk.m.configure(vec![config]).unwrap();
+    let raw_replaced_config = desk.host().status().config_generation;
+    assert!(raw_replaced_config > raw_initial_config);
     let (index, reset) = desk.rec.wait_status_from(from, "new configuration", |s| {
-        s.config_generation > first.config_generation && s.daemon_version.is_none()
+        s.config_generation != first.config_generation && s.daemon_version.is_none()
     });
     assert_eq!(
         reset.update_unavailable, None,
@@ -248,8 +254,14 @@ fn authoritative_reconnect_and_config_generation_replace_ownership_evidence() {
     let (_, first) = desk
         .rec
         .wait_status_from(index, "owned target in new configuration", |s| {
-            usable(s) && s.config_generation == reset.config_generation
+            usable(s) && s.update_unavailable.is_some()
         });
+    assert_eq!(desk.host().status().config_generation, raw_replaced_config);
+    assert_eq!(
+        first.config_generation,
+        desk.m.access(ID).unwrap().status().config_generation,
+        "published evidence and public access use the same action target"
+    );
     assert!(first.update_unavailable.is_some());
     let from = desk.rec.count();
     server.shutdown();
@@ -265,13 +277,18 @@ fn authoritative_reconnect_and_config_generation_replace_ownership_evidence() {
     let (_, next) = desk
         .rec
         .wait_status_from(from, "Persistent successor", |s| {
-            usable(s) && s.link_generation > first.link_generation
+            usable(s) && s.link_generation != first.link_generation
         });
     assert_eq!(
         next.update_unavailable, None,
         "authoritative new Hello replaces diagnosis"
     );
-    assert_eq!(next.config_generation, first.config_generation);
+    assert_eq!(desk.host().status().config_generation, raw_replaced_config);
+    assert_eq!(
+        next.config_generation,
+        desk.m.access(ID).unwrap().status().config_generation
+    );
+    assert_ne!(next.config_generation, first.config_generation);
     assert!(!next
         .daemon_capabilities
         .iter()

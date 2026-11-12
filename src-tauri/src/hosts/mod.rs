@@ -311,7 +311,9 @@ mod channel_sink_tests {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].0, "data");
-        assert!(matches!(&messages[0].1, InvokeResponseBody::Raw(bytes) if bytes == &[0, 128, 255]));
+        assert!(
+            matches!(&messages[0].1, InvokeResponseBody::Raw(bytes) if bytes == &[0, 128, 255])
+        );
         assert_eq!(messages[1].0, "resync");
         assert!(matches!(&messages[1].1, InvokeResponseBody::Json(body) if body == "null"));
         assert_eq!(messages[2].0, "other-data");

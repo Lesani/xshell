@@ -20,7 +20,7 @@ use xshell_protocol::ring::relay::{RingClient, RingTimeouts};
 use xshell_protocol::ring::{
     DeviceKeys, Member, NoiseKey, Role as RingRole, RosterChain, SignKey, SignedRoster,
 };
-use xshelld::server::{Config, ExitReason, Role, ServerHandle};
+use xshelld::server::{Config, ExitReason, Role, Server, ServerHandle, StartError};
 
 fn relay() -> TestRelay {
     TestRelay::start_with(TestRelayOptions {
@@ -227,9 +227,20 @@ fn identity_is_stable_and_private() {
     fs::create_dir(&other).unwrap();
     fs::create_dir_all(h2.paths().ring_dir.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&other, h2.paths().ring_dir).unwrap();
-    let srv = server(&h2);
-    let mut c = desktop(&srv);
-    assert!(c.request(&ClientMsg::RingIdentity).is_err());
+    // The protected counterpart now checks this directory before the server starts,
+    // rather than deferring its rejection until the first identity request.
+    match Server::start(config(&h2)) {
+        Err(StartError::Io(_)) => {}
+        Err(e) => panic!("unsafe Ring directory should fail private startup: {e}"),
+        Ok(srv) => {
+            srv.shutdown();
+            panic!("server followed an unsafe Ring directory");
+        }
+    }
+    assert!(fs::symlink_metadata(h2.paths().ring_dir)
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(
         fs::read_dir(&other).unwrap().count(),
         0,
@@ -241,6 +252,19 @@ fn identity_is_stable_and_private() {
 fn mobile_cannot_use_ring_messages() {
     let h = TestHome::new();
     let srv = server(&h);
+    // Private startup may create Ring state before any client request. Mobile denial
+    // must preserve that state, not assume its directory was never initialized.
+    let dir = h.paths().ring_dir;
+    let contents = || {
+        let mut names = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = contents();
+    let keys_before = fs::read(dir.join("keys.json")).ok();
     let mut m = Client::in_process(&srv, Role::Mobile);
     for msg in [
         ClientMsg::RingIdentity,
@@ -252,7 +276,13 @@ fn mobile_cannot_use_ring_messages() {
         let e = m.request(&msg).unwrap_err();
         assert!(e.starts_with("forbidden for mobile"), "{e}");
     }
-    assert!(!h.paths().ring_dir.exists(), "nothing created");
+    assert_eq!(contents(), before, "forbidden requests created Ring state");
+    assert!(
+        fs::read(dir.join("keys.json")).ok() == keys_before,
+        "forbidden requests changed retained keys"
+    );
+    assert!(!dir.join("roster.json").exists(), "no membership granted");
+    assert_eq!(mode(&dir), 0o700);
 }
 
 #[test]
@@ -384,7 +414,7 @@ fn join_refuses_a_mobile_signed_chain() {
 }
 
 #[test]
-fn join_of_other_ring_replaces_membership() {
+fn join_of_other_ring_requires_explicit_departure() {
     let (a, b) = (relay(), relay());
     let h = TestHome::new();
     let srv = server(&h);
@@ -393,15 +423,19 @@ fn join_of_other_ring_replaces_membership() {
     let one = Ring::new(&a.url(), &id, RingRole::Daemon);
     join(&mut c, one.tokens()).unwrap();
     wait_presence(&a, &one, &id.sign, online);
-    // This Desktop lost its app data and made a new Ring.
+    // A regenerated Desktop Ring does not authorize replacing the retained one.
+    let stored = fs::read(h.paths().ring_dir.join("roster.json")).unwrap();
     let two = Ring::new(&b.url(), &id, RingRole::Daemon);
-    join(&mut c, two.tokens()).unwrap();
-    wait_presence(&b, &two, &id.sign, online);
-    wait_presence(&a, &one, &id.sign, closed_with("quit"));
+    assert!(join(&mut c, two.tokens())
+        .unwrap_err()
+        .starts_with("leave_required:"));
+    wait_presence(&a, &one, &id.sign, online);
+    assert!(presence(&b, &two, &id.sign).is_none());
     assert_eq!(
         identity(&mut c).raw["ring"]["ringId"],
-        two.chain.ring_id().as_str()
+        one.chain.ring_id().as_str()
     );
+    assert!(fs::read(h.paths().ring_dir.join("roster.json")).unwrap() == stored);
 }
 
 #[test]
@@ -602,16 +636,16 @@ fn conditional_join_checks_the_membership() {
         cjoin(&mut c, ring.tokens(), Some(&rid), Some(2)).unwrap()["version"],
         3
     );
-    // Another Ring, expecting the current one at its version: the Host moves.
+    // Matching the current head is not authority to replace its Ring.
+    let stored = fs::read(h.paths().ring_dir.join("roster.json")).unwrap();
     let other = Ring::new(&r.url(), &id, RingRole::Daemon);
-    assert_eq!(
-        cjoin(&mut c, other.tokens(), Some(&rid), Some(3)).unwrap()["version"],
-        2
-    );
-    assert_eq!(
-        identity(&mut c).raw["ring"]["ringId"],
-        other.chain.ring_id().as_str()
-    );
+    assert!(cjoin(&mut c, other.tokens(), Some(&rid), Some(3))
+        .unwrap_err()
+        .starts_with("leave_required:"));
+    let retained = identity(&mut c);
+    assert_eq!(retained.raw["ring"]["ringId"], rid);
+    assert_eq!(retained.raw["ring"]["version"], 3);
+    assert!(fs::read(h.paths().ring_dir.join("roster.json")).unwrap() == stored);
     srv.shutdown();
 }
 
