@@ -40,6 +40,13 @@ impl HostAccess {
             Self::Broker(_) => None,
         }
     }
+    pub fn companion_pending(
+        &self,
+        request: xshell_protocol::ring::companion::CompanionAdminRequest,
+        w: Waiter,
+    ) {
+        delegate!(self, companion_pending, request, w)
+    }
     pub fn call(&self, method: String, params: Value, w: Waiter) {
         delegate!(self, call, method, params, w)
     }

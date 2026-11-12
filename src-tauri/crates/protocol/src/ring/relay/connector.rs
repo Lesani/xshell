@@ -1517,6 +1517,32 @@ impl ProposalConnection {
         Ok(())
     }
 
+    /// Local completion has no pairing transcript or Worker proposal grant. Freeze its
+    /// exact unsigned successor on the same authorized creator connection instead.
+    pub fn freeze_completion(&self, proposal: &crate::ring::Roster) -> Result<(), RingError> {
+        self.current()?;
+        if !matches!(
+            proposal.membership()?.change,
+            crate::ring::membership::RosterChange::CompleteComputer { .. }
+        ) {
+            return Err(RingError::Invalid("not local Computer completion".into()));
+        }
+        crate::ring::membership::verify_local_proposal(Some(&self.predecessor), proposal)?;
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or(RingError::Closed(CloseReason::Local))?;
+        if proposal.signed_by != inner.base.signer.sign_key()
+            || self.created.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RingError::Invalid(
+                "completion creator mismatch or already frozen".into(),
+            ));
+        }
+        *self.frozen.lock().unwrap_or_else(|e| e.into_inner()) = Some(proposal.clone());
+        Ok(())
+    }
+
     pub fn create(
         &self,
         intent: &crate::ring::pairing::adoption::AdoptionIntent,
@@ -1597,11 +1623,14 @@ impl ProposalConnection {
         }
         let mut unsigned = next.roster().clone();
         let mut membership = unsigned.membership()?;
-        let crate::ring::membership::RosterChange::Enroll { proofs, .. } = &mut membership.change
-        else {
-            return Err(RingError::Invalid(
-                "proposal publication must be Enroll".into(),
-            ));
+        let proofs = match &mut membership.change {
+            crate::ring::membership::RosterChange::Enroll { proofs, .. }
+            | crate::ring::membership::RosterChange::CompleteComputer { proofs, .. } => proofs,
+            _ => {
+                return Err(RingError::Invalid(
+                    "publication must be frozen adoption".into(),
+                ))
+            }
         };
         proofs.clear();
         unsigned.set_membership(&membership);

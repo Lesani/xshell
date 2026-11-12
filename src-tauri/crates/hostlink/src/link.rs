@@ -135,6 +135,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::DaemonUpgradeSelected { .. } => "daemon.upgrade-selected",
         ClientMsg::TermEvent { .. } => "term.event",
         ClientMsg::RingIdentity => "ring.identity",
+        ClientMsg::RingCompanion { .. } => "ring.companion-pending",
         ClientMsg::RingJoin { .. } => "ring.join",
         ClientMsg::PushRegister { .. } => "push.register",
         ClientMsg::PushUnregister => "push.unregister",

@@ -16,7 +16,7 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn load(store: &Store) -> Result<Option<CompanionPolicy>, String> {
+pub(super) fn load(store: &Store) -> Result<Option<CompanionPolicy>, String> {
     read_private(&store.dir.join("companion.json"))
         .map_err(|e| e.to_string())?
         .map(|bytes| {
@@ -25,14 +25,14 @@ fn load(store: &Store) -> Result<Option<CompanionPolicy>, String> {
         })
         .transpose()
 }
-fn save(store: &Store, policy: &CompanionPolicy) -> Result<(), String> {
+pub(super) fn save(store: &Store, policy: &CompanionPolicy) -> Result<(), String> {
     write_private(
         &store.dir.join("companion.json"),
         &serde_json::to_vec(policy).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
 }
-fn trusted(store: &Store) -> Result<Option<RosterChain>, String> {
+pub(super) fn trusted(store: &Store) -> Result<Option<RosterChain>, String> {
     let chain = store.read_chain()?;
     if chain.is_none()
         && std::fs::read_dir(&store.dir)
@@ -146,7 +146,30 @@ fn dispatch(
             hash: durable.head().hash(),
         });
     }
+    // Only retained completion needs this additional current/durable comparison. Taking
+    // the runtime membership lock for registration would invert the legacy Host-commit
+    // ordering (and a fresh Create has no retained membership to compare).
+    let completion_check = matches!(
+        &request,
+        CompanionRequest::CompletionStart { .. } | CompanionRequest::CheckPrepared { .. }
+    ) || matches!(&request, CompanionRequest::Prepare { proposal } if matches!(proposal.transcript, ConsentTranscript::Local) && !proposal.predecessor.is_empty())
+        || (matches!(&request, CompanionRequest::Consent { .. })
+            && std::fs::symlink_metadata(store.dir.join("completion.json")).is_ok());
+    let live = if completion_check {
+        Some(daemon.ring.lock_trusted_chain_until(budget)?)
+    } else {
+        None
+    };
     let _lock = store.lock_until(budget)?;
+    if completion_check
+        && live
+            .as_ref()
+            .and_then(|guard| guard.as_ref())
+            .map(|c| c.head().hash())
+            != trusted(&store)?.as_ref().map(|c| c.head().hash())
+    {
+        return Err("retained membership is not durably current".into());
+    }
     let keys = store
         .load_keys()?
         .ok_or("request counterpart Descriptor before registration")?;
@@ -168,6 +191,7 @@ fn dispatch(
             }
         } else {
             let _offer = store.registration_admission()?;
+            super::adoption::refuse_unresolved_standalone(&store)?;
             let registered = CompanionPolicy::new(profile.clone())?;
             budget.check().map_err(|e| e.to_string())?;
             save(&store, &registered)?;
@@ -180,7 +204,27 @@ fn dispatch(
     validate_profile(&store, policy.profile(), &keys)?;
     budget.check().map_err(|e| e.to_string())?;
     let response = match request {
+        CompanionRequest::CompletionStart { intent } => {
+            super::completion::start(&store, policy, intent)?
+        }
+        CompanionRequest::CompletionStatus => {
+            return Ok(CompanionResponse::Completion {
+                pending: super::completion::status(&store, policy)?.map(Box::new),
+            });
+        }
+        CompanionRequest::CheckPrepared { operation } => {
+            policy.check_prepared(
+                &operation,
+                live.as_ref().and_then(|guard| guard.as_ref()),
+                now(),
+            )?;
+            return Ok(CompanionResponse::Status {
+                operation,
+                phase: CompanionPhase::Prepared,
+            });
+        }
         CompanionRequest::Start { intent } => {
+            super::adoption::refuse_unresolved_standalone(&store)?;
             if trusted(&store)?.is_some() {
                 return Err("leave_required: Create requires an unpaired Daemon".into());
             }
@@ -227,9 +271,18 @@ fn dispatch(
         CompanionRequest::Consent {
             operation,
             desktop_proof,
-        } => CompanionResponse::Consent {
-            proof: policy.consent(&keys, &operation, &desktop_proof, now())?,
-        },
+        } => {
+            if completion_check {
+                policy.check_prepared(
+                    &operation,
+                    live.as_ref().and_then(|guard| guard.as_ref()),
+                    now(),
+                )?;
+            }
+            CompanionResponse::Consent {
+                proof: policy.consent(&keys, &operation, &desktop_proof, now())?,
+            }
+        }
         _ => return Err("invalid counterpart operation".into()),
     };
     // No proof is returned to the socket unless the matching obligation is durable.

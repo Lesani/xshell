@@ -138,6 +138,13 @@ pub enum CompanionRequest {
         proof: Signature,
     },
     Descriptor,
+    CompletionStart {
+        intent: AdoptionIntent,
+    },
+    CompletionStatus,
+    CheckPrepared {
+        operation: String,
+    },
     Start {
         intent: AdoptionIntent,
     },
@@ -203,6 +210,9 @@ pub enum CompanionResponse {
     Installed {
         hash: String,
     },
+    Completion {
+        pending: Option<Box<CompletionPending>>,
+    },
     Error {
         message: String,
     },
@@ -241,6 +251,13 @@ impl CompanionPolicy {
     }
     pub fn profile(&self) -> &CompanionProfile {
         &self.profile
+    }
+    pub fn completion_proofs(&self, proposal: &CompanionProposal) -> Option<Vec<ConsentProof>> {
+        let obligation = self.obligation.as_ref()?;
+        (obligation.proposal.as_ref() == Some(proposal)
+            && matches!(proposal.transcript, ConsentTranscript::Local))
+        .then(|| obligation.proofs.clone())
+        .flatten()
     }
     pub fn phase(&self, operation: &str) -> Result<CompanionPhase, String> {
         Ok(self.operation(operation)?.phase.clone())
@@ -424,6 +441,46 @@ impl CompanionPolicy {
         o.phase = CompanionPhase::Prepared;
         Ok(())
     }
+    /// Recheck a retained local proposal at proof release, not just when prepared.
+    /// Callers serialize current runtime trust and the obligation through this check/sign/save.
+    pub fn check_prepared(
+        &self,
+        operation: &str,
+        trusted: Option<&RosterChain>,
+        now: u64,
+    ) -> Result<(), String> {
+        let obligation = self.live(operation, now)?;
+        if obligation.phase != CompanionPhase::Prepared {
+            return Err("proposal not awaiting consent".into());
+        }
+        let proposal = obligation
+            .proposal
+            .as_ref()
+            .ok_or("prepared proposal missing")?;
+        if !matches!(proposal.transcript, ConsentTranscript::Local)
+            || proposal.predecessor.is_empty()
+        {
+            return Err("retained local proposal required".into());
+        }
+        let recorded =
+            RosterChain::from_tokens(&proposal.predecessor).map_err(|e| e.to_string())?;
+        let current = trusted.ok_or("retained membership missing at consent")?;
+        if current.head() != recorded.head()
+            || current.ring_id() != recorded.ring_id()
+            || current
+                .authorized_member(&proposal.proposal.signed_by)
+                .is_none()
+            || current
+                .authorized_member(&self.profile.daemon.sign_key)
+                .is_none()
+        {
+            return Err(
+                "prepared predecessor or participant changed; fresh proposal/confirmation required"
+                    .into(),
+            );
+        }
+        verify_local_proposal(Some(current.head()), &proposal.proposal).map_err(|e| e.to_string())
+    }
     pub fn consent(
         &mut self,
         keys: &DeviceKeys,
@@ -543,4 +600,36 @@ impl CompanionPolicy {
         self.obligation.as_mut().expect("checked operation").phase = CompanionPhase::Installed;
         Ok(())
     }
+}
+
+/// Public completion administration carries proposals and proofs, never a local
+/// confirmation capability or either guest store's installation receipt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionPending {
+    pub intent: AdoptionIntent,
+    pub predecessor: Vec<String>,
+    pub proposal: Option<CompanionProposal>,
+    pub proofs: Option<Vec<ConsentProof>>,
+    pub accepted: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CompanionAdminRequest {
+    Pending,
+    Propose {
+        proposal: Box<CompanionProposal>,
+    },
+    Proofs {
+        operation: String,
+    },
+    Accepted {
+        operation: String,
+        rosters: Vec<String>,
+    },
 }

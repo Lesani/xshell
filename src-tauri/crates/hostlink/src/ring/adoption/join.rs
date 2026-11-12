@@ -394,6 +394,7 @@ impl DesktopRing {
                 return Err("Join reservation changed".into());
             }
             stored.pending_join = Some(PendingJoin {
+                retained_predecessor: vec![],
                 intent: intent.clone(),
                 relay_url: relay.clone(),
             });
@@ -696,7 +697,7 @@ impl DesktopRing {
         }
     }
 
-    fn outgoing_update(
+    pub(super) fn outgoing_update(
         &self,
         operation: &str,
         update: impl FnOnce(&mut OutgoingAdoption),
@@ -774,14 +775,6 @@ impl DesktopRing {
             },
             Some(&cancel),
             |intent, hash| {
-                if !matches!(
-                    intent.target,
-                    xshell_protocol::ring::pairing::adoption::JoinTarget::Computer { .. }
-                ) {
-                    return Err(PairError::Payload(
-                        "this controller requires a Computer target".into(),
-                    ));
-                }
                 let ready_until = until.min(Instant::now() + self.cfg.pair_publish_wait);
                 let (chain, captured) = loop {
                     if cancel.load(Ordering::Acquire)
@@ -824,7 +817,10 @@ impl DesktopRing {
                     .map_err(|e| PairError::Payload(e.to_string()))?;
                 membership.enrollments.push(Enrollment {
                     id: intent.operation.clone(),
-                    kind: EnrollmentKind::Computer,
+                    kind: match intent.target {
+                        xshell_protocol::ring::pairing::adoption::JoinTarget::Computer { .. } => EnrollmentKind::Computer,
+                        xshell_protocol::ring::pairing::adoption::JoinTarget::StandaloneDaemon { .. } => EnrollmentKind::Daemon,
+                    },
                     members: intent
                         .target
                         .identities()
@@ -860,7 +856,7 @@ impl DesktopRing {
                                 .map(|r| r.token().into())
                                 .collect(),
                             proposal: proposal.clone(),
-                            final_noise_hash: b64::encode(&hash),
+                            final_noise_hash: Some(b64::encode(&hash)),
                             phase: OutgoingPhase::Prepared,
                             signed_candidate: None,
                             accepted: vec![],
@@ -882,6 +878,9 @@ impl DesktopRing {
                 })
             },
             |signed| {
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::ApprovalProofsReceived,
+                );
                 let op = operation
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -927,6 +926,9 @@ impl DesktopRing {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
                     .ok_or(PairError::Cancelled)?;
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::ApprovalBeforePublish,
+                );
                 if cancel.load(Ordering::Acquire)
                     || now() >= original_expiry
                     || !self.pairing_ipc_owner()

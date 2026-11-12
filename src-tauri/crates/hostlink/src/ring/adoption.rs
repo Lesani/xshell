@@ -1,6 +1,6 @@
 //! Public consented Computer Create, Join and Approve controllers. Confirmation is a local
-//! backend capability, never a Host/Relay request. Native origin/window integration,
-//! Host-first delegation, retained completion and general recovery remain separate work.
+//! backend capability, never a Host/Relay request. Retained v2 Daemon-only completion
+//! uses typed Host administration; native origins, Host-first and general recovery remain later.
 use super::companion_ipc::CompanionClient;
 use super::store::{AdoptionJournal, AdoptionPhase, RingState};
 use super::DesktopRing;
@@ -17,6 +17,8 @@ use xshell_protocol::ring::{
     DeviceKeys, Member, RingId, Roster, RosterChain, SignKey, Signature, Signer,
 };
 
+mod completion;
+pub use completion::{CompletionApproval, CompletionOutcome};
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinStatus};
 
@@ -119,6 +121,11 @@ impl RingEvents for BootstrapEvents {
     fn roster_rejected(&self, _: xshell_protocol::ring::RosterError) {}
 }
 impl DesktopRing {
+    fn adoption_test_point(&self, point: super::desktop::AdoptionTestPoint) {
+        if let Some(hook) = &self.cfg.adoption_test_hook {
+            (hook.0)(point);
+        }
+    }
     fn reserve_adoption(&self) -> Result<AdoptionAdmission, String> {
         self.adoption
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

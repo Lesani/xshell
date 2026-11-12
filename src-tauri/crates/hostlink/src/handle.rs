@@ -1910,6 +1910,22 @@ impl HostHandle {
         }
     }
 
+    /// Typed completion administration on this authorized Host generation. No request
+    /// here can register a counterpart, confirm its GUI, or sign arbitrary bytes.
+    pub fn companion_pending(
+        &self,
+        request: xshell_protocol::ring::companion::CompanionAdminRequest,
+        w: Waiter,
+    ) {
+        self.gated(
+            ClientMsg::RingCompanion { request },
+            &[RING_CAPABILITY],
+            RING_REFUSED,
+            Some(self.link_generation()),
+            w,
+        );
+    }
+
     /// `ring.identity`: the Host's Ring keys, name and membership, on link generation
     /// `link_gen` only ([`HostStatus::link_generation`]). Refused without sending anything
     /// when the Daemon does not advertise the `ring` capability.

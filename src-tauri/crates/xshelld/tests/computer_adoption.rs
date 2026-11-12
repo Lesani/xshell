@@ -70,6 +70,49 @@ mod unix {
     }
 
     #[test]
+    fn unregistered_headless_is_daemon_only_public_adoption() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        use std::time::Duration;
+        let relay = Relay::start();
+        let a = Computer::new(&relay);
+        a.ring
+            .create_computer(&a.companion(), |p, lease| {
+                Ok(CreateDecision::Confirm(lease.confirm(&p.proposal_hash)?))
+            })
+            .unwrap();
+        let home = tempfile::Builder::new().prefix("r3-").tempdir().unwrap();
+        let paths = xshelld::paths::resolve(home.path(), None, None);
+        let daemon_dir = paths.ring_dir.clone();
+        let d = Server::start(Config::new(home.path().into(), paths)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let url = relay.url();
+        std::thread::scope(|scope| {
+            let guest = scope.spawn(|| d.adopt_standalone(&url, Duration::from_secs(30), &Arc::new(AtomicBool::new(false)), |code| tx.send(code.clone()).unwrap(), |p, lease| {
+                assert!(matches!(p.intent.target, xshell_protocol::ring::pairing::adoption::JoinTarget::StandaloneDaemon { .. }));
+                assert!(!daemon_dir.join("companion.json").exists());
+                Ok(Some(lease.confirm(&p.proposal_hash)?))
+            }));
+            let code = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let approved = a.ring.approve_device_code(&code);
+            let joined = guest.join().unwrap();
+            assert!(
+                approved.is_ok(),
+                "standalone approval refused: {approved:?}"
+            );
+            let chain = joined.unwrap();
+            let m = chain.head().roster().membership().unwrap();
+            assert_eq!(m.enrollments.len(), 2);
+            assert_eq!(
+                m.enrollments[1].kind,
+                xshell_protocol::ring::membership::EnrollmentKind::Daemon
+            );
+            assert_eq!(chain.head().roster().members.len(), 3);
+            assert!(daemon_dir.join("roster.json").exists());
+            assert!(!daemon_dir.join("companion.json").exists());
+        });
+    }
+
+    #[test]
     fn public_create_uses_two_private_stores_only_after_backend_confirmation() {
         let mut relay = Relay::start();
         let computer = Computer::new(&relay);
@@ -1491,5 +1534,125 @@ mod unix {
             .unwrap();
         assert!(profile.pending_join.is_none() && profile.membership.is_none());
         assert!(guest.ring.begin_join(&guest.companion()).is_err());
+    }
+    #[test]
+    fn standalone_chain_store_order_child() {
+        if std::env::var_os("XSHELL_R3_LOCK_ORDER_CHILD").is_none() {
+            return;
+        }
+        use std::sync::{atomic::AtomicBool, mpsc, Mutex};
+        use std::time::Duration;
+        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+        use xshell_protocol::ring::{DeviceKeys, Member, Role, SignedRoster};
+        use xshelld::server::{TestHook, TestPoint};
+        let relay = Relay::start();
+        let (entered, reached) = mpsc::channel();
+        let (release, go) = mpsc::channel();
+        let go = Mutex::new(go);
+        let computer = Computer::with_hook(
+            &relay,
+            Some(TestHook(Arc::new(move |_, point| {
+                if point == TestPoint::BeforeHostRingJoinCommit {
+                    entered.send(()).unwrap();
+                    go.lock().unwrap().recv().unwrap();
+                }
+                false
+            }))),
+        );
+        let CompanionResponse::Identity { identity, .. } = computer
+            .companion()
+            .request(CompanionRequest::Descriptor)
+            .unwrap()
+        else {
+            panic!("identity");
+        };
+        // Historical v1 negative, matching the existing ordered Host-commit control.
+        let other = DeviceKeys::generate().unwrap();
+        let genesis =
+            SignedRoster::genesis(&other, other.noise_key(), "other", &relay.url(), 1).unwrap();
+        let next = genesis
+            .next(&other, 2, |draft| {
+                draft.add(Member::new(
+                    "daemon",
+                    Role::Daemon,
+                    identity.sign_key,
+                    identity.noise_key,
+                    2,
+                ))
+            })
+            .unwrap();
+        let url = relay.url();
+        std::thread::scope(|scope| {
+            let host = scope.spawn(|| {
+                host_request(
+                    &computer.daemon,
+                    xshell_protocol::msg::ClientMsg::RingJoin {
+                        rosters: vec![genesis.token().into(), next.token().into()],
+                        expect: None,
+                    },
+                )
+            });
+            reached.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (done, result) = mpsc::channel();
+            let daemon = &computer.daemon;
+            scope.spawn(move || {
+                let value = daemon.adopt_standalone(
+                    &url,
+                    Duration::from_secs(1),
+                    &Arc::new(AtomicBool::new(false)),
+                    |_| panic!("paused Host membership excludes incompatible words"),
+                    |_, _| panic!("no proof"),
+                );
+                done.send(value.is_err()).unwrap();
+            });
+            let bounded = result.recv_timeout(Duration::from_secs(2));
+            release.send(()).unwrap();
+            assert!(
+                bounded.is_ok_and(|refused| refused),
+                "standalone admission must be bounded before releasing the paused chain owner"
+            );
+            host.join().unwrap().unwrap();
+        });
+    }
+    #[test]
+    fn standalone_admission_respects_chain_before_store_and_original_budget() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix::standalone_chain_store_order_child",
+                "--nocapture",
+            ])
+            .env("XSHELL_R3_LOCK_ORDER_CHILD", "1")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    status.success(),
+                    "ordered child failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "ordered chain/store deadlock (owned process group killed): {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

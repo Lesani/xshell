@@ -233,6 +233,7 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
         // Ring membership is the Desktop's to manage.
         ClientMsg::RingIdentity => Err(forbidden("ring.identity")),
+        ClientMsg::RingCompanion { .. } => Err(forbidden("ring.companion-pending")),
         ClientMsg::RingJoin { .. } => Err(forbidden("ring.join")),
         // A Mobile's own push registration; the handler refuses anyone else.
         ClientMsg::PushRegister { .. } | ClientMsg::PushUnregister => Ok(()),
@@ -929,6 +930,9 @@ pub(crate) mod tests {
                 },
             },
             &ClientMsg::RingIdentity,
+            &ClientMsg::RingCompanion {
+                request: xshell_protocol::ring::companion::CompanionAdminRequest::Pending,
+            },
             &join,
         ] {
             assert!(check(Role::Mobile, &ctx, m)

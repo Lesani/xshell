@@ -755,6 +755,20 @@ impl Conn {
                 reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
             }
             ClientMsg::RingIdentity => reply(&self.ob, id, d.ring.identity()),
+            ClientMsg::RingCompanion { request } => {
+                #[cfg(unix)]
+                let result = if self.ingress != Ingress::Relay {
+                    Err("companion administration requires an authorized Ring link".into())
+                } else {
+                    super::completion::admin(&d, self.peer.as_ref().map(|p| p.sign_key), request)
+                };
+                #[cfg(not(unix))]
+                let result = {
+                    let _ = request;
+                    Err("Unix counterpart required".into())
+                };
+                reply(&self.ob, id, result);
+            }
             ClientMsg::RingJoin { rosters, expect } => {
                 // A Relay session can synchronize retained membership, not establish local
                 // provenance or bootstrap an unpaired counterpart.

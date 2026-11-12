@@ -316,6 +316,10 @@ impl AdoptionJournal {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PendingJoin {
+    /// Nonempty only for retained completion: the independently verified local trust
+    /// captured before any remote proposal. Fresh pairing uses its actual Noise context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_predecessor: Vec<String>,
     pub intent: xshell_protocol::ring::pairing::adoption::AdoptionIntent,
     pub relay_url: String,
 }
@@ -335,27 +339,52 @@ pub struct OutgoingAdoption {
     pub intent: xshell_protocol::ring::pairing::adoption::AdoptionIntent,
     pub predecessor: Vec<String>,
     pub proposal: xshell_protocol::ring::Roster,
-    pub final_noise_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_noise_hash: Option<String>,
     pub phase: OutgoingPhase,
     pub signed_candidate: Option<String>,
     pub accepted: Vec<String>,
 }
 impl OutgoingAdoption {
     fn validation_record(&self) -> Result<AdoptionJournal, String> {
-        let hash = xshell_protocol::ring::b64::decode_array::<32>(&self.final_noise_hash)
-            .map_err(|e| e.to_string())?;
+        let (transcript, context) = match &self.final_noise_hash {
+            Some(hash) => {
+                let bytes = xshell_protocol::ring::b64::decode_array::<32>(hash)
+                    .map_err(|e| e.to_string())?;
+                (
+                    xshell_protocol::ring::companion::ConsentTranscript::Pairing {
+                        final_noise_hash: hash.clone(),
+                    },
+                    xshell_protocol::ring::membership::pairing_consent_context(
+                        &self.proposal,
+                        &bytes,
+                    )
+                    .map_err(|e| e.to_string())?,
+                )
+            }
+            None => {
+                if !matches!(
+                    self.proposal
+                        .membership()
+                        .map_err(|e| e.to_string())?
+                        .change,
+                    xshell_protocol::ring::membership::RosterChange::CompleteComputer { .. }
+                ) {
+                    return Err("local outgoing proposal must be CompleteComputer".into());
+                }
+                (
+                    xshell_protocol::ring::companion::ConsentTranscript::Local,
+                    xshell_protocol::ring::membership::local_consent_context(&self.proposal)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+        };
         Ok(AdoptionJournal {
             intent: self.intent.clone(),
             predecessor: self.predecessor.clone(),
             proposal: self.proposal.clone(),
-            context: xshell_protocol::ring::membership::pairing_consent_context(
-                &self.proposal,
-                &hash,
-            )
-            .map_err(|e| e.to_string())?,
-            transcript: xshell_protocol::ring::companion::ConsentTranscript::Pairing {
-                final_noise_hash: self.final_noise_hash.clone(),
-            },
+            context,
+            transcript,
             phase: match self.phase {
                 OutgoingPhase::Prepared => AdoptionPhase::Prepared,
                 OutgoingPhase::PublicationUncertain => AdoptionPhase::PublicationUncertain,
@@ -766,6 +795,41 @@ impl Store {
             pending.intent.validate().map_err(|e| e.to_string())?;
             xshell_protocol::ring::url::RelayUrl::parse(&pending.relay_url)
                 .map_err(|e| e.to_string())?;
+            if !pending.retained_predecessor.is_empty() {
+                if pending.retained_predecessor.len() > 4096
+                    || pending
+                        .retained_predecessor
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
+                        > 16 * 1024 * 1024
+                {
+                    return Err("retained completion predecessor bounds".into());
+                }
+                let chain = RosterChain::from_tokens(&pending.retained_predecessor)
+                    .map_err(|e| e.to_string())?;
+                let companion = profile
+                    .companion
+                    .as_ref()
+                    .ok_or("completion counterpart missing")?;
+                if chain.head().roster().v != 2
+                    || chain.head().roster().relay_url != pending.relay_url
+                    || chain
+                        .authorized_member(&companion.daemon.sign_key)
+                        .is_none_or(|m| m.noise_key != companion.daemon.noise_key)
+                    || chain
+                        .head()
+                        .roster()
+                        .membership()
+                        .map_err(|e| e.to_string())?
+                        .unit_for(&companion.daemon.sign_key)
+                        .is_none_or(|unit| {
+                            unit.kind != xshell_protocol::ring::membership::EnrollmentKind::Daemon
+                        })
+                {
+                    return Err("retained completion trust mismatch".into());
+                }
+            }
             if profile.membership.is_some()
                 || profile
                     .companion

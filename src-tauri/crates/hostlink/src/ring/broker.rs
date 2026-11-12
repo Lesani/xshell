@@ -40,6 +40,9 @@ pub(crate) struct BrokerRequest {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub(crate) enum BrokerOperation {
+    CompanionPending {
+        request: xshell_protocol::ring::companion::CompanionAdminRequest,
+    },
     Call {
         method: String,
         params: Value,
@@ -811,6 +814,9 @@ impl Session {
         let session = self.clone();
         let done: Waiter = Box::new(move |result| session.finish(id, result));
         match request.operation {
+            BrokerOperation::CompanionPending { request } => {
+                h.companion_pending(request, done);
+            }
             BrokerOperation::Call { method, params } => {
                 if method.starts_with("daemon.") || method.starts_with("ring.") {
                     return Err(HostError::invalid(
@@ -1757,6 +1763,14 @@ impl BrokerHostProxy {
     }
     pub fn link_generation(&self) -> u64 {
         self.status().link_generation
+    }
+    pub fn companion_pending(
+        &self,
+        request: xshell_protocol::ring::companion::CompanionAdminRequest,
+        w: Waiter,
+    ) {
+        self.client
+            .request(self, BrokerOperation::CompanionPending { request }, None, w);
     }
     pub fn call(&self, method: String, params: Value, w: Waiter) {
         self.call_cancellable(method, params, w);

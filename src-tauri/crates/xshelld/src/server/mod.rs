@@ -18,11 +18,15 @@
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
 
+#[cfg(unix)]
+pub mod adoption;
 mod agent;
 mod calls;
 mod codex_link;
 #[cfg(unix)]
 mod companion;
+#[cfg(unix)]
+mod completion;
 mod conn;
 mod drops;
 mod last_line;

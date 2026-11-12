@@ -279,12 +279,24 @@ impl Store {
         self.refuse_registered_join()?;
         Ok(offer)
     }
+    #[cfg(unix)]
+    pub(super) fn reserve_standalone_offer(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<StoreLock, String> {
+        let offer = self.offer_lock()?;
+        let _ring = self.lock_until(budget)?;
+        self.refuse_registered_join()?;
+        Ok(offer)
+    }
     /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
     #[cfg(unix)]
     pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
         self.offer_lock()
     }
     pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        super::adoption::refuse_unresolved_standalone(self)?;
         if companion_registered(&self.dir) {
             return Err("protected_counterpart_required: registered Computer installation is not a legacy/Host commit".into());
         }
@@ -460,6 +472,10 @@ impl Store {
         };
         match origin {
             JoinOrigin::Host => self.refuse_registered_join()?,
+            #[cfg(unix)]
+            JoinOrigin::Standalone { operation } => {
+                super::adoption::validate_standalone_install(self, operation, chain)?
+            }
             #[cfg(unix)]
             JoinOrigin::Companion { operation } => {
                 super::companion::validate_install_locked(self, operation, chain)?
@@ -657,6 +673,10 @@ struct Life {
 enum JoinOrigin {
     Host,
     #[cfg(unix)]
+    Standalone {
+        operation: String,
+    },
+    #[cfg(unix)]
     Companion {
         operation: String,
     },
@@ -728,6 +748,32 @@ impl Ring {
     }
 
     /// The chain this Host trusts, if it is in a Ring.
+    #[cfg(unix)]
+    pub(super) fn lock_trusted_chain_until<'a>(
+        &'a self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<std::sync::MutexGuard<'a, Option<RosterChain>>, String> {
+        budget.lock(&self.persist.chain).map_err(|e| e.to_string())
+    }
+    /// The established order is runtime chain, then ring.lock. Never hold a file lock
+    /// while waiting for the chain owner (including a paused ordinary Host commit).
+    #[cfg(unix)]
+    pub(super) fn standalone_transaction<T>(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        change: impl FnOnce(&Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let live = self.lock_trusted_chain_until(budget)?;
+        let store = &self.persist.store;
+        let _lock = store.lock_until(budget)?;
+        store.refuse_registered_join()?;
+        if live.is_some() || super::companion::trusted(store)?.is_some() {
+            return Err("leave_required: standalone adoption requires an unpaired Daemon".into());
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        change(store)
+    }
+
     pub fn trusted_chain(&self) -> Option<RosterChain> {
         self.persist
             .chain
@@ -888,6 +934,22 @@ impl Ring {
     /// the expected one, checked under the same locks as the commit.
     pub fn join(&self, tokens: &[String], expect: Option<&JoinExpect>) -> Result<Value, String> {
         self.join_inner(tokens, expect, JoinOrigin::Host, None)
+    }
+    #[cfg(unix)]
+    pub(super) fn join_accepted_standalone(
+        &self,
+        tokens: &[String],
+        operation: &str,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(
+            tokens,
+            None,
+            JoinOrigin::Standalone {
+                operation: operation.into(),
+            },
+            Some(budget),
+        )
     }
     #[cfg(unix)]
     pub(super) fn join_accepted_companion(

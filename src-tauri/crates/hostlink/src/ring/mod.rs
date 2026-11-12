@@ -14,9 +14,9 @@ pub mod store;
 pub mod sync;
 
 pub use desktop::{
-    ConfiguredHosts, DesktopRing, DesktopRingConfig, FarewellView, HostOutcome, HostRef,
-    LocalIdentity, MemberView, PairingEvent, PairingFlow, PairingObserver, PhoneOffer,
-    PresenceView, RingObserver, RingView, REMOVE_IN_USE, REMOVE_SELF,
+    AdoptionTestHook, AdoptionTestPoint, ConfiguredHosts, DesktopRing, DesktopRingConfig,
+    FarewellView, HostOutcome, HostRef, LocalIdentity, MemberView, PairingEvent, PairingFlow,
+    PairingObserver, PhoneOffer, PresenceView, RingObserver, RingView, REMOVE_IN_USE, REMOVE_SELF,
 };
 pub use store::HostMember;
 pub use sync::{HostRingState, HostSync, SyncWorker};

@@ -311,8 +311,20 @@ pub trait RingObserver: Send + Sync {
     fn changed(&self, view: &RingView);
 }
 
+/// Deterministic transaction test seams; none supplies authority or alters a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptionTestPoint {
+    ApprovalProofsReceived,
+    ApprovalBeforePublish,
+    CompletionBeforeUncertainWrite,
+    CompletionBeforePublish,
+}
+#[derive(Clone)]
+pub struct AdoptionTestHook(pub Arc<dyn Fn(AdoptionTestPoint) + Send + Sync>);
+
 #[derive(Clone)]
 pub struct DesktopRingConfig {
+    pub adoption_test_hook: Option<AdoptionTestHook>,
     /// The private directory holding `ring.json`.
     pub dir: PathBuf,
     /// This Desktop's member name (the hostname).
@@ -348,6 +360,7 @@ impl DesktopRingConfig {
     pub fn new(dir: PathBuf, name: String) -> Self {
         let hosted = super::HOSTED_RELAY_URL.to_string();
         DesktopRingConfig {
+            adoption_test_hook: None,
             dir,
             name,
             default_relay_url: hosted.clone(),

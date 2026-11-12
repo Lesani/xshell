@@ -133,6 +133,11 @@ pub enum ClientMsg {
     /// only; gated on the `ring` capability.
     #[serde(rename = "ring.identity")]
     RingIdentity,
+    /// Authorized Ring administration only; cannot register or confirm a local GUI.
+    #[serde(rename = "ring.companion-pending")]
+    RingCompanion {
+        request: crate::ring::companion::CompanionAdminRequest,
+    },
     /// Join (or follow) a Ring: the whole Roster chain from version 1, as tokens. The chain
     /// must verify and its head must list this Host as a `daemon`; a chain of the same Ring
     /// must extend the stored one. Desktop only; gated on the `ring` capability.
@@ -693,6 +698,7 @@ const CLIENT_TYPES: &[&str] = &[
     "daemon.upgrade-selected",
     "term.event",
     "ring.identity",
+    "ring.companion-pending",
     "ring.join",
     "push.register",
     "push.unregister",
@@ -1330,6 +1336,29 @@ mod tests {
                     .as_bytes()
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn companion_pending_is_typed_administration_not_confirmation_or_signing() {
+        use crate::ring::companion::CompanionAdminRequest;
+        for request in [
+            CompanionAdminRequest::Pending,
+            CompanionAdminRequest::Proofs {
+                operation: "operation".into(),
+            },
+            CompanionAdminRequest::Accepted {
+                operation: "operation".into(),
+                rosters: vec![],
+            },
+        ] {
+            let msg = ClientMsg::RingCompanion { request };
+            let bytes = body(encode_msg(&msg, Some(7)).unwrap());
+            assert_eq!(decode_inbound(&bytes).unwrap().msg, msg);
+        }
+        for action in ["register", "confirm", "sign"] {
+            let bytes = json!({"t":"ring.companion-pending", "request":{"action":action,"confirm":true,"bytes":"eA"}}).to_string();
+            assert!(decode_inbound(bytes.as_bytes()).is_err());
         }
     }
 

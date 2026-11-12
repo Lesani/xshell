@@ -81,10 +81,24 @@ impl Computer {
     pub(super) fn with_config(relay: &Relay, tweak: impl FnOnce(&mut Config)) -> Self {
         Self::with_factory(relay, tweak, |_| Arc::new(NoSsh))
     }
+    pub(super) fn with_ring_config(
+        relay: &Relay,
+        tweak: impl FnOnce(&mut DesktopRingConfig),
+    ) -> Self {
+        Self::with_options(relay, |_| {}, |_| Arc::new(NoSsh), tweak)
+    }
     pub(super) fn with_factory(
         relay: &Relay,
         tweak: impl FnOnce(&mut Config),
         factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
+    ) -> Self {
+        Self::with_options(relay, tweak, factory, |_| {})
+    }
+    fn with_options(
+        relay: &Relay,
+        tweak: impl FnOnce(&mut Config),
+        factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
+        ring_config: impl FnOnce(&mut DesktopRingConfig),
     ) -> Self {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
@@ -95,6 +109,7 @@ impl Computer {
         cfg.default_relay_url = relay.url();
         cfg.owner_retry = Duration::from_millis(20);
         cfg.backoff_unit = Duration::from_millis(10);
+        ring_config(&mut cfg);
         let ring = DesktopRing::open(cfg, Arc::new(Quiet));
         let events = Arc::new(Events::default());
         let mut cfg = ManagerConfig::new("1.5.0", factory(&home), Arc::new(NoSsh), events.clone());

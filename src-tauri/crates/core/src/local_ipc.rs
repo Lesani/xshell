@@ -13,6 +13,12 @@ pub struct RequestBudget {
     stop: Arc<AtomicBool>,
 }
 impl RequestBudget {
+    /// Reuse bounded lock admission for an explicit in-process operation. This carries
+    /// only its original deadline/cancellation, never local confirmation authority.
+    pub fn for_operation(until: Instant, stop: Arc<AtomicBool>) -> Self {
+        Self { until, stop }
+    }
+
     pub fn check(&self) -> io::Result<()> {
         if self.stop.load(Ordering::Acquire) {
             return Err(io::Error::new(
