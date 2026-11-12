@@ -627,7 +627,8 @@ pub struct DesktopRing {
     pub(super) cfg: DesktopRingConfig,
     pub(super) store: Store,
     /// Nonblocking admission for one local adoption; never a filesystem lock.
-    pub(super) adoption: Mutex<()>,
+    pub(super) adoption: Arc<AtomicBool>,
+    pub(super) adoption_cancel: Mutex<Option<Weak<AtomicBool>>>,
     observer: Arc<dyn RingObserver>,
     live: Mutex<Live>,
     /// Serializes every commit with the adoption of its result (into `live` and the
@@ -788,7 +789,8 @@ impl DesktopRing {
         let ring = Arc::new_cyclic(|me| DesktopRing {
             cfg,
             store,
-            adoption: Mutex::new(()),
+            adoption: Arc::new(AtomicBool::new(false)),
+            adoption_cancel: Mutex::new(None),
             observer,
             live: Mutex::new(Live::default()),
             commit: Mutex::new(()),
@@ -1452,6 +1454,28 @@ impl DesktopRing {
 
     /// The same connection election owns the private enrollment endpoint, even before
     /// a Ring exists. Missing membership never creates a Ring or a second signer.
+    pub(super) fn proposal_snapshot(
+        &self,
+    ) -> Result<
+        (
+            RosterChain,
+            xshell_protocol::ring::relay::connector::ProposalConnection,
+        ),
+        String,
+    > {
+        let connector = self
+            .lock()
+            .connector
+            .clone()
+            .ok_or("creator Connector is not available")?;
+        let lane = connector.proposal_connection().map_err(|e| e.to_string())?;
+        let chain = connector.chain();
+        if chain.head() != lane.predecessor() {
+            return Err("creator snapshot changed before proposal reservation".into());
+        }
+        Ok((chain, lane))
+    }
+
     pub fn pairing_ipc_owner(&self) -> bool {
         self.ensure_connector();
         let state = self.lock();
@@ -2584,6 +2608,15 @@ impl DesktopRing {
     /// The app quits: say goodbye (`quit`), stop connecting, and hand the connection over
     /// (the owner lock is released after the goodbye).
     pub fn quit(&self) {
+        if let Some(cancel) = self
+            .adoption_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            cancel.store(true, Ordering::Release);
+        }
         {
             let _commit = self.lock_commit();
             let mut live = self.lock();

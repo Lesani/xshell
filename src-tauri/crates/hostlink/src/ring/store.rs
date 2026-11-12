@@ -62,6 +62,8 @@ pub struct ProfileState {
     pub membership: Option<RingState>,
     pub journal: Option<AdoptionJournal>,
     pub companion: Option<xshell_protocol::ring::companion::CompanionProfile>,
+    pub pending_join: Option<PendingJoin>,
+    pub outgoing: Option<OutgoingAdoption>,
 }
 
 /// A conservative durable obligation, not permission to replay a signed mutation.
@@ -310,6 +312,86 @@ impl AdoptionJournal {
     }
 }
 
+/// Nonsecret pre-proposal reservation. Words, PairSecret and live leases never enter it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingJoin {
+    pub intent: xshell_protocol::ring::pairing::adoption::AdoptionIntent,
+    pub relay_url: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OutgoingPhase {
+    Prepared,
+    PublicationUncertain,
+    Published,
+    Cancelled,
+}
+/// The approver's publication obligation. Published is a Relay disposition, not a receipt
+/// for either of the guest's private stores; those receipts are deliberately absent here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutgoingAdoption {
+    pub intent: xshell_protocol::ring::pairing::adoption::AdoptionIntent,
+    pub predecessor: Vec<String>,
+    pub proposal: xshell_protocol::ring::Roster,
+    pub final_noise_hash: String,
+    pub phase: OutgoingPhase,
+    pub signed_candidate: Option<String>,
+    pub accepted: Vec<String>,
+}
+impl OutgoingAdoption {
+    fn validation_record(&self) -> Result<AdoptionJournal, String> {
+        let hash = xshell_protocol::ring::b64::decode_array::<32>(&self.final_noise_hash)
+            .map_err(|e| e.to_string())?;
+        Ok(AdoptionJournal {
+            intent: self.intent.clone(),
+            predecessor: self.predecessor.clone(),
+            proposal: self.proposal.clone(),
+            context: xshell_protocol::ring::membership::pairing_consent_context(
+                &self.proposal,
+                &hash,
+            )
+            .map_err(|e| e.to_string())?,
+            transcript: xshell_protocol::ring::companion::ConsentTranscript::Pairing {
+                final_noise_hash: self.final_noise_hash.clone(),
+            },
+            phase: match self.phase {
+                OutgoingPhase::Prepared => AdoptionPhase::Prepared,
+                OutgoingPhase::PublicationUncertain => AdoptionPhase::PublicationUncertain,
+                OutgoingPhase::Published => AdoptionPhase::Accepted,
+                OutgoingPhase::Cancelled => AdoptionPhase::Cancelled,
+            },
+            signed_candidate: self.signed_candidate.clone(),
+            accepted: self.accepted.clone(),
+            desktop_installed: false,
+            daemon_installed: false,
+        })
+    }
+    fn validate(&self) -> Result<(), String> {
+        if matches!(
+            self.phase,
+            OutgoingPhase::PublicationUncertain | OutgoingPhase::Published
+        ) && self.signed_candidate.is_none()
+        {
+            return Err("outgoing publication requires its exact signed candidate".into());
+        }
+        self.validation_record()?.validate()
+    }
+    fn may_replace_with(&self, new: Option<&Self>) -> Result<(), String> {
+        if matches!(
+            self.phase,
+            OutgoingPhase::Published | OutgoingPhase::Cancelled
+        ) && new.is_none_or(|new| new.intent.operation != self.intent.operation)
+        {
+            return Ok(());
+        }
+        let new = new.ok_or("outgoing publication still requires reconciliation")?;
+        self.validation_record()?
+            .may_replace_with(Some(&new.validation_record()?))
+    }
+}
+
 /// A Remote Host's Daemon in the Roster.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -373,6 +455,10 @@ struct File {
     adoption: Option<AdoptionJournal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     companion: Option<xshell_protocol::ring::companion::CompanionProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_join: Option<PendingJoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outgoing: Option<OutgoingAdoption>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -454,7 +540,9 @@ impl Store {
                         keys: state.keys.clone(),
                         membership: Some(state),
                         journal: profile.as_ref().and_then(|p| p.journal.clone()),
-                        companion: profile.and_then(|p| p.companion),
+                        companion: profile.as_ref().and_then(|p| p.companion.clone()),
+                        pending_join: profile.as_ref().and_then(|p| p.pending_join.clone()),
+                        outgoing: profile.and_then(|p| p.outgoing),
                     })
                 }
             };
@@ -494,6 +582,8 @@ impl Store {
                     .as_ref()
                     .map(|s| (s.keys.sign_key(), s.keys.noise_key()));
                 let journal = state.as_ref().and_then(|s| s.journal.clone());
+                let outgoing = state.as_ref().and_then(|s| s.outgoing.clone());
+                let pending = state.as_ref().and_then(|s| s.pending_join.clone());
                 let companion = state.as_ref().and_then(|s| s.companion.clone());
                 let membership = state
                     .as_ref()
@@ -511,6 +601,10 @@ impl Store {
                         }
                         if let Some(journal) = &journal {
                             journal.may_replace_with(n.journal.as_ref())?;
+                        }
+                        if let Some(outgoing) = &outgoing { outgoing.may_replace_with(n.outgoing.as_ref())?; }
+                        if pending.as_ref().is_some_and(|pending| n.pending_join.as_ref().is_some_and(|new| new != pending)) {
+                            return Err("pending Join must be explicitly terminated before replacement".into());
                         }
                         if let Some(old) = &membership {
                             let next = n.membership.as_ref().ok_or("leave_required: retained membership cannot be discarded")?;
@@ -644,6 +738,8 @@ impl Store {
                     membership: None,
                     journal: None,
                     companion: None,
+                    pending_join: None,
+                    outgoing: None,
                 }),
                 keys,
             ))
@@ -666,6 +762,42 @@ impl Store {
                 return Err("retained Desktop companion profile association mismatch".into());
             }
         }
+        if let Some(pending) = &profile.pending_join {
+            pending.intent.validate().map_err(|e| e.to_string())?;
+            xshell_protocol::ring::url::RelayUrl::parse(&pending.relay_url)
+                .map_err(|e| e.to_string())?;
+            if profile.membership.is_some()
+                || profile
+                    .companion
+                    .as_ref()
+                    .is_none_or(|companion| pending.intent.target != companion.target())
+            {
+                return Err("pending Join profile/membership mismatch".into());
+            }
+        }
+        if let Some(outgoing) = &profile.outgoing {
+            if profile.membership.is_none() {
+                return Err("outgoing adoption requires retained approver membership".into());
+            }
+            outgoing.validate()?;
+            let member = profile
+                .membership
+                .as_ref()
+                .ok_or("approver membership missing")?;
+            if outgoing.proposal.signed_by != profile.keys.sign_key()
+                || outgoing.proposal.ring_id != *member.chain.ring_id()
+                || outgoing
+                    .predecessor
+                    .iter()
+                    .enumerate()
+                    .any(|(index, token)| {
+                        member.chain.versions().get(index).map(|r| r.token())
+                            != Some(token.as_str())
+                    })
+            {
+                return Err("outgoing proposal does not match the retained creator/trust".into());
+            }
+        }
         Ok(())
     }
     fn save_locked(&self, profile: &ProfileState) -> Result<(), String> {
@@ -682,7 +814,12 @@ impl Store {
         }
         let (sign, noise) = profile.keys.seeds();
         let f = File {
-            v: if state.is_some() && profile.journal.is_none() && profile.companion.is_none() {
+            v: if state.is_some()
+                && profile.journal.is_none()
+                && profile.companion.is_none()
+                && profile.pending_join.is_none()
+                && profile.outgoing.is_none()
+            {
                 1
             } else {
                 2
@@ -707,6 +844,8 @@ impl Store {
             host_members: state.map(|s| s.host_members.clone()).unwrap_or_default(),
             adoption: profile.journal.clone(),
             companion: profile.companion.clone(),
+            pending_join: profile.pending_join.clone(),
+            outgoing: profile.outgoing.clone(),
         };
         let json = encode(&f)?;
         write_private(&self.file(), &json).map_err(|e| e.to_string())
@@ -719,14 +858,30 @@ fn capacity(f: &File) -> usize {
     let esc = |s: &str| 6 * s.len() + 2;
     // The keys, the seeds, `localMember`, the numbers and the punctuation.
     1024 + f
-        .companion
+        .pending_join
         .as_ref()
-        .map(|profile| {
-            serde_json::to_vec(profile)
-                .expect("profile serializes")
+        .map(|v| {
+            serde_json::to_vec(v)
+                .expect("pending Join serializes")
                 .len()
         })
         .unwrap_or(0)
+        + f.outgoing
+            .as_ref()
+            .map(|v| {
+                serde_json::to_vec(v)
+                    .expect("outgoing adoption serializes")
+                    .len()
+            })
+            .unwrap_or(0)
+        + f.companion
+            .as_ref()
+            .map(|profile| {
+                serde_json::to_vec(profile)
+                    .expect("profile serializes")
+                    .len()
+            })
+            .unwrap_or(0)
         + f.adoption
             .as_ref()
             .map(|a| serde_json::to_vec(a).expect("journal serializes").len())
@@ -757,7 +912,13 @@ fn encode(f: &File) -> Result<Zeroizing<Vec<u8>>, String> {
 
 fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
     let f: File = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if (f.v != 1 && f.v != 2) || (f.v == 1 && (f.adoption.is_some() || f.companion.is_some())) {
+    if (f.v != 1 && f.v != 2)
+        || (f.v == 1
+            && (f.adoption.is_some()
+                || f.companion.is_some()
+                || f.pending_join.is_some()
+                || f.outgoing.is_some()))
+    {
         return Err(format!("unsupported profile format {}", f.v));
     }
     let keys = DeviceKeys::from_seeds(&f.sign_seed.0, &f.noise_seed.0);
@@ -780,6 +941,8 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
             membership: None,
             journal: f.adoption,
             companion: f.companion,
+            pending_join: f.pending_join,
+            outgoing: f.outgoing,
         });
     }
     let chain = RosterChain::from_tokens(&f.rosters).map_err(|e| e.to_string())?;
@@ -818,6 +981,8 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
         membership: Some(membership),
         journal: f.adoption,
         companion: f.companion,
+        pending_join: f.pending_join,
+        outgoing: f.outgoing,
     })
 }
 
@@ -1072,6 +1237,8 @@ mod tests {
             host_members: BTreeMap::new(),
             adoption: None,
             companion: None,
+            pending_join: None,
+            outgoing: None,
         };
         let mut v = serde_json::to_value(&f).unwrap();
         let o = v.as_object_mut().unwrap();
@@ -1331,6 +1498,8 @@ mod tests {
             host_members: st.host_members.clone(),
             adoption: None,
             companion: None,
+            pending_join: None,
+            outgoing: None,
         };
         let cap = capacity(&f);
         let json = encode(&f).unwrap();

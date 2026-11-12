@@ -1410,6 +1410,7 @@ pub struct ProposalConnection {
     grant: Mutex<Option<super::proposal::ProposalHandle>>,
     created: std::sync::atomic::AtomicBool,
     published: std::sync::atomic::AtomicBool,
+    published_token: Mutex<Option<String>>,
 }
 
 impl Connector {
@@ -1440,11 +1441,55 @@ impl Connector {
             grant: Mutex::new(None),
             created: std::sync::atomic::AtomicBool::new(false),
             published: std::sync::atomic::AtomicBool::new(false),
+            published_token: Mutex::new(None),
         })
     }
 }
 
 impl ProposalConnection {
+    pub fn predecessor(&self) -> &SignedRoster {
+        &self.predecessor
+    }
+    /// Read back this exact candidate on the captured creator socket after publication.
+    /// A replacement connection or a different signed token is not a recovery anchor.
+    pub fn read_accepted(&self, signed: &SignedRoster) -> Result<RosterChain, RingError> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or(RingError::Closed(CloseReason::Local))?;
+        {
+            let state = lock(&inner.st);
+            if !self.published.load(std::sync::atomic::Ordering::Acquire)
+                || state.stop.is_some()
+                || state.gen != self.generation
+                || !state
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| Arc::ptr_eq(client, &self.client))
+                || self.client.is_closed()
+            {
+                return Err(RingError::Invalid(
+                    "proposal creator connection ended; reconcile instead".into(),
+                ));
+            }
+        }
+        if self
+            .published_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            != Some(signed.token())
+        {
+            return Err(RingError::Invalid(
+                "accepted read is not this exact published candidate".into(),
+            ));
+        }
+        self.client.read_accepted_chain(&super::ChainPin {
+            version: signed.version(),
+            hash: signed.hash(),
+        })
+    }
+
     fn current(&self) -> Result<(), RingError> {
         let inner = self
             .inner
@@ -1580,6 +1625,10 @@ impl ProposalConnection {
                 "proposal publication is one-shot; reconcile instead".into(),
             ));
         }
+        *self
+            .published_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(next.token().into());
         self.client.publish_roster(next)
     }
 }

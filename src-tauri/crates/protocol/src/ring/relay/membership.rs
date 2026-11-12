@@ -41,6 +41,14 @@ impl RingClient {
         kind: Kind,
         frame: impl FnOnce(u64) -> ClientFrame,
     ) -> Result<RelayFrame, RingError> {
+        self.membership_request_with_timeout(kind, frame, self.timeouts.request)
+    }
+    pub(super) fn membership_request_with_timeout(
+        &self,
+        kind: Kind,
+        frame: impl FnOnce(u64) -> ClientFrame,
+        timeout: Duration,
+    ) -> Result<RelayFrame, RingError> {
         let at_capacity = {
             let st = lock(&self.state);
             st.waiting.len() + st.replies.len() >= 256
@@ -50,7 +58,7 @@ impl RingClient {
         }
         let ticket = self.waited(kind, None, |id, _| frame(id))?;
         let id = ticket.id();
-        let result = ticket.wait(self.timeouts.request);
+        let result = ticket.wait(timeout);
         let response = lock(&self.state).replies.remove(&id);
         result?;
         response.ok_or_else(|| RingError::Protocol("missing membership response".into()))

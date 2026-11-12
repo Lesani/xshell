@@ -1,5 +1,6 @@
-//! Public Runtime1 Create transaction. The callback is a local backend boundary, not a
-//! Host/Relay request. Native window-origin integration and the other A controllers follow.
+//! Public consented Computer Create, Join and Approve controllers. Confirmation is a local
+//! backend capability, never a Host/Relay request. Native origin/window integration,
+//! Host-first delegation, retained completion and general recovery remain separate work.
 use super::companion_ipc::CompanionClient;
 use super::store::{AdoptionJournal, AdoptionPhase, RingState};
 use super::DesktopRing;
@@ -16,6 +17,15 @@ use xshell_protocol::ring::{
     DeviceKeys, Member, RingId, Roster, RosterChain, SignKey, Signature, Signer,
 };
 
+mod join;
+pub use join::{ApprovalOutcome, JoinOffer, JoinStatus};
+
+struct AdoptionAdmission(Arc<AtomicBool>);
+impl Drop for AdoptionAdmission {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -36,8 +46,9 @@ pub struct ConsentPreview {
     pub proposal: Roster,
     pub expires_at: u64,
 }
-/// An in-process, operation-specific lease. It cannot be deserialized or sent over Host
-/// IPC. OS/window lifecycle integration is deliberately not claimed by this backend type.
+/// An in-process, operation-specific lease, introduced for Create and also used by Join.
+/// It cannot be deserialized or sent over Host IPC. Native window-origin integration is
+/// deliberately not claimed by this backend capability.
 #[derive(Clone)]
 pub struct CreateConfirmationLease {
     operation: String,
@@ -108,11 +119,15 @@ impl RingEvents for BootstrapEvents {
     fn roster_rejected(&self, _: xshell_protocol::ring::RosterError) {}
 }
 impl DesktopRing {
-    pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
-        let _admission = self
-            .adoption
-            .try_lock()
+    fn reserve_adoption(&self) -> Result<AdoptionAdmission, String> {
+        self.adoption
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "another adoption operation is active")?;
+        Ok(AdoptionAdmission(self.adoption.clone()))
+    }
+
+    pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
+        let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
             return Err("another process owns the Desktop counterpart".into());
         }
@@ -216,6 +231,58 @@ impl DesktopRing {
         }
         Ok(())
     }
+    fn install_joined_computer(
+        &self,
+        client: &CompanionClient,
+        operation: &str,
+        profile: &CompanionProfile,
+        accepted: &RosterChain,
+    ) -> Result<(), String> {
+        let tokens: Vec<String> = accepted
+            .versions()
+            .iter()
+            .map(|roster| roster.token().into())
+            .collect();
+        self.journal_update(operation, |journal| {
+            journal.phase = AdoptionPhase::Accepted;
+            journal.accepted = tokens.clone();
+        })?;
+        match client.request(CompanionRequest::InstallAccepted {
+            operation: operation.into(),
+            rosters: tokens,
+        })? {
+            CompanionResponse::Installed { hash } if hash == accepted.head().hash() => {}
+            _ => return Err("counterpart durable installation receipt missing".into()),
+        }
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained profile missing")?;
+            let journal = stored
+                .journal
+                .as_mut()
+                .filter(|journal| journal.intent.operation == operation)
+                .ok_or("adoption journal changed")?;
+            if stored.membership.is_some() {
+                return Err("membership appeared before accepted local installation".into());
+            }
+            journal.daemon_installed = true;
+            journal.desktop_installed = true;
+            journal.phase = AdoptionPhase::Installed;
+            stored.membership = Some(RingState {
+                keys: stored.keys.clone(),
+                chain: accepted.clone(),
+                local_member: Some(profile.daemon.sign_key),
+                farewells: vec![],
+                held_relays: [accepted.head().roster().relay_url.clone()]
+                    .into_iter()
+                    .collect(),
+                host_members: Default::default(),
+            });
+            Ok((Some(stored), ()))
+        })?;
+        self.reload();
+        Ok(())
+    }
+
     /// Explicit Create only. No connection/setup path calls this automatically. The callback
     /// must present the verified preview and return a matching in-process confirmation.
     pub fn create_computer(
@@ -226,14 +293,14 @@ impl DesktopRing {
             &CreateConfirmationLease,
         ) -> Result<CreateDecision, String>,
     ) -> Result<AdoptionOutcome, String> {
-        let _admission = self
-            .adoption
-            .try_lock()
-            .map_err(|_| "another adoption operation is active")?;
+        let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
             return Err("another process owns Create".into());
         }
         if let Some(profile) = self.store.load_profile()?.0 {
+            if profile.pending_join.is_some() {
+                return Err("reconciliation_required: an earlier Join is unresolved".into());
+            }
             if profile.membership.is_some() {
                 return Err("leave_required: Create needs an unpaired Desktop".into());
             }
@@ -313,6 +380,10 @@ impl DesktopRing {
             expires_at,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
+        *self
+            .adoption_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&lease.cancelled));
         self.store.transact_profile(|stored, _| {
             let mut stored = stored.ok_or("retained profile missing")?;
             if stored.membership.is_some() {
@@ -439,46 +510,7 @@ impl DesktopRing {
                     "accepted Create is forked or no longer authorizes this Computer".into(),
                 );
             }
-            let tokens: Vec<String> = accepted
-                .versions()
-                .iter()
-                .map(|roster| roster.token().into())
-                .collect();
-            self.journal_update(&operation, |journal| {
-                journal.phase = AdoptionPhase::Accepted;
-                journal.accepted = tokens.clone();
-            })?;
-            match client.request(CompanionRequest::InstallAccepted {
-                operation: operation.clone(),
-                rosters: tokens,
-            })? {
-                CompanionResponse::Installed { hash } if hash == accepted.head().hash() => {}
-                _ => return Err("counterpart durable installation receipt missing".into()),
-            }
-            self.store.transact_profile(|stored, _| {
-                let mut stored = stored.ok_or("retained profile missing")?;
-                let journal = stored
-                    .journal
-                    .as_mut()
-                    .filter(|journal| journal.intent.operation == operation)
-                    .ok_or("Create journal changed")?;
-                if stored.membership.is_some() {
-                    return Err("membership appeared before accepted Create installation".into());
-                }
-                journal.daemon_installed = true;
-                journal.desktop_installed = true;
-                journal.phase = AdoptionPhase::Installed;
-                stored.membership = Some(RingState {
-                    keys: stored.keys.clone(),
-                    chain: accepted.clone(),
-                    local_member: Some(profile.daemon.sign_key),
-                    farewells: vec![],
-                    held_relays: [completed.relay_url.clone()].into_iter().collect(),
-                    host_members: Default::default(),
-                });
-                Ok((Some(stored), ()))
-            })?;
-            self.reload();
+            self.install_joined_computer(client, &operation, &profile, &accepted)?;
             Ok(AdoptionOutcome::Installed {
                 operation: operation.clone(),
                 chain: accepted,

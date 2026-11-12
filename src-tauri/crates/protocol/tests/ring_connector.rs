@@ -2029,3 +2029,63 @@ fn proposal_connection_capture_does_not_replace_the_creator_socket() {
         .to_string()
         .contains("creator connection or predecessor changed"));
 }
+
+/// Legacy readback control; v2 publication readback is covered by actualworkerd public
+/// Join/Approve, not by pretending TestRelay implements the v2 proposal protocol.
+#[test]
+fn accepted_chain_readback_uses_existing_client_and_rejects_wrong_pin() {
+    use xshell_protocol::ring::relay::{ChainPin, RingClient};
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let client = RingClient::connect(
+        config(&relay.target(), &chain, ring.desktop.clone()),
+        xshell_protocol::ring::relay::contract::Recorder::new(),
+    )
+    .unwrap();
+    let accepted = client
+        .read_accepted_chain(&ChainPin {
+            version: 1,
+            hash: chain.head().hash(),
+        })
+        .unwrap();
+    assert_eq!(accepted, chain);
+    assert!(client
+        .read_accepted_chain(&ChainPin {
+            version: 1,
+            hash: xshell_protocol::ring::b64::encode(&[99; 32])
+        })
+        .is_err());
+    assert!(!client.is_closed());
+    assert_eq!(client.chain(), chain);
+    client.bye(ByeReason::quit()).unwrap();
+}
+
+#[test]
+fn accepted_chain_readback_timeout_does_not_replace_or_poison_the_client() {
+    use xshell_protocol::ring::relay::{ChainPin, RingClient};
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let mut config = config(&relay.target(), &chain, ring.desktop.clone());
+    config.timeouts.request = Duration::from_millis(150);
+    let client = RingClient::connect(
+        config,
+        xshell_protocol::ring::relay::contract::Recorder::new(),
+    )
+    .unwrap();
+    relay.fail_next_roster_get(GetFault::Ignore);
+    let pin = ChainPin {
+        version: 1,
+        hash: chain.head().hash(),
+    };
+    let started = Instant::now();
+    assert!(matches!(
+        client.read_accepted_chain(&pin),
+        Err(RingError::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!client.is_closed());
+    assert_eq!(client.read_accepted_chain(&pin).unwrap(), chain);
+    client.bye(ByeReason::quit()).unwrap();
+}

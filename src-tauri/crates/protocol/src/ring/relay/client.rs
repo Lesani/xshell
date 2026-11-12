@@ -147,6 +147,7 @@ enum Kind {
     ActivityEvidence,
     PolicyPreview,
     ProposalCreated,
+    ChainSnapshot,
 }
 
 /// A request awaiting its answer.
@@ -784,6 +785,56 @@ impl RingClient {
         lock(&self.state).chain.clone()
     }
 
+    /// Independently read accepted signed metadata on this existing authenticated socket.
+    /// Used by the proposal owner: no competing same-key fetch connection is opened.
+    /// All pages share one request deadline; page progress never renews the budget.
+    pub fn read_accepted_chain(&self, pin: &ChainPin) -> Result<RosterChain, RingError> {
+        let mut tokens = Vec::new();
+        let mut bytes = 0;
+        let until = Instant::now() + self.timeouts.request;
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RingError::Timeout);
+            }
+            let since = tokens.len() as u64;
+            let RelayFrame::RosterChain { rosters, more, .. } = self
+                .membership_request_with_timeout(
+                    Kind::ChainSnapshot,
+                    |id| ClientFrame::RosterGet { id, since },
+                    remaining,
+                )?
+            else {
+                return Err(RingError::Protocol(
+                    "expected accepted roster snapshot".into(),
+                ));
+            };
+            if rosters.is_empty() && more {
+                return Err(RingError::Protocol(
+                    "nonprogressing accepted snapshot".into(),
+                ));
+            }
+            bytes += rosters.iter().map(String::len).sum::<usize>();
+            if tokens.len() + rosters.len() > 4096 || bytes > super::wire::MAX_CANDIDATE_BYTES {
+                return Err(RingError::Invalid("accepted snapshot bounds".into()));
+            }
+            tokens.extend(rosters);
+            if !more {
+                break;
+            }
+        }
+        let mut chain = RosterChain::from_tokens(&tokens)?;
+        if chain
+            .get(pin.version)
+            .is_none_or(|roster| roster.hash() != pin.hash)
+        {
+            return Err(RingError::Invalid("accepted snapshot pin mismatch".into()));
+        }
+        let current = self.chain();
+        chain.merge_terminal_from(&current);
+        Ok(current.extended(chain.versions())?.0)
+    }
+
     pub fn entitlement(&self) -> Option<String> {
         lock(&self.state).entitlement.clone()
     }
@@ -1175,6 +1226,13 @@ impl Handler for ClientHandler {
             }
             RelayFrame::RosterChain { id, rosters, more } => {
                 self.events.accepted();
+                if let Some(pending) = self.take_waiter(id, Kind::ChainSnapshot) {
+                    lock(&self.state)
+                        .replies
+                        .insert(id, RelayFrame::RosterChain { id, rosters, more });
+                    let _ = pending.waiter.send(Ok(()));
+                    return;
+                }
                 let gap = matches!(self.accept(&rosters), Acceptance::Gap);
                 if more || gap {
                     let since = lock(&self.state).chain.head().version();
