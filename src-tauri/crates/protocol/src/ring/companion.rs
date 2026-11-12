@@ -141,6 +141,11 @@ pub enum CompanionRequest {
     CompletionStart {
         intent: AdoptionIntent,
     },
+    /// Protected local preparation only. Never installs supplied membership.
+    RetainedCompletionStart {
+        intent: AdoptionIntent,
+        predecessor: Vec<String>,
+    },
     CompletionStatus,
     CheckPrepared {
         operation: String,
@@ -252,6 +257,14 @@ impl CompanionPolicy {
     pub fn profile(&self) -> &CompanionProfile {
         &self.profile
     }
+    pub fn retained_local(&self, operation: &str) -> bool {
+        self.operation(operation)
+            .ok()
+            .and_then(|o| o.proposal.as_ref())
+            .is_some_and(|p| {
+                matches!(p.transcript, ConsentTranscript::Local) && !p.predecessor.is_empty()
+            })
+    }
     pub fn completion_proofs(&self, proposal: &CompanionProposal) -> Option<Vec<ConsentProof>> {
         let obligation = self.obligation.as_ref()?;
         (obligation.proposal.as_ref() == Some(proposal)
@@ -355,6 +368,63 @@ impl CompanionPolicy {
         }
         Ok(())
     }
+    /// An unpaired Daemon may prepare against its registered Desktop's retained
+    /// chain. This confers no membership or signing authority without the exact
+    /// Desktop consent proof. Existing Daemon trust is never replaced.
+    pub fn completion_trust<'a>(
+        &self,
+        recorded: Option<&'a RosterChain>,
+        trusted: Option<&'a RosterChain>,
+    ) -> Result<Option<&'a RosterChain>, String> {
+        // Matching heads do not restore a removed/terminal retained participant.
+        // Only a genuinely unpaired Daemon may use the never-seen bootstrap below.
+        if trusted.is_some_and(|chain| {
+            chain
+                .authorized_member(&self.profile.daemon.sign_key)
+                .is_none_or(|member| {
+                    member.role != super::Role::Daemon
+                        || member.noise_key != self.profile.daemon.noise_key
+                })
+        }) {
+            return Err("retained Daemon is removed, terminal or mismatched".into());
+        }
+        if recorded.map(|c| (c.ring_id(), c.head().hash()))
+            == trusted.map(|c| (c.ring_id(), c.head().hash()))
+        {
+            return Ok(trusted);
+        }
+        if trusted.is_some() {
+            return Err("local proposal does not extend retained membership".into());
+        }
+        let chain = recorded.ok_or("retained Desktop predecessor missing")?;
+        let member = chain
+            .authorized_member(&self.profile.desktop.sign_key)
+            .ok_or("registered Desktop is not authorized by preparation trust")?;
+        let membership = chain
+            .head()
+            .roster()
+            .membership()
+            .map_err(|e| e.to_string())?;
+        if chain.head().roster().v != 2
+            || member.role != super::Role::Desktop
+            || member.noise_key != self.profile.desktop.noise_key
+            || membership.unit_for(&member.sign_key).is_none_or(|unit| {
+                !matches!(
+                    unit.kind,
+                    EnrollmentKind::LegacyDesktop | EnrollmentKind::Computer
+                )
+            })
+            || chain
+                .versions()
+                .iter()
+                .any(|roster| roster.member(&self.profile.daemon.sign_key).is_some())
+        {
+            return Err(
+                "unpaired Daemon preparation requires its exact registered retained Desktop".into(),
+            );
+        }
+        Ok(Some(chain))
+    }
     pub fn prepare(
         &mut self,
         proposal: CompanionProposal,
@@ -401,15 +471,13 @@ impl CompanionPolicy {
                             .map_err(|e| e.to_string())?,
                     )
                 };
-                if recorded.as_ref().map(|c| (c.ring_id(), c.head().hash()))
-                    != trusted.map(|c| (c.ring_id(), c.head().hash()))
+                let preparation_trust = self.completion_trust(recorded.as_ref(), trusted)?;
+                if preparation_trust
+                    .is_some_and(|chain| chain.authorized_member(&r.signed_by).is_none())
                 {
-                    return Err("local proposal does not extend retained membership".into());
-                }
-                if trusted.is_some_and(|chain| chain.authorized_member(&r.signed_by).is_none()) {
                     return Err("local proposal approver is terminal or removed".into());
                 }
-                verify_local_proposal(trusted.map(RosterChain::head), r)
+                verify_local_proposal(preparation_trust.map(RosterChain::head), r)
                     .map_err(|e| e.to_string())?;
                 let unit = m
                     .unit_for(&self.profile.desktop.sign_key)
@@ -420,7 +488,8 @@ impl CompanionPolicy {
                     || unit.kind != EnrollmentKind::Computer
                     || unit.members.len() != 2
                     || !unit.members.contains(&self.profile.daemon.sign_key)
-                    || (trusted.is_none() && (m.enrollments.len() != 1 || r.members.len() != 2))
+                    || (preparation_trust.is_none()
+                        && (m.enrollments.len() != 1 || r.members.len() != 2))
                 {
                     return Err("local proposal counterpart mismatch".into());
                 }
@@ -464,15 +533,21 @@ impl CompanionPolicy {
         }
         let recorded =
             RosterChain::from_tokens(&proposal.predecessor).map_err(|e| e.to_string())?;
-        let current = trusted.ok_or("retained membership missing at consent")?;
+        let current = self
+            .completion_trust(Some(&recorded), trusted)?
+            .ok_or("retained membership missing at consent")?;
         if current.head() != recorded.head()
             || current.ring_id() != recorded.ring_id()
             || current
                 .authorized_member(&proposal.proposal.signed_by)
                 .is_none()
-            || current
-                .authorized_member(&self.profile.daemon.sign_key)
-                .is_none()
+            || (current
+                .head()
+                .member(&self.profile.daemon.sign_key)
+                .is_some()
+                && current
+                    .authorized_member(&self.profile.daemon.sign_key)
+                    .is_none())
         {
             return Err(
                 "prepared predecessor or participant changed; fresh proposal/confirmation required"

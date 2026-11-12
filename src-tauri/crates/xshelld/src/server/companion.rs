@@ -151,17 +151,30 @@ fn dispatch(
     // ordering (and a fresh Create has no retained membership to compare).
     let completion_check = matches!(
         &request,
-        CompanionRequest::CompletionStart { .. } | CompanionRequest::CheckPrepared { .. }
+        CompanionRequest::CompletionStart { .. }
+            | CompanionRequest::RetainedCompletionStart { .. }
+            | CompanionRequest::CheckPrepared { .. }
     ) || matches!(&request, CompanionRequest::Prepare { proposal } if matches!(proposal.transcript, ConsentTranscript::Local) && !proposal.predecessor.is_empty())
-        || (matches!(&request, CompanionRequest::Consent { .. })
-            && std::fs::symlink_metadata(store.dir.join("completion.json")).is_ok());
+        || matches!(&request, CompanionRequest::Consent { .. });
     let live = if completion_check {
         Some(daemon.ring.lock_trusted_chain_until(budget)?)
     } else {
         None
     };
     let _lock = store.lock_until(budget)?;
-    if completion_check
+    let keys = store
+        .load_keys()?
+        .ok_or("request counterpart Descriptor before registration")?;
+    let mut policy = load(&store)?;
+    // Decide under ring.lock after reading the obligation, not by mailbox-file
+    // existence: a mailbox write failure or concurrent preparation cannot bypass it.
+    let retained_check = match &request {
+        CompanionRequest::Consent { operation, .. } => {
+            policy.as_ref().is_some_and(|p| p.retained_local(operation))
+        }
+        _ => completion_check,
+    };
+    if retained_check
         && live
             .as_ref()
             .and_then(|guard| guard.as_ref())
@@ -170,10 +183,6 @@ fn dispatch(
     {
         return Err("retained membership is not durably current".into());
     }
-    let keys = store
-        .load_keys()?
-        .ok_or("request counterpart Descriptor before registration")?;
-    let mut policy = load(&store)?;
     if let CompanionRequest::Register { profile, proof } = request {
         validate_profile(&store, &profile, &keys)?;
         if !verify(
@@ -207,6 +216,10 @@ fn dispatch(
         CompanionRequest::CompletionStart { intent } => {
             super::completion::start(&store, policy, intent)?
         }
+        CompanionRequest::RetainedCompletionStart {
+            intent,
+            predecessor,
+        } => super::completion::start_retained(&store, policy, intent, predecessor)?,
         CompanionRequest::CompletionStatus => {
             return Ok(CompanionResponse::Completion {
                 pending: super::completion::status(&store, policy)?.map(Box::new),
@@ -250,7 +263,8 @@ fn dispatch(
         }
         CompanionRequest::Prepare { proposal } => {
             let operation = proposal.operation.clone();
-            policy.prepare(*proposal, trusted(&store)?.as_ref(), now())?;
+            policy.prepare(*proposal.clone(), trusted(&store)?.as_ref(), now())?;
+            super::completion::prepared(&store, &proposal)?;
             CompanionResponse::Status {
                 phase: policy.phase(&operation)?,
                 operation,
@@ -272,7 +286,7 @@ fn dispatch(
             operation,
             desktop_proof,
         } => {
-            if completion_check {
+            if policy.retained_local(&operation) {
                 policy.check_prepared(
                     &operation,
                     live.as_ref().and_then(|guard| guard.as_ref()),

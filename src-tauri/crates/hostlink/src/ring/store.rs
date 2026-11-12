@@ -157,29 +157,42 @@ impl AdoptionJournal {
                     return Err("local adoption journal requires a Computer".into());
                 };
                 let membership = self.proposal.membership().map_err(|e| e.to_string())?;
-                let unit = membership
-                    .unit_for(&desktop.sign_key)
-                    .ok_or("local journal Computer missing")?;
-                if unit.id != self.intent.operation
-                    || unit.kind != xshell_protocol::ring::membership::EnrollmentKind::Computer
-                    || unit.members.len() != 2
-                    || !unit.members.contains(&daemon.sign_key)
-                    || self
-                        .intent
-                        .target
-                        .identities()
-                        .iter()
-                        .any(|(identity, role)| {
-                            self.proposal
-                                .member(&identity.sign_key)
-                                .is_none_or(|member| {
-                                    member.role != *role
-                                        || member.noise_key != identity.noise_key
-                                        || member.name != identity.name
-                                })
-                        })
-                {
-                    return Err("local journal counterpart mismatch".into());
+                // A singleton-only Upgrade deliberately does not group the registered
+                // counterpart. Its explicit local capability authorizes only format migration.
+                if matches!(
+                    membership.change,
+                    xshell_protocol::ring::membership::RosterChange::Upgrade { .. }
+                ) {
+                    if membership.enrollments.iter().any(|unit| {
+                        unit.kind == xshell_protocol::ring::membership::EnrollmentKind::Computer
+                    }) {
+                        return Err("Upgrade journal cannot infer a Computer".into());
+                    }
+                } else {
+                    let unit = membership
+                        .unit_for(&desktop.sign_key)
+                        .ok_or("local journal Computer missing")?;
+                    if unit.id != self.intent.operation
+                        || unit.kind != xshell_protocol::ring::membership::EnrollmentKind::Computer
+                        || unit.members.len() != 2
+                        || !unit.members.contains(&daemon.sign_key)
+                        || self
+                            .intent
+                            .target
+                            .identities()
+                            .iter()
+                            .any(|(identity, role)| {
+                                self.proposal
+                                    .member(&identity.sign_key)
+                                    .is_none_or(|member| {
+                                        member.role != *role
+                                            || member.noise_key != identity.noise_key
+                                            || member.name != identity.name
+                                    })
+                            })
+                    {
+                        return Err("local journal counterpart mismatch".into());
+                    }
                 }
             }
         }
@@ -369,8 +382,11 @@ impl OutgoingAdoption {
                         .map_err(|e| e.to_string())?
                         .change,
                     xshell_protocol::ring::membership::RosterChange::CompleteComputer { .. }
+                        | xshell_protocol::ring::membership::RosterChange::Upgrade { .. }
                 ) {
-                    return Err("local outgoing proposal must be CompleteComputer".into());
+                    return Err(
+                        "local outgoing proposal must be Upgrade or CompleteComputer".into(),
+                    );
                 }
                 (
                     xshell_protocol::ring::companion::ConsentTranscript::Local,

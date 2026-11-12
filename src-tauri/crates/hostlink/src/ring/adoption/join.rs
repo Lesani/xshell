@@ -345,7 +345,7 @@ impl Signer for LocalCounterpart<'_> {
     }
 }
 impl DesktopRing {
-    fn record_driver_cancel(&self, cancel: &Arc<AtomicBool>) -> Result<(), String> {
+    pub(super) fn record_driver_cancel(&self, cancel: &Arc<AtomicBool>) -> Result<(), String> {
         *self
             .adoption_cancel
             .lock()
@@ -742,12 +742,20 @@ impl DesktopRing {
             .membership
             .ok_or("approval requires enrolled membership")?;
         if member.chain.head().roster().v != 2
+            || member
+                .chain
+                .head()
+                .roster()
+                .membership()
+                .map_err(|e| e.to_string())?
+                .unit_for(&stored.keys.sign_key())
+                .is_none_or(|unit| unit.kind != EnrollmentKind::Computer)
             || !member
                 .chain
                 .authorized_member(&stored.keys.sign_key())
                 .is_some_and(|member| member.role == xshell_protocol::ring::Role::Desktop)
         {
-            return Err("approval requires an authorized v2 Desktop".into());
+            return Err("approval requires an authorized v2 Computer Desktop".into());
         }
         let until = Instant::now() + self.cfg.pair_ttl.min(Duration::from_secs(600));
         let cancel = Arc::new(AtomicBool::new(false));

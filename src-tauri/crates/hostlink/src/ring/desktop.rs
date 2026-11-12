@@ -318,6 +318,10 @@ pub enum AdoptionTestPoint {
     ApprovalBeforePublish,
     CompletionBeforeUncertainWrite,
     CompletionBeforePublish,
+    UpgradeBeforeUncertainWrite,
+    UpgradeBeforePublish,
+    RetainedPublicationAttempt,
+    AcceptedBeforeCompanionInstall,
 }
 #[derive(Clone)]
 pub struct AdoptionTestHook(pub Arc<dyn Fn(AdoptionTestPoint) + Send + Sync>);

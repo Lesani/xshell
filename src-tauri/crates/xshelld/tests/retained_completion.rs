@@ -1281,3 +1281,14 @@ fn standalone_initial_admission_wait_does_not_extend_wire_expiry_or_publication_
         1
     );
 }
+
+#[test]
+fn installation_before_any_completion_proposal_remains_pending() {
+    let r = Retained::new(WAIT);
+    r.begin();
+    assert!(matches!(
+        r.b.install_companion_completion(&r.client()).unwrap(),
+        CompletionOutcome::Pending { .. }
+    ));
+    r.no_local_proofs();
+}

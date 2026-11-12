@@ -288,3 +288,239 @@ fn cancelled_local_proposal_proof_cannot_be_reused_under_a_new_operation() {
         );
     }
 }
+
+// Adversarial signed-history fixtures only; runtime positives use public enable/Upgrade.
+fn retained_singleton_chain(
+    signer: &DeviceKeys,
+    registered: &DeviceKeys,
+    noise: xshell_protocol::ring::NoiseKey,
+    role: xshell_protocol::ring::Role,
+) -> xshell_protocol::ring::RosterChain {
+    use xshell_protocol::ring::membership::{
+        Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+    };
+    use xshell_protocol::ring::{Member, Role, RosterChain, SignedRoster};
+    let g = SignedRoster::genesis(
+        signer,
+        signer.noise_key(),
+        "retained",
+        "ws://127.0.0.1:8787",
+        100,
+    )
+    .unwrap();
+    let mut roster = g.roster().clone();
+    if signer.sign_key() == registered.sign_key() {
+        roster.members[0].noise_key = noise;
+        roster.members[0].role = role;
+    } else {
+        roster.members.push(Member::new(
+            "candidate",
+            role,
+            registered.sign_key(),
+            noise,
+            100,
+        ));
+    }
+    let g = roster.sign(signer).unwrap();
+    let mut r = g.roster().clone();
+    r.v = 2;
+    r.version = 2;
+    r.prev = Some(g.hash());
+    r.issued_at = 101;
+    let enrollments = r
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| Enrollment {
+            id: b64::encode(&[i as u8 + 1; 32]),
+            kind: match m.role {
+                Role::Desktop => EnrollmentKind::LegacyDesktop,
+                Role::Daemon => EnrollmentKind::Daemon,
+                Role::Mobile => EnrollmentKind::Mobile,
+            },
+            members: vec![m.sign_key],
+            enrolled_at: 101,
+        })
+        .collect();
+    r.set_membership(&Membership {
+        enrollments,
+        retired: vec![],
+        policy: RingPolicy {
+            inactivity_seconds: None,
+            activity_key: DeviceKeys::generate().unwrap().sign_key(),
+        },
+        change: RosterChange::Upgrade { proofs: vec![] },
+    });
+    RosterChain::from_chain(vec![g, r.sign(signer).unwrap()]).unwrap()
+}
+#[test]
+fn unpaired_daemon_preparation_requires_exact_registered_desktop_key_noise_and_role() {
+    use xshell_protocol::ring::Role;
+    let desktop = DeviceKeys::generate().unwrap();
+    let daemon = DeviceKeys::generate().unwrap();
+    let other = DeviceKeys::generate().unwrap();
+    let policy = CompanionPolicy::new(fixture_profile(&desktop, &daemon)).unwrap();
+    let good = retained_singleton_chain(&desktop, &desktop, desktop.noise_key(), Role::Desktop);
+    assert!(policy
+        .completion_trust(Some(&good), None)
+        .unwrap()
+        .is_some());
+    let wrong_key = retained_singleton_chain(&other, &other, other.noise_key(), Role::Desktop);
+    let wrong_noise =
+        retained_singleton_chain(&desktop, &desktop, other.noise_key(), Role::Desktop);
+    let wrong_role = retained_singleton_chain(&other, &desktop, desktop.noise_key(), Role::Mobile);
+    for bad in [&wrong_key, &wrong_noise, &wrong_role] {
+        assert!(policy.completion_trust(Some(bad), None).is_err());
+    }
+    assert!(
+        policy
+            .completion_trust(Some(&good), Some(&wrong_key))
+            .is_err(),
+        "registered local trust cannot replace a foreign retained Daemon Ring"
+    );
+}
+
+#[test]
+fn retained_daemon_preparation_cannot_resurrect_its_previously_removed_identity() {
+    use xshell_protocol::ring::membership::RosterChange;
+    use xshell_protocol::ring::Role;
+    let desktop = DeviceKeys::generate().unwrap();
+    let daemon = DeviceKeys::generate().unwrap();
+    let policy = CompanionPolicy::new(fixture_profile(&desktop, &daemon)).unwrap();
+    let old = retained_singleton_chain(&desktop, &daemon, daemon.noise_key(), Role::Daemon);
+    let mut removed = old.head().roster().clone();
+    removed.version += 1;
+    removed.prev = Some(old.head().hash());
+    let mut m = removed.membership().unwrap();
+    let unit = m.unit_for(&daemon.sign_key()).unwrap().clone();
+    m.enrollments.retain(|u| u.id != unit.id);
+    m.retired.push(unit.id.clone());
+    m.change = RosterChange::Remove {
+        enrollment_id: unit.id,
+    };
+    removed
+        .members
+        .retain(|member| member.sign_key != daemon.sign_key());
+    removed.set_membership(&m);
+    let removed = old.extended(&[removed.sign(&desktop).unwrap()]).unwrap().0;
+    assert!(policy.completion_trust(Some(&removed), None).is_err());
+    assert!(
+        policy
+            .completion_trust(Some(&removed), Some(&removed))
+            .is_err(),
+        "matching retained removal heads cannot restore the Daemon"
+    );
+}
+
+#[test]
+fn protected_desktop_only_completion_prepares_without_installing_supplied_trust() {
+    use xshell_protocol::ring::companion::{CompanionProposal, ConsentTranscript};
+    use xshell_protocol::ring::membership::{Enrollment, EnrollmentKind, RosterChange};
+    use xshell_protocol::ring::{Member, Role};
+    let desktop = DeviceKeys::generate().unwrap();
+    let daemon = DeviceKeys::generate().unwrap();
+    let chain = retained_singleton_chain(&desktop, &desktop, desktop.noise_key(), Role::Desktop);
+    let mut profile = fixture_profile(&desktop, &daemon);
+    profile.desktop.name = chain
+        .head()
+        .member(&desktop.sign_key())
+        .unwrap()
+        .name
+        .clone();
+    let intent = AdoptionIntent {
+        operation: b64::encode(&[63; 32]),
+        expires_at: 600,
+        target: profile.target(),
+    };
+    let mut policy = CompanionPolicy::new(profile).unwrap();
+    policy.start(intent.clone(), 101).unwrap();
+    let mut proposal = chain.head().roster().clone();
+    proposal.version += 1;
+    proposal.prev = Some(chain.head().hash());
+    proposal.issued_at = 102;
+    proposal.members.push(Member::new(
+        "computer",
+        Role::Daemon,
+        daemon.sign_key(),
+        daemon.noise_key(),
+        102,
+    ));
+    let mut membership = proposal.membership().unwrap();
+    let old = membership.unit_for(&desktop.sign_key()).unwrap().id.clone();
+    membership.enrollments.clear();
+    membership.retired.push(old.clone());
+    membership.enrollments.push(Enrollment {
+        id: intent.operation.clone(),
+        kind: EnrollmentKind::Computer,
+        members: vec![desktop.sign_key(), daemon.sign_key()],
+        enrolled_at: 102,
+    });
+    membership.change = RosterChange::CompleteComputer {
+        replaces: vec![old],
+        enrollment_id: intent.operation.clone(),
+        proofs: vec![],
+    };
+    proposal.set_membership(&membership);
+    policy.prepare(CompanionProposal { operation: intent.operation.clone(), predecessor: chain.versions().iter().map(|r| r.token().into()).collect(), proposal, transcript: ConsentTranscript::Local }, None, 102).expect("protected registered Desktop-only predecessor is preparation trust, not Daemon membership");
+    policy.check_prepared(&intent.operation, None, 102).unwrap();
+    assert_eq!(
+        policy.phase(&intent.operation).unwrap(),
+        xshell_protocol::ring::companion::CompanionPhase::Prepared
+    );
+}
+
+#[test]
+fn matching_retained_completion_trust_requires_current_daemon_identity() {
+    use xshell_protocol::ring::Role;
+    let desktop = DeviceKeys::generate().unwrap();
+    let daemon = DeviceKeys::generate().unwrap();
+    let other = DeviceKeys::generate().unwrap();
+    let policy = CompanionPolicy::new(fixture_profile(&desktop, &daemon)).unwrap();
+    let good = retained_singleton_chain(&desktop, &daemon, daemon.noise_key(), Role::Daemon);
+    assert!(policy.completion_trust(Some(&good), Some(&good)).is_ok());
+    let wrong_noise = retained_singleton_chain(&desktop, &daemon, other.noise_key(), Role::Daemon);
+    let wrong_role = retained_singleton_chain(&desktop, &daemon, daemon.noise_key(), Role::Mobile);
+    for chain in [&wrong_noise, &wrong_role] {
+        assert!(policy.completion_trust(Some(chain), Some(chain)).is_err());
+    }
+}
+
+#[test]
+fn fresh_create_preparation_still_refuses_unrelated_enrollments() {
+    use xshell_protocol::ring::companion::{CompanionProposal, ConsentTranscript};
+    use xshell_protocol::ring::membership::{Enrollment, EnrollmentKind};
+    use xshell_protocol::ring::{Member, Role};
+    let (_, desktop, daemon, intent, mut proposal) = prepared();
+    let mobile = DeviceKeys::generate().unwrap();
+    proposal.members.push(Member::new(
+        "unrelated",
+        Role::Mobile,
+        mobile.sign_key(),
+        mobile.noise_key(),
+        1000,
+    ));
+    let mut membership = proposal.membership().unwrap();
+    membership.enrollments.push(Enrollment {
+        id: b64::encode(&[64; 32]),
+        kind: EnrollmentKind::Mobile,
+        members: vec![mobile.sign_key()],
+        enrolled_at: 1000,
+    });
+    proposal.set_membership(&membership);
+    xshell_protocol::ring::membership::verify_local_proposal(None, &proposal).unwrap();
+    let mut policy = CompanionPolicy::new(fixture_profile(&desktop, &daemon)).unwrap();
+    policy.start(intent.clone(), 1000).unwrap();
+    let error = policy
+        .prepare(
+            CompanionProposal {
+                operation: intent.operation,
+                predecessor: vec![],
+                proposal,
+                transcript: ConsentTranscript::Local,
+            },
+            None,
+            1000,
+        )
+        .expect_err("fresh Create must remain exactly its local Computer");
+    assert!(error.contains("counterpart mismatch"), "{error}");
+}

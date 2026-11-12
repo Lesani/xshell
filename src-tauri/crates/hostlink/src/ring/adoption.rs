@@ -1,6 +1,7 @@
 //! Public consented Computer Create, Join and Approve controllers. Confirmation is a local
-//! backend capability, never a Host/Relay request. Retained v2 Daemon-only completion
-//! uses typed Host administration; native origins, Host-first and general recovery remain later.
+//! backend capability, never a Host/Relay request. Retained v1 Upgrade and this Desktop's
+//! local completion are explicit; retained v2 Daemon-only completion uses typed Host
+//! administration. Native origins, Host-first and general recovery remain later.
 use super::companion_ipc::CompanionClient;
 use super::store::{AdoptionJournal, AdoptionPhase, RingState};
 use super::DesktopRing;
@@ -18,6 +19,7 @@ use xshell_protocol::ring::{
 };
 
 mod completion;
+mod retained;
 pub use completion::{CompletionApproval, CompletionOutcome};
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinStatus};
@@ -157,6 +159,24 @@ impl DesktopRing {
             .ok_or("counterpart endpoint has no directory")?
             .canonicalize()
             .map_err(|e| e.to_string())?;
+        let membership = self.store.load()?.0;
+        let retained_name = |key: &SignKey| {
+            membership
+                .as_ref()
+                .and_then(|state| state.chain.head().member(key))
+                .map(|member| member.name.clone())
+        };
+        let desktop_name = existing
+            .as_ref()
+            .map(|p| p.desktop.name.clone())
+            .or_else(|| retained_name(&keys.sign_key()))
+            .unwrap_or_else(|| xshell_protocol::ring::member_name(&self.cfg.name, "computer"));
+        let mut daemon = daemon;
+        daemon.name = existing
+            .as_ref()
+            .map(|p| p.daemon.name.clone())
+            .or_else(|| retained_name(&daemon.sign_key))
+            .unwrap_or(daemon.name);
         let profile = CompanionProfile::for_stores(
             desktop_dir
                 .to_str()
@@ -167,7 +187,7 @@ impl DesktopRing {
                 .ok_or("Daemon profile path is not UTF-8")?
                 .into(),
             PublicIdentity {
-                name: xshell_protocol::ring::member_name(&self.cfg.name, "computer"),
+                name: desktop_name,
                 sign_key: keys.sign_key(),
                 noise_key: keys.noise_key(),
             },
@@ -254,6 +274,7 @@ impl DesktopRing {
             journal.phase = AdoptionPhase::Accepted;
             journal.accepted = tokens.clone();
         })?;
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::AcceptedBeforeCompanionInstall);
         match client.request(CompanionRequest::InstallAccepted {
             operation: operation.into(),
             rosters: tokens,
@@ -268,22 +289,45 @@ impl DesktopRing {
                 .as_mut()
                 .filter(|journal| journal.intent.operation == operation)
                 .ok_or("adoption journal changed")?;
-            if stored.membership.is_some() {
-                return Err("membership appeared before accepted local installation".into());
+            if let Some(member) = &stored.membership {
+                let predecessor =
+                    RosterChain::from_tokens(&journal.predecessor).map_err(|e| e.to_string())?;
+                if !matches!(
+                    journal
+                        .proposal
+                        .membership()
+                        .map_err(|e| e.to_string())?
+                        .change,
+                    RosterChange::CompleteComputer { .. }
+                ) || predecessor.get(member.chain.head().version()) != Some(member.chain.head())
+                    && accepted.get(member.chain.head().version()) != Some(member.chain.head())
+                {
+                    return Err("membership changed before accepted local installation".into());
+                }
             }
             journal.daemon_installed = true;
             journal.desktop_installed = true;
             journal.phase = AdoptionPhase::Installed;
-            stored.membership = Some(RingState {
-                keys: stored.keys.clone(),
-                chain: accepted.clone(),
-                local_member: Some(profile.daemon.sign_key),
-                farewells: vec![],
-                held_relays: [accepted.head().roster().relay_url.clone()]
-                    .into_iter()
-                    .collect(),
-                host_members: Default::default(),
-            });
+            if let Some(member) = &mut stored.membership {
+                member.chain = member
+                    .chain
+                    .extended(accepted.versions())
+                    .map_err(|e| e.to_string())?
+                    .0;
+                member.local_member = Some(profile.daemon.sign_key);
+                member.retarget_farewells();
+            } else {
+                stored.membership = Some(RingState {
+                    keys: stored.keys.clone(),
+                    chain: accepted.clone(),
+                    local_member: Some(profile.daemon.sign_key),
+                    farewells: vec![],
+                    held_relays: [accepted.head().roster().relay_url.clone()]
+                        .into_iter()
+                        .collect(),
+                    host_members: Default::default(),
+                });
+            }
             Ok((Some(stored), ()))
         })?;
         self.reload();

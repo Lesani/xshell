@@ -73,6 +73,75 @@ pub(super) fn start(
         pending: Some(Box::new(pending)),
     })
 }
+/// Local registered Desktop bootstrap: preparation trust only, not a Host RPC and
+/// not an installation. The policy repeats the identity/head checks before consent.
+pub(super) fn start_retained(
+    store: &Store,
+    policy: &mut CompanionPolicy,
+    intent: AdoptionIntent,
+    predecessor: Vec<String>,
+) -> Result<CompanionResponse, String> {
+    super::adoption::refuse_unresolved_standalone(store)?;
+    if predecessor.len() > 4096
+        || predecessor.iter().map(String::len).sum::<usize>() > 16 * 1024 * 1024
+    {
+        return Err("retained completion predecessor bounds".into());
+    }
+    let recorded = RosterChain::from_tokens(&predecessor).map_err(|e| e.to_string())?;
+    let retained = trusted(store)?;
+    policy.completion_trust(Some(&recorded), retained.as_ref())?;
+    let membership = recorded
+        .head()
+        .roster()
+        .membership()
+        .map_err(|e| e.to_string())?;
+    for identity in [&policy.profile().desktop, &policy.profile().daemon] {
+        if let Some(member) = recorded.head().member(&identity.sign_key) {
+            if recorded.authorized_member(&identity.sign_key).is_none()
+                || member.noise_key != identity.noise_key
+                || membership.unit_for(&identity.sign_key).is_none_or(|unit| {
+                    !matches!(
+                        unit.kind,
+                        EnrollmentKind::LegacyDesktop | EnrollmentKind::Daemon
+                    )
+                })
+            {
+                return Err("retained completion requires authorized matching singletons".into());
+            }
+        }
+    }
+    if let Some(old) = read(store)? {
+        if policy.phase(&old.intent.operation)? != CompanionPhase::Cancelled {
+            return Err("reconciliation_required: completion already pending".into());
+        }
+    }
+    policy.start(intent.clone(), now())?;
+    save(store, policy)?;
+    let pending = CompletionPending {
+        intent,
+        predecessor,
+        proposal: None,
+        proofs: None,
+        accepted: vec![],
+    };
+    write(store, &pending)?;
+    Ok(CompanionResponse::Completion {
+        pending: Some(Box::new(pending)),
+    })
+}
+pub(super) fn prepared(store: &Store, proposal: &CompanionProposal) -> Result<(), String> {
+    let Some(mut pending) = read(store)? else {
+        return Ok(());
+    };
+    if pending.intent.operation != proposal.operation {
+        return Ok(());
+    }
+    if pending.proposal.as_ref().is_some_and(|old| old != proposal) {
+        return Err("completion proposal already frozen".into());
+    }
+    pending.proposal = Some(proposal.clone());
+    write(store, &pending)
+}
 pub(super) fn status(
     store: &Store,
     policy: &CompanionPolicy,

@@ -29,7 +29,7 @@ fn local_status(client: &CompanionClient) -> Result<CompletionPending, String> {
         _ => Err("no protected pending completion".into()),
     }
 }
-fn check_prepared(client: &CompanionClient, operation: &str) -> Result<(), String> {
+pub(super) fn check_prepared(client: &CompanionClient, operation: &str) -> Result<(), String> {
     match client.request(CompanionRequest::CheckPrepared {
         operation: operation.into(),
     })? {
@@ -318,15 +318,18 @@ impl DesktopRing {
         }
         let pending = local_status(client)?;
         let operation = pending.intent.operation.clone();
-        if pending.accepted.is_empty() {
-            return Ok(CompletionOutcome::Pending { operation });
-        }
-        let accepted = RosterChain::from_tokens(&pending.accepted).map_err(|e| e.to_string())?;
         let stored = self
             .store
             .load_profile()?
             .0
             .ok_or("retained profile missing")?;
+        if pending.accepted.is_empty()
+            && stored.journal.as_ref().is_none_or(|journal| {
+                journal.intent != pending.intent || journal.accepted.is_empty()
+            })
+        {
+            return Ok(CompletionOutcome::Pending { operation });
+        }
         let journal = stored
             .journal
             .as_ref()
@@ -336,6 +339,15 @@ impl DesktopRing {
         {
             return Err("accepted result does not match local completion".into());
         }
+        let accepted_tokens = if pending.accepted.is_empty() {
+            &journal.accepted
+        } else {
+            &pending.accepted
+        };
+        if accepted_tokens.is_empty() {
+            return Ok(CompletionOutcome::Pending { operation });
+        }
+        let accepted = RosterChain::from_tokens(accepted_tokens).map_err(|e| e.to_string())?;
         let profile = stored.companion.ok_or("registered counterpart missing")?;
         self.install_joined_computer(client, &operation, &profile, &accepted)
             .map_err(|e| format!("reconciliation_required: {e}"))?;

@@ -1517,15 +1517,23 @@ impl ProposalConnection {
         Ok(())
     }
 
-    /// Local completion has no pairing transcript or Worker proposal grant. Freeze its
+    /// Revalidate the captured creator/head after a local wait, before proof release.
+    pub fn check_current(&self) -> Result<(), RingError> {
+        self.current()
+    }
+
+    /// Local Upgrade/completion has no pairing transcript or Worker proposal grant. Freeze its
     /// exact unsigned successor on the same authorized creator connection instead.
     pub fn freeze_completion(&self, proposal: &crate::ring::Roster) -> Result<(), RingError> {
         self.current()?;
         if !matches!(
             proposal.membership()?.change,
             crate::ring::membership::RosterChange::CompleteComputer { .. }
+                | crate::ring::membership::RosterChange::Upgrade { .. }
         ) {
-            return Err(RingError::Invalid("not local Computer completion".into()));
+            return Err(RingError::Invalid(
+                "not local Upgrade or Computer completion".into(),
+            ));
         }
         crate::ring::membership::verify_local_proposal(Some(&self.predecessor), proposal)?;
         let inner = self
@@ -1625,7 +1633,8 @@ impl ProposalConnection {
         let mut membership = unsigned.membership()?;
         let proofs = match &mut membership.change {
             crate::ring::membership::RosterChange::Enroll { proofs, .. }
-            | crate::ring::membership::RosterChange::CompleteComputer { proofs, .. } => proofs,
+            | crate::ring::membership::RosterChange::CompleteComputer { proofs, .. }
+            | crate::ring::membership::RosterChange::Upgrade { proofs } => proofs,
             _ => {
                 return Err(RingError::Invalid(
                     "publication must be frozen adoption".into(),
