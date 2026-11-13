@@ -121,6 +121,50 @@ fn dispatch(
             profile: existing.map(|policy| policy.profile().clone()),
         });
     }
+    if matches!(request, CompanionRequest::MembershipSnapshot) {
+        return daemon.ring.with_effective_chain_until(budget, |live| {
+            let _lock = store.lock_until(budget)?;
+            let policy = load(&store)?.ok_or("companion is not registered")?;
+            let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
+            validate_profile(&store, policy.profile(), &keys)?;
+            let durable = trusted(&store)?;
+            let chain = match (live.as_ref(), durable) {
+                (Some(live), Some(mut durable)) => {
+                    durable.merge_terminal_from(live);
+                    durable
+                        .extended(live.versions())
+                        .map_err(|e| e.to_string())?
+                        .0
+                }
+                (None, None) => {
+                    return Ok(CompanionResponse::MembershipSnapshot { rosters: vec![] })
+                }
+                // A failed roster write can leave verified accepted membership in force.
+                // Export evidence, not a durable receipt, so recovery may retry that write.
+                (Some(live), None) => live.clone(),
+                (None, Some(durable)) => durable,
+            };
+            if chain.head().roster().v == 2
+                && chain
+                    .head()
+                    .roster()
+                    .membership()
+                    .map_err(|e| e.to_string())?
+                    .enrollments
+                    .iter()
+                    .any(|unit| chain.terminal_enrollments().contains(&unit.id))
+            {
+                // This token-only snapshot cannot export independently observed activity
+                // evidence. Refuse rather than strip a current terminal fence on recovery.
+                return Err(
+                    "counterpart has terminal evidence not represented by signed cleanup".into(),
+                );
+            }
+            Ok(CompanionResponse::MembershipSnapshot {
+                rosters: chain.versions().iter().map(|r| r.token().into()).collect(),
+            })
+        });
+    }
     if let CompanionRequest::InstallAccepted { operation, rosters } = request {
         let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;
         {

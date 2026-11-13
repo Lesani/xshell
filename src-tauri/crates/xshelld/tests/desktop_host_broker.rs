@@ -1914,6 +1914,76 @@ fn owner_loss_mutable_alias_retarget_does_not_deliver_other_canonical_same_uuid(
     sync.shutdown();
 }
 
+const KICK_BACKOFF_UNIT: Duration = Duration::from_millis(2000);
+const KICK_HORIZON: Duration = Duration::from_secs(1);
+
+fn kick_ready_before_natural_retry(
+    snapshot: &Value,
+    host: &str,
+    sampled_epoch_ms: u64,
+    sampled_at: Instant,
+    now: Instant,
+    ready_until: Instant,
+) -> Option<Instant> {
+    let (row, status) = target_snapshot(snapshot, host);
+    if now >= ready_until
+        || row["activeRoute"] != "relay"
+        || row["reachability"]["kind"] != "online"
+    {
+        return None;
+    }
+    // nextRetryAt is epoch milliseconds; supervisor waits use Instant. Anchor before
+    // the snapshot RPC, not at its reply, so RPC age consumes the remaining backoff.
+    // Remove one millisecond for epoch truncation; this boundary is conservative.
+    let remaining_ms = status["nextRetryAt"]
+        .as_u64()?
+        .checked_sub(sampled_epoch_ms)?
+        .checked_sub(1)?;
+    let natural_retry = sampled_at.checked_add(Duration::from_millis(remaining_ms))?;
+    (natural_retry.checked_duration_since(now)? > KICK_HORIZON + KICK_BACKOFF_UNIT / 10)
+        .then_some(natural_retry)
+}
+
+#[test]
+fn kick_ready_before_natural_retry_rejects_non_online_and_aged_snapshot() {
+    // Serialized snapshot predicate coverage only: no transport or signed-presence proof.
+    let mut snapshot = json!({
+        "hosts": [{"id":"target", "aliases":["alias"], "activeRoute":"relay",
+            "reachability":{"kind":"unreachable"}},
+            {"id":"other", "aliases":["other"], "activeRoute":"relay",
+            "reachability":{"kind":"online"}}],
+        "snapshots": [{"status":{"host":"other", "nextRetryAt":99000}},
+            {"status":{"host":"target", "nextRetryAt":12000}}]
+    });
+    let at = Instant::now();
+    let until = at + WAIT;
+    let ready = |snapshot: &Value, now, until| {
+        kick_ready_before_natural_retry(snapshot, "alias", 10000, at, now, until)
+    };
+    let (_, status) = target_snapshot(&snapshot, "alias");
+    assert!(!status["nextRetryAt"].is_null(), "old readiness premise");
+    assert!(ready(&snapshot, at, until).is_none());
+    snapshot["hosts"][0]["reachability"]["kind"] = json!("online");
+    let boundary = at + Duration::from_millis(1999);
+    assert_eq!(ready(&snapshot, at, until), Some(boundary));
+    assert!(ready(&snapshot, at + Duration::from_millis(799), until).is_none());
+    assert!(ready(&snapshot, at + Duration::from_secs(2), until).is_none());
+    assert!(
+        ready(&snapshot, until, until).is_none(),
+        "late RPC exceeds WAIT"
+    );
+    snapshot["snapshots"][1]["status"]["nextRetryAt"] = json!(10000);
+    assert!(
+        ready(&snapshot, at, until).is_none(),
+        "expired epoch deadline"
+    );
+    snapshot["snapshots"][1]["status"]["nextRetryAt"] = json!("12000");
+    assert!(
+        ready(&snapshot, at, until).is_none(),
+        "deadline must be numeric"
+    );
+}
+
 #[test]
 fn offline_authorized_kick_reaches_owner_supervisor_during_real_backoff() {
     use std::sync::atomic::AtomicUsize;
@@ -1938,39 +2008,70 @@ fn offline_authorized_kick_reaches_owner_supervisor_during_real_backoff() {
         }
     }
     let _release = Release(paused.clone());
-    // Short Hello and explicit owned backoff expose the existing supervisor wait. Neither
-    // production deadline nor retry policy is enlarged to conceal a failed operation.
+    // Short Hello and a 2000ms backoff unit expose the existing supervisor wait;
+    // the actual scheduled delay can be a multiple of that unit. Neither production
+    // deadline nor retry policy is enlarged to conceal a failed operation.
     let mut owner = Process::start_options(
         &setup.owner.home.root().join("desktop"),
         None,
-        Some((100, 2000)),
+        Some((100, KICK_BACKOFF_UNIT.as_millis() as u64)),
     );
     owner.usable(&setup.host);
     paused.store(true, Ordering::Release);
     setup.relay.restart();
     let until = Instant::now() + WAIT;
-    loop {
+    let (before, at, natural_retry) = loop {
+        let sampled_at = Instant::now();
+        let sampled_epoch_ms = xshell_hostlink::status::now_ms();
         let snapshot = owner.ok(json!({"op":"snapshot"}));
-        let (_, status) = target_snapshot(&snapshot, &setup.host);
-        if !status["nextRetryAt"].is_null() {
-            break;
+        let now = Instant::now();
+        assert!(
+            now < until,
+            "no Online Relay target in actual backoff with sufficient remaining time within WAIT: {snapshot}"
+        );
+        if kick_ready_before_natural_retry(
+            &snapshot,
+            &setup.host,
+            sampled_epoch_ms,
+            sampled_at,
+            now,
+            until,
+        )
+        .is_some()
+        {
+            let before = hits.load(Ordering::Acquire);
+            let at = Instant::now();
+            // Recheck the same aged sample immediately before Kick. Never refresh the
+            // accepted natural-retry boundary after sending the command.
+            if let Some(natural_retry) = kick_ready_before_natural_retry(
+                &snapshot,
+                &setup.host,
+                sampled_epoch_ms,
+                sampled_at,
+                at,
+                until,
+            ) {
+                break (before, at, natural_retry);
+            }
         }
-        assert!(
-            Instant::now() < until,
-            "supervisor did not enter actual backoff: {status}"
-        );
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let before = hits.load(Ordering::Acquire);
-    let at = Instant::now();
-    owner.ok(json!({"op":"kick","host":setup.host}));
-    while hits.load(Ordering::Acquire) == before {
+    };
+    let assert_expedited = || {
+        let now = Instant::now();
         assert!(
-            at.elapsed() < Duration::from_secs(1),
-            "owner kick did not advance supervisor before the2s backoff"
+            now.duration_since(at) < KICK_HORIZON && now < natural_retry,
+            "owner kick did not advance supervisor within 1s and before the sampled natural retry: elapsed={:?}, remaining={:?}",
+            now.duration_since(at),
+            natural_retry.checked_duration_since(now)
         );
+    };
+    owner.ok(json!({"op":"kick","host":setup.host}));
+    assert_expedited();
+    while hits.load(Ordering::Acquire) == before {
+        assert_expedited();
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert_expedited();
     paused.store(false, Ordering::Release);
     owner.usable(&setup.host);
     owner.quit();

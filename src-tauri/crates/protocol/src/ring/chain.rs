@@ -143,8 +143,10 @@ impl RosterChain {
         &self.terminal.ids
     }
 
+    /// Preserve independently verified terminal evidence from the same accepted ancestry.
+    /// Does not trust a divergent chain or infer terminal state from connection failure.
     #[cfg(feature = "relay-client")]
-    pub(crate) fn merge_terminal_from(&mut self, other: &Self) -> bool {
+    pub fn merge_terminal_from(&mut self, other: &Self) -> bool {
         let overlap = self.head().version().min(other.head().version());
         if self.ring_id() != other.ring_id() || self.get(overlap) != other.get(overlap) {
             return false;

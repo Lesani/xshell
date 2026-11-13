@@ -322,6 +322,10 @@ pub enum AdoptionTestPoint {
     UpgradeBeforePublish,
     RetainedPublicationAttempt,
     AcceptedBeforeCompanionInstall,
+    /// Accepted readback/guest Joined has returned; controller journal/return has not.
+    AcceptedBeforeJournal,
+    /// Matching durable Daemon receipt received, before the Desktop store transaction.
+    CompanionInstalledBeforeDesktop,
 }
 #[derive(Clone)]
 pub struct AdoptionTestHook(pub Arc<dyn Fn(AdoptionTestPoint) + Send + Sync>);
@@ -1749,6 +1753,42 @@ impl DesktopRing {
             return Err("creator snapshot changed before proposal reservation".into());
         }
         Ok((chain, lane))
+    }
+
+    pub(super) fn adoption_owner_connector(&self) -> Option<Arc<Connector>> {
+        self.lock().connector.clone()
+    }
+
+    /// The current owner's effective evidence, not Live.state's version-only cache.
+    /// Hold the owner slot stable during bounded Connector snapshot admission; never
+    /// take a file lock or perform network work while holding this lifecycle lock.
+    pub(super) fn adoption_effective_chain(&self) -> Result<Option<RosterChain>, String> {
+        let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+            Instant::now() + Duration::from_secs(5),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let live = budget.lock(&self.live).map_err(|e| e.to_string())?;
+        let mut effective = live.state.as_ref().map(|s| s.chain.clone());
+        if let Some(connector) = &live.connector {
+            let owner = loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(chain) = connector.try_chain() {
+                    break chain;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            effective = Some(match effective {
+                Some(mut chain) => {
+                    chain.merge_terminal_from(&owner);
+                    chain
+                        .extended(owner.versions())
+                        .map_err(|e| e.to_string())?
+                        .0
+                }
+                None => owner,
+            });
+        }
+        Ok(effective)
     }
 
     pub fn pairing_ipc_owner(&self) -> bool {

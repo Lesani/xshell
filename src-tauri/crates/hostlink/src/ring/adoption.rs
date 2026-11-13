@@ -1,7 +1,8 @@
 //! Public consented Computer Create, Join and Approve controllers. Confirmation is a local
 //! backend capability, never a Host/Relay request. Retained v1 Upgrade and this Desktop's
 //! local completion are explicit; retained v2 Daemon-only completion uses typed Host
-//! administration. Native origins, Host-first and general recovery remain later.
+//! administration. Restart reconciliation is read-only except for missing local stores;
+//! native origins and registered Host-first forwarding remain later.
 use super::companion_ipc::CompanionClient;
 use super::store::{AdoptionJournal, AdoptionPhase, RingState};
 use super::DesktopRing;
@@ -19,8 +20,13 @@ use xshell_protocol::ring::{
 };
 
 mod completion;
+mod reconcile;
 mod retained;
 pub use completion::{CompletionApproval, CompletionOutcome};
+pub use reconcile::{
+    AdoptionRecovery, AdoptionRecoveryState, AdoptionRecoveryStatus, PublicationRecoveryState,
+    PublicationRecoveryStatus,
+};
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinStatus};
 
@@ -265,13 +271,36 @@ impl DesktopRing {
         profile: &CompanionProfile,
         accepted: &RosterChain,
     ) -> Result<(), String> {
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::AcceptedBeforeJournal);
         let tokens: Vec<String> = accepted
             .versions()
             .iter()
             .map(|roster| roster.token().into())
             .collect();
+        let stored = self
+            .store
+            .load_profile()?
+            .0
+            .ok_or("retained profile missing")?;
+        let journal = stored
+            .journal
+            .as_ref()
+            .filter(|j| j.intent.operation == operation)
+            .ok_or("adoption journal changed")?;
+        journal.verify_accepted(accepted)?;
+        if stored.companion.as_ref() != Some(profile)
+            || profile.target() != journal.intent.target
+            || stored.keys.sign_key() != profile.desktop.sign_key
+            || [profile.desktop.sign_key, profile.daemon.sign_key]
+                .iter()
+                .any(|key| accepted.authorized_member(key).is_none())
+        {
+            return Err("accepted local Computer is mismatched or terminal".into());
+        }
         self.journal_update(operation, |journal| {
-            journal.phase = AdoptionPhase::Accepted;
+            if journal.phase != AdoptionPhase::Installed {
+                journal.phase = AdoptionPhase::Accepted;
+            }
             journal.accepted = tokens.clone();
         })?;
         self.adoption_test_point(super::desktop::AdoptionTestPoint::AcceptedBeforeCompanionInstall);
@@ -282,6 +311,9 @@ impl DesktopRing {
             CompanionResponse::Installed { hash } if hash == accepted.head().hash() => {}
             _ => return Err("counterpart durable installation receipt missing".into()),
         }
+        self.adoption_test_point(
+            super::desktop::AdoptionTestPoint::CompanionInstalledBeforeDesktop,
+        );
         self.store.transact_profile(|stored, _| {
             let mut stored = stored.ok_or("retained profile missing")?;
             let journal = stored
@@ -289,31 +321,27 @@ impl DesktopRing {
                 .as_mut()
                 .filter(|journal| journal.intent.operation == operation)
                 .ok_or("adoption journal changed")?;
-            if let Some(member) = &stored.membership {
-                let predecessor =
-                    RosterChain::from_tokens(&journal.predecessor).map_err(|e| e.to_string())?;
-                if !matches!(
-                    journal
-                        .proposal
-                        .membership()
-                        .map_err(|e| e.to_string())?
-                        .change,
-                    RosterChange::CompleteComputer { .. }
-                ) || predecessor.get(member.chain.head().version()) != Some(member.chain.head())
-                    && accepted.get(member.chain.head().version()) != Some(member.chain.head())
-                {
-                    return Err("membership changed before accepted local installation".into());
-                }
+            let current = reconcile::merge(
+                stored.membership.as_ref().map(|member| &member.chain),
+                accepted.clone(),
+            )?;
+            journal.verify_accepted(&current)?;
+            if [profile.desktop.sign_key, profile.daemon.sign_key]
+                .iter()
+                .any(|key| current.authorized_member(key).is_none())
+            {
+                return Err("local Computer became terminal before Desktop installation".into());
             }
+            journal.accepted = current
+                .versions()
+                .iter()
+                .map(|r| r.token().into())
+                .collect();
             journal.daemon_installed = true;
             journal.desktop_installed = true;
             journal.phase = AdoptionPhase::Installed;
             if let Some(member) = &mut stored.membership {
-                member.chain = member
-                    .chain
-                    .extended(accepted.versions())
-                    .map_err(|e| e.to_string())?
-                    .0;
+                member.chain = current;
                 member.local_member = Some(profile.daemon.sign_key);
                 member.retarget_farewells();
             } else {
@@ -355,12 +383,11 @@ impl DesktopRing {
             if profile.membership.is_some() {
                 return Err("leave_required: Create needs an unpaired Desktop".into());
             }
-            if profile.journal.as_ref().is_some_and(|journal| {
-                !matches!(
-                    journal.phase,
-                    AdoptionPhase::Cancelled | AdoptionPhase::Installed
-                )
-            }) {
+            if profile
+                .journal
+                .as_ref()
+                .is_some_and(|journal| !journal.phase.permits_new_operation())
+            {
                 return Err("reconciliation_required: an earlier adoption is unresolved".into());
             }
         }
@@ -483,7 +510,7 @@ impl DesktopRing {
                     operation: operation.clone(),
                 })?;
                 self.journal_update(&operation, |journal| {
-                    journal.phase = AdoptionPhase::Cancelled
+                    journal.phase = AdoptionPhase::DeclinedBeforeProof
                 })?;
                 return Ok(AdoptionOutcome::Declined {
                     operation: operation.clone(),
@@ -582,7 +609,11 @@ impl DesktopRing {
                     .is_ok()
                 {
                     self.journal_update(&operation, |journal| {
-                        journal.phase = AdoptionPhase::Cancelled
+                        journal.phase = if now() >= journal.intent.expires_at {
+                            AdoptionPhase::ExpiredBeforeProof
+                        } else {
+                            AdoptionPhase::Cancelled
+                        };
                     })?;
                 }
                 return Err(error);

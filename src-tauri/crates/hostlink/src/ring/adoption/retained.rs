@@ -10,9 +10,10 @@ fn tokens(chain: &RosterChain) -> Vec<String> {
 }
 fn idle(stored: &ProfileState) -> Result<(), String> {
     if stored.pending_join.is_some()
-        || stored.journal.as_ref().is_some_and(|j| {
-            !matches!(j.phase, AdoptionPhase::Installed | AdoptionPhase::Cancelled)
-        })
+        || stored
+            .journal
+            .as_ref()
+            .is_some_and(|j| !j.phase.permits_new_operation())
         || stored.outgoing.as_ref().is_some_and(|j| {
             !matches!(j.phase, OutgoingPhase::Published | OutgoingPhase::Cancelled)
         })
@@ -203,6 +204,9 @@ impl DesktopRing {
             self.retained_live(&lease, &lane)?;
             lane.publish_once(&signed).map_err(|e| e.to_string())?;
             let accepted = lane.read_accepted(&signed).map_err(|e| e.to_string())?;
+            self.adoption_test_point(
+                super::super::desktop::AdoptionTestPoint::AcceptedBeforeJournal,
+            );
             self.store.transact_profile(|stored, _| {
                 let mut stored = stored.ok_or("retained profile missing")?;
                 let outgoing = stored
@@ -490,7 +494,15 @@ impl DesktopRing {
                 })
                 .is_ok()
         {
-            self.journal_update(&operation, |j| j.phase = AdoptionPhase::Cancelled)?;
+            self.journal_update(&operation, |j| {
+                j.phase = if matches!(result, Ok(AdoptionOutcome::Declined { .. })) {
+                    AdoptionPhase::DeclinedBeforeProof
+                } else if now() >= j.intent.expires_at {
+                    AdoptionPhase::ExpiredBeforeProof
+                } else {
+                    AdoptionPhase::Cancelled
+                }
+            })?;
         }
         result.map_err(|e| {
             if phase != Some(AdoptionPhase::Prepared) {

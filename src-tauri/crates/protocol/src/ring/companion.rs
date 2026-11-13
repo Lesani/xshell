@@ -147,6 +147,8 @@ pub enum CompanionRequest {
         predecessor: Vec<String>,
     },
     CompletionStatus,
+    /// Protected read-only current membership; conveys no installation receipt.
+    MembershipSnapshot,
     CheckPrepared {
         operation: String,
     },
@@ -217,6 +219,9 @@ pub enum CompanionResponse {
     },
     Completion {
         pending: Option<Box<CompletionPending>>,
+    },
+    MembershipSnapshot {
+        rosters: Vec<String>,
     },
     Error {
         message: String,

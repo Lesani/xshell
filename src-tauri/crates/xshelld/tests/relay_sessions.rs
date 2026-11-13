@@ -757,3 +757,93 @@ fn mobile_answers_prompt_over_relay() {
             .any(|i| i.terminal == term && i.permission_prompt.is_none())
     });
 }
+
+fn deadline_during_roster_io_enforces_removal(write_error: bool) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use xshelld::server::{TestHook, TestPoint};
+    let armed = Arc::new(AtomicBool::new(false));
+    let hit = Arc::new(AtomicBool::new(false));
+    let (a, h) = (armed.clone(), hit.clone());
+    let request = timeouts().request; // existing timeout, never increased or renewed
+    let mut s = setup_with(|c| {
+        fast(c);
+        c.test_hook = Some(TestHook(Arc::new(move |_, point| {
+            if point == TestPoint::RingRosterTempSynced && a.load(Ordering::Acquire) {
+                h.store(true, Ordering::Release);
+                // Deliberately cross the captured request deadline inside actual
+                // temp-write/sync -> rename IO, not in an admission prerequisite.
+                let (_held, wait) = mpsc::channel::<()>();
+                assert!(wait
+                    .recv_timeout(request + Duration::from_millis(100))
+                    .is_err());
+                return write_error;
+            }
+            false
+        })));
+    });
+    let phone = Peer::new(&s.r, &s.ring.chain, &s.mobile);
+    let base = settled(&s.srv);
+    let mut live = phone.client(&s.daemon);
+    assert!(live.call("list_claude_projects", json!({})).is_ok());
+    s.r.ignore_roster_puts(true); // no Relay observation can silently repair the owner
+    let before = std::fs::read(s.h.paths().ring_dir.join("roster.json")).unwrap();
+    let key = s.mobile.sign_key();
+    s.ring.next(|d| {
+        d.remove(&key);
+    });
+    armed.store(true, Ordering::Release);
+    let mut local = Client::in_process(&s.srv, Role::Desktop);
+    let error = local
+        .request(&ClientMsg::RingJoin {
+            rosters: tokens(&s.ring.chain),
+            expect: None,
+        })
+        .unwrap_err();
+    armed.store(false, Ordering::Release);
+    assert!(hit.load(Ordering::Acquire));
+    assert!(
+        error.contains(if write_error {
+            "could not be saved"
+        } else {
+            "counterpart request deadline"
+        }),
+        "{error}"
+    );
+    let current = local.request(&ClientMsg::RingIdentity).unwrap();
+    assert_eq!(
+        current["ring"]["version"],
+        s.ring.chain.head().version(),
+        "cache must enforce settled authority despite error"
+    );
+    local.shutdown(); // exclude this test's administration connection from the count
+    wait_connections(&s.srv, base, Duration::from_secs(3));
+    assert!(
+        online(&s.r, s.ring.chain.ring_id(), &key),
+        "Relay deliberately retains old authority"
+    );
+    assert!(
+        phone.sessions.open(&s.daemon).is_err(),
+        "fresh admission must use the revoked owner authority"
+    );
+    let bytes = std::fs::read(s.h.paths().ring_dir.join("roster.json")).unwrap();
+    if write_error {
+        assert_eq!(bytes, before);
+    } else {
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["rosters"].as_array().unwrap().last().unwrap(),
+            s.ring.chain.head().token()
+        );
+    }
+}
+#[test]
+fn expired_after_roster_sync_still_revokes_live_and_fresh_sessions() {
+    deadline_during_roster_io_enforces_removal(false);
+}
+#[test]
+fn expired_after_roster_sync_write_error_still_revokes_live_and_fresh_sessions() {
+    deadline_during_roster_io_enforces_removal(true);
+}

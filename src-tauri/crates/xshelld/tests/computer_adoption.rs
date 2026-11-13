@@ -265,7 +265,7 @@ mod unix {
             .unwrap()
             .journal
             .unwrap();
-        assert_eq!(journal.phase, AdoptionPhase::Cancelled);
+        assert_eq!(journal.phase, AdoptionPhase::DeclinedBeforeProof);
         assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
         assert!(computer.ring.chain().is_none());
         assert!(!computer.daemon_dir.join("roster.json").exists());
@@ -1166,7 +1166,7 @@ mod unix {
                 .unwrap();
         assert_eq!(durable["rosters"][2], third_chain.head().token());
     }
-    fn runtime2_assert_no_guest_proofs(guest: &Computer) {
+    fn runtime2_assert_no_guest_proofs(guest: &Computer, expected: AdoptionPhase) {
         let stored = Store::new(guest.desktop.clone())
             .load_profile()
             .unwrap()
@@ -1174,7 +1174,7 @@ mod unix {
             .unwrap();
         assert!(stored.membership.is_none() && stored.pending_join.is_none());
         let journal = stored.journal.unwrap();
-        assert_eq!(journal.phase, AdoptionPhase::Cancelled);
+        assert_eq!(journal.phase, expected);
         assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
         let counterpart: serde_json::Value = serde_json::from_slice(
             &std::fs::read(guest.daemon_dir.join("companion.json")).unwrap(),
@@ -1203,7 +1203,7 @@ mod unix {
             ));
             assert!(approval.join().unwrap().is_err());
         });
-        runtime2_assert_no_guest_proofs(&guest);
+        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
         let stored = Store::new(host.desktop.clone())
             .load_profile()
             .unwrap()
@@ -1241,7 +1241,7 @@ mod unix {
             assert!(approval.join().unwrap().is_err());
             assert!(lease.confirm("expired").is_err());
         });
-        runtime2_assert_no_guest_proofs(&guest);
+        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::ExpiredBeforeProof);
         assert_eq!(host.ring.chain().unwrap().head().version(), 1);
     }
     #[test]
@@ -1278,7 +1278,7 @@ mod unix {
             offer.wait().unwrap();
             assert!(approval.join().unwrap().is_err());
         });
-        runtime2_assert_no_guest_proofs(&guest);
+        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
     }
     #[test]
     fn public_join_changed_head_never_rebases_or_publishes_frozen_enrollment() {
@@ -1515,7 +1515,7 @@ mod unix {
             );
             assert!(approval.join().unwrap().is_err());
         });
-        runtime2_assert_no_guest_proofs(&guest);
+        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::Cancelled);
         let replacement = guest.ring.begin_join(&guest.companion()).unwrap();
         drop(replacement);
         assert_eq!(host.ring.chain().unwrap().head().version(), 1);
@@ -1654,5 +1654,42 @@ mod unix {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+    #[test]
+    fn reconciliation_retries_installed_create_without_genesis_or_enrollment() {
+        use xshell_hostlink::ring::adoption::AdoptionRecoveryState;
+        let relay = Relay::start();
+        let c = Computer::new(&relay);
+        let AdoptionOutcome::Installed { operation, chain } = c
+            .ring
+            .create_computer(&c.companion(), |p, l| {
+                Ok(CreateDecision::Confirm(l.confirm(&p.proposal_hash)?))
+            })
+            .unwrap()
+        else {
+            panic!("not installed")
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while c.ring.view().connection != "connected" {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for _ in 0..2 {
+            let status = c
+                .ring
+                .reconcile_adoption(&c.companion(), &operation)
+                .unwrap();
+            assert_eq!(
+                status.local.unwrap().state,
+                AdoptionRecoveryState::Installed
+            );
+        }
+        let saved = Store::new(c.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(saved.membership.unwrap().chain.head(), chain.head());
+        assert_eq!(relay_version(&relay.target(), chain.ring_id()), 1);
     }
 }

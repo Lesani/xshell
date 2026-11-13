@@ -368,12 +368,10 @@ impl DesktopRing {
                 return Err("leave_required: Join needs an unpaired Desktop".into());
             }
             if stored.pending_join.is_some()
-                || stored.journal.as_ref().is_some_and(|journal| {
-                    !matches!(
-                        journal.phase,
-                        AdoptionPhase::Cancelled | AdoptionPhase::Installed
-                    )
-                })
+                || stored
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| !journal.phase.permits_new_operation())
             {
                 return Err("reconciliation_required: an earlier Join is unresolved".into());
             }
@@ -675,7 +673,13 @@ impl DesktopRing {
                         .as_mut()
                         .filter(|journal| journal.intent.operation == intent.operation)
                     {
-                        journal.phase = AdoptionPhase::Cancelled;
+                        journal.phase = if declined {
+                            AdoptionPhase::DeclinedBeforeProof
+                        } else if now() >= journal.intent.expires_at {
+                            AdoptionPhase::ExpiredBeforeProof
+                        } else {
+                            AdoptionPhase::Cancelled
+                        };
                     }
                     if stored
                         .pending_join
@@ -949,6 +953,9 @@ impl DesktopRing {
                 let accepted = captured
                     .read_accepted(signed)
                     .map_err(|e| PairError::Relay(e.to_string()))?;
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::AcceptedBeforeJournal,
+                );
                 self.store
                     .transact_profile(|profile, _| {
                         let mut profile = profile.ok_or("retained approver missing")?;

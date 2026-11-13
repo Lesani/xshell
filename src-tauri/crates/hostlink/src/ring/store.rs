@@ -90,7 +90,21 @@ pub enum AdoptionPhase {
     PublicationUncertain,
     Accepted,
     Installed,
+    /// Legacy cancellation: the precise pre-proof reason was not recorded.
     Cancelled,
+    DeclinedBeforeProof,
+    ExpiredBeforeProof,
+}
+impl AdoptionPhase {
+    pub(crate) fn before_proof_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::DeclinedBeforeProof | Self::ExpiredBeforeProof
+        )
+    }
+    pub(crate) fn permits_new_operation(&self) -> bool {
+        *self == Self::Installed || self.before_proof_terminal()
+    }
 }
 
 impl AdoptionJournal {
@@ -241,6 +255,18 @@ impl AdoptionJournal {
         {
             return Err("installation receipt without verified accepted bytes".into());
         }
+        if matches!(
+            self.phase,
+            AdoptionPhase::DeclinedBeforeProof | AdoptionPhase::ExpiredBeforeProof
+        ) && (self.signed_candidate.is_some()
+            || !self.accepted.is_empty()
+            || self.desktop_installed
+            || self.daemon_installed)
+        {
+            return Err(
+                "pre-proof terminal state carries publication/installation evidence".into(),
+            );
+        }
         if self.phase == AdoptionPhase::Installed
             && !(self.desktop_installed && self.daemon_installed)
         {
@@ -249,10 +275,7 @@ impl AdoptionJournal {
         Ok(())
     }
     fn may_replace_with(&self, new: Option<&Self>) -> Result<(), String> {
-        let terminal = matches!(
-            self.phase,
-            AdoptionPhase::Installed | AdoptionPhase::Cancelled
-        );
+        let terminal = self.phase.permits_new_operation();
         let Some(new) = new else {
             return if terminal {
                 Ok(())
@@ -285,16 +308,40 @@ impl AdoptionJournal {
             AdoptionPhase::PublicationUncertain => 2,
             AdoptionPhase::Accepted => 3,
             AdoptionPhase::Installed => 4,
-            AdoptionPhase::Cancelled => 5,
+            AdoptionPhase::Cancelled
+            | AdoptionPhase::DeclinedBeforeProof
+            | AdoptionPhase::ExpiredBeforeProof => 5,
         };
         if rank(&new.phase) < rank(&self.phase)
-            || (new.phase == AdoptionPhase::Cancelled
-                && !matches!(
-                    self.phase,
-                    AdoptionPhase::Prepared | AdoptionPhase::Cancelled
-                ))
+            || (new.phase.before_proof_terminal()
+                && self.phase != AdoptionPhase::Prepared
+                && self.phase != new.phase)
         {
             return Err("possible consent/publication cannot be cancelled as nonmembership".into());
+        }
+        Ok(())
+    }
+
+    /// Verify the recorded transition without releasing proofs or publishing any bytes.
+    pub(crate) fn verify_accepted(&self, chain: &RosterChain) -> Result<(), String> {
+        if self
+            .predecessor
+            .iter()
+            .enumerate()
+            .any(|(i, token)| chain.versions().get(i).map(|r| r.token()) != Some(token.as_str()))
+        {
+            return Err("reconciliation predecessor mismatch".into());
+        }
+        let signed = chain
+            .get(self.proposal.version)
+            .ok_or("recorded transition not observed")?;
+        self.matches_signed(signed)?;
+        if self
+            .signed_candidate
+            .as_ref()
+            .is_some_and(|token| token != signed.token())
+        {
+            return Err("reconciliation exact signed candidate mismatch".into());
         }
         Ok(())
     }
@@ -359,7 +406,7 @@ pub struct OutgoingAdoption {
     pub accepted: Vec<String>,
 }
 impl OutgoingAdoption {
-    fn validation_record(&self) -> Result<AdoptionJournal, String> {
+    pub(crate) fn validation_record(&self) -> Result<AdoptionJournal, String> {
         let (transcript, context) = match &self.final_noise_hash {
             Some(hash) => {
                 let bytes = xshell_protocol::ring::b64::decode_array::<32>(hash)
@@ -567,9 +614,7 @@ impl Store {
                     if profile
                         .as_ref()
                         .and_then(|p| p.journal.as_ref())
-                        .is_some_and(|j| {
-                            !matches!(j.phase, AdoptionPhase::Installed | AdoptionPhase::Cancelled)
-                        })
+                        .is_some_and(|j| !j.phase.permits_new_operation())
                     {
                         return Err(
                             "adoption reconciliation required before legacy Ring mutation".into(),
@@ -1948,14 +1993,93 @@ mod adoption_profile_tests {
         RosterChain::from_chain(vec![first.clone()]).unwrap();
         RosterChain::from_chain(vec![fork.clone()]).unwrap();
         assert_ne!(first.hash(), fork.hash());
+        journal
+            .verify_accepted(&RosterChain::from_chain(vec![first.clone()]).unwrap())
+            .unwrap();
+        // A guest without the token can recognize the exact recorded proposal/proofs.
+        journal
+            .verify_accepted(&RosterChain::from_chain(vec![fork.clone()]).unwrap())
+            .unwrap();
         journal.signed_candidate = Some(first.token().into());
         journal.accepted = vec![first.token().into()];
         journal.phase = AdoptionPhase::Accepted;
         journal.validate().unwrap();
+        journal
+            .verify_accepted(&RosterChain::from_chain(vec![first.clone()]).unwrap())
+            .unwrap();
+        assert!(journal
+            .verify_accepted(&RosterChain::from_chain(vec![fork.clone()]).unwrap())
+            .is_err());
+        let mut changed_context = journal.clone();
+        changed_context.context = xshell_protocol::ring::membership::ConsentContext {
+            kind: xshell_protocol::ring::membership::ConsentFlow::LocalUpgrade,
+            hash: journal.context.hash.clone(),
+        };
+        assert!(changed_context
+            .verify_accepted(&RosterChain::from_chain(vec![first.clone()]).unwrap())
+            .is_err());
         journal.accepted = vec![fork.token().into()];
         assert!(
             journal.validate().is_err(),
             "accepted proof-order fork must not match known candidate"
         );
+    }
+    #[test]
+    fn legacy_cancelled_and_explicit_preproof_terminal_states_round_trip_without_reclassification()
+    {
+        let keys = DeviceKeys::generate().unwrap();
+        let prepared = genesis_journal(&keys);
+        for (wire, phase) in [
+            ("cancelled", AdoptionPhase::Cancelled),
+            ("declinedBeforeProof", AdoptionPhase::DeclinedBeforeProof),
+            ("expiredBeforeProof", AdoptionPhase::ExpiredBeforeProof),
+        ] {
+            let mut json = serde_json::to_value(&prepared).unwrap();
+            json["phase"] = serde_json::Value::String(wire.into());
+            let decoded: AdoptionJournal = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.phase, phase);
+            decoded.validate().unwrap();
+            prepared.may_replace_with(Some(&decoded)).unwrap();
+            assert!(decoded.phase.permits_new_operation());
+            assert!(decoded.may_replace_with(Some(&prepared)).is_err());
+            let encoded = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(encoded["phase"], wire);
+        }
+        let mut legacy = prepared.clone();
+        legacy.phase = AdoptionPhase::Cancelled;
+        let mut relabelled = legacy.clone();
+        relabelled.phase = AdoptionPhase::DeclinedBeforeProof;
+        assert!(
+            legacy.may_replace_with(Some(&relabelled)).is_err(),
+            "old cancellation reason is unknown"
+        );
+    }
+
+    #[test]
+    fn proof_or_publication_uncertainty_never_becomes_declined_or_expired_before_proof() {
+        let keys = DeviceKeys::generate().unwrap();
+        let prepared = genesis_journal(&keys);
+        for from in [
+            AdoptionPhase::ConsentMayHaveLeft,
+            AdoptionPhase::PublicationUncertain,
+            AdoptionPhase::Accepted,
+            AdoptionPhase::Installed,
+        ] {
+            let mut escaped = prepared.clone();
+            escaped.phase = from;
+            for to in [
+                AdoptionPhase::Cancelled,
+                AdoptionPhase::DeclinedBeforeProof,
+                AdoptionPhase::ExpiredBeforeProof,
+            ] {
+                let mut terminal = escaped.clone();
+                terminal.phase = to;
+                assert!(escaped.may_replace_with(Some(&terminal)).is_err());
+            }
+        }
+        let mut invalid = prepared;
+        invalid.phase = AdoptionPhase::ExpiredBeforeProof;
+        invalid.signed_candidate = Some("not-even-a-token".into());
+        assert!(invalid.validate().is_err());
     }
 }

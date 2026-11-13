@@ -23,10 +23,10 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xshell_protocol::msg::{JoinExpect, MEMBERSHIP_CHANGED};
 use xshell_protocol::ring::relay::sessions::Sessions;
 use xshell_protocol::ring::relay::wire::{ErrorCode, MemberPresence};
@@ -119,6 +119,14 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<
 /// Writes `bytes` to `path` atomically: an exclusive 0600 temp file with a unique name (never
 /// following a symlink), synced, then renamed over `path`.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private_inner(path, bytes, None)
+}
+
+fn write_private_inner(
+    path: &Path,
+    bytes: &[u8],
+    roster_hook: Option<&super::TestHook>,
+) -> io::Result<()> {
     let mut name = path.as_os_str().to_owned();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -142,6 +150,13 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        if roster_hook
+            .is_some_and(|hook| (hook.0)(uuid::Uuid::nil(), super::TestPoint::RingRosterTempSynced))
+        {
+            return Err(io::Error::other(
+                "injected roster commit failure after temp sync",
+            ));
+        }
         fs::rename(&tmp, path)
     })();
     if r.is_err() {
@@ -462,6 +477,7 @@ impl Store {
     fn save_join_chain(
         &self,
         chain: &RosterChain,
+        effective_base: Option<&RosterChain>,
         origin: &JoinOrigin,
         budget: Option<&xshell_core::local_ipc::RequestBudget>,
         hook: Option<&super::TestHook>,
@@ -484,8 +500,69 @@ impl Store {
         if let Some(budget) = budget {
             budget.check().map_err(|e| e.to_string())?;
         }
-        Ok(self.settle_locked(chain, hook))
+        self.settle_accepted_locked(chain, effective_base, budget, hook)
     }
+
+    /// `chain` has already been verified against the guarded effective owner. Any
+    /// newer disk suffix must extend that effective ancestry BEFORE a write or adoption.
+    fn settle_accepted_locked(
+        &self,
+        chain: &RosterChain,
+        effective_base: Option<&RosterChain>,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+        hook: Option<&super::TestHook>,
+    ) -> Result<Saved, String> {
+        let disk = match self.read_chain() {
+            Ok(disk) => disk,
+            // Keep an independently validated revocation in force even when the
+            // private file is unavailable. Never label that as a durable receipt or
+            // overwrite unreadable evidence with a guessed disk ancestry.
+            Err(error) => return Ok(Saved::new(chain.clone(), Some(error))),
+        };
+        let next = match disk {
+            Some(disk) if disk.ring_id() == chain.ring_id() => {
+                // Establish disk authority from the guarded base first. A valid newer
+                // disk wins a candidate fork, but a terminal-signed disk suffix cannot.
+                let durable = match effective_base {
+                    Some(base) => {
+                        base.extended(disk.versions())
+                            .map_err(|e| {
+                                format!("effective accepted ancestry refuses durable suffix: {e}")
+                            })?
+                            .0
+                    }
+                    None => disk.clone(),
+                };
+                let merged = match durable.extended(chain.versions()) {
+                    Ok((merged, _)) => merged,
+                    Err(error) => {
+                        return Ok(Saved {
+                            trusted: durable,
+                            conflict: Some(format!(
+                                "the roster conflicts with the one stored here ({})",
+                                error.as_code()
+                            )),
+                            write_error: None,
+                        })
+                    }
+                };
+                if merged.versions() == disk.versions() {
+                    return Ok(Saved::new(merged, None));
+                }
+                merged
+            }
+            Some(_) => {
+                return Err("leave_required: accepted install cannot replace a foreign Ring".into())
+            }
+            None => chain.clone(),
+        };
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
+        let error = self.write_chain_inner(&next, hook).err();
+        Ok(Saved::new(next, error))
+    }
+
     fn settle_locked(&self, chain: &RosterChain, hook: Option<&super::TestHook>) -> Saved {
         let next = match self.read_chain() {
             Ok(Some(disk)) if disk.ring_id() == chain.ring_id() => {
@@ -544,7 +621,7 @@ impl Store {
         }) {
             return Err("injected roster write failure after prerequisite reads".into());
         }
-        write_private(&self.roster_path(), &json).map_err(|e| e.to_string())
+        write_private_inner(&self.roster_path(), &json, hook).map_err(|e| e.to_string())
     }
 }
 
@@ -682,6 +759,9 @@ enum JoinOrigin {
     },
 }
 
+#[cfg(test)]
+type HostBudgetHook = Box<dyn Fn(&xshell_core::local_ipc::RequestBudget) + Send>;
+
 /// This Host's Ring membership.
 pub(crate) struct Ring {
     test_hook: std::sync::OnceLock<super::TestHook>,
@@ -696,6 +776,10 @@ pub(crate) struct Ring {
     /// Test hook: runs in `join` between the `stopped` check and the install.
     #[cfg(test)]
     install_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    host_budget_hook: Mutex<Option<HostBudgetHook>>,
+    #[cfg(test)]
+    effective_query_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 fn link_json(s: &LinkState) -> (&'static str, Option<String>) {
@@ -730,6 +814,10 @@ impl Ring {
             timeouts,
             #[cfg(test)]
             install_hook: Mutex::new(None),
+            #[cfg(test)]
+            host_budget_hook: Mutex::new(None),
+            #[cfg(test)]
+            effective_query_hook: Mutex::new(None),
         }
     }
 
@@ -755,6 +843,64 @@ impl Ring {
     ) -> Result<std::sync::MutexGuard<'a, Option<RosterChain>>, String> {
         budget.lock(&self.persist.chain).map_err(|e| e.to_string())
     }
+    /// Read effective evidence under lifecycle -> cache -> Connector -> file order.
+    /// Identity and evidence stay fixed through the local read/receipt; no network,
+    /// session/event callback or join is allowed in the closure. Observations release
+    /// Connector state before calling persistence, so no reverse cache lock is held.
+    #[cfg(unix)]
+    pub(super) fn with_effective_chain_until<T>(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        read: impl FnOnce(Option<RosterChain>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let life = budget.lock(&self.life).map_err(|e| e.to_string())?;
+        if life.stopped {
+            return Err("Daemon Ring is stopping".into());
+        }
+        let cached = self.lock_trusted_chain_until(budget)?;
+        // Keep the read guard through the local file comparison/receipt so an owner
+        // observation cannot become effective halfway through that transaction.
+        let owner_guard = if let Some(joined) = &life.joined {
+            Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = joined.connector.try_accepted_install() {
+                    break guard;
+                }
+                std::thread::yield_now();
+            })
+        } else {
+            None
+        };
+        let mut effective = cached.clone();
+        if let Some(guard) = &owner_guard {
+            let owner = guard.current();
+            effective = Some(match effective {
+                Some(mut chain) => {
+                    chain.merge_terminal_from(owner);
+                    chain
+                        .extended(owner.versions())
+                        .map_err(|e| e.to_string())?
+                        .0
+                }
+                None => owner.clone(),
+            });
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if let Some(hook) = self.effective_query_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        let result = read(effective);
+        drop(owner_guard);
+        result
+    }
+
+    /// Unit-test coordination at the guarded local-read boundary; never authority.
+    #[cfg(test)]
+    pub(super) fn set_effective_query_hook(&self, hook: Box<dyn Fn() + Send>) {
+        *self.effective_query_hook.lock().unwrap() = Some(hook);
+    }
+
     /// The established order is runtime chain, then ring.lock. Never hold a file lock
     /// while waiting for the chain owner (including a paused ordinary Host commit).
     #[cfg(unix)]
@@ -933,8 +1079,27 @@ impl Ring {
     /// `expect`, only while this Host's membership (as `ring.identity` reports it) is still
     /// the expected one, checked under the same locks as the commit.
     pub fn join(&self, tokens: &[String], expect: Option<&JoinExpect>) -> Result<Value, String> {
-        self.join_inner(tokens, expect, JoinOrigin::Host, None)
+        // Host IPC supplies no deadline. Bound this local install once at ingress
+        // using the existing request timeout; never renew internal accepted budgets.
+        let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+            Instant::now() + self.timeouts.request,
+            Arc::new(AtomicBool::new(false)),
+        );
+        #[cfg(test)]
+        if let Some(hook) = self.host_budget_hook.lock().unwrap().as_ref() {
+            hook(&budget);
+        }
+        self.join_inner(tokens, expect, JoinOrigin::Host, Some(&budget))
     }
+    #[cfg(test)]
+    pub(super) fn test_host_join_until(
+        &self,
+        tokens: &[String],
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(tokens, None, JoinOrigin::Host, Some(budget))
+    }
+
     #[cfg(unix)]
     pub(super) fn join_accepted_standalone(
         &self,
@@ -1017,7 +1182,27 @@ impl Ring {
                 return Err(MEMBERSHIP_CHANGED.into());
             }
         }
-        if cur
+        let owner = life.joined.as_ref().map(|j| j.connector.clone());
+        // The earlier lifecycle/cache locks serialize all file -> Connector paths in
+        // this Ring. Owner callbacks drop Connector state before taking the cache lock.
+        let install_guard = if let Some(owner) = &owner {
+            let budget = budget.ok_or("accepted install requires its original request budget")?;
+            Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = owner.try_accepted_install() {
+                    break guard;
+                }
+                std::thread::yield_now();
+            })
+        } else {
+            None
+        };
+        let current = match (&install_guard, cur.as_ref()) {
+            (Some(guard), Some(cached)) => Some(guard.extend(cached).map_err(|e| e.to_string())?),
+            (Some(guard), None) => Some(guard.current().clone()),
+            (None, cached) => cached.cloned(),
+        };
+        if current
             .as_ref()
             .is_some_and(|c| c.ring_id() != chain.ring_id() || !is_daemon_member(c, &keys))
         {
@@ -1025,8 +1210,10 @@ impl Ring {
                 "leave_required: retained foreign or terminal membership cannot be replaced".into(),
             );
         }
-        let same_ring = cur.as_ref().is_some_and(|c| c.ring_id() == chain.ring_id());
-        let next = match cur.as_ref() {
+        let same_ring = current
+            .as_ref()
+            .is_some_and(|c| c.ring_id() == chain.ring_id());
+        let next = match current.as_ref() {
             Some(c) if same_ring => {
                 let (merged, a) = c.extended(chain.versions()).map_err(refused)?;
                 if a.added == 0 && chain.head().version() < c.head().version() {
@@ -1046,14 +1233,46 @@ impl Ring {
                 );
             }
         }
-        let saved =
-            self.persist
-                .store
-                .save_join_chain(&next, &origin, budget, self.test_hook.get())?;
+        let saved = self.persist.store.save_join_chain(
+            &next,
+            current.as_ref(),
+            &origin,
+            budget,
+            self.test_hook.get(),
+        )?;
         let trusted = saved.trusted;
+        // Settlement may already have changed disk, or produced an unsaved removal
+        // that must rule now. Report budget failure only after coherent enforcement.
+        let committed = match install_guard
+            .map(|guard| guard.commit(&trusted))
+            .transpose()
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                // The same guarded ancestry was verified before settlement, so this
+                // is an invariant failure. Never return with the old owner live.
+                *cur = Some(trusted.clone());
+                let epoch = self.persist.adopt();
+                life.stopped = true;
+                let failed = life.joined.take();
+                drop(cur);
+                drop(life);
+                if let Some(failed) = failed {
+                    failed.sessions.stop();
+                    failed.connector.stop(ByeReason::quit());
+                }
+                self.persist.head_changed(epoch, &trusted);
+                return Err(format!(
+                    "accepted state application failed; Ring owner stopped: {error}"
+                ));
+            }
+        };
+        // The guard is now released; no session callback runs under Connector state.
         // Then in force at once, whether or not the write succeeded: in memory, in the
         // Connector (whose head new handshakes are checked against), and in the sweep.
-        let same_ring = cur
+        // An existing guarded owner always uses the non-fallible same-Ring branch;
+        // initial Connector creation below has no old authority to leave running.
+        let same_ring = current
             .as_ref()
             .is_some_and(|c| c.ring_id() == trusted.ring_id());
         let moved = cur.as_ref() != Some(&trusted);
@@ -1061,10 +1280,12 @@ impl Ring {
         let epoch = moved.then(|| self.persist.adopt());
         match life.joined.as_ref() {
             Some(j) if same_ring => {
-                if moved {
-                    j.connector.set_chain(trusted.clone());
-                } else {
-                    j.connector.kick();
+                if committed.is_none() {
+                    if moved {
+                        j.connector.set_chain(trusted.clone());
+                    } else {
+                        j.connector.kick();
+                    }
                 }
                 j.sessions.sweep(trusted.head());
             }
@@ -1072,6 +1293,10 @@ impl Ring {
             _ => self.install(&mut life, trusted.clone(), keys)?,
         }
         drop(cur);
+        drop(life);
+        if let Some(committed) = committed {
+            committed.finish();
+        }
         if let Some(epoch) = epoch {
             self.persist.head_changed(epoch, &trusted);
         }
@@ -1087,6 +1312,9 @@ impl Ring {
             return Err(format!(
                 "the roster is in force but could not be saved: {e}"
             ));
+        }
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
         }
         let version = trusted.head().version();
         Ok(json!({ "version": version }))
@@ -1158,6 +1386,126 @@ mod tests {
         assert_eq!(read_private(&t.path().join("none")).unwrap(), None);
         // Only the target is left: no temp files.
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_chain_query_bounds_lifecycle_chain_and_file_admission() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = Ring::new(
+            dir.path().join("ring"),
+            Duration::from_millis(10),
+            RingTimeouts::default(),
+            Duration::from_secs(5),
+        );
+        let budget = || {
+            xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_millis(30),
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
+        let life = ring.lock_life();
+        let error = ring
+            .with_effective_chain_until(&budget(), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        drop(life);
+        let cached = ring.persist.chain.lock().unwrap();
+        let error = ring
+            .with_effective_chain_until(&budget(), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        drop(cached);
+        let _file = ring.persist.store.lock().unwrap();
+        let budget = budget();
+        let error = ring
+            .with_effective_chain_until(&budget, |_| {
+                let _file = ring.persist.store.lock_until(&budget)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        assert!(ring.life.try_lock().is_ok());
+        assert!(ring.persist.chain.try_lock().is_ok());
+    }
+
+    #[test]
+    fn host_join_spends_one_budget_across_lifecycle_and_file_admission() {
+        use std::sync::mpsc;
+        use xshell_protocol::ring::{Member, SignedRoster};
+        let home = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(180);
+        let ring = Arc::new(Ring::new(
+            home.path().join("ring"),
+            Duration::from_millis(10),
+            RingTimeouts {
+                request: timeout,
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        ));
+        ring.identity().unwrap();
+        let keys = ring.persist.store.load_keys().unwrap().unwrap();
+        let desktop = DeviceKeys::generate().unwrap();
+        let genesis = SignedRoster::genesis(
+            &desktop,
+            desktop.noise_key(),
+            "desktop",
+            "ws://127.0.0.1:9",
+            1000,
+        )
+        .unwrap();
+        let joined = genesis
+            .next(&desktop, 1001, |r| {
+                r.add(Member::new(
+                    "D",
+                    Role::Daemon,
+                    keys.sign_key(),
+                    keys.noise_key(),
+                    1001,
+                ))
+            })
+            .unwrap();
+        let chain = RosterChain::from_chain(vec![genesis, joined]).unwrap();
+        let tokens: Vec<String> = chain.versions().iter().map(|r| r.token().into()).collect();
+        ring.join(&tokens, None).unwrap();
+        let successor = chain.head().next(&desktop, 1002, |_| {}).unwrap();
+        let next = chain.extended(&[successor]).unwrap().0;
+        let next_tokens: Vec<String> = next.versions().iter().map(|r| r.token().into()).collect();
+        let (entry, entered) = mpsc::channel();
+        *ring.host_budget_hook.lock().unwrap() = Some(Box::new(move |b| {
+            entry.send(b.clone()).unwrap();
+        }));
+        let life = ring.lock_life();
+        let file = ring.persist.store.lock().unwrap();
+        let before = std::fs::read(ring.persist.store.roster_path()).unwrap();
+        let r = ring.clone();
+        let worker = std::thread::spawn(move || r.join(&next_tokens, None));
+        let original = entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Deliberately spend part of this known captured request budget at the first
+        // admission; this is a deadline control, not a fixture-stabilization sleep.
+        let (_unreleased, wait) = mpsc::channel::<()>();
+        assert!(wait.recv_timeout(timeout / 2).is_err());
+        original.check().unwrap();
+        drop(life);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(
+            original.check().is_err(),
+            "later file admission cannot renew the entry budget"
+        );
+        assert_eq!(
+            std::fs::read(ring.persist.store.roster_path()).unwrap(),
+            before
+        );
+        assert!(ring.life.try_lock().is_ok());
+        assert!(ring.persist.chain.try_lock().is_ok());
+        let owner = ring.lock_life().joined.as_ref().unwrap().connector.clone();
+        assert!(owner.try_accepted_install().is_some());
+        drop(file);
+        ring.stop(ByeReason::quit());
     }
 
     /// A `join` that passed the `stopped` check installs under the lifecycle lock; a `stop`

@@ -191,6 +191,9 @@ pub(super) struct Inner {
     pub(super) farewell_max: Duration,
     /// The farewell and fetch worker, started with its first job.
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Test-only coordination of actual attempt generation transitions, never authority.
+    #[cfg(feature = "test-relay")]
+    test_attempt_gate: Mutex<()>,
     /// Test hook: runs on the worker right before a quota report's fence.
     #[cfg(test)]
     before_quota: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -200,6 +203,58 @@ pub(super) struct Inner {
 pub struct Connector {
     inner: Arc<Inner>,
     thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// A bounded-admission local accepted-install transaction. The owner holds its own
+/// lifecycle/cache locks before this guard and may take only its private file lock next.
+/// No network, session/event callback, stop or worker join is allowed while it is held.
+pub struct AcceptedChainGuard<'a> {
+    connector: &'a Connector,
+    state: MutexGuard<'a, St>,
+}
+/// Deferred connection cleanup/wakeup, run only after the owner's installation locks end.
+pub struct AcceptedChainCommit {
+    inner: Arc<Inner>,
+    cut: Option<Arc<RingClient>>,
+}
+impl AcceptedChainCommit {
+    pub fn finish(self) {
+        if let Some(client) = self.cut {
+            client.shutdown();
+        }
+        self.inner.cv.notify_all();
+    }
+}
+impl AcceptedChainGuard<'_> {
+    pub fn current(&self) -> &RosterChain {
+        &self.state.chain
+    }
+
+    /// Verify successors under this owner's known terminal fences. Candidate-only
+    /// evidence is learned in history order, then retained even for an unchanged head.
+    pub fn extend(&self, candidate: &RosterChain) -> Result<RosterChain, RingError> {
+        if self.state.stop.is_some() || candidate.ring_id() != self.state.chain.ring_id() {
+            return Err(RingError::Invalid(
+                "accepted-install owner ended or changed Ring".into(),
+            ));
+        }
+        // Keep fences already known by this owner during replay. Suffix Expire
+        // transitions teach their own evidence in order, not before earlier signers.
+        let mut current = self.state.chain.extended(candidate.versions())?.0;
+        current.merge_terminal_from(candidate);
+        Ok(current)
+    }
+    pub fn commit(mut self, chain: &RosterChain) -> Result<AcceptedChainCommit, RingError> {
+        let effective = self.extend(chain)?;
+        self.state.chain = effective;
+        self.state.dirty = true;
+        self.state.fw_dirty = true;
+        let cut = Inner::prune_farewells(&mut self.state);
+        Ok(AcceptedChainCommit {
+            inner: self.connector.inner.clone(),
+            cut,
+        })
+    }
 }
 
 pub(super) fn lock(m: &Mutex<St>) -> MutexGuard<'_, St> {
@@ -505,6 +560,11 @@ impl Inner {
     /// Ends the current attempt's connection without a goodbye and fences its callbacks.
     fn abandon(&self) {
         let c = {
+            #[cfg(feature = "test-relay")]
+            let _attempt = self
+                .test_attempt_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut st = lock(&self.st);
             st.gen += 1;
             st.closed = None;
@@ -572,6 +632,11 @@ impl Inner {
     /// The stop request: says goodbye on `c` if there is one.
     fn finish(&self, c: Option<Arc<RingClient>>) {
         let reason = {
+            #[cfg(feature = "test-relay")]
+            let _attempt = self
+                .test_attempt_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut st = lock(&self.st);
             st.gen += 1;
             st.client = None;
@@ -587,6 +652,11 @@ impl Inner {
         'attempt: loop {
             // One attempt: what to dial, under a new generation.
             let (target, gen) = {
+                #[cfg(feature = "test-relay")]
+                let _attempt = self
+                    .test_attempt_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let mut st = lock(&self.st);
                 if st.stop.is_some() {
                     break;
@@ -826,6 +896,8 @@ impl Connector {
             farewell_unit: cfg.farewell_backoff_unit,
             farewell_max: cfg.farewell_backoff_max,
             worker: Mutex::new(None),
+            #[cfg(feature = "test-relay")]
+            test_attempt_gate: Mutex::new(()),
             #[cfg(test)]
             before_quota: Mutex::new(None),
         }
@@ -1143,6 +1215,29 @@ impl Connector {
         lock(&self.inner.st).chain.clone()
     }
 
+    /// Nonblocking admission; the owner supplies its original deadline/cancellation.
+    pub fn try_accepted_install(&self) -> Option<AcceptedChainGuard<'_>> {
+        let state = match self.inner.st.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(AcceptedChainGuard {
+            connector: self,
+            state,
+        })
+    }
+
+    /// Nonblocking effective-chain snapshot for bounded owner queries. Includes verified
+    /// same-head terminal observations, even when the connection has since stopped.
+    pub fn try_chain(&self) -> Option<RosterChain> {
+        match self.inner.st.try_lock() {
+            Ok(state) => Some(state.chain.clone()),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().chain.clone()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     pub fn state(&self) -> LinkState {
         lock(&self.inner.st).link.clone()
     }
@@ -1212,8 +1307,113 @@ mod tests {
     use crate::ring::relay::wire::{ClientFrame, RelayFrame};
     use std::sync::mpsc;
 
+    use crate as protocol;
+    mod chronology_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/recovery_chronology.rs"
+        ));
+    }
+
+    // Only the socket-identity holder uses legacy TestRelay. The v2 snapshot read is
+    // substituted cryptographic evidence, never claimed as Relay transport acceptance.
+    fn snapshot_owner(relay: &TestRelay, f: &chronology_fixture::RecoveryChronology) -> Connector {
+        let client = RingClient::connect(
+            config(&relay.target(), &f.legacy, f.reader.clone()),
+            super::super::contract::Recorder::new(),
+        )
+        .unwrap();
+        let owner = Connector {
+            inner: Arc::new(Connector::inner(
+                ConnectorConfig::new(RingClientConfig::new(f.known.clone(), f.reader.clone())),
+                Arc::new(Errors::default()),
+            )),
+            thread: Mutex::new(None),
+        };
+        lock(&owner.inner.st).client = Some(Arc::new(client));
+        owner
+    }
+
     #[test]
-    fn same_head_terminal_evidence_merges_without_rewriting_roster() {
+    fn recovery_snapshot_replays_cleanup_after_the_authorized_enroll() {
+        let relay = TestRelay::start();
+        let f = chronology_fixture::recovery_chronology(&relay.url());
+        let owner = snapshot_owner(&relay, &f);
+        let pin = super::super::ChainPin {
+            version: f.known.head().version(),
+            hash: f.known.head().hash(),
+        };
+        let accepted = owner
+            .read_accepted_chain_with(&pin, |_, captured| {
+                assert_eq!(captured, &pin);
+                assert_eq!(owner.chain().head(), f.known.head());
+                assert!(
+                    owner.inner.st.try_lock().is_ok(),
+                    "no state lock across snapshot read"
+                );
+                Ok(f.accepted.clone())
+            })
+            .expect("later cleanup must not forbid its earlier authorized signer");
+        assert_eq!(accepted.head(), f.accepted.head());
+        assert!(accepted.terminal_enrollments().contains(&f.terminal_id));
+        assert!(accepted.authorized_member(&f.b.sign_key()).is_none());
+        assert_eq!(
+            owner.chain().head(),
+            f.known.head(),
+            "snapshot remains read-only"
+        );
+    }
+
+    #[test]
+    fn recovery_snapshot_preserves_preexisting_terminal_and_capture_fences() {
+        let relay = TestRelay::start();
+        let f = chronology_fixture::recovery_chronology(&relay.url());
+        let owner = snapshot_owner(&relay, &f);
+        let pin = super::super::ChainPin {
+            version: f.known.head().version(),
+            hash: f.known.head().hash(),
+        };
+        let wrong_pin = super::super::ChainPin {
+            version: pin.version,
+            hash: crate::ring::b64::encode(&[99; 32]),
+        };
+        assert!(owner
+            .read_accepted_chain_with(&wrong_pin, |_, _| Ok(f.accepted.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot pin mismatch"));
+        lock(&owner.inner.st)
+            .chain
+            .observe_activity(&f.evidence)
+            .unwrap();
+        assert!(owner
+            .read_accepted_chain_with(&pin, |_, _| Ok(f.accepted.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("terminal-expired signer"));
+        assert!(
+            owner
+                .read_accepted_chain_with(&pin, |_, _| {
+                    lock(&owner.inner.st).gen += 1;
+                    Ok(f.accepted.clone())
+                })
+                .is_err(),
+            "stale generation must refuse even verified evidence"
+        );
+        assert!(
+            owner
+                .read_accepted_chain_with(&pin, |_, _| {
+                    lock(&owner.inner.st).client = None;
+                    Ok(f.accepted.clone())
+                })
+                .is_err(),
+            "replaced socket must refuse even verified evidence"
+        );
+        assert_eq!(owner.chain().head(), f.known.head());
+        assert!(owner.chain().authorized_member(&f.b.sign_key()).is_none());
+    }
+
+    fn signed_same_head_terminal_fixture() -> (crate::ring::DeviceKeys, RosterChain, String) {
         use crate::ring::{
             activity::{policy_hash, ActivityEvidence, UnitActivity},
             b64,
@@ -1253,7 +1453,6 @@ mod tests {
         });
         let u = r.sign(&keys).unwrap();
         let ours = RosterChain::from_chain(vec![g, u]).unwrap();
-        let mut learned = ours.clone();
         let report = ActivityEvidence {
             ring_id: ours.ring_id().clone(),
             relay_url: r.relay_url,
@@ -1270,6 +1469,13 @@ mod tests {
         }
         .sign(&source)
         .unwrap();
+        (keys, ours, report)
+    }
+
+    #[test]
+    fn same_head_terminal_evidence_merges_without_rewriting_roster() {
+        let (keys, ours, report) = signed_same_head_terminal_fixture();
+        let mut learned = ours.clone();
         learned.observe_activity(&report).unwrap();
         let merged =
             merge(&ours, &learned).expect("same-head evidence is a new authorization observation");
@@ -1278,6 +1484,46 @@ mod tests {
         assert!(
             merge(&merged, &ours).is_none(),
             "an older observation cannot resurrect authority"
+        );
+    }
+
+    #[test]
+    fn test_activity_observation_rejects_stale_generation_without_stopping_owner() {
+        let (keys, chain, token) = signed_same_head_terminal_fixture();
+        let principal = keys.sign_key();
+        let pin = super::super::ChainPin {
+            version: chain.head().version(),
+            hash: chain.head().hash(),
+        };
+        let connector = Connector {
+            inner: Arc::new(Connector::inner(
+                ConnectorConfig::new(RingClientConfig::new(chain, Arc::new(keys))),
+                Arc::new(Errors::default()),
+            )),
+            thread: Mutex::new(None),
+        };
+        assert!(connector
+            .test_observe_activity(&pin, principal, &token, || {
+                connector.inner.abandon();
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("generation changed"));
+        let state = lock(&connector.inner.st);
+        assert!(
+            state.stop.is_none(),
+            "isolate replacement-generation gate from stopped-owner gate"
+        );
+        assert!(state.chain.authorized_member(&principal).is_some());
+        drop(state);
+        connector
+            .test_with_stable_attempt(|| {
+                connector.test_observe_activity(&pin, principal, &token, || {})
+            })
+            .unwrap();
+        assert!(
+            connector.chain().authorized_member(&principal).is_none(),
+            "fresh verified capture after controlled transition must deliver"
         );
     }
 
@@ -1414,6 +1660,150 @@ pub struct ProposalConnection {
 }
 
 impl Connector {
+    /// Coordinate a positive observation with actual attempt transitions. The caller
+    /// still runs all observation verification; no network or stop/join is allowed here.
+    #[cfg(feature = "test-relay")]
+    #[doc(hidden)]
+    pub fn test_with_stable_attempt<T>(
+        &self,
+        observe: impl FnOnce() -> Result<T, RingError>,
+    ) -> Result<T, RingError> {
+        self.test_coordinate_attempt(None, observe)
+    }
+
+    /// Request a real worker-attempt transition, then freshly verify exactly once at
+    /// a coordinated current generation. A refused observation is never retried.
+    #[cfg(feature = "test-relay")]
+    #[doc(hidden)]
+    pub fn test_with_next_attempt<T>(
+        &self,
+        observe: impl FnOnce() -> Result<T, RingError>,
+    ) -> Result<T, RingError> {
+        let previous = lock(&self.inner.st).gen;
+        self.kick();
+        self.test_coordinate_attempt(Some(previous), observe)
+    }
+
+    #[cfg(feature = "test-relay")]
+    fn test_coordinate_attempt<T>(
+        &self,
+        previous: Option<u64>,
+        observe: impl FnOnce() -> Result<T, RingError>,
+    ) -> Result<T, RingError> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= until {
+                return Err(RingError::Timeout);
+            }
+            let attempt = match self.inner.test_attempt_gate.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            if let Some(_attempt) = attempt {
+                let ready = match previous {
+                    None => true,
+                    Some(previous) => {
+                        let state = lock(&self.inner.st);
+                        if state.stop.is_some() {
+                            return Err(RingError::Closed(CloseReason::Local));
+                        }
+                        state.gen != previous
+                    }
+                };
+                if ready {
+                    return observe();
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Deliver verified same-head activity through the normal generation-fenced owner
+    /// observation path. Test support only; never a production observation ingress.
+    #[cfg(feature = "test-relay")]
+    #[doc(hidden)]
+    pub fn test_observe_activity(
+        &self,
+        pin: &super::ChainPin,
+        principal: SignKey,
+        token: &str,
+        before_apply: impl FnOnce(),
+    ) -> Result<(), RingError> {
+        let (mut chain, generation) = {
+            let state = lock(&self.inner.st);
+            if state.stop.is_some()
+                || principal != self.inner.base.signer.sign_key()
+                || state.chain.head().version() != pin.version
+                || state.chain.head().hash() != pin.hash
+            {
+                return Err(RingError::Invalid("test activity owner/pin changed".into()));
+            }
+            (state.chain.clone(), state.gen)
+        };
+        chain.observe_activity(token)?;
+        before_apply();
+        {
+            let state = lock(&self.inner.st);
+            if state.stop.is_some() || state.gen != generation || state.chain.head() != chain.head()
+            {
+                return Err(RingError::Invalid(
+                    "test activity owner generation changed".into(),
+                ));
+            }
+        }
+        Attempt {
+            inner: Arc::downgrade(&self.inner),
+            gen: generation,
+            dialed: chain.head().roster().relay_url.clone(),
+        }
+        .chain(&chain);
+        Ok(())
+    }
+
+    /// Read-only recovery on the normal owner's existing socket. Never stages a chain,
+    /// creates a proposal, or opens a competing connection with the same identity.
+    pub fn read_accepted_chain(&self, pin: &super::ChainPin) -> Result<RosterChain, RingError> {
+        self.read_accepted_chain_with(pin, |client, pin| client.read_accepted_chain(pin))
+    }
+
+    fn read_accepted_chain_with(
+        &self,
+        pin: &super::ChainPin,
+        read: impl FnOnce(&RingClient, &super::ChainPin) -> Result<RosterChain, RingError>,
+    ) -> Result<RosterChain, RingError> {
+        let (client, generation) = {
+            let st = lock(&self.inner.st);
+            if st.stop.is_some() {
+                return Err(RingError::Closed(CloseReason::Local));
+            }
+            let client = st
+                .client
+                .as_ref()
+                .filter(|c| !c.is_closed())
+                .cloned()
+                .ok_or(RingError::Closed(CloseReason::Local))?;
+            (client, st.gen)
+        };
+        let accepted = read(&client, pin)?;
+        let st = lock(&self.inner.st);
+        if st.stop.is_some()
+            || st.gen != generation
+            || !st.client.as_ref().is_some_and(|c| Arc::ptr_eq(c, &client))
+        {
+            return Err(RingError::Closed(CloseReason::Local));
+        }
+        if accepted
+            .get(pin.version)
+            .is_none_or(|r| r.hash() != pin.hash)
+        {
+            return Err(RingError::Invalid("accepted snapshot pin mismatch".into()));
+        }
+        let mut current = st.chain.extended(accepted.versions())?.0;
+        current.merge_terminal_from(&accepted);
+        Ok(current)
+    }
+
     pub fn proposal_connection(&self) -> Result<ProposalConnection, RingError> {
         let st = lock(&self.inner.st);
         let client = st

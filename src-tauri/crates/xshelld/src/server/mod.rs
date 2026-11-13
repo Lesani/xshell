@@ -222,6 +222,12 @@ pub enum TestPoint {
     CompanionRequestAdmitted,
     /// Actual roster write after prerequisite reads (ring.lock held); true injects a write error.
     BeforeRingRosterWrite,
+    /// Actual roster temp bytes are written and synced, before rename (file/owner locks
+    /// held). Returning true injects commit failure; must not re-enter Ring/session APIs.
+    RingRosterTempSynced,
+    /// Standalone recovery installed its store, before the final journal lock. No locks
+    /// held; may order concurrent recovery without supplying authority or a receipt.
+    StandaloneInstalledBeforeJournal,
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
     /// Selected-update commit has been acknowledged; on its worker, outside all locks.

@@ -522,7 +522,8 @@ fn either_store_failure_reports_reconciliation_and_retries_installation_not_enro
                     return false;
                 }
                 if point == TestPoint::CompanionRequestAdmitted
-                    && admitted.fetch_add(1, Ordering::SeqCst) == 1
+                    // CompletionStatus, read-only MembershipSnapshot, then InstallAccepted.
+                    && admitted.fetch_add(1, Ordering::SeqCst) == 2
                 {
                     let dir = directory.lock().unwrap().clone().unwrap();
                     let file = dir.join(if fail_desktop {

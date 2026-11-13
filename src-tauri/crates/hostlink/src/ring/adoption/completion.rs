@@ -78,9 +78,10 @@ impl DesktopRing {
             .ok_or("retained profile missing")?;
         if stored.membership.is_some()
             || stored.pending_join.is_some()
-            || stored.journal.as_ref().is_some_and(|j| {
-                !matches!(j.phase, AdoptionPhase::Cancelled | AdoptionPhase::Installed)
-            })
+            || stored
+                .journal
+                .as_ref()
+                .is_some_and(|j| !j.phase.permits_new_operation())
         {
             return Err(
                 "leave_required or reconciliation_required: Desktop already has membership/work"
@@ -147,10 +148,7 @@ impl DesktopRing {
             if let Some(journal) = &mut stored.journal {
                 if journal.intent == pending.intent && journal.phase == AdoptionPhase::Prepared {
                     journal.phase = AdoptionPhase::Cancelled;
-                } else if !matches!(
-                    journal.phase,
-                    AdoptionPhase::Cancelled | AdoptionPhase::Installed
-                ) {
+                } else if !journal.phase.permits_new_operation() {
                     return Err(
                         "reconciliation_required: completion journal is not cancellable".into(),
                     );
@@ -267,7 +265,7 @@ impl DesktopRing {
             client.request(CompanionRequest::Cancel {
                 operation: operation.clone(),
             })?;
-            self.journal_update(&operation, |j| j.phase = AdoptionPhase::Cancelled)?;
+            self.journal_update(&operation, |j| j.phase = AdoptionPhase::DeclinedBeforeProof)?;
             return Ok(CompletionOutcome::Declined { operation });
         };
         lease.verify(&confirmation)?;
@@ -312,10 +310,6 @@ impl DesktopRing {
         &self,
         client: &CompanionClient,
     ) -> Result<CompletionOutcome, String> {
-        let _admission = self.reserve_adoption()?;
-        if !self.pairing_ipc_owner() {
-            return Err("another process owns completion".into());
-        }
         let pending = local_status(client)?;
         let operation = pending.intent.operation.clone();
         let stored = self
@@ -323,39 +317,35 @@ impl DesktopRing {
             .load_profile()?
             .0
             .ok_or("retained profile missing")?;
-        if pending.accepted.is_empty()
-            && stored.journal.as_ref().is_none_or(|journal| {
-                journal.intent != pending.intent || journal.accepted.is_empty()
-            })
-        {
-            return Ok(CompletionOutcome::Pending { operation });
-        }
-        let journal = stored
+        let Some(journal) = stored
             .journal
             .as_ref()
-            .ok_or("local completion journal missing")?;
-        if journal.intent != pending.intent
-            || !matches!(journal.transcript, ConsentTranscript::Local)
-        {
+            .filter(|j| j.intent == pending.intent)
+        else {
+            return Ok(CompletionOutcome::Pending { operation });
+        };
+        if !matches!(journal.transcript, ConsentTranscript::Local) {
             return Err("accepted result does not match local completion".into());
         }
-        let accepted_tokens = if pending.accepted.is_empty() {
-            &journal.accepted
-        } else {
-            &pending.accepted
-        };
-        if accepted_tokens.is_empty() {
-            return Ok(CompletionOutcome::Pending { operation });
+        let recovered = self.reconcile_adoption(client, &operation)?;
+        match recovered.local.map(|s| s.state) {
+            Some(AdoptionRecoveryState::Installed) => Ok(CompletionOutcome::Installed {
+                operation,
+                chain: self
+                    .store
+                    .load_profile()?
+                    .0
+                    .and_then(|p| p.membership)
+                    .ok_or("installed completion membership missing")?
+                    .chain,
+            }),
+            Some(AdoptionRecoveryState::Terminal) => {
+                Err("completion is terminal; no reinstall".into())
+            }
+            _ => Ok(CompletionOutcome::Pending { operation }),
         }
-        let accepted = RosterChain::from_tokens(accepted_tokens).map_err(|e| e.to_string())?;
-        let profile = stored.companion.ok_or("registered counterpart missing")?;
-        self.install_joined_computer(client, &operation, &profile, &accepted)
-            .map_err(|e| format!("reconciliation_required: {e}"))?;
-        Ok(CompletionOutcome::Installed {
-            operation,
-            chain: accepted,
-        })
     }
+
     pub fn prepare_companion_completion(
         &self,
         host: HostAccess,
