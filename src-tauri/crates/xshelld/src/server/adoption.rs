@@ -1,6 +1,6 @@
 //! Explicit command-scoped standalone adoption. No Host RPC can invoke or confirm this
 //! controller; registration (including a stopped Desktop) always excludes it.
-use super::ring::{read_private, write_private, Store};
+use super::ring::{read_private, write_private, PrivateRingFile, Store};
 use super::ServerHandle;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,14 +32,16 @@ struct StandaloneJournal {
     installed: bool,
 }
 fn load_journal(store: &Store) -> Result<Option<StandaloneJournal>, String> {
-    read_private(&store.dir.join("standalone-adoption.json"))
-        .map_err(|e| e.to_string())?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|e| {
-                format!("reconciliation_required: unreadable standalone obligation: {e}")
-            })
-        })
-        .transpose()
+    read_private(
+        &store.dir.join("standalone-adoption.json"),
+        PrivateRingFile::StandaloneJournal,
+    )
+    .map_err(|e| e.to_string())?
+    .map(|bytes| {
+        serde_json::from_slice(&bytes)
+            .map_err(|e| format!("reconciliation_required: unreadable standalone obligation: {e}"))
+    })
+    .transpose()
 }
 fn recorded_predecessor(store: &Store, record: &StandaloneJournal) -> Result<RosterChain, String> {
     record.intent.validate().map_err(|e| e.to_string())?;
@@ -181,8 +183,18 @@ pub(super) fn validate_standalone_install(
     operation: &str,
     chain: &RosterChain,
 ) -> Result<(), String> {
-    if super::ring::companion_registered(&store.dir) {
+    if !matches!(std::fs::symlink_metadata(store.dir.join("companion.json")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         return Err("registered counterpart excludes standalone installation".into());
+    }
+    // Startup reservation is denial for new offers, not registration or authority.
+    // Only the exact recorded accepted operation below may finish through it.
+    if xshell_core::companion_reservation::read_reservation(&store.dir)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
+    {
+        return Err("uncertain legacy outcome excludes standalone installation".into());
     }
     let record = load_journal(store)?.ok_or("standalone accepted obligation missing")?;
     let accepted = accepted_record(store, &record)?;

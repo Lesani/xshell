@@ -23,9 +23,20 @@ type Subscription = (Uuid, Uuid);
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum ClientMessage {
-    Hello { version: u32, profile_id: String },
+    Hello {
+        version: u32,
+        profile_id: String,
+    },
     Request(Box<BrokerRequest>),
-    Cancel { owner_epoch: Uuid, request_id: u64 },
+    Administration {
+        owner_epoch: Uuid,
+        request_id: u64,
+        request: super::administration::AdministrationRequest,
+    },
+    Cancel {
+        owner_epoch: Uuid,
+        request_id: u64,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct BrokerRequest {
@@ -435,6 +446,7 @@ pub(crate) struct Broker {
     snapshot: Mutex<Option<Arc<SnapshotFrame>>>,
     stopped: AtomicBool,
     pub assembly: Arc<Assembly>,
+    pub(super) administration: Mutex<super::administration::Administration>,
     replay_budget: crate::attachments::ReplayBudget,
 }
 impl Broker {
@@ -449,6 +461,7 @@ impl Broker {
             snapshot: Mutex::new(None),
             stopped: AtomicBool::new(false),
             assembly: Arc::new(Assembly::default()),
+            administration: Mutex::new(super::administration::Administration::default()),
             replay_budget: manager.replay_budget(),
         })
     }
@@ -684,6 +697,7 @@ impl Session {
         self.out.stop();
         self.pending.lock().unwrap().clear();
         if let Some(broker) = self.broker.upgrade() {
+            broker.administration.lock().unwrap().disconnect(self.id);
             broker.detach(self.id, None);
         }
     }
@@ -742,6 +756,33 @@ impl Session {
                         error
                     }),
                 );
+                Ok(())
+            }
+            ClientMessage::Administration {
+                owner_epoch,
+                request_id,
+                request,
+            } => {
+                if !self.greeted.load(Ordering::Acquire)
+                    || owner_epoch != broker.epoch
+                    || self.stopped.load(Ordering::Acquire)
+                {
+                    return Err(HostError::invalid("administration epoch/origin mismatch"));
+                }
+                // A short synchronous admission/status transaction, never a human-wait worker.
+                let result = {
+                    let mut administration = broker.administration.lock().unwrap();
+                    // Serialize admission with disconnect; an already queued start cannot
+                    // recreate an origin after its disconnect cleanup has run.
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Err(HostError::offline("administration origin disconnected"));
+                    }
+                    administration.request(self.id, request).and_then(|status| {
+                        serde_json::to_value(status)
+                            .map_err(|_| HostError::invalid("administration status encoding"))
+                    })
+                };
+                self.emit(&Event::Reply { request_id, result }, false);
                 Ok(())
             }
             ClientMessage::Request(request) => {

@@ -141,6 +141,33 @@ impl DesktopRing {
         Ok(AdoptionAdmission(self.adoption.clone()))
     }
 
+    /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared
+    /// by Desktop shutdown/cancellation; not evidence of counterpart registration.
+    #[cfg(unix)]
+    pub fn reserve_local_companion(&self, home: &std::path::Path) -> Result<bool, String> {
+        if !self.pairing_ipc_owner() {
+            return Ok(false);
+        }
+        let desktop = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
+        xshell_core::companion_reservation::reserve(home, &desktop).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// The same elected startup path used by Tauri before any adoption action.
+    #[cfg(unix)]
+    pub fn register_local_companion(
+        &self,
+        daemon: &crate::LocalDaemon,
+    ) -> Result<Option<CompanionProfile>, String> {
+        if !self.pairing_ipc_owner() {
+            return Ok(None);
+        }
+        let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
+        daemon
+            .with_registration_endpoint(&desktop_dir, |client| self.register_companion(client))
+            .map(Some)
+    }
+
     pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
         let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {

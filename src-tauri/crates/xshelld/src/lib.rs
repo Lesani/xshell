@@ -73,6 +73,24 @@ pub fn main_entry() -> i32 {
         }
         Command::JobExec { job, program, args } => return job_exec::run(&job, &program, &args),
         Command::ConsoleMode { pid } => return console_mode::run(pid),
+        Command::CompanionRegistration(o) => {
+            #[cfg(unix)]
+            {
+                return server::registration_child(&o).map_or_else(
+                    |e| {
+                        eprintln!("xshelld: {e}");
+                        1
+                    },
+                    |()| 0,
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = o;
+                eprintln!("xshelld: protected registration adapter unavailable");
+                return 1;
+            }
+        }
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
         #[cfg(windows)]

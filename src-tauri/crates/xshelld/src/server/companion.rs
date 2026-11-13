@@ -2,7 +2,7 @@
 //! survives endpoint/process loss. Only this Daemon's store and keys are ever written here.
 #![cfg(unix)]
 use super::registry::Daemon;
-use super::ring::{read_private, write_private, Store};
+use super::ring::{read_private, write_private, PrivateRingFile, Store};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -17,13 +17,16 @@ fn now() -> u64 {
         .as_secs()
 }
 pub(super) fn load(store: &Store) -> Result<Option<CompanionPolicy>, String> {
-    read_private(&store.dir.join("companion.json"))
-        .map_err(|e| e.to_string())?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes)
-                .map_err(|e| format!("unreadable companion registration: {e}"))
-        })
-        .transpose()
+    read_private(
+        &store.dir.join("companion.json"),
+        PrivateRingFile::CompanionPolicy,
+    )
+    .map_err(|e| e.to_string())?
+    .map(|bytes| {
+        serde_json::from_slice(&bytes)
+            .map_err(|e| format!("unreadable companion registration: {e}"))
+    })
+    .transpose()
 }
 pub(super) fn save(store: &Store, policy: &CompanionPolicy) -> Result<(), String> {
     write_private(
@@ -81,6 +84,126 @@ pub(super) fn validate_install_locked(
     policy.accept_chain(operation, chain, trusted(store)?.as_ref())?;
     Ok(())
 }
+/// Shared by live serve and the bounded registration-only child. Caller holds ring.lock.
+fn registration_locked(
+    store: &Store,
+    request: CompanionRequest,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<CompanionResponse, String> {
+    budget.check().map_err(|e| e.to_string())?;
+    if let CompanionRequest::ReserveRegistration { desktop_store } = &request {
+        xshell_core::companion_reservation::reserve_locked(
+            &store.dir.canonicalize().map_err(|e| e.to_string())?,
+            Path::new(desktop_store),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(CompanionResponse::Descriptor { profile: None });
+    }
+    refuse_legacy_uncertainty(store)?;
+    if matches!(request, CompanionRequest::Descriptor) {
+        trusted(store)?;
+        let existing = load(store)?;
+        budget.check().map_err(|e| e.to_string())?;
+        let keys = match existing.as_ref() {
+            Some(_) => store
+                .load_keys()?
+                .ok_or("registered counterpart has lost its retained keys")?,
+            None => store.keys_locked()?,
+        };
+        if let Some(policy) = &existing {
+            validate_profile(store, policy.profile(), &keys)?;
+        }
+        return Ok(CompanionResponse::Identity {
+            identity: PublicIdentity {
+                sign_key: keys.sign_key(),
+                noise_key: keys.noise_key(),
+                name: super::ring::host_name(),
+            },
+            profile: existing.map(|policy| policy.profile().clone()),
+        });
+    }
+    let keys = store
+        .load_keys()?
+        .ok_or("request counterpart Descriptor before registration")?;
+    let policy = load(store)?;
+    if let CompanionRequest::Register { profile, proof } = request {
+        validate_profile(store, &profile, &keys)?;
+        validate_pending(store, &profile.desktop_store)?;
+        if !verify(
+            &profile.desktop.sign_key,
+            &registration_message(&profile),
+            &proof,
+        ) {
+            return Err("companion registration possession proof refused".into());
+        }
+        if let Some(existing) = &policy {
+            if existing.profile() != &profile {
+                return Err(
+                    "conflicting companion registration; no downgrade or replacement".into(),
+                );
+            }
+        } else {
+            let _offer = store.registration_admission()?;
+            super::adoption::refuse_unresolved_standalone(store)?;
+            let registered = CompanionPolicy::new(profile.clone())?;
+            budget.check().map_err(|e| e.to_string())?;
+            save(store, &registered)?;
+        }
+        // Commit valid registration durably before removing only its exact denial.
+        std::fs::File::open(&store.dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        // Debug-only owned-child crash cut: valid policy is durable, denial still exists.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("XSHELLD_TEST_REGISTRATION_AFTER_SAVE") {
+            let path = std::path::PathBuf::from(path);
+            write_private(&path, b"registration-durable-before-denial-clear")
+                .map_err(|e| e.to_string())?;
+            while path.exists() {
+                budget.check().map_err(|e| e.to_string())?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        validate_pending(store, &profile.desktop_store)?;
+        match std::fs::remove_file(store.dir.join("companion-pending.json")) {
+            Ok(()) => std::fs::File::open(&store.dir)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        return Ok(CompanionResponse::Descriptor {
+            profile: Some(profile),
+        });
+    }
+    Err("registration helper refuses non-registration requests".into())
+}
+fn refuse_legacy_uncertainty(store: &Store) -> Result<(), String> {
+    if xshell_core::companion_reservation::read_reservation(&store.dir)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
+    {
+        return Err("reconciliation_required: incumbent legacy pairing remote outcome is uncertain; registration cannot resolve or clear this denial".into());
+    }
+    Ok(())
+}
+fn validate_pending(store: &Store, desktop_store: &str) -> Result<(), String> {
+    if let Some(reservation) = xshell_core::companion_reservation::read_reservation(&store.dir)
+        .map_err(|e| e.to_string())?
+    {
+        if reservation.desktop_store != desktop_store {
+            return Err("conflicting pending counterpart registration".into());
+        }
+        if reservation.legacy_outcome_uncertain {
+            return Err(
+                "reconciliation_required: incumbent legacy pairing remote outcome is uncertain"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 fn dispatch(
     daemon: &Arc<Daemon>,
     request: CompanionRequest,
@@ -98,28 +221,22 @@ fn dispatch(
     }
     budget.check().map_err(|e| e.to_string())?;
     let store = Store::new(daemon.cfg.paths.ring_dir.clone());
-    if matches!(request, CompanionRequest::Descriptor) {
+    if matches!(
+        request,
+        CompanionRequest::Descriptor
+            | CompanionRequest::Register { .. }
+            | CompanionRequest::ReserveRegistration { .. }
+    ) {
         let _lock = store.lock_until(budget)?;
-        trusted(&store)?;
-        let existing = load(&store)?;
-        budget.check().map_err(|e| e.to_string())?;
-        let keys = match existing.as_ref() {
-            Some(_) => store
-                .load_keys()?
-                .ok_or("registered counterpart has lost its retained keys")?,
-            None => store.keys_locked()?,
-        };
-        if let Some(policy) = &existing {
-            validate_profile(&store, policy.profile(), &keys)?;
-        }
-        return Ok(CompanionResponse::Identity {
-            identity: PublicIdentity {
-                sign_key: keys.sign_key(),
-                noise_key: keys.noise_key(),
-                name: super::ring::host_name(),
-            },
-            profile: existing.map(|policy| policy.profile().clone()),
-        });
+        return registration_locked(&store, request, budget);
+    }
+    if !matches!(
+        request,
+        CompanionRequest::Status { .. }
+            | CompanionRequest::Cancel { .. }
+            | CompanionRequest::CompletionStatus
+    ) {
+        refuse_legacy_uncertainty(&store)?;
     }
     if matches!(request, CompanionRequest::MembershipSnapshot) {
         return daemon.ring.with_effective_chain_until(budget, |live| {
@@ -226,32 +343,6 @@ fn dispatch(
             != trusted(&store)?.as_ref().map(|c| c.head().hash())
     {
         return Err("retained membership is not durably current".into());
-    }
-    if let CompanionRequest::Register { profile, proof } = request {
-        validate_profile(&store, &profile, &keys)?;
-        if !verify(
-            &profile.desktop.sign_key,
-            &registration_message(&profile),
-            &proof,
-        ) {
-            return Err("companion registration possession proof refused".into());
-        }
-        if let Some(existing) = &policy {
-            if existing.profile() != &profile {
-                return Err(
-                    "conflicting companion registration; no downgrade or replacement".into(),
-                );
-            }
-        } else {
-            let _offer = store.registration_admission()?;
-            super::adoption::refuse_unresolved_standalone(&store)?;
-            let registered = CompanionPolicy::new(profile.clone())?;
-            budget.check().map_err(|e| e.to_string())?;
-            save(&store, &registered)?;
-        }
-        return Ok(CompanionResponse::Descriptor {
-            profile: Some(profile),
-        });
     }
     let policy = policy.as_mut().ok_or("companion is not registered")?;
     validate_profile(&store, policy.profile(), &keys)?;
@@ -385,4 +476,136 @@ pub(super) fn serve(
             .unwrap_or_else(|message| CompanionResponse::Error { message })
     })
     .map(Some)
+}
+
+/// Read-only classification for the actual CLI. Unreadable association is an error,
+/// never standalone permission; a pending reservation may contain no keys at all.
+pub(crate) fn registered_desktop(
+    store: &Store,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<String, String> {
+    let _lock = store.lock_until(budget)?;
+    budget.check().map_err(|e| e.to_string())?;
+    if let Some(policy) = load(store)? {
+        let keys = store.load_keys()?.ok_or("registered Daemon keys missing")?;
+        validate_profile(store, policy.profile(), &keys)?;
+        validate_pending(store, &policy.profile().desktop_store)?;
+        budget.check().map_err(|e| e.to_string())?;
+        return Ok(policy.profile().desktop_store.clone());
+    }
+    let path = xshell_core::companion_reservation::read_reservation(&store.dir)
+        .map_err(|e| e.to_string())?
+        .ok_or("registered Computer association is unreadable")?
+        .desktop_store;
+    xshell_core::local_ipc::private_dir(Path::new(&path)).map_err(|e| e.to_string())?;
+    budget.check().map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Registration-only command: no Daemon, Host, Relay, signer RPC or membership runtime.
+/// stdin owns its lifetime; EOF or the original 15-second bound drains the endpoint.
+pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+    let home = opts
+        .home
+        .clone()
+        .or_else(dirs::home_dir)
+        .ok_or("home unavailable")?;
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let paths = crate::paths::resolve(&home, xdg.as_deref(), opts.socket.as_deref());
+    let until = Instant::now() + Duration::from_secs(15);
+    let stdin = std::io::stdin();
+    let mut bytes = Vec::new();
+    let input_until = until.min(Instant::now() + Duration::from_secs(5));
+    // Bounded private pipe input; paths/public metadata only, never a seed or capability.
+    loop {
+        poll_stdin(stdin.as_raw_fd(), input_until)?;
+        let mut byte = [0];
+        let count = unsafe { libc::read(stdin.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        if count <= 0 {
+            return Err("registration child cancelled or interrupted".into());
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= 4096 {
+            return Err("registration input too large".into());
+        }
+        bytes.push(byte[0]);
+    }
+    let desktop_store: String = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    crate::paths::ensure_private_dir(paths.lock.parent().ok_or("lock parent missing")?)
+        .map_err(|e| e.to_string())?;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&paths.lock)
+        .map_err(|e| e.to_string())?;
+    let meta = lock.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err("unsafe Daemon owner lock".into());
+    }
+    lock.try_lock()
+        .map_err(|e| format!("registration child cannot own Daemon endpoint: {e}"))?;
+    let home = home.canonicalize().map_err(|e| e.to_string())?;
+    xshell_core::companion_reservation::reserve(&home, Path::new(&desktop_store))
+        .map_err(|e| e.to_string())?;
+    let store = Store::new(paths.ring_dir);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, stop);
+    {
+        let _lock = store.lock_until(&budget)?;
+        registration_locked(
+            &store,
+            CompanionRequest::ReserveRegistration { desktop_store },
+            &budget,
+        )?;
+    }
+    let endpoint = store
+        .dir
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .join("companion.sock");
+    let server = xshell_core::local_ipc::serve(endpoint, move |request, budget| {
+        let result = (|| {
+            let _lock = store.lock_until(&budget)?;
+            registration_locked(&store, request, &budget)
+        })();
+        result.unwrap_or_else(|message| CompanionResponse::Error { message })
+    })
+    .map_err(|e| e.to_string())?;
+    // Only EOF is accepted after the initial line. No generic command channel.
+    let result = poll_stdin(stdin.as_raw_fd(), until);
+    drop(server); // cancel budgets and drain before releasing the endpoint-owner lock
+    drop(lock);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if Instant::now() >= until => {
+            let _ = e;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+fn poll_stdin(fd: std::os::fd::RawFd, until: std::time::Instant) -> Result<(), String> {
+    let left = until.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        return Err("registration child deadline".into());
+    }
+    let mut event = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut event, 1, left.as_millis().min(i32::MAX as u128) as i32) };
+    if ready <= 0 {
+        return Err("registration child deadline or interrupted".into());
+    }
+    Ok(())
 }

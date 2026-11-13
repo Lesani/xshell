@@ -19,6 +19,7 @@ path = "src/main.rs"
 xshell-buildinfo = { path = "../buildinfo" }
 
 [dependencies]
+xshell-hostlink = { path = "../hostlink" }
 base64 = "=0.22.1"
 sha2 = "=0.10.9"
 xshell-core = { path = "../core" }
@@ -60,7 +61,6 @@ windows-sys = { version = "0.61", features = [
 vt100 = "=0.16.2"
 md5 = { workspace = true }
 tempfile = "3"
-xshell-hostlink = { path = "../hostlink" }
 xshell-protocol = { path = "../protocol", features = ["test-relay"] }
 # Reads the Codex `-c notify=…` override in tests the way Codex does.
 toml = "0.9"

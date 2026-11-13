@@ -11,6 +11,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve(Opts),
+    /// Private, bounded registration-only child of the elected Desktop.
+    CompanionRegistration(Opts),
     Connect(Opts),
     /// `pair [--relay URL] [--name NAME] [--force]`: add this computer to a Ring.
     Pair(Opts),
@@ -167,7 +169,7 @@ pub fn parse(
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
         "console-mode" => return parse_console_mode(args),
-        "serve" | "connect" | "pair" => {}
+        "serve" | "connect" | "pair" | "companion-registration" => {}
         other => return Err(format!("unknown command: {other}")),
     }
     let mut opts = Opts::default();
@@ -248,6 +250,17 @@ pub fn parse(
     }
     Ok(match cmd {
         "serve" => Command::Serve(opts),
+        "companion-registration" => {
+            if opts.gui_bound
+                || opts.parent_pid.is_some()
+                || opts.interactive_env
+                || opts.job.is_some()
+                || opts.idle_timeout.is_some()
+            {
+                return Err("registration helper accepts only --home and --socket".into());
+            }
+            Command::CompanionRegistration(opts)
+        }
         "pair" => Command::Pair(opts),
         _ => Command::Connect(opts),
     })

@@ -1026,6 +1026,7 @@ impl DesktopRing {
     #[cfg(unix)]
     fn maintain_host_broker(&self, manager: &Arc<crate::Manager>, generation: Option<u64>) {
         use sha2::{Digest, Sha256};
+        let elected = self.pairing_ipc_owner();
         let mut binding = self.host_broker.lock().unwrap();
         if self.lock().quitting {
             return;
@@ -1048,12 +1049,12 @@ impl DesktopRing {
             });
         }
         let binding = binding.as_mut().expect("initialized");
-        if binding.generation != generation {
+        if binding.generation != generation || !elected {
             binding.server.take();
             binding.generation = generation;
         }
-        manager.set_broker(binding.client.clone(), generation.is_none());
-        if generation.is_some() && binding.server.is_none() {
+        manager.set_broker(binding.client.clone(), !elected);
+        if elected && binding.server.is_none() {
             let broker = super::broker::Broker::new(binding.profile.clone(), manager);
             if let Ok(server) = super::broker::Server::bind(binding.path.clone(), broker) {
                 binding.server = Some(server);
@@ -1062,7 +1063,7 @@ impl DesktopRing {
         if !binding.client.has_transport() {
             if let Some(server) = &binding.server {
                 let _ = server.local(&binding.client);
-            } else if generation.is_none() {
+            } else if !elected {
                 let _ = binding.client.connect(&binding.path);
             }
         }
@@ -1789,6 +1790,22 @@ impl DesktopRing {
             });
         }
         Ok(effective)
+    }
+
+    /// Native startup workers stop with the backend, before releasing election ownership.
+    pub fn is_quitting(&self) -> bool {
+        self.lock().quitting
+    }
+
+    /// Focus can request presentation, never confirmation. Consumed only by native setup.
+    #[cfg(unix)]
+    pub fn take_administration_focus_request(&self) -> bool {
+        self.host_broker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|b| b.server.as_ref())
+            .is_some_and(|s| s.broker.administration.lock().unwrap().take_focus_request())
     }
 
     pub fn pairing_ipc_owner(&self) -> bool {

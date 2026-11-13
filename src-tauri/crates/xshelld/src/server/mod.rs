@@ -24,7 +24,9 @@ mod agent;
 mod calls;
 mod codex_link;
 #[cfg(unix)]
-mod companion;
+pub(crate) mod companion;
+#[cfg(unix)]
+pub use companion::registration_child;
 #[cfg(unix)]
 mod completion;
 mod conn;

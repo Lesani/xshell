@@ -658,6 +658,51 @@ fn standalone_actual_store_write_failure_retries_same_accepted_bytes_and_receipt
             .state,
         StandaloneRecoveryState::AcceptedInstalling
     );
+    // The failed invocation has released its offer lease. Actual startup denial can
+    // now coexist with the recorded accepted obligation without authorizing a new one.
+    let directory = d.home.paths().ring_dir;
+    let keys_before = std::fs::read(directory.join("keys.json")).unwrap();
+    assert_eq!(
+        xshell_core::companion_reservation::reserve(&d.home.home(), &d.home.root().join("desktop"))
+            .unwrap(),
+        directory
+    );
+    let pending = directory.join(xshell_core::companion_reservation::FILE);
+    let pending_before = std::fs::read(&pending).unwrap();
+    let reservation = xshell_core::companion_reservation::read_reservation(&directory)
+        .unwrap()
+        .unwrap();
+    assert!(!reservation.legacy_outcome_uncertain, "offer lease ended");
+    assert!(!directory.join("companion.json").exists());
+    let accepted_before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let mut host = common::Client::connect(&d.daemon.as_ref().unwrap().socket);
+    host.hello(common::range(1, 1));
+    let rosters = serde_json::from_value(accepted_before["accepted"].clone()).unwrap();
+    assert!(
+        host.request(&xshell_protocol::msg::ClientMsg::RingJoin {
+            rosters,
+            expect: None,
+        })
+        .is_err(),
+        "pending denial still fences ordinary Host installation"
+    );
+    assert!(d
+        .daemon
+        .as_ref()
+        .unwrap()
+        .adopt_standalone(
+            &url,
+            WAIT,
+            &Arc::new(AtomicBool::new(false)),
+            |_| panic!("pending denial must not emit a new offer"),
+            |_, _| panic!("pending denial must not request consent"),
+        )
+        .is_err());
+    assert!(
+        d.ring.begin_join(&d.companion()).is_err(),
+        "unresolved standalone obligation must still fence registration"
+    );
+    assert_eq!(std::fs::read(&pending).unwrap(), pending_before);
     fail.store(false, Ordering::Release);
     wait_daemon_online(&d);
     let recovered = d
@@ -675,6 +720,43 @@ fn standalone_actual_store_write_failure_retries_same_accepted_bytes_and_receipt
     assert_eq!(after["accepted"], before["accepted"]);
     assert_eq!(after["intent"], before["intent"]);
     assert_eq!(after["installed"], true);
+    let mut expected = before.clone();
+    expected["installed"] = serde_json::json!(true);
+    assert_eq!(
+        after, expected,
+        "only the durable installation receipt changes"
+    );
+    let roster_after = std::fs::read(directory.join("roster.json")).unwrap();
+    let roster: serde_json::Value = serde_json::from_slice(&roster_after).unwrap();
+    assert_eq!(roster["rosters"], before["accepted"]);
+    assert_eq!(
+        std::fs::read(directory.join("keys.json")).unwrap(),
+        keys_before
+    );
+    assert_eq!(std::fs::read(&pending).unwrap(), pending_before);
+    assert!(
+        !directory.join("companion.json").exists(),
+        "denial is not registration"
+    );
+    let journal_after = std::fs::read(directory.join("standalone-adoption.json")).unwrap();
+    assert_eq!(
+        d.daemon
+            .as_ref()
+            .unwrap()
+            .reconcile_standalone_adoption()
+            .unwrap()
+            .state,
+        StandaloneRecoveryState::Installed
+    );
+    assert_eq!(
+        std::fs::read(directory.join("standalone-adoption.json")).unwrap(),
+        journal_after
+    );
+    assert_eq!(
+        std::fs::read(directory.join("roster.json")).unwrap(),
+        roster_after
+    );
+    assert_eq!(std::fs::read(&pending).unwrap(), pending_before);
     assert_eq!(
         xshell_protocol::ring::relay::contract::relay_version(
             &relay.target(),

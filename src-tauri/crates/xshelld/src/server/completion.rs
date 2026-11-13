@@ -2,7 +2,7 @@
 //! proposal/result, but only protected counterpart ingress can release local proofs.
 use super::companion::{load, save, trusted};
 use super::registry::Daemon;
-use super::ring::{read_private, write_private, Store};
+use super::ring::{read_private, write_private, PrivateRingFile, Store};
 use serde_json::Value;
 use xshell_protocol::ring::companion::*;
 use xshell_protocol::ring::membership::{EnrollmentKind, RosterChange};
@@ -15,12 +15,13 @@ fn now() -> u64 {
         .as_secs()
 }
 fn read(store: &Store) -> Result<Option<CompletionPending>, String> {
-    read_private(&store.dir.join("completion.json"))
-        .map_err(|e| e.to_string())?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|e| format!("unreadable completion: {e}"))
-        })
-        .transpose()
+    read_private(
+        &store.dir.join("completion.json"),
+        PrivateRingFile::CompletionMailbox,
+    )
+    .map_err(|e| e.to_string())?
+    .map(|bytes| serde_json::from_slice(&bytes).map_err(|e| format!("unreadable completion: {e}")))
+    .transpose()
 }
 fn write(store: &Store, pending: &CompletionPending) -> Result<(), String> {
     write_private(
@@ -246,4 +247,103 @@ pub(super) fn admin(
         }
     }
     serde_json::to_value(Some(pending)).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    /// A genuine signed historical store and normal completion-mailbox writer/reader.
+    /// No consent, proof or accepted-install receipt is fabricated or released.
+    #[test]
+    fn completion_mailbox_preserves_full_history_larger_than_a_host_frame() {
+        use super::super::ring::{historical_storage_chain, storage_test_directory};
+        use xshell_protocol::ring::membership::{Enrollment, Membership, RingPolicy};
+        use xshell_protocol::ring::pairing::adoption::PublicIdentity;
+        use xshell_protocol::ring::{b64, DeviceKeys};
+        let temp = storage_test_directory();
+        let store = Store::new(temp.path().join("ring"));
+        let daemon = store.load_or_create_keys().unwrap();
+        let (signer, chain) = historical_storage_chain(&daemon);
+        let mut upgrade = chain.head().roster().clone();
+        upgrade.v = 2;
+        upgrade.version += 1;
+        upgrade.prev = Some(chain.head().hash());
+        upgrade.extra.clear();
+        upgrade.set_membership(&Membership {
+            enrollments: vec![
+                Enrollment {
+                    id: b64::encode(&[1; 32]),
+                    kind: EnrollmentKind::LegacyDesktop,
+                    members: vec![signer.sign_key()],
+                    enrolled_at: upgrade.issued_at,
+                },
+                Enrollment {
+                    id: b64::encode(&[2; 32]),
+                    kind: EnrollmentKind::Daemon,
+                    members: vec![daemon.sign_key()],
+                    enrolled_at: upgrade.issued_at,
+                },
+            ],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: None,
+                activity_key: signer.sign_key(),
+            },
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let retained = chain.extended(&[upgrade.sign(&signer).unwrap()]).unwrap().0;
+        drop(chain);
+        let desktop = DeviceKeys::generate().unwrap();
+        let profile = CompanionProfile::for_stores(
+            temp.path().join("desktop").to_str().unwrap().into(),
+            store.dir.to_str().unwrap().into(),
+            PublicIdentity {
+                name: "registered Desktop".into(),
+                sign_key: desktop.sign_key(),
+                noise_key: desktop.noise_key(),
+            },
+            PublicIdentity {
+                name: "historical Daemon".into(),
+                sign_key: daemon.sign_key(),
+                noise_key: daemon.noise_key(),
+            },
+            store.dir.join("companion.sock").to_str().unwrap().into(),
+        );
+        let mut policy = CompanionPolicy::new(profile).unwrap();
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[3; 32]),
+            expires_at: now() + 60,
+            target: policy.profile().target(),
+        };
+        let _lock = store.lock().unwrap();
+        store.write_chain(&retained).unwrap();
+        let result = start(&store, &mut policy, intent.clone()).unwrap();
+        assert!(matches!(
+            result,
+            CompanionResponse::Completion { pending: Some(_) }
+        ));
+        assert!(
+            std::fs::metadata(store.dir.join("completion.json"))
+                .unwrap()
+                .len()
+                > xshell_protocol::frame::MAX_FRAME_LEN as u64
+        );
+        eprintln!("STORAGE_COMPAT completion.json bytes={} signed_predecessors={} phase=Waiting no-proofs-no-accepted-receipt", std::fs::metadata(store.dir.join("completion.json")).unwrap().len(), retained.versions().len());
+        let readback = read(&store).unwrap().unwrap();
+        assert_eq!(readback.intent, intent);
+        assert!(readback
+            .predecessor
+            .iter()
+            .map(String::as_str)
+            .eq(retained.versions().iter().map(|r| r.token())));
+        assert!(
+            readback.proposal.is_none()
+                && readback.proofs.is_none()
+                && readback.accepted.is_empty()
+        );
+        assert_eq!(
+            policy.phase(&intent.operation).unwrap(),
+            CompanionPhase::Waiting
+        );
+    }
 }

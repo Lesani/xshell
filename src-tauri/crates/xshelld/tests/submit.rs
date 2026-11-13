@@ -2096,21 +2096,41 @@ mod mode_gate {
         std::thread::sleep(ms(2100)); // past the refusal's TTL
         fake.set(VT);
         let before = fake.calls();
-        let f = fake.clone();
-        let hold = e.hold.clone();
-        // Hold at the reading before Enter: the second of this reply.
-        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
-            if f.calls() == before + 2 {
-                hold.at(Some(TestPoint::SubmitModeRead));
-            }
-        }));
+        e.hold.at(Some(TestPoint::SubmitEnter));
         let id = send_submit(&mut m, &t, "b");
         e.hold.wait_held();
+        let at_enter = fake.calls();
+        assert!(at_enter >= before + 2);
         fake.set(RECORDS);
         std::thread::sleep(ms(250));
         e.hold.at(None);
         assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
-        assert_eq!(fake.calls(), before + 3);
+        assert_eq!(fake.calls(), at_enter + 1);
+        t.expect_input(b"\x1b[200~b\x1b[201~");
+    }
+
+    /// A1: an extra stale Paste reading does not move the held Enter boundary.
+    #[test]
+    fn a_stale_paste_reading_still_rechecks_the_mode_before_enter() {
+        let fake = Fake::new(VT);
+        let mut e = gated_env(&fake, |c| c.submit_enter_delay = ms(300));
+        let t = e.ready("claude");
+        let mut m = e.mobile();
+        e.hold.at(Some(TestPoint::SubmitModeRead));
+        let id = send_submit(&mut m, &t, "b");
+        e.hold.wait_held();
+        assert_eq!(fake.calls(), 1);
+        std::thread::sleep(ms(250));
+        // Release the stale VT Paste reading while atomically arming the Enter hold.
+        e.hold.at(Some(TestPoint::SubmitEnter));
+        e.hold.wait_held();
+        let at_enter = fake.calls();
+        assert!(at_enter >= 3);
+        fake.set(RECORDS);
+        std::thread::sleep(ms(250));
+        e.hold.at(None);
+        assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
+        assert_eq!(fake.calls(), at_enter + 1);
         t.expect_input(b"\x1b[200~b\x1b[201~");
     }
 

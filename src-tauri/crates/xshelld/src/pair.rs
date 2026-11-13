@@ -17,6 +17,7 @@ use crate::server::ring::{host_name, is_daemon_member, Store};
 use serde_json::Value;
 use std::io::{self, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
@@ -32,6 +33,7 @@ pub const EXPIRED_EXIT: i32 = 5;
 
 enum Failure {
     Expired,
+    ComputerExpired,
     Other(String),
 }
 
@@ -53,6 +55,13 @@ pub fn run_pair_to(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> i32 {
             say(
                 out,
                 "This code expired. Run xshelld pair again to get a new one.",
+            );
+            EXPIRED_EXIT
+        }
+        Err(Failure::ComputerExpired) => {
+            say(
+                out,
+                "Computer pairing request expired. No pairing code was generated.",
             );
             EXPIRED_EXIT
         }
@@ -80,13 +89,12 @@ fn say(out: &mut dyn Write, line: &str) {
 
 fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
     let store = Store::new(paths.ring_dir.clone());
-    let _offer = store.reserve_legacy_offer()?;
+    xshell_core::companion_reservation::validate_daemon_store(&paths.ring_dir)
+        .map_err(|e| format!("protected_counterpart_required: unsafe local Store: {e}"))?;
     if crate::server::ring::companion_registered(&paths.ring_dir) {
-        return Err(Failure::Other(
-            "protected_counterpart_required: registered GUI pairing must use its local controller"
-                .into(),
-        ));
+        return registered_computer_pending(&store, out);
     }
+    let _offer = store.reserve_legacy_offer()?;
     let stored = store
         .read_chain()
         .map_err(|e| format!("the stored ring is unreadable ({e})"))?;
@@ -131,9 +139,14 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
             say(out, &format!("Relay: {relay}"));
         },
     )
-    .map_err(|e| match e {
-        PairError::Expired => Failure::Expired,
-        e => Failure::Other(format!("pairing failed: {e}")),
+    .map_err(|e| {
+        if legacy_outcome_uncertain(&store) {
+            return uncertain_legacy_failure(format!("pairing ended: {e}"));
+        }
+        match e {
+            PairError::Expired => Failure::Expired,
+            e => Failure::Other(format!("pairing failed: {e}")),
+        }
     })?;
     if !is_daemon_member(&fetched, &keys) {
         return Err(Failure::Other(
@@ -166,6 +179,105 @@ fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> 
     Ok(())
 }
 
+/// Administration prefix only: retain the association and wait without generating a
+/// second/legacy code. No success is possible until the separately assigned Pair driver
+/// and native owner-local consent dispatcher are implemented.
+fn registered_computer_pending(store: &Store, out: &mut dyn Write) -> Result<(), Failure> {
+    use xshell_hostlink::ring::administration::{
+        AdministrationClient, AdministrationRequest as R, AdministrationStatus as S,
+    };
+    let duration = ttl();
+    let until = std::time::Instant::now() + duration;
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+        until,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let desktop =
+        crate::server::companion::registered_desktop(store, &budget).map_err(|error| {
+            if std::time::Instant::now() >= until {
+                Failure::ComputerExpired
+            } else {
+                Failure::Other(format!("protected_counterpart_required: {error}"))
+            }
+        })?;
+    budget.check().map_err(|_| Failure::ComputerExpired)?;
+    let operation = uuid::Uuid::new_v4();
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        + duration.as_secs().max(1);
+    say(
+        out,
+        "Computer pairing pending. Open xshell and continue in the pairing window.",
+    );
+    say(out, "The Computer Pair driver is not available in this build; no pairing code has been generated.");
+    say(
+        out,
+        "Press Ctrl-C to cancel. The registered Computer association will be retained.",
+    );
+    let mut client = None;
+    while std::time::Instant::now() < until {
+        if client.is_none() {
+            if let Ok(mut connected) = AdministrationClient::connect(Path::new(&desktop), until) {
+                if std::time::Instant::now() >= until {
+                    break;
+                }
+                match connected.request(
+                    R::Start {
+                        operation,
+                        expires_at,
+                    },
+                    until,
+                ) {
+                    Ok(S::ComputerPending) => {
+                        if std::time::Instant::now() < until {
+                            let _ = connected.request(R::RequestOwnerFocus {}, until);
+                        }
+                        client = Some(connected);
+                    }
+                    Ok(S::Cancelled | S::OriginInvalidated) => {
+                        return Err(Failure::Other("Computer pairing cancelled".into()))
+                    }
+                    Ok(S::Expired) => return Err(Failure::ComputerExpired),
+                    _ => {}
+                }
+            }
+        } else if let Some(connected) = &mut client {
+            match connected.request(R::Status { operation }, until) {
+                Ok(S::ComputerPending) => {}
+                Ok(S::Cancelled | S::OriginInvalidated) => {
+                    return Err(Failure::Other("Computer pairing cancelled".into()))
+                }
+                Ok(S::Expired) => break,
+                _ => {
+                    client.take();
+                }
+            }
+        }
+        std::thread::sleep(
+            Duration::from_millis(100)
+                .min(until.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    if let Some(mut connected) = client {
+        // Expiry permits only this explicit 100ms cleanup allowance, never a fresh
+        // operation/Start/focus budget. Time already spent past expiry consumes it.
+        let _ = connected.request(R::Cancel { operation }, until + Duration::from_millis(100));
+    }
+    Err(Failure::ComputerExpired)
+}
+
+fn legacy_outcome_uncertain(store: &Store) -> bool {
+    xshell_core::companion_reservation::read_reservation(&store.dir)
+        .ok()
+        .flatten()
+        .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
+}
+fn uncertain_legacy_failure(message: String) -> Failure {
+    Failure::Other(format!("reconciliation_required: legacy pairing remote outcome is uncertain; startup denial does not revoke a transmitted proof or establish nonmembership ({message})"))
+}
+
 /// Stores only an initial membership or an authorized extension of the retained Ring.
 /// Foreign/terminal membership is never a force-replacement or a new enrollment attempt.
 fn adopt(
@@ -174,7 +286,13 @@ fn adopt(
     keys: &xshell_protocol::ring::DeviceKeys,
 ) -> Result<RosterChain, Failure> {
     let _lock = store.lock()?;
-    store.refuse_registered_join()?;
+    store.refuse_registered_join().map_err(|error| {
+        if legacy_outcome_uncertain(store) {
+            uncertain_legacy_failure(error)
+        } else {
+            Failure::Other(error)
+        }
+    })?;
     let disk = store
         .read_chain()
         .map_err(|e| format!("the stored ring is unreadable ({e})"))?;
@@ -310,6 +428,41 @@ mod tests {
         RosterChain::from_chain(c.versions()[..n].to_vec()).unwrap()
     }
 
+    #[test]
+    fn incumbent_local_legacy_commit_is_refused_without_discarding_uncertainty_or_keys() {
+        use std::os::unix::fs::DirBuilderExt;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let store = Store::new(paths.ring_dir.clone());
+        let offer = store.reserve_legacy_offer().unwrap();
+        let me = store.load_or_create_keys().unwrap();
+        let (_, fetched) = chain(&me); // Historical v1 negative fixture, not new adoption authority.
+        let desktop = temp.path().join("desktop");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&desktop)
+            .unwrap();
+        xshell_core::companion_reservation::reserve(
+            &temp.path().canonicalize().unwrap(),
+            &desktop.canonicalize().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(adopt(&store, fetched, &me), Err(Failure::Other(message)) if message.contains("remote outcome is uncertain"))
+        );
+        drop(offer);
+        assert!(store.read_chain().unwrap().is_none());
+        assert_eq!(
+            store.load_keys().unwrap().unwrap().sign_key(),
+            me.sign_key()
+        );
+        assert!(
+            xshell_core::companion_reservation::read_reservation(&paths.ring_dir)
+                .unwrap()
+                .unwrap()
+                .legacy_outcome_uncertain
+        );
+    }
     #[test]
     fn an_older_pinned_head_never_overwrites_newer_local_trust() {
         let t = tempfile::tempdir().unwrap();

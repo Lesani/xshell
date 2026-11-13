@@ -118,6 +118,60 @@ pub fn setup(app: &AppHandle) {
             eprintln!("xshell: cannot attach Ring Host routing: {e}");
         }
     }
+    // Persist denial before a sidecar/endpoint can fail. This metadata grants no policy
+    // or key authority and is also required when local terminals run in-process.
+    #[cfg(unix)]
+    if let Some(home) = dirs::home_dir().and_then(|h| h.canonicalize().ok()) {
+        if let Err(error) = ring.reserve_local_companion(&home) {
+            eprintln!("xshell: cannot reserve local Computer association: {error}");
+        }
+    }
+    // Register even before membership. Followers never register another profile. The
+    // registration child cannot start serve or release Computer consent.
+    #[cfg(unix)]
+    if let Some(daemon) = app
+        .try_state::<crate::hosts::Hosts>()
+        .and_then(|h| h.local_daemon.clone())
+    {
+        let startup_ring = Arc::downgrade(&ring);
+        std::thread::spawn(move || loop {
+            let Some(ring) = startup_ring.upgrade() else {
+                break;
+            };
+            if ring.is_quitting() {
+                break;
+            }
+            match ring.register_local_companion(&daemon) {
+                Ok(Some(_)) => break,
+                Ok(None) => {} // followers wait; only an elected successor may register
+                Err(error) => eprintln!("xshell: local Computer registration pending: {error}"),
+            }
+            drop(ring);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+    }
+    #[cfg(unix)]
+    {
+        let owner_ring = Arc::downgrade(&ring);
+        let focus_app = app.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let Some(ring) = owner_ring.upgrade() else {
+                break;
+            };
+            if ring.is_quitting() {
+                break;
+            }
+            if ring.take_administration_focus_request() {
+                let app = focus_app.clone();
+                let _ = focus_app.run_on_main_thread(move || {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.set_focus();
+                    }
+                });
+            }
+        });
+    }
     let (a, b) = (app.clone(), app.clone());
     let worker = SyncWorker::new(
         ring,

@@ -547,6 +547,94 @@ fn register_standalone_profile(f: &Fixture) {
         .unwrap();
 }
 #[test]
+fn standalone_install_pending_denial_requires_exact_record_and_safe_nonuncertain_metadata() {
+    use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+    let f = Fixture::new(true);
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let record = load_journal(&store).unwrap().unwrap();
+    let desktop = f._home.path().join("desktop");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&desktop)
+        .unwrap();
+    xshell_core::companion_reservation::reserve(f._home.path(), &desktop).unwrap();
+    let pending = store.dir.join(xshell_core::companion_reservation::FILE);
+    let original = std::fs::read(&pending).unwrap();
+    let snapshot = || {
+        ["keys.json", "roster.json", "standalone-adoption.json"]
+            .map(|name| std::fs::read(store.dir.join(name)).unwrap())
+    };
+    let before = snapshot();
+    let install = |operation: &str| {
+        f.handle
+            .d
+            .ring
+            .join_accepted_standalone(&record.accepted, operation, &budget())
+    };
+    install(&record.intent.operation).unwrap();
+    assert!(
+        install(&b64::encode(&[99; 32])).is_err(),
+        "pending cannot authorize a different operation"
+    );
+    assert!(
+        f.handle.d.ring.join(&record.accepted, None).is_err(),
+        "Host origin still denied"
+    );
+    assert!(
+        store.reserve_legacy_offer().is_err(),
+        "new offers still denied"
+    );
+    assert_eq!(std::fs::read(&pending).unwrap(), original);
+    let mut uncertain = xshell_core::companion_reservation::read_reservation(&store.dir)
+        .unwrap()
+        .unwrap();
+    uncertain.legacy_outcome_uncertain = true;
+    for bytes in [serde_json::to_vec(&uncertain).unwrap(), b"{".to_vec()] {
+        write_private(&pending, &bytes).unwrap();
+        assert!(install(&record.intent.operation).is_err());
+        assert_eq!(std::fs::read(&pending).unwrap(), bytes);
+        assert_eq!(snapshot(), before);
+    }
+    write_private(&pending, &original).unwrap();
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        install(&record.intent.operation).is_err(),
+        "unsafe opened-object permissions denied"
+    );
+    std::fs::remove_file(&pending).unwrap();
+    symlink(store.dir.join("keys.json"), &pending).unwrap();
+    assert!(install(&record.intent.operation).is_err(), "symlink denied");
+    std::fs::remove_file(&pending).unwrap();
+    let fifo = std::ffi::CString::new(pending.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(
+        install(&record.intent.operation).is_err(),
+        "FIFO denied without blocking"
+    );
+    assert_eq!(snapshot(), before);
+}
+
+#[test]
+fn standalone_install_actual_registration_remains_excluded() {
+    let f = Fixture::new(true);
+    register_standalone_profile(&f);
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let record = load_journal(&store).unwrap().unwrap();
+    let policy = std::fs::read(store.dir.join("companion.json")).unwrap();
+    let error = f
+        .handle
+        .d
+        .ring
+        .join_accepted_standalone(&record.accepted, &record.intent.operation, &budget())
+        .unwrap_err();
+    assert!(error.contains("registered counterpart"), "{error}");
+    assert_eq!(
+        std::fs::read(store.dir.join("companion.json")).unwrap(),
+        policy
+    );
+}
+
+#[test]
 fn newer_standalone_install_preserves_other_computer_terminal_signer_and_export_fences() {
     let (f, accepted) = other_terminal_standalone();
     let record = set_journal(&f, &accepted, false);

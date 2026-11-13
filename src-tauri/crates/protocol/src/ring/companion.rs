@@ -133,6 +133,10 @@ impl CompanionProposal {
     deny_unknown_fields
 )]
 pub enum CompanionRequest {
+    /// Deny-only reservation; no identity, membership or proof authority.
+    ReserveRegistration {
+        desktop_store: String,
+    },
     Register {
         profile: CompanionProfile,
         proof: Signature,
