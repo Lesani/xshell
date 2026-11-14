@@ -33,6 +33,11 @@ export function roleKey(role: MemberRole): StringKey {
   return role === "desktop" ? "mobile.role.desktop" : role === "daemon" ? "mobile.role.daemon" : "mobile.role.mobile";
 }
 
+// A member row's label: a grouped Computer (a format-v2 Ring) is one "Computer" row.
+export function memberRoleKey(m: Pick<MemberView, "role" | "kind">): StringKey {
+  return m.kind === "computer" ? "mobile.role.computer" : roleKey(m.role);
+}
+
 // A Relay URL as the copy names it: the host, with the port if any, never the full URL.
 export function relayHost(url: string | null | undefined): string {
   if (!url) return "";

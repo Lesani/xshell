@@ -8,7 +8,7 @@ import { REMOVAL_IDLE, removalReducer, type Removal } from "../ring/mobileSettin
 import type { MemberView, RingStatus } from "../ring/types";
 
 function member(over: Partial<MemberView>): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind: "online" }, ...over };
+  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind: "online" }, enrollmentId: null, kind: null, daemonKey: null, ...over };
 }
 
 const me = member({ name: "desk", role: "desktop", signKey: "d", thisApp: true });
@@ -46,6 +46,20 @@ describe("the device list", () => {
     const html = render(after, r);
     expect(html).not.toContain(">Pixel<");
     expect(html).toContain(fmt("mobile.remove.pending", { name: "Pixel" }));
+  });
+
+  it("shows a v2 Computer as one row with one Remove that sends the Desktop signKey", () => {
+    const own = member({ name: "desk", role: "desktop", signKey: "d", thisApp: true, thisComputer: true, enrollmentId: "u1", kind: "computer", daemonKey: "dd" });
+    const laptop = member({ name: "laptop", role: "desktop", signKey: "d2", removable: true, enrollmentId: "u2", kind: "computer", daemonKey: "dd2" });
+    const html = render(status({ members: [own, laptop] }), REMOVAL_IDLE);
+    expect(html.match(/host-row-remove/g)?.length).toBe(1);
+    expect(html.match(new RegExp(`>${fmt("mobile.role.computer")}`, "g"))?.length).toBe(2);
+    expect(html).not.toContain(fmt("mobile.role.daemon"));
+    // The row's Remove asks for the Desktop key; the Desktop expands it to the whole unit.
+    const removing = removalReducer(removalReducer(REMOVAL_IDLE, { type: "ask", member: laptop }), { type: "start" });
+    expect(removing).toMatchObject({ state: "removing", signKey: "d2" });
+    // This computer's own row offers none.
+    expect(render(status({ members: [own] }), REMOVAL_IDLE)).not.toContain("host-row-remove");
   });
 
   it("hides Remove in a window that does not run the connection", () => {

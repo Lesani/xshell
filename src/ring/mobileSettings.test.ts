@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, farewellLines, localLine, relayHost, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, farewellLines, localLine, relayHost, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, memberRoleKey, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import type { HostRingState, MemberView, RingStatus } from "./types";
 
@@ -29,7 +29,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
 }
 
 function member(kind: MemberView["presence"]["kind"], over: Partial<MemberView> = {}): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, ...over };
+  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, enrollmentId: null, kind: null, daemonKey: null, ...over };
 }
 
 describe("presence", () => {
@@ -59,6 +59,9 @@ describe("presence", () => {
     expect(fmt(roleKey("daemon"))).toBe("Host");
     expect(fmt(roleKey("desktop"))).toBe("Desktop");
     expect(fmt(roleKey("mobile"))).toBe("Phone");
+    expect(fmt(memberRoleKey({ role: "desktop", kind: "computer" }))).toBe("Computer");
+    expect(fmt(memberRoleKey({ role: "mobile", kind: "mobile" }))).toBe("Phone");
+    expect(fmt(memberRoleKey({ role: "daemon", kind: null }))).toBe("Host");
     for (const v of Object.values(S)) expect(v.toLowerCase()).not.toContain("daemon");
   });
 });
