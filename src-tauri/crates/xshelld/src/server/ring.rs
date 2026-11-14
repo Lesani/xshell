@@ -465,7 +465,18 @@ impl Store {
                     Err(e) => return Err(e),
                 }
             }
-            xshell_core::private_fs::ensure_dir_validated(&self.dir)
+            // Hot path (every Store lock): an existing Store is validated without repair
+            // only; it was normalized once by `ownership::canonical_store` at Daemon start.
+            match fs::symlink_metadata(&self.dir) {
+                Ok(_) => xshell_core::private_fs::check_dir_no_repair(
+                    &self.dir,
+                    xshell_core::private_fs::Exposure::Private,
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    xshell_core::private_fs::ensure_dir(&self.dir)
+                }
+                Err(e) => Err(e),
+            }
         }
         #[cfg(unix)]
         ensure_private_dir(&self.dir)
