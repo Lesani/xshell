@@ -25,6 +25,7 @@ enum Ev {
     Entitlement(Option<String>),
     Error(ErrorCode, Option<SignKey>),
     Accepted,
+    Removed,
 }
 
 #[derive(Default)]
@@ -99,6 +100,10 @@ impl ConnectorEvents for Rec {
     }
     fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
         self.ev.lock().unwrap().push(Ev::Error(code.clone(), to));
+        self.cv.notify_all();
+    }
+    fn removed(&self) {
+        self.ev.lock().unwrap().push(Ev::Removed);
         self.cv.notify_all();
     }
     fn accepted(&self) {
@@ -262,6 +267,40 @@ fn new_head_with_other_relay_url_moves_connection() {
     // The new Relay got the whole chain staged.
     assert_eq!(b.head_version(&ring.ring_id()), Some(3));
     assert_eq!(c.chain().head().version(), 3);
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn removed_close_and_not_member_fire_removed_once() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let mobile = ring.mobile.sign_key();
+    let removed = |rec: &Rec| rec.all().iter().filter(|e| matches!(e, Ev::Removed)).count();
+    // Closed as removed while connected.
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.mobile.clone()));
+    assert!(rec.connected());
+    assert_eq!(removed(&rec), 0, "a connected member hears no removal");
+    let (desk, _) = connect(&r.target(), &ring.chain, ring.desktop.clone());
+    let v3 = ring.next(|d| {
+        d.remove(&mobile);
+    });
+    desk.publish_roster(&v3).unwrap();
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
+    // The Relay's word only: the owner checks and, still a member after all, kicks: the
+    // Connector dials again and is refused again, once more reported.
+    rec.clear();
+    c.kick();
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
+    c.stop(ByeReason::quit());
+    // Refused as not a member at connect.
+    let (c, rec) = start(cfg(&r, &ring.up_to(2), ring.mobile.clone()));
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
     c.stop(ByeReason::quit());
 }
 

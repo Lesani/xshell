@@ -702,8 +702,8 @@ pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), Ros
     verify_transition_roster(prev, n, true)
 }
 
-/// `key` may approve a Device Code on `head`: a Desktop of a Computer unit, or a Mobile of
-/// a Mobile unit (format 2 only).
+/// `key` may approve a Device Code on `head`: a Desktop (of a Computer or legacy Desktop
+/// unit), or a Mobile of a Mobile unit (format 2 only). Never a Daemon.
 pub fn enroll_approver(head: &SignedRoster, key: &SignKey) -> bool {
     let Some(member) = head.member(key) else {
         return false;
@@ -712,7 +712,9 @@ pub fn enroll_approver(head: &SignedRoster, key: &SignKey) -> bool {
         return false;
     };
     match (member.role, m.unit_for(key).map(|u| u.kind.clone())) {
-        (Role::Desktop, Some(EnrollmentKind::Computer)) => true,
+        // A legacy Desktop unit exists only in Rings upgraded from format 1; the Relay
+        // accepts it too, and the Desktop app sets such Rings aside.
+        (Role::Desktop, Some(EnrollmentKind::Computer | EnrollmentKind::LegacyDesktop)) => true,
         (Role::Mobile, Some(EnrollmentKind::Mobile)) => true,
         _ => false,
     }

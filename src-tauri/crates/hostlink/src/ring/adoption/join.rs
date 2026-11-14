@@ -732,6 +732,9 @@ impl DesktopRing {
                 // proposal verified against this exact transcript and the code is still
                 // shown (not cancelled, blurred or expired, this process still owns Join),
                 // so the joining keys sign now. Nothing is released otherwise.
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::JoinBeforeConsent,
+                );
                 if shared.cancel.load(Ordering::Acquire)
                     || Instant::now() >= request.until
                     || now() >= intent.expires_at
@@ -739,9 +742,6 @@ impl DesktopRing {
                 {
                     return Err(PairError::Cancelled);
                 }
-                self.adoption_test_point(
-                    super::super::desktop::AdoptionTestPoint::JoinBeforeConsent,
-                );
                 {
                     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.status = JoinStatus::Completing;

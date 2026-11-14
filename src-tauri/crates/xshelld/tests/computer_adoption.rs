@@ -14,6 +14,12 @@ mod unix {
     use xshell_protocol::ring::membership::{ConsentFlow, RosterChange};
     use xshell_protocol::ring::relay::contract::relay_version;
     use xshelld::server::{Config, Server, ServerHandle};
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
     struct Observer;
     impl RingObserver for Observer {
         fn changed(&self, _: &RingView) {}
@@ -23,7 +29,6 @@ mod unix {
         ring: Arc<DesktopRing>,
         desktop: std::path::PathBuf,
         daemon_dir: std::path::PathBuf,
-        config: DesktopRingConfig,
         // Drop the Daemon/IPC before deleting its private home.
         _home: tempfile::TempDir,
     }
@@ -72,30 +77,14 @@ mod unix {
             if let Some(wait) = publish_wait {
                 config.pair_publish_wait = wait;
             }
-            let ring = DesktopRing::open(config.clone(), Arc::new(Observer));
+            let ring = DesktopRing::open(config, Arc::new(Observer));
             Self {
                 _home: home,
                 daemon,
                 ring,
                 desktop,
                 daemon_dir,
-                config,
             }
-        }
-        /// The Daemon restarts over the same home (the Desktop keeps running).
-        fn restart_daemon(&mut self) {
-            self.daemon.stopper().shutdown();
-            assert!(self
-                .daemon
-                .wait_timeout(std::time::Duration::from_secs(5))
-                .is_some());
-            let paths = xshelld::paths::resolve(self._home.path(), None, None);
-            self.daemon = Server::start(Config::new(self._home.path().into(), paths)).unwrap();
-        }
-        /// The Desktop restarts over the same store (the Daemon keeps running).
-        fn restart_desktop(&mut self) {
-            self.ring.quit();
-            self.ring = DesktopRing::open(self.config.clone(), Arc::new(Observer));
         }
         fn companion(&self) -> CompanionClient {
             CompanionClient::for_store(self.daemon.companion_endpoint().unwrap().parent().unwrap())
@@ -130,6 +119,45 @@ mod unix {
         }
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    /// Pauses a Join at [`AdoptionTestPoint::JoinBeforeConsent`] (the approver's proposal
+    /// verified, nothing signed yet) until released.
+    #[derive(Clone, Default)]
+    struct ConsentGate(Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>);
+    impl ConsentGate {
+        fn hook(&self) -> xshell_hostlink::ring::AdoptionTestHook {
+            let gate = self.clone();
+            xshell_hostlink::ring::AdoptionTestHook(Arc::new(move |point| {
+                if point == xshell_hostlink::ring::AdoptionTestPoint::JoinBeforeConsent {
+                    let (lock, cv) = &*gate.0;
+                    let mut st = lock.lock().unwrap();
+                    st.0 = true;
+                    cv.notify_all();
+                    while !st.1 {
+                        st = cv.wait(st).unwrap();
+                    }
+                }
+            }))
+        }
+        fn reached(&self) {
+            let (lock, cv) = &*self.0;
+            let mut st = lock.lock().unwrap();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !st.0 {
+                assert!(std::time::Instant::now() < until, "Join never reached consent");
+                st = cv.wait_timeout(st, std::time::Duration::from_millis(50)).unwrap().0;
+            }
+        }
+        fn release(&self) {
+            let (lock, cv) = &*self.0;
+            lock.lock().unwrap().1 = true;
+            cv.notify_all();
+        }
+    }
+    impl Computer {
+        fn gated(relay: &Relay, gate: &ConsentGate, ttl: Option<std::time::Duration>) -> Self {
+            Self::build(&relay.url(), None, ttl, Some(gate.hook()), None)
         }
     }
     impl Drop for Computer {
@@ -322,42 +350,6 @@ mod unix {
         wait_online();
     }
 
-    #[test]
-    fn decline_creates_no_enrollment_proofs_candidate_or_relay_membership() {
-        let relay = Relay::start();
-        let computer = Computer::new(&relay);
-        let companion = computer.companion();
-        let profile = computer.ring.register_companion(&companion).unwrap();
-        let result = computer
-            .ring
-            .create_computer(&companion, |_, _| Ok(CreateDecision::Decline))
-            .unwrap();
-        assert!(matches!(result, AdoptionOutcome::Declined { .. }));
-        let journal = Store::new(computer.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap()
-            .journal
-            .unwrap();
-        assert_eq!(journal.phase, AdoptionPhase::DeclinedBeforeProof);
-        assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
-        assert!(computer.ring.chain().is_none());
-        assert!(!computer.daemon_dir.join("roster.json").exists());
-        let policy: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(computer.daemon_dir.join("companion.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(policy["obligation"]["phase"], "cancelled");
-        assert!(policy["obligation"]["proofs"].is_null());
-        assert_eq!(
-            relay_version(
-                &relay.target(),
-                &xshell_protocol::ring::RingId::derive(&profile.desktop.sign_key)
-            ),
-            0
-        );
-    }
     fn host_request(
         daemon: &ServerHandle,
         message: xshell_protocol::msg::ClientMsg,
@@ -446,62 +438,6 @@ mod unix {
     }
 
     #[test]
-    fn cancelled_wrong_hash_and_stale_leases_release_no_enrollment_proofs() {
-        let relay = Relay::start();
-        let computer = Computer::new(&relay);
-        let client = computer.companion();
-        computer.ring.register_companion(&client).unwrap();
-        assert!(computer
-            .ring
-            .create_computer(&client, |preview, lease| {
-                let proof = lease.confirm(&preview.proposal_hash)?;
-                lease.cancel();
-                Ok(CreateDecision::Confirm(proof))
-            })
-            .is_err());
-        assert!(computer
-            .ring
-            .create_computer(&client, |_, lease| Ok(CreateDecision::Confirm(
-                lease.confirm("wrong-hash")?
-            )))
-            .is_err());
-        let mut stale = None;
-        computer
-            .ring
-            .create_computer(&client, |preview, lease| {
-                stale = Some(lease.confirm(&preview.proposal_hash)?);
-                Ok(CreateDecision::Decline)
-            })
-            .unwrap();
-        assert!(computer
-            .ring
-            .create_computer(&client, |_, _| Ok(CreateDecision::Confirm(
-                stale.take().unwrap()
-            )))
-            .is_err());
-        let policy: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(computer.daemon_dir.join("companion.json")).unwrap(),
-        )
-        .unwrap();
-        assert!(policy["obligation"]["proofs"].is_null());
-        assert!(!computer.daemon_dir.join("roster.json").exists());
-        assert!(computer.ring.chain().is_none());
-        let stored = Store::new(computer.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap();
-        assert_eq!(stored.journal.unwrap().phase, AdoptionPhase::Cancelled);
-        assert_eq!(
-            relay_version(
-                &relay.target(),
-                &xshell_protocol::ring::RingId::derive(&stored.keys.sign_key())
-            ),
-            0
-        );
-    }
-
-    #[test]
     fn registered_gui_survives_daemon_stop_restart_without_fallback_or_new_keys() {
         let relay = Relay::start();
         let home = tempfile::Builder::new().prefix("r1-").tempdir().unwrap();
@@ -550,54 +486,6 @@ mod unix {
         ));
         ring.quit();
         server.shutdown();
-    }
-
-    #[test]
-    fn conflicting_profile_and_wire_confirmation_cannot_authorize_the_daemon() {
-        use xshell_protocol::ring::companion::{
-            registration_message, CompanionProfile, CompanionRequest, CompanionResponse,
-        };
-        use xshell_protocol::ring::{DeviceKeys, Signature, Signer};
-        let relay = Relay::start();
-        let computer = Computer::new(&relay);
-        let client = computer.companion();
-        let profile = computer.ring.register_companion(&client).unwrap();
-        let other = DeviceKeys::generate().unwrap();
-        let mut identity = profile.desktop.clone();
-        identity.sign_key = other.sign_key();
-        identity.noise_key = other.noise_key();
-        let conflict = CompanionProfile::for_stores(
-            profile.desktop_store.clone(),
-            profile.daemon_store.clone(),
-            identity,
-            profile.daemon.clone(),
-            profile.endpoint.clone(),
-        );
-        let proof = Signature::from_bytes(other.sign(&registration_message(&conflict)).unwrap());
-        assert!(client
-            .request(CompanionRequest::Register {
-                profile: conflict,
-                proof
-            })
-            .is_err());
-        for request in [
-            serde_json::json!({"type":"confirm","confirm":true}),
-            serde_json::json!({"type":"sign","bytes":"eA"}),
-        ] {
-            assert!(xshell_core::local_ipc::exchange::<_, CompanionResponse>(
-                client.endpoint(),
-                &request
-            )
-            .is_err());
-        }
-        let CompanionResponse::Identity {
-            profile: retained, ..
-        } = client.request(CompanionRequest::Descriptor).unwrap()
-        else {
-            panic!("identity missing");
-        };
-        assert_eq!(retained, Some(profile));
-        assert!(!computer.daemon_dir.join("roster.json").exists());
     }
 
     #[test]
@@ -1156,15 +1044,7 @@ mod unix {
         let code = offer.code.clone();
         let accepted = std::thread::scope(|scope| {
             let approval = scope.spawn(|| approver.ring.approve_device_code(&code));
-            let (preview, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
-            assert_eq!(preview.context.kind, ConsentFlow::Pairing);
-            assert!(guest.ring.chain().is_none());
-            assert!(!guest.daemon_dir.join("roster.json").exists());
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
+            // No confirmation on the joining machine: it signs and installs by itself.
             let outcome = offer.wait().unwrap();
             let published = approval.join().unwrap().unwrap();
             let AdoptionOutcome::Installed { chain, .. } = outcome else {
@@ -1326,10 +1206,10 @@ mod unix {
         assert!(VerifiedRingHost::project(&chain)
             .iter()
             .any(|h| h.id() == relay_host_id(&daemon2)));
-        use xshell_hostlink::ring::ApprovalReadiness;
+        use xshell_hostlink::ring::MembershipState;
         assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::Ready
+            second.ring.membership_state().unwrap(),
+            MembershipState::Member
         );
         // Removing through the Daemon's key removes the whole Computer.
         let removed = original.ring.remove_member(&daemon2).unwrap();
@@ -1357,17 +1237,15 @@ mod unix {
             entry,
             "the SSH Host entry is untouched"
         );
-        // The removed Computer's Desktop retains its completed adoption journal: that is a
-        // definitive removal, never "reconciliation required".
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while second.ring.chain().map(|c| c.head().version()) != Some(3) {
-            assert!(std::time::Instant::now() < until, "second never saw v3");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // The removed Computer's Desktop detects its removal by itself: a verified removal,
+        // never "finishing", and it is set aside with the notice.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while second.ring.membership_state().unwrap() != MembershipState::Removed
+            || second.ring.chain().is_some()
+        {
+            assert!(std::time::Instant::now() < until, "second never detected its removal");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::Removed
-        );
         // Either key of the retired unit is now a no-op.
         assert_eq!(
             original
@@ -1382,280 +1260,6 @@ mod unix {
     /// Removed by another device, this Computer leaves locally (the old Ring is not
     /// contacted), survives an interrupted Leave and Desktop restarts, and then joins a new
     /// Ring with both identities. Leave is refused while it is still a member.
-    #[test]
-    fn removed_computer_leaves_locally_and_joins_a_new_ring() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint, ApprovalReadiness};
-        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
-        let relay = Relay::start();
-        let original = Computer::new(&relay);
-        runtime2_create(&original);
-        let crash = Arc::new(AtomicBool::new(false));
-        let armed = crash.clone();
-        let hook = AdoptionTestHook(Arc::new(move |point| {
-            if point == AdoptionTestPoint::LeaveDaemonLeft && armed.swap(false, Ordering::SeqCst) {
-                panic!("simulated crash between the Daemon and Desktop Leave");
-            }
-        }));
-        let mut second = Computer::build(&relay.url(), None, None, Some(hook), None);
-        let joined = runtime2_join(&original, &second);
-        let desk2 = Store::new(second.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap()
-            .keys
-            .sign_key();
-        let unit = joined
-            .head()
-            .roster()
-            .membership()
-            .unwrap()
-            .unit_for(&desk2)
-            .unwrap()
-            .clone();
-        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
-        // Still a member: refused on both sides, nothing changed.
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::Ready
-        );
-        let refused = second.ring.leave_removed(&second.companion()).unwrap_err();
-        assert!(refused.starts_with("not_removed:"), "{refused}");
-        let refused = second
-            .companion()
-            .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
-            .unwrap_err();
-        assert!(refused.starts_with("not_removed:"), "{refused}");
-        // The current membership is no removal evidence.
-        let refused = second
-            .companion()
-            .request(CompanionRequest::LeaveRemoved {
-                rosters: joined
-                    .versions()
-                    .iter()
-                    .map(|r| r.token().to_string())
-                    .collect(),
-            })
-            .unwrap_err();
-        assert!(refused.contains("does not remove"), "{refused}");
-        // The Join's accepted install authority, for the replay checks after Leave.
-        let operation = Store::new(second.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap()
-            .journal
-            .unwrap()
-            .intent
-            .operation;
-        let replay = || CompanionRequest::InstallAccepted {
-            operation: operation.clone(),
-            rosters: joined
-                .versions()
-                .iter()
-                .map(|r| r.token().to_string())
-                .collect(),
-        };
-        assert!(second.daemon_dir.join("roster.json").exists());
-        // Another device removes the whole Computer.
-        let removed = original.ring.remove_member(&daemon2).unwrap();
-        assert_eq!(removed.head().version(), 3);
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while second.ring.approval_readiness().unwrap() != ApprovalReadiness::Removed {
-            assert!(
-                std::time::Instant::now() < until,
-                "second never saw its removal"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let relay_before = relay_version(&relay.target(), removed.ring_id());
-        // Interrupted after the Daemon left, before the Desktop store: still Removed after
-        // a restart (Leave offered again), and the Daemon's membership stays set aside.
-        crash.store(true, Ordering::SeqCst);
-        let (ring, client) = (second.ring.clone(), second.companion());
-        assert!(std::thread::spawn(move || ring.leave_removed(&client))
-            .join()
-            .is_err());
-        assert!(!second.daemon_dir.join("roster.json").exists());
-        second.restart_desktop();
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::Removed
-        );
-        // The Daemon side is idempotent; the Desktop side completes.
-        assert!(matches!(
-            second
-                .companion()
-                .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
-                .unwrap(),
-            CompanionResponse::Left
-        ));
-        second.ring.leave_removed(&second.companion()).unwrap();
-        assert!(second.ring.chain().is_none());
-        assert!(!second.ring.view().enabled);
-        second.restart_desktop();
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::NotEnrolled
-        );
-        assert!(second.ring.chain().is_none());
-        let after = Store::new(second.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap();
-        assert_eq!(after.keys.sign_key(), desk2, "the identity is retained");
-        assert!(
-            after.companion.is_some(),
-            "the counterpart stays registered"
-        );
-        let left = |dir: &std::path::Path, prefix: &str| {
-            std::fs::read_dir(dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|e| e.file_name().to_string_lossy().starts_with(prefix))
-        };
-        assert!(left(&second.desktop, "ring.json.left-"));
-        assert!(left(&second.daemon_dir, "roster.json.left-"));
-        assert!(second.ring.leave_removed(&second.companion()).is_err());
-        // The departed Ring's accepted install cannot be replayed, before or after a
-        // Daemon restart.
-        let refused = second.companion().request(replay()).unwrap_err();
-        assert!(refused.contains("unknown companion operation"), "{refused}");
-        assert!(!second.daemon_dir.join("roster.json").exists());
-        second.restart_daemon();
-        let refused = second.companion().request(replay()).unwrap_err();
-        assert!(refused.contains("unknown companion operation"), "{refused}");
-        assert!(!second.daemon_dir.join("roster.json").exists());
-        // No Relay contact: the old Ring is unchanged.
-        assert_eq!(
-            relay_version(&relay.target(), removed.ring_id()),
-            relay_before
-        );
-        // A different Computer creates a new Ring; the left Computer joins it with both
-        // identities, without merging or moving the old Ring.
-        let third = Computer::new(&relay);
-        runtime2_create(&third);
-        let fresh = runtime2_join(&third, &second);
-        assert_ne!(fresh.ring_id(), removed.ring_id());
-        let unit = fresh
-            .head()
-            .roster()
-            .membership()
-            .unwrap()
-            .unit_for(&desk2)
-            .unwrap()
-            .clone();
-        assert_eq!(
-            unit.kind,
-            xshell_protocol::ring::membership::EnrollmentKind::Computer
-        );
-        assert_eq!(unit.members.len(), 2);
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::Ready
-        );
-        assert_eq!(relay_version(&relay.target(), removed.ring_id()), 3);
-    }
-    /// The Daemon was offline when its Computer was removed, so its own Roster still
-    /// authorizes it. Leave carries the Desktop's verified removal as evidence; forged,
-    /// unrelated and non-removing evidence is refused.
-    #[test]
-    fn offline_daemon_leaves_with_verified_removal_evidence() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use xshell_hostlink::ring::ApprovalReadiness;
-        use xshell_protocol::ring::companion::CompanionRequest;
-        let relay = Relay::start();
-        let original = Computer::new(&relay);
-        runtime2_create(&original);
-        let offline = Arc::new(AtomicBool::new(false));
-        let dropping = offline.clone();
-        let hook = xshelld::server::TestHook(Arc::new(move |_, point| {
-            point == xshelld::server::TestPoint::RosterCallbackAdmitted
-                && dropping.load(Ordering::SeqCst)
-        }));
-        let second = Computer::build(&relay.url(), Some(hook), None, None, None);
-        let joined = runtime2_join(&original, &second);
-        let desk2 = Store::new(second.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap()
-            .keys
-            .sign_key();
-        let unit = joined
-            .head()
-            .roster()
-            .membership()
-            .unwrap()
-            .unit_for(&desk2)
-            .unwrap()
-            .clone();
-        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
-        offline.store(true, Ordering::SeqCst);
-        let removed = original.ring.remove_member(&daemon2).unwrap();
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while second.ring.approval_readiness().unwrap() != ApprovalReadiness::Removed {
-            assert!(
-                std::time::Instant::now() < until,
-                "Desktop never saw its removal"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let roster = |dir: &std::path::Path| -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(dir.join("roster.json")).unwrap()).unwrap()
-        };
-        let stale = roster(&second.daemon_dir);
-        assert_eq!(
-            stale["rosters"].as_array().unwrap().len(),
-            2,
-            "the Daemon missed its removal"
-        );
-        let tokens = |c: &xshell_protocol::ring::RosterChain| -> Vec<String> {
-            c.versions().iter().map(|r| r.token().to_string()).collect()
-        };
-        let leave = |rosters: Vec<String>| {
-            second
-                .companion()
-                .request(CompanionRequest::LeaveRemoved { rosters })
-        };
-        assert!(leave(vec![]).unwrap_err().starts_with("not_removed:"));
-        assert!(leave(tokens(&joined))
-            .unwrap_err()
-            .contains("does not remove"));
-        let other = Computer::new(&relay);
-        runtime2_create(&other);
-        let unrelated = tokens(&other.ring.chain().unwrap());
-        assert!(leave(unrelated).unwrap_err().contains("another Ring"));
-        let mut forged = tokens(&removed);
-        let last = forged.last_mut().unwrap();
-        let flip = if last.ends_with('A') { 'B' } else { 'A' };
-        last.pop();
-        last.push(flip);
-        assert!(leave(forged).is_err());
-        assert_eq!(roster(&second.daemon_dir), stale, "refusals change nothing");
-        // The Desktop's verified removal is the evidence.
-        second.ring.leave_removed(&second.companion()).unwrap();
-        assert!(!second.daemon_dir.join("roster.json").exists());
-        let left = std::fs::read_dir(&second.daemon_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .find(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("roster.json.left-")
-            })
-            .unwrap();
-        let kept: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(left.path()).unwrap()).unwrap();
-        assert_eq!(kept["rosters"].as_array().unwrap().len(), 3);
-        assert_eq!(
-            second.ring.approval_readiness().unwrap(),
-            ApprovalReadiness::NotEnrolled
-        );
-    }
-    /// A standalone Daemon enrolled by `approver`: its handle, home and signing key.
     fn runtime2_standalone(
         approver: &Computer,
         url: &str,
@@ -1874,101 +1478,28 @@ mod unix {
         assert!(!guest.daemon_dir.join("roster.json").exists());
     }
     #[test]
-    fn public_join_decline_releases_no_enrollment_proofs_or_publication() {
-        let relay = Relay::start();
-        let host = Computer::new(&relay);
-        runtime2_create(&host);
-        let guest = Computer::new(&relay);
-        let offer = guest.ring.begin_join(&guest.companion()).unwrap();
-        let code = offer.code.clone();
-        std::thread::scope(|scope| {
-            let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
-            offer.decline_join().unwrap();
-            assert!(matches!(
-                offer.wait().unwrap(),
-                AdoptionOutcome::Declined { .. }
-            ));
-            assert!(approval.join().unwrap().is_err());
-        });
-        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
-        let stored = Store::new(host.desktop.clone())
-            .load_profile()
-            .unwrap()
-            .0
-            .unwrap();
-        let outgoing = stored.outgoing.unwrap();
-        assert_eq!(
-            outgoing.phase,
-            xshell_hostlink::ring::store::OutgoingPhase::Cancelled
-        );
-        assert!(outgoing.signed_candidate.is_none() && outgoing.accepted.is_empty());
-        let serialized = serde_json::to_string(&outgoing).unwrap();
-        assert!(
-            !serialized.contains("desktopInstalled") && !serialized.contains("daemonInstalled")
-        );
-        assert_eq!(
-            relay_version(&relay.target(), stored.membership.unwrap().chain.ring_id()),
-            1
-        );
-    }
-    #[test]
     fn public_join_expiry_is_terminal_without_regeneration_or_enrollment_proofs() {
         let relay = Relay::start();
         let host = Computer::new(&relay);
         runtime2_create(&host);
-        let guest = Computer::with_options(&relay, None, Some(std::time::Duration::from_secs(3)));
+        let gate = ConsentGate::default();
+        let guest = Computer::gated(&relay, &gate, Some(std::time::Duration::from_secs(3)));
         let offer = guest.ring.begin_join(&guest.companion()).unwrap();
         let code = offer.code.clone();
+        let expires_at = offer.expires_at;
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            let (_, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
+            gate.reached();
+            // The code expires while the proposal waits: no proof may be released after.
+            while now_secs() < expires_at {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            gate.release();
             assert!(offer.wait().is_err());
             assert!(approval.join().unwrap().is_err());
-            assert!(lease.confirm("expired").is_err());
         });
         runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::ExpiredBeforeProof);
         assert_eq!(host.ring.chain().unwrap().head().version(), 1);
-    }
-    #[test]
-    fn public_join_refuses_wrong_origin_lease_before_proof_release() {
-        let relay = Relay::start();
-        let host = Computer::new(&relay);
-        runtime2_create(&host);
-        let unrelated = Computer::new(&relay);
-        let mut wrong = None;
-        unrelated
-            .ring
-            .create_computer(&unrelated.companion(), |preview, lease| {
-                wrong = Some(lease.confirm(&preview.proposal_hash)?);
-                Ok(CreateDecision::Decline)
-            })
-            .unwrap();
-        let guest = Computer::new(&relay);
-        let offer = guest.ring.begin_join(&guest.companion()).unwrap();
-        let code = offer.code.clone();
-        std::thread::scope(|scope| {
-            let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            let (preview, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
-            assert!(offer.confirm_join(wrong.take().unwrap()).is_err());
-            assert!(lease.confirm("wrong-proposal-hash").is_err());
-            let counterpart: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(guest.daemon_dir.join("companion.json")).unwrap(),
-            )
-            .unwrap();
-            assert!(counterpart["obligation"]["proofs"].is_null());
-            assert_eq!(preview.context.kind, ConsentFlow::Pairing);
-            offer.decline_join().unwrap();
-            offer.wait().unwrap();
-            assert!(approval.join().unwrap().is_err());
-        });
-        runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
     }
     #[test]
     fn public_join_changed_head_never_rebases_or_publishes_frozen_enrollment() {
@@ -1977,29 +1508,25 @@ mod unix {
         runtime2_create(&original);
         let approver = Computer::new(&relay);
         runtime2_join(&original, &approver);
-        let guest = Computer::new(&relay);
+        let gate = ConsentGate::default();
+        let guest = Computer::gated(&relay, &gate, None);
         let offer = guest.ring.begin_join(&guest.companion()).unwrap();
         let code = offer.code.clone();
         let operation = offer.operation.clone();
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| approver.ring.approve_device_code(&code));
-            let (preview, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
-            assert_eq!(preview.proposal.version, 3);
+            gate.reached();
             // Independent publication by the other real authorized Desktop, not a manual
             // controller-state mutation or a competing same-key connection.
             let concurrent = Computer::new(&relay);
             let accepted = runtime2_join(&original, &concurrent);
             assert_eq!(accepted.head().version(), 3);
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
+            gate.release();
             let error = offer
                 .wait()
                 .err()
                 .expect("changed head must not silently succeed");
-            assert!(error.starts_with("reconciliation_required:"));
+            assert!(error.starts_with("finishing:"), "{error}");
             assert!(approval.join().unwrap().is_err());
             assert_eq!(relay_version(&relay.target(), accepted.ring_id()), 3);
             assert!(accepted
@@ -2019,7 +1546,12 @@ mod unix {
             .unwrap();
         assert_eq!(guest_journal.phase, AdoptionPhase::ConsentMayHaveLeft);
         assert!(
-            guest.ring.begin_join(&guest.companion()).is_err(),
+            guest
+                .ring
+                .begin_join(&guest.companion())
+                .err()
+                .unwrap()
+                .starts_with("finishing:"),
             "possible consent is not permission for a replacement offer"
         );
         let outgoing = Store::new(approver.desktop.clone())
@@ -2048,25 +1580,19 @@ mod unix {
         let mut relay = Relay::start();
         let host = Computer::new(&relay);
         runtime2_create(&host);
-        let guest = Computer::new(&relay);
+        let gate = ConsentGate::default();
+        let guest = Computer::gated(&relay, &gate, None);
         let offer = guest.ring.begin_join(&guest.companion()).unwrap();
         let code = offer.code.clone();
+        let ring_id = host.ring.chain().unwrap().ring_id().clone();
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            let (preview, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
+            gate.reached();
             relay.restart(); // kills actual creator/pair sockets, then restarts same storage
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
-            assert!(offer
-                .wait()
-                .err()
-                .unwrap()
-                .starts_with("reconciliation_required:"));
+            gate.release();
+            assert!(offer.wait().err().unwrap().starts_with("finishing:"));
             assert!(approval.join().unwrap().is_err());
-            assert_eq!(relay_version(&relay.target(), &preview.ring_id), 1);
+            assert_eq!(relay_version(&relay.target(), &ring_id), 1);
         });
         let stored = Store::new(guest.desktop.clone())
             .load_profile()
@@ -2085,14 +1611,13 @@ mod unix {
         let relay = Relay::start();
         let host = Computer::new(&relay);
         runtime2_create(&host);
-        let guest = Computer::new(&relay);
+        let gate = ConsentGate::default();
+        let guest = Computer::gated(&relay, &gate, None);
         let offer = guest.ring.begin_join(&guest.companion()).unwrap();
         let code = offer.code.clone();
         let rejected = std::thread::scope(|scope| {
             let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
+            gate.reached();
             let result = Store::new(host.desktop.clone()).transact_profile(|profile, _| {
                 let mut profile = profile.unwrap();
                 let outgoing = profile.outgoing.as_mut().unwrap();
@@ -2100,8 +1625,10 @@ mod unix {
                 outgoing.phase = OutgoingPhase::PublicationUncertain;
                 Ok((Some(profile), ()))
             });
-            offer.decline_join().unwrap();
-            offer.wait().unwrap();
+            // Leaving the code screen: no proof is released after the cancel.
+            offer.cancel_join();
+            gate.release();
+            assert!(offer.wait().is_err());
             assert!(approval.join().unwrap().is_err());
             result.is_err()
         });
@@ -2128,17 +1655,7 @@ mod unix {
         let code = offer.code.clone();
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            let (preview, lease) = offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
-            assert!(offer
-                .wait()
-                .err()
-                .unwrap()
-                .starts_with("reconciliation_required:"));
+            assert!(offer.wait().err().unwrap().starts_with("finishing:"));
             let publication = approval.join().unwrap().unwrap();
             assert_eq!(publication.chain.head().version(), 2);
         });
@@ -2189,15 +1706,17 @@ mod unix {
         let relay = Relay::start();
         let host = Computer::new(&relay);
         runtime2_create(&host);
-        let guest = Computer::new(&relay);
+        let gate = ConsentGate::default();
+        let guest = Computer::gated(&relay, &gate, None);
         let offer = guest.ring.begin_join(&guest.companion()).unwrap();
         let code = offer.code.clone();
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| host.ring.approve_device_code(&code));
-            offer
-                .await_consent(std::time::Duration::from_secs(10))
-                .unwrap();
+            gate.reached();
             let before = std::time::Instant::now();
+            // Leaving the code screen at the last moment: nothing is signed after it.
+            offer.cancel_join();
+            gate.release();
             drop(offer);
             assert!(
                 before.elapsed() < std::time::Duration::from_secs(2),

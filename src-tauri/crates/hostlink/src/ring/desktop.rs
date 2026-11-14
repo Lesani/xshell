@@ -521,6 +521,10 @@ pub struct DesktopRingConfig {
     /// The same while the quota notice is shown: rarely enough that a day of refusals stays
     /// well under the Relay's close after 32 in a row.
     pub quota_probe_limited: Duration,
+    /// Keep a stored format-1 Ring instead of setting it aside at open. Only for the tests
+    /// of the format-1 code that stays until the cleanup slice deletes it; never set in the
+    /// app.
+    pub keep_format1: bool,
 }
 
 impl DesktopRingConfig {
@@ -541,6 +545,7 @@ impl DesktopRingConfig {
             pair_publish_wait: Duration::from_secs(10),
             quota_probe: Duration::from_secs(10 * 60),
             quota_probe_limited: Duration::from_secs(60 * 60),
+            keep_format1: false,
         }
     }
 }
@@ -4116,6 +4121,8 @@ mod tests {
 
     fn cfg(dir: &std::path::Path, url: &str) -> DesktopRingConfig {
         let mut c = DesktopRingConfig::new(dir.join("ring"), "desk".into());
+        // These tests drive the format-1 code kept until S7.
+        c.keep_format1 = true;
         c.default_relay_url = url.into();
         c.hosted_relay_url = url.into();
         c.backoff_unit = Duration::from_millis(10);
@@ -5015,7 +5022,9 @@ mod tests {
         a.enable(None, false).unwrap();
         let (b, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
         wait_view(&b, "follower enrolled", |v| v.enabled);
-        a.store.leave_removed(|_| Ok(())).unwrap();
+        a.store
+            .set_aside(super::super::store::AsideReason::SelfRemoved, |_| Ok(()))
+            .unwrap();
         a.forget_membership();
         assert!(!a.view().enabled);
         wait_view(&b, "follower left", |v| !v.enabled && v.problem.is_none());
@@ -7601,15 +7610,41 @@ mod v2_edits_tests {
     }
 
     #[test]
-    fn v2_remove_member_refuses_own_unit() {
+    fn self_removal_candidate_built_and_commit_sets_aside_without_notice() {
         let t = tempfile::tempdir().unwrap();
         let x = v2_ring(&t);
-        assert_eq!(x.ring.remove_member(&x.me).unwrap_err(), REMOVE_SELF);
+        // Either key of this computer's own unit builds the Remove of the whole unit.
+        for key in [x.me, x.my_daemon.sign_key()] {
+            let (candidate, s) = removed(&t, &x, &key);
+            assert!(candidate.member(&x.me).is_none());
+            assert!(candidate.member(&x.my_daemon.sign_key()).is_none());
+            assert!(s.local_member.is_none(), "this computer's Daemon mapping goes");
+        }
+        let (candidate, committed) = removed(&t, &x, &x.me);
+        let before = Store::new(t.path().join("ring"))
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        x.ring.set_aside_self_removed(&committed.chain);
+        assert_eq!(committed.chain.head(), &candidate);
+        let after = Store::new(t.path().join("ring"))
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(after.membership.is_none() && after.companion.is_none());
+        assert!(after.removed.is_none(), "a self-removal shows no notice");
+        assert_ne!(after.keys.sign_key(), before.keys.sign_key(), "new identity");
+        assert!(x.ring.chain().is_none(), "the live Ring is dropped");
         assert_eq!(
-            x.ring.remove_member(&x.my_daemon.sign_key()).unwrap_err(),
-            REMOVE_SELF
+            x.ring.membership_state().unwrap(),
+            MembershipState::None
         );
-        assert_eq!(stored(&t).chain.head().version(), 3, "nothing signed");
+        assert!(std::fs::read_dir(t.path().join("ring"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("ring.json.removed-")));
         x.ring.quit();
     }
 
@@ -7798,7 +7833,8 @@ mod v2_edits_tests {
         let own = v.members.iter().find(|m| m.sign_key == x.me).unwrap();
         assert_eq!(own.kind, Some(EnrollmentKind::Computer));
         assert_eq!(own.daemon_key, Some(x.my_daemon.sign_key()));
-        assert!(own.this_app && own.this_computer && !own.removable);
+        // ADR-0016: this computer's own row is removable too.
+        assert!(own.this_app && own.this_computer && own.removable);
         let other = v
             .members
             .iter()

@@ -1570,6 +1570,8 @@ mod tests {
             companion: None,
             pending_join: None,
             outgoing: None,
+            removed: None,
+            old_ring: None,
         };
         let mut v = serde_json::to_value(&f).unwrap();
         let o = v.as_object_mut().unwrap();
@@ -1831,6 +1833,8 @@ mod tests {
             companion: None,
             pending_join: None,
             outgoing: None,
+            removed: None,
+            old_ring: None,
         };
         let cap = capacity(&f);
         let json = encode(&f).unwrap();
@@ -2287,5 +2291,109 @@ mod adoption_profile_tests {
         invalid.phase = AdoptionPhase::ExpiredBeforeProof;
         invalid.signed_candidate = Some("not-even-a-token".into());
         assert!(invalid.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod set_aside_tests {
+    use super::*;
+    use xshell_protocol::ring::SignedRoster;
+
+    fn v1_member(dir: &Path) -> (Store, Arc<DeviceKeys>) {
+        let store = Store::new(dir.to_path_buf());
+        let keys = store.retained_keys().unwrap();
+        let g = SignedRoster::genesis(&*keys, keys.noise_key(), "desk", "wss://r.example", 1)
+            .unwrap();
+        store
+            .transact(|_, _| {
+                Ok((
+                    Some(RingState {
+                        chain: RosterChain::from_chain(vec![g]).unwrap(),
+                        keys: keys.clone(),
+                        local_member: None,
+                        farewells: Vec::new(),
+                        held_relays: Default::default(),
+                        host_members: BTreeMap::new(),
+                    }),
+                    (),
+                ))
+            })
+            .unwrap();
+        (store, keys)
+    }
+
+    fn aside_files(dir: &Path, prefix: &str) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    #[test]
+    fn set_aside_v1_rotates_keys_drops_companion() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("desktop");
+        let (store, keys) = v1_member(&dir);
+        assert!(store.set_aside(AsideReason::V1, |_| Ok(())).unwrap());
+        let after = store.load_profile().unwrap().0.unwrap();
+        assert_ne!(after.keys.sign_key(), keys.sign_key(), "a new identity");
+        assert_ne!(after.keys.noise_key(), keys.noise_key());
+        assert!(after.membership.is_none() && after.companion.is_none());
+        assert!(after.journal.is_none() && after.pending_join.is_none());
+        assert!(after.removed.is_none());
+        assert!(after.old_ring.is_some(), "the old-Ring notice is set");
+        assert_eq!(aside_files(&dir, "ring.json.v1-"), 1);
+        // Kept as evidence: the aside file still holds the old keys' Ring.
+        let reopened = Store::new(dir.clone());
+        assert_eq!(
+            reopened.retained_keys().unwrap().sign_key(),
+            after.keys.sign_key()
+        );
+        // A refusing check leaves everything as it was.
+        let (store, keys) = v1_member(&t.path().join("other"));
+        assert!(store
+            .set_aside(AsideReason::V1, |_| Err("no".into()))
+            .is_err());
+        assert_eq!(
+            store.load_profile().unwrap().0.unwrap().keys.sign_key(),
+            keys.sign_key()
+        );
+    }
+
+    #[test]
+    fn set_aside_removed_writes_notice_and_file() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("desktop");
+        let (store, _) = v1_member(&dir);
+        let ring = store.load().unwrap().0.unwrap().chain.ring_id().clone();
+        let notice = RemovedNotice {
+            ring_id: ring.clone(),
+            version: 7,
+            at: 99,
+        };
+        assert!(store
+            .set_aside(AsideReason::Removed(notice.clone()), |_| Ok(()))
+            .unwrap());
+        let after = store.load_profile().unwrap().0.unwrap();
+        assert_eq!(after.removed, Some(notice));
+        assert!(after.old_ring.is_none());
+        assert!(after.membership.is_none());
+        assert_eq!(aside_files(&dir, "ring.json.removed-"), 1);
+        // The notice survives a reload (it is in the file).
+        let again = Store::new(dir.clone()).load_profile().unwrap().0.unwrap();
+        assert_eq!(again.removed.as_ref().unwrap().version, 7);
+        // Clearing it (what a Join or Create does) persists too.
+        store
+            .transact_profile(|p, _| {
+                let mut p = p.unwrap();
+                p.removed = None;
+                Ok((Some(p), ()))
+            })
+            .unwrap();
+        assert!(store.load_profile().unwrap().0.unwrap().removed.is_none());
+        // Nothing stored: nothing to set aside.
+        let empty = Store::new(t.path().join("empty"));
+        assert!(!empty.set_aside(AsideReason::SelfRemoved, |_| Ok(())).unwrap());
     }
 }

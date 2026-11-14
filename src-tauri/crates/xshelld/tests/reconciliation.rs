@@ -70,10 +70,6 @@ fn owned_controller_child() {
             // One credential to the invoking parent pipe only; never written to an artifact.
             println!("WORDS:{}", offer.code.format().as_str());
             std::io::stdout().flush().unwrap();
-            let (preview, lease) = offer.await_consent(WAIT).unwrap();
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
             offer.wait().unwrap();
         }
         "upgrade" => {

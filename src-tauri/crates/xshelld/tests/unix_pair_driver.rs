@@ -257,10 +257,14 @@ fn controller(ring: &DesktopRing) -> Arc<JoinOffer> {
     });
     result.unwrap()
 }
+/// There is no confirmation on the joining machine any more: the Join continues by itself
+/// once the approver's proposal verifies. Waits until it has left `Waiting`.
 fn confirm_backend(join: &JoinOffer) {
-    let (preview, lease) = join.await_consent(Duration::from_secs(8)).unwrap();
-    join.confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(8);
+    while matches!(join.join_status(), JoinStatus::Waiting) {
+        assert!(std::time::Instant::now() < until, "Join never continued by itself");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 fn assert_no_words_on_disk(f: &Fixture, code: &DeviceCode) {
     let words = code.format();
@@ -600,7 +604,7 @@ fn actual_cli_durable_desktop_failure_is_reconciliation_not_success_backend_cons
     assert_eq!(child.words, 1);
     assert!(matches!(
         join.join_status(),
-        JoinStatus::ReconciliationRequired { .. }
+        JoinStatus::Finishing { .. }
     ));
     assert!(b.paths.ring_dir.join("roster.json").exists());
     let saved: serde_json::Value = serde_json::from_slice(

@@ -92,6 +92,9 @@ impl DesktopRing {
             return;
         };
         if format1(&stored) {
+            if self.cfg.keep_format1 {
+                return;
+            }
             self.tell_daemon_left(&stored, None);
             match self.store.set_aside(AsideReason::V1, |p| {
                 format1(p)
@@ -257,6 +260,15 @@ impl DesktopRing {
     /// backoff from 5 s to 5 min.
     pub(in crate::ring) fn spawn_removal_check(&self) {
         let Some(ring) = self.me.upgrade() else { return };
+        // Only a format-2 Ring has removals to verify (format 1 is set aside at open).
+        if self
+            .lock()
+            .state
+            .as_ref()
+            .is_none_or(|s| s.chain.head().roster().v != 2)
+        {
+            return;
+        }
         {
             let mut st = self.maintenance.lock();
             if st.removal {

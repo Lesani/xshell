@@ -255,3 +255,86 @@ impl DesktopRing {
         self.adoption.load(Ordering::Acquire)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ring::store::{PendingJoin, RemovedNotice, RingState};
+    use xshell_protocol::ring::pairing::adoption::{AdoptionIntent, JoinTarget};
+    use xshell_protocol::ring::{RosterChain, SignedRoster};
+
+    fn bare() -> ProfileState {
+        ProfileState {
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+            membership: None,
+            journal: None,
+            companion: None,
+            pending_join: None,
+            outgoing: None,
+            removed: None,
+            old_ring: None,
+        }
+    }
+
+    #[test]
+    fn membership_of_none_member_finishing_removed() {
+        assert_eq!(membership_of(None, |_| false), MembershipState::None);
+        let p = bare();
+        assert_eq!(membership_of(Some(&p), |_| false), MembershipState::None);
+        // A notice: removed.
+        let mut removed = bare();
+        removed.removed = Some(RemovedNotice {
+            ring_id: RingId::derive(&removed.keys.sign_key()),
+            version: 3,
+            at: 1,
+        });
+        assert_eq!(
+            membership_of(Some(&removed), |_| false),
+            MembershipState::Removed
+        );
+        // An unresolved record that is not this process's live work: finishing, even with
+        // a notice.
+        let mut finishing = removed.clone();
+        let daemon = DeviceKeys::generate().unwrap();
+        let identity = |k: &DeviceKeys| PublicIdentity {
+            name: "x".into(),
+            sign_key: k.sign_key(),
+            noise_key: k.noise_key(),
+        };
+        let op = xshell_protocol::ring::b64::encode(&[9; 32]);
+        finishing.pending_join = Some(PendingJoin {
+            retained_predecessor: vec![],
+            intent: AdoptionIntent {
+                operation: op.clone(),
+                expires_at: 10,
+                target: JoinTarget::Computer {
+                    desktop: identity(&finishing.keys),
+                    daemon: identity(&daemon),
+                },
+            },
+            relay_url: "wss://r.example".into(),
+        });
+        assert_eq!(
+            membership_of(Some(&finishing), |_| false),
+            MembershipState::Finishing
+        );
+        // The same record driven live by this process is not "finishing".
+        assert_eq!(
+            membership_of(Some(&finishing), |o| o == op),
+            MembershipState::Removed
+        );
+        // A format-1 member is not a member (set aside at the next start).
+        let mut v1 = bare();
+        let g = SignedRoster::genesis(&*v1.keys, v1.keys.noise_key(), "d", "wss://r.example", 1)
+            .unwrap();
+        v1.membership = Some(RingState {
+            keys: v1.keys.clone(),
+            chain: RosterChain::from_chain(vec![g]).unwrap(),
+            local_member: None,
+            farewells: vec![],
+            held_relays: Default::default(),
+            host_members: Default::default(),
+        });
+        assert_eq!(membership_of(Some(&v1), |_| false), MembershipState::None);
+    }
+}
