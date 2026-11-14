@@ -521,7 +521,7 @@ mod unix {
             })
             .err()
             .expect("failed Daemon installation cannot succeed");
-        assert!(error.starts_with("reconciliation_required:"));
+        assert!(error.starts_with("finishing:"), "{error}");
         std::fs::remove_dir(computer.daemon_dir.join("roster.json")).unwrap();
         let saved = Store::new(computer.desktop.clone())
             .load_profile()
@@ -547,7 +547,7 @@ mod unix {
             ))
             .err()
             .unwrap()
-            .starts_with("reconciliation_required:"));
+            .starts_with("finishing:"));
     }
     #[test]
     fn long_home_short_xdg_keeps_legacy_server_usable_and_companion_explicitly_unsupported() {
@@ -818,7 +818,7 @@ mod unix {
             .err()
             .expect("actual roster write fault must report reconciliation, not success");
         assert!(
-            error.starts_with("reconciliation_required:") && error.contains("could not be saved"),
+            error.starts_with("finishing:") && error.contains("could not be saved"),
             "{error}"
         );
         assert!(

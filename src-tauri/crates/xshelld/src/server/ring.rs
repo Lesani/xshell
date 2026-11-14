@@ -2461,14 +2461,16 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                 }
                 #[cfg(unix)]
                 if now >= standalone_at {
-                    let handle = super::ServerHandle {
-                        socket: d.cfg.paths.socket.clone(),
-                        d: d.clone(),
-                    };
+                    // Never a ServerHandle here: dropping one shuts the Daemon down.
+                    let handle = super::adoption::Standalone { d: &d };
                     match maintain_standalone(&handle) {
                         Ok(true) => {
                             standalone_delay = Duration::from_secs(1);
                             standalone_at = now + Duration::from_secs(60);
+                        }
+                        // A pair command is still running: look again soon, no backoff.
+                        Err(e) if e == STANDALONE_PENDING => {
+                            standalone_at = now + Duration::from_secs(1);
                         }
                         Ok(false) | Err(_) => {
                             standalone_at = now + standalone_delay;
@@ -2480,9 +2482,12 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
         });
 }
 
+#[cfg(unix)]
+const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
+
 /// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
 #[cfg(unix)]
-fn maintain_standalone(handle: &super::ServerHandle) -> Result<bool, String> {
+fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool, String> {
     use super::adoption::StandaloneRecoveryState as S;
     let Some(status) = handle.standalone_adoption_status()? else {
         return Ok(true);
@@ -2494,6 +2499,11 @@ fn maintain_standalone(handle: &super::ServerHandle) -> Result<bool, String> {
             .as_secs()
             >= status.expires_at
     };
+    // A pair command still running owns its obligation until its code expires: never
+    // compete with it (its own journal writes would see a changed record).
+    if status.state != S::Installed && !expired() {
+        return Err(STANDALONE_PENDING.into());
+    }
     match status.state {
         S::Installed => Ok(true),
         S::Terminal => {
@@ -2526,7 +2536,10 @@ fn maintain_standalone(handle: &super::ServerHandle) -> Result<bool, String> {
 /// The standalone obligation never enrolled (or was removed): its journal is renamed
 /// aside so a new pair command or registration can start.
 #[cfg(unix)]
-fn abandon_standalone(handle: &super::ServerHandle, operation: &str) -> Result<(), String> {
+fn abandon_standalone(
+    handle: &super::adoption::Standalone<'_>,
+    operation: &str,
+) -> Result<(), String> {
     let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
     let budget = xshell_core::local_ipc::RequestBudget::for_operation(
         Instant::now() + Duration::from_secs(5),

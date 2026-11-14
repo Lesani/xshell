@@ -235,6 +235,47 @@ pub(super) fn finalize_standalone_install(
 
 impl ServerHandle {
     pub fn standalone_adoption_status(&self) -> Result<Option<StandaloneRecoveryStatus>, String> {
+        Standalone { d: &self.d }.standalone_adoption_status()
+    }
+
+    /// Observe only, then retry the same accepted local obligation. No Pair Open, proof
+    /// release, signed publication or fresh enrollment occurs on this path.
+    pub fn reconcile_standalone_adoption(&self) -> Result<StandaloneRecoveryStatus, String> {
+        Standalone { d: &self.d }.reconcile_standalone_adoption()
+    }
+
+    #[cfg(test)]
+    fn reconcile_standalone_adoption_with(
+        &self,
+        observe: impl FnOnce(
+            &StandaloneJournal,
+            Arc<xshell_protocol::ring::DeviceKeys>,
+            &ChainPin,
+        ) -> Result<RosterChain, String>,
+    ) -> Result<StandaloneRecoveryStatus, String> {
+        Standalone { d: &self.d }.reconcile_standalone_adoption_with(observe)
+    }
+
+    #[cfg(test)]
+    fn finish_standalone_reconciliation(
+        &self,
+        store: &Store,
+        record: &mut StandaloneJournal,
+        accepted: &RosterChain,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<StandaloneRecoveryStatus, String> {
+        Standalone { d: &self.d }.finish_standalone_reconciliation(store, record, accepted, budget)
+    }
+}
+
+/// The standalone obligation's recovery on a borrowed Daemon (no handle whose drop would
+/// shut the Daemon down): used by the handle and by the maintenance loop.
+pub(crate) struct Standalone<'a> {
+    pub(crate) d: &'a Arc<super::registry::Daemon>,
+}
+
+impl Standalone<'_> {
+    pub(crate) fn standalone_adoption_status(&self) -> Result<Option<StandaloneRecoveryStatus>, String> {
         let _operation = self.d.store_admission.admit()?;
         let store = Store::new(self.d.cfg.paths.ring_dir.clone());
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(
@@ -250,9 +291,7 @@ impl ServerHandle {
         })
     }
 
-    /// Observe only, then retry the same accepted local obligation. No Pair Open, proof
-    /// release, signed publication or fresh enrollment occurs on this path.
-    pub fn reconcile_standalone_adoption(&self) -> Result<StandaloneRecoveryStatus, String> {
+    pub(crate) fn reconcile_standalone_adoption(&self) -> Result<StandaloneRecoveryStatus, String> {
         self.reconcile_standalone_adoption_with(|original, keys, pin| {
             if let Some((owner, _, _)) = self.d.ring.push_link() {
                 owner.read_accepted_chain(pin)
@@ -401,6 +440,9 @@ impl ServerHandle {
         })
     }
 
+}
+
+impl ServerHandle {
     /// Runs only for this explicit command invocation. The initial words callback is the
     /// sole output of the credential. A missing ACK after confirmation is reconciliation,
     /// never permission to generate another offer or replace retained membership.

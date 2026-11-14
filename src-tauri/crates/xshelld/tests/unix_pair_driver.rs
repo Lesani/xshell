@@ -354,7 +354,7 @@ fn actual_cli_stopped_owner_manual_open_uses_original_deadline_without_autostart
     let before = Instant::now();
     let mut child = b.pair(&relay.url(), 4_000);
     let line = child.lines.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(line.starts_with("Computer pairing pending."));
+    assert!(line.starts_with("Getting a Device Code from xshell on this computer"));
     std::thread::sleep(Duration::from_millis(300));
     assert!(child.lines.try_recv().is_err());
     assert!(child.child.try_wait().unwrap().is_none());
@@ -642,7 +642,7 @@ fn registration_child_cannot_claim_live_driver_readiness_and_manual_daemon_start
         .lines
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
-        .starts_with("Computer pairing pending."));
+        .starts_with("Getting a Device Code from xshell on this computer"));
     std::thread::sleep(Duration::from_millis(250));
     assert!(child.lines.try_recv().is_err());
     assert!(!b.paths.socket.exists());

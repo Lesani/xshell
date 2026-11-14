@@ -411,6 +411,29 @@ impl DesktopRing {
             }
             let accepted = match self.read_reconciliation_chain(&stored, j) {
                 Ok(chain) => merge(evidence.as_ref(), chain)?,
+                // Enrolled (the accepted chain is known here) but refused now: read the
+                // signed history as a former member; a verified removal ends it at once.
+                Err(e)
+                    if e.starts_with("not_member:")
+                        && evidence
+                            .as_ref()
+                            .is_some_and(|c| c.get(j.proposal.version).is_some()) =>
+                {
+                    let known = evidence.as_ref().expect("checked");
+                    match xshell_protocol::ring::relay::check_removal(
+                        known,
+                        stored.keys.clone(),
+                        None,
+                        self.cfg.timeouts.connect,
+                    ) {
+                        Ok(xshell_protocol::ring::relay::RemovalCheck::Removed(chain)) => {
+                            self.record_reconciled_acceptance(operation, &chain)?;
+                            return abandon("enrolled, then removed");
+                        }
+                        Ok(xshell_protocol::ring::relay::RemovalCheck::Member(chain)) => chain,
+                        Err(e) => return Err(format!("offline: {e}")),
+                    }
+                }
                 Err(e) if e.starts_with("not_member:") && now() >= j.intent.expires_at => {
                     return abandon(&e);
                 }
