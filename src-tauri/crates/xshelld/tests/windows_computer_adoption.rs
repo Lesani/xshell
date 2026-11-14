@@ -939,3 +939,40 @@ fn attached_console_ctrl_c_cancels_the_offer_without_proof_release() {
 fn attached_console_ctrl_break_cancels_the_offer_without_proof_release() {
     console_ctrl_cancels_offer("break");
 }
+
+/// Not a test unless `XSHELL_X87_HOLD` names a directory: registers a Computer (real
+/// GUI-bound Daemon, Desktop backend owner) and holds it until `stop` appears there, after
+/// writing its pipe names and paths to `endpoints.txt`. Used for the cross-user (SID)
+/// negative run as the separate testadmin account.
+#[test]
+fn helper_hold_registered_computer() {
+    let Some(dir) = std::env::var_os("XSHELL_X87_HOLD").map(PathBuf::from) else {
+        return;
+    };
+    let relay = Relay::start();
+    let a = WinComputer::new(&relay);
+    let profile = a.register();
+    let desktop = xshell_core::local_ipc::canonical_store(&a.desktop).unwrap();
+    std::fs::write(
+        dir.join("endpoints.txt"),
+        format!(
+            "companion={}\nbroker={}\nhome={}\ndaemon_store={}\ndesktop_store={}\npipe={}\n",
+            profile.endpoint,
+            xshell_core::local_ipc::host_broker_endpoint(&desktop)
+                .unwrap()
+                .display(),
+            a.home.home().display(),
+            profile.daemon_store,
+            profile.desktop_store,
+            a.home.pipe.display(),
+        ),
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(300);
+    while !dir.join("stop").exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Still registered and intact after the foreign attempts.
+    assert!(a.daemon_dir().join("companion.json").exists());
+    std::fs::write(dir.join("held-ok"), b"").unwrap();
+}
