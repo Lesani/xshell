@@ -1198,6 +1198,14 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// A shared directory above private Stores/IPC (`~/.xshell`): see
+/// [`xshell_core::server::prepare_shared_dir`]. A group/world-writable one is refused
+/// unchanged, never repaired.
+#[cfg(unix)]
+pub fn prepare_shared_dir(dir: &Path) -> io::Result<()> {
+    xshell_core::server::prepare_shared_dir(dir)
+}
+
 /// Creates `dir` (and parents) private: on Unix 0700, owned by this user, not a symlink; on
 /// Windows owned by this user with a protected user-only DACL, not a reparse point (see
 /// `xshell_core::private_fs`).

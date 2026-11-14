@@ -168,20 +168,30 @@ pub fn setup(app: &AppHandle) {
         .and_then(|h| h.local_daemon.clone())
     {
         let startup_ring = Arc::downgrade(&ring);
-        std::thread::spawn(move || loop {
-            let Some(ring) = startup_ring.upgrade() else {
-                break;
-            };
-            if ring.is_quitting() {
-                break;
+        std::thread::spawn(move || {
+            // Retried every 2 s; a lasting refusal (e.g. an unsafe directory the owner has
+            // to fix) is logged once, not on every attempt.
+            let mut last_error = None;
+            loop {
+                let Some(ring) = startup_ring.upgrade() else {
+                    break;
+                };
+                if ring.is_quitting() {
+                    break;
+                }
+                match ring.register_local_companion(&daemon) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {} // followers wait; only an elected successor may register
+                    Err(error) => {
+                        if last_error.as_ref() != Some(&error) {
+                            eprintln!("xshell: local Computer registration pending: {error}");
+                        }
+                        last_error = Some(error);
+                    }
+                }
+                drop(ring);
+                std::thread::sleep(std::time::Duration::from_secs(2));
             }
-            match ring.register_local_companion(&daemon) {
-                Ok(Some(_)) => break,
-                Ok(None) => {} // followers wait; only an elected successor may register
-                Err(error) => eprintln!("xshell: local Computer registration pending: {error}"),
-            }
-            drop(ring);
-            std::thread::sleep(std::time::Duration::from_secs(2));
         });
     }
     #[cfg(any(unix, windows))]
