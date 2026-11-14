@@ -196,11 +196,20 @@ impl PairChild {
                         return DeviceCode::parse(words).expect("eight words");
                     }
                 }
-                Err(e) => panic!(
-                    "CLI gave no Device code ({e:?}); status {:?}; stderr:\n{}",
-                    self.child.try_wait(),
-                    self.stderr.lock().unwrap()
-                ),
+                Err(e) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let status = self.child.try_wait();
+                    if matches!(status, Ok(Some(_))) {
+                        for reader in self.readers.drain(..) {
+                            let _ = reader.join();
+                        }
+                    }
+                    panic!(
+                        "CLI gave no Device code ({e:?}); status {status:?}; stdout {:?}; stderr:\n{}",
+                        self.stdout(),
+                        self.stderr.lock().unwrap()
+                    )
+                }
             }
         }
     }
@@ -693,33 +702,71 @@ fn host_first_decline_exits_1_and_expiry_exits_5_without_proofs() {
 #[test]
 fn host_first_late_owner_keeps_original_deadline_and_expired_offer_is_not_dispatched() {
     let relay = Relay::start();
-    let b = WinComputer::new(&relay);
-    b.register();
-    b.ring.quit();
-    b.manager.shutdown();
-    // Delayed: the owner appears 1.5 s into a 4 s budget.
+    let home = TestHome::new();
+    let daemon = Arc::new(
+        LocalDaemon::new(LocalDaemonConfig {
+            bin: win::bin().into(),
+            env: home.daemon_env(),
+            home: home.home(),
+            socket: home.pipe.clone(),
+            version: "1.5.0".into(),
+            build: None,
+        })
+        .unwrap(),
+    );
+    let desktop = home.root().join("desktop");
+    {
+        // Register, then the Desktop backend goes away entirely (its broker with it).
+        let (ring, manager) = open_backend(&desktop, &relay);
+        assert!(ring
+            .reserve_local_companion(&home.home().canonicalize().unwrap())
+            .unwrap());
+        daemon.ensure_spawned().unwrap();
+        ring.register_local_companion(&daemon).unwrap().unwrap();
+        ring.quit();
+        manager.shutdown();
+    }
+    let pair = |ttl_ms: u64| {
+        let mut command = Command::new(win::bin());
+        command
+            .arg("pair")
+            .args(["--relay", &relay.url()])
+            .env("XSHELLD_HOME", home.home())
+            .env("XSHELLD_SOCKET", &home.pipe)
+            .env("XSHELLD_PAIR_TTL_MS", ttl_ms.to_string());
+        PairChild::spawn(command)
+    };
+    // Delayed: the owner appears 1.5 s into a 6 s budget.
     let started = Instant::now();
-    let mut child = b.pair(&relay.url(), 4_000);
+    let mut child = pair(6_000);
     let first = child.lines.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(first.starts_with("Computer pairing pending."), "{first}");
     std::thread::sleep(Duration::from_millis(1_500));
-    let (ring, _manager) = open_backend(&b.desktop, &relay);
+    assert!(
+        child.child.try_wait().unwrap().is_none(),
+        "CLI waits for an owner"
+    );
+    let (ring, manager) = open_backend(&desktop, &relay);
     let code = child.code();
     let join = controller(&ring);
     assert!(join.code.format() == code.format());
-    assert!(join.expires_at <= unix_now() + 3);
+    assert!(join.expires_at <= unix_now() + 5);
     assert_eq!(child.finish(), 5, "stderr:\n{}", child.stderr());
-    assert!(started.elapsed() < Duration::from_secs(6));
+    assert!(started.elapsed() < Duration::from_secs(8));
     ring.quit();
+    manager.shutdown();
+    drop(ring);
     // Expired: the owner appears only after a 1.5 s budget ended.
-    let mut child = b.pair(&relay.url(), 1_500);
+    let mut child = pair(1_500);
     std::thread::sleep(Duration::from_millis(2_000));
-    let (ring, _manager) = open_backend(&b.desktop, &relay);
+    let (ring, manager) = open_backend(&desktop, &relay);
     assert_eq!(child.finish(), 5, "stderr:\n{}", child.stderr());
     std::thread::sleep(Duration::from_millis(300));
     assert!(ring.administration_joins().is_empty());
     assert_eq!(child.words_printed(), 0);
     ring.quit();
+    manager.shutdown();
+    daemon.terminate(Duration::from_secs(10));
 }
 
 #[test]

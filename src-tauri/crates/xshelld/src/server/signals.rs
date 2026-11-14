@@ -86,7 +86,11 @@ pub fn watch_pair_signals(cancel: Arc<std::sync::atomic::AtomicBool>) -> io::Res
     if unsafe { GetConsoleCP() } == 0 {
         return Ok(());
     }
-    if unsafe { SetConsoleCtrlHandler(Some(pair_win::on_ctrl), 1) } == 0 {
+    // A launcher may have started us with Ctrl+C ignored (an inherited process attribute,
+    // as SSH and service hosts do); this interactive command must still honour it.
+    if unsafe { SetConsoleCtrlHandler(None, 0) } == 0
+        || unsafe { SetConsoleCtrlHandler(Some(pair_win::on_ctrl), 1) } == 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
