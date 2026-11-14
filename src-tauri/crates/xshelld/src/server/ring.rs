@@ -244,15 +244,23 @@ fn write_private_inner(
     r
 }
 
-/// This Host's name for the Roster: its hostname, cleaned up.
-#[cfg(windows)]
+/// This Host's name for the Roster: `XSHELL_MACHINE_NAME` when set (several test
+/// machines on one host), else its hostname, cleaned up.
 pub(crate) fn host_name() -> String {
+    match std::env::var("XSHELL_MACHINE_NAME") {
+        Ok(name) if !name.trim().is_empty() => member_name(name.trim(), FALLBACK_NAME),
+        _ => system_host_name(),
+    }
+}
+
+#[cfg(windows)]
+fn system_host_name() -> String {
     let raw = std::env::var("COMPUTERNAME").unwrap_or_default();
     member_name(&raw, FALLBACK_NAME)
 }
 
 #[cfg(unix)]
-pub(crate) fn host_name() -> String {
+fn system_host_name() -> String {
     let mut buf = [0u8; 256];
     let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     let raw = if r == 0 {
@@ -825,6 +833,7 @@ impl Persist {
 struct Events {
     persist: Arc<Persist>,
     sessions: Sessions,
+    removal_signal: Arc<AtomicBool>,
     /// The Connector these events are of (set once it exists).
     connector: Arc<std::sync::OnceLock<std::sync::Weak<Connector>>>,
 }
@@ -863,6 +872,11 @@ impl ConnectorEvents for Events {
     fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
         self.sessions.error(code, to);
     }
+
+    fn removed(&self) {
+        crate::log!("INFO", "ring: the relay says this Host was removed; checking the signed history");
+        self.removal_signal.store(true, Ordering::Release);
+    }
 }
 
 /// The Connector's lifecycle, under one lock: whether the Daemon is exiting, the installed
@@ -874,6 +888,13 @@ struct Life {
     joined: Option<Joined>,
     /// Connectors of a Ring this Host left for another, still saying goodbye.
     retiring: Vec<JoinHandle<()>>,
+}
+
+/// Why [`Ring::set_aside`] sets the membership aside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Aside {
+    V1,
+    Removed,
 }
 
 pub(super) enum JoinOrigin {
@@ -902,6 +923,8 @@ pub(crate) struct Ring {
     name: String,
     backoff_unit: Duration,
     timeouts: RingTimeouts,
+    /// Set by the Connector's `removed` report; taken by the maintenance loop.
+    removal_signal: Arc<AtomicBool>,
     /// Test hook: runs in `join` between the `stopped` check and the install.
     #[cfg(test)]
     install_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -944,6 +967,7 @@ impl Ring {
             name: host_name(),
             backoff_unit,
             timeouts,
+            removal_signal: Arc::default(),
             #[cfg(test)]
             install_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1074,21 +1098,29 @@ impl Ring {
         change(store)
     }
 
-    /// Local-only Leave after this Computer was removed by another device, under the
-    /// lifecycle, runtime-chain and ring.lock order. `check` validates the registration
-    /// and returns the registered Desktop key. A durable, cached or Connector chain that
-    /// still authorizes this Daemon (it missed the removal while offline) is accepted only
-    /// with `evidence`: a verified extension of that same chain whose head authorizes
-    /// neither identity and retires this Computer's unit. The settled removal is written,
-    /// `retire` durably retires the last installation authority, then `roster.json` is
-    /// renamed aside (`roster.json.left-<ms>`), the cached chain dropped and the Connector
-    /// retired. Nothing retained: only `retire` runs.
+    /// Sets this Daemon's membership aside, under the lifecycle, runtime-chain and
+    /// ring.lock order. `check` validates the registration and refuses while a counterpart
+    /// or standalone operation is open (the caller defers and retries).
+    ///
+    /// [`Aside::Removed`]: a durable, cached or Connector chain that still authorizes this
+    /// Daemon (it missed the removal while offline) is accepted only with `evidence`: a
+    /// verified extension of that same chain whose head authorizes no key of this Daemon's
+    /// unit and retires the unit. The settled removal is written, `retire` durably retires
+    /// the last installation authority, then `roster.json` is renamed aside
+    /// (`roster.json.removed-<ms>`). [`Aside::V1`]: a format-1 chain is renamed
+    /// `roster.json.v1-<ms>` without evidence.
+    ///
+    /// Either way the identity rotates (one rule for every set-aside): `keys.json` and the
+    /// registration `companion.json` are renamed aside too, so the next Descriptor makes new
+    /// keys and the Desktop registers again. The cached chain is dropped and the Connector
+    /// retired. Terminals keep running.
     #[cfg(any(unix, windows))]
-    pub(super) fn leave_removed(
+    pub(super) fn set_aside(
         &self,
         budget: &xshell_core::local_ipc::RequestBudget,
+        reason: Aside,
         evidence: Option<&RosterChain>,
-        check: impl FnOnce(&Store, &DeviceKeys) -> Result<SignKey, String>,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
         retire: impl FnOnce(&Store) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut life = budget.lock(&self.life).map_err(|e| e.to_string())?;
@@ -1109,37 +1141,61 @@ impl Ring {
         let store = &self.persist.store;
         let _lock = store.lock_until(budget)?;
         let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
-        let desktop = check(store, &keys)?;
-        let durable = super::companion::trusted(store)?;
+        check(store, &keys)?;
+        let durable = match reason {
+            Aside::V1 => store.read_chain().ok().flatten(),
+            Aside::Removed => super::companion::trusted(store)?,
+        };
         // Every retained view that still authorizes this Daemon must be superseded by the
         // evidence; the merged removal is what is settled.
         let mut settled: Option<RosterChain> = None;
-        for chain in [durable.as_ref(), cached.as_ref(), owner.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter(|chain| is_daemon_member(chain, &keys))
-        {
-            let evidence =
-                evidence.ok_or("not_removed: this Host is still a member of its Ring")?;
-            let merged = removal_extension(chain, evidence, &keys.sign_key(), &desktop)?;
-            if settled
-                .as_ref()
-                .is_none_or(|s| merged.head().version() > s.head().version())
+        if reason == Aside::Removed {
+            for chain in [durable.as_ref(), cached.as_ref(), owner.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|chain| is_daemon_member(chain, &keys))
             {
-                settled = Some(merged);
+                let evidence =
+                    evidence.ok_or("not_removed: this Host is still a member of its Ring")?;
+                let merged = removal_extension(chain, evidence, &keys.sign_key())?;
+                if settled
+                    .as_ref()
+                    .is_none_or(|s| merged.head().version() > s.head().version())
+                {
+                    settled = Some(merged);
+                }
             }
+        } else if durable.as_ref().is_none_or(|c| c.head().roster().v != 1) {
+            return Err("no format-1 membership to set aside".into());
         }
         budget.check().map_err(|e| e.to_string())?;
         retire(store)?;
         if let (Some(settled), Some(_)) = (&settled, &durable) {
-            // The left file keeps the verified removal, not the stale membership.
+            // The aside file keeps the verified removal, not the stale membership.
             store.write_chain(settled)?;
         }
-        if durable.is_some() {
-            let aside = store
-                .dir
-                .join(format!("roster.json.left-{}", super::registry::now_ms()));
-            fs::rename(store.roster_path(), &aside).map_err(|e| e.to_string())?;
+        let suffix = match reason {
+            Aside::V1 => "v1",
+            Aside::Removed => "removed",
+        };
+        let stamp = super::registry::now_ms();
+        let mut renamed = false;
+        for (name, present) in [
+            ("roster.json", durable.is_some()),
+            ("keys.json", true),
+            ("companion.json", true),
+            // A finished standalone obligation belongs to the membership set aside.
+            ("standalone-adoption.json", true),
+        ] {
+            let from = store.dir.join(name);
+            if !present || fs::symlink_metadata(&from).is_err() {
+                continue;
+            }
+            fs::rename(&from, store.dir.join(format!("{name}.{suffix}-{stamp}")))
+                .map_err(|e| e.to_string())?;
+            renamed = true;
+        }
+        if renamed {
             #[cfg(unix)]
             fs::File::open(&store.dir)
                 .and_then(|f| f.sync_all())
@@ -1153,6 +1209,7 @@ impl Ring {
         {
             *self.persist.left.lock().unwrap_or_else(|e| e.into_inner()) = Some(ring);
         }
+        *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *cached = None;
         self.persist.adopt();
         let retired = life.joined.take();
@@ -1162,7 +1219,55 @@ impl Ring {
             old.sessions.stop();
             old.connector.stop(ByeReason::quit());
         }
+        crate::log!("INFO", "ring: membership set aside ({suffix}); this Host is in no Ring");
         Ok(())
+    }
+
+    /// The Connector stopped on the Relay's word that this Host was removed: the removal
+    /// check runs from the maintenance loop.
+    pub(super) fn take_removal_signal(&self) -> bool {
+        self.removal_signal.swap(false, Ordering::AcqRel)
+    }
+
+    /// Ask the Relay, as a (possibly former) member, for the signed history. Removed: the
+    /// membership is set aside (deferred with an `Err("busy: …")` while a counterpart or
+    /// standalone operation is open). Still a member: the newer chain is kept and the
+    /// Connector kicked, even when the head is unchanged. The Relay's word alone never
+    /// sets anything aside.
+    #[cfg(any(unix, windows))]
+    pub(super) fn check_removal(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
+        retire: impl FnOnce(&Store) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let Some(chain) = self.trusted_chain() else {
+            return Ok(false);
+        };
+        let Some(keys) = self.keys(false)? else {
+            return Ok(false);
+        };
+        let signer: Arc<dyn xshell_protocol::ring::Signer> = keys.clone();
+        match xshell_protocol::ring::relay::check_removal(&chain, signer, None, self.timeouts.connect)
+            .map_err(|e| e.to_string())?
+        {
+            xshell_protocol::ring::relay::RemovalCheck::Removed(evidence) => {
+                self.set_aside(budget, Aside::Removed, Some(&evidence), check, retire)?;
+                Ok(true)
+            }
+            xshell_protocol::ring::relay::RemovalCheck::Member(newer) => {
+                let joined = self
+                    .lock_life()
+                    .joined
+                    .as_ref()
+                    .map(|j| (j.connector.clone(), j.sessions.clone()));
+                if let Some((connector, sessions)) = joined {
+                    self.persist.keep_newer(&newer, Some(&connector), &sessions);
+                    connector.kick();
+                }
+                Ok(false)
+            }
+        }
     }
 
     pub fn trusted_chain(&self) -> Option<RosterChain> {
@@ -1205,6 +1310,42 @@ impl Ring {
             self.persist.adopt()
         };
         self.persist.head_changed(epoch, &chain);
+        // Format 1 (D2a) and a stored chain that no longer authorizes this Host are set
+        // aside at start; a busy counterpart or standalone operation defers the removal to
+        // the maintenance loop.
+        #[cfg(any(unix, windows))]
+        {
+            let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_secs(10),
+                Arc::new(AtomicBool::new(false)),
+            );
+            if chain.head().roster().v == 1 {
+                match self.set_aside(
+                    &budget,
+                    Aside::V1,
+                    None,
+                    |_, _| Ok(()),
+                    super::companion::retire_for_format_reset,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => crate::log!("ERROR", "ring: cannot set the format-1 Ring aside: {e}"),
+                }
+                return;
+            }
+            if !is_daemon_member(&chain, &keys) {
+                if let Err(e) = self.set_aside(
+                    &budget,
+                    Aside::Removed,
+                    None,
+                    super::companion::idle_for_set_aside,
+                    super::companion::retire_for_set_aside,
+                ) {
+                    crate::log!("INFO", "ring: removed membership not set aside yet: {e}");
+                    self.removal_signal.store(true, Ordering::Release);
+                }
+                return;
+            }
+        }
         if !is_daemon_member(&chain, &keys) {
             crate::log!("INFO", "ring: this Host is not in the stored Roster");
             return;
@@ -1267,6 +1408,7 @@ impl Ring {
             Arc::new(Events {
                 persist: self.persist.clone(),
                 sessions: sessions.clone(),
+                removal_signal: self.removal_signal.clone(),
                 connector: slot.clone(),
             }),
         )
@@ -1611,7 +1753,6 @@ fn removal_extension(
     retained: &RosterChain,
     evidence: &RosterChain,
     daemon: &SignKey,
-    desktop: &SignKey,
 ) -> Result<RosterChain, String> {
     if evidence.ring_id() != retained.ring_id() {
         return Err("removal evidence is for another Ring".into());
@@ -1619,9 +1760,18 @@ fn removal_extension(
     let (merged, _) = retained
         .extended(evidence.versions())
         .map_err(|e| format!("removal evidence does not extend retained membership: {e}"))?;
+    // Every key of the unit that held this Daemon (a standalone Daemon, or a Computer's
+    // Desktop and Daemon) must be gone.
+    let unit_keys = retained
+        .head()
+        .roster()
+        .membership()
+        .ok()
+        .and_then(|m| m.unit_for(daemon).map(|u| u.members.clone()))
+        .unwrap_or_else(|| vec![*daemon]);
     if merged.head().version() <= retained.head().version()
         || merged.authorized_member(daemon).is_some()
-        || merged.authorized_member(desktop).is_some()
+        || unit_keys.iter().any(|k| merged.authorized_member(k).is_some())
     {
         return Err("removal evidence does not remove this Computer".into());
     }
@@ -2259,4 +2409,141 @@ mod tests {
         let n = host_name();
         assert!(!n.is_empty() && n.len() <= 64);
     }
+}
+
+/// The Daemon's background membership upkeep: the removal check after the Connector
+/// reported a refusal or close as removed (retried with backoff from 5 s to 5 min, and
+/// deferred while a counterpart or standalone operation is open), and, on Unix, the
+/// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
+/// installed when enrolled, ended when not a member once its code expired.
+#[cfg(any(unix, windows))]
+pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
+    let weak = Arc::downgrade(d);
+    let _ = std::thread::Builder::new()
+        .name("ring-maintenance".into())
+        .spawn(move || {
+            let mut removal_at: Option<Instant> = None;
+            let mut removal_delay = Duration::from_secs(5);
+            #[cfg(unix)]
+            let mut standalone_at = Instant::now();
+            #[cfg(unix)]
+            let mut standalone_delay = Duration::from_secs(1);
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let Some(d) = weak.upgrade() else { return };
+                if d.exiting.load(Ordering::Acquire) || d.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = Instant::now();
+                if d.ring.take_removal_signal() && removal_at.is_none() {
+                    removal_at = Some(now);
+                }
+                if removal_at.is_some_and(|at| now >= at) {
+                    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                        now + Duration::from_secs(30),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    match d.ring.check_removal(
+                        &budget,
+                        super::companion::idle_for_set_aside,
+                        super::companion::retire_for_set_aside,
+                    ) {
+                        Ok(_) => {
+                            removal_at = None;
+                            removal_delay = Duration::from_secs(5);
+                        }
+                        Err(e) => {
+                            crate::log!("INFO", "ring: removal check: {e}; retrying in {removal_delay:?}");
+                            removal_at = Some(now + removal_delay);
+                            removal_delay = (removal_delay * 2).min(Duration::from_secs(300));
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                if now >= standalone_at {
+                    let handle = super::ServerHandle {
+                        socket: d.cfg.paths.socket.clone(),
+                        d: d.clone(),
+                    };
+                    match maintain_standalone(&handle) {
+                        Ok(true) => {
+                            standalone_delay = Duration::from_secs(1);
+                            standalone_at = now + Duration::from_secs(60);
+                        }
+                        Ok(false) | Err(_) => {
+                            standalone_at = now + standalone_delay;
+                            standalone_delay = (standalone_delay * 2).min(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
+#[cfg(unix)]
+fn maintain_standalone(handle: &super::ServerHandle) -> Result<bool, String> {
+    use super::adoption::StandaloneRecoveryState as S;
+    let Some(status) = handle.standalone_adoption_status()? else {
+        return Ok(true);
+    };
+    let expired = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            >= status.expires_at
+    };
+    match status.state {
+        S::Installed => Ok(true),
+        S::Terminal => {
+            abandon_standalone(handle, &status.operation)?;
+            Ok(true)
+        }
+        S::ReconciliationRequired | S::AcceptedInstalling => {
+            match handle.reconcile_standalone_adoption() {
+                Ok(s) if s.state == S::Installed => Ok(true),
+                Ok(s) if s.state == S::Terminal => {
+                    abandon_standalone(handle, &s.operation)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(e)
+                    if expired()
+                        && ["not_member", "bad_signature", "removed", "no_roster"]
+                            .iter()
+                            .any(|c| e.contains(c)) =>
+                {
+                    abandon_standalone(handle, &status.operation)?;
+                    Ok(true)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// The standalone obligation never enrolled (or was removed): its journal is renamed
+/// aside so a new pair command or registration can start.
+#[cfg(unix)]
+fn abandon_standalone(handle: &super::ServerHandle, operation: &str) -> Result<(), String> {
+    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+        Instant::now() + Duration::from_secs(5),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _lock = store.lock_until(&budget)?;
+    let path = store.dir.join("standalone-adoption.json");
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(());
+    }
+    fs::rename(
+        &path,
+        store
+            .dir
+            .join(format!("standalone-adoption.json.abandoned-{}", super::registry::now_ms())),
+    )
+    .map_err(|e| e.to_string())?;
+    crate::log!("INFO", "ring: standalone pairing {operation} ended without membership");
+    Ok(())
 }
