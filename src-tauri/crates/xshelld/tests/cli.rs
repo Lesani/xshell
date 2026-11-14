@@ -220,10 +220,10 @@ fn connect_reaps_a_losing_serve() {
     let _ = connect.wait();
 }
 
-/// After a GUI-bound Daemon ran here, `connect` starts none: a missing Daemon means xshell
-/// is closed on this machine.
+/// ADR-0017: a `gui-bound` mode marker with nothing listening is stale (its Desktop is
+/// gone); `connect` starts the always-on Daemon anyway.
 #[test]
-fn connect_never_starts_gui_bound_daemon() {
+fn connect_starts_daemon_despite_stale_gui_bound_marker() {
     let h = TestHome::new();
     let mut parent = GuiParent::start(&h, &[]);
     let mut c = Client::connect(&h.paths().socket);
@@ -232,21 +232,25 @@ fn connect_never_starts_gui_bound_daemon() {
     let daemon = parent.daemon_pid();
     parent.kill();
     assert!(wait_dead(daemon, Duration::from_secs(3)));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
     let serving = log_lines(&h, "serving");
 
-    let out = bin_cmd(&h)
-        .arg("connect")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(xshell_protocol::NOT_RUNNING_EXIT));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("xshell is not running"), "{err}");
-    assert!(!err.contains("No such file") && !err.contains("Connection refused"));
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(!h.paths().socket.exists());
-    assert!(!h.paths().pid.exists());
-    assert_eq!(log_lines(&h, "serving"), serving, "a Daemon was started");
+    let _guard = DaemonGuard::new(&h);
+    let mut p = ConnectProc::start(&h);
+    p.client.hello(range(1, 1));
+    assert!(p.finish().success());
+    assert_eq!(
+        log_lines(&h, "serving"),
+        serving + 1,
+        "connect started exactly one Daemon"
+    );
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "persistent"
+    );
 }
 
 #[test]

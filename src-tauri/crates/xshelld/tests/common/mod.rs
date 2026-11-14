@@ -1142,8 +1142,14 @@ pub struct ConnectProc {
 
 impl ConnectProc {
     pub fn start(h: &TestHome) -> ConnectProc {
-        let mut child = bin_cmd(h)
-            .arg("connect")
+        let mut c = bin_cmd(h);
+        c.arg("connect");
+        Self::spawn(c)
+    }
+
+    /// `cmd` (an `xshelld connect` command line) with a protocol client over its stdio.
+    pub fn spawn(mut cmd: Command) -> ConnectProc {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

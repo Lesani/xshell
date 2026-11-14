@@ -586,11 +586,16 @@ impl Daemon {
     }
 
     pub fn supervise(self: Arc<Self>) {
-        // A GUI-bound Daemon lives exactly as long as the app.
-        if self.cfg.gui_bound.is_some() {
+        // A GUI-bound Daemon lives exactly as long as the app; any other is always on
+        // (ADR-0017) unless a test set an idle timeout.
+        let Some(idle_timeout) = self
+            .cfg
+            .idle_timeout
+            .filter(|_| self.cfg.gui_bound.is_none())
+        else {
             return;
-        }
-        let tick = (self.cfg.idle_timeout / 4).min(Duration::from_secs(1));
+        };
+        let tick = (idle_timeout / 4).min(Duration::from_secs(1));
         loop {
             std::thread::sleep(tick);
             if self.exiting.load(Ordering::SeqCst) {
@@ -598,11 +603,10 @@ impl Daemon {
             }
             let idle = {
                 let reg = self.reg.lock().unwrap();
-                reg.idle_since
-                    .is_some_and(|t| t.elapsed() >= self.cfg.idle_timeout)
+                reg.idle_since.is_some_and(|t| t.elapsed() >= idle_timeout)
             };
             if idle {
-                crate::log!("INFO", "idle for {:?}; exiting", self.cfg.idle_timeout);
+                crate::log!("INFO", "idle for {idle_timeout:?}; exiting");
                 self.exit(ExitReason::Idle);
                 return;
             }
@@ -709,6 +713,8 @@ impl Daemon {
         xshell_core::transfer::abort_all();
         let _ = transport::remove_endpoint(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
+        #[cfg(unix)]
+        crate::paths::remove_endpoint_of(&self.cfg.paths.endpoint, std::process::id());
         if let Some(h) = bye {
             let _ = h.join();
         }

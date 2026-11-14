@@ -75,8 +75,9 @@ pub(crate) type ConnId = u64;
 pub struct Config {
     pub home: PathBuf,
     pub paths: Paths,
-    /// Exit after this long with no Terminals and no connections.
-    pub idle_timeout: Duration,
+    /// Exit after this long with no Terminals and no connections. `None` (the default): never;
+    /// the Daemon is always on (ADR-0017). Only `--idle-timeout-ms` (tests) sets it.
+    pub idle_timeout: Option<Duration>,
     /// SIGHUP → SIGKILL delay when ending a Terminal.
     pub kill_grace: Duration,
     /// How long a refused `term.open` (its Terminal could not be saved) waits for the
@@ -554,7 +555,7 @@ impl Config {
         Self {
             home,
             paths,
-            idle_timeout: Duration::from_secs(3600),
+            idle_timeout: None,
             kill_grace: Duration::from_secs(2),
             refused_open_wait: None,
             write_stall_timeout: Duration::from_secs(60),
@@ -703,6 +704,7 @@ impl Server {
             ownership: Some(ownership),
             pid: false,
             socket: false,
+            endpoint: false,
         };
         // Holding the lock, record how this Daemon runs: `connect` starts none while xshell
         // owns it, and a Persistent `serve` hands it back.
@@ -731,6 +733,18 @@ impl Server {
         transport::remove_endpoint(&paths.socket)?;
         let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
+        // Every client of this home finds this socket, whatever its XDG_RUNTIME_DIR (A2).
+        #[cfg(unix)]
+        {
+            crate::paths::write_endpoint(&paths.endpoint, std::process::id(), &paths.socket)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("cannot write {}: {e}", paths.endpoint.display()),
+                    )
+                })?;
+            starting.endpoint = true;
+        }
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
         xshell_core::files::sweep_dropped_files(&ctx, cfg.drop_max_age, SystemTime::now());
@@ -868,6 +882,9 @@ struct Starting<'a> {
     ownership: Option<ring::ownership::StoreOwnershipLease>,
     pid: bool,
     socket: bool,
+    /// The endpoint record was written (Unix).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    endpoint: bool,
 }
 
 impl Drop for Starting<'_> {
@@ -875,6 +892,10 @@ impl Drop for Starting<'_> {
         let Some(lock) = self.lock.take() else {
             return;
         };
+        #[cfg(unix)]
+        if self.endpoint {
+            crate::paths::remove_endpoint_of(&self.paths.endpoint, std::process::id());
+        }
         if self.socket {
             let _ = transport::remove_endpoint(&self.paths.socket);
         }
@@ -1052,5 +1073,18 @@ fn hold_loser_for_tests() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !std::path::Path::new(&p).exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0017: a Daemon is always on; only a test's `--idle-timeout-ms` lets it go idle.
+    #[test]
+    fn default_config_has_no_idle_exit() {
+        let paths = crate::paths::resolve(Path::new("/h"), None, None);
+        let cfg = Config::new(PathBuf::from("/h"), paths);
+        assert_eq!(cfg.idle_timeout, None);
     }
 }

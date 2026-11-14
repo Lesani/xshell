@@ -35,6 +35,10 @@ pub struct Paths {
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
     /// `$XDG_RUNTIME_DIR/xshell/tmp`, else `home/.xshell/tmp`.
     pub tmp: PathBuf,
+    /// `home/.xshell/run/daemon.endpoint`: the pid and socket of the `serve` that holds the
+    /// lock, written once it holds it (Unix). Always under the home, whatever
+    /// `XDG_RUNTIME_DIR` says, so every client finds the one Daemon of this home.
+    pub endpoint: PathBuf,
 }
 
 /// The paths of this platform. Environment values are passed in; on Windows
@@ -101,7 +105,90 @@ fn with_home(home: &Path, socket: PathBuf, lock_dir: &Path, tmp: PathBuf) -> Pat
         server_root: xshell_core::server::server_root(home),
         ring_dir: home.join(".xshell").join("daemon").join("ring"),
         tmp,
+        endpoint: endpoint_path(home),
     }
+}
+
+/// `home/.xshell/run/daemon.endpoint` (see [`Paths::endpoint`]).
+pub fn endpoint_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_endpoint_path(home)
+}
+
+/// Record the socket this Daemon (pid `pid`) listens on: `<pid>\n<socket>\n`, written to a
+/// private temp file and renamed over `path`, in a private directory.
+#[cfg(unix)]
+pub fn write_endpoint(path: &Path, pid: u32, socket: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = private_file(
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&tmp)?;
+        let mut body = format!("{pid}\n").into_bytes();
+        body.extend_from_slice(socket.as_os_str().as_bytes());
+        body.push(b'\n');
+        f.write_all(&body)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// The pid and socket an endpoint record names; `None` when missing or malformed.
+#[cfg(unix)]
+pub fn read_endpoint(path: &Path) -> Option<(u32, PathBuf)> {
+    xshell_hostlink::local::read_local_endpoint(path)
+}
+
+/// Remove the endpoint record if it still names `pid` (a clean exit).
+#[cfg(unix)]
+pub fn remove_endpoint_of(path: &Path, pid: u32) {
+    if read_endpoint(path).is_some_and(|(p, _)| p == pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Whether `pid` is a live `xshelld` process (Linux: its `comm`; elsewhere: it exists).
+#[cfg(unix)]
+pub fn pid_is_xshelld(pid: u32) -> bool {
+    xshell_hostlink::local::pid_is_xshelld(pid)
+}
+
+/// The socket of the Daemon that serves this home (A2): the one its endpoint record names
+/// while that Daemon lives, else `fallback` (the socket the environment derives). Callers
+/// with an explicit `--socket` / `XSHELLD_SOCKET` skip this.
+#[cfg(unix)]
+pub fn live_socket(home: &Path, fallback: &Path) -> PathBuf {
+    xshell_hostlink::local::local_live_socket(home, fallback)
+}
+
+/// [`live_socket`] given the endpoint record's path.
+#[cfg(unix)]
+pub fn live_socket_at(endpoint: &Path, fallback: &Path) -> PathBuf {
+    xshell_hostlink::local::local_live_socket_at(endpoint, fallback)
+}
+
+/// Whether a Daemon of this home is alive: its endpoint record names a live `xshelld`, or
+/// the environment's socket answers (a Daemon of an older build writes no record).
+#[cfg(unix)]
+pub fn daemon_alive(home: &Path, env_socket: &Path) -> bool {
+    if read_endpoint(&endpoint_path(home)).is_some_and(|(pid, _)| pid_is_xshelld(pid)) {
+        return true;
+    }
+    std::os::unix::net::UnixStream::connect(env_socket).is_ok()
 }
 
 /// How the Daemon on this machine is run: by the xshell app (GUI-bound, ADR-0005) or on its
@@ -246,6 +333,44 @@ mod tests {
         assert_eq!(p.lock, PathBuf::from("/r/xshell/daemon.lock"));
         assert_eq!(p.pid, PathBuf::from("/r/xshell/daemon.pid"));
         assert_eq!(p.tmp, PathBuf::from("/r/xshell/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_record_round_trip_and_liveness() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let p = resolve_unix(home, Some(Path::new("/r")), None);
+        assert_eq!(p.endpoint, home.join(".xshell/run/daemon.endpoint"));
+        // Whatever XDG says, the record is under the home.
+        assert_eq!(resolve_unix(home, None, None).endpoint, p.endpoint);
+        let fallback = Path::new("/env/daemon.sock");
+        assert_eq!(live_socket(home, fallback), fallback);
+        // A record naming this (non-xshelld test) process: not an xshelld, ignored on Linux.
+        write_endpoint(&p.endpoint, std::process::id(), Path::new("/x/daemon.sock")).unwrap();
+        assert_eq!(
+            read_endpoint(&p.endpoint),
+            Some((std::process::id(), PathBuf::from("/x/daemon.sock")))
+        );
+        let mode = fs::metadata(&p.endpoint).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        if cfg!(target_os = "linux") {
+            assert_eq!(live_socket(home, fallback), fallback);
+        }
+        // A dead pid: ignored.
+        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
+        assert_eq!(live_socket(home, fallback), fallback);
+        assert!(!daemon_alive(home, fallback));
+        // Removed only by its own pid.
+        remove_endpoint_of(&p.endpoint, 42);
+        assert!(p.endpoint.exists());
+        remove_endpoint_of(&p.endpoint, 999_999_999);
+        assert!(!p.endpoint.exists());
+        // Malformed records are ignored.
+        fs::write(&p.endpoint, "abc\n/x\n").unwrap();
+        assert_eq!(read_endpoint(&p.endpoint), None);
+        fs::write(&p.endpoint, "1234\nrelative\n").unwrap();
+        assert_eq!(read_endpoint(&p.endpoint), None);
     }
 
     #[cfg(unix)]

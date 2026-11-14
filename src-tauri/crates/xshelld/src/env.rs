@@ -79,6 +79,8 @@ fn login_path(interactive: bool, cancelled: &dyn Fn() -> bool) -> Result<String,
     if interactive {
         cmd.arg("-i");
     }
+    // The profile's xshell block must not start another Daemon from here (A3).
+    cmd.env("XSHELL_SERVICE_GUARD", "1");
     cmd.arg("-c")
         .arg(format!("printf '\\n{MARKER}%s\\n' \"$PATH\""))
         .stdin(Stdio::null())

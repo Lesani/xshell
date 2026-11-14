@@ -504,7 +504,7 @@ fn idle_exit_says_bye_idle() {
     let h = TestHome::new();
     let srv = start(&h, |c| {
         fast(c);
-        c.idle_timeout = Duration::from_millis(300);
+        c.idle_timeout = Some(Duration::from_millis(300));
     });
     let mut c = desktop(&srv);
     let id = identity(&mut c);

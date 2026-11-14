@@ -15,6 +15,8 @@ pub mod maintenance;
 pub mod pair;
 pub mod paths;
 pub mod server;
+#[cfg(unix)]
+pub mod service;
 pub mod stage;
 
 use cli::Command;
@@ -31,6 +33,13 @@ pub fn main_entry() -> i32 {
     };
     let (opts, serve) = match cmd {
         Command::Maintenance(opts) => return maintenance::run(opts),
+        #[cfg(unix)]
+        Command::Service { action, opts } => return service::main(action, &opts),
+        #[cfg(not(unix))]
+        Command::Service { .. } => {
+            eprintln!("xshelld: service is Linux and macOS only");
+            return 1;
+        }
         Command::StageBuild {
             dir,
             sha256,
@@ -105,7 +114,10 @@ pub fn main_entry() -> i32 {
                 return 1;
             };
             let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-            let paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            let mut paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            if o.socket.is_none() {
+                paths.socket = paths::live_socket(&home, &paths.socket);
+            }
             return pair::run_pair(&o, &paths);
         }
     };
@@ -132,6 +144,10 @@ pub fn main_entry() -> i32 {
     let paths = paths::resolve(&home, xdg.as_deref(), opts.socket.as_deref());
     if !serve {
         return connect::run_connect(&opts, &paths);
+    }
+    #[cfg(unix)]
+    if let Some(m) = std::env::var_os(service::SERVICE_ENV) {
+        crate::log!("INFO", "started by the {} service", m.to_string_lossy());
     }
     let gui_bound = opts
         .parent_pid
@@ -165,14 +181,16 @@ pub fn main_entry() -> i32 {
     env::prepare(gui_bound.is_some() || opts.interactive_env, &|| {
         stop.is_set()
     });
+    // The login shells above ran with the guard; Terminals start without it, so a shell the
+    // user opens later behaves as any other login (it finds this Daemon alive).
+    #[cfg(unix)]
+    std::env::remove_var(service::GUARD_ENV);
     if stop.is_set() {
         crate::log!("INFO", "stopped while starting; exiting");
         return 0;
     }
     let mut cfg = server::Config::new(home, paths);
-    if let Some(t) = opts.idle_timeout {
-        cfg.idle_timeout = t;
-    }
+    cfg.idle_timeout = opts.idle_timeout;
     cfg.gui_bound = gui_bound;
     cfg.supports_selected_restart = cfg!(windows) && opts.supports_selected_restart;
     cfg.test_hook = test_hook();

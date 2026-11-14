@@ -780,31 +780,24 @@ fn gui_bound_terminate_ends_terminals() {
     assert!(!home.paths().socket.exists());
 }
 
-/// AC3: a remote Desktop reaching a machine whose xshell is closed is told so, and nothing
-/// is started there.
+/// A remote Desktop reaching a machine whose xshell window is closed starts its Daemon.
 #[test]
-fn remote_desktop_sees_xshell_not_running_hint() {
+fn remote_desktop_starts_daemon_after_gui_bound_quit() {
+    // ADR-0017: once the GUI-bound Daemon's Desktop is gone, its stale marker no longer
+    // keeps `xshelld connect` from starting the always-on Daemon.
     let home = common::TestHome::new();
     let a = LocalDesk::new(&home);
     a.wait_usable();
     a.quit();
+    let _guard = common::DaemonGuard::new(&home);
     let remote = Fx::desk(&home, |_| {});
-    let s = remote.rec.wait_status("failed", |s| s.error_hint.is_some());
+    let s = remote.rec.wait_status("usable", |s| s.usable());
+    assert_eq!(s.error_hint, None, "{s:#?}");
     assert_eq!(
-        s.error_hint,
-        Some(xshell_hostlink::HostErrorHint::XshellNotRunning),
-        "{s:#?}"
-    );
-    assert!(
-        s.last_error
-            .as_deref()
-            .unwrap_or("")
-            .contains("xshell is not running"),
-        "{s:#?}"
+        std::fs::read_to_string(home.paths().mode).unwrap().trim(),
+        "persistent"
     );
     remote.m.shutdown();
-    assert!(!home.paths().socket.exists());
-    assert!(!home.paths().pid.exists());
 }
 
 #[test]

@@ -672,6 +672,17 @@ pub fn install_local(
     home: &std::path::Path,
     dir_name: &str,
 ) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(src)?;
+    install_local_bytes(&bytes, home, dir_name)
+}
+
+/// [`install_local`] from bytes in memory (the Desktop's embedded `xshelld`).
+#[cfg(unix)]
+pub fn install_local_bytes(
+    bytes: &[u8],
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     if !valid_version(dir_name) {
@@ -710,7 +721,6 @@ pub fn install_local(
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    let bytes = std::fs::read(src)?;
     if let Ok(m) = std::fs::symlink_metadata(&dest) {
         let same = m.file_type().is_file()
             && m.uid() == uid
@@ -737,7 +747,7 @@ pub fn install_local(
             .create_new(true)
             .mode(0o700)
             .open(&tmp)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         // The umask may have narrowed it.
         f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         f.sync_all()?;
@@ -823,6 +833,42 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_bytes_idempotent_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let p = install_local_bytes(b"#!/bin/sh\necho one\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(p, local_server_bin(home, "1.5.0+abc"));
+        let m = std::fs::metadata(&p).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o700);
+        for d in [".xshell", ".xshell/server", ".xshell/server/1.5.0+abc"] {
+            let m = std::fs::metadata(home.join(d)).unwrap();
+            assert_eq!(m.mode() & 0o777, 0o700, "{d}");
+        }
+        // Identical: the file is not replaced (same inode).
+        let ino = m.ino();
+        install_local_bytes(b"#!/bin/sh\necho one\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+        // Different bytes or a loosened mode: replaced atomically.
+        install_local_bytes(b"#!/bin/sh\necho two\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\necho two\n");
+        assert_ne!(std::fs::metadata(&p).unwrap().ino(), ino);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_local_bytes(b"#!/bin/sh\necho two\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o700);
+        // No temp files left; a bad directory name is refused.
+        let left = std::fs::read_dir(p.parent().unwrap()).unwrap().count();
+        assert_eq!(left, 1);
+        assert!(install_local_bytes(b"x", home, "../x").is_err());
+        // The path wrapper is the same operation.
+        let src = home.join("src");
+        std::fs::write(&src, b"#!/bin/sh\necho three\n").unwrap();
+        install_local(&src, home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\necho three\n");
+    }
 
     /// The `selected` probe of a Daemon command Host (#55), through a real `sh` with a fake
     /// HOME: a name only for a valid, private install not older than the command's Daemon.
