@@ -486,6 +486,34 @@ fn offer_deadline(expires_at: u64, until: Instant) -> Result<Instant, PairError>
         .ok_or(PairError::Expired)?;
     Ok(until.min(Instant::now() + remaining))
 }
+/// Points in a guest's adoption exchange where a test can stop it (`test-relay` only).
+#[cfg(feature = "test-relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestTestPoint {
+    /// The proposal handle is received and checked, before the proposal reader connects.
+    HandleBeforeReader,
+}
+/// A test's callback at each [`GuestTestPoint`].
+#[cfg(feature = "test-relay")]
+pub type GuestTestHook = Box<dyn Fn(GuestTestPoint)>;
+#[cfg(feature = "test-relay")]
+thread_local! {
+    static GUEST_TEST_HOOK: std::cell::RefCell<Option<GuestTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Runs `hook` at every [`GuestTestPoint`] of guest exchanges on this thread (`test-relay`).
+#[cfg(feature = "test-relay")]
+pub fn set_guest_test_hook(hook: Option<GuestTestHook>) {
+    GUEST_TEST_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+#[cfg(feature = "test-relay")]
+fn guest_test_point(point: GuestTestPoint) {
+    GUEST_TEST_HOOK.with(|h| {
+        if let Some(hook) = h.borrow().as_ref() {
+            hook(point);
+        }
+    });
+}
 /// `e`, unless the approver's authenticated typed refusal is (or arrives within
 /// [`REFUSAL_GRACE`]) on the pipe: then that refusal.
 fn refusal_or(pipe: &mut PairPipe, guest: &mut Guest, e: PairError) -> PairError {
@@ -700,16 +728,23 @@ fn adopt_guest(
         return Err(PairError::Pin);
     }
     live(until, cancel)?;
-    let reader = ProposalReader::connect(
+    #[cfg(feature = "test-relay")]
+    guest_test_point(GuestTestPoint::HandleBeforeReader);
+    // The approver may have refused meanwhile (a Desktop cancel revokes the proposal and
+    // sends a typed refusal on the pipe): that refusal is the answer, not the connect or
+    // read error.
+    let reader = match ProposalReader::connect(
         &handle,
         req.signers.principal,
         opts.tls.clone(),
         opts.step
             .min(until.saturating_duration_since(Instant::now())),
     )
-    .map_err(relay_err)?;
-    // The approver may have refused meanwhile (a Desktop cancel revokes the proposal and
-    // sends a typed refusal on the pipe): that refusal is the answer, not the read error.
+    .map_err(relay_err)
+    {
+        Ok(r) => r,
+        Err(e) => return Err(refusal_or(&mut pipe, &mut guest, e)),
+    };
     let verified = match reader
         .with_cancel(cancel.cloned())
         .fetch_until(until)

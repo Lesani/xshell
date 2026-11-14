@@ -928,3 +928,49 @@ fn a_v2_offer_nobody_holds_fails_at_once_with_not_found() {
     );
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+/// A Desktop cancel after the phone got its proposal handle but before its proposal reader
+/// connected: the revoked grant fails the connect, and the phone still reports the Desktop's
+/// authenticated `cancelled_by_desktop`, not the Relay error.
+#[test]
+fn a_desktop_cancel_before_the_proposal_reader_connects_is_cancelled_by_desktop() {
+    use xshell_protocol::ring::relay::pair::{set_guest_test_hook, GuestTestPoint};
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    let created = a.create();
+    connected(&a);
+    let version = created.head().version();
+    let phone = phone_keys(72);
+    let (o, _) = offer(&a);
+    let (reached, reached_rx) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+    let scanner = {
+        let phone = phone.clone();
+        std::thread::spawn(move || {
+            set_guest_test_hook(Some(Box::new(move |p| {
+                if p == GuestTestPoint::HandleBeforeReader {
+                    let _ = reached.send(());
+                    let _ = resume_rx.recv_timeout(Duration::from_secs(60));
+                }
+            })));
+            scan(&o, &phone)
+        })
+    };
+    reached_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    a.ring.cancel_pairing(PairingFlow::Phone);
+    // The Desktop notices within its poll, refuses on the pipe and revokes the grant.
+    std::thread::sleep(Duration::from_millis(1500));
+    resume.send(()).unwrap();
+    assert_eq!(
+        scanner.join().unwrap().unwrap_err(),
+        PairError::Refused(PairRefusal::Cancelled)
+    );
+    assert_eq!(relay_head(&relay, &created), version);
+    assert!(a
+        .ring
+        .chain()
+        .unwrap()
+        .head()
+        .member(&phone.sign_key())
+        .is_none());
+}
