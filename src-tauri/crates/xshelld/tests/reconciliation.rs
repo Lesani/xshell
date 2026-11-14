@@ -1,7 +1,6 @@
 #![cfg(unix)]
 //! Runtime5 owned-controller SIGKILL evidence against public production workerd setup.
 mod common;
-#[allow(dead_code)]
 #[path = "desktop/relay_fixture.rs"]
 mod fixture;
 #[allow(dead_code)]

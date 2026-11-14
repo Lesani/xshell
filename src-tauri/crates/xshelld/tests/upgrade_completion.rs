@@ -1,7 +1,6 @@
 #![cfg(unix)]
 //! Runtime4: retained v1 is established by public legacy enable/Host join, never seeded v2 rows.
 mod common;
-#[allow(dead_code)]
 #[path = "desktop/relay_fixture.rs"]
 mod fixture;
 #[allow(dead_code)]

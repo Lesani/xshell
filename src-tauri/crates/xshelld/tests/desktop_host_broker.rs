@@ -2,7 +2,6 @@
 //! Separate Desktop processes, one private profile, production workerd and real Daemons.
 mod common;
 #[path = "desktop/relay_fixture.rs"]
-#[allow(dead_code)]
 mod fixture;
 #[path = "desktop/workerd.rs"]
 mod workerd;

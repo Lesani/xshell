@@ -1,4 +1,6 @@
 //! Public pairing fixture shared by owner routing and separate-process broker tests.
+// Shared by several test crates, each using only part of it (some parts are feature-gated).
+#![allow(unused_imports, dead_code)]
 use super::common;
 use super::common::TestHome;
 use super::workerd::Relay;

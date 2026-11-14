@@ -1,4 +1,8 @@
 #![cfg(unix)]
+#![cfg_attr(
+    not(feature = "legacy-pair-test-control"),
+    allow(unused_imports, dead_code)
+)]
 //! Seam 2: sessions through the Relay into the Daemon. The test Relay, the real
 //! `DesktopRing` (pairing), in-process Daemons and the protocol's Ring client standing in for
 //! the phone. A session is one more protocol connection with the peer's Roster role.

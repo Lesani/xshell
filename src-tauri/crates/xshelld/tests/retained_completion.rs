@@ -2,7 +2,6 @@
 //! Runtime3 public standalone -> retained v2 completion. No roster/authorization seeding.
 mod common;
 #[path = "desktop/relay_fixture.rs"]
-#[allow(dead_code)]
 mod fixture;
 #[allow(dead_code)]
 #[path = "desktop/workerd.rs"]

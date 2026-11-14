@@ -1,4 +1,8 @@
 #![cfg(unix)]
+#![cfg_attr(
+    not(feature = "legacy-pair-test-control"),
+    allow(unused_imports, dead_code)
+)]
 //! First S3 owner-backend vertical. Actual public pairing/controllers, production workerd,
 //! actual Daemons and Manager HostHandles. No SSH configuration for Relay-only positives.
 mod common;
@@ -15,7 +19,6 @@ use xshell_hostlink::{HostConfig, TermSink, Transport, TransportFactory};
 use xshell_protocol::msg::OpenSpec;
 use xshelld::server::{Config, Server};
 #[path = "desktop/relay_fixture.rs"]
-#[allow(dead_code)]
 mod fixture;
 use fixture::*;
 
