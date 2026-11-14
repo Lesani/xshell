@@ -242,6 +242,23 @@ fn commit_acknowledged(
     Ok(s)
 }
 
+/// `candidate` (its predecessor in `current`) is still within its signer's authority under
+/// `current`'s terminal evidence: a terminal-expired signer may only clean up itself.
+fn still_authorized(current: &RosterChain, candidate: &SignedRoster) -> Result<(), String> {
+    let prev = candidate
+        .version()
+        .checked_sub(1)
+        .and_then(|v| current.get(v))
+        .filter(|p| candidate.roster().prev.as_deref() == Some(p.hash().as_str()))
+        .ok_or(REMOVE_CONFLICT)?;
+    xshell_protocol::ring::membership::verify_terminal_authority(
+        prev,
+        candidate,
+        current.terminal_enrollments(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// A refusal because the Relay holds another head than the candidate's predecessor.
 fn removal_conflict(e: &RingError) -> bool {
     matches!(
@@ -2885,9 +2902,11 @@ impl DesktopRing {
     ///   newer head and same-ancestry terminal evidence included), so a terminal-expired
     ///   signer or this app's own unit ([`REMOVE_SELF`]) is refused before anything is sent;
     /// - it needs a connected Relay ([`REMOVE_OFFLINE`]); it is published with no Ring lock
-    ///   held (the Connector's Roster report takes the commit lock);
-    /// - on the Relay's acknowledgment, from the same Connector, it is committed and the
-    ///   unit's Host mappings are dropped (Settings → Hosts entries stay);
+    ///   held (the Connector's Roster report takes the commit lock), fenced again at each
+    ///   upload by the owner's current terminal evidence ([`Connector::publish_fenced_until`]);
+    /// - on the Relay's acknowledgment, from the same Connector and still authorized under
+    ///   the current evidence, it is committed and the unit's Host mappings are dropped
+    ///   (Settings → Hosts entries stay);
     /// - a conflicting head is read again and a fresh candidate (a new signature on the new
     ///   head, never an old one moved) is tried once, then [`REMOVE_CONFLICT`]; no answer
     ///   is [`REMOVE_UNCERTAIN`]; another refusal is reported. None of them is persisted.
@@ -2917,7 +2936,7 @@ impl DesktopRing {
             };
             self.adoption_test_point(AdoptionTestPoint::RemoveBeforePublish);
             let deadline = Instant::now() + self.cfg.pair_publish_wait;
-            match connector.publish_until(&candidate, deadline, None) {
+            match connector.publish_fenced_until(&candidate, deadline, None) {
                 Ok(()) => {
                     return self
                         .commit_removal(&effective, &candidate, &unit_keys, &connector, epoch)
@@ -2969,6 +2988,9 @@ impl DesktopRing {
                     return Err(REMOVE_UNCERTAIN.to_string());
                 }
             }
+            // The owner's current evidence, not the one the candidate was built under.
+            let current = self.adoption_effective_chain()?.ok_or(PAIR_NOT_ENABLED)?;
+            still_authorized(&current, candidate)?;
             let s = self.tx(|cur, _| {
                 let s = cur.ok_or(PAIR_NOT_ENABLED)?;
                 let s = commit_acknowledged(s, effective, candidate, unit_keys)?;
@@ -6565,6 +6587,14 @@ mod v2_edits_tests {
     /// This Computer (Desktop "desk" + its Daemon), a second Computer and a phone, in a v2
     /// Ring whose Relay is unreachable (the Connector exists but never connects).
     fn v2_ring(t: &tempfile::TempDir) -> V2 {
+        v2_ring_with(t, None, Duration::from_millis(10))
+    }
+
+    fn v2_ring_with(
+        t: &tempfile::TempDir,
+        hook: Option<AdoptionTestHook>,
+        backoff: Duration,
+    ) -> V2 {
         let dir = t.path().join("ring");
         let store = Store::new(dir.clone());
         let keys = store.retained_keys().unwrap();
@@ -6648,7 +6678,8 @@ mod v2_edits_tests {
         let mut c = DesktopRingConfig::new(dir, "desk".into());
         c.default_relay_url = RELAY.into();
         c.hosted_relay_url = RELAY.into();
-        c.backoff_unit = Duration::from_millis(10);
+        c.backoff_unit = backoff;
+        c.adoption_test_hook = hook;
         let ring = DesktopRing::open(c, Arc::new(Observer));
         assert_eq!(ring.chain().unwrap().head().version(), 3);
         V2 {
@@ -6940,6 +6971,74 @@ mod v2_edits_tests {
         assert_eq!(json["kind"], "computer");
         assert_eq!(json["daemonKey"], x.daemon2.sign_key().to_string());
         assert_eq!(json["enrollmentId"], eid(2));
+        x.ring.quit();
+    }
+
+    /// Terminal evidence installed after the candidate was built (at the publication seam)
+    /// refuses the upload: the fenced publication sees it, nothing is committed.
+    #[test]
+    fn v2_terminal_evidence_at_publication_refuses_the_upload() {
+        use xshell_protocol::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
+        use xshell_protocol::ring::relay::ChainPin;
+        let t = tempfile::tempdir().unwrap();
+        let slot: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
+        let seam = slot.clone();
+        let hook = AdoptionTestHook(Arc::new(move |p| {
+            if p == AdoptionTestPoint::RemoveBeforePublish {
+                if let Some(f) = seam.lock().unwrap().as_ref() {
+                    f();
+                }
+            }
+        }));
+        // A long backoff: after the first failed dial the link stays as this test sets it.
+        let x = v2_ring_with(&t, Some(hook), Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while x.ring.view().connection != "waiting" {
+            assert!(Instant::now() < deadline, "{:?}", x.ring.view().connection);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let connector = x.ring.lock().connector.clone().unwrap();
+        let head = x.ring.chain().unwrap().head().clone();
+        let m = head.roster().membership().unwrap();
+        let evidence = ActivityEvidence {
+            ring_id: head.ring_id().clone(),
+            relay_url: RELAY.into(),
+            policy_head_hash: head.hash(),
+            policy_hash: policy_hash(&m.policy),
+            observed_at: head.roster().issued_at + 31 * 24 * 3600,
+            units: vec![UnitActivity {
+                enrollment_id: eid(1),
+                member_keys: vec![x.me, x.my_daemon.sign_key()],
+                online: false,
+                last_active: 1000,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&*x.keys)
+        .unwrap();
+        let (c, me, hash) = (connector.clone(), x.me, head.hash());
+        *slot.lock().unwrap() = Some(Box::new(move || {
+            c.test_with_stable_attempt(|| {
+                c.test_observe_activity(
+                    &ChainPin {
+                        version: 3,
+                        hash: hash.clone(),
+                    },
+                    me,
+                    &evidence,
+                    || {},
+                )
+            })
+            .unwrap();
+        }));
+        // Pretend the link is up so the removal reaches its publication.
+        x.ring.lock().link = Some(LinkState::Connected { limited: false });
+        assert!(connector.chain().authorized_member(&x.me).is_some());
+        let e = x.ring.remove_member(&x.desk2.sign_key()).unwrap_err();
+        assert!(e.contains("terminal"), "{e}");
+        assert_eq!(stored(&t).chain.head().version(), 3, "nothing committed");
+        assert_eq!(x.ring.chain().unwrap().head().version(), 3);
+        assert!(connector.chain().authorized_member(&x.me).is_none());
         x.ring.quit();
     }
 }
