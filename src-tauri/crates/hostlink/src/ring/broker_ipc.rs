@@ -270,13 +270,17 @@ pub(crate) mod native {
     }
     impl Read for DeadlineStream<'_> {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-            self.stream.set_read_timeout(Some(self.left()?))?;
+            xshell_core::local_ipc::tolerate_closed_peer(
+                self.stream.set_read_timeout(Some(self.left()?)),
+            )?;
             self.stream.read(bytes)
         }
     }
     impl Write for DeadlineStream<'_> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.stream.set_write_timeout(Some(self.left()?))?;
+            xshell_core::local_ipc::tolerate_closed_peer(
+                self.stream.set_write_timeout(Some(self.left()?)),
+            )?;
             self.stream.write(bytes)
         }
         fn flush(&mut self) -> io::Result<()> {

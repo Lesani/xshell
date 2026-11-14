@@ -57,20 +57,25 @@ mod native {
     use std::time::{Duration, Instant};
     const IO: Duration = Duration::from_secs(5);
     const MAX: usize = xshell_protocol::ring::companion::MAX_COMPANION_FRAME;
+    #[cfg(unix)]
+    use platform::denied;
     pub use platform::{check_path, private_dir, protected_connect, ProtectedListener, Stream};
-    use platform::{denied, dial_pinned, endpoint_identity, peer, Identity};
+    use platform::{dial_pinned, endpoint_identity, peer, Identity};
     #[cfg(test)]
     thread_local! {
         static AFTER_PIN_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             std::cell::RefCell::new(None);
     }
     /// Pins local routing identity across a command's exchanges; not wire authority.
-    /// Unix pins the socket inode; Windows pipes have no inode, so the pin is the
-    /// validated pipe name and the owner-SID checks done by every connect.
+    /// Unix-only: it pins the socket inode. Windows pipes have no comparable instance
+    /// identity (the owner-SID check distinguishes users, not endpoint lifetimes), so a
+    /// Windows version would not detect replacement and is deliberately not offered.
+    #[cfg(unix)]
     pub struct ProtectedEndpoint {
         path: PathBuf,
         identity: Identity,
     }
+    #[cfg(unix)]
     impl ProtectedEndpoint {
         pub fn pin(path: PathBuf) -> io::Result<Self> {
             let identity = endpoint_identity(&path)?;
@@ -114,13 +119,13 @@ mod native {
     }
     impl Read for Bounded {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-            self.stream.set_read_timeout(Some(self.left()?))?;
+            super::tolerate_closed_peer(self.stream.set_read_timeout(Some(self.left()?)))?;
             self.stream.read(bytes)
         }
     }
     impl Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.stream.set_write_timeout(Some(self.left()?))?;
+            super::tolerate_closed_peer(self.stream.set_write_timeout(Some(self.left()?)))?;
             self.stream.write(bytes)
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -524,9 +529,6 @@ mod native {
         pub(super) fn peer(_: &Stream) -> io::Result<()> {
             Ok(())
         }
-        pub(super) fn denied(why: &str) -> io::Error {
-            io::Error::new(io::ErrorKind::PermissionDenied, why)
-        }
         /// Named pipes have no inode; the pinned identity is the validated name, and
         /// each connect re-verifies the server owner through `crate::pipe::connect`.
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -698,10 +700,22 @@ mod native {
         }
     }
 }
+#[cfg(unix)]
+pub use native::ProtectedEndpoint;
+/// Applies a socket timeout result. On macOS and the BSDs, setting a timeout on a socket
+/// whose peer has already closed fails with EINVAL even when its reply is still buffered;
+/// the following read or write then reports the buffered data, EOF or EPIPE truthfully.
+pub fn tolerate_closed_peer(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
+    }
+}
 #[cfg(any(unix, windows))]
 pub use native::{
-    check_path, exchange, exchange_until, private_dir, protected_connect, serve, ProtectedEndpoint,
-    ProtectedListener, Server, Stream,
+    check_path, exchange, exchange_until, private_dir, protected_connect, serve, ProtectedListener,
+    Server, Stream,
 };
 
 /// Validate traversed Windows ancestors before canonicalizing a protected store binding.

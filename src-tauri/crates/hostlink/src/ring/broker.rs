@@ -2147,7 +2147,7 @@ mod native_transport {
                         })
                 })
                 .transpose()?;
-            self.stream.set_read_timeout(timeout)?;
+            xshell_core::local_ipc::tolerate_closed_peer(self.stream.set_read_timeout(timeout))?;
             let length = if self.until.is_none() {
                 bytes.len().min(1)
             } else if self.header > 0 {
