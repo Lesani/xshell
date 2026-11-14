@@ -480,6 +480,9 @@ mod native {
             pub fn accept(&self) -> io::Result<UnixStream> {
                 let (stream, _) = self.listener.accept()?;
                 peer(&stream)?;
+                // BSD/macOS accept() copies the listener's O_NONBLOCK; Linux does not. A
+                // non-blocking stream ignores the read/write timeouts and fails with WouldBlock.
+                stream.set_nonblocking(false)?;
                 Ok(stream)
             }
         }

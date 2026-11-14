@@ -51,27 +51,27 @@ impl RegistrationGate {
     fn wait_for(&self, point: P) {
         let (state, _) = self
             .changed
-            .wait_timeout_while(self.state.lock().unwrap(), Duration::from_secs(6), |s| {
+            .wait_timeout_while(self.lock(), Duration::from_secs(6), |s| {
                 !s.events.contains(&point)
             })
-            .unwrap();
-        assert!(state.events.contains(&point), "missing event {point:?}");
+            .unwrap_or_else(|e| e.into_inner());
+        let seen = state.events.contains(&point);
+        drop(state); // never poison the gate: Drop paths still need it
+        assert!(seen, "missing event {point:?}");
+    }
+    /// Poison-tolerant: a failed assertion elsewhere must not abort the test binary in Drop.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn release(&self) {
-        self.state.lock().unwrap().release = true;
+        self.lock().release = true;
         self.changed.notify_all();
     }
     fn count(&self, point: P) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .events
-            .iter()
-            .filter(|p| **p == point)
-            .count()
+        self.lock().events.iter().filter(|p| **p == point).count()
     }
     fn before(&self, first: P, second: P) {
-        let state = self.state.lock().unwrap();
+        let state = self.lock();
         let a = state.events.iter().position(|p| *p == first).unwrap();
         let b = state.events.iter().position(|p| *p == second).unwrap();
         assert!(a < b, "causal event order {first:?} -> {second:?}");
