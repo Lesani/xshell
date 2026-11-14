@@ -275,7 +275,12 @@ fn removed_close_and_not_member_fire_removed_once() {
     let r = relay();
     let mut ring = TestRing::new(&r.url());
     let mobile = ring.mobile.sign_key();
-    let removed = |rec: &Rec| rec.all().iter().filter(|e| matches!(e, Ev::Removed)).count();
+    let removed = |rec: &Rec| {
+        rec.all()
+            .iter()
+            .filter(|e| matches!(e, Ev::Removed))
+            .count()
+    };
     // Closed as removed while connected.
     let (c, rec) = start(cfg(&r, &ring.chain, ring.mobile.clone()));
     assert!(rec.connected());

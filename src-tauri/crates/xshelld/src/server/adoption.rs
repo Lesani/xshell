@@ -275,7 +275,9 @@ pub(crate) struct Standalone<'a> {
 }
 
 impl Standalone<'_> {
-    pub(crate) fn standalone_adoption_status(&self) -> Result<Option<StandaloneRecoveryStatus>, String> {
+    pub(crate) fn standalone_adoption_status(
+        &self,
+    ) -> Result<Option<StandaloneRecoveryStatus>, String> {
         let _operation = self.d.store_admission.admit()?;
         let store = Store::new(self.d.cfg.paths.ring_dir.clone());
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(
@@ -439,7 +441,6 @@ impl Standalone<'_> {
             finalize_standalone_receipt_locked(store, record, accepted, effective, budget)
         })
     }
-
 }
 
 impl ServerHandle {

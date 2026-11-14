@@ -531,8 +531,8 @@ mod rjw {
     use super::*;
     use xshell_protocol::ring::companion::{CompanionPhase, CompanionProposal, ConsentTranscript};
     use xshell_protocol::ring::membership::{
-        consent_message, local_consent_context, pairing_consent_context, remove_unit,
-        ConsentProof, Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+        consent_message, local_consent_context, pairing_consent_context, remove_unit, ConsentProof,
+        Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
     };
     use xshell_protocol::ring::pairing::adoption::enroll_proposal;
     use xshell_protocol::ring::{Member, RingId, Role, Roster, RosterChain, Signature, Signer};
@@ -557,7 +557,11 @@ mod rjw {
     }
 
     /// v1 genesis of Computer A; v2 Enroll of `daemon` as a standalone Daemon unit.
-    fn standalone_member(a_desk: &DeviceKeys, a_daemon: &DeviceKeys, daemon: &DeviceKeys) -> RosterChain {
+    fn standalone_member(
+        a_desk: &DeviceKeys,
+        a_daemon: &DeviceKeys,
+        daemon: &DeviceKeys,
+    ) -> RosterChain {
         let mut g = Roster {
             v: 2,
             ring_id: RingId::derive(&a_desk.sign_key()),
@@ -567,8 +571,20 @@ mod rjw {
             signed_by: a_desk.sign_key(),
             issued_at: 1000,
             members: vec![
-                Member::new("a", Role::Desktop, a_desk.sign_key(), a_desk.noise_key(), 1000),
-                Member::new("a host", Role::Daemon, a_daemon.sign_key(), a_daemon.noise_key(), 1000),
+                Member::new(
+                    "a",
+                    Role::Desktop,
+                    a_desk.sign_key(),
+                    a_desk.noise_key(),
+                    1000,
+                ),
+                Member::new(
+                    "a host",
+                    Role::Daemon,
+                    a_daemon.sign_key(),
+                    a_daemon.noise_key(),
+                    1000,
+                ),
             ],
             extra: Default::default(),
         };
@@ -688,7 +704,10 @@ mod rjw {
         // Another Ring's predecessor that retires a unit of the same id is refused: it must
         // extend the retained chain.
         let unit = b64::encode(&[2; 32]);
-        let (o_desk, o_daemon) = (DeviceKeys::generate().unwrap(), DeviceKeys::generate().unwrap());
+        let (o_desk, o_daemon) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
         let foreign = standalone_member(&o_desk, &o_daemon, &daemon);
         let removed = remove_unit(foreign.head(), &o_desk, 1002, &unit).unwrap();
         let mut pred = foreign.clone();

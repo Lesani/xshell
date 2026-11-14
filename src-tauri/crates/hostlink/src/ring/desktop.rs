@@ -3411,7 +3411,10 @@ impl DesktopRing {
 
     /// [`DesktopRing::remove_member_v2`] for a caller that already holds the membership
     /// mutation reservation (an approval replacing a standalone Daemon unit).
-    pub(in crate::ring) fn remove_member_reserved(&self, key: &SignKey) -> Result<RosterChain, String> {
+    pub(in crate::ring) fn remove_member_reserved(
+        &self,
+        key: &SignKey,
+    ) -> Result<RosterChain, String> {
         // Removing this computer's own unit: the Relay's removed close that follows is
         // expected; the self-removal sets the membership aside (without a notice).
         let own = self.lock().state.as_ref().is_some_and(|s| {
@@ -3420,7 +3423,10 @@ impl DesktopRing {
                 .roster()
                 .membership()
                 .ok()
-                .and_then(|m| m.unit_for(key).map(|u| u.members.contains(&s.keys.sign_key())))
+                .and_then(|m| {
+                    m.unit_for(key)
+                        .map(|u| u.members.contains(&s.keys.sign_key()))
+                })
                 .unwrap_or(false)
         });
         let _self_removal = own.then(|| self.self_removal());
@@ -3516,7 +3522,14 @@ impl DesktopRing {
                 s.chain
             }
         };
-        if unit_keys.contains(&self.store.load_profile()?.0.map(|p| p.keys.sign_key()).ok_or(PAIR_NOT_ENABLED)?) {
+        if unit_keys.contains(
+            &self
+                .store
+                .load_profile()?
+                .0
+                .map(|p| p.keys.sign_key())
+                .ok_or(PAIR_NOT_ENABLED)?,
+        ) {
             self.set_aside_self_removed(&chain);
             return Ok(chain);
         }
@@ -7630,7 +7643,10 @@ mod v2_edits_tests {
             let (candidate, s) = removed(&t, &x, &key);
             assert!(candidate.member(&x.me).is_none());
             assert!(candidate.member(&x.my_daemon.sign_key()).is_none());
-            assert!(s.local_member.is_none(), "this computer's Daemon mapping goes");
+            assert!(
+                s.local_member.is_none(),
+                "this computer's Daemon mapping goes"
+            );
         }
         let (candidate, committed) = removed(&t, &x, &x.me);
         let before = Store::new(t.path().join("ring"))
@@ -7647,16 +7663,20 @@ mod v2_edits_tests {
             .unwrap();
         assert!(after.membership.is_none() && after.companion.is_none());
         assert!(after.removed.is_none(), "a self-removal shows no notice");
-        assert_ne!(after.keys.sign_key(), before.keys.sign_key(), "new identity");
-        assert!(x.ring.chain().is_none(), "the live Ring is dropped");
-        assert_eq!(
-            x.ring.membership_state().unwrap(),
-            MembershipState::None
+        assert_ne!(
+            after.keys.sign_key(),
+            before.keys.sign_key(),
+            "new identity"
         );
+        assert!(x.ring.chain().is_none(), "the live Ring is dropped");
+        assert_eq!(x.ring.membership_state().unwrap(), MembershipState::None);
         assert!(std::fs::read_dir(t.path().join("ring"))
             .unwrap()
             .filter_map(Result::ok)
-            .any(|e| e.file_name().to_string_lossy().starts_with("ring.json.removed-")));
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ring.json.removed-")));
         x.ring.quit();
     }
 

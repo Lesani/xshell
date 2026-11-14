@@ -496,9 +496,7 @@ pub(super) fn dispatch_pending(
                         J::Installed { .. } => (AdministrationStatus::Installed, true),
                         J::Failed { .. } => (AdministrationStatus::Failed, true),
                         // The wire keeps its name; the pair command says "Finishing".
-                        J::Finishing { .. } => {
-                            (AdministrationStatus::ReconciliationRequired, true)
-                        }
+                        J::Finishing { .. } => (AdministrationStatus::ReconciliationRequired, true),
                     };
                     state.lock().unwrap().update(&dispatch, status);
                     if ended {

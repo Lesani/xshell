@@ -2302,8 +2302,8 @@ mod set_aside_tests {
     fn v1_member(dir: &Path) -> (Store, Arc<DeviceKeys>) {
         let store = Store::new(dir.to_path_buf());
         let keys = store.retained_keys().unwrap();
-        let g = SignedRoster::genesis(&*keys, keys.noise_key(), "desk", "wss://r.example", 1)
-            .unwrap();
+        let g =
+            SignedRoster::genesis(&*keys, keys.noise_key(), "desk", "wss://r.example", 1).unwrap();
         store
             .transact(|_, _| {
                 Ok((
@@ -2394,6 +2394,8 @@ mod set_aside_tests {
         assert!(store.load_profile().unwrap().0.unwrap().removed.is_none());
         // Nothing stored: nothing to set aside.
         let empty = Store::new(t.path().join("empty"));
-        assert!(!empty.set_aside(AsideReason::SelfRemoved, |_| Ok(())).unwrap());
+        assert!(!empty
+            .set_aside(AsideReason::SelfRemoved, |_| Ok(()))
+            .unwrap());
     }
 }

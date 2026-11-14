@@ -852,9 +852,7 @@ impl DesktopRing {
     /// `offline`, `not_found`, `already_used`, `closed`, `expired`, `cancelled`, `refused`,
     /// `uncertain`.
     pub fn approve_device_code(&self, code: &DeviceCode) -> Result<ApprovalOutcome, String> {
-        let _admission = self
-            .reserve_adoption()
-            .map_err(|e| format!("busy: {e}"))?;
+        let _admission = self.reserve_adoption().map_err(|e| format!("busy: {e}"))?;
         if !self.pairing_ipc_owner() {
             return Err("other_window: another window owns approval".into());
         }
@@ -1166,9 +1164,10 @@ impl DesktopRing {
                 ));
             }
         }
-        Err(result
-            .err()
-            .map_or_else(|| "uncertain: approval ended without publication".into(), code_of))
+        Err(result.err().map_or_else(
+            || "uncertain: approval ended without publication".into(),
+            code_of,
+        ))
     }
 }
 

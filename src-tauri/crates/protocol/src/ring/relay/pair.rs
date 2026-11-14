@@ -1256,7 +1256,10 @@ pub fn approve_adoption_read(
     ) {
         let e = PairError::Payload("a phone joins through a pairing offer".into());
         let AdoptionRead {
-            pipe, mut host, typed, ..
+            pipe,
+            mut host,
+            typed,
+            ..
         } = read;
         refuse_pipe(pipe, &mut host, typed, &e);
         return Err(e);
@@ -1318,7 +1321,10 @@ impl AdoptionRead {
     /// Ends the exchange, telling a phone why (typed refusal) when it is one.
     pub fn refuse(self, e: &PairError) {
         let AdoptionRead {
-            pipe, mut host, typed, ..
+            pipe,
+            mut host,
+            typed,
+            ..
         } = self;
         refuse_pipe(pipe, &mut host, typed, e);
     }

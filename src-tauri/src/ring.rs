@@ -113,12 +113,10 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
         .as_ref()
         .is_some_and(|r| *r.busy.lock().unwrap_or_else(|e| e.into_inner()));
     let worker = state.as_ref().map(|r| r.worker.clone());
-    let profile = worker
-        .as_ref()
-        .and_then(|w| w.ring.notices().ok());
+    let profile = worker.as_ref().and_then(|w| w.ring.notices().ok());
     let (removed, old_ring) = profile.unwrap_or_default();
-    let finishing_offline = membership == "finishing"
-        && worker.as_ref().is_some_and(|w| w.ring.finishing_offline());
+    let finishing_offline =
+        membership == "finishing" && worker.as_ref().is_some_and(|w| w.ring.finishing_offline());
     let too_old = worker
         .as_ref()
         .is_some_and(|w| w.state_of(LOCAL_HOST_ID) == Some("too-old"));

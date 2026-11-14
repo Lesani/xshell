@@ -4,6 +4,8 @@ pub mod proposal;
 pub mod wire;
 
 #[cfg(feature = "relay-client")]
+pub mod approve;
+#[cfg(feature = "relay-client")]
 mod client;
 #[cfg(feature = "relay-client")]
 pub mod connector;
@@ -11,8 +13,6 @@ pub mod connector;
 mod farewell;
 #[cfg(feature = "relay-client")]
 mod io;
-#[cfg(feature = "relay-client")]
-pub mod approve;
 #[cfg(feature = "relay-client")]
 pub mod pair;
 #[cfg(feature = "relay-client")]

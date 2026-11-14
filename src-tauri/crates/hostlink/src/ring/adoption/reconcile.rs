@@ -504,9 +504,7 @@ impl DesktopRing {
             .as_ref()
             .filter(|j| j.intent.operation == operation)
             .ok_or("publication changed")?;
-        let cancel = || {
-            self.outgoing_update(operation, |o| o.phase = OutgoingPhase::Cancelled)
-        };
+        let cancel = || self.outgoing_update(operation, |o| o.phase = OutgoingPhase::Cancelled);
         match outgoing.phase {
             OutgoingPhase::Published | OutgoingPhase::Cancelled => return Ok(()),
             // Nothing left this machine; the proposal grant lapsed with its connection.

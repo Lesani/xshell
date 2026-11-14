@@ -1216,15 +1216,21 @@ mod rjw {
         for daemon in [&ks[2]] {
             assert!(!enroll_approver(head, &daemon.sign_key()));
             let i = computer(&keys(40), &keys(41), 21);
-            let mut r = enroll_proposal(head, ks[0].sign_key(), &i, head.roster().issued_at + 1)
-                .unwrap();
+            let mut r =
+                enroll_proposal(head, ks[0].sign_key(), &i, head.roster().issued_at + 1).unwrap();
             r.signed_by = daemon.sign_key();
             assert!(verify_enroll_proposal(head, &r).is_err());
         }
         let (ks, h) = upgrade_multi();
         let head = h.last().unwrap();
-        assert!(!enroll_approver(head, &ks[2].sign_key()), "standalone Daemon");
-        assert!(!enroll_approver(head, &keys(77).sign_key()), "never a member");
+        assert!(
+            !enroll_approver(head, &ks[2].sign_key()),
+            "standalone Daemon"
+        );
+        assert!(
+            !enroll_approver(head, &keys(77).sign_key()),
+            "never a member"
+        );
     }
 
     #[test]
@@ -1280,15 +1286,23 @@ mod rjw {
         assert!(chain.authorized_member(&ks[2].sign_key()).is_none());
         // Now nothing of the target is a member: a plain Enroll of the Computer.
         assert_eq!(standalone_unit_to_replace(&removed, &i).unwrap(), None);
-        let mut p = enroll_proposal(&removed, ks[0].sign_key(), &i, removed.roster().issued_at + 1)
-            .unwrap();
+        let mut p = enroll_proposal(
+            &removed,
+            ks[0].sign_key(),
+            &i,
+            removed.roster().issued_at + 1,
+        )
+        .unwrap();
         consent(&mut p, &[&desktop, &ks[2]]);
         let enrolled = signed(&p, &ks[0]);
         let mut all = h.clone();
         all.push(removed);
         let chain = accepts(&all, enrolled);
         let m = chain.head().roster().membership().unwrap();
-        assert!(m.retired.contains(&id), "the old standalone id stays retired");
+        assert!(
+            m.retired.contains(&id),
+            "the old standalone id stays retired"
+        );
         let unit = m.unit(&eid(40)).unwrap();
         assert_eq!(unit.kind, Kind::Computer);
         assert!(unit.members.contains(&ks[2].sign_key()));

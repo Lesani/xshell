@@ -188,9 +188,11 @@ pub const APPROVE_CODES: [&str; 13] = [
 ];
 
 fn has_code(error: &str, codes: &[&str]) -> bool {
-    codes
-        .iter()
-        .any(|c| error.strip_prefix(c).is_some_and(|rest| rest.starts_with(':')))
+    codes.iter().any(|c| {
+        error
+            .strip_prefix(c)
+            .is_some_and(|rest| rest.starts_with(':'))
+    })
 }
 
 /// `ring_approve_device_code`'s error: one of [`APPROVE_CODES`] (else `other`), then the
@@ -902,9 +904,15 @@ mod tests {
         let flag = registry.reserve(op).unwrap();
         // No RingState is managed in this mock app; the call must be a pure no-op anyway.
         window_blurred(app.handle());
-        assert!(!flag.load(Ordering::Acquire), "OS focus loss must not cancel words");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "OS focus loss must not cancel words"
+        );
         registry.cancel(op);
-        assert!(flag.load(Ordering::Acquire), "leaving the code screen cancels");
+        assert!(
+            flag.load(Ordering::Acquire),
+            "leaving the code screen cancels"
+        );
     }
 
     #[test]

@@ -874,7 +874,10 @@ impl ConnectorEvents for Events {
     }
 
     fn removed(&self) {
-        crate::log!("INFO", "ring: the relay says this Host was removed; checking the signed history");
+        crate::log!(
+            "INFO",
+            "ring: the relay says this Host was removed; checking the signed history"
+        );
         self.removal_signal.store(true, Ordering::Release);
     }
 }
@@ -1219,7 +1222,10 @@ impl Ring {
             old.sessions.stop();
             old.connector.stop(ByeReason::quit());
         }
-        crate::log!("INFO", "ring: membership set aside ({suffix}); this Host is in no Ring");
+        crate::log!(
+            "INFO",
+            "ring: membership set aside ({suffix}); this Host is in no Ring"
+        );
         Ok(())
     }
 
@@ -1248,8 +1254,13 @@ impl Ring {
             return Ok(false);
         };
         let signer: Arc<dyn xshell_protocol::ring::Signer> = keys.clone();
-        match xshell_protocol::ring::relay::check_removal(&chain, signer, None, self.timeouts.connect)
-            .map_err(|e| e.to_string())?
+        match xshell_protocol::ring::relay::check_removal(
+            &chain,
+            signer,
+            None,
+            self.timeouts.connect,
+        )
+        .map_err(|e| e.to_string())?
         {
             xshell_protocol::ring::relay::RemovalCheck::Removed(evidence) => {
                 self.set_aside(budget, Aside::Removed, Some(&evidence), check, retire)?;
@@ -1782,7 +1793,9 @@ fn removal_extension(
         .unwrap_or_else(|| vec![*daemon]);
     if merged.head().version() <= retained.head().version()
         || merged.authorized_member(daemon).is_some()
-        || unit_keys.iter().any(|k| merged.authorized_member(k).is_some())
+        || unit_keys
+            .iter()
+            .any(|k| merged.authorized_member(k).is_some())
     {
         return Err("removal evidence does not remove this Computer".into());
     }
@@ -2468,7 +2481,10 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                             removal_at = Some(now + Duration::from_secs(1));
                         }
                         Err(e) => {
-                            crate::log!("INFO", "ring: removal check: {e}; retrying in {removal_delay:?}");
+                            crate::log!(
+                                "INFO",
+                                "ring: removal check: {e}; retrying in {removal_delay:?}"
+                            );
                             removal_at = Some(now + removal_delay);
                             removal_delay = (removal_delay * 2).min(Duration::from_secs(300));
                         }
@@ -2567,11 +2583,15 @@ fn abandon_standalone(
     }
     fs::rename(
         &path,
-        store
-            .dir
-            .join(format!("standalone-adoption.json.abandoned-{}", super::registry::now_ms())),
+        store.dir.join(format!(
+            "standalone-adoption.json.abandoned-{}",
+            super::registry::now_ms()
+        )),
     )
     .map_err(|e| e.to_string())?;
-    crate::log!("INFO", "ring: standalone pairing {operation} ended without membership");
+    crate::log!(
+        "INFO",
+        "ring: standalone pairing {operation} ended without membership"
+    );
     Ok(())
 }

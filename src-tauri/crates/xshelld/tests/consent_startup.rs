@@ -164,7 +164,10 @@ fn expired_pending(f: &Fixture) {
     let relay = format!("ws://{}", relay_sentinel.local_addr().unwrap());
     let (mut child, rx) = f.pair_on_relay(450, Some(&relay));
     let line = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(line.starts_with("Getting a Device Code from xshell on this computer"), "{line}");
+    assert!(
+        line.starts_with("Getting a Device Code from xshell on this computer"),
+        "{line}"
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "must stay pending, not exit success/error immediately"

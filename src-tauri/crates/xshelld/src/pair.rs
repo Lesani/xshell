@@ -189,8 +189,8 @@ fn registered_computer_pair(
         expires_at,
     };
     writeln!(out, "Getting a Device Code from xshell on this computer…")
-    .and_then(|()| out.flush())
-    .map_err(|_| "Pair origin output closed".to_string())?;
+        .and_then(|()| out.flush())
+        .map_err(|_| "Pair origin output closed".to_string())?;
     let mut client = None;
     let mut printed = false;
     let mut started = false;

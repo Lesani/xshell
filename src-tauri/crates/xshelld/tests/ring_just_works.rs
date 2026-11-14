@@ -23,8 +23,7 @@ use xshell_protocol::ring::membership::EnrollmentKind;
 use xshell_protocol::ring::pairing::adoption::JoinTarget;
 use xshell_protocol::ring::pairing::PairingOffer;
 use xshell_protocol::ring::relay::approve::{
-    approve_device_code, prepare_approval, publish_approval, resume_approval, ApproveError,
-    Resume,
+    approve_device_code, prepare_approval, publish_approval, resume_approval, ApproveError, Resume,
 };
 use xshell_protocol::ring::relay::pair::{
     adopt_mobile_as_guest_with_ready, MobileAdoptionRequest, PairOptions,
@@ -108,7 +107,10 @@ fn wait_removed(c: &Computer) {
     let until = Instant::now() + Duration::from_secs(20);
     while c.ring.membership_state().unwrap() != MembershipState::Removed || c.ring.chain().is_some()
     {
-        assert!(Instant::now() < until, "the Desktop never detected its removal");
+        assert!(
+            Instant::now() < until,
+            "the Desktop never detected its removal"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -250,7 +252,9 @@ fn removed_desktop_and_daemon_detect_removal_and_join_again() {
     });
     assert_eq!(b.ring.membership_state().unwrap(), MembershipState::Member);
     assert!(b.ring.notices().unwrap().0.is_none(), "the notice clears");
-    assert!(chain.authorized_member(&profile(&b).keys.sign_key()).is_some());
+    assert!(chain
+        .authorized_member(&profile(&b).keys.sign_key())
+        .is_some());
     assert!(chain.authorized_member(&old).is_none());
 }
 
@@ -265,7 +269,11 @@ fn removal_then_create_in_the_same_process_gets_a_new_ring() {
     wait_daemon_set_aside(&a);
     reregister(&a);
     let second = a.create();
-    assert_ne!(second.ring_id(), first.ring_id(), "a new creator key, a new Ring");
+    assert_ne!(
+        second.ring_id(),
+        first.ring_id(),
+        "a new creator key, a new Ring"
+    );
 }
 
 #[test]
@@ -346,7 +354,11 @@ fn v1_stores_set_aside_and_create_gets_new_ring_id() {
     let (removed, old) = ring.notices().unwrap();
     assert!(removed.is_none() && old.is_some(), "the old-Ring notice");
     assert_eq!(files(&desktop, "ring.json.v1-"), 1);
-    let stored = Store::new(desktop.clone()).load_profile().unwrap().0.unwrap();
+    let stored = Store::new(desktop.clone())
+        .load_profile()
+        .unwrap()
+        .0
+        .unwrap();
     assert_ne!(stored.keys.sign_key(), keys.sign_key());
     assert_ne!(
         xshell_protocol::ring::RingId::derive(&stored.keys.sign_key()),
@@ -402,7 +414,11 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
         let op = prepared.op().clone();
         assert_eq!(op.predecessor_version, head);
         assert!(op.replaced.is_none());
-        assert_eq!(connector.chain().head().version(), head, "prepare publishes nothing");
+        assert_eq!(
+            connector.chain().head().version(),
+            head,
+            "prepare publishes nothing"
+        );
         let device = publish_approval(prepared).unwrap();
         assert!(matches!(resume_approval(&connector, &op), Resume::Done(_)));
         assert_eq!(device.kind, EnrollmentKind::Computer);
@@ -419,7 +435,11 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
         .unwrap()
         .clone();
     assert_eq!(
-        chain.get(chain.head().version()).unwrap().roster().signed_by,
+        chain
+            .get(chain.head().version())
+            .unwrap()
+            .roster()
+            .signed_by,
         phone_keys.sign_key(),
         "the phone signed the Enroll"
     );
@@ -448,8 +468,14 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
     wait_removed(&b);
     // Not found: nobody shows these words.
     assert_eq!(
-        approve_device_code(&connector, phone_keys.clone(), &words, &PairOptions::default(), None)
-            .unwrap_err(),
+        approve_device_code(
+            &connector,
+            phone_keys.clone(),
+            &words,
+            &PairOptions::default(),
+            None
+        )
+        .unwrap_err(),
         ApproveError::NotFound
     );
     connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
@@ -472,7 +498,15 @@ fn standalone(d: &xshelld::server::ServerHandle, approver: &Computer, url: &str)
         approver.ring.approve_device_code(&code).unwrap();
         guest.join().unwrap().unwrap()
     });
-    chain.head().roster().membership().unwrap().enrollments.last().unwrap().members[0]
+    chain
+        .head()
+        .roster()
+        .membership()
+        .unwrap()
+        .enrollments
+        .last()
+        .unwrap()
+        .members[0]
 }
 
 #[test]
@@ -534,7 +568,10 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
         .unwrap();
         let op = prepared.op().clone();
         let stored = serde_json::to_string(&op).unwrap();
-        assert!(!stored.contains(code.format().as_str()), "no words in the record");
+        assert!(
+            !stored.contains(code.format().as_str()),
+            "no words in the record"
+        );
         assert!(op.replaced.is_some(), "a standalone unit to replace");
         assert!(matches!(op.target, JoinTarget::Computer { .. }));
         // Stage 1 only: the standalone removal is published, then the app dies before
@@ -547,7 +584,10 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
         )
         .unwrap();
         drop(prepared);
-        assert!(joining.join().unwrap().is_err(), "the joining machine was never enrolled");
+        assert!(
+            joining.join().unwrap().is_err(),
+            "the joining machine was never enrolled"
+        );
         op
     });
     match resume_approval(&connector, &op) {
@@ -567,7 +607,10 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
             None,
         )
         .unwrap();
-        assert!(device.replaced.is_none(), "nothing standalone left to replace");
+        assert!(
+            device.replaced.is_none(),
+            "nothing standalone left to replace"
+        );
     });
     assert!(chain
         .authorized_member(&profile(&b).keys.sign_key())

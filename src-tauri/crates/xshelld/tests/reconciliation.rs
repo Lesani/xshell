@@ -248,7 +248,10 @@ fn process_recovery(mode: &str, cut: &str, descendant: bool, revoke: bool) {
             Ok(r) => {
                 assert_ne!(cut, "accepted-before-journal");
                 assert_eq!(r.local.unwrap().state, AdoptionRecoveryState::Terminal);
-                assert!(stored(&b).membership.is_none(), "revocation must not revive Desktop");
+                assert!(
+                    stored(&b).membership.is_none(),
+                    "revocation must not revive Desktop"
+                );
                 assert_eq!(
                     stored(&b).journal.unwrap().phase,
                     AdoptionPhase::Abandoned,
@@ -258,7 +261,10 @@ fn process_recovery(mode: &str, cut: &str, descendant: bool, revoke: bool) {
             Err(error) => {
                 assert_eq!(cut, "accepted-before-journal");
                 assert!(error.starts_with("finishing:"), "{error}");
-                assert!(stored(&b).membership.is_none(), "revocation must not revive Desktop");
+                assert!(
+                    stored(&b).membership.is_none(),
+                    "revocation must not revive Desktop"
+                );
                 assert!(b
                     .ring
                     .begin_join(&b.companion())
@@ -602,8 +608,14 @@ fn killed_before_publication_and_expired_stays_uncertain_without_absence_inferen
         PublicationRecoveryState::CancelledBeforePublication
     );
     let after = stored(&a).outgoing.unwrap();
-    assert_eq!(after.phase, xshell_hostlink::ring::store::OutgoingPhase::Cancelled);
-    assert_eq!(after.signed_candidate, outgoing.signed_candidate, "never replayed");
+    assert_eq!(
+        after.phase,
+        xshell_hostlink::ring::store::OutgoingPhase::Cancelled
+    );
+    assert_eq!(
+        after.signed_candidate, outgoing.signed_candidate,
+        "never replayed"
+    );
     // The headless machine's own obligation ends by itself too: not a member after its
     // code expired (the Daemon's maintenance loop).
     wait("standalone obligation ended", || {

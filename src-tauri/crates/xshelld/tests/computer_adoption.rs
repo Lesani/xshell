@@ -145,8 +145,14 @@ mod unix {
             let mut st = lock.lock().unwrap();
             let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
             while !st.0 {
-                assert!(std::time::Instant::now() < until, "Join never reached consent");
-                st = cv.wait_timeout(st, std::time::Duration::from_millis(50)).unwrap().0;
+                assert!(
+                    std::time::Instant::now() < until,
+                    "Join never reached consent"
+                );
+                st = cv
+                    .wait_timeout(st, std::time::Duration::from_millis(50))
+                    .unwrap()
+                    .0;
             }
         }
         fn release(&self) {
@@ -1243,7 +1249,10 @@ mod unix {
         while second.ring.membership_state().unwrap() != MembershipState::Removed
             || second.ring.chain().is_some()
         {
-            assert!(std::time::Instant::now() < until, "second never detected its removal");
+            assert!(
+                std::time::Instant::now() < until,
+                "second never detected its removal"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         // Either key of the retired unit is now a no-op.

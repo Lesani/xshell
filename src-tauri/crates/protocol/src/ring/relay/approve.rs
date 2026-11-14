@@ -23,8 +23,8 @@ use super::connector::{Connector, LinkState, ProposalConnection};
 use super::pair::{
     approve_adoption_read, AdoptionHostRequest, AdoptionRead, Cancel, PairOptions, PairPipe,
 };
-use super::remove::{publish_removal, removal_candidate, RemovalOp, RemoveError};
 pub use super::remove::Resume;
+use super::remove::{publish_removal, removal_candidate, RemovalOp, RemoveError};
 use super::{ChainPin, RingClient, RingTimeouts, VerifiedProposal};
 use crate::ring::device_code::DeviceCode;
 use crate::ring::membership::{enroll_approver, EnrollmentKind};
@@ -352,7 +352,9 @@ pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice
             cancel.as_ref(),
             |intent, hash| {
                 if !enroll_approver(connector.chain().head(), &me) {
-                    return Err(PairError::Relay("not_approver: no longer an approver".into()));
+                    return Err(PairError::Relay(
+                        "not_approver: no longer an approver".into(),
+                    ));
                 }
                 // The proposal lane needs the Connector at the accepted head (after the
                 // standalone removal, when there was one).
@@ -367,8 +369,7 @@ pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice
                     }
                     if let Ok(captured) = connector.proposal_connection() {
                         let chain = connector.chain();
-                        if chain.head() == captured.predecessor()
-                            && chain.head().version() >= after
+                        if chain.head() == captured.predecessor() && chain.head().version() >= after
                         {
                             break (chain, captured);
                         }
@@ -499,7 +500,14 @@ pub fn check_join(
         hash: record.predecessor_hash.clone(),
     };
     let me = keys.sign_key();
-    match RingClient::fetch_chain(&record.relay_url, &record.ring_id, keys, &pin, tls, timeouts) {
+    match RingClient::fetch_chain(
+        &record.relay_url,
+        &record.ring_id,
+        keys,
+        &pin,
+        tls,
+        timeouts,
+    ) {
         Ok(chain) => {
             let listed = chain.head().roster().membership().is_ok_and(|m| {
                 m.unit(&record.operation)

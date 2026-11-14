@@ -334,7 +334,11 @@ impl CompanionPolicy {
     /// its own Ring, against a predecessor that extends its retained chain and has already
     /// retired its own `Daemon` unit (the approver removed it in the same approval). Any
     /// other retained membership refuses: removal or leave comes first.
-    fn standalone_regroup(&self, trusted: &RosterChain, predecessor: &RosterChain) -> Result<(), String> {
+    fn standalone_regroup(
+        &self,
+        trusted: &RosterChain,
+        predecessor: &RosterChain,
+    ) -> Result<(), String> {
         let refuse = || "leave required before pairing an enrolled counterpart".to_string();
         if trusted.ring_id() != predecessor.ring_id() {
             return Err(refuse());

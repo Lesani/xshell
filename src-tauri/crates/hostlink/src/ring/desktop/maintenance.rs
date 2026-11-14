@@ -71,9 +71,10 @@ fn format1(stored: &ProfileState) -> bool {
             Ok(RosterChange::Upgrade { .. } | RosterChange::CompleteComputer { .. })
         )
     };
-    let journal_v1 = stored.journal.as_ref().is_some_and(|j| {
-        matches!(j.transcript, ConsentTranscript::Local) && local_v1(&j.proposal)
-    });
+    let journal_v1 = stored
+        .journal
+        .as_ref()
+        .is_some_and(|j| matches!(j.transcript, ConsentTranscript::Local) && local_v1(&j.proposal));
     let outgoing_v1 = stored
         .outgoing
         .as_ref()
@@ -104,7 +105,9 @@ impl DesktopRing {
                     .then_some(())
                     .ok_or_else(|| "changed".to_string())
             }) {
-                Ok(true) => eprintln!("xshell: a format-1 Ring was set aside; this computer is in no Ring"),
+                Ok(true) => {
+                    eprintln!("xshell: a format-1 Ring was set aside; this computer is in no Ring")
+                }
                 Ok(false) => {}
                 Err(e) => eprintln!("xshell: cannot set the format-1 Ring aside: {e}"),
             }
@@ -153,12 +156,11 @@ impl DesktopRing {
             at: now(),
         };
         let ring = evidence.ring_id().clone();
-        self.store.set_aside(AsideReason::Removed(notice), |p| {
-            match &p.membership {
+        self.store
+            .set_aside(AsideReason::Removed(notice), |p| match &p.membership {
                 Some(m) if m.chain.ring_id() == &ring => Ok(()),
                 _ => Err("membership changed".into()),
-            }
-        })?;
+            })?;
         self.forget_membership();
         self.emit();
         Ok(())
@@ -171,12 +173,13 @@ impl DesktopRing {
             self.tell_daemon_left(&stored, Some(evidence));
         }
         let ring = evidence.ring_id().clone();
-        if let Err(e) = self.store.set_aside(AsideReason::SelfRemoved, |p| {
-            match &p.membership {
+        if let Err(e) = self
+            .store
+            .set_aside(AsideReason::SelfRemoved, |p| match &p.membership {
                 Some(m) if m.chain.ring_id() == &ring => Ok(()),
                 _ => Err("membership changed".into()),
-            }
-        }) {
+            })
+        {
             eprintln!("xshell: cannot set the membership aside after removing this computer: {e}");
         }
         self.forget_membership();
@@ -234,7 +237,9 @@ impl DesktopRing {
                     };
                     match result {
                         Ok(true) => delay = RECONCILE_MAX,
-                        Ok(false) | Err(_) => delay = (delay * 2).clamp(RECONCILE_MIN, RECONCILE_MAX),
+                        Ok(false) | Err(_) => {
+                            delay = (delay * 2).clamp(RECONCILE_MIN, RECONCILE_MAX)
+                        }
                     }
                     if changed || matches!(result, Ok(true)) {
                         ring.emit();
@@ -258,8 +263,7 @@ impl DesktopRing {
 
     /// Finishing, and the reconciler cannot reach the Relay right now.
     pub fn finishing_offline(&self) -> bool {
-        self.maintenance.lock().offline
-            && self.membership_state() == Ok(MembershipState::Finishing)
+        self.maintenance.lock().offline && self.membership_state() == Ok(MembershipState::Finishing)
     }
 
     /// The Relay refused or closed this Desktop as removed, or a verified chain dropped it:
@@ -268,7 +272,9 @@ impl DesktopRing {
     /// head is unchanged (it stopped on the Relay's word). Unreachable: retried with
     /// backoff from 5 s to 5 min.
     pub(in crate::ring) fn spawn_removal_check(&self) {
-        let Some(ring) = self.me.upgrade() else { return };
+        let Some(ring) = self.me.upgrade() else {
+            return;
+        };
         // Only a format-2 Ring has removals to verify (format 1 is set aside at open).
         if self
             .lock()

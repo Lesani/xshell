@@ -113,9 +113,10 @@ pub(super) fn retire_for_format_reset(store: &Store) -> Result<(), String> {
         let from = store.dir.join("companion-pending.json");
         std::fs::rename(
             &from,
-            store
-                .dir
-                .join(format!("companion-pending.json.v1-{}", super::registry::now_ms())),
+            store.dir.join(format!(
+                "companion-pending.json.v1-{}",
+                super::registry::now_ms()
+            )),
         )
         .map_err(|e| e.to_string())?;
     }

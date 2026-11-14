@@ -262,7 +262,10 @@ fn controller(ring: &DesktopRing) -> Arc<JoinOffer> {
 fn confirm_backend(join: &JoinOffer) {
     let until = std::time::Instant::now() + Duration::from_secs(8);
     while matches!(join.join_status(), JoinStatus::Waiting) {
-        assert!(std::time::Instant::now() < until, "Join never continued by itself");
+        assert!(
+            std::time::Instant::now() < until,
+            "Join never continued by itself"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -602,10 +605,7 @@ fn actual_cli_durable_desktop_failure_is_reconciliation_not_success_backend_cons
     });
     assert_ne!(child.finish(), 0);
     assert_eq!(child.words, 1);
-    assert!(matches!(
-        join.join_status(),
-        JoinStatus::Finishing { .. }
-    ));
+    assert!(matches!(join.join_status(), JoinStatus::Finishing { .. }));
     assert!(b.paths.ring_dir.join("roster.json").exists());
     let saved: serde_json::Value = serde_json::from_slice(
         &std::fs::read(b.desktop.join("receipt-before-failure.json")).unwrap(),

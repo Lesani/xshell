@@ -189,7 +189,11 @@ pub fn standalone_unit_to_replace(
             Ok(Some(unit.id.clone()))
         }
         other => {
-            if other.identities().iter().any(|(i, _)| enrolled(&i.sign_key)) {
+            if other
+                .identities()
+                .iter()
+                .any(|(i, _)| enrolled(&i.sign_key))
+            {
                 return Err(refuse());
             }
             Ok(None)
