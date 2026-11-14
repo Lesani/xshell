@@ -1,14 +1,15 @@
-//! Computer adoption in Settings → Hosts → Ring (#87): Create ring, Join ring with its local
-//! consent, the pairing window for `xshelld pair` started on this computer, Add computer by
-//! eight words, and the explicit Ring upgrade. Commands `ring_create_computer`,
-//! `ring_join_start`, `ring_join_confirm`, `ring_join_decline`, `ring_join_cancel`,
-//! `ring_join_overview`, `ring_approve_device_code`, `ring_upgrade_computer` and
-//! `ring_leave_removed`; the events
-//! `ring:join` and `ring:focus`.
+//! Computer adoption in Settings → Ring ("Ring just works"): Create, Join (the Device Code
+//! screen; it continues by itself when another device approves, no confirmation here), the
+//! code screen for `xshelld pair` started on this computer, and Add a machine by eight
+//! words. Commands `ring_create_computer`, `ring_join_start`, `ring_join_cancel`,
+//! `ring_join_overview` and `ring_approve_device_code`; the event `ring:join`.
 //!
 //! The Device Code words leave Rust exactly once, in the `ring_join_start` reply. They are
-//! never logged, persisted, put in an event or in an error. The confirmation lease never
-//! crosses IPC: it stays in [`JoinEntry`] and the frontend only names the operation.
+//! never logged, persisted, put in an event or in an error.
+//!
+//! Shown words are cancelled when the code screen is left (`ring_join_cancel`), the window
+//! is closed, or another xshell window takes over. Losing OS focus, minimising or locking
+//! does not cancel them.
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager as _};
 use uuid::Uuid;
 use xshell_hostlink::ring::adoption::{
-    ApprovalReadiness, ConsentPreview, CreateConfirmationLease, JoinOffer, JoinStatus,
+    ConsentPreview, CreateConfirmationLease, JoinOffer, JoinStatus, MembershipState,
 };
 use xshell_protocol::ring::device_code::DeviceCode;
 use xshell_protocol::ring::Roster;
@@ -36,34 +37,19 @@ pub enum JoinOrigin {
 #[serde(rename_all = "camelCase")]
 pub enum JoinState {
     Waiting,
-    AwaitingConfirmation,
     Completing,
     Installed,
-    Declined,
+    /// Being finished automatically after a crash or a lost answer ("Finishing…").
+    Finishing,
     Expired,
-    Failed,
-    ReconciliationRequired,
     Cancelled,
+    Failed,
 }
 
 impl JoinState {
     pub fn terminal(self) -> bool {
-        !matches!(
-            self,
-            JoinState::Waiting | JoinState::AwaitingConfirmation | JoinState::Completing
-        )
+        !matches!(self, JoinState::Waiting | JoinState::Completing)
     }
-}
-
-/// What the consent card shows. No keys, no words, no lease.
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct JoinPreview {
-    pub ring_id: String,
-    pub ring_short: String,
-    pub approver: Option<String>,
-    pub computer: String,
-    pub expires_at: u64,
 }
 
 /// The `ring:join` event and the rows of `ring_join_overview`.
@@ -73,8 +59,6 @@ pub struct JoinEvent {
     pub operation: Uuid,
     pub origin: JoinOrigin,
     pub state: JoinState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<JoinPreview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub expires_at: u64,
@@ -113,7 +97,7 @@ impl Serialize for JoinStarted {
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinOverview {
-    /// `platform`, `in-process` or `not-registered`.
+    /// `platform` or `not-registered`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<&'static str>,
     pub owner: bool,
@@ -140,16 +124,12 @@ pub fn join_state(
 ) -> (JoinState, Option<String>) {
     match status {
         JoinStatus::Waiting => (JoinState::Waiting, None),
-        JoinStatus::AwaitingConfirmation(_) => (JoinState::AwaitingConfirmation, None),
         JoinStatus::Completing => (JoinState::Completing, None),
         JoinStatus::Installed { .. } => (JoinState::Installed, None),
-        JoinStatus::Declined => (JoinState::Declined, None),
+        JoinStatus::Finishing { error } => (JoinState::Finishing, Some(error.clone())),
         JoinStatus::Failed { .. } if cancelled => (JoinState::Cancelled, None),
         JoinStatus::Failed { .. } if now >= expires_at => (JoinState::Expired, None),
         JoinStatus::Failed { error } => (JoinState::Failed, Some(error.clone())),
-        JoinStatus::ReconciliationRequired { error } => {
-            (JoinState::ReconciliationRequired, Some(error.clone()))
-        }
     }
 }
 
@@ -180,26 +160,6 @@ pub fn scrub(text: &str, code: &DeviceCode) -> String {
     out
 }
 
-/// The approving device: the proposal's signer.
-pub fn approver_name(proposal: &Roster) -> Option<String> {
-    proposal
-        .members
-        .iter()
-        .find(|m| m.sign_key == proposal.signed_by)
-        .map(|m| m.name.clone())
-}
-
-pub fn preview_of(p: &ConsentPreview) -> JoinPreview {
-    let ring_id = p.ring_id.to_string();
-    JoinPreview {
-        ring_short: ring_id.chars().take(8).collect(),
-        ring_id,
-        approver: approver_name(&p.proposal),
-        computer: p.profile.desktop.name.clone(),
-        expires_at: p.expires_at,
-    }
-}
-
 /// The names of the members in `after` that `before` did not have.
 pub fn new_member_names(before: Option<&Roster>, after: &Roster) -> Vec<String> {
     after
@@ -210,45 +170,75 @@ pub fn new_member_names(before: Option<&Roster>, after: &Roster) -> Vec<String> 
         .collect()
 }
 
-/// `ring_approve_device_code`'s error: `invalid_code|not_approver|reconciliation_required|busy|
-/// other_window|other` first, then the backend's text (which never holds the words).
-pub fn approve_error(error: &str) -> String {
-    const CODES: [&str; 5] = [
-        "invalid_code",
-        "not_approver",
-        "reconciliation_required",
-        "busy",
-        "other_window",
-    ];
-    if CODES.iter().any(|c| error.starts_with(c)) {
-        return error.to_string();
-    }
-    let code = if error == "another adoption operation is active" {
-        "busy"
-    } else if error.starts_with("another process owns") {
-        "other_window"
-    } else if error.contains("approval requires") || error.contains("no retained approver profile")
-    {
-        "not_approver"
-    } else {
-        "other"
-    };
-    format!("{code}: {error}")
+/// The error codes `ring_approve_device_code` reports, first in `code: detail`.
+pub const APPROVE_CODES: [&str; 13] = [
+    "invalid_code",
+    "not_found",
+    "already_used",
+    "closed",
+    "expired",
+    "not_approver",
+    "busy",
+    "other_window",
+    "finishing",
+    "offline",
+    "conflict",
+    "cancelled",
+    "uncertain",
+];
+
+fn has_code(error: &str, codes: &[&str]) -> bool {
+    codes
+        .iter()
+        .any(|c| error.strip_prefix(c).is_some_and(|rest| rest.starts_with(':')))
 }
 
-/// A Create/Join/Upgrade start error: a local Host that is registered but not serving yet
-/// (first run, Daemon still starting) is `not_registered:` like a missing registration, so
-/// the page shows "not ready yet" instead of a socket error. Other errors pass unchanged.
+/// `ring_approve_device_code`'s error: one of [`APPROVE_CODES`] (else `other`), then the
+/// backend's text (which never holds the words).
+pub fn approve_error(error: &str) -> String {
+    if has_code(error, &APPROVE_CODES) {
+        return error.to_string();
+    }
+    format!("other: {error}")
+}
+
+/// The error codes Create and Join report, first in `code: detail`.
+pub const START_CODES: [&str; 9] = [
+    "not_registered",
+    "busy",
+    "other_window",
+    "finishing",
+    "already_member",
+    "invalid_relay",
+    "unavailable",
+    "cancelled",
+    "offline",
+];
+
+/// A Create/Join start error in `code: detail` form: a local Host that is registered but
+/// not serving yet (first run, Daemon still starting) is `not_registered:`; an unreachable
+/// Relay is `offline:`; another admission is `busy:`.
 pub fn start_error(error: String) -> String {
     const NOT_READY: [&str; 2] = [
         "protected counterpart unavailable",
         "protected counterpart readiness unavailable",
     ];
     if NOT_READY.iter().any(|p| error.starts_with(p)) {
-        format!("not_registered: {error}")
-    } else {
-        error
+        return format!("not_registered: {error}");
     }
+    if has_code(&error, &START_CODES) {
+        return error;
+    }
+    if error == "another adoption operation is active" {
+        return format!("busy: {error}");
+    }
+    if error.starts_with("another process owns") {
+        return format!("other_window: {error}");
+    }
+    if error.starts_with("relay") || error.contains("timed out") {
+        return format!("offline: {error}");
+    }
+    format!("other: {error}")
 }
 
 /// The local Host's client once it is registered and its endpoint exists (Unix: the socket
@@ -265,32 +255,14 @@ fn ready_local_client(
     Ok(client)
 }
 
-/// `RingStatus.approval`.
-pub fn approval_text(readiness: ApprovalReadiness, local_available: bool) -> &'static str {
-    match readiness {
-        ApprovalReadiness::Ready => "ready",
-        ApprovalReadiness::NeedsUpgrade | ApprovalReadiness::NeedsCompletion
-            if !local_available =>
-        {
-            "unavailable"
-        }
-        ApprovalReadiness::NeedsUpgrade => "needs-upgrade",
-        ApprovalReadiness::NeedsCompletion => "needs-completion",
-        ApprovalReadiness::Unresolved => "unresolved",
-        ApprovalReadiness::Removed => "removed",
-        ApprovalReadiness::NoProfile | ApprovalReadiness::NotEnrolled => "none",
+/// `RingStatus.membership`.
+pub fn membership_text(state: MembershipState) -> &'static str {
+    match state {
+        MembershipState::None => "none",
+        MembershipState::Member => "member",
+        MembershipState::Finishing => "finishing",
+        MembershipState::Removed => "removed",
     }
-}
-
-/// The joins to cancel when this process's window loses focus (BINDING AMENDMENT 3): every
-/// GUI join and start. Each xshell window is its own process, so losing focus covers
-/// switching to another xshell window. CLI-started offers belong to the terminal.
-pub fn gui_joins_to_cancel_on_blur(entries: &[(Uuid, JoinOrigin)]) -> Vec<Uuid> {
-    entries
-        .iter()
-        .filter(|(_, origin)| *origin == JoinOrigin::Gui)
-        .map(|(op, _)| *op)
-        .collect()
 }
 
 // ── The registry ──────────────────────────────────────────────────────────
@@ -298,8 +270,6 @@ pub fn gui_joins_to_cancel_on_blur(entries: &[(Uuid, JoinOrigin)]) -> Vec<Uuid> 
 pub struct JoinEntry {
     pub origin: JoinOrigin,
     offer: Arc<JoinOffer>,
-    lease: Mutex<Option<(String, CreateConfirmationLease)>>,
-    preview: Mutex<Option<JoinPreview>>,
     cancelled: AtomicBool,
     last: Mutex<Option<JoinEvent>>,
 }
@@ -309,44 +279,23 @@ impl JoinEntry {
         Self {
             origin,
             offer,
-            lease: Mutex::new(None),
-            preview: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             last: Mutex::new(None),
         }
     }
 
-    /// The current event; takes the lease once the verified preview is up.
+    /// The current event.
     fn observe(&self, operation: Uuid, now: u64) -> JoinEvent {
-        let status = self.offer.join_status();
-        if matches!(status, JoinStatus::AwaitingConfirmation(_)) {
-            let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
-            if lease.is_none() {
-                if let Ok((p, l)) = self.offer.await_consent(std::time::Duration::ZERO) {
-                    *self.preview.lock().unwrap_or_else(|e| e.into_inner()) = Some(preview_of(&p));
-                    *lease = Some((p.proposal_hash.clone(), l));
-                }
-            }
-        }
         let (state, error) = join_state(
-            &status,
+            &self.offer.join_status(),
             self.cancelled.load(Ordering::Acquire),
             self.offer.expires_at,
             now,
         );
-        let preview = match state {
-            JoinState::AwaitingConfirmation | JoinState::Completing => self
-                .preview
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-            _ => None,
-        };
         JoinEvent {
             operation,
             origin: self.origin,
             state,
-            preview,
             error: error.map(|e| scrub(&e, &self.offer.code)),
             expires_at: self.offer.expires_at,
         }
@@ -354,9 +303,6 @@ impl JoinEntry {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some((_, lease)) = &*self.lease.lock().unwrap_or_else(|e| e.into_inner()) {
-            lease.cancel();
-        }
         self.offer.cancel_join();
     }
 }
@@ -432,6 +378,7 @@ impl JoinRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn get(&self, operation: Uuid) -> Option<Arc<JoinEntry>> {
         self.lock().entries.get(&operation).cloned()
     }
@@ -456,24 +403,6 @@ impl JoinRegistry {
             }
         }
         new
-    }
-
-    /// The window lost focus: cancels every GUI start and join.
-    pub fn cancel_on_blur(&self) -> Vec<Uuid> {
-        let rows: Vec<(Uuid, JoinOrigin)> = {
-            let inner = self.lock();
-            inner
-                .entries
-                .iter()
-                .map(|(op, e)| (*op, e.origin))
-                .chain(inner.starting.keys().map(|op| (*op, JoinOrigin::Gui)))
-                .collect()
-        };
-        let ops = gui_joins_to_cancel_on_blur(&rows);
-        for op in &ops {
-            self.cancel(*op);
-        }
-        ops
     }
 
     fn events(&self) -> Vec<JoinEvent> {
@@ -543,59 +472,40 @@ pub fn track_cli_joins(app: &AppHandle, ring: &xshell_hostlink::ring::DesktopRin
     }
 }
 
-/// This window lost focus: its GUI codes die (switching to another window, BINDING
-/// AMENDMENT 3).
-pub fn window_blurred<R: tauri::Runtime>(app: &AppHandle<R>) {
-    if let Some(state) = app.try_state::<RingState>() {
-        state.joins.cancel_on_blur();
-    }
-}
+/// This window lost OS focus. Shown words stay valid: losing focus, minimising or locking
+/// does not cancel them (only leaving the code screen, closing the window, or another
+/// window taking over does).
+pub fn window_blurred<R: tauri::Runtime>(_app: &AppHandle<R>) {}
 
-fn local_in_process(app: &AppHandle) -> bool {
-    app.try_state::<crate::hosts::Hosts>().is_some_and(|h| {
-        matches!(
-            h.local_mode,
-            crate::hosts::local::LocalMode::InProcess { .. }
-        )
-    })
-}
-
-/// Recomputes `RingStatus.approval` and stores it for `status_of`. Never from inside the
-/// RingObserver callback (it reads the store).
+/// Recomputes `RingStatus.membership` and `busy` and stores them for `status_of`. Never
+/// from inside the RingObserver callback (it reads the store).
 pub fn refresh_approval(app: &AppHandle) -> &'static str {
     let Some(state) = app.try_state::<RingState>() else {
         return "none";
     };
-    let local = cfg!(unix) && !local_in_process(app);
     let text = state
         .worker
         .ring
-        .approval_readiness()
-        .map(|r| approval_text(r, local))
+        .membership_state()
+        .map(membership_text)
         .unwrap_or("none");
-    *state.approval.lock().unwrap_or_else(|e| e.into_inner()) = text;
-    *state.format.lock().unwrap_or_else(|e| e.into_inner()) =
-        state.worker.ring.ring_format().ok().flatten();
+    *state.membership.lock().unwrap_or_else(|e| e.into_inner()) = text;
     *state.busy.lock().unwrap_or_else(|e| e.into_inner()) = state.worker.ring.adoption_busy();
     text
 }
 
-fn ensure_local(app: &AppHandle) -> Result<(), String> {
+fn ensure_local() -> Result<(), String> {
     if !cfg!(unix) {
         return Err("unavailable: platform".into());
-    }
-    if local_in_process(app) {
-        return Err("unavailable: in-process".into());
     }
     Ok(())
 }
 
+/// The Create click is the local consent for exactly the genesis the backend presents.
 fn confirm_local(
     p: &ConsentPreview,
     lease: &CreateConfirmationLease,
 ) -> Result<xshell_hostlink::ring::adoption::CreateDecision, String> {
-    // The click on Create ring / Upgrade Ring is the explicit local consent for exactly the
-    // preview the backend presents.
     Ok(xshell_hostlink::ring::adoption::CreateDecision::Confirm(
         lease.confirm(&p.proposal_hash)?,
     ))
@@ -626,7 +536,7 @@ pub async fn ring_create_computer(
     relay_url: Option<String>,
 ) -> Result<RingStatus, String> {
     let w = worker(&app)?;
-    ensure_local(&app)?;
+    ensure_local()?;
     let relay = chosen_relay(relay_url)?;
     run(move || {
         let client = ready_local_client(&w.ring)?;
@@ -638,7 +548,7 @@ pub async fn ring_create_computer(
         match outcome {
             xshell_hostlink::ring::adoption::AdoptionOutcome::Installed { .. } => {}
             xshell_hostlink::ring::adoption::AdoptionOutcome::Declined { .. } => {
-                return Err("declined".into())
+                return Err("cancelled: Create cancelled".into())
             }
         }
         HOST_SYNC.poke_all();
@@ -657,7 +567,7 @@ pub async fn ring_join_start(
     relay_url: Option<String>,
 ) -> Result<JoinStarted, String> {
     let w = worker(&app)?;
-    ensure_local(&app)?;
+    ensure_local()?;
     let relay = chosen_relay(relay_url)?;
     let joins = app
         .try_state::<RingState>()
@@ -700,35 +610,6 @@ pub async fn ring_join_start(
     .await
 }
 
-fn entry_of(app: &AppHandle, operation: Uuid) -> Result<Arc<JoinEntry>, String> {
-    app.try_state::<RingState>()
-        .and_then(|s| s.joins.get(operation))
-        .ok_or_else(|| "not_found: this Join has ended".to_string())
-}
-
-/// Confirm on the consent card: the lease taken for the presented preview, never one from IPC.
-#[tauri::command]
-pub async fn ring_join_confirm(app: AppHandle, operation: Uuid) -> Result<(), String> {
-    let entry = entry_of(&app, operation)?;
-    run(move || {
-        let confirmation = {
-            let lease = entry.lease.lock().unwrap_or_else(|e| e.into_inner());
-            let (hash, lease) = lease
-                .as_ref()
-                .ok_or("not_ready: no verified request to confirm")?;
-            lease.confirm(hash)?
-        };
-        entry.offer.confirm_join(confirmation)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn ring_join_decline(app: AppHandle, operation: Uuid) -> Result<(), String> {
-    let entry = entry_of(&app, operation)?;
-    run(move || entry.offer.decline_join()).await
-}
-
 /// Leaving the Join screen: the code dies with it. No-op for CLI-started offers.
 #[tauri::command]
 pub async fn ring_join_cancel(app: AppHandle, operation: Uuid) -> Result<(), String> {
@@ -744,8 +625,6 @@ pub async fn ring_join_overview(app: AppHandle) -> Result<JoinOverview, String> 
     run(move || {
         let unavailable = if !cfg!(unix) {
             Some("platform")
-        } else if local_in_process(&app) {
-            Some("in-process")
         } else if ready_local_client(&w.ring).is_err() {
             Some("not-registered")
         } else {
@@ -787,66 +666,6 @@ pub async fn ring_approve_device_code(
             names: new_member_names(before.as_ref(), head.roster()),
             version: head.version(),
         })
-    })
-    .await
-}
-
-/// Upgrade Ring: a retained v1 Ring is upgraded and this Computer completed; one click is the
-/// consent for both. A v2 Ring that only needs completion is completed.
-#[tauri::command]
-pub async fn ring_upgrade_computer(app: AppHandle) -> Result<RingStatus, String> {
-    let w = worker(&app)?;
-    ensure_local(&app)?;
-    run(move || {
-        let readiness = w.ring.approval_readiness()?;
-        let result = (|| match readiness {
-            ApprovalReadiness::Ready => Ok(()),
-            ApprovalReadiness::Unresolved => {
-                Err("reconciliation_required: earlier Ring work is unresolved".to_string())
-            }
-            ApprovalReadiness::NoProfile | ApprovalReadiness::NotEnrolled => {
-                Err("not_enrolled: this Desktop is not in a Ring".to_string())
-            }
-            ApprovalReadiness::Removed => {
-                Err("not_enrolled: this Desktop is no longer a member of its Ring".to_string())
-            }
-            ApprovalReadiness::NeedsUpgrade => {
-                let client = ready_local_client(&w.ring)?;
-                w.ring
-                    .upgrade_retained_ring(&client, confirm_local)
-                    .map_err(start_error)?;
-                w.ring.finish_retained_computer(&client, confirm_local)?;
-                Ok(())
-            }
-            ApprovalReadiness::NeedsCompletion => {
-                let client = ready_local_client(&w.ring)?;
-                w.ring
-                    .finish_retained_computer(&client, confirm_local)
-                    .map_err(start_error)?;
-                Ok(())
-            }
-        })();
-        HOST_SYNC.poke_all();
-        refresh_approval(&app);
-        result.map(|()| status_of(&app, w.ring.view()))
-    })
-    .await
-}
-
-/// Leave this Ring: only after another device removed this computer (approval `removed`).
-/// Local-only cleanup of both identities' membership; the old Ring is not contacted.
-#[tauri::command]
-pub async fn ring_leave_removed(app: AppHandle) -> Result<RingStatus, String> {
-    let w = worker(&app)?;
-    ensure_local(&app)?;
-    run(move || {
-        let result = w
-            .ring
-            .local_companion_client()
-            .and_then(|client| w.ring.leave_removed(&client).map_err(start_error));
-        HOST_SYNC.poke_all();
-        refresh_approval(&app);
-        result.map(|()| status_of(&app, w.ring.view()))
     })
     .await
 }
@@ -909,40 +728,31 @@ mod tests {
     fn join_event_is_camel_case_and_has_no_words() {
         let code = fixed_code();
         assert!(!words_in(
-            "operation origin cli gui state awaitingConfirmation preview ringId ringShort approver computer expiresAt error relay laptop desk",
+            "operation origin cli gui state finishing completing expiresAt error relay",
             &code
         ));
         let event = JoinEvent {
             operation: Uuid::from_u128(7),
             origin: JoinOrigin::Cli,
-            state: JoinState::AwaitingConfirmation,
-            preview: Some(JoinPreview {
-                ring_id: "abcdefghijkl".into(),
-                ring_short: "abcdefgh".into(),
-                approver: Some("desk".into()),
-                computer: "laptop".into(),
-                expires_at: 9,
-            }),
+            state: JoinState::Finishing,
             error: Some(scrub(&format!("relay: {}", code.format().as_str()), &code)),
             expires_at: 9,
         };
         let v = serde_json::to_value(&event).unwrap();
-        assert_eq!(v["state"], "awaitingConfirmation");
+        assert_eq!(v["state"], "finishing");
         assert_eq!(v["origin"], "cli");
         assert_eq!(v["expiresAt"], 9);
-        assert_eq!(v["preview"]["ringShort"], "abcdefgh");
-        assert_eq!(v["preview"]["expiresAt"], 9);
+        assert!(v.get("preview").is_none(), "no consent preview any more");
         assert!(v.get("words").is_none());
         assert!(!words_in(&v.to_string(), &code), "an event carries a word");
-        let reconcile = JoinEvent {
-            state: JoinState::ReconciliationRequired,
-            preview: None,
+        let waiting = JoinEvent {
+            state: JoinState::Waiting,
             error: None,
             ..event
         };
-        let v = serde_json::to_value(&reconcile).unwrap();
-        assert_eq!(v["state"], "reconciliationRequired");
-        assert!(v.get("preview").is_none() && v.get("error").is_none());
+        let v = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(v["state"], "waiting");
+        assert!(v.get("error").is_none());
     }
 
     #[test]
@@ -985,24 +795,17 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_and_declined_mapping() {
+    fn join_state_maps_every_status() {
         assert_eq!(
             join_state(
-                &JoinStatus::ReconciliationRequired {
-                    error: "reconciliation_required: x".into()
+                &JoinStatus::Finishing {
+                    error: "finishing: x".into()
                 },
                 true,
                 100,
                 200
             ),
-            (
-                JoinState::ReconciliationRequired,
-                Some("reconciliation_required: x".into())
-            )
-        );
-        assert_eq!(
-            join_state(&JoinStatus::Declined, false, 100, 200),
-            (JoinState::Declined, None)
+            (JoinState::Finishing, Some("finishing: x".into()))
         );
         assert_eq!(
             join_state(&JoinStatus::Installed { version: 2 }, false, 100, 200),
@@ -1012,17 +815,29 @@ mod tests {
             join_state(&JoinStatus::Completing, false, 100, 200),
             (JoinState::Completing, None)
         );
+        assert_eq!(
+            join_state(&JoinStatus::Waiting, false, 100, 50),
+            (JoinState::Waiting, None)
+        );
         assert!(!JoinState::Completing.terminal());
-        assert!(!JoinState::AwaitingConfirmation.terminal());
+        assert!(!JoinState::Waiting.terminal());
         for s in [
             JoinState::Installed,
-            JoinState::Declined,
+            JoinState::Finishing,
             JoinState::Expired,
             JoinState::Failed,
-            JoinState::ReconciliationRequired,
             JoinState::Cancelled,
         ] {
             assert!(s.terminal());
+        }
+        for (state, text) in [
+            (JoinState::Completing, "completing"),
+            (JoinState::Installed, "installed"),
+            (JoinState::Expired, "expired"),
+            (JoinState::Cancelled, "cancelled"),
+            (JoinState::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), text);
         }
     }
 
@@ -1044,7 +859,6 @@ mod tests {
                     operation,
                     origin: JoinOrigin::Gui,
                     state,
-                    preview: None,
                     error: None,
                     expires_at: 1,
                 },
@@ -1076,25 +890,21 @@ mod tests {
         assert!(registry.get(op).is_none());
         // Unknown operations: no-op.
         registry.cancel(Uuid::from_u128(2));
-        // Losing focus cancels a GUI start.
-        let other = registry.reserve(Uuid::from_u128(3)).unwrap();
-        assert_eq!(registry.cancel_on_blur(), vec![Uuid::from_u128(3)]);
-        assert!(other.load(Ordering::Acquire));
     }
 
     #[test]
-    fn blur_cancels_every_gui_join_and_no_cli_offer() {
-        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
-        let rows = [
-            (a, JoinOrigin::Gui),
-            (b, JoinOrigin::Cli),
-            (c, JoinOrigin::Gui),
-        ];
-        assert_eq!(gui_joins_to_cancel_on_blur(&rows), vec![a, c]);
-        assert_eq!(
-            gui_joins_to_cancel_on_blur(&[(b, JoinOrigin::Cli)]),
-            Vec::<Uuid>::new()
-        );
+    fn losing_focus_cancels_nothing() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let registry = Arc::new(JoinRegistry::default());
+        let op = Uuid::from_u128(3);
+        let flag = registry.reserve(op).unwrap();
+        // No RingState is managed in this mock app; the call must be a pure no-op anyway.
+        window_blurred(app.handle());
+        assert!(!flag.load(Ordering::Acquire), "OS focus loss must not cancel words");
+        registry.cancel(op);
+        assert!(flag.load(Ordering::Acquire), "leaving the code screen cancels");
     }
 
     #[test]
@@ -1111,16 +921,6 @@ mod tests {
     }
 
     #[test]
-    fn approver_is_the_member_that_signed_the_proposal() {
-        let (signer, daemon) = (key(1), key(2));
-        let r = roster(&signer, &[("approver host", &daemon)]);
-        assert_eq!(approver_name(&r).as_deref(), Some("approver desk"));
-        let mut foreign = r.clone();
-        foreign.signed_by = key(3).sign_key();
-        assert_eq!(approver_name(&foreign), None);
-    }
-
-    #[test]
     fn host_not_serving_yet_is_not_registered() {
         for raw in [
             "protected counterpart unavailable: No such file or directory (os error 2)",
@@ -1132,34 +932,29 @@ mod tests {
             assert!(mapped.ends_with(raw));
         }
         for kept in [
-            "reconciliation_required: unresolved",
-            "another adoption operation is active",
-            "declined",
+            "finishing: an earlier Join is being finished",
+            "already_member: this computer is already in a Ring",
+            "offline: relay unreachable",
+            "other_window: another window owns Create",
         ] {
             assert_eq!(start_error(kept.to_string()), kept);
         }
+        assert_eq!(
+            start_error("another adoption operation is active".into()),
+            "busy: another adoption operation is active"
+        );
+        assert!(start_error("something else".into()).starts_with("other: "));
     }
 
     #[test]
     fn approve_error_codes() {
-        assert_eq!(
-            approve_error("another adoption operation is active"),
-            "busy: another adoption operation is active"
-        );
-        assert!(approve_error("another process owns approval").starts_with("other_window: "));
-        assert!(
-            approve_error("approval requires enrolled membership").starts_with("not_approver: ")
-        );
-        assert!(
-            approve_error("approval requires an authorized v2 Computer Desktop")
-                .starts_with("not_approver: ")
-        );
-        assert!(approve_error("no retained approver profile").starts_with("not_approver: "));
-        assert_eq!(
-            approve_error("reconciliation_required: an earlier proposal is unresolved"),
-            "reconciliation_required: an earlier proposal is unresolved"
-        );
+        for code in APPROVE_CODES {
+            let e = format!("{code}: detail");
+            assert_eq!(approve_error(&e), e);
+        }
         assert!(approve_error("nobody is waiting with this code").starts_with("other: "));
+        // A code must be followed by its colon, not just be a prefix of a word.
+        assert!(approve_error("closedness").starts_with("other: "));
     }
 
     #[test]
@@ -1201,16 +996,10 @@ mod tests {
     }
 
     #[test]
-    fn approval_status_text() {
-        use ApprovalReadiness::*;
-        assert_eq!(approval_text(Ready, true), "ready");
-        assert_eq!(approval_text(NeedsUpgrade, true), "needs-upgrade");
-        assert_eq!(approval_text(NeedsCompletion, true), "needs-completion");
-        assert_eq!(approval_text(NeedsUpgrade, false), "unavailable");
-        assert_eq!(approval_text(Unresolved, true), "unresolved");
-        assert_eq!(approval_text(Removed, true), "removed");
-        assert_eq!(approval_text(Removed, false), "removed");
-        assert_eq!(approval_text(NotEnrolled, true), "none");
-        assert_eq!(approval_text(NoProfile, false), "none");
+    fn membership_status_text() {
+        assert_eq!(membership_text(MembershipState::None), "none");
+        assert_eq!(membership_text(MembershipState::Member), "member");
+        assert_eq!(membership_text(MembershipState::Finishing), "finishing");
+        assert_eq!(membership_text(MembershipState::Removed), "removed");
     }
 }
