@@ -1072,3 +1072,72 @@ fn test_monotonic_deadline() -> u64 {
         .unwrap()
     })
 }
+
+/// #87 review P2 (re-review): startup registration through the actual registration-only
+/// child cannot recover an earlier never-approved Join (the helper refuses Cancel/Status),
+/// and must not hide it as success. Recovery runs separately once a normal Daemon serves:
+/// the reservation is retired, and Join is available again.
+#[test]
+fn helper_startup_then_normal_daemon_recovers_a_lost_owners_waiting_join() {
+    let relay = workerd::Relay::start();
+    let f = Fixture::new();
+    let mut cfg = DesktopRingConfig::new(f.desktop.clone(), "local computer".into());
+    cfg.owner_retry = Duration::from_millis(20);
+    cfg.default_relay_url = relay.url();
+    let ring = DesktopRing::open(cfg.clone(), Arc::new(Quiet));
+    let daemon = f.daemon(bin(), xshelld::build_id::BUILD.clone());
+    ring.register_local_companion(&daemon).unwrap().unwrap();
+    // A normal Daemon serves; a code waits; the owner is lost with the Daemon gone.
+    let serve = || {
+        xshelld::server::Server::start(xshelld::server::Config::new(
+            f.home.clone(),
+            xshelld::paths::resolve(&f.home, None, Some(&f.socket)),
+        ))
+        .unwrap()
+    };
+    let server = serve();
+    let offer = ring.begin_join(&endpoint(&f)).unwrap();
+    let operation = offer.operation.clone();
+    server.stopper().shutdown();
+    assert!(server.wait_timeout(Duration::from_secs(5)).is_some());
+    ring.quit();
+    assert!(offer.wait().is_err());
+    drop(ring);
+    let pending = |f: &Fixture| {
+        xshell_hostlink::ring::store::Store::new(f.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .pending_join
+            .map(|p| p.intent.operation)
+    };
+    assert_eq!(pending(&f), Some(operation.clone()));
+    // Restart with only the registration helper: registration succeeds, recovery cannot.
+    let ring = DesktopRing::open(cfg, Arc::new(Quiet));
+    ring.register_local_companion(&daemon).unwrap().unwrap();
+    assert!(!f.socket.exists(), "no normal serve yet");
+    assert!(ring.recover_pre_proof_join().is_err());
+    assert_eq!(
+        pending(&f),
+        Some(operation.clone()),
+        "kept while unconfirmed"
+    );
+    // The normal Daemon comes up: the same retry now completes the fenced recovery.
+    let _server = serve();
+    wait(|| ring.recover_pre_proof_join().unwrap_or(false));
+    assert_eq!(pending(&f), None);
+    assert!(
+        !ring.recover_pre_proof_join().unwrap(),
+        "nothing left to recover"
+    );
+    let fresh = ring.begin_join(&endpoint(&f)).unwrap();
+    assert_ne!(fresh.operation, operation);
+    fresh.cancel_join();
+    drop(fresh);
+    assert_no_membership_beyond_keys(&f);
+    ring.quit();
+}
+fn assert_no_membership_beyond_keys(f: &Fixture) {
+    assert!(!f.daemon_dir().join("roster.json").exists());
+}

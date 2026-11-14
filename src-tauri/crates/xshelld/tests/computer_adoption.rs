@@ -2086,6 +2086,8 @@ mod unix {
         guest.ring.register_companion(&guest.companion()).unwrap();
         let e = guest.ring.begin_join(&guest.companion()).err().unwrap();
         assert!(e.starts_with("reconciliation_required:"), "{e}");
+        // The Desktop's recovery retry never touches it either.
+        assert!(!guest.ring.recover_pre_proof_join().unwrap());
         assert_eq!(
             Store::new(guest.desktop.clone())
                 .load_profile()

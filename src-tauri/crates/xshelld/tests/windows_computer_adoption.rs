@@ -1267,6 +1267,8 @@ fn lost_owner_of_a_waiting_cli_code_restarts_and_can_pair_again() {
     let (ring, manager) = open_backend(&desktop, &relay);
     daemon.ensure_spawned().unwrap();
     ring.register_local_companion(&daemon).unwrap().unwrap();
+    // The Desktop's approval refresh retries recovery through the normal Daemon.
+    assert!(ring.recover_pre_proof_join().unwrap());
     let stored = xshell_hostlink::ring::store::Store::new(desktop.clone())
         .load_profile()
         .unwrap()

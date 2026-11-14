@@ -561,11 +561,27 @@ fn local_in_process(app: &AppHandle) -> bool {
 
 /// Recomputes `RingStatus.approval` and stores it for `status_of`. Never from inside the
 /// RingObserver callback (it reads the store).
+/// The last pre-proof recovery error logged (logged once, not every second).
+static LAST_RECOVERY_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 pub fn refresh_approval(app: &AppHandle) -> &'static str {
     let Some(state) = app.try_state::<RingState>() else {
         return "none";
     };
     let local = cfg!(any(unix, windows)) && !local_in_process(app);
+    // A lost owner's never-signed Join is retired as soon as a normal Daemon serves
+    // (fenced, pre-proof only); until then it stays unresolved and this retries.
+    if local {
+        if let Err(error) = state.worker.ring.recover_pre_proof_join() {
+            let mut last = LAST_RECOVERY_ERROR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() != Some(error.as_str()) {
+                eprintln!("xshell: earlier Join stays unresolved: {error}");
+                *last = Some(error);
+            }
+        }
+    }
     let text = state
         .worker
         .ring

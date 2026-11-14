@@ -447,6 +447,22 @@ impl DesktopRing {
     /// retired without membership reconciliation. Anything past `Prepared` stays an
     /// uncertainty for reconciliation. The caller holds the adoption admission, so no live
     /// driver in this process owns the operation; the elected owner excludes other ones.
+    /// A cheap local check (no IPC): a Join reservation or Pairing journal still pre-proof.
+    pub(in crate::ring) fn pre_proof_join_pending(&self) -> Result<bool, String> {
+        let Some(stored) = self.store.load_profile()?.0 else {
+            return Ok(false);
+        };
+        Ok(stored.membership.is_none()
+            && (stored
+                .pending_join
+                .as_ref()
+                .is_some_and(|p| p.retained_predecessor.is_empty())
+                || stored.journal.as_ref().is_some_and(|j| {
+                    j.phase == AdoptionPhase::Prepared
+                        && matches!(j.transcript, ConsentTranscript::Pairing { .. })
+                })))
+    }
+
     pub(in crate::ring) fn recover_pre_proof_join_admitted(
         &self,
         client: &CompanionClient,

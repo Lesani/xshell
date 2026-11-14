@@ -223,18 +223,24 @@ impl DesktopRing {
         }
         let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
         daemon
-            .with_registration_endpoint(&desktop_dir, |client| {
-                let profile = self.register_companion(client)?;
-                // Startup: a previous owner's never-signed Join is retired (fenced), so a
-                // new code can be generated; uncertainty past Prepared is kept.
-                if let Some(_admission) = self.try_reserve_adoption() {
-                    if let Err(error) = self.recover_pre_proof_join_admitted(client) {
-                        eprintln!("xshell: earlier Join stays unresolved: {error}");
-                    }
-                }
-                Ok(profile)
-            })
+            .with_registration_endpoint(&desktop_dir, |client| self.register_companion(client))
             .map(Some)
+    }
+
+    /// Fenced pre-proof Join recovery through the normal Daemon endpoint (the retained
+    /// profile's client, PID-checked on Windows), never the Unix registration-only child,
+    /// which refuses Cancel/Status. Independent of registration: the Desktop retries it
+    /// from its approval refresh until a normal Daemon serves. `Ok(true)`: an earlier
+    /// never-signed Join was retired; `Ok(false)`: nothing to recover here (or busy).
+    pub fn recover_pre_proof_join(&self) -> Result<bool, String> {
+        let Some(_admission) = self.try_reserve_adoption() else {
+            return Ok(false);
+        };
+        if !self.pre_proof_join_pending()? {
+            return Ok(false);
+        }
+        let client = self.local_companion_client()?;
+        self.recover_pre_proof_join_admitted(&client)
     }
 
     pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
