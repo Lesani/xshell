@@ -1377,8 +1377,17 @@ impl DesktopRing {
     pub(super) fn reload(&self) {
         {
             let _c = self.lock_commit();
-            if let Ok(Some(s)) = self.tx(|cur, _| Ok((None, cur))) {
-                self.adopt(s);
+            match self.tx(|cur, _| Ok((None, cur))) {
+                Ok(Some(s)) => {
+                    self.adopt(s);
+                }
+                // Another instance left the Ring (a local Leave): drop the one held here.
+                Ok(None) => {
+                    if self.lock().state.is_some() {
+                        self.drop_live_membership();
+                    }
+                }
+                Err(_) => {}
             }
         }
         self.ensure_connector();
@@ -1387,8 +1396,14 @@ impl DesktopRing {
     /// After a local Leave: the Ring held in memory is dropped and its Connector retired,
     /// as for moved-aside settings but with no recovery problem.
     pub(in crate::ring) fn forget_membership(&self) {
+        let _c = self.lock_commit();
+        self.drop_live_membership();
+    }
+
+    /// Under the commit lock: no live membership, routing or Connector (retired on its own
+    /// thread). The emit is deferred to the commit guard.
+    fn drop_live_membership(&self) {
         let retire = {
-            let _c = self.lock_commit();
             let mut l = self.lock();
             l.state = None;
             l.state_revision += 1;
@@ -4865,6 +4880,24 @@ mod tests {
             !connected(v) && v.members.iter().all(|m| m.presence.kind == "unknown")
         });
         ring.quit();
+    }
+
+    /// A local Leave committed by one instance: another instance on the same store drops
+    /// its live membership on reload instead of keeping the old Ring.
+    #[test]
+    fn follower_drops_membership_another_instance_left() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
+        a.enable(None, false).unwrap();
+        let (b, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
+        wait_view(&b, "follower enrolled", |v| v.enabled);
+        a.store.leave_removed(|_| Ok(())).unwrap();
+        a.forget_membership();
+        assert!(!a.view().enabled);
+        wait_view(&b, "follower left", |v| !v.enabled && v.problem.is_none());
+        assert!(b.chain().is_none());
+        a.quit();
+        b.quit();
     }
 
     /// First run under a loose umask (an installer made `~/.xshell/bin` 0775, the app data

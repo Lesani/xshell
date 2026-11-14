@@ -780,7 +780,10 @@ impl Persist {
             None
         };
         if let Some(hook) = self.test_hook.get() {
-            (hook.0)(uuid::Uuid::nil(), super::TestPoint::RosterCallbackAdmitted);
+            // `true` drops the callback: a Daemon that never received this roster.
+            if (hook.0)(uuid::Uuid::nil(), super::TestPoint::RosterCallbackAdmitted) {
+                return;
+            }
         }
         let mut cur = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cur.as_ref() {
@@ -1071,16 +1074,22 @@ impl Ring {
         change(store)
     }
 
-    /// Local-only Leave after this Computer was removed by another device: under the
-    /// lifecycle, runtime-chain and ring.lock order, `check` validates the registration;
-    /// a Daemon still authorized by the durable, cached or Connector chain is refused.
-    /// `roster.json` is renamed aside (`roster.json.left-<ms>`, kept as evidence), the
-    /// cached chain dropped and the Connector retired. Nothing retained: a no-op.
+    /// Local-only Leave after this Computer was removed by another device, under the
+    /// lifecycle, runtime-chain and ring.lock order. `check` validates the registration
+    /// and returns the registered Desktop key. A durable, cached or Connector chain that
+    /// still authorizes this Daemon (it missed the removal while offline) is accepted only
+    /// with `evidence`: a verified extension of that same chain whose head authorizes
+    /// neither identity and retires this Computer's unit. The settled removal is written,
+    /// `retire` durably retires the last installation authority, then `roster.json` is
+    /// renamed aside (`roster.json.left-<ms>`), the cached chain dropped and the Connector
+    /// retired. Nothing retained: only `retire` runs.
     #[cfg(any(unix, windows))]
     pub(super) fn leave_removed(
         &self,
         budget: &xshell_core::local_ipc::RequestBudget,
-        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
+        evidence: Option<&RosterChain>,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<SignKey, String>,
+        retire: impl FnOnce(&Store) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut life = budget.lock(&self.life).map_err(|e| e.to_string())?;
         if life.stopped {
@@ -1100,16 +1109,32 @@ impl Ring {
         let store = &self.persist.store;
         let _lock = store.lock_until(budget)?;
         let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
-        check(store, &keys)?;
+        let desktop = check(store, &keys)?;
         let durable = super::companion::trusted(store)?;
-        if [durable.as_ref(), cached.as_ref(), owner.as_ref()]
+        // Every retained view that still authorizes this Daemon must be superseded by the
+        // evidence; the merged removal is what is settled.
+        let mut settled: Option<RosterChain> = None;
+        for chain in [durable.as_ref(), cached.as_ref(), owner.as_ref()]
             .into_iter()
             .flatten()
-            .any(|chain| is_daemon_member(chain, &keys))
+            .filter(|chain| is_daemon_member(chain, &keys))
         {
-            return Err("not_removed: this Host is still a member of its Ring".into());
+            let evidence =
+                evidence.ok_or("not_removed: this Host is still a member of its Ring")?;
+            let merged = removal_extension(chain, evidence, &keys.sign_key(), &desktop)?;
+            if settled
+                .as_ref()
+                .is_none_or(|s| merged.head().version() > s.head().version())
+            {
+                settled = Some(merged);
+            }
         }
         budget.check().map_err(|e| e.to_string())?;
+        retire(store)?;
+        if let (Some(settled), Some(_)) = (&settled, &durable) {
+            // The left file keeps the verified removal, not the stale membership.
+            store.write_chain(settled)?;
+        }
         if durable.is_some() {
             let aside = store
                 .dir
@@ -1575,6 +1600,49 @@ fn expected(x: &JoinExpect, now: Option<(String, u64)>) -> bool {
         (Some(want), Some((id, version))) => *want == id && x.version.is_none_or(|v| v == version),
         _ => false,
     }
+}
+
+/// `evidence` as removal proof for `retained`: the same Ring, a verified extension of the
+/// retained ancestry (every successor signed and authorized by the chain rules), whose
+/// head authorizes neither this Daemon nor its registered Desktop and, on a v2 Ring,
+/// retires the unit that held this Daemon. Returns the merged chain.
+#[cfg(any(unix, windows))]
+fn removal_extension(
+    retained: &RosterChain,
+    evidence: &RosterChain,
+    daemon: &SignKey,
+    desktop: &SignKey,
+) -> Result<RosterChain, String> {
+    if evidence.ring_id() != retained.ring_id() {
+        return Err("removal evidence is for another Ring".into());
+    }
+    let (merged, _) = retained
+        .extended(evidence.versions())
+        .map_err(|e| format!("removal evidence does not extend retained membership: {e}"))?;
+    if merged.head().version() <= retained.head().version()
+        || merged.authorized_member(daemon).is_some()
+        || merged.authorized_member(desktop).is_some()
+    {
+        return Err("removal evidence does not remove this Computer".into());
+    }
+    let head = retained.head().roster();
+    if head.v == 2 {
+        let unit = head
+            .membership()
+            .map_err(|e| e.to_string())?
+            .unit_for(daemon)
+            .map(|u| u.id.clone());
+        let retired = merged
+            .head()
+            .roster()
+            .membership()
+            .map_err(|e| e.to_string())?
+            .retired;
+        if unit.is_some_and(|id| !retired.contains(&id)) {
+            return Err("removal evidence does not retire this Computer".into());
+        }
+    }
+    Ok(merged)
 }
 
 pub(crate) fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {

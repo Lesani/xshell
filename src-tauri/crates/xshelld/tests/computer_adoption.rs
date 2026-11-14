@@ -82,6 +82,16 @@ mod unix {
                 config,
             }
         }
+        /// The Daemon restarts over the same home (the Desktop keeps running).
+        fn restart_daemon(&mut self) {
+            self.daemon.stopper().shutdown();
+            assert!(self
+                .daemon
+                .wait_timeout(std::time::Duration::from_secs(5))
+                .is_some());
+            let paths = xshelld::paths::resolve(self._home.path(), None, None);
+            self.daemon = Server::start(Config::new(self._home.path().into(), paths)).unwrap();
+        }
         /// The Desktop restarts over the same store (the Daemon keeps running).
         fn restart_desktop(&mut self) {
             self.ring.quit();
@@ -1410,9 +1420,39 @@ mod unix {
         assert!(refused.starts_with("not_removed:"), "{refused}");
         let refused = second
             .companion()
-            .request(CompanionRequest::LeaveRemoved)
+            .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
             .unwrap_err();
         assert!(refused.starts_with("not_removed:"), "{refused}");
+        // The current membership is no removal evidence.
+        let refused = second
+            .companion()
+            .request(CompanionRequest::LeaveRemoved {
+                rosters: joined
+                    .versions()
+                    .iter()
+                    .map(|r| r.token().to_string())
+                    .collect(),
+            })
+            .unwrap_err();
+        assert!(refused.contains("does not remove"), "{refused}");
+        // The Join's accepted install authority, for the replay checks after Leave.
+        let operation = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .journal
+            .unwrap()
+            .intent
+            .operation;
+        let replay = || CompanionRequest::InstallAccepted {
+            operation: operation.clone(),
+            rosters: joined
+                .versions()
+                .iter()
+                .map(|r| r.token().to_string())
+                .collect(),
+        };
         assert!(second.daemon_dir.join("roster.json").exists());
         // Another device removes the whole Computer.
         let removed = original.ring.remove_member(&daemon2).unwrap();
@@ -1443,7 +1483,7 @@ mod unix {
         assert!(matches!(
             second
                 .companion()
-                .request(CompanionRequest::LeaveRemoved)
+                .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
                 .unwrap(),
             CompanionResponse::Left
         ));
@@ -1475,6 +1515,15 @@ mod unix {
         assert!(left(&second.desktop, "ring.json.left-"));
         assert!(left(&second.daemon_dir, "roster.json.left-"));
         assert!(second.ring.leave_removed(&second.companion()).is_err());
+        // The departed Ring's accepted install cannot be replayed, before or after a
+        // Daemon restart.
+        let refused = second.companion().request(replay()).unwrap_err();
+        assert!(refused.contains("unknown companion operation"), "{refused}");
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        second.restart_daemon();
+        let refused = second.companion().request(replay()).unwrap_err();
+        assert!(refused.contains("unknown companion operation"), "{refused}");
+        assert!(!second.daemon_dir.join("roster.json").exists());
         // No Relay contact: the old Ring is unchanged.
         assert_eq!(
             relay_version(&relay.target(), removed.ring_id()),
@@ -1504,6 +1553,103 @@ mod unix {
             ApprovalReadiness::Ready
         );
         assert_eq!(relay_version(&relay.target(), removed.ring_id()), 3);
+    }
+    /// The Daemon was offline when its Computer was removed, so its own Roster still
+    /// authorizes it. Leave carries the Desktop's verified removal as evidence; forged,
+    /// unrelated and non-removing evidence is refused.
+    #[test]
+    fn offline_daemon_leaves_with_verified_removal_evidence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use xshell_hostlink::ring::ApprovalReadiness;
+        use xshell_protocol::ring::companion::CompanionRequest;
+        let relay = Relay::start();
+        let original = Computer::new(&relay);
+        runtime2_create(&original);
+        let offline = Arc::new(AtomicBool::new(false));
+        let dropping = offline.clone();
+        let hook = xshelld::server::TestHook(Arc::new(move |_, point| {
+            point == xshelld::server::TestPoint::RosterCallbackAdmitted
+                && dropping.load(Ordering::SeqCst)
+        }));
+        let second = Computer::build(&relay.url(), Some(hook), None, None, None);
+        let joined = runtime2_join(&original, &second);
+        let desk2 = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .keys
+            .sign_key();
+        let unit = joined
+            .head()
+            .roster()
+            .membership()
+            .unwrap()
+            .unit_for(&desk2)
+            .unwrap()
+            .clone();
+        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
+        offline.store(true, Ordering::SeqCst);
+        let removed = original.ring.remove_member(&daemon2).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.ring.approval_readiness().unwrap() != ApprovalReadiness::Removed {
+            assert!(
+                std::time::Instant::now() < until,
+                "Desktop never saw its removal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let roster = |dir: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("roster.json")).unwrap()).unwrap()
+        };
+        let stale = roster(&second.daemon_dir);
+        assert_eq!(
+            stale["rosters"].as_array().unwrap().len(),
+            2,
+            "the Daemon missed its removal"
+        );
+        let tokens = |c: &xshell_protocol::ring::RosterChain| -> Vec<String> {
+            c.versions().iter().map(|r| r.token().to_string()).collect()
+        };
+        let leave = |rosters: Vec<String>| {
+            second
+                .companion()
+                .request(CompanionRequest::LeaveRemoved { rosters })
+        };
+        assert!(leave(vec![]).unwrap_err().starts_with("not_removed:"));
+        assert!(leave(tokens(&joined))
+            .unwrap_err()
+            .contains("does not remove"));
+        let other = Computer::new(&relay);
+        runtime2_create(&other);
+        let unrelated = tokens(&other.ring.chain().unwrap());
+        assert!(leave(unrelated).unwrap_err().contains("another Ring"));
+        let mut forged = tokens(&removed);
+        let last = forged.last_mut().unwrap();
+        let flip = if last.ends_with('A') { 'B' } else { 'A' };
+        last.pop();
+        last.push(flip);
+        assert!(leave(forged).is_err());
+        assert_eq!(roster(&second.daemon_dir), stale, "refusals change nothing");
+        // The Desktop's verified removal is the evidence.
+        second.ring.leave_removed(&second.companion()).unwrap();
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        let left = std::fs::read_dir(&second.daemon_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("roster.json.left-")
+            })
+            .unwrap();
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(left.path()).unwrap()).unwrap();
+        assert_eq!(kept["rosters"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::NotEnrolled
+        );
     }
     /// A standalone Daemon enrolled by `approver`: its handle, home and signing key.
     fn runtime2_standalone(

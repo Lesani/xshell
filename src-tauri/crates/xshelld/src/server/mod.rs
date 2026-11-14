@@ -226,7 +226,8 @@ pub enum TestPoint {
     BeforeHostRingJoinCommit,
     /// Decoded companion request before store admission; no handler locks held.
     CompanionRequestAdmitted,
-    /// Admitted roster callback before any persistence/runtime guard.
+    /// Admitted roster callback before any persistence/runtime guard; `true` drops it
+    /// (a Daemon that never received that roster).
     RosterCallbackAdmitted,
     /// Admitted Host completion administration, before runtime/Store access.
     RingCompanionAdmitted,

@@ -201,11 +201,25 @@ impl DesktopRing {
             _ => Err("not_removed: this Desktop is still a member of its Ring".to_string()),
         };
         let stored = self.store.load_profile()?.0;
-        match stored.as_ref() {
-            Some(stored) if stored.membership.is_some() => removed(stored)?,
+        // This Desktop's verified chain is the removal evidence for a Daemon that missed it.
+        let rosters = match stored.as_ref() {
+            Some(stored) if stored.membership.is_some() => {
+                removed(stored)?;
+                stored
+                    .membership
+                    .as_ref()
+                    .map(|m| {
+                        m.chain
+                            .versions()
+                            .iter()
+                            .map(|r| r.token().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             _ => return Err("not_enrolled: this Desktop is not in a Ring".into()),
-        }
-        match client.request(CompanionRequest::LeaveRemoved)? {
+        };
+        match client.request(CompanionRequest::LeaveRemoved { rosters })? {
             CompanionResponse::Left => {}
             _ => return Err("invalid counterpart Leave response".into()),
         }
