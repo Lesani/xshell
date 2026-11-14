@@ -1051,7 +1051,7 @@ fn cancelled_join_start_aborts_the_ready_wait_and_never_shows_an_offer() {
     let cancel = Arc::new(AtomicBool::new(false));
     let (ring, start_client, start_cancel) = (b.ring.clone(), client.clone(), cancel.clone());
     let start =
-        std::thread::spawn(move || ring.begin_join_cancellable(&start_client, start_cancel));
+        std::thread::spawn(move || ring.begin_join_cancellable(&start_client, start_cancel, None));
     reached_rx.recv_timeout(WAIT).expect("readiness reached");
     // The UI's cancel command during the start.
     cancel.store(true, Ordering::Release);
@@ -1078,7 +1078,7 @@ fn cancelled_join_start_aborts_the_ready_wait_and_never_shows_an_offer() {
     // The admission is free again: a new Join starts and waits for its approver.
     let offer = b
         .ring
-        .begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)))
+        .begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)), None)
         .unwrap();
     assert!(offer.is_ready());
     assert!(matches!(offer.join_status(), JoinStatus::Waiting));
@@ -1094,4 +1094,38 @@ fn approve_needs_an_upgraded_computer_desktop() {
     let code = xshell_protocol::ring::device_code::DeviceCode::generate().unwrap();
     let error = a.ring.approve_device_code(&code).unwrap_err();
     assert!(error.contains("approval requires"), "{error}");
+}
+
+#[test]
+fn create_and_join_bind_the_chosen_relay_not_the_default() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let relay = workerd::Relay::start();
+    // The default points nowhere: success proves the chosen Relay is bound.
+    let unreachable = "ws://127.0.0.1:9/";
+    let a = Computer::with_ring_config(&relay, |cfg| cfg.default_relay_url = unreachable.into());
+    a.ring.register_companion(&a.companion()).unwrap();
+    let chain = installed(
+        a.ring
+            .create_computer_on(&a.companion(), &relay.url(), confirm)
+            .unwrap(),
+    );
+    assert_eq!(chain.head().roster().relay_url, relay.url());
+    assert!(a
+        .ring
+        .create_computer_on(&a.companion(), "not a url", confirm)
+        .is_err());
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.default_relay_url = unreachable.into());
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b
+        .ring
+        .begin_join_cancellable(
+            &b.ring.local_companion_client().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Some(&relay.url()),
+        )
+        .unwrap();
+    assert!(offer.is_ready());
+    offer.cancel_join();
+    drop(offer);
 }

@@ -23,18 +23,24 @@ pub enum ApprovalReadiness {
     Unresolved,
 }
 
-pub(in crate::ring) fn readiness_of(stored: Option<&ProfileState>) -> ApprovalReadiness {
+/// `in_flight`: a local adoption/approval holds the admission right now, so its durable
+/// journal or reservation is live work, not unresolved uncertainty.
+pub(in crate::ring) fn readiness_of(
+    stored: Option<&ProfileState>,
+    in_flight: bool,
+) -> ApprovalReadiness {
     let Some(stored) = stored else {
         return ApprovalReadiness::NoProfile;
     };
-    if stored.pending_join.is_some()
-        || stored
-            .journal
-            .as_ref()
-            .is_some_and(|j| !j.phase.permits_new_operation())
-        || stored.outgoing.as_ref().is_some_and(|j| {
-            !matches!(j.phase, OutgoingPhase::Published | OutgoingPhase::Cancelled)
-        })
+    if !in_flight
+        && (stored.pending_join.is_some()
+            || stored
+                .journal
+                .as_ref()
+                .is_some_and(|j| !j.phase.permits_new_operation())
+            || stored.outgoing.as_ref().is_some_and(|j| {
+                !matches!(j.phase, OutgoingPhase::Published | OutgoingPhase::Cancelled)
+            }))
     {
         return ApprovalReadiness::Unresolved;
     }
@@ -89,11 +95,15 @@ impl DesktopRing {
     /// [`DesktopRing::begin_join`] with an external cancel flag that also ends the wait for
     /// the Relay slot. A cancelled start never returns an offer: its driver is cancelled and
     /// joined, so no words can be shown for it.
+    /// `relay_url`: the user's own Relay chosen before Join, else the hosted default.
     pub fn begin_join_cancellable(
         self: &Arc<Self>,
         client: &CompanionClient,
         cancel: Arc<AtomicBool>,
+        relay_url: Option<&str>,
     ) -> Result<JoinOffer, String> {
+        let relay = relay_url.unwrap_or(&self.cfg.default_relay_url).to_string();
+        xshell_protocol::ring::url::RelayUrl::parse(&relay).map_err(|e| e.to_string())?;
         let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
         let until = Instant::now() + ttl;
         let offer = self.begin_join_with_offer_cancel(
@@ -101,7 +111,7 @@ impl DesktopRing {
             JoinOfferInput {
                 operation: nonce()?,
                 code: DeviceCode::generate().map_err(|e| e.to_string())?,
-                relay_url: self.cfg.default_relay_url.clone(),
+                relay_url: relay,
                 expires_at: now() + ttl.as_secs(),
             },
             until,
@@ -143,6 +153,20 @@ impl DesktopRing {
 
     /// Read-only approval readiness from the retained profile.
     pub fn approval_readiness(&self) -> Result<ApprovalReadiness, String> {
-        Ok(readiness_of(self.store.load_profile()?.0.as_ref()))
+        let in_flight = self.adoption.load(Ordering::Acquire);
+        Ok(readiness_of(
+            self.store.load_profile()?.0.as_ref(),
+            in_flight,
+        ))
+    }
+
+    /// The retained Ring's Roster format (1 or 2), if this Desktop is in a Ring.
+    pub fn ring_format(&self) -> Result<Option<u8>, String> {
+        Ok(self
+            .store
+            .load_profile()?
+            .0
+            .and_then(|p| p.membership)
+            .map(|m| m.chain.head().roster().v as u8))
     }
 }

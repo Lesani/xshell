@@ -741,11 +741,12 @@ pub fn run() {
                 .build()?;
             Ok(())
         })
-        // A GUI Device Code dies when another xshell window gains focus (#87).
+        // A GUI Device Code dies when its window loses focus (#87, BINDING AMENDMENT 3:
+        // each xshell window is its own process).
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(true) = event {
+            if let tauri::WindowEvent::Focused(false) = event {
                 use tauri::Manager as _;
-                ring::join::window_focused(window.app_handle(), window.label());
+                ring::join::window_blurred(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![

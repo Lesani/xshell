@@ -251,18 +251,14 @@ pub fn approval_text(readiness: ApprovalReadiness, local_available: bool) -> &'s
     }
 }
 
-/// The GUI joins to cancel when the xshell window `focused` gains focus: every one started
-/// from another window. CLI-started offers belong to the terminal, never to a window.
-pub fn joins_to_cancel_on_focus(
-    entries: &[(Uuid, JoinOrigin, Option<&str>)],
-    focused: &str,
-) -> Vec<Uuid> {
+/// The joins to cancel when this process's window loses focus (BINDING AMENDMENT 3): every
+/// GUI join and start. Each xshell window is its own process, so losing focus covers
+/// switching to another xshell window. CLI-started offers belong to the terminal.
+pub fn gui_joins_to_cancel_on_blur(entries: &[(Uuid, JoinOrigin)]) -> Vec<Uuid> {
     entries
         .iter()
-        .filter(|(_, origin, window)| {
-            *origin == JoinOrigin::Gui && window.is_some_and(|w| w != focused)
-        })
-        .map(|(op, _, _)| *op)
+        .filter(|(_, origin)| *origin == JoinOrigin::Gui)
+        .map(|(op, _)| *op)
         .collect()
 }
 
@@ -270,7 +266,6 @@ pub fn joins_to_cancel_on_focus(
 
 pub struct JoinEntry {
     pub origin: JoinOrigin,
-    pub window: Option<String>,
     offer: Arc<JoinOffer>,
     lease: Mutex<Option<(String, CreateConfirmationLease)>>,
     preview: Mutex<Option<JoinPreview>>,
@@ -279,10 +274,9 @@ pub struct JoinEntry {
 }
 
 impl JoinEntry {
-    fn new(origin: JoinOrigin, window: Option<String>, offer: Arc<JoinOffer>) -> Self {
+    fn new(origin: JoinOrigin, offer: Arc<JoinOffer>) -> Self {
         Self {
             origin,
-            window,
             offer,
             lease: Mutex::new(None),
             preview: Mutex::new(None),
@@ -339,8 +333,8 @@ impl JoinEntry {
 #[derive(Default)]
 struct JoinInner {
     entries: HashMap<Uuid, Arc<JoinEntry>>,
-    /// GUI starts not returned yet: their cancel flag and window.
-    starting: HashMap<Uuid, (Arc<AtomicBool>, Option<String>)>,
+    /// GUI starts not returned yet: their cancel flag.
+    starting: HashMap<Uuid, Arc<AtomicBool>>,
     /// CLI operations already tracked (so a finished one listed a while longer is not
     /// tracked again).
     seen_cli: HashSet<Uuid>,
@@ -357,17 +351,13 @@ impl JoinRegistry {
     }
 
     /// Reserves a GUI start before the backend runs, so a cancel during the start is seen.
-    pub fn reserve(
-        &self,
-        operation: Uuid,
-        window: Option<String>,
-    ) -> Result<Arc<AtomicBool>, String> {
+    pub fn reserve(&self, operation: Uuid) -> Result<Arc<AtomicBool>, String> {
         let mut inner = self.lock();
         if inner.entries.contains_key(&operation) || inner.starting.contains_key(&operation) {
             return Err("busy: this Join is already running".into());
         }
         let flag = Arc::new(AtomicBool::new(false));
-        inner.starting.insert(operation, (flag.clone(), window));
+        inner.starting.insert(operation, flag.clone());
         Ok(flag)
     }
 
@@ -376,17 +366,17 @@ impl JoinRegistry {
     pub fn finish_start(
         &self,
         operation: Uuid,
-        make: impl FnOnce(Option<String>) -> Arc<JoinEntry>,
+        make: impl FnOnce() -> Arc<JoinEntry>,
     ) -> Result<Arc<JoinEntry>, String> {
         let mut inner = self.lock();
-        let (flag, window) = inner
+        let flag = inner
             .starting
             .remove(&operation)
             .ok_or("cancelled: Join start was not reserved")?;
         if flag.load(Ordering::Acquire) {
             return Err("cancelled: Join cancelled before its code was shown".into());
         }
-        let entry = make(window);
+        let entry = make();
         inner.entries.insert(operation, entry.clone());
         Ok(entry)
     }
@@ -400,7 +390,7 @@ impl JoinRegistry {
     pub fn cancel(&self, operation: Uuid) {
         let entry = {
             let inner = self.lock();
-            if let Some((flag, _)) = inner.starting.get(&operation) {
+            if let Some(flag) = inner.starting.get(&operation) {
                 flag.store(true, Ordering::Release);
                 return;
             }
@@ -429,7 +419,7 @@ impl JoinRegistry {
         let mut new = vec![];
         for (op, offer) in listed {
             if inner.seen_cli.insert(op) && !inner.entries.contains_key(&op) {
-                let entry = Arc::new(JoinEntry::new(JoinOrigin::Cli, None, offer));
+                let entry = Arc::new(JoinEntry::new(JoinOrigin::Cli, offer));
                 inner.entries.insert(op, entry.clone());
                 new.push((op, entry));
             }
@@ -437,27 +427,18 @@ impl JoinRegistry {
         new
     }
 
-    /// The GUI starts and joins to cancel when `focused` gains focus.
-    pub fn cancel_on_focus(&self, focused: &str) -> Vec<Uuid> {
-        let rows: Vec<(Uuid, JoinOrigin, Option<String>)> = {
+    /// The window lost focus: cancels every GUI start and join.
+    pub fn cancel_on_blur(&self) -> Vec<Uuid> {
+        let rows: Vec<(Uuid, JoinOrigin)> = {
             let inner = self.lock();
             inner
                 .entries
                 .iter()
-                .map(|(op, e)| (*op, e.origin, e.window.clone()))
-                .chain(
-                    inner
-                        .starting
-                        .iter()
-                        .map(|(op, (_, w))| (*op, JoinOrigin::Gui, w.clone())),
-                )
+                .map(|(op, e)| (*op, e.origin))
+                .chain(inner.starting.keys().map(|op| (*op, JoinOrigin::Gui)))
                 .collect()
         };
-        let borrowed: Vec<_> = rows
-            .iter()
-            .map(|(op, origin, w)| (*op, *origin, w.as_deref()))
-            .collect();
-        let ops = joins_to_cancel_on_focus(&borrowed, focused);
+        let ops = gui_joins_to_cancel_on_blur(&rows);
         for op in &ops {
             self.cancel(*op);
         }
@@ -531,10 +512,11 @@ pub fn track_cli_joins(app: &AppHandle, ring: &xshell_hostlink::ring::DesktopRin
     }
 }
 
-/// An xshell window gained focus: GUI codes shown by any other window die.
-pub fn window_focused<R: tauri::Runtime>(app: &AppHandle<R>, label: &str) {
+/// This window lost focus: its GUI codes die (switching to another window, BINDING
+/// AMENDMENT 3).
+pub fn window_blurred<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Some(state) = app.try_state::<RingState>() {
-        state.joins.cancel_on_focus(label);
+        state.joins.cancel_on_blur();
     }
 }
 
@@ -561,6 +543,8 @@ pub fn refresh_approval(app: &AppHandle) -> &'static str {
         .map(|r| approval_text(r, local))
         .unwrap_or("none");
     *state.approval.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    *state.format.lock().unwrap_or_else(|e| e.into_inner()) =
+        state.worker.ring.ring_format().ok().flatten();
     text
 }
 
@@ -587,15 +571,38 @@ fn confirm_local(
 
 // ── Commands ──────────────────────────────────────────────────────────────
 
+/// The Relay chosen on the unpaired screen: `None` (hosted default) or a valid URL.
+pub fn chosen_relay(relay_url: Option<String>) -> Result<Option<String>, String> {
+    match relay_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+    {
+        None => Ok(None),
+        Some(url) => {
+            xshell_protocol::ring::url::RelayUrl::parse(&url)
+                .map_err(|e| format!("invalid_relay: {e}"))?;
+            Ok(Some(url))
+        }
+    }
+}
+
 /// Create ring: this Computer Device (Desktop and its Local Host) becomes the Ring's first
-/// member. The click is the local consent.
+/// member, on `relay_url` if the user chose their own Relay. The click is the local consent.
 #[tauri::command]
-pub async fn ring_create_computer(app: AppHandle) -> Result<RingStatus, String> {
+pub async fn ring_create_computer(
+    app: AppHandle,
+    relay_url: Option<String>,
+) -> Result<RingStatus, String> {
     let w = worker(&app)?;
     ensure_local(&app)?;
+    let relay = chosen_relay(relay_url)?;
     run(move || {
         let client = w.ring.local_companion_client()?;
-        match w.ring.create_computer(&client, confirm_local)? {
+        let outcome = match &relay {
+            Some(url) => w.ring.create_computer_on(&client, url, confirm_local)?,
+            None => w.ring.create_computer(&client, confirm_local)?,
+        };
+        match outcome {
             xshell_hostlink::ring::adoption::AdoptionOutcome::Installed { .. } => {}
             xshell_hostlink::ring::adoption::AdoptionOutcome::Declined { .. } => {
                 return Err("declined".into())
@@ -613,22 +620,23 @@ pub async fn ring_create_computer(app: AppHandle) -> Result<RingStatus, String> 
 #[tauri::command]
 pub async fn ring_join_start(
     app: AppHandle,
-    window: tauri::Window,
     operation: Uuid,
+    relay_url: Option<String>,
 ) -> Result<JoinStarted, String> {
     let w = worker(&app)?;
     ensure_local(&app)?;
+    let relay = chosen_relay(relay_url)?;
     let joins = app
         .try_state::<RingState>()
         .map(|s| s.joins.clone())
         .ok_or("mobile access is unavailable")?;
-    let flag = joins.reserve(operation, Some(window.label().to_string()))?;
+    let flag = joins.reserve(operation)?;
     let watch_app = app.clone();
     run(move || {
-        let offer = w
-            .ring
-            .local_companion_client()
-            .and_then(|client| w.ring.begin_join_cancellable(&client, flag));
+        let offer = w.ring.local_companion_client().and_then(|client| {
+            w.ring
+                .begin_join_cancellable(&client, flag, relay.as_deref())
+        });
         let offer = match offer {
             Ok(offer) => Arc::new(offer),
             Err(error) => {
@@ -641,8 +649,8 @@ pub async fn ring_join_start(
             words: offer.code.format(),
             expires_at: offer.expires_at,
         };
-        match joins.finish_start(operation, |window| {
-            Arc::new(JoinEntry::new(JoinOrigin::Gui, window, offer.clone()))
+        match joins.finish_start(operation, || {
+            Arc::new(JoinEntry::new(JoinOrigin::Gui, offer.clone()))
         }) {
             Ok(entry) => {
                 watch(watch_app, joins.clone(), operation, entry);
@@ -996,48 +1004,51 @@ mod tests {
     fn cancel_while_starting_sets_the_flag_and_refuses_the_late_offer() {
         let registry = JoinRegistry::default();
         let op = Uuid::from_u128(1);
-        let flag = registry.reserve(op, Some("main".into())).unwrap();
-        assert!(
-            registry.reserve(op, None).is_err(),
-            "one start per operation"
-        );
+        let flag = registry.reserve(op).unwrap();
+        assert!(registry.reserve(op).is_err(), "one start per operation");
         registry.cancel(op);
         assert!(
             flag.load(Ordering::Acquire),
             "cancel reaches the starting backend"
         );
         let late =
-            registry.finish_start(op, |_| unreachable!("a cancelled start registers nothing"));
+            registry.finish_start(op, || unreachable!("a cancelled start registers nothing"));
         assert!(late.err().expect("cancelled").starts_with("cancelled"));
         assert!(registry.get(op).is_none());
         // Unknown operations: no-op.
         registry.cancel(Uuid::from_u128(2));
-        // Focus on another window cancels a GUI start of `main`.
-        let other = registry
-            .reserve(Uuid::from_u128(3), Some("main".into()))
-            .unwrap();
-        assert_eq!(registry.cancel_on_focus("main"), Vec::<Uuid>::new());
-        assert!(!other.load(Ordering::Acquire));
-        assert_eq!(registry.cancel_on_focus("second"), vec![Uuid::from_u128(3)]);
+        // Losing focus cancels a GUI start.
+        let other = registry.reserve(Uuid::from_u128(3)).unwrap();
+        assert_eq!(registry.cancel_on_blur(), vec![Uuid::from_u128(3)]);
         assert!(other.load(Ordering::Acquire));
     }
 
     #[test]
-    fn focus_cancels_only_gui_joins_of_other_windows() {
-        let (a, b, c, d) = (
-            Uuid::from_u128(1),
-            Uuid::from_u128(2),
-            Uuid::from_u128(3),
-            Uuid::from_u128(4),
-        );
+    fn blur_cancels_every_gui_join_and_no_cli_offer() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         let rows = [
-            (a, JoinOrigin::Gui, Some("main")),
-            (b, JoinOrigin::Gui, Some("other")),
-            (c, JoinOrigin::Cli, None),
-            (d, JoinOrigin::Gui, None),
+            (a, JoinOrigin::Gui),
+            (b, JoinOrigin::Cli),
+            (c, JoinOrigin::Gui),
         ];
-        assert_eq!(joins_to_cancel_on_focus(&rows, "main"), vec![b]);
-        assert_eq!(joins_to_cancel_on_focus(&rows, "other"), vec![a]);
+        assert_eq!(gui_joins_to_cancel_on_blur(&rows), vec![a, c]);
+        assert_eq!(
+            gui_joins_to_cancel_on_blur(&[(b, JoinOrigin::Cli)]),
+            Vec::<Uuid>::new()
+        );
+    }
+
+    #[test]
+    fn chosen_relay_is_validated_and_empty_means_hosted() {
+        assert_eq!(chosen_relay(None), Ok(None));
+        assert_eq!(chosen_relay(Some("  ".into())), Ok(None));
+        assert_eq!(
+            chosen_relay(Some(" wss://relay.example.com ".into())),
+            Ok(Some("wss://relay.example.com".into()))
+        );
+        assert!(chosen_relay(Some("http://x".into()))
+            .unwrap_err()
+            .starts_with("invalid_relay: "));
     }
 
     #[test]

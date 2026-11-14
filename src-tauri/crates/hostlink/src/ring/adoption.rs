@@ -407,6 +407,22 @@ impl DesktopRing {
             &CreateConfirmationLease,
         ) -> Result<CreateDecision, String>,
     ) -> Result<AdoptionOutcome, String> {
+        let relay = self.cfg.default_relay_url.clone();
+        self.create_computer_on(client, &relay, confirm)
+    }
+
+    /// [`DesktopRing::create_computer`] on the Relay `relay_url` (the user's own Relay chosen
+    /// before Create), bound into the genesis proposal.
+    pub fn create_computer_on(
+        &self,
+        client: &CompanionClient,
+        relay_url: &str,
+        confirm: impl FnOnce(
+            &ConsentPreview,
+            &CreateConfirmationLease,
+        ) -> Result<CreateDecision, String>,
+    ) -> Result<AdoptionOutcome, String> {
+        xshell_protocol::ring::url::RelayUrl::parse(relay_url).map_err(|e| e.to_string())?;
         let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
             return Err("another process owns Create".into());
@@ -437,20 +453,16 @@ impl DesktopRing {
             target: profile.target(),
         };
         let ring_id = RingId::derive(&keys.sign_key());
-        let activity_key = RingClient::activity_key(
-            &self.cfg.default_relay_url,
-            &ring_id,
-            None,
-            self.cfg.timeouts.connect,
-        )
-        .map_err(|e| e.to_string())?;
+        let activity_key =
+            RingClient::activity_key(relay_url, &ring_id, None, self.cfg.timeouts.connect)
+                .map_err(|e| e.to_string())?;
         let at = now();
         let mut proposal = Roster {
             v: 2,
             ring_id: ring_id.clone(),
             version: 1,
             prev: None,
-            relay_url: self.cfg.default_relay_url.clone(),
+            relay_url: relay_url.to_string(),
             signed_by: keys.sign_key(),
             issued_at: at,
             members: intent

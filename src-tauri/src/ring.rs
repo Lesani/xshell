@@ -42,6 +42,9 @@ pub struct RingStatus {
     /// `unavailable` (an upgrade is needed but cannot run here), `unresolved` (earlier
     /// adoption work needs reconciliation) or `none` (not in a Ring).
     pub approval: &'static str,
+    /// The retained Ring's Roster format (1 or 2): a v2 Ring's Relay is fixed (shown
+    /// read-only).
+    pub format: Option<u8>,
 }
 
 pub struct RingState {
@@ -50,6 +53,8 @@ pub struct RingState {
     /// `RingStatus.approval`, cached: computed by commands and the owner thread, never inside
     /// the RingObserver callback.
     pub approval: std::sync::Mutex<&'static str>,
+    /// `RingStatus.format`, cached the same way.
+    pub format: std::sync::Mutex<Option<u8>>,
     _pairing_ipc: Option<xshell_pairing_access::local::Server>,
 }
 
@@ -83,6 +88,9 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
         .try_state::<RingState>()
         .map(|r| *r.approval.lock().unwrap_or_else(|e| e.into_inner()))
         .unwrap_or("none");
+    let format = app
+        .try_state::<RingState>()
+        .and_then(|r| *r.format.lock().unwrap_or_else(|e| e.into_inner()));
     let worker = app.try_state::<RingState>().map(|r| r.worker.clone());
     let too_old = worker
         .as_ref()
@@ -105,6 +113,7 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
         },
         hosts,
         approval,
+        format,
     }
 }
 
@@ -244,6 +253,7 @@ pub fn setup(app: &AppHandle) {
         worker: worker.clone(),
         joins: Arc::default(),
         approval: std::sync::Mutex::new("none"),
+        format: std::sync::Mutex::new(None),
         _pairing_ipc: pairing_ipc.ok(),
     });
     join::refresh_approval(app);
