@@ -1702,7 +1702,11 @@ fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
 fn an_older_prefix_from_the_owner_is_an_echo() {
     let m = split_move(Some(GetFault::Close), true, false, Then::ToC, Fetches::Open);
     let key = m.ring.daemon.sign_key();
-    wait_long("the Daemon on C", || online(&m.c, &m.ring, &key));
+    // Presence on C can precede the Daemon's own Connected report; wait for both, or a late
+    // Connected lands after the clear below and looks like a redial.
+    wait_long("the Daemon on C", || {
+        online(&m.c, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
     assert_eq!(m.dmn.chain().head().version(), 4);
     m.mrec.clear();
     m.dmn.set_chain(m.ring.up_to(2));
