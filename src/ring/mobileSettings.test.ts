@@ -25,6 +25,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     local: "daemon",
     hosts: [],
     approval: "ready",
+    format: null,
     ...over,
   };
 }

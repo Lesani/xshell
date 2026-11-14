@@ -4,7 +4,7 @@ import { fmt } from "../ring/strings";
 import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { canSubmit, COMPUTER_IDLE, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects, wordsError } from "../ring/pairing";
-import { cliCardsFrom, cliLine, codeExpiresLine, consentBody, joinBusy, joinOperation, JOIN_IDLE, joinReducer, offersNewCode as joinOffersNewCode, outcomeLine, showsJoinPanel, wordGroups, type JoinAction, type JoinUi } from "../ring/join";
+import { cliCardsFrom, cliLine, codeExpiresLine, consentBody, joinBusy, joinOperation, trackedOperation, JOIN_IDLE, joinReducer, offersNewCode as joinOffersNewCode, outcomeLine, showsJoinPanel, wordGroups, type JoinAction, type JoinUi } from "../ring/join";
 import { useRing, type PairingEvents } from "../ring/useRing";
 import type { ApprovedComputer, HostRingState, JoinEvent, JoinOverview, JoinPreview, JoinStarted, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
@@ -24,6 +24,9 @@ export interface Pairing {
 // Computer adoption (#87): the commands and what they report.
 export interface JoinApi {
   overview: JoinOverview | null;
+  // The Relay chosen before Create/Join (null: hosted), bound into the operation.
+  relay: string | null;
+  setRelay: (url: string | null) => Promise<void>;
   // The latest `ring:join` event per operation.
   events: Record<string, JoinEvent>;
   createComputer: () => Promise<void>;
@@ -398,6 +401,16 @@ function HostNote({ h, onClaim }: { h: HostRingState; onClaim: (host: string) =>
   );
 }
 
+// A v2 Ring's Relay is fixed: shown, not edited.
+function FixedRelay({ s }: { s: RingStatus }) {
+  return (
+    <div className="edit-field" data-ring-relay-fixed>
+      <label className="edit-label">{fmt("mobile.relay.title")}</label>
+      <div className="host-row-note">{s.relayHosted ? fmt("mobile.relay.hosted") : (s.relayUrl ?? "")}</div>
+    </div>
+  );
+}
+
 function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => Promise<void> }) {
   const [form, setForm] = useState<RelayForm>(() => initialForm(s));
   const [busy, setBusy] = useState(false);
@@ -482,7 +495,9 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
   // Replies after leaving Settings are not shown; the current operation is cancelled.
   const mounted = useRef(true);
   const op = useRef<string | null>(null);
+  // The operation a cancel ends (the active one) and the one whose events still matter.
   op.current = joinOperation(jst);
+  const tracked = trackedOperation(jst);
   const dispatchJoin = useCallback((a: JoinAction) => { if (mounted.current) setJst(a); }, []);
   const joinRef = useRef(join);
   joinRef.current = join;
@@ -508,7 +523,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
     window.addEventListener("pagehide", onHide);
     return () => window.removeEventListener("pagehide", onHide);
   }, [cancelJoin]);
-  const current = op.current ? join?.events[op.current] : undefined;
+  const current = tracked ? join?.events[tracked] : undefined;
   useEffect(() => { if (current) dispatchJoin({ type: "event", event: current }); }, [current, dispatchJoin]);
   const counting = jst.state === "code" || jst.state === "consent";
   useEffect(() => {
@@ -616,15 +631,21 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
           follower ? <div className="host-row-note">{fmt("ring.follower")}</div> : join && (
             showsJoinPanel(jst)
               ? <JoinPanel st={jst} onCancel={cancelJoin} onConfirm={confirmJoin} onDecline={declineJoin} onNewCode={startJoin} />
-              : <>
-                  <UnpairedRing s={s} join={join} st={jst} onCreate={create} onStart={startJoin} unavailable={unavailable} />
-                  <Line line={outcome} />
-                </>
+              : s.approval === "unresolved" && !joinBusy(jst)
+                // Durable uncertainty from an earlier Create/Join: no new code or Ring.
+                ? <div className="host-form-error" data-ring-unresolved>{fmt("ring.reconciliationRequired")}</div>
+                : <>
+                    <UnpairedRing s={s} join={join} st={jst} onCreate={create} onStart={startJoin} unavailable={unavailable} />
+                    <Line line={outcome} />
+                    <div data-ring-relay-unpaired>
+                      <RelaySettings s={{ ...s, relayUrl: join.relay ?? s.hostedRelayUrl }} onSave={url => join.setRelay(url === s.hostedRelayUrl ? null : url)} />
+                    </div>
+                  </>
           )
         ) : (
           <>
             {(jst.state === "installed" || jst.state === "created") && <Line line={outcome} />}
-            <RelaySettings s={s} onSave={onSaveRelay} />
+            {s.format === 2 ? <FixedRelay s={s} /> : <RelaySettings s={s} onSave={onSaveRelay} />}
             {conn && <div className="host-row-note">{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
             {farewells.map((f, i) => <div key={i} className={`host-row-note ${f.warn ? "host-row-warn" : ""}`}>{f.text}</div>)}
@@ -661,7 +682,7 @@ export function MobileSettings({ visible = true }: { visible?: boolean }) {
   if (!r.status) return null;
   const p: Pairing = { events: r.pairing, startPhone: r.startPhone, cancelPhone: r.cancelPhone, approveComputer: r.approveComputer };
   const join: JoinApi = {
-    overview: r.overview, events: r.joinEvents, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
+    overview: r.overview, events: r.joinEvents, relay: r.chosenRelay, setRelay: r.setUnpairedRelay, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
     start: r.joinStart, confirm: r.joinConfirm, decline: r.joinDecline, cancel: r.joinCancel,
   };
   return <MobileSettingsView s={r.status} onEnable={r.enable} onSaveRelay={r.setRelayUrl} onClaimHost={r.claimHost} onRemoveMember={r.removeMember} pairing={p} join={join} visible={visible} />;

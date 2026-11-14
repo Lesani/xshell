@@ -35,7 +35,7 @@ vi.mock("./components/TerminalTab", () => ({ TerminalTab: () => null, DARK_TERM_
 const ring: RingStatus = {
   enabled: false, ringId: null, version: null, relayUrl: null, hostedRelayUrl: "wss://r", connection: "off",
   retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
-  members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none",
+  members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none", format: null,
 };
 
 let root: Root | undefined;

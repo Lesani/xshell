@@ -6,8 +6,9 @@ import { MobileSettings } from "./MobileSettings";
 import { fmt, S } from "../ring/strings";
 import type { JoinEvent, JoinOverview, MemberView, RingStatus } from "../ring/types";
 
-const native = vi.hoisted(() => ({ invoke: vi.fn(), handlers: new Map<string, (event: { payload: unknown }) => void>() }));
+const native = vi.hoisted(() => ({ invoke: vi.fn(), handlers: new Map<string, (event: { payload: unknown }) => void>(), settings: new Map<string, unknown>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+vi.mock("@tauri-apps/plugin-store", () => ({ load: async () => ({ get: async (k: string) => native.settings.get(k) ?? null, set: async (k: string, v: unknown) => { native.settings.set(k, v); }, save: async () => {} }) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, handler: (event: { payload: unknown }) => void) => { native.handlers.set(name, handler); return () => native.handlers.delete(name); } }));
 
 const WORDS = "acid-baker-cable-dance-eagle-fable-gamma-habit";
@@ -18,7 +19,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: false, ringId: null, version: null, relayUrl: null, hostedRelayUrl: "wss://r", connection: "off",
     retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
-    members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none", ...over,
+    members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none", format: null, ...over,
   };
 }
 const enrolled = (over: Partial<RingStatus> = {}) => status({ enabled: true, ringId: "abcdefgh", version: 2, relayUrl: "wss://r", connection: "connected", members: [me], approval: "ready", ...over });
@@ -58,6 +59,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   native.invoke.mockReset();
   native.handlers.clear();
+  native.settings.clear();
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -255,5 +257,90 @@ describe("enrolled Desktop: Add computer and Upgrade", () => {
     await mount();
     await act(async () => { Array.from(container.querySelectorAll("button")).find(b => b.textContent?.includes(S["mobile.pair.phone"]))!.click(); });
     expect(calls()).toContain("ring_pair_phone_start");
+  });
+});
+
+describe("review fixes (Sol)", () => {
+  it("cancel after Confirm keeps tracking: a later reconciliationRequired shows on return to Hosts", async () => {
+    setup(status(), undefined, { ring_join_confirm: () => undefined });
+    await mount(true);
+    const op = await startJoin();
+    await emit("ring:join", joinEvent(op, "awaitingConfirmation", { preview }));
+    await click("[data-ring-confirm]");
+    await mount(false); // another section: the screen is left
+    expect(argsOf("ring_join_cancel")).toEqual([{ operation: op }]);
+    await emit("ring:join", joinEvent(op, "reconciliationRequired", { error: "reconciliation_required: x" }));
+    await mount(true);
+    expect(text()).toContain(S["ring.reconciliationRequired"]);
+    expect(q("[data-ring-new-code]")).toBeNull();
+    expect(q("[data-ring-create]")).toBeNull();
+  });
+
+  it("a persisted unresolved, unpaired Desktop shows the reconcile copy and no Create/Join", async () => {
+    setup(status({ approval: "unresolved" }));
+    await mount();
+    expect(q("[data-ring-unresolved]")?.textContent).toBe(S["ring.reconciliationRequired"]);
+    expect(q("[data-ring-create]")).toBeNull();
+    expect(q("[data-ring-join-action]")).toBeNull();
+  });
+
+  it("Create failing with reconciliation_required goes to reconcile, not a plain failure", async () => {
+    setup(status(), undefined, { ring_create_computer: () => { throw "reconciliation_required: an earlier Join is unresolved"; } });
+    await mount();
+    await click("[data-ring-create]");
+    expect(text()).toContain(S["ring.reconciliationRequired"]);
+    expect(text()).not.toContain("Couldn’t create the Ring");
+    expect(q("[data-ring-create]")).toBeNull();
+  });
+
+  it("follower → owner takeover shows Create/Join without remount", async () => {
+    setup(status({ connection: "other-window" }), { owner: false, joins: [] });
+    await mount();
+    expect(text()).toContain(S["ring.follower"]);
+    commands.ring_join_overview = () => ({ owner: true, joins: [] });
+    await emit("ring:status", status({ connection: "off" }));
+    await act(async () => {});
+    expect(text()).not.toContain(S["ring.follower"]);
+    expect(q("[data-ring-create]")).not.toBeNull();
+  });
+
+  it("Create and Join pass the chosen custom Relay; the unpaired form saves it", async () => {
+    native.settings.set("ring_relay_url", "wss://own.example.com");
+    setup(status(), undefined, { ring_create_computer: () => status() });
+    await mount();
+    await act(async () => {});
+    await click("[data-ring-create]");
+    expect(argsOf("ring_create_computer")).toEqual([{ relayUrl: "wss://own.example.com" }]);
+    await startJoin();
+    expect(argsOf("ring_join_start")[0].relayUrl).toBe("wss://own.example.com");
+  });
+
+  it("the unpaired Relay form stores the choice; hosted clears it", async () => {
+    setup(status());
+    await mount();
+    const form = q("[data-ring-relay-unpaired]")!;
+    const radios = form.querySelectorAll<HTMLInputElement>("input[type=radio]");
+    await act(async () => { radios[1].click(); });
+    const input = form.querySelector<HTMLInputElement>("input.edit-input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "wss://own.example.com");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { form.querySelector<HTMLButtonElement>("button.btn-primary")!.click(); });
+    expect(native.settings.get("ring_relay_url")).toBe("wss://own.example.com");
+    expect(calls()).not.toContain("ring_set_relay_url");
+  });
+
+  it("a v2 Ring shows its Relay read-only; a v1 Ring keeps the editable form", async () => {
+    setup(enrolled({ format: 2 }));
+    await mount();
+    expect(q("[data-ring-relay-fixed]")?.textContent).toContain(S["mobile.relay.hosted"]);
+    expect(container.querySelector("input[name=mobile-relay]")).toBeNull();
+    await act(async () => { root.unmount(); });
+    root = createRoot(container);
+    setup(enrolled({ format: 1, approval: "needs-upgrade" }));
+    await mount();
+    expect(q("[data-ring-relay-fixed]")).toBeNull();
+    expect(container.querySelector("input[name=mobile-relay]")).not.toBeNull();
   });
 });

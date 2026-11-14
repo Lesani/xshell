@@ -18,7 +18,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: true, ringId: "r", version: 2, relayUrl: "wss://r", hostedRelayUrl: "wss://r", connection: "connected",
     retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
-    members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "ready", ...over,
+    members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "ready", format: null, ...over,
   };
 }
 

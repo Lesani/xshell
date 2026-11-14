@@ -49,6 +49,8 @@ export interface RingStatus {
   // Whether this Desktop can add computers (#87): `unavailable` means an upgrade is needed but
   // cannot run here; `unresolved` means earlier adoption work needs reconciliation.
   approval: Approval;
+  // The retained Ring's Roster format: a v2 Ring's Relay is fixed (shown read-only).
+  format: 1 | 2 | null;
 }
 
 export type Approval = "ready" | "needs-upgrade" | "needs-completion" | "unavailable" | "unresolved" | "none";

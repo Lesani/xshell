@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cliCardsFrom, cliLine, cliReducer, consentBody, createFailedLine, JOIN_IDLE, joinBusy, joinOperation, joinReducer, offersNewCode, outcomeLine, showsJoinPanel, wordGroups, type JoinAction, type JoinUi } from "./join";
+import { cliCardsFrom, cliLine, cliReducer, consentBody, createFailedLine, JOIN_IDLE, joinBusy, joinOperation, joinReducer, offersNewCode, outcomeLine, showsJoinPanel, trackedOperation, wordGroups, type JoinAction, type JoinUi } from "./join";
 import { fmt, S } from "./strings";
 import type { JoinEvent, JoinPreview } from "./types";
 
@@ -56,11 +56,19 @@ describe("Join ring code screen", () => {
     expect(byEvent).toEqual({ state: "ended", reason: "expired" });
     expect(offersNewCode(byEvent)).toBe(true);
     expect(outcomeLine(byEvent)?.text).toBe(S["ring.expired"]);
+    // The local countdown ends the screen but keeps tracking until the backend's result.
     const byClock = run(code(), { type: "tick", nowMs: (FAR + 1) * 1000 });
-    expect(byClock).toEqual({ state: "ended", reason: "expired" });
+    expect(byClock).toEqual({ state: "ended", reason: "expired", operation: "A" });
+    expect(offersNewCode(byClock)).toBe(false);
+    expect(run(byClock, { type: "start", operation: "C" })).toBe(byClock);
     expect(run(code(), { type: "tick", nowMs: Date.now() }).state).toBe("code");
+    const final = run(byClock, { type: "event", event: ev("A", "expired") });
+    expect(final).toEqual({ state: "ended", reason: "expired" });
+    expect(offersNewCode(final)).toBe(true);
+    // A late reconciliation after the local expiry is still shown.
+    expect(run(byClock, { type: "event", event: ev("A", "reconciliationRequired") }).state).toBe("reconcile");
     // Generate new code starts a fresh operation.
-    expect(run(byClock, { type: "start", operation: "C" })).toEqual({ state: "starting", operation: "C" });
+    expect(run(final, { type: "start", operation: "C" })).toEqual({ state: "starting", operation: "C" });
   });
 
   it("decline → declined line and a fresh code is offered", () => {
@@ -91,9 +99,30 @@ describe("Join ring code screen", () => {
     expect(outcomeLine(failed)?.text).toBe(fmt("ring.joinFailed", { error: "relay: down" }));
   });
 
-  it("cancel returns to the Create/Join choice", () => {
-    expect(run(code(), { type: "cancel", operation: "A" })).toEqual(JOIN_IDLE);
+  it("cancel leaves the screen but tracks the operation until its definitive result", () => {
+    const left = run(code(), { type: "cancel", operation: "A" });
+    expect(left).toEqual({ state: "cancelled", operation: "A" });
+    expect(showsJoinPanel(left)).toBe(false);
+    expect(joinBusy(left)).toBe(true);
+    expect(joinOperation(left)).toBeNull();
+    expect(trackedOperation(left)).toBe("A");
+    expect(run(left, { type: "event", event: ev("A", "cancelled") })).toEqual(JOIN_IDLE);
+    expect(run(left, { type: "event", event: ev("A", "failed", { error: "cancelled" }) })).toEqual(JOIN_IDLE);
     expect(run(code(), { type: "event", event: ev("A", "cancelled") })).toEqual(JOIN_IDLE);
+    // A start cancelled before its reply never registered: its refusal ends the tracking.
+    const early = run(JOIN_IDLE, { type: "start", operation: "B" }, { type: "cancel", operation: "B" });
+    expect(run(early, { type: "startFailed", operation: "B", error: "cancelled: x" })).toEqual(JOIN_IDLE);
+  });
+
+  it("cancel after Confirm still shows a later reconciliationRequired", () => {
+    let s = run(code(), { type: "event", event: ev("A", "awaitingConfirmation", { preview }) }, { type: "confirm", operation: "A" });
+    s = run(s, { type: "cancel", operation: "A" });
+    expect(s).toEqual({ state: "cancelled", operation: "A" });
+    expect(run(s, { type: "event", event: ev("A", "completing") })).toBe(s);
+    const r = run(s, { type: "event", event: ev("A", "reconciliationRequired", { error: "reconciliation_required: x" }) });
+    expect(r.state).toBe("reconcile");
+    expect(offersNewCode(r)).toBe(false);
+    expect(run(s, { type: "event", event: ev("A", "installed") })).toEqual({ state: "installed" });
   });
 
   it("Create ring: creating, created, and its failure lines", () => {
@@ -101,6 +130,7 @@ describe("Join ring code screen", () => {
     expect(c).toEqual({ state: "creating" });
     expect(run(c, { type: "start", operation: "A" })).toBe(c);
     expect(outcomeLine(run(c, { type: "created" }))?.text).toBe(S["ring.created"]);
+    expect(run(c, { type: "createFailed", error: "reconciliation_required: an earlier Join is unresolved" }).state).toBe("reconcile");
     expect(createFailedLine("not_registered: x")).toBe(S["ring.hostNotReady"]);
     expect(createFailedLine("unavailable: platform")).toBe(S["ring.unsupported"]);
     expect(createFailedLine("relay: down")).toBe("Couldn’t create the Ring: relay: down");

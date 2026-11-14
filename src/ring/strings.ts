@@ -100,7 +100,7 @@ export const S = {
   "ring.joinTitle": "Join ring",
   "ring.joinInstruction": "On a computer already in your Ring, open Settings → Hosts → Ring and enter these eight words.",
   "ring.codeExpires": "Expires in {m}:{ss}",
-  "ring.codeLifetime": "Leaving this screen or switching to another xshell tab or window cancels this code.",
+  "ring.codeLifetime": "Leaving this screen or switching to another window cancels this code.",
   "ring.cancel": "Cancel",
   "ring.waiting": "Waiting for the other computer…",
   "ring.completing": "Completing pairing…",

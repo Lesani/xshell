@@ -19,8 +19,12 @@ export type JoinUi =
   | { state: "consent"; operation: string; preview: JoinPreview; expiresAt: number }
   | { state: "confirming"; operation: string; preview: JoinPreview; expiresAt: number }
   | { state: "completing"; operation: string }
+  // The screen was left: the backend offer is cancelled, but its operation is tracked until
+  // a definitive result (a confirmed Join may still need reconciliation).
+  | { state: "cancelled"; operation: string }
   | { state: "installed" }
-  | { state: "ended"; reason: EndReason; error?: string }
+  // `operation`: ended by the local countdown, still tracked until the backend's result.
+  | { state: "ended"; reason: EndReason; error?: string; operation?: string }
   | { state: "reconcile"; error?: string };
 
 export type JoinAction =
@@ -48,9 +52,17 @@ export function joinOperation(s: JoinUi): string | null {
   }
 }
 
+// The operation whose events still matter: the active one, or one left/expired locally whose
+// backend result has not arrived.
+export function trackedOperation(s: JoinUi): string | null {
+  if (s.state === "cancelled") return s.operation;
+  if (s.state === "ended") return s.operation ?? null;
+  return joinOperation(s);
+}
+
 // Whether a Join or Create runs (nothing else may start).
 export function joinBusy(s: JoinUi): boolean {
-  return s.state === "creating" || joinOperation(s) !== null;
+  return s.state === "creating" || s.state === "cancelled" || joinOperation(s) !== null;
 }
 
 // Whether the Join screen (code, consent or an outcome) replaces Create ring / Join ring.
@@ -59,7 +71,17 @@ export function showsJoinPanel(s: JoinUi): boolean {
 }
 
 function canStart(s: JoinUi): boolean {
-  return s.state === "idle" || s.state === "ended" || s.state === "createFailed" || s.state === "created";
+  return s.state === "idle" || (s.state === "ended" && !s.operation) || s.state === "createFailed" || s.state === "created";
+}
+
+// A left or locally expired operation: only a definitive backend result changes it.
+function fromTrackedEvent(s: Extract<JoinUi, { state: "cancelled" | "ended" }>, e: JoinEvent): JoinUi {
+  switch (e.state) {
+    case "waiting": case "awaitingConfirmation": case "completing": return s;
+    case "installed": return { state: "installed" };
+    case "reconciliationRequired": return { state: "reconcile", error: e.error };
+    default: return s.state === "cancelled" ? JOIN_IDLE : { state: "ended", reason: s.reason, error: s.error };
+  }
 }
 
 function fromEvent(s: JoinUi, e: JoinEvent): JoinUi {
@@ -85,7 +107,9 @@ export function joinReducer(s: JoinUi, a: JoinAction): JoinUi {
     case "created":
       return s.state === "creating" ? { state: "created" } : s;
     case "createFailed":
-      return s.state === "creating" ? { state: "createFailed", error: a.error } : s;
+      if (s.state !== "creating") return s;
+      // Durable uncertainty is never a plain failure: no new Create or Join.
+      return a.error.startsWith("reconciliation_required") ? { state: "reconcile", error: a.error } : { state: "createFailed", error: a.error };
     case "start":
       return canStart(s) ? { state: "starting", operation: a.operation } : s;
     case "started":
@@ -93,6 +117,7 @@ export function joinReducer(s: JoinUi, a: JoinAction): JoinUi {
         ? { state: "code", operation: a.started.operation, words: a.started.words, expiresAt: a.started.expiresAt }
         : s;
     case "startFailed": {
+      if (s.state === "cancelled" && s.operation === a.operation) return a.error.startsWith("reconciliation_required") ? { state: "reconcile", error: a.error } : JOIN_IDLE;
       if (s.state !== "starting" || s.operation !== a.operation) return s;
       if (a.error.startsWith("reconciliation_required")) return { state: "reconcile", error: a.error };
       if (a.error.startsWith("cancelled")) return JOIN_IDLE;
@@ -100,7 +125,8 @@ export function joinReducer(s: JoinUi, a: JoinAction): JoinUi {
     }
     case "event": {
       // CLI-started offers have their own cards; another operation's events are stale.
-      if (a.event.origin !== "gui" || joinOperation(s) !== a.event.operation) return s;
+      if (a.event.origin !== "gui" || trackedOperation(s) !== a.event.operation) return s;
+      if (s.state === "cancelled" || s.state === "ended") return fromTrackedEvent(s, a.event);
       return fromEvent(s, a.event);
     }
     case "confirm":
@@ -110,15 +136,15 @@ export function joinReducer(s: JoinUi, a: JoinAction): JoinUi {
     case "declined":
       return (s.state === "consent" || s.state === "confirming") && s.operation === a.operation ? { state: "ended", reason: "declined" } : s;
     case "cancel":
-      return joinOperation(s) === a.operation ? JOIN_IDLE : s;
+      return joinOperation(s) === a.operation ? { state: "cancelled", operation: a.operation } : s;
     case "tick":
-      return (s.state === "code" || s.state === "consent") && secondsLeft(s.expiresAt, a.nowMs) === 0 ? { state: "ended", reason: "expired" } : s;
+      return (s.state === "code" || s.state === "consent") && secondsLeft(s.expiresAt, a.nowMs) === 0 ? { state: "ended", reason: "expired", operation: s.operation } : s;
   }
 }
 
 // "Generate new code" only after a definitive outcome; never while completing or reconciling.
 export function offersNewCode(s: JoinUi): boolean {
-  return s.state === "ended";
+  return s.state === "ended" && !s.operation;
 }
 
 // The words in two rows of four.
