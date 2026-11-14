@@ -50,11 +50,76 @@ pub async fn hosts_configure(
         .map_err(|e| e.to_string())?
 }
 
-/// How local Tabs run: `daemon` (Daemon Terminals on host `local`) or `in-process`, and the
-/// Persistent Daemon setting.
+/// How local Tabs run (`daemon`, `in-process` or `failed`), the Daemon's state and what
+/// keeps it running.
 #[tauri::command]
 pub fn local_host_info(state: State<'_, Hosts>) -> super::local::LocalHostInfo {
     state.local_info()
+}
+
+/// Retry the Local Host's Daemon: clear the start error and dial again; in mode `failed` set
+/// the Daemon up again; rerun the service install when it failed. Answers the new info.
+#[tauri::command]
+pub async fn local_daemon_retry(
+    app: tauri::AppHandle,
+) -> Result<super::local::LocalHostInfo, String> {
+    use tauri::Manager as _;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.try_state::<Hosts>()
+            .map(|h| h.retry_local())
+            .ok_or_else(|| "not ready".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The frontend listens for `local:quit-prompt`: closing may now ask.
+#[tauri::command]
+pub fn local_quit_prompt_ready(quit: State<'_, super::quit::QuitState>) {
+    quit.set_attached();
+}
+
+/// Whether closing now would ask, and why (informational).
+#[tauri::command]
+pub fn local_quit_check(app: tauri::AppHandle) -> Result<super::quit::QuitCheck, String> {
+    super::quit::check(&app).ok_or_else(|| "not ready".into())
+}
+
+/// Answer the prompt `id`: `keep` (with `remember`: never ask again), `stop` (ends exactly
+/// the Terminals shown), or `cancel`. `null`, `{changed:{id, added}}` (new Terminals since
+/// the prompt: the shown ones are stopped, ask again about `added`), or an error
+/// (`failed:<n> …`: n did not stop; `stale…`).
+#[tauri::command]
+pub async fn local_quit_resolve(
+    app: tauri::AppHandle,
+    id: String,
+    choice: String,
+    remember: bool,
+) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || super::quit::resolve(&app, &id, &choice, remember))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The updater relaunches: no prompt from here on.
+#[tauri::command]
+pub fn local_quit_bypass(quit: State<'_, super::quit::QuitState>) {
+    quit.set_bypass();
+}
+
+/// `local_keep_sessions`: `"ask"` (default) or `"always"`.
+#[tauri::command]
+pub fn local_keep_sessions_get(state: State<'_, Hosts>) -> &'static str {
+    super::local::read_keep_sessions(state.store.as_deref()).as_str()
+}
+
+/// Save `local_keep_sessions` durably.
+#[tauri::command]
+pub fn local_keep_sessions_set(state: State<'_, Hosts>, value: String) -> Result<(), String> {
+    let v = super::local::KeepSessions::parse(&value)
+        .ok_or_else(|| format!("invalid value {value:?}: ask or always"))?;
+    let store = state.store.as_deref().ok_or("settings are unavailable")?;
+    store.set_saved(super::local::KEEP_SESSIONS_KEY, Value::from(v.as_str()))
 }
 
 /// How long a switch may take for its Daemon to come up before it is undone.

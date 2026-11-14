@@ -1,15 +1,19 @@
 //! Remote Host connections: Tauri glue over `xshell_hostlink::Manager`. Status changes and
 //! `terminals` lists become events; Terminal output goes through the same `Channel`s local
 //! Terminals use. The Local Host is one of the Manager's Hosts too (id `local`) when its
-//! Terminals run in a Daemon ([`local::LocalMode::Daemon`]), GUI-bound or Persistent.
+//! Terminals run in a Daemon ([`local::LocalMode::Daemon`]): on Linux and macOS always the
+//! one always-on Daemon (ADR-0017), on Windows the GUI-bound one.
 
 pub mod available;
 pub mod binaries;
 pub mod commands;
 pub mod local;
+pub mod presence;
+pub mod quit;
+pub mod service;
 
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager as _};
 use xshell_hostlink::{
@@ -18,20 +22,30 @@ use xshell_hostlink::{
 };
 use xshell_protocol::msg::TerminalInfo;
 
+type DaemonSlot = Arc<Mutex<Option<Arc<xshell_hostlink::LocalDaemon>>>>;
+
 pub struct Hosts {
     pub manager: Arc<Manager>,
     pub available: Arc<available::AvailableState>,
-    /// How local Tabs run, as resolved at startup.
+    /// How local Tabs run, as resolved at startup (see [`Hosts::local_mode_now`]).
     pub local_mode: local::LocalMode,
-    /// The Daemon this app may start for the Local Host (Daemon mode only).
+    /// The Daemon this app may start for the Local Host, as set up at startup (Daemon mode
+    /// only; see [`Hosts::local_daemon_now`] for one a Retry set up later).
     pub local_daemon: Option<Arc<xshell_hostlink::LocalDaemon>>,
-    /// `settings.json`, for the Persistent Daemon setting.
+    /// `settings.json`.
     pub store: Option<Arc<dyn local::SettingStore>>,
-    /// One switch of the Daemon mode at a time.
+    /// One switch of the Daemon mode at a time (legacy Persistent switch).
     pub switch_lock: tokio::sync::Mutex<()>,
+    /// What keeps the Daemon running (Unix).
+    pub service: Arc<service::ServiceState>,
+    /// The mode and Daemon now: a Retry from `Failed` replaces them.
+    current: Mutex<local::LocalMode>,
+    daemon: DaemonSlot,
+    app: AppHandle,
+    version: String,
 }
 
-/// Linux or macOS: where the Persistent Daemon setting is offered.
+/// Linux or macOS.
 pub fn linux_or_macos() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
@@ -54,6 +68,130 @@ impl local::RawStore for TauriStore {
     }
 }
 
+/// `~/.xshell/server/<version>+<build>/xshelld`: where the embedded Daemon is installed.
+fn own_install_bin(version: &str) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let dir = xshell_protocol::build::install_dir_name(version, crate::build_id::BUILD.as_ref());
+    Some(xshell_hostlink::install::local_server_bin(&home, &dir))
+}
+
+/// Resolve how local Tabs run and set up the Local Host's Daemon for it.
+fn setup_local(
+    version: &str,
+    exe_dir: Option<&std::path::Path>,
+    svc: &Arc<service::ServiceState>,
+) -> (local::LocalMode, Option<Arc<xshell_hostlink::LocalDaemon>>) {
+    let install_bin = own_install_bin(version);
+    let mut mode = local::resolve_local(
+        exe_dir,
+        &|k| std::env::var_os(k),
+        cfg!(unix),
+        binaries::embedded_own().is_some(),
+        install_bin.as_deref(),
+    );
+    let daemon = match &mode {
+        local::LocalMode::Daemon { bin, source } => match local_daemon(bin.clone(), version) {
+            Ok(d) => {
+                configure(&d, source, svc);
+                Some(d)
+            }
+            Err(reason) => {
+                mode = if cfg!(unix) {
+                    local::LocalMode::Failed { reason }
+                } else {
+                    local::LocalMode::InProcess { reason }
+                };
+                None
+            }
+        },
+        _ => None,
+    };
+    match &mode {
+        local::LocalMode::Daemon { bin, .. } => {
+            eprintln!("xshell: local terminals run in {}", bin.display())
+        }
+        local::LocalMode::InProcess { reason } => {
+            eprintln!("xshell: local terminals run in the app: {reason}")
+        }
+        local::LocalMode::Failed { reason } => {
+            eprintln!("xshell: the local Daemon cannot be set up: {reason}")
+        }
+    }
+    (mode, daemon)
+}
+
+/// Before the Local Host starts dialing. Unix: always-on (ADR-0017), `serve` first, and a
+/// prepare hook that installs the embedded Daemon (or reports that there is none) and waits
+/// once, briefly, for the service. Windows: the stored GUI-bound mode as before.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn configure(
+    d: &Arc<xshell_hostlink::LocalDaemon>,
+    source: &local::DaemonSource,
+    svc: &Arc<service::ServiceState>,
+) {
+    #[cfg(unix)]
+    {
+        d.set_persistent(true);
+        d.set_serve_first(true);
+        let svc = svc.clone();
+        let hook: xshell_hostlink::local::PrepareHook = match source.clone() {
+            local::DaemonSource::Missing(reason) => Arc::new(move || Err(reason.clone())),
+            local::DaemonSource::Embedded => {
+                let bin = d.bin().to_path_buf();
+                Arc::new(move || {
+                    install_embedded(&bin)?;
+                    svc.wait_first(service::FIRST_WAIT);
+                    Ok(())
+                })
+            }
+            local::DaemonSource::File => Arc::new(move || {
+                svc.wait_first(service::FIRST_WAIT);
+                Ok(())
+            }),
+        };
+        d.set_prepare(hook);
+    }
+    // Windows: GUI-bound only (the Persistent setting is not offered there).
+    #[cfg(not(unix))]
+    d.set_persistent(false);
+}
+
+/// Install the embedded Daemon at `bin` (`~/.xshell/server/<dir>/xshelld`).
+#[cfg(unix)]
+fn install_embedded(bin: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let bytes = binaries::embedded_own().ok_or("this build carries no xshelld")?;
+    let dir = bin
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .ok_or("bad install path")?;
+    let home = bin
+        .ancestors()
+        .nth(4)
+        .ok_or("bad install path")?
+        .to_path_buf();
+    xshell_hostlink::install::install_local_bytes(bytes, &home, dir)
+        .map_err(|e| format!("cannot install the Daemon to {}: {e}", bin.display()))
+}
+
+/// The installed Daemon to run `service install` with, per source; `Err`: why there is none.
+#[cfg(unix)]
+fn service_binary(
+    d: &xshell_hostlink::LocalDaemon,
+    source: &local::DaemonSource,
+) -> Result<std::path::PathBuf, String> {
+    match source {
+        local::DaemonSource::Missing(r) => Err(r.clone()),
+        local::DaemonSource::Embedded => install_embedded(d.bin()),
+        local::DaemonSource::File => {
+            d.check_bin().map_err(|e| e.to_string())?;
+            let home = dirs::home_dir().ok_or("the home directory is unknown")?;
+            xshell_hostlink::install::install_local(d.bin(), &home, &d.install_dir())
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
 impl Hosts {
     pub fn new(app: &AppHandle) -> Self {
         use tauri_plugin_store::StoreExt as _;
@@ -68,42 +206,19 @@ impl Hosts {
                 None
             }
         };
-        let mut local_mode =
-            local::resolve_daemon_binary(exe_dir.as_deref(), &|k| std::env::var_os(k));
-        let local_daemon = match &local_mode {
-            local::LocalMode::Daemon { bin } => match local_daemon(bin.clone(), &version) {
-                Ok(d) => Some(d),
-                Err(reason) => {
-                    local_mode = local::LocalMode::InProcess { reason };
-                    None
-                }
-            },
-            local::LocalMode::InProcess { .. } => None,
-        };
-        // Before the Local Host starts dialing: the first Daemon starts in the stored mode.
-        if let Some(d) = &local_daemon {
-            let on = local::persistent_supported(&local_mode, linux_or_macos())
-                && local::read_persistent(store.as_deref());
-            d.set_persistent(on);
-        }
-        match &local_mode {
-            local::LocalMode::Daemon { bin } => {
-                eprintln!("xshell: local terminals run in {}", bin.display())
-            }
-            local::LocalMode::InProcess { reason } => {
-                eprintln!("xshell: local terminals run in the app: {reason}")
-            }
-        }
+        let svc = Arc::new(service::ServiceState::default());
+        let (local_mode, local_daemon) = setup_local(&version, exe_dir.as_deref(), &svc);
         let cache_dir = app
             .path()
             .app_cache_dir()
             .unwrap_or_else(|_| std::env::temp_dir().join("xshell-cache"));
+        let slot: DaemonSlot = Arc::new(Mutex::new(local_daemon.clone()));
         let factory = SshFactory {
-            local: local_daemon.clone(),
+            local: slot.clone(),
         };
         let available = Arc::new(available::AvailableState::default());
         let mut cfg = ManagerConfig::new(
-            version,
+            version.clone(),
             Arc::new(factory),
             Arc::new(binaries::production_source(exe_dir, cache_dir)),
             Arc::new(TauriObserver(app.clone(), available.clone())),
@@ -112,65 +227,178 @@ impl Hosts {
         let manager = Arc::new(Manager::new(cfg));
         available.bind_manager(&manager);
         if local_daemon.is_some() {
-            manager.set_local(HostConfig {
-                id: LOCAL_HOST_ID.into(),
-                name: LOCAL_HOST_ID.into(),
-                ssh_target: String::new(),
-                color: None,
-                daemon_command: None,
-                launch_prefixes: Default::default(),
-            });
+            manager.set_local(local_host_config());
         }
-        Self {
+        let hosts = Self {
             manager,
             available,
+            current: Mutex::new(local_mode.clone()),
             local_mode,
             local_daemon,
             store,
             switch_lock: tokio::sync::Mutex::new(()),
+            service: svc,
+            daemon: slot,
+            app: app.clone(),
+            version,
+        };
+        hosts.start_service_install();
+        hosts
+    }
+
+    /// The mode now (a Retry may have set the Daemon up after a failed start).
+    pub fn local_mode_now(&self) -> local::LocalMode {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// The Local Host's Daemon now.
+    pub fn local_daemon_now(&self) -> Option<Arc<xshell_hostlink::LocalDaemon>> {
+        self.daemon.lock().unwrap().clone()
+    }
+
+    /// Unix: `service install` on its own thread, then the report and a `local:daemon` event.
+    /// Development builds skip it unless `XSHELL_SERVICE=1`.
+    fn start_service_install(&self) {
+        #[cfg(unix)]
+        {
+            let (local::LocalMode::Daemon { source, .. }, Some(d)) =
+                (self.local_mode_now(), self.local_daemon_now())
+            else {
+                return;
+            };
+            let svc = self.service.clone();
+            svc.reset();
+            if !service::should_install(cfg!(debug_assertions), &|k| std::env::var_os(k)) {
+                svc.set(local::ServiceInfo {
+                    mechanism: None,
+                    linger: None,
+                    error: Some("not installed by a development build (XSHELL_SERVICE=1)".into()),
+                });
+                return;
+            }
+            let app = self.app.clone();
+            let _ = std::thread::Builder::new()
+                .name("daemon-service".into())
+                .spawn(move || {
+                    let info = match service_binary(&d, &source) {
+                        Ok(bin) => service::run_install(&bin, service::INSTALL_TIMEOUT),
+                        Err(e) => local::ServiceInfo {
+                            mechanism: None,
+                            linger: None,
+                            error: Some(e),
+                        },
+                    };
+                    if let Some(e) = &info.error {
+                        eprintln!("xshell: Daemon service: {e}");
+                    }
+                    svc.set(info);
+                    emit_local_info(&app);
+                });
         }
     }
 
-    /// What `local_host_info` answers.
+    /// What `local_host_info` answers and `local:daemon` carries.
     pub fn local_info(&self) -> local::LocalHostInfo {
-        let supported = local::persistent_supported(&self.local_mode, linux_or_macos());
-        let p = match (&self.local_daemon, supported) {
-            (Some(d), true) => {
-                let usable = self.manager.host(LOCAL_HOST_ID).is_some_and(|h| {
-                    matches!(
-                        h.status().status,
-                        xshell_hostlink::StatusKind::Connected
-                            | xshell_hostlink::StatusKind::UpgradePending
-                            | xshell_hostlink::StatusKind::BuildDiffers
-                    )
-                });
-                local::PersistentInfo {
-                    supported,
-                    enabled: d.persistent(),
-                    running: usable.then(|| d.running_mode()).flatten(),
+        let mode = self.local_mode_now();
+        let daemon = match (&mode, self.local_daemon_now()) {
+            (local::LocalMode::Daemon { .. }, Some(d)) => {
+                let snap = self.manager.access(LOCAL_HOST_ID).map(|h| h.snapshot());
+                let (state, error) = local::daemon_state(
+                    d.start_error(),
+                    snap.as_ref().map(|s| &s.status),
+                    snap.as_ref().is_some_and(|s| s.terminals.is_some()),
+                );
+                Some(local::DaemonInfo {
+                    state,
+                    error_kind: local::error_kind(error.as_deref()),
+                    error,
                     log: Some(d.log.display().to_string()),
-                }
+                })
             }
-            _ => local::PersistentInfo::default(),
+            _ => None,
         };
-        self.local_mode.info(p)
+        let service = match (&mode, cfg!(unix)) {
+            (local::LocalMode::Daemon { .. }, true) => Some(self.service.get().unwrap_or_default()),
+            _ => None,
+        };
+        mode.info(local::PersistentInfo::default(), daemon, service)
     }
 
-    /// Quitting: end the GUI-bound Daemon this app started (and with it every local
-    /// Terminal), stop every Host link, then wait for its orderly exit (it ends Terminals
-    /// within about 8 s) before killing it. A Persistent Daemon, and a Daemon this app did
-    /// not start, are left alone.
+    /// `local_daemon_retry`: clear the start error and dial again; in `Failed` set the
+    /// Daemon up again first (A8); rerun the service install when it failed.
+    pub fn retry_local(&self) -> local::LocalHostInfo {
+        if matches!(self.local_mode_now(), local::LocalMode::Failed { .. }) {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let (mode, daemon) = setup_local(&self.version, exe_dir.as_deref(), &self.service);
+            *self.current.lock().unwrap() = mode;
+            if daemon.is_some() {
+                *self.daemon.lock().unwrap() = daemon;
+                self.manager.set_local(local_host_config());
+                self.start_service_install();
+            }
+        } else if self.service.get().is_some_and(|s| s.error.is_some()) {
+            self.start_service_install();
+        }
+        if let Some(d) = self.local_daemon_now() {
+            d.clear_start_error();
+        }
+        if let Some(h) = self.manager.access(LOCAL_HOST_ID) {
+            h.kick();
+        }
+        self.local_info()
+    }
+
+    /// Quitting: stop every Host link. On Unix the always-on Daemon keeps running (its
+    /// Terminals too: the quit prompt already asked); on Windows the GUI-bound Daemon this app
+    /// started ends (and with it every local Terminal), within about 8 s before it is killed.
     pub fn quit(&self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        if let Some(d) = &self.local_daemon {
+        let d = self.local_daemon_now();
+        if let Some(d) = &d {
             d.hang_up();
         }
         // Kill every ssh; Remote Daemons and their Terminals keep running.
         self.manager.shutdown();
-        if let Some(d) = &self.local_daemon {
+        if let Some(d) = &d {
             d.reap(deadline);
         }
     }
+}
+
+fn local_host_config() -> HostConfig {
+    HostConfig {
+        id: LOCAL_HOST_ID.into(),
+        name: LOCAL_HOST_ID.into(),
+        ssh_target: String::new(),
+        color: None,
+        daemon_command: None,
+        launch_prefixes: Default::default(),
+    }
+}
+
+/// Send `local:daemon` with the current info. Observer callbacks may run under hostlink's
+/// locks, so the info is read and sent on a worker thread; bursts collapse into one event.
+pub fn emit_local_info(app: &AppHandle) {
+    static WORKER: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<()>>> =
+        std::sync::OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let app = app.clone();
+        let _ = std::thread::Builder::new()
+            .name("local-info".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    while rx.try_recv().is_ok() {}
+                    if let Some(h) = app.try_state::<Hosts>() {
+                        let _ = app.emit("local:daemon", h.local_info());
+                    }
+                }
+            });
+        Mutex::new(tx)
+    });
+    let _ = tx.lock().unwrap().send(());
 }
 
 /// The Local Host's Daemon, reached on this user's Daemon socket (Windows: named pipe).
@@ -217,11 +445,18 @@ impl Observer for TauriObserver {
         // Records the Host's connection for the Ring; the work runs elsewhere.
         crate::ring::observe(&crate::ring::HOST_SYNC, s);
         let _ = self.0.emit("hosts:status", s);
+        if s.host == LOCAL_HOST_ID {
+            emit_local_info(&self.0);
+        }
     }
     fn terminals(&self, host: &str, list: &[TerminalInfo]) {
         let _ = self
             .0
             .emit("hosts:terminals", TerminalsEvent { host, list });
+        // Readiness needs the first list (A8).
+        if host == LOCAL_HOST_ID {
+            emit_local_info(&self.0);
+        }
     }
     fn renamed(&self, host: &str) {
         // The Host's Ring member takes the new name.
@@ -258,7 +493,7 @@ impl TermSink for ChannelSink {
 }
 
 struct SshFactory {
-    local: Option<Arc<xshell_hostlink::LocalDaemon>>,
+    local: DaemonSlot,
 }
 
 impl TransportFactory for SshFactory {
@@ -271,7 +506,7 @@ impl TransportFactory for SshFactory {
         if cfg.id != LOCAL_HOST_ID {
             return None;
         }
-        let daemon = self.local.clone()?;
+        let daemon = self.local.lock().unwrap().clone()?;
         Some(Box::new(xshell_hostlink::LocalDialer { daemon }))
     }
 }

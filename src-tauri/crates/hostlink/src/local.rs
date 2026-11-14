@@ -415,9 +415,8 @@ impl LocalDaemon {
     /// hook, try again, then spawn and wait for it to listen. Every failure to start is
     /// recorded as [`LocalDaemon::start_error`]; a connection clears it.
     pub fn connect_or_start(&self, cancel: &CancelToken) -> Result<LocalStream, DialError> {
-        match self.try_connect(cancel)? {
-            Some(s) => return Ok(s),
-            None => {}
+        if let Some(s) = self.try_connect(cancel)? {
+            return Ok(s);
         }
         let prepare = self.prepare.lock().unwrap().clone();
         if let Some(p) = prepare {

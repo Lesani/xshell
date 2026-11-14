@@ -261,6 +261,31 @@ impl local_pty::Sink for ChannelSink {
     }
 }
 
+/// A4 (ADR-0017): on Linux and macOS every local Terminal runs in the Daemon; the in-process
+/// PTY commands refuse unless the test override `XSHELL_LOCAL_DAEMON=0` is set. Windows
+/// keeps them (a Desktop without its Daemon runs Terminals in this process).
+fn in_process_allowed(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<(), String> {
+    if cfg!(unix) && env("XSHELL_LOCAL_DAEMON").as_deref() != Some("0".as_ref()) {
+        return Err(
+            "in-process: local terminals run in this computer's Daemon (host \"local\")".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Run an in-process PTY command when [`in_process_allowed`].
+fn local_pty_command<T>(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    in_process_allowed(env)?;
+    f()
+}
+
+fn process_env(k: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(k)
+}
+
 // The argument list is the frontend IPC contract (`invoke('spawn_terminal', {...})`).
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -298,12 +323,14 @@ fn spawn_terminal(
         data: on_data,
         exit: on_exit,
     });
-    state.ptys.spawn(id, spec, cols, rows, sink)
+    local_pty_command(&process_env, || {
+        state.ptys.spawn(id, spec, cols, rows, sink)
+    })
 }
 
 #[tauri::command]
 fn write_terminal(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
-    state.ptys.write(&id, data.as_bytes())
+    local_pty_command(&process_env, || state.ptys.write(&id, data.as_bytes()))
 }
 
 #[tauri::command]
@@ -313,13 +340,15 @@ fn resize_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    state.ptys.resize(&id, cols, rows)
+    local_pty_command(&process_env, || state.ptys.resize(&id, cols, rows))
 }
 
 #[tauri::command]
 fn close_terminal(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.ptys.close(&id);
-    Ok(())
+    local_pty_command(&process_env, || {
+        state.ptys.close(&id);
+        Ok(())
+    })
 }
 
 /// Restart a Terminal with `skipPermissions` changed, resuming `session_id` (the Tab's
@@ -332,6 +361,7 @@ async fn relaunch_terminal(
     session_id: Option<String>,
     agent: Option<String>,
 ) -> Result<bool, String> {
+    in_process_allowed(&process_env)?;
     let ptys = state.ptys.clone();
     // Ending the old process waits for it; keep that off the runtime workers.
     tauri::async_runtime::spawn_blocking(move || {
@@ -418,6 +448,13 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_test",
     "local_host_info",
     "local_daemon_set_persistent",
+    "local_daemon_retry",
+    "local_quit_prompt_ready",
+    "local_quit_check",
+    "local_quit_resolve",
+    "local_quit_bypass",
+    "local_keep_sessions_get",
+    "local_keep_sessions_set",
 ];
 // The PTY commands; a remote host serves terminals through its own protocol.
 #[cfg(test)]
@@ -722,6 +759,14 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager as _;
             app.manage(hosts::Hosts::new(app.handle()));
+            // The quit prompt's presence lives in a machine-local runtime dir (A6).
+            #[cfg(unix)]
+            let presence = hosts::presence::Presence::register(&hosts::presence::default_dir())
+                .map_err(|e| eprintln!("xshell: quit prompt presence unavailable: {e}"))
+                .ok();
+            #[cfg(not(unix))]
+            let presence = None;
+            app.manage(hosts::quit::QuitState::new(presence));
             ring::setup(app.handle());
             open_copies::sweep_in_background(app.handle());
             #[cfg(unix)]
@@ -744,11 +789,16 @@ pub fn run() {
         })
         // A GUI Device Code dies when its window loses focus (#87, BINDING AMENDMENT 3:
         // each xshell window is its own process).
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(false) = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::Focused(false) => {
                 use tauri::Manager as _;
                 ring::join::window_blurred(window.app_handle());
             }
+            // Closing the last window with local Terminals running asks (ADR-0017).
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                hosts::quit::close_requested(window, api);
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             app_build,
@@ -837,6 +887,13 @@ pub fn run() {
             hosts::commands::host_test,
             hosts::commands::local_host_info,
             hosts::commands::local_daemon_set_persistent,
+            hosts::commands::local_daemon_retry,
+            hosts::commands::local_quit_prompt_ready,
+            hosts::commands::local_quit_check,
+            hosts::commands::local_quit_resolve,
+            hosts::commands::local_quit_bypass,
+            hosts::commands::local_keep_sessions_get,
+            hosts::commands::local_keep_sessions_set,
             hosts::commands::list_ssh_hosts,
             local_migration::local_migration_lock,
             local_migration::local_migration_unlock,
@@ -865,6 +922,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, ev| {
+            // An application quit (not the last window closing) goes through the same
+            // decision as closing the last window (A7); the updater's relaunch bypasses it.
+            if let tauri::RunEvent::ExitRequested {
+                api, code: Some(_), ..
+            } = &ev
+            {
+                if hosts::quit::exit_requested(app) {
+                    api.prevent_exit();
+                }
+            }
             if let tauri::RunEvent::Exit = ev {
                 use tauri::Manager as _;
                 // Say goodbye to the Relay while the local Daemon ends (at most 2.5 s).
@@ -876,8 +943,8 @@ pub fn run() {
                         ring::quit(&a);
                         let _ = tx.send(());
                     });
-                // End the local Daemon this app started; kill every ssh (Remote Daemons and
-                // their Terminals keep running).
+                // Kill every ssh (Remote Daemons and their Terminals keep running). Unix: the
+                // always-on Daemon keeps running; Windows: the GUI-bound Daemon ends.
                 if let Some(h) = app.try_state::<hosts::Hosts>() {
                     h.quit();
                 }
@@ -939,13 +1006,58 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 110);
+        assert_eq!(registered.len(), 117);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)
             .chain(HOST_LINK_COMMANDS)
         {
             assert!(registered.contains(*c), "{c} is not registered");
+        }
+    }
+
+    /// A4: the in-process PTY commands refuse on Unix (unless the test override is set), and
+    /// nothing starts.
+    #[test]
+    fn in_process_commands_refuse_on_unix() {
+        let ptys = Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
+            xshell_core::plan_command_with(&ctx(), spec, hooks)
+        })));
+        let none = |_: &str| None;
+        let off = |k: &str| (k == "XSHELL_LOCAL_DAEMON").then(|| "0".into());
+        let sink = Arc::new(ChannelSink {
+            data: Channel::new(|_| Ok(())),
+            exit: Channel::new(|_| Ok(())),
+        });
+        let spec = LaunchSpec {
+            agent: None,
+            session_id: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            shell_mode: Some("command".into()),
+            shell_command: Some("true".into()),
+            shell_id: None,
+            fullscreen_rendering: None,
+            force_sync_output: None,
+            skip_permissions: None,
+            launch_prefix: None,
+        };
+        let mut ran = false;
+        let r = local_pty_command(&none, || {
+            ran = true;
+            ptys.spawn("t1".into(), spec.clone(), 80, 24, sink.clone())
+        });
+        let w = local_pty_command(&none, || ptys.write("t1", b"x"));
+        if cfg!(unix) {
+            assert!(r.unwrap_err().starts_with("in-process:"));
+            assert!(w.unwrap_err().starts_with("in-process:"));
+            assert!(in_process_allowed(&none).is_err());
+            // Nothing was spawned.
+            assert!(!ran, "the PTY was started");
+            assert!(in_process_allowed(&off).is_ok());
+        } else {
+            assert!(ran);
+            assert!(in_process_allowed(&none).is_ok());
+            ptys.close("t1");
         }
     }
 
