@@ -4985,32 +4985,58 @@ mod tests {
         b.quit();
     }
 
-    /// First run under a loose umask (an installer made `~/.xshell/bin` 0775, the app data
-    /// dir is group-readable): the startup denial reservation succeeds on the first call.
+    /// First run: a missing `~/.xshell` is created 0700 and a read-only one (0755, with an
+    /// installer's 0775 `bin` below it) is tightened, so the reservation succeeds on the first
+    /// call. A group/world-writable `~/.xshell` is refused unchanged with an error naming it:
+    /// it is never repaired into an accepted ancestry.
     #[cfg(unix)]
     #[test]
-    fn first_run_reservation_tightens_loose_umask_directories() {
+    fn first_run_reservation_creates_private_root_and_refuses_writable_one_unchanged() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let mode = |p: &std::path::Path| {
             std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(p).unwrap()) & 0o777
         };
-        for loose in [0o775, 0o755] {
+        for shared in [None, Some(0o755), Some(0o775), Some(0o777)] {
             let t = tempfile::tempdir().unwrap();
             let home = t.path().canonicalize().unwrap();
             std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
             let app = home.join("app");
-            for d in [home.join(".xshell"), home.join(".xshell/bin"), app.clone()] {
-                std::fs::DirBuilder::new().mode(loose).create(&d).unwrap();
-                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(loose)).unwrap();
+            std::fs::DirBuilder::new().mode(0o775).create(&app).unwrap();
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o775)).unwrap();
+            if let Some(shared) = shared {
+                for (d, m) in [
+                    (home.join(".xshell"), shared),
+                    (home.join(".xshell/bin"), 0o775),
+                ] {
+                    std::fs::DirBuilder::new().mode(m).create(&d).unwrap();
+                    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m)).unwrap();
+                }
             }
             let (ring, _) = open(cfg(&app, "ws://127.0.0.1:9"));
-            assert_eq!(ring.reserve_local_companion(&home), Ok(true), "{loose:o}");
-            assert_eq!(mode(&app.join("ring")), 0o700);
-            assert_eq!(mode(&home.join(".xshell")), 0o700);
-            assert!(home
+            let reservation = home
                 .join(".xshell/daemon/ring")
-                .join(xshell_core::companion_reservation::FILE)
-                .exists());
+                .join(xshell_core::companion_reservation::FILE);
+            match shared {
+                Some(loose) if loose & 0o022 != 0 => {
+                    let error = ring.reserve_local_companion(&home).unwrap_err();
+                    let named = home.join(".xshell").display().to_string();
+                    assert!(
+                        error.contains(&named) && error.contains("writable by other users"),
+                        "{error}"
+                    );
+                    assert_eq!(mode(&home.join(".xshell")), loose);
+                    assert!(!reservation.exists());
+                }
+                _ => {
+                    assert_eq!(ring.reserve_local_companion(&home), Ok(true), "{shared:?}");
+                    assert_eq!(mode(&home.join(".xshell")), 0o700);
+                    assert!(reservation.exists());
+                    if shared.is_some() {
+                        assert_eq!(mode(&home.join(".xshell/bin")), 0o775, "left alone");
+                    }
+                }
+            }
+            assert_eq!(mode(&app.join("ring")), 0o700);
             ring.quit();
         }
     }

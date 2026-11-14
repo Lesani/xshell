@@ -703,6 +703,9 @@ pub fn install_local(
                 format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
             ));
         }
+        if part == ".xshell" {
+            xshell_core::server::refuse_writable_shared_root(&dir, m.mode())?;
+        }
         if m.mode() & 0o077 != 0 {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }

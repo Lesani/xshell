@@ -77,7 +77,17 @@ fn owned_directory(path: &Path, private: bool) -> io::Result<()> {
     }
     let forbidden = if private { 0o077 } else { 0o022 };
     if meta.mode() & forbidden != 0 {
-        return Err(denied("unsafe counterpart directory permissions"));
+        // Name the directory: the Desktop logs this and the owner has to fix it by hand.
+        return Err(denied(&format!(
+            "unsafe counterpart directory permissions: {} (mode {:03o}) must {}",
+            path.display(),
+            meta.mode() & 0o777,
+            if private {
+                "be private to this user (0700)"
+            } else {
+                "not be writable by other users (chmod go-w)"
+            }
+        )));
     }
     Ok(())
 }

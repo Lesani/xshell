@@ -178,10 +178,14 @@ mod linux {
     }
     pub fn serve(ring: Arc<DesktopRing>, path: PathBuf) -> Result<Server, AccessError> {
         let dir = path.parent().ok_or(AccessError::PermissionRequired)?;
-        // Reuse the Ring store's user-private directory handling, then strictly inspect.
+        // The parent is the shared `~/.xshell`: created 0700, but an existing group/world-
+        // writable one is refused unchanged, never repaired (that would launder the Store
+        // and IPC ancestry for the reservation checks). Then strictly inspect.
         let parent = dir.parent().ok_or(AccessError::PermissionRequired)?;
-        xshell_hostlink::ring::store::ensure_private_dir(parent)
-            .map_err(|_| AccessError::PermissionRequired)?;
+        xshell_hostlink::ring::store::prepare_shared_dir(parent).map_err(|error| {
+            eprintln!("xshell: pairing access: {error}");
+            AccessError::PermissionRequired
+        })?;
         xshell_hostlink::ring::store::ensure_private_dir(dir)
             .map_err(|_| AccessError::PermissionRequired)?;
         private(parent, false)?;

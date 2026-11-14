@@ -194,15 +194,15 @@ impl DesktopRing {
     /// by Desktop shutdown/cancellation; not evidence of counterpart registration.
     #[cfg(unix)]
     pub fn reserve_local_companion(&self, home: &std::path::Path) -> Result<bool, String> {
-        // First run: the election lock lives in the Desktop Store, and an installer may
-        // have created `~/.xshell/bin` under a loose umask (0002). Tighten what this user
-        // owns, as the server install does, before the reservation would refuse it.
-        // Symlinks and foreign owners stay refused.
+        // First run: the election lock lives in the Desktop Store (a private leaf).
         super::store::ensure_private_dir(self.store.dir()).map_err(|e| e.to_string())?;
         if !self.pairing_ipc_owner() {
             return Ok(false);
         }
-        super::store::ensure_private_dir(&home.join(".xshell")).map_err(|e| e.to_string())?;
+        // `~/.xshell` is created 0700 whatever the umask; an existing read-only exposure
+        // (0755) is tightened, but a group/world-writable one is refused unchanged, never
+        // repaired into an accepted ancestry.
+        xshell_core::server::prepare_shared_root(home).map_err(|e| e.to_string())?;
         let desktop = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
         xshell_core::companion_reservation::reserve(home, &desktop).map_err(|e| e.to_string())?;
         Ok(true)

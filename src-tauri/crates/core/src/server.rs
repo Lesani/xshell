@@ -37,7 +37,10 @@ fn dir_version(name: &str) -> &str {
 }
 
 #[cfg(unix)]
-pub use unix::{resolve_selected, valid_install, write_selected};
+pub use unix::{
+    prepare_shared_dir, prepare_shared_root, refuse_writable_shared_root, resolve_selected,
+    valid_install, write_selected,
+};
 
 #[cfg(unix)]
 mod unix {
@@ -47,6 +50,74 @@ mod unix {
 
     fn uid() -> u32 {
         unsafe { libc::getuid() }
+    }
+
+    /// `~/.xshell` is the shared root above every private Store, IPC and install directory.
+    /// An existing one that is writable by group or others is refused unchanged: other
+    /// users may already have used that rename authority, so making it 0700 now would
+    /// launder an ancestry that must not be trusted. The error names the directory and the
+    /// fix. `mode` is the directory's full `st_mode`.
+    pub fn refuse_writable_shared_root(dir: &Path, mode: u32) -> io::Result<()> {
+        if mode & 0o022 == 0 {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by other users (mode {:03o}); xshell will not use it. \
+                 Remove group/other write access (chmod go-w {}) if only you could have \
+                 changed it, or move it aside",
+                dir.display(),
+                mode & 0o777,
+                dir.display()
+            ),
+        ))
+    }
+
+    /// Creates `home/.xshell` 0700 (explicitly, independent of the umask) or accepts an
+    /// existing one that is ours, a real directory and not writable by others; read-only
+    /// exposure (e.g. 0755) is tightened to 0700. A group/world-writable one is refused
+    /// unchanged ([`refuse_writable_shared_root`]). Directories created below a 0700
+    /// `.xshell` with a loose umask (e.g. an installer's `~/.xshell/bin` 0775) are not a
+    /// rename risk for other users, who cannot traverse `.xshell`; this does not look at
+    /// them. Does not validate `home` itself: callers that need it check it separately.
+    pub fn prepare_shared_root(home: &Path) -> io::Result<PathBuf> {
+        let dir = home.join(".xshell");
+        prepare_shared_dir(&dir)?;
+        Ok(dir)
+    }
+
+    /// [`prepare_shared_root`] for an explicit shared directory (its parent must exist).
+    pub fn prepare_shared_dir(dir: &Path) -> io::Result<()> {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)
+            .map_err(|e| Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
+        let m = file.metadata()?;
+        if !m.is_dir() {
+            return Err(Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        if m.uid() != uid() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
+            ));
+        }
+        refuse_writable_shared_root(dir, m.mode())?;
+        if m.mode() & 0o7777 != 0o700 {
+            // fchmod on the opened, validated directory: never a path re-resolution.
+            file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
 
     /// Ours, not a symlink, and not writable by group or others.
@@ -134,6 +205,9 @@ mod unix {
                     ErrorKind::PermissionDenied,
                     format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
                 ));
+            }
+            if part == ".xshell" {
+                refuse_writable_shared_root(&dir, m.mode())?;
             }
             if m.mode() & 0o077 != 0 {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -267,11 +341,46 @@ mod tests {
         }
 
         #[test]
+        fn shared_root_is_created_private_and_writable_one_refused_unchanged() {
+            let t = tempfile::tempdir().unwrap();
+            let home = t.path();
+            assert_eq!(prepare_shared_root(home).unwrap(), home.join(".xshell"));
+            assert_eq!(mode(&home.join(".xshell")), 0o700);
+            std::fs::set_permissions(home.join(".xshell"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            prepare_shared_root(home).unwrap();
+            assert_eq!(
+                mode(&home.join(".xshell")),
+                0o700,
+                "read-only exposure tightened"
+            );
+            install(home, "1.5.0+85ee920a1b2c");
+            for loose in [0o775, 0o777, 0o722] {
+                std::fs::set_permissions(
+                    home.join(".xshell"),
+                    std::fs::Permissions::from_mode(loose),
+                )
+                .unwrap();
+                for e in [
+                    prepare_shared_root(home).unwrap_err(),
+                    write_selected(home, "1.5.0+85ee920a1b2c").unwrap_err(),
+                ] {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(e.to_string().contains("writable by other users"), "{e}");
+                }
+                assert_eq!(mode(&home.join(".xshell")), loose, "refused unchanged");
+                assert!(!server_root(home).join(SELECTED).exists());
+            }
+        }
+
+        #[test]
         fn write_refuses_symlinked_root() {
             let t = tempfile::tempdir().unwrap();
             let home = t.path().join("home");
             let elsewhere = t.path().join("elsewhere");
             std::fs::create_dir_all(home.join(".xshell")).unwrap();
+            std::fs::set_permissions(home.join(".xshell"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
             std::fs::create_dir(&elsewhere).unwrap();
             std::os::unix::fs::symlink(&elsewhere, server_root(&home)).unwrap();
             let e = write_selected(&home, "1.5.0").unwrap_err();
