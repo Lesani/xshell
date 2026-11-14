@@ -12,7 +12,11 @@ mod farewell;
 #[cfg(feature = "relay-client")]
 mod io;
 #[cfg(feature = "relay-client")]
+pub mod approve;
+#[cfg(feature = "relay-client")]
 pub mod pair;
+#[cfg(feature = "relay-client")]
+pub mod remove;
 #[cfg(feature = "relay-client")]
 pub mod sessions;
 #[cfg(feature = "relay-client")]
@@ -29,9 +33,9 @@ pub mod test_relay;
 
 #[cfg(feature = "relay-client")]
 pub use client::{
-    ActivityReport, ChainPin, DepartureClient, DepartureStatus, MemberStatus, PolicyPreview,
-    ProposalReader, PushRequest, RingClient, RingClientConfig, RingEvents, RingLimits,
-    RingTimeouts, Ticket, VerifiedProposal,
+    check_removal, ActivityReport, ChainPin, DepartureClient, DepartureStatus, MemberStatus,
+    PolicyPreview, ProposalReader, PushRequest, RemovalCheck, RingClient, RingClientConfig,
+    RingEvents, RingLimits, RingTimeouts, Ticket, VerifiedProposal,
 };
 #[cfg(feature = "relay-client")]
 pub use connector::{Connector, ConnectorConfig, ConnectorEvents, LinkState};

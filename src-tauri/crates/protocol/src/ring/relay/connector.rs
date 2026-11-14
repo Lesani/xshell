@@ -102,6 +102,12 @@ pub trait ConnectorEvents: Send + Sync {
     /// A farewell's new state (see [`FarewellState`]). Never called from
     /// [`Connector::set_farewells`] or [`Connector::set_chain`] themselves.
     fn farewell(&self, _state: &FarewellState) {}
+    /// The Relay refused or closed this device's connection as removed / not a member, and
+    /// the Connector stopped (once per stop, after the `Stopped` state report). The Relay is
+    /// untrusted: the owner must verify a signed removal (for example with
+    /// [`super::check_removal`]) before it acts, and [`Connector::kick`] it when the check
+    /// says this device is still a member.
+    fn removed(&self) {}
     /// `relay` holds this Ring, at least up to `version`: the main connection authenticated
     /// there (`version` is then the newest the Relay holds that names `relay`), a farewell was
     /// acknowledged there, or it refused this Ring for quota (only a Relay that holds a Ring
@@ -286,6 +292,11 @@ fn named_by(chain: &RosterChain, relay: &str) -> Option<u64> {
 }
 
 /// Whether the Relay said this device is no longer in the Ring: no point in dialing again.
+/// A Device Code approver: a Computer's Desktop or a Mobile, never a Daemon.
+fn approver_role(role: crate::ring::Role) -> bool {
+    matches!(role, crate::ring::Role::Desktop | crate::ring::Role::Mobile)
+}
+
 fn removed_close(why: &CloseReason) -> bool {
     match why {
         CloseReason::Relay { close_code, error } => {
@@ -731,6 +742,7 @@ impl Inner {
                     self.set_link(LinkState::Stopped {
                         error: Some(e.to_string()),
                     });
+                    self.events.removed();
                     match self.wait(None, false) {
                         Woke::Stop => {
                             self.finish(None);
@@ -793,6 +805,7 @@ impl Inner {
                             self.set_link(LinkState::Stopped {
                                 error: Some(why.to_string()),
                             });
+                            self.events.removed();
                             match self.wait(None, false) {
                                 Woke::Stop => {
                                     self.finish(None);
@@ -1941,7 +1954,7 @@ impl Connector {
             || !st
                 .chain
                 .authorized_member(&self.inner.base.signer.sign_key())
-                .is_some_and(|m| m.role == crate::ring::Role::Desktop)
+                .is_some_and(|m| approver_role(m.role))
         {
             return Err(RingError::Invalid(
                 "proposal connection is not at the accepted head".into(),
@@ -2023,7 +2036,7 @@ impl ProposalConnection {
             || !st
                 .chain
                 .authorized_member(&inner.base.signer.sign_key())
-                .is_some_and(|m| m.role == crate::ring::Role::Desktop)
+                .is_some_and(|m| approver_role(m.role))
         {
             return Err(RingError::Invalid(
                 "proposal creator connection or predecessor changed".into(),

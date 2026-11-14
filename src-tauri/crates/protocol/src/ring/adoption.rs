@@ -152,6 +152,51 @@ pub fn enroll_proposal(
     Ok(proposal)
 }
 
+/// The standalone `Daemon` unit an approval must remove before it enrolls `intent`'s
+/// Computer: a machine whose headless Daemon is already a member joins with its Desktop,
+/// and the Terminals stay. `Some(id)` only when the target is a Computer and `head` has a
+/// `Daemon` unit whose only member is exactly the intent's Daemon (same signing and Noise
+/// keys). `None` when no target key is a member. `Err` for every other overlap: a target
+/// key in any other unit is never taken over. Call only after possession of both target
+/// keys was verified in this same pairing.
+pub fn standalone_unit_to_replace(
+    head: &crate::ring::SignedRoster,
+    intent: &AdoptionIntent,
+) -> Result<Option<String>, PairError> {
+    let refuse = || PairError::Payload("a target key is already enrolled".into());
+    let m = head
+        .roster()
+        .membership()
+        .map_err(|e| PairError::Payload(e.to_string()))?;
+    let enrolled = |key: &SignKey| head.member(key).is_some() || m.unit_for(key).is_some();
+    match &intent.target {
+        JoinTarget::Computer { desktop, daemon } => {
+            if enrolled(&desktop.sign_key) {
+                return Err(refuse());
+            }
+            if !enrolled(&daemon.sign_key) {
+                return Ok(None);
+            }
+            let unit = m.unit_for(&daemon.sign_key).ok_or_else(refuse)?;
+            let member = head.member(&daemon.sign_key).ok_or_else(refuse)?;
+            if unit.kind != EnrollmentKind::Daemon
+                || unit.members != [daemon.sign_key]
+                || member.role != Role::Daemon
+                || member.noise_key != daemon.noise_key
+            {
+                return Err(refuse());
+            }
+            Ok(Some(unit.id.clone()))
+        }
+        other => {
+            if other.identities().iter().any(|(i, _)| enrolled(&i.sign_key)) {
+                return Err(refuse());
+            }
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptionIntent {

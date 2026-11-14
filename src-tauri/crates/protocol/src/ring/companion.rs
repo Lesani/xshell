@@ -203,6 +203,12 @@ pub enum CompanionRequest {
     LeaveRemoved {
         rosters: Vec<String>,
     },
+    /// The Desktop's reconciler found that a consented operation never enrolled and its
+    /// offer expired: retire it ([`CompanionPolicy::abandon_expired`]) and drop any partly
+    /// written Daemon membership of it. Never grants or installs membership.
+    AbandonExpired {
+        operation: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +329,84 @@ impl CompanionPolicy {
             }
         }
         Ok(())
+    }
+    /// A Daemon that is still a retained standalone member may pair as a Computer only in
+    /// its own Ring, against a predecessor that extends its retained chain and has already
+    /// retired its own `Daemon` unit (the approver removed it in the same approval). Any
+    /// other retained membership refuses: removal or leave comes first.
+    fn standalone_regroup(&self, trusted: &RosterChain, predecessor: &RosterChain) -> Result<(), String> {
+        let refuse = || "leave required before pairing an enrolled counterpart".to_string();
+        if trusted.ring_id() != predecessor.ring_id() {
+            return Err(refuse());
+        }
+        let key = self.profile.daemon.sign_key;
+        let unit = trusted
+            .versions()
+            .iter()
+            .rev()
+            .find_map(|h| h.roster().membership().ok()?.unit_for(&key).cloned())
+            .ok_or_else(refuse)?;
+        if unit.kind != EnrollmentKind::Daemon || unit.members != [key] {
+            return Err(refuse());
+        }
+        // The predecessor must contain the whole retained history (the same ancestry).
+        if trusted.versions().iter().any(|h| {
+            predecessor
+                .get(h.version())
+                .is_none_or(|p| p.hash() != h.hash())
+        }) {
+            return Err(refuse());
+        }
+        let head = predecessor
+            .head()
+            .roster()
+            .membership()
+            .map_err(|e| e.to_string())?;
+        if !head.retired.contains(&unit.id) || predecessor.head().member(&key).is_some() {
+            return Err(refuse());
+        }
+        Ok(())
+    }
+    /// Abandon a consented operation whose offer has expired and that the Ring never
+    /// enrolled (the caller verified that). It is retired so it can never install, which
+    /// frees the counterpart for a new registration or Join. Refused before expiry.
+    pub fn abandon_expired(&mut self, operation: &str, now: u64) -> Result<(), String> {
+        let o = self.operation(operation)?;
+        if now < o.intent.expires_at {
+            return Err("operation has not expired".into());
+        }
+        if !matches!(
+            o.phase,
+            CompanionPhase::ConsentMayHaveLeft | CompanionPhase::Accepted
+        ) {
+            return Err("no consented operation to abandon".into());
+        }
+        let old = self.obligation.take().expect("checked operation");
+        if self.retired.len() < 64 {
+            self.retired
+                .insert(old.intent.operation, old.intent.expires_at);
+        }
+        Ok(())
+    }
+    /// Format reset: whatever operation was open is retired unconditionally. Only for a
+    /// membership that is being set aside as a whole (format 1, removal, new registration).
+    pub fn reset(&mut self) {
+        if let Some(old) = self.obligation.take() {
+            if self.retired.len() < 64 {
+                self.retired
+                    .insert(old.intent.operation, old.intent.expires_at);
+            }
+        }
+    }
+    /// [`CompanionPolicy::idle`], or the open operation's offer has expired: a registration
+    /// that may be replaced by a new Desktop identity (its old operation can never install
+    /// once the policy is replaced).
+    pub fn idle_or_expired(&self, now: u64) -> bool {
+        self.idle()
+            || self
+                .obligation
+                .as_ref()
+                .is_some_and(|o| now >= o.intent.expires_at)
     }
     /// No open operation: none, or the last one ended (cancelled or installed).
     pub fn idle(&self) -> bool {
@@ -509,14 +593,14 @@ impl CompanionPolicy {
         let m = r.membership().map_err(|e| e.to_string())?;
         match &proposal.transcript {
             ConsentTranscript::Pairing { .. } => {
-                if trusted.is_some() {
-                    return Err("leave required before pairing an enrolled counterpart".into());
-                }
                 if o.possession.is_none() {
                     return Err("pairing possession missing".into());
                 }
                 let chain =
                     RosterChain::from_tokens(&proposal.predecessor).map_err(|e| e.to_string())?;
+                if let Some(trusted) = trusted {
+                    self.standalone_regroup(trusted, &chain)?;
+                }
                 verify_enroll_proposal(chain.head(), r).map_err(|e| e.to_string())?;
                 o.intent
                     .target
