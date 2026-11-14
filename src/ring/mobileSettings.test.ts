@@ -29,7 +29,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
 }
 
 function member(kind: MemberView["presence"]["kind"], over: Partial<MemberView> = {}): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, enrollmentId: null, kind: null, daemonKey: null, ...over };
+  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, enrollmentId: null, kind: null, daemonKey: null, daemonPresence: null, ...over };
 }
 
 describe("presence", () => {
@@ -320,7 +320,7 @@ describe("removing a device", () => {
     expect(r).toEqual({ state: "confirming", member: m });
     expect(removalReducer(r, { type: "cancel" })).toEqual(REMOVAL_IDLE);
     r = removalReducer(r, { type: "start" });
-    expect(r).toEqual({ state: "removing", signKey: "p", name: "Pixel" });
+    expect(r).toEqual({ state: "removing", signKey: "p", name: "Pixel", confirmed: false });
     // Another row's Remove does nothing meanwhile.
     expect(removalReducer(r, { type: "ask", member: member("online") })).toBe(r);
     const failed = removalReducer(r, { type: "failed", error: "in_use: x" });

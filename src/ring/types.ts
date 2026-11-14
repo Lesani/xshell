@@ -23,6 +23,8 @@ export interface MemberView {
   enrollmentId: string | null;
   kind: EnrollmentKind | null;
   daemonKey: string | null;
+  // A grouped Computer: its Daemon's own presence (presence is online when either key is).
+  daemonPresence: { kind: PresenceKind; reason?: string; at?: number } | null;
 }
 
 export type EnrollmentKind = "computer" | "daemon" | "mobile" | "legacyDesktop";

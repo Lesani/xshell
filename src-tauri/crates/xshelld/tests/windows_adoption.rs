@@ -158,6 +158,11 @@ fn public_create_uses_two_private_stores_only_after_backend_confirmation() {
                     == Some(xshell_protocol::ring::membership::EnrollmentKind::Computer)
                 && view.members[0].daemon_key == Some(profile.daemon.sign_key)
                 && view.members[0].presence.kind == "online"
+                // The Daemon itself, as the Relay reports it (not this app's own presence).
+                && view.members[0]
+                    .daemon_presence
+                    .as_ref()
+                    .is_some_and(|p| p.kind == "online")
             {
                 break;
             }

@@ -208,7 +208,8 @@ export function removePendingLine(s: Pick<RingStatus, "connection">, name: strin
 export type Removal =
   | { state: "idle" }
   | { state: "confirming"; member: MemberView }
-  | { state: "removing"; signKey: string; name: string }
+  // `confirmed`: a format-v2 removal, which succeeds only once the Relay has it.
+  | { state: "removing"; signKey: string; name: string; confirmed: boolean }
   | { state: "failed"; signKey: string; line: string }
   | { state: "removed"; pending: string | null };
 
@@ -225,8 +226,8 @@ export function removalReducer(r: Removal, a: RemovalAction): Removal {
   switch (a.type) {
     case "ask": return r.state === "removing" ? r : { state: "confirming", member: a.member };
     case "cancel": return r.state === "confirming" ? REMOVAL_IDLE : r;
-    case "start": return r.state === "confirming" ? { state: "removing", signKey: r.member.signKey, name: r.member.name } : r;
-    case "done": return r.state === "removing" ? { state: "removed", pending: removePendingLine(a.status, r.name) } : r;
+    case "start": return r.state === "confirming" ? { state: "removing", signKey: r.member.signKey, name: r.member.name, confirmed: r.member.enrollmentId != null } : r;
+    case "done": return r.state === "removing" ? { state: "removed", pending: r.confirmed ? null : removePendingLine(a.status, r.name) } : r;
     case "failed": return r.state === "removing" ? { state: "failed", signKey: r.signKey, line: removeErrorLine(r.name, a.error) } : r;
   }
 }

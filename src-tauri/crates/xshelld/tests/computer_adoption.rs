@@ -38,6 +38,23 @@ mod unix {
             hook: Option<xshelld::server::TestHook>,
             ttl: Option<std::time::Duration>,
         ) -> Self {
+            Self::build(&relay.url(), hook, ttl, None, None)
+        }
+        /// A Computer whose Desktop runs `steps` at each v2 Remove publication.
+        fn with_remove_steps(
+            url: &str,
+            steps: &RemoveSteps,
+            publish_wait: std::time::Duration,
+        ) -> Self {
+            Self::build(url, None, None, Some(steps.hook()), Some(publish_wait))
+        }
+        fn build(
+            url: &str,
+            hook: Option<xshelld::server::TestHook>,
+            ttl: Option<std::time::Duration>,
+            desktop_hook: Option<xshell_hostlink::ring::AdoptionTestHook>,
+            publish_wait: Option<std::time::Duration>,
+        ) -> Self {
             let home = tempfile::Builder::new().prefix("r1-").tempdir().unwrap();
             let paths = xshelld::paths::resolve(home.path(), None, None);
             let daemon_dir = paths.ring_dir.clone();
@@ -46,9 +63,13 @@ mod unix {
             let daemon = Server::start(daemon_config).unwrap();
             let desktop = home.path().join("desktop");
             let mut config = DesktopRingConfig::new(desktop.clone(), "computer".into());
-            config.default_relay_url = relay.url();
+            config.default_relay_url = url.to_string();
             if let Some(ttl) = ttl {
                 config.pair_ttl = ttl;
+            }
+            config.adoption_test_hook = desktop_hook;
+            if let Some(wait) = publish_wait {
+                config.pair_publish_wait = wait;
             }
             let ring = DesktopRing::open(config, Arc::new(Observer));
             Self {
@@ -62,6 +83,36 @@ mod unix {
         fn companion(&self) -> CompanionClient {
             CompanionClient::for_store(self.daemon.companion_endpoint().unwrap().parent().unwrap())
                 .unwrap()
+        }
+    }
+    type Step = Box<dyn FnOnce() + Send>;
+    /// What a Desktop does at its next v2 Remove publications, in order (`None`: nothing),
+    /// and how many publications it attempted.
+    #[derive(Clone, Default)]
+    struct RemoveSteps {
+        queue: Arc<std::sync::Mutex<std::collections::VecDeque<Option<Step>>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl RemoveSteps {
+        fn hook(&self) -> xshell_hostlink::ring::AdoptionTestHook {
+            let steps = self.clone();
+            xshell_hostlink::ring::AdoptionTestHook(Arc::new(move |point| {
+                if point == xshell_hostlink::ring::AdoptionTestPoint::RemoveBeforePublish {
+                    steps
+                        .calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let step = steps.queue.lock().unwrap().pop_front().flatten();
+                    if let Some(step) = step {
+                        step();
+                    }
+                }
+            }))
+        }
+        fn then(&self, step: Option<Step>) {
+            self.queue.lock().unwrap().push_back(step);
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
     impl Drop for Computer {
@@ -223,6 +274,11 @@ mod unix {
                         == Some(xshell_protocol::ring::membership::EnrollmentKind::Computer)
                     && view.members[0].daemon_key == Some(profile.daemon.sign_key)
                     && view.members[0].presence.kind == "online"
+                    // The Daemon itself, as the Relay reports it (not this app's own presence).
+                    && view.members[0]
+                        .daemon_presence
+                        .as_ref()
+                        .is_some_and(|p| p.kind == "online")
                 {
                     break;
                 }
@@ -1285,6 +1341,207 @@ mod unix {
                 .version(),
             3
         );
+    }
+    /// A standalone Daemon enrolled by `approver`: its handle, home and signing key.
+    fn runtime2_standalone(
+        approver: &Computer,
+        url: &str,
+    ) -> (
+        ServerHandle,
+        tempfile::TempDir,
+        xshell_protocol::ring::SignKey,
+    ) {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        let home = tempfile::Builder::new().prefix("r3-").tempdir().unwrap();
+        let paths = xshelld::paths::resolve(home.path(), None, None);
+        let d = Server::start(Config::new(home.path().into(), paths)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let chain = std::thread::scope(|scope| {
+            let guest = scope.spawn(|| {
+                d.adopt_standalone(
+                    url,
+                    std::time::Duration::from_secs(30),
+                    &Arc::new(AtomicBool::new(false)),
+                    |code| tx.send(code.clone()).unwrap(),
+                    |p, lease| Ok(Some(lease.confirm(&p.proposal_hash)?)),
+                )
+            });
+            let code = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            approver.ring.approve_device_code(&code).unwrap();
+            guest.join().unwrap().unwrap()
+        });
+        let m = chain.head().roster().membership().unwrap();
+        let key = m.enrollments.last().unwrap().members[0];
+        (d, home, key)
+    }
+    /// Until `ring` is connected and holds the head of version `v`.
+    fn wait_version(ring: &xshell_hostlink::ring::DesktopRing, v: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while ring.chain().unwrap().head().version() != v || ring.view().connection != "connected" {
+            assert!(
+                std::time::Instant::now() < until,
+                "never connected at v{v}: {:?}",
+                ring.chain().map(|c| c.head().version())
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    fn stored_head(c: &Computer) -> xshell_protocol::ring::SignedRoster {
+        Store::new(c.desktop.clone())
+            .load()
+            .unwrap()
+            .0
+            .unwrap()
+            .chain
+            .head()
+            .clone()
+    }
+
+    /// A, B (Computers) and two standalone Daemons, every Desktop connected at the head; A
+    /// runs `steps` at its v2 Remove publications. (Two enrollments per Relay keep under
+    /// its pairing rate limit.)
+    fn concurrent_ring(
+        relay: &Relay,
+        steps: &RemoveSteps,
+    ) -> (
+        Computer,
+        Computer,
+        Vec<(
+            ServerHandle,
+            tempfile::TempDir,
+            xshell_protocol::ring::SignKey,
+        )>,
+    ) {
+        let a =
+            Computer::with_remove_steps(&relay.url(), steps, std::time::Duration::from_secs(10));
+        runtime2_create(&a);
+        let b = Computer::new(relay);
+        runtime2_join(&a, &b);
+        let units = (0..2)
+            .map(|_| runtime2_standalone(&a, &relay.url()))
+            .collect();
+        wait_version(&a.ring, 4);
+        wait_version(&b.ring, 4);
+        (a, b, units)
+    }
+
+    /// Another Desktop publishes first: the Remove is built again on the head that won (a
+    /// fresh signature on the new predecessor) and succeeds. The losing candidate is never
+    /// stored.
+    #[test]
+    fn concurrent_edit_is_retried_on_the_winning_head() {
+        let relay = Relay::start();
+        let steps = RemoveSteps::default();
+        let (a, b, units) = concurrent_ring(&relay, &steps);
+        let (c, d) = (units[0].2, units[1].2);
+        let before = a.ring.chain().unwrap().head().clone();
+        let other = b.ring.clone();
+        steps.then(Some(Box::new(move || {
+            other.remove_member(&d).unwrap();
+        })));
+        let chain = a.ring.remove_member(&c).unwrap();
+        assert_eq!(steps.calls(), 2, "one retry");
+        let head = chain.head();
+        assert_eq!(head.version(), 6);
+        let won = chain.get(5).unwrap();
+        assert_eq!(b.ring.chain().unwrap().get(5).unwrap().hash(), won.hash());
+        assert_ne!(won.roster().signed_by, head.roster().signed_by);
+        assert_eq!(head.roster().prev.as_deref(), Some(won.hash().as_str()));
+        assert_ne!(won.roster().prev.as_deref(), None);
+        assert_eq!(won.roster().prev.as_deref(), Some(before.hash().as_str()));
+        assert!(head.member(&c).is_none() && head.member(&d).is_none());
+        assert_eq!(relay_version(&relay.target(), chain.ring_id()), 6);
+        assert_eq!(stored_head(&a).hash(), head.hash());
+        wait_version(&b.ring, 6);
+        assert_eq!(b.ring.chain().unwrap().head().hash(), head.hash());
+    }
+
+    /// Another Desktop wins twice: reported as a conflict, and nothing of this Desktop's is
+    /// stored; its store follows the Relay's head, and asking again is decided on that head.
+    #[test]
+    fn repeated_concurrent_edit_reports_conflict_without_fork() {
+        use xshell_hostlink::ring::REMOVE_CONFLICT;
+        let relay = Relay::start();
+        let steps = RemoveSteps::default();
+        let (a, b, units) = concurrent_ring(&relay, &steps);
+        let (e, f) = (units[0].2, units[1].2);
+        let other = b.ring.clone();
+        steps.then(Some(Box::new(move || {
+            other.remove_member(&f).unwrap();
+        })));
+        let other = b.ring.clone();
+        steps.then(Some(Box::new(move || {
+            other.remove_member(&e).unwrap();
+        })));
+        assert_eq!(a.ring.remove_member(&e).unwrap_err(), REMOVE_CONFLICT);
+        assert_eq!(steps.calls(), 2);
+        let ring_id = a.ring.chain().unwrap().ring_id().clone();
+        assert_eq!(relay_version(&relay.target(), &ring_id), 6);
+        wait_version(&a.ring, 6);
+        wait_version(&b.ring, 6);
+        let theirs = b.ring.chain().unwrap().head().clone();
+        assert_eq!(stored_head(&a).hash(), theirs.hash(), "no local fork");
+        assert!(theirs.member(&e).is_none() && theirs.member(&f).is_none());
+        // Asking again is decided on the Relay's head: E is gone already.
+        assert_eq!(
+            a.ring.remove_member(&e).unwrap().head().hash(),
+            theirs.hash()
+        );
+    }
+
+    /// No answer from the Relay is reported as uncertain and nothing is stored; the Relay's
+    /// head then reaches the store on its own and asking again acts on it. A Relay restart
+    /// during a removal is ridden out.
+    #[test]
+    fn unanswered_removal_is_uncertain_and_reconnect_during_removal_completes() {
+        use xshell_hostlink::ring::REMOVE_UNCERTAIN;
+        let relay = Arc::new(std::sync::Mutex::new(Relay::start()));
+        let url = relay.lock().unwrap().url();
+        let target = relay.lock().unwrap().target();
+        let steps = RemoveSteps::default();
+        let a = Computer::with_remove_steps(&url, &steps, std::time::Duration::from_secs(6));
+        runtime2_create(&a);
+        let (_g_handle, _g_home, g) = runtime2_standalone(&a, &url);
+        let (_h_handle, _h_home, h) = runtime2_standalone(&a, &url);
+        wait_version(&a.ring, 3);
+        let r = relay.clone();
+        steps.then(Some(Box::new(move || r.lock().unwrap().pause())));
+        assert_eq!(a.ring.remove_member(&g).unwrap_err(), REMOVE_UNCERTAIN);
+        assert_eq!(
+            stored_head(&a).version(),
+            3,
+            "nothing stored without the Relay's answer"
+        );
+        assert_eq!(a.ring.chain().unwrap().head().version(), 3);
+        relay.lock().unwrap().unpause();
+        // The store follows whatever the Relay holds (the queued Remove may have landed).
+        let ring_id = a.ring.chain().unwrap().ring_id().clone();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let v = relay_version(&target, &ring_id);
+            if a.ring.view().connection == "connected" && stored_head(&a).version() == v {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "store never followed the Relay"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Asking again is no silent no-op: it removes G unless the Relay already did.
+        let again = a.ring.remove_member(&g).unwrap();
+        assert!(again.head().member(&g).is_none());
+        assert_eq!(relay_version(&target, &ring_id), again.head().version());
+        assert_eq!(stored_head(&a).hash(), again.head().hash());
+        // The Relay restarts while the next removal publishes: retried after reconnecting.
+        let r = relay.clone();
+        steps.then(Some(Box::new(move || r.lock().unwrap().restart())));
+        let v = again.head().version();
+        let done = a.ring.remove_member(&h).unwrap();
+        assert_eq!(done.head().version(), v + 1);
+        assert!(done.head().member(&h).is_none());
+        assert_eq!(relay_version(&target, &ring_id), v + 1);
+        assert_eq!(stored_head(&a).hash(), done.head().hash());
     }
     fn runtime2_assert_no_guest_proofs(guest: &Computer, expected: AdoptionPhase) {
         let stored = Store::new(guest.desktop.clone())
