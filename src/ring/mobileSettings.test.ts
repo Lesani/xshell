@@ -26,6 +26,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     hosts: [],
     approval: "ready",
     format: null,
+    busy: false,
     ...over,
   };
 }

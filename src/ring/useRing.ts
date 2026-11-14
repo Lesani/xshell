@@ -21,6 +21,9 @@ export function useRing() {
   const [joinEvents, setJoinEvents] = useState<Record<string, JoinEvent>>({});
   const [overview, setOverview] = useState<JoinOverview | null>(null);
   const [chosenRelay, setChosenRelay] = useState<string | null>(null);
+  // Create/Join wait for the saved choice and for a Save in progress.
+  const [relayLoaded, setRelayLoaded] = useState(false);
+  const [relaySaving, setRelaySaving] = useState(false);
   const relayRef = useRef<string | null>(null);
   const mounted = useRef(false);
   const operations = useRef<Partial<Record<PairingFlow, string>>>({});
@@ -45,10 +48,15 @@ export function useRing() {
     listen("ring:focus", () => { if (mounted.current) refreshOverview(); })
       .then(keep)
       .catch(() => {});
+    // An unpaired takeover need not change any status: re-read when the window gains focus.
+    const onFocus = () => { if (mounted.current) refreshOverview(); };
+    window.addEventListener("focus", onFocus);
+    unlisten.push(() => window.removeEventListener("focus", onFocus));
     load("settings.json", { defaults: {}, autoSave: true })
       .then(store => store.get<string>(RING_RELAY_SETTING))
       .then(v => { if (mounted.current && typeof v === "string" && v) { relayRef.current = v; setChosenRelay(v); } })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { if (mounted.current) setRelayLoaded(true); });
     listen<PairingEvent>("ring:pairing", e => {
       const ev = e.payload;
       if (mounted.current && ev.flow === "phone" && operations.current.phone === ev.operation) setPairing(p => ({ ...p, phone: ev }));
@@ -98,10 +106,16 @@ export function useRing() {
 
   // The unpaired screen's Relay: `null` is the hosted one.
   const setUnpairedRelay = useCallback(async (url: string | null) => {
-    const store = await load("settings.json", { defaults: {}, autoSave: true });
-    await store.set(RING_RELAY_SETTING, url);
-    relayRef.current = url;
-    if (mounted.current) setChosenRelay(url);
+    setRelaySaving(true);
+    try {
+      const store = await load("settings.json", { defaults: {}, autoSave: true });
+      await store.set(RING_RELAY_SETTING, url);
+      // Committed: only now do Create and Join use it.
+      relayRef.current = url;
+      if (mounted.current) setChosenRelay(url);
+    } finally {
+      if (mounted.current) setRelaySaving(false);
+    }
   }, []);
   const createComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })); }, [apply]);
   const upgradeComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_upgrade_computer")); }, [apply]);
@@ -112,6 +126,6 @@ export function useRing() {
 
   return {
     status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, approveComputer,
-    joinEvents, overview, chosenRelay, setUnpairedRelay, createComputer, upgradeComputer, joinStart, joinConfirm, joinDecline, joinCancel,
+    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, joinStart, joinConfirm, joinDecline, joinCancel,
   };
 }

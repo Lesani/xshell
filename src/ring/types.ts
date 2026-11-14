@@ -51,6 +51,8 @@ export interface RingStatus {
   approval: Approval;
   // The retained Ring's Roster format: a v2 Ring's Relay is fixed (shown read-only).
   format: 1 | 2 | null;
+  // An adoption, approval or registration runs now: nothing new can start (not uncertainty).
+  busy: boolean;
 }
 
 export type Approval = "ready" | "needs-upgrade" | "needs-completion" | "unavailable" | "unresolved" | "none";

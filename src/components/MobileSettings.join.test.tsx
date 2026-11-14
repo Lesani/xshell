@@ -6,9 +6,13 @@ import { MobileSettings } from "./MobileSettings";
 import { fmt, S } from "../ring/strings";
 import type { JoinEvent, JoinOverview, MemberView, RingStatus } from "../ring/types";
 
-const native = vi.hoisted(() => ({ invoke: vi.fn(), handlers: new Map<string, (event: { payload: unknown }) => void>(), settings: new Map<string, unknown>() }));
+const native = vi.hoisted(() => ({ invoke: vi.fn(), handlers: new Map<string, (event: { payload: unknown }) => void>(), settings: new Map<string, unknown>(), gate: { get: null as Promise<void> | null, set: null as Promise<void> | null } }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
-vi.mock("@tauri-apps/plugin-store", () => ({ load: async () => ({ get: async (k: string) => native.settings.get(k) ?? null, set: async (k: string, v: unknown) => { native.settings.set(k, v); }, save: async () => {} }) }));
+vi.mock("@tauri-apps/plugin-store", () => ({ load: async () => ({
+  get: async (k: string) => { if (native.gate.get) await native.gate.get; return native.settings.get(k) ?? null; },
+  set: async (k: string, v: unknown) => { if (native.gate.set) await native.gate.set; native.settings.set(k, v); },
+  save: async () => {},
+}) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, handler: (event: { payload: unknown }) => void) => { native.handlers.set(name, handler); return () => native.handlers.delete(name); } }));
 
 const WORDS = "acid-baker-cable-dance-eagle-fable-gamma-habit";
@@ -19,7 +23,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: false, ringId: null, version: null, relayUrl: null, hostedRelayUrl: "wss://r", connection: "off",
     retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
-    members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none", format: null, ...over,
+    members: [], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "none", format: null, busy: false, ...over,
   };
 }
 const enrolled = (over: Partial<RingStatus> = {}) => status({ enabled: true, ringId: "abcdefgh", version: 2, relayUrl: "wss://r", connection: "connected", members: [me], approval: "ready", ...over });
@@ -60,6 +64,8 @@ beforeEach(() => {
   native.invoke.mockReset();
   native.handlers.clear();
   native.settings.clear();
+  native.gate.get = null;
+  native.gate.set = null;
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -342,5 +348,69 @@ describe("review fixes (Sol)", () => {
     await mount();
     expect(q("[data-ring-relay-fixed]")).toBeNull();
     expect(container.querySelector("input[name=mobile-relay]")).not.toBeNull();
+  });
+});
+
+describe("re-review fixes (Sol)", () => {
+  const disabled = (sel: string) => q(sel)!.hasAttribute("disabled");
+  const saveRelay = async (url: string) => {
+    const form = q("[data-ring-relay-unpaired]")!;
+    await act(async () => { form.querySelectorAll<HTMLInputElement>("input[type=radio]")[1].click(); });
+    const input = form.querySelector<HTMLInputElement>("input.edit-input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, url);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { form.querySelector<HTMLButtonElement>("button.btn-primary")!.click(); });
+  };
+
+  it("an unpaired takeover with no status change shows Create/Join after window focus", async () => {
+    setup(status(), { owner: false, joins: [] });
+    await mount();
+    expect(text()).toContain(S["ring.follower"]);
+    commands.ring_join_overview = () => ({ owner: true, joins: [] });
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    await act(async () => {});
+    expect(text()).not.toContain(S["ring.follower"]);
+    expect(q("[data-ring-create]")).not.toBeNull();
+  });
+
+  it("Create/Join are disabled until the saved Relay has loaded", async () => {
+    let loaded!: () => void;
+    native.gate.get = new Promise(r => { loaded = r; });
+    native.settings.set("ring_relay_url", "wss://own.example.com");
+    setup(status(), undefined, { ring_create_computer: () => status() });
+    await mount();
+    expect(disabled("[data-ring-create]")).toBe(true);
+    expect(disabled("[data-ring-join-action]")).toBe(true);
+    await click("[data-ring-create]");
+    expect(calls()).not.toContain("ring_create_computer");
+    await act(async () => { loaded(); });
+    expect(disabled("[data-ring-create]")).toBe(false);
+    await click("[data-ring-create]");
+    expect(argsOf("ring_create_computer")).toEqual([{ relayUrl: "wss://own.example.com" }]);
+  });
+
+  it("Create/Join are disabled while a Relay Save is pending, then use the new Relay", async () => {
+    setup(status(), undefined, { ring_create_computer: () => status() });
+    await mount();
+    expect(disabled("[data-ring-create]")).toBe(false);
+    let saved!: () => void;
+    native.gate.set = new Promise(r => { saved = r; });
+    await saveRelay("wss://new.example.com");
+    expect(disabled("[data-ring-create]")).toBe(true);
+    expect(disabled("[data-ring-join-action]")).toBe(true);
+    await act(async () => { saved(); });
+    expect(disabled("[data-ring-create]")).toBe(false);
+    await click("[data-ring-create]");
+    expect(argsOf("ring_create_computer")).toEqual([{ relayUrl: "wss://new.example.com" }]);
+  });
+
+  it("busy (an admission is held) disables Create/Join without the reconcile copy", async () => {
+    setup(status({ busy: true }));
+    await mount();
+    expect(disabled("[data-ring-create]")).toBe(true);
+    expect(disabled("[data-ring-join-action]")).toBe(true);
+    expect(q("[data-ring-unresolved]")).toBeNull();
   });
 });

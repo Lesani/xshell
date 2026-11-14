@@ -26,6 +26,8 @@ export interface JoinApi {
   overview: JoinOverview | null;
   // The Relay chosen before Create/Join (null: hosted), bound into the operation.
   relay: string | null;
+  // The saved choice has loaded and no Save is pending.
+  relayReady: boolean;
   setRelay: (url: string | null) => Promise<void>;
   // The latest `ring:join` event per operation.
   events: Record<string, JoinEvent>;
@@ -468,7 +470,9 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
 // state lives in the parent so the outcome stays visible once the Ring view takes over.
 function UnpairedRing({ s, join, st, onCreate, onStart, unavailable }: { s: RingStatus; join: JoinApi; st: JoinUi; onCreate: () => void; onStart: () => void; unavailable: boolean }) {
   const busy = joinBusy(st);
-  const blocked = unavailable || s.local === "in-process";
+  // Busy: another adoption, approval or registration runs; not ready: the Relay choice is
+  // still loading or being saved.
+  const blocked = unavailable || s.local === "in-process" || s.busy || !join.relayReady;
   return (
     <div className="edit-field" data-ring-unpaired>
       <div className="edit-hint">{fmt("ring.description")}</div>
@@ -533,7 +537,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
   }, [counting, dispatchJoin]);
 
   const create = async () => {
-    if (!join || joinBusy(jst)) return;
+    if (!join || joinBusy(jst) || !join.relayReady) return;
     dispatchJoin({ type: "create" });
     try {
       await join.createComputer();
@@ -543,7 +547,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
     }
   };
   const startJoin = async () => {
-    if (!join || joinBusy(jst)) return;
+    if (!join || joinBusy(jst) || !join.relayReady) return;
     const owned = crypto.randomUUID();
     op.current = owned;
     dispatchJoin({ type: "start", operation: owned });
@@ -682,7 +686,7 @@ export function MobileSettings({ visible = true }: { visible?: boolean }) {
   if (!r.status) return null;
   const p: Pairing = { events: r.pairing, startPhone: r.startPhone, cancelPhone: r.cancelPhone, approveComputer: r.approveComputer };
   const join: JoinApi = {
-    overview: r.overview, events: r.joinEvents, relay: r.chosenRelay, setRelay: r.setUnpairedRelay, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
+    overview: r.overview, events: r.joinEvents, relay: r.chosenRelay, relayReady: r.relayReady, setRelay: r.setUnpairedRelay, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
     start: r.joinStart, confirm: r.joinConfirm, decline: r.joinDecline, cancel: r.joinCancel,
   };
   return <MobileSettingsView s={r.status} onEnable={r.enable} onSaveRelay={r.setRelayUrl} onClaimHost={r.claimHost} onRemoveMember={r.removeMember} pairing={p} join={join} visible={visible} />;
