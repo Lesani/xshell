@@ -291,9 +291,7 @@ fn forced_registration_contention(ending: Ending) {
     let _manager = f.manager(&ring);
     let mut child = ObservedChild::start(&f, &relay.url());
     wait(|| child.output.lock().unwrap().pending);
-    let original_start = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+    let original_start = unix_now();
     assert!(!f.paths.socket.exists());
     gate.state.lock().unwrap().armed = true;
     let _daemon = f.server();
@@ -353,17 +351,10 @@ fn forced_registration_contention(ending: Ending) {
             assert_eq!(pending.intent.expires_at, join.expires_at);
             assert_eq!(pending.relay_url, relay.url());
             assert!(
-                join.expires_at
-                    <= xshell_protocol::ring::pairing::wall_expiry_at(
-                        original_start,
-                        Duration::from_secs(4)
-                    ),
+                join.expires_at <= original_start + 4,
                 "original expiry was renewed"
             );
-            assert!(
-                join.expires_at
-                    <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4))
-            );
+            assert!(join.expires_at <= unix_now() + 4);
             gate.before(P::OriginJoinAdmissionBusy, P::OriginJoinAdmitted);
             gate.before(P::OriginJoinAdmitted, P::JoinBeforeCounterpartStart);
             gate.before(P::JoinBeforeCounterpartStart, P::JoinWorkerStarted);

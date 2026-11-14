@@ -359,8 +359,7 @@ fn actual_cli_stopped_owner_manual_open_uses_original_deadline_without_autostart
     let code = child.code();
     let join = controller(&br);
     assert!(join.code.format() == code.format());
-    // No later than an offer of the same TTL created now (wall expiry rounds up).
-    assert!(join.expires_at <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4)));
+    assert!(join.expires_at <= unix_now() + 4);
     assert_eq!(child.finish(), 5);
     assert_eq!(child.words, 1);
     assert!(before.elapsed() < Duration::from_secs(5));
@@ -658,8 +657,7 @@ fn registration_child_cannot_claim_live_driver_readiness_and_manual_daemon_start
     let code = child.code();
     let join = controller(&br);
     assert!(join.code.format() == code.format());
-    // No later than an offer of the same TTL created now (wall expiry rounds up).
-    assert!(join.expires_at <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4)));
+    assert!(join.expires_at <= unix_now() + 4);
     child.cancel();
     assert_eq!(child.finish(), 1);
     assert_eq!(child.words, 1);

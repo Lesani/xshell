@@ -134,6 +134,7 @@ pub enum ClientMsg {
     #[serde(rename = "ring.identity")]
     RingIdentity,
     /// Authorized Ring administration only; cannot register or confirm a local GUI.
+    #[cfg(feature = "ring")]
     #[serde(rename = "ring.companion-pending")]
     RingCompanion {
         request: crate::ring::companion::CompanionAdminRequest,
@@ -1339,6 +1340,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ring")]
     #[test]
     fn companion_pending_is_typed_administration_not_confirmation_or_signing() {
         use crate::ring::companion::CompanionAdminRequest;

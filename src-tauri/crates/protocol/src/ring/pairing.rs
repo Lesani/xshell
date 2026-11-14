@@ -48,29 +48,6 @@ pub const CODE_BYTES: usize = 10;
 /// How long a Desktop keeps a secret valid.
 pub const PAIR_TTL_SECS: u64 = 600;
 
-/// The whole-second Unix expiry for a pairing operation that lives `ttl` from now.
-///
-/// It rounds up, so the wall-clock expiry never ends the operation before its monotonic
-/// deadline (`Instant::now() + ttl`), which is the one that decides. Rounding down would
-/// cut up to a second off: a 2 s offer created at x.95 s would expire after 1.05 s. The
-/// result is capped at `floor(now) + PAIR_TTL_SECS`, so the 600 s bounds that peers check
-/// against `floor(now)` still hold for a full-length offer.
-pub fn wall_expiry(ttl: std::time::Duration) -> u64 {
-    wall_expiry_at(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default(),
-        ttl,
-    )
-}
-
-/// [`wall_expiry`] at the Unix time `now`.
-pub fn wall_expiry_at(now: std::time::Duration, ttl: std::time::Duration) -> u64 {
-    let end = now.saturating_add(ttl);
-    let ceil = end.as_secs() + u64::from(end.subsec_nanos() > 0);
-    ceil.min(now.as_secs().saturating_add(PAIR_TTL_SECS))
-}
-
 /// Crockford base32.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -861,29 +838,6 @@ impl Host {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn wall_expiry_rounds_up_and_keeps_the_600s_bound() {
-        use super::{wall_expiry_at, PAIR_TTL_SECS};
-        use std::time::Duration;
-        let at = |s: u64, ms: u64| Duration::from_secs(s) + Duration::from_millis(ms);
-        // A short offer never expires on the wall clock before its monotonic deadline.
-        assert_eq!(wall_expiry_at(at(100, 950), Duration::from_secs(2)), 103);
-        assert_eq!(wall_expiry_at(at(100, 0), Duration::from_secs(2)), 102);
-        assert_eq!(wall_expiry_at(at(100, 1), Duration::from_millis(2500)), 103);
-        // A full-length offer stays within floor(now) + 600, as before.
-        assert_eq!(
-            wall_expiry_at(at(100, 950), Duration::from_secs(600)),
-            100 + PAIR_TTL_SECS
-        );
-        assert_eq!(
-            wall_expiry_at(at(100, 0), Duration::from_secs(600)),
-            100 + PAIR_TTL_SECS
-        );
-        assert_eq!(
-            wall_expiry_at(at(100, 400), Duration::from_secs(900)),
-            100 + PAIR_TTL_SECS
-        );
-    }
     use super::*;
 
     fn keys(n: u8) -> DeviceKeys {
