@@ -609,7 +609,7 @@ fn stale_and_replaced_pid_records_refuse_before_any_request() {
     // Malformed: never parsed into a PID.
     std::fs::write(
         xshell_hostlink::local::local_pid_record_path(&a.home.home()),
-        b"12 34\n",
+        b"12 34 56\n",
     )
     .unwrap();
     assert!(xshell_hostlink::local::read_pid_record(&a.home.home()).is_err());
