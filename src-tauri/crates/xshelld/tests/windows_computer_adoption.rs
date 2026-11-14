@@ -976,3 +976,38 @@ fn helper_hold_registered_computer() {
     assert!(a.daemon_dir().join("companion.json").exists());
     std::fs::write(dir.join("held-ok"), b"").unwrap();
 }
+
+/// Not a test unless `XSHELL_X87_GUI` names a directory: the approving Computer for the
+/// native Desktop GUI scenario. Starts the Windows-local Relay (URL in `relay.txt`), creates
+/// a Ring, then approves each `code-<n>.txt` written there (result in `approved-<n>.txt`)
+/// until `stop` appears.
+#[test]
+fn helper_gui_approver() {
+    let Some(dir) = std::env::var_os("XSHELL_X87_GUI").map(PathBuf::from) else {
+        return;
+    };
+    let relay = Relay::start();
+    let a = WinComputer::new(&relay);
+    let profile = a.register();
+    a.create(&profile);
+    std::fs::write(dir.join("relay.txt"), relay.url()).unwrap();
+    let until = Instant::now() + Duration::from_secs(3600);
+    let mut n = 0;
+    while !dir.join("stop").exists() && Instant::now() < until {
+        let code = dir.join(format!("code-{n}.txt"));
+        if let Ok(text) = std::fs::read_to_string(&code) {
+            let result = match DeviceCode::parse(text.trim()) {
+                Ok(code) => match a.ring.approve_device_code(&code) {
+                    Ok(outcome) => {
+                        format!("approved version={}", outcome.chain.head().roster().version)
+                    }
+                    Err(e) => format!("refused: {e}"),
+                },
+                Err(e) => format!("unparsable code: {e:?}"),
+            };
+            std::fs::write(dir.join(format!("approved-{n}.txt")), result).unwrap();
+            n += 1;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
