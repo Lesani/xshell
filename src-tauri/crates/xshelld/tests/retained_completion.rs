@@ -911,13 +911,28 @@ fn completion_lock_wait_rechecks_deadline_and_owner_before_any_publication_attem
         })
         .unwrap();
         *path.lock().unwrap() = Some(r.a.home.root().join("desktop/ring.lock"));
+        // Releases the simulated peer's ring.lock on any exit, including a panicking
+        // assertion: `thread::scope` joins its threads before propagating the panic, and
+        // they all wait for this lock.
+        struct ReleaseOnDrop<'a>(&'a Mutex<Option<std::fs::File>>);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
+        }
+        let relay_url = r.a.ring.chain().unwrap().head().roster().relay_url.clone();
         let result = std::thread::scope(|scope| {
+            let _release = ReleaseOnDrop(&holder);
             let publisher = scope.spawn(move || approval.publish());
             rx.recv_timeout(WAIT).unwrap();
             let quit = if lose_owner {
+                // A commit-lock holder stuck behind the peer's ring.lock (as the periodic
+                // reconcile reload can be) must not delay the owner loss quit announces.
+                let stuck = scope.spawn(|| r.a.ring.set_relay_url(&relay_url));
+                std::thread::sleep(Duration::from_millis(300));
                 let q = scope.spawn(|| r.a.ring.quit());
                 wait_for(|| !r.a.ring.pairing_ipc_owner());
-                Some(q)
+                Some((q, stuck))
             } else {
                 wait_for(|| {
                     std::time::SystemTime::now()
@@ -930,8 +945,9 @@ fn completion_lock_wait_rechecks_deadline_and_owner_before_any_publication_attem
             };
             holder.lock().unwrap().take();
             let result = publisher.join().unwrap();
-            if let Some(q) = quit {
+            if let Some((q, stuck)) = quit {
                 q.join().unwrap();
+                stuck.join().unwrap().unwrap();
             }
             result
         });

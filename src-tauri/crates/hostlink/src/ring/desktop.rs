@@ -3088,6 +3088,17 @@ impl DesktopRing {
         {
             cancel.store(true, Ordering::Release);
         }
+        // Owner loss is visible before waiting for the commit lock: a commit holder can be
+        // blocked on another process's `ring.lock` (the periodic reload, a user change),
+        // and fenced work (approval publication) must see the loss meanwhile, not after.
+        {
+            let mut live = self.lock();
+            live.quitting = true;
+            for (_, _, cancel) in &live.pairing {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        // Then wait out any in-flight commit, so none starts unfenced after this point.
         {
             let _commit = self.lock_commit();
             let mut live = self.lock();
