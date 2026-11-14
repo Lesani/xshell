@@ -922,12 +922,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, ev| {
-            // An application quit (not the last window closing) goes through the same
-            // decision as closing the last window (A7); the updater's relaunch bypasses it.
-            if let tauri::RunEvent::ExitRequested {
-                api, code: Some(_), ..
-            } = &ev
-            {
+            // An application quit, `code: None` (the platform quits, or the windows are gone)
+            // or `Some` (a programmatic exit), goes through the same decision as closing the
+            // last window (A7); the updater's relaunch bypasses it; with no window left
+            // nothing asks.
+            if let tauri::RunEvent::ExitRequested { api, .. } = &ev {
                 if hosts::quit::exit_requested(app) {
                     api.prevent_exit();
                 }
@@ -1013,6 +1012,61 @@ mod tests {
             .chain(HOST_LINK_COMMANDS)
         {
             assert!(registered.contains(*c), "{c} is not registered");
+        }
+    }
+
+    /// A4 through the real command: `spawn_terminal` invoked over (mock) IPC refuses on Unix;
+    /// without the guard it would start the Terminal and answer `null`.
+    #[test]
+    fn spawn_terminal_command_refuses_on_unix() {
+        use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
+        if std::env::var_os("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
+            return;
+        }
+        let app = mock_builder()
+            .manage(AppState {
+                ptys: Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
+                    xshell_core::plan_command_with(&ctx(), spec, hooks)
+                }))),
+            })
+            .invoke_handler(tauri::generate_handler![spawn_terminal, write_terminal])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let w = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let call = |cmd: &str, body: serde_json::Value| {
+            get_ipc_response(
+                &w,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: INVOKE_KEY.to_string(),
+                },
+            )
+        };
+        let r = call(
+            "spawn_terminal",
+            serde_json::json!({
+                "id": "t1", "cwd": std::env::temp_dir(), "cols": 80, "rows": 24,
+                "shellMode": "command", "shellCommand": "true",
+                "onData": "__CHANNEL__:1", "onExit": "__CHANNEL__:2"
+            }),
+        );
+        let w2 = call(
+            "write_terminal",
+            serde_json::json!({"id": "t1", "data": "x"}),
+        );
+        if cfg!(unix) {
+            let e = r.expect_err("spawn_terminal must refuse on Unix");
+            assert!(e.to_string().contains("in-process:"), "{e}");
+            assert!(w2.unwrap_err().to_string().contains("in-process:"));
+        } else {
+            assert!(r.is_ok(), "{r:?}");
         }
     }
 

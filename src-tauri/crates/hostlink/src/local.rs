@@ -102,40 +102,75 @@ pub fn read_local_endpoint(path: &Path) -> Option<(u32, PathBuf)> {
     (pid > 1 && sock.is_absolute()).then_some((pid, sock))
 }
 
-/// Whether `pid` is a live `xshelld` process (Linux: its `comm`; elsewhere: it exists).
+/// `home/.xshell/run/daemon.owner`: held exclusively (`flock`) by the `serve` that owns this
+/// home's endpoint, for its whole life, taken before it writes the endpoint record. Probed
+/// with a shared lock released at once; the owner takes it with a blocking lock, so a probe
+/// never makes a starting `serve` fail.
+pub fn local_owner_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.owner")
+}
+
+/// `home/.xshell/run/daemon.start`: held exclusively by every Unix `serve` from before its
+/// login-environment preparation to its exit, so a second starter knows one is coming.
+pub fn local_start_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.start")
+}
+
+/// Whether some process holds `path`'s lock: a shared try-lock that is released at once.
+/// A missing file is free.
 #[cfg(unix)]
-pub fn pid_is_xshelld(pid: u32) -> bool {
-    if pid <= 1 || pid > i32::MAX as u32 {
+pub fn lock_held(path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) else {
         return false;
+    };
+    match f.try_lock_shared() {
+        Ok(()) => {
+            let _ = f.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
     }
-    if unsafe { libc::kill(pid as i32, 0) } != 0
-        && io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
-    {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .is_ok_and(|c| c.trim_end() == "xshelld")
-    }
-    #[cfg(not(target_os = "linux"))]
-    true
 }
 
 /// The socket of the Daemon serving this home (A2): the one its endpoint record names while
-/// that Daemon lives, else `fallback` (the socket this process's environment derives).
+/// that Daemon holds the home's owner lock, else `fallback` (the socket this process's
+/// environment derives). A record whose owner lock is free is stale and removed (under a
+/// shared hold of the owner lock, so a starting owner's fresh record is never removed).
 #[cfg(unix)]
 pub fn local_live_socket(home: &Path, fallback: &Path) -> PathBuf {
-    local_live_socket_at(&local_endpoint_path(home), fallback)
+    let endpoint = local_endpoint_path(home);
+    let owner = local_owner_path(home);
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&owner) {
+        match f.try_lock_shared() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some((_, sock)) = read_local_endpoint(&endpoint) {
+                    return sock;
+                }
+                return fallback.to_path_buf();
+            }
+            Ok(()) => {
+                // Free: no owner. Any record is stale.
+                let _ = std::fs::remove_file(&endpoint);
+                let _ = f.unlock();
+                return fallback.to_path_buf();
+            }
+            Err(_) => {}
+        }
+    } else if endpoint.exists() {
+        // A record without an owner file: stale too.
+        let _ = std::fs::remove_file(&endpoint);
+    }
+    fallback.to_path_buf()
 }
 
-/// [`local_live_socket`] given the record's path.
+/// Whether a Daemon of this home is alive or starting: it holds the owner or the start lock,
+/// or (a Daemon of an older build, which takes neither) the environment's socket answers.
 #[cfg(unix)]
-pub fn local_live_socket_at(endpoint: &Path, fallback: &Path) -> PathBuf {
-    match read_local_endpoint(endpoint) {
-        Some((pid, sock)) if pid_is_xshelld(pid) => sock,
-        _ => fallback.to_path_buf(),
-    }
+pub fn local_daemon_alive(home: &Path, env_socket: &Path) -> bool {
+    lock_held(&local_owner_path(home))
+        || lock_held(&local_start_path(home))
+        || std::os::unix::net::UnixStream::connect(env_socket).is_ok()
 }
 
 /// THE decision which installed build starts this machine's Daemon (ADR-0017; the launcher
@@ -2483,7 +2518,8 @@ while True:\n    conns.append(s.accept()[0])\n";
         assert_eq!(d.daemon.start_error(), None);
     }
 
-    /// A2: the Daemon's own record wins over this process's environment socket.
+    /// A2 / P1-b: the Daemon's record is followed only while its owner lock is held; a
+    /// record naming a live but unrelated PID is stale and removed.
     #[test]
     fn live_socket_follows_the_endpoint_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -2492,16 +2528,24 @@ while True:\n    conns.append(s.accept()[0])\n";
         assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
         let rec = local_endpoint_path(&home);
         std::fs::create_dir_all(rec.parent().unwrap()).unwrap();
-        // Not an xshelld (this test binary): ignored.
         std::fs::write(
             &rec,
             format!("{}\n/other/daemon.sock\n", std::process::id()),
         )
         .unwrap();
-        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
         assert_eq!(
             read_local_endpoint(&rec),
             Some((std::process::id(), PathBuf::from("/other/daemon.sock")))
         );
+        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
+        assert!(!rec.exists(), "a record without its owner is removed");
+        // Owner lock held (another open file description): followed.
+        let owner = std::fs::File::create(local_owner_path(&home)).unwrap();
+        owner.lock().unwrap();
+        std::fs::write(&rec, "999999999\n/other/daemon.sock\n").unwrap();
+        assert_eq!(d.daemon.live_socket(), PathBuf::from("/other/daemon.sock"));
+        assert!(lock_held(&local_owner_path(&home)));
+        owner.unlock().unwrap();
+        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
     }
 }

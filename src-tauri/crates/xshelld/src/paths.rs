@@ -161,38 +161,69 @@ pub fn remove_endpoint_of(path: &Path, pid: u32) {
     }
 }
 
-/// Whether `pid` is a live `xshelld` process (Linux: its `comm`; elsewhere: it exists).
-#[cfg(unix)]
-pub fn pid_is_xshelld(pid: u32) -> bool {
-    xshell_hostlink::local::pid_is_xshelld(pid)
+/// `home/.xshell/run/daemon.owner` (see `xshell_hostlink::local::local_owner_path`).
+pub fn owner_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_owner_path(home)
+}
+
+/// `home/.xshell/run/daemon.start` (see `xshell_hostlink::local::local_start_path`).
+pub fn start_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_start_path(home)
 }
 
 /// The socket of the Daemon that serves this home (A2): the one its endpoint record names
-/// while that Daemon lives, else `fallback` (the socket the environment derives). Callers
-/// with an explicit `--socket` / `XSHELLD_SOCKET` skip this.
+/// while that Daemon holds the owner lock, else `fallback` (the socket the environment
+/// derives); a stale record is removed. Callers with an explicit `--socket` /
+/// `XSHELLD_SOCKET` skip this.
 #[cfg(unix)]
 pub fn live_socket(home: &Path, fallback: &Path) -> PathBuf {
     xshell_hostlink::local::local_live_socket(home, fallback)
 }
 
-/// [`live_socket`] given the endpoint record's path.
+/// [`live_socket`] given the endpoint record's path (`home/.xshell/run/daemon.endpoint`).
 #[cfg(unix)]
 pub fn live_socket_at(endpoint: &Path, fallback: &Path) -> PathBuf {
-    xshell_hostlink::local::local_live_socket_at(endpoint, fallback)
+    match endpoint.ancestors().nth(3) {
+        Some(home) => live_socket(home, fallback),
+        None => fallback.to_path_buf(),
+    }
 }
 
-/// Whether a Daemon of this home is alive: its endpoint record names a live `xshelld`, or
-/// the environment's socket answers (a Daemon of an older build writes no record).
+/// Whether a Daemon of this home is alive or starting (owner or start lock held), or an
+/// older-build Daemon answers on the environment's socket.
 #[cfg(unix)]
 pub fn daemon_alive(home: &Path, env_socket: &Path) -> bool {
-    if read_endpoint(&endpoint_path(home)).is_some_and(|(pid, _)| pid_is_xshelld(pid)) {
-        return true;
-    }
-    std::os::unix::net::UnixStream::connect(env_socket).is_ok()
+    xshell_hostlink::local::local_daemon_alive(home, env_socket)
 }
 
-/// How the Daemon on this machine is run: by the xshell app (GUI-bound, ADR-0005) or on its
-/// own (Persistent). Recorded in [`Paths::mode`] by each `serve` that takes the lock.
+/// Take `path`'s lock exclusively for this process's life (the file stays open, close-on-exec):
+/// `Ok(Some)` held, `Ok(None)` another process holds it. Retried briefly, so a client's
+/// momentary shared probe never makes us give up.
+#[cfg(unix)]
+pub fn hold_exclusive(path: &Path) -> io::Result<Option<fs::File>> {
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir)?;
+    }
+    let f = private_file(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false),
+    )
+    .open(path)?;
+    for _ in 0..10 {
+        match f.try_lock() {
+            Ok(()) => return Ok(Some(f)),
+            Err(fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     GuiBound,
@@ -346,7 +377,9 @@ mod tests {
         assert_eq!(resolve_unix(home, None, None).endpoint, p.endpoint);
         let fallback = Path::new("/env/daemon.sock");
         assert_eq!(live_socket(home, fallback), fallback);
-        // A record naming this (non-xshelld test) process: not an xshelld, ignored on Linux.
+        assert!(!daemon_alive(home, fallback));
+        // A record naming a live process (this one), but nobody holds the owner lock:
+        // stale, ignored and removed. A PID never decides liveness.
         write_endpoint(&p.endpoint, std::process::id(), Path::new("/x/daemon.sock")).unwrap();
         assert_eq!(
             read_endpoint(&p.endpoint),
@@ -354,14 +387,23 @@ mod tests {
         );
         let mode = fs::metadata(&p.endpoint).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        if cfg!(target_os = "linux") {
-            assert_eq!(live_socket(home, fallback), fallback);
-        }
-        // A dead pid: ignored.
-        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
         assert_eq!(live_socket(home, fallback), fallback);
+        assert!(!p.endpoint.exists(), "the stale record was removed");
+        // The owner lock held: the record is followed, and the Daemon counts as alive.
+        let owner = hold_exclusive(&owner_path(home)).unwrap().unwrap();
+        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
+        assert_eq!(live_socket(home, fallback), PathBuf::from("/x/daemon.sock"));
+        assert!(daemon_alive(home, fallback));
+        drop(owner);
+        assert_eq!(live_socket(home, fallback), fallback);
+        // The start lock alone (a Daemon still preparing) counts as alive too.
+        let start = hold_exclusive(&start_path(home)).unwrap().unwrap();
+        assert!(daemon_alive(home, fallback));
+        assert!(hold_exclusive(&start_path(home)).unwrap().is_none());
+        drop(start);
         assert!(!daemon_alive(home, fallback));
         // Removed only by its own pid.
+        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
         remove_endpoint_of(&p.endpoint, 42);
         assert!(p.endpoint.exists());
         remove_endpoint_of(&p.endpoint, 999_999_999);

@@ -41,9 +41,15 @@ pub fn verify_own(
             }
         }
         "macos" => {
-            let magic = bytes.get(..4);
-            if magic != Some(b"\xcf\xfa\xed\xfe") && magic != Some(b"\xca\xfe\xba\xbe") {
-                return Err("embedded Daemon must be a Mach-O executable".into());
+            let cpu: u32 = match target_arch {
+                "x86_64" => 0x0100_0007,
+                "aarch64" => 0x0100_000c,
+                other => return Err(format!("no embedded Daemon for macOS {other}")),
+            };
+            if !macho_has_cpu(bytes, cpu) {
+                return Err(format!(
+                    "embedded Daemon must be a 64-bit Mach-O executable with a {target_arch} slice"
+                ));
             }
         }
         other => return Err(format!("no embedded own-target Daemon on {other}")),
@@ -57,6 +63,29 @@ pub fn verify_own(
         ));
     }
     Ok(())
+}
+
+/// Whether `bytes` is a thin 64-bit little-endian Mach-O of `cpu`, or a fat binary with a
+/// `cpu` slice.
+fn macho_has_cpu(bytes: &[u8], cpu: u32) -> bool {
+    let be = |o: usize| {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    let le = |o: usize| {
+        bytes
+            .get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    match bytes.get(..4) {
+        Some(b"\xcf\xfa\xed\xfe") => le(4) == Some(cpu),
+        Some(b"\xca\xfe\xba\xbe") => {
+            let n = be(4).unwrap_or(0).min(32) as usize;
+            (0..n).any(|i| be(8 + i * 20) == Some(cpu))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -123,9 +152,31 @@ mod tests {
         )
         .is_err());
         assert!(verify_own(&dirty, &sha(&dirty), &want, "linux", "x86_64").is_err());
-        // Mach-O magic accepted on macOS.
+        // Mach-O: the CPU type must match (thin), or a slice must (fat).
         let mut macho = clean.clone();
         macho[..4].copy_from_slice(b"\xcf\xfa\xed\xfe");
+        macho[4..8].copy_from_slice(&0x0100_000cu32.to_le_bytes());
         verify_own(&macho, &sha(&macho), &want, "macos", "aarch64").unwrap();
+        assert!(verify_own(&macho, &sha(&macho), &want, "macos", "x86_64").is_err());
+        // A well-formed fat header: two slices, both the stamped bytes after the header.
+        let fat_with = |second_cpu: u32| {
+            let body = b"@@XSHELL-BUILD-V1:85ee920a1b2c:7@@".to_vec();
+            let mut fat = vec![0u8; 64];
+            fat[..4].copy_from_slice(b"\xca\xfe\xba\xbe");
+            fat[4..8].copy_from_slice(&2u32.to_be_bytes());
+            for (i, cpu) in [0x0100_0007u32, second_cpu].into_iter().enumerate() {
+                let e = 8 + i * 20;
+                fat[e..e + 4].copy_from_slice(&cpu.to_be_bytes());
+                fat[e + 8..e + 12].copy_from_slice(&64u32.to_be_bytes());
+                fat[e + 12..e + 16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+            }
+            fat.extend_from_slice(&body);
+            fat
+        };
+        let fat = fat_with(0x0100_000c);
+        verify_own(&fat, &sha(&fat), &want, "macos", "x86_64").unwrap();
+        verify_own(&fat, &sha(&fat), &want, "macos", "aarch64").unwrap();
+        let fat = fat_with(0x0000_0012);
+        assert!(verify_own(&fat, &sha(&fat), &want, "macos", "aarch64").is_err());
     }
 }

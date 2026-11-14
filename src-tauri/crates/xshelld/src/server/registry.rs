@@ -31,6 +31,8 @@ pub(crate) struct Daemon {
     pub exit: Mutex<Option<ExitReason>>,
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
+    /// The home's owner lock (`daemon.owner`, Unix), released after the endpoint record.
+    pub owner_file: Mutex<Option<fs::File>>,
     pub store_admission: Arc<super::ring::ownership::StoreAdmission>,
     #[cfg(any(unix, windows))]
     pub companion: Mutex<Option<xshell_core::local_ipc::Server>>,
@@ -715,6 +717,9 @@ impl Daemon {
         let _ = fs::remove_file(&self.cfg.paths.pid);
         #[cfg(unix)]
         crate::paths::remove_endpoint_of(&self.cfg.paths.endpoint, std::process::id());
+        if let Some(o) = self.owner_file.lock().unwrap().take() {
+            let _ = o.unlock();
+        }
         if let Some(h) = bye {
             let _ = h.join();
         }

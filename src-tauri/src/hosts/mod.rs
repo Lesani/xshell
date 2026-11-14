@@ -43,7 +43,11 @@ pub struct Hosts {
     daemon: DaemonSlot,
     app: AppHandle,
     version: String,
+    /// The home directory (a seam: tests make it unknown, then known).
+    home_of: HomeFn,
 }
+
+type HomeFn = Arc<dyn Fn() -> Option<std::path::PathBuf> + Send + Sync>;
 
 /// Linux or macOS.
 pub fn linux_or_macos() -> bool {
@@ -69,10 +73,10 @@ impl local::RawStore for TauriStore {
 }
 
 /// `~/.xshell/server/<version>+<build>/xshelld`: where the embedded Daemon is installed.
-fn own_install_bin(version: &str) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
+fn own_install_bin(version: &str, home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let home = home?;
     let dir = xshell_protocol::build::install_dir_name(version, crate::build_id::BUILD.as_ref());
-    Some(xshell_hostlink::install::local_server_bin(&home, &dir))
+    Some(xshell_hostlink::install::local_server_bin(home, &dir))
 }
 
 /// Resolve how local Tabs run and set up the Local Host's Daemon for it.
@@ -80,8 +84,9 @@ fn setup_local(
     version: &str,
     exe_dir: Option<&std::path::Path>,
     svc: &Arc<service::ServiceState>,
+    home: Option<std::path::PathBuf>,
 ) -> (local::LocalMode, Option<Arc<xshell_hostlink::LocalDaemon>>) {
-    let install_bin = own_install_bin(version);
+    let install_bin = own_install_bin(version, home.as_deref());
     let mut mode = local::resolve_local(
         exe_dir,
         &|k| std::env::var_os(k),
@@ -90,20 +95,22 @@ fn setup_local(
         install_bin.as_deref(),
     );
     let daemon = match &mode {
-        local::LocalMode::Daemon { bin, source } => match local_daemon(bin.clone(), version) {
-            Ok(d) => {
-                configure(&d, source, svc);
-                Some(d)
+        local::LocalMode::Daemon { bin, source } => {
+            match local_daemon(bin.clone(), version, home) {
+                Ok(d) => {
+                    configure(&d, source, svc);
+                    Some(d)
+                }
+                Err(reason) => {
+                    mode = if cfg!(unix) {
+                        local::LocalMode::Failed { reason }
+                    } else {
+                        local::LocalMode::InProcess { reason }
+                    };
+                    None
+                }
             }
-            Err(reason) => {
-                mode = if cfg!(unix) {
-                    local::LocalMode::Failed { reason }
-                } else {
-                    local::LocalMode::InProcess { reason }
-                };
-                None
-            }
-        },
+        }
         _ => None,
     };
     match &mode {
@@ -194,6 +201,10 @@ fn service_binary(
 
 impl Hosts {
     pub fn new(app: &AppHandle) -> Self {
+        Self::with_home(app, Arc::new(dirs::home_dir))
+    }
+
+    fn with_home(app: &AppHandle, home_of: HomeFn) -> Self {
         use tauri_plugin_store::StoreExt as _;
         let version = app.package_info().version.to_string();
         let exe_dir = std::env::current_exe()
@@ -207,7 +218,7 @@ impl Hosts {
             }
         };
         let svc = Arc::new(service::ServiceState::default());
-        let (local_mode, local_daemon) = setup_local(&version, exe_dir.as_deref(), &svc);
+        let (local_mode, local_daemon) = setup_local(&version, exe_dir.as_deref(), &svc, home_of());
         let cache_dir = app
             .path()
             .app_cache_dir()
@@ -241,6 +252,7 @@ impl Hosts {
             daemon: slot,
             app: app.clone(),
             version,
+            home_of,
         };
         hosts.start_service_install();
         hosts
@@ -299,53 +311,27 @@ impl Hosts {
 
     /// What `local_host_info` answers and `local:daemon` carries.
     pub fn local_info(&self) -> local::LocalHostInfo {
-        let mode = self.local_mode_now();
-        let daemon = match (&mode, self.local_daemon_now()) {
-            (local::LocalMode::Daemon { .. }, Some(d)) => {
-                let snap = self.manager.access(LOCAL_HOST_ID).map(|h| h.snapshot());
-                let (state, error) = local::daemon_state(
-                    d.start_error(),
-                    snap.as_ref().map(|s| &s.status),
-                    snap.as_ref().is_some_and(|s| s.terminals.is_some()),
-                );
-                Some(local::DaemonInfo {
-                    state,
-                    error_kind: local::error_kind(error.as_deref()),
-                    error,
-                    log: Some(d.log.display().to_string()),
-                })
-            }
-            _ => None,
-        };
-        let service = match (&mode, cfg!(unix)) {
-            (local::LocalMode::Daemon { .. }, true) => Some(self.service.get().unwrap_or_default()),
-            _ => None,
-        };
-        mode.info(local::PersistentInfo::default(), daemon, service)
+        info_of(
+            &self.local_mode_now(),
+            self.local_daemon_now().as_deref(),
+            &self.manager,
+            &self.service,
+        )
     }
 
     /// `local_daemon_retry`: clear the start error and dial again; in `Failed` set the
     /// Daemon up again first (A8); rerun the service install when it failed.
     pub fn retry_local(&self) -> local::LocalHostInfo {
-        if matches!(self.local_mode_now(), local::LocalMode::Failed { .. }) {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (mode, daemon) = setup_local(&self.version, exe_dir.as_deref(), &self.service);
-            *self.current.lock().unwrap() = mode;
-            if daemon.is_some() {
-                *self.daemon.lock().unwrap() = daemon;
-                self.manager.set_local(local_host_config());
-                self.start_service_install();
-            }
-        } else if self.service.get().is_some_and(|s| s.error.is_some()) {
+        let set_up = retry_setup(
+            &self.current,
+            &self.daemon,
+            &self.manager,
+            &self.version,
+            &self.service,
+            (self.home_of)(),
+        );
+        if set_up || self.service.get().is_some_and(|s| s.error.is_some()) {
             self.start_service_install();
-        }
-        if let Some(d) = self.local_daemon_now() {
-            d.clear_start_error();
-        }
-        if let Some(h) = self.manager.access(LOCAL_HOST_ID) {
-            h.kick();
         }
         self.local_info()
     }
@@ -365,6 +351,70 @@ impl Hosts {
             d.reap(deadline);
         }
     }
+}
+
+/// [`Hosts::local_info`] from its parts.
+fn info_of(
+    mode: &local::LocalMode,
+    d: Option<&xshell_hostlink::LocalDaemon>,
+    manager: &Manager,
+    svc: &service::ServiceState,
+) -> local::LocalHostInfo {
+    let daemon = match (mode, d) {
+        (local::LocalMode::Daemon { .. }, Some(d)) => {
+            let snap = manager.access(LOCAL_HOST_ID).map(|h| h.snapshot());
+            let (state, error) = local::daemon_state(
+                d.start_error(),
+                snap.as_ref().map(|s| &s.status),
+                snap.as_ref().is_some_and(|s| s.terminals.is_some()),
+            );
+            Some(local::DaemonInfo {
+                state,
+                error_kind: local::error_kind(error.as_deref()),
+                error,
+                log: Some(d.log.display().to_string()),
+            })
+        }
+        _ => None,
+    };
+    let service = match (mode, cfg!(unix)) {
+        (local::LocalMode::Daemon { .. }, true) => Some(svc.get().unwrap_or_default()),
+        _ => None,
+    };
+    mode.info(local::PersistentInfo::default(), daemon, service)
+}
+
+/// A Retry: in `Failed`, set the Daemon up again (and add the Local Host); always clear the
+/// start error and kick the Local Host. Returns whether a Daemon was newly set up.
+fn retry_setup(
+    current: &Mutex<local::LocalMode>,
+    slot: &DaemonSlot,
+    manager: &Manager,
+    version: &str,
+    svc: &Arc<service::ServiceState>,
+    home: Option<std::path::PathBuf>,
+) -> bool {
+    let mut set_up = false;
+    let failed = matches!(*current.lock().unwrap(), local::LocalMode::Failed { .. });
+    if failed {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let (mode, daemon) = setup_local(version, exe_dir.as_deref(), svc, home);
+        *current.lock().unwrap() = mode;
+        if daemon.is_some() {
+            *slot.lock().unwrap() = daemon;
+            manager.set_local(local_host_config());
+            set_up = true;
+        }
+    }
+    if let Some(d) = slot.lock().unwrap().clone() {
+        d.clear_start_error();
+    }
+    if let Some(h) = manager.access(LOCAL_HOST_ID) {
+        h.kick();
+    }
+    set_up
 }
 
 fn local_host_config() -> HostConfig {
@@ -405,8 +455,9 @@ pub fn emit_local_info(app: &AppHandle) {
 fn local_daemon(
     bin: std::path::PathBuf,
     version: &str,
+    home: Option<std::path::PathBuf>,
 ) -> Result<Arc<xshell_hostlink::LocalDaemon>, String> {
-    let home = dirs::home_dir().ok_or("the home directory is unknown")?;
+    let home = home.ok_or("the home directory is unknown")?;
     #[cfg(unix)]
     let socket = {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
@@ -571,5 +622,149 @@ mod channel_sink_tests {
             resync: None,
         };
         sink.resync_required();
+    }
+}
+
+/// A8 with real parts: hostlink's Manager dials a Local Host Daemon that refuses hello.
+#[cfg(all(test, unix))]
+mod local_readiness_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    struct Quiet;
+    impl Observer for Quiet {
+        fn status(&self, _: &HostStatus) {}
+        fn terminals(&self, _: &str, _: &[TerminalInfo]) {}
+    }
+    struct NoBinaries;
+    impl xshell_hostlink::BinarySource for NoBinaries {
+        fn fetch(
+            &self,
+            _: &xshell_hostlink::Wanted,
+            _: &xshell_hostlink::CancelToken,
+        ) -> Result<xshell_hostlink::Fetched, String> {
+            Err("none".into())
+        }
+    }
+
+    #[test]
+    fn refused_hello_is_failed_with_the_reason() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let sock = t.path().join("d.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut c = c;
+                let body = br#"{"t":"error","code":"refused","message":"hello refused by test"}"#;
+                let _ = xshell_protocol::frame::write_frame(
+                    &mut c,
+                    &xshell_protocol::frame::Frame::Json(body.to_vec()),
+                );
+                let _ = c.flush();
+            }
+        });
+        let d = Arc::new(
+            xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+                bin: t.path().join("no-xshelld"),
+                env: vec![],
+                home,
+                socket: sock,
+                version: "1.5.0".into(),
+                build: None,
+            })
+            .unwrap(),
+        );
+        d.set_persistent(true);
+        let slot: DaemonSlot = Arc::new(Mutex::new(Some(d.clone())));
+        let m = Manager::new(ManagerConfig::new(
+            "1.5.0",
+            Arc::new(SshFactory { local: slot }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ));
+        m.set_local(local_host_config());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (state, error) = loop {
+            let snap = m.access(LOCAL_HOST_ID).unwrap().snapshot();
+            let r = local::daemon_state(
+                d.start_error(),
+                Some(&snap.status),
+                snap.terminals.is_some(),
+            );
+            if r.0 == "failed" || Instant::now() >= deadline {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(state, "failed");
+        assert!(
+            error
+                .as_deref()
+                .unwrap_or("")
+                .contains("hello refused by test"),
+            "{error:?} / {:#?}",
+            m.access(LOCAL_HOST_ID).unwrap().snapshot().status
+        );
+        m.shutdown();
+    }
+
+    /// A8: a real retry from `LocalMode::Failed` sets the Daemon up (with the Local Host)
+    /// once the cause is gone, and reports Daemon mode.
+    #[test]
+    fn retry_from_failed_sets_the_daemon_up() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service::ServiceState::default());
+        // Home unknown: Failed (Unix), no Daemon.
+        let (mode, daemon) = setup_local("1.5.0", Some(t.path()), &svc, None);
+        assert!(daemon.is_none());
+        if !cfg!(unix) {
+            return;
+        }
+        assert!(
+            matches!(&mode, local::LocalMode::Failed { reason } if reason.contains("home directory is unknown"))
+        );
+        let current = Mutex::new(mode);
+        let slot: DaemonSlot = Arc::new(Mutex::new(None));
+        let m = Manager::new(ManagerConfig::new(
+            "1.5.0",
+            Arc::new(SshFactory {
+                local: slot.clone(),
+            }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ));
+        let info = info_of(&current.lock().unwrap(), None, &m, &svc);
+        assert_eq!(info.mode, "failed");
+        // Still unknown: stays failed, no Local Host.
+        assert!(!retry_setup(&current, &slot, &m, "1.5.0", &svc, None));
+        assert!(m.access(LOCAL_HOST_ID).is_none());
+        // Known now: set up, the Local Host exists, the info says daemon.
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(retry_setup(
+            &current,
+            &slot,
+            &m,
+            "1.5.0",
+            &svc,
+            Some(home.clone())
+        ));
+        let d = slot.lock().unwrap().clone().expect("a Daemon");
+        assert!(m.access(LOCAL_HOST_ID).is_some());
+        let info = info_of(&current.lock().unwrap(), Some(&d), &m, &svc);
+        assert_eq!(info.mode, "daemon", "{info:?}");
+        assert!(info
+            .daemon
+            .unwrap()
+            .log
+            .unwrap()
+            .starts_with(&home.display().to_string()));
+        assert!(info.service.is_some());
+        d.hang_up();
+        m.shutdown();
     }
 }

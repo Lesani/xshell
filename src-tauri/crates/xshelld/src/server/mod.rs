@@ -705,6 +705,7 @@ impl Server {
             pid: false,
             socket: false,
             endpoint: false,
+            owner: None,
         };
         // Holding the lock, record how this Daemon runs: `connect` starts none while xshell
         // owns it, and a Persistent `serve` hands it back.
@@ -733,9 +734,25 @@ impl Server {
         transport::remove_endpoint(&paths.socket)?;
         let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
-        // Every client of this home finds this socket, whatever its XDG_RUNTIME_DIR (A2).
+        // Every client of this home finds this socket, whatever its XDG_RUNTIME_DIR (A2): the
+        // owner lock first (blocking: clients only probe it with a momentary shared lock),
+        // then the record, so a record is trusted only while its owner holds the lock.
         #[cfg(unix)]
         {
+            let owner = crate::paths::owner_path(&cfg.home);
+            if let Some(dir) = owner.parent() {
+                ensure_private_dir(dir)?;
+            }
+            let f = private_file(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false),
+            )
+            .open(&owner)?;
+            f.lock()?;
+            starting.owner = Some(f);
             crate::paths::write_endpoint(&paths.endpoint, std::process::id(), &paths.socket)
                 .map_err(|e| {
                     io::Error::new(
@@ -790,6 +807,7 @@ impl Server {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(starting.lock.take()),
+            owner_file: Mutex::new(starting.owner.take()),
             store_admission: ring::ownership::StoreAdmission::new(
                 starting.ownership.take().unwrap(),
             ),
@@ -885,6 +903,8 @@ struct Starting<'a> {
     /// The endpoint record was written (Unix).
     #[cfg_attr(not(unix), allow(dead_code))]
     endpoint: bool,
+    /// The home's owner lock (Unix), held from before the record is written.
+    owner: Option<fs::File>,
 }
 
 impl Drop for Starting<'_> {
@@ -895,6 +915,9 @@ impl Drop for Starting<'_> {
         #[cfg(unix)]
         if self.endpoint {
             crate::paths::remove_endpoint_of(&self.paths.endpoint, std::process::id());
+        }
+        if let Some(o) = self.owner.take() {
+            let _ = o.unlock();
         }
         if self.socket {
             let _ = transport::remove_endpoint(&self.paths.socket);
@@ -1066,7 +1089,7 @@ pub fn run_serve(mut cfg: Config, stop: Arc<StopLatch>) -> i32 {
 /// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits
 /// (at most 30 s) until `<path>` exists before exiting, so a test can order its exit after
 /// `connect` has already bridged to the winner.
-fn hold_loser_for_tests() {
+pub(crate) fn hold_loser_for_tests() {
     let Some(p) = std::env::var_os("XSHELLD_TEST_HOLD_LOSER") else {
         return;
     };

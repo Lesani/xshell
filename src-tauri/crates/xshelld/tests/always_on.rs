@@ -323,8 +323,9 @@ fn endpoint_is_found_with_and_without_xdg_runtime_dir() {
     }
 }
 
-/// A3: with real login preparation and the profile block installed, starting the Daemon
-/// starts exactly one, and leaves no waiting `service run` behind.
+/// A3: with real login preparation and the profile block installed, a `serve` started
+/// directly (no guard inherited from `ensure`) starts no second Daemon through the block, and
+/// leaves no `service` process behind.
 #[test]
 fn profile_block_never_starts_a_second_daemon() {
     let h = TestHome::new();
@@ -334,22 +335,163 @@ fn profile_block_never_starts_a_second_daemon() {
     assert!(fs::read_to_string(h.home().join(".profile"))
         .unwrap()
         .contains("service ensure"));
-    let ok = svc(&h)
+    let mut serve = svc(&h)
         .env_remove("XSHELLD_LOGIN_ENV")
-        .args(["service", "ensure"])
-        .status()
+        .env_remove("XSHELL_SERVICE_GUARD")
+        .args(["serve", "--interactive-env", "--home"])
+        .arg(h.home())
+        .stdin(Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(ok.success());
     assert!(wait_until(Duration::from_secs(20), || {
         std::os::unix::net::UnixStream::connect(h.paths().socket).is_ok()
     }));
     // The interactive login shell ran (and with it the block); give anything it started
     // time to show up.
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(procs(&h.home(), "serve").len(), 1);
+    let serves = procs(&h.home(), "serve");
+    assert_eq!(serves.len(), 1, "{serves:?}");
+    assert_eq!(serves[0].0, serve.id() as i32);
     assert!(procs(&h.home(), "service").is_empty());
-    assert_eq!(log_lines(&h, "started by the profile service"), 1);
-    assert_eq!(log_lines(&h, "another xshelld serve holds the lock"), 0);
+    assert_eq!(log_lines(&h, "started by the"), 0);
+    unsafe { libc::kill(serve.id() as i32, libc::SIGTERM) };
+    let _ = serve.wait();
+}
+
+/// P1-b: a Daemon killed with SIGKILL leaves its endpoint record; the next start (`ensure`,
+/// a Desktop's start) starts a Daemon and clients never follow the stale socket.
+#[test]
+fn stale_endpoint_after_kill_is_ignored() {
+    let h = TestHome::new();
+    let _reap = Reap(h.home());
+    json_out(svc(&h).args(["service", "install", "--json"]));
+    // First Daemon with XDG set: its socket is under run/xshell.
+    assert!(svc(&h)
+        .args(["service", "ensure"])
+        .status()
+        .unwrap()
+        .success());
+    let rec = h.home().join(".xshell/run/daemon.endpoint");
+    assert!(wait_until(Duration::from_secs(10), || rec.exists()
+        && std::os::unix::net::UnixStream::connect(h.paths().socket)
+            .is_ok()));
+    let first = procs(&h.home(), "serve")[0].0;
+    unsafe { libc::kill(first, libc::SIGKILL) };
+    assert!(wait_dead(first, T));
+    assert!(rec.exists(), "SIGKILL leaves the record");
+    // Without XDG the environment's socket is under the home; the stale record (owner lock
+    // free) must not redirect `ensure` or clients to the dead socket.
+    let no_xdg = |c: &mut Command| {
+        c.env_remove("XDG_RUNTIME_DIR");
+    };
+    let mut e = svc(&h);
+    no_xdg(&mut e);
+    assert!(e.args(["service", "ensure"]).status().unwrap().success());
+    let home_sock = h.home().join(".xshell/run/daemon.sock");
+    assert!(wait_until(Duration::from_secs(10), || {
+        std::os::unix::net::UnixStream::connect(&home_sock).is_ok()
+    }));
+    let record = fs::read_to_string(&rec).unwrap();
+    assert!(
+        record.ends_with(&format!("{}\n", home_sock.display())),
+        "{record}"
+    );
+    let serves = procs(&h.home(), "serve");
+    assert_eq!(serves.len(), 1, "{serves:?}");
+    // A client with XDG set follows the live record to the new socket.
+    let mut c = bin_cmd(&h);
+    c.arg("connect");
+    let mut p = ConnectProc::spawn(c);
+    p.client.hello(range(1, 1));
+    assert!(p.finish().success());
+    assert_eq!(procs(&h.home(), "serve").len(), 1);
+
+    // The Desktop's start after another SIGKILL: it starts a Daemon, not the dead socket.
+    let second = serves[0].0;
+    unsafe { libc::kill(second, libc::SIGKILL) };
+    assert!(wait_dead(second, T));
+    let local = xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+        bin: bin().into(),
+        home: h.home(),
+        socket: h.paths().socket,
+        env: vec![
+            ("HOME".into(), h.home().into()),
+            ("XDG_RUNTIME_DIR".into(), h.run().into()),
+            ("XSHELLD_LOGIN_ENV".into(), "0".into()),
+        ],
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: xshelld::build_id::BUILD.clone(),
+    })
+    .unwrap();
+    local.set_persistent(true);
+    assert_eq!(
+        local.live_socket(),
+        h.paths().socket,
+        "followed a stale record"
+    );
+    local
+        .connect_or_start(&xshell_hostlink::CancelToken::new())
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || procs(
+        h.root(),
+        "serve"
+    )
+    .len()
+        == 1));
+    local.hang_up();
+}
+
+/// P2-g: a runner `ensure` starts gives up when another starter won: after the first Daemon
+/// published its endpoint, and while another `serve` still prepares (start lock held).
+#[test]
+fn ensure_runner_exits_when_another_starter_won() {
+    let h = TestHome::new();
+    let _reap = Reap(h.home());
+    json_out(svc(&h).args(["service", "install", "--json"]));
+    // A `serve` whose login preparation is slow: it holds the start lock meanwhile.
+    let slow = h.script("slowsh", "sleep 3; exec /bin/sh \"$@\"");
+    let mut serve = svc(&h)
+        .env_remove("XSHELLD_LOGIN_ENV")
+        .env("SHELL", &slow)
+        .args(["serve", "--home"])
+        .arg(h.home())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        xshell_hostlink::local::lock_held(&h.home().join(".xshell/run/daemon.start"))
+    }));
+    assert!(!h.home().join(".xshell/run/daemon.endpoint").exists());
+    let t0 = Instant::now();
+    let st = svc(&h)
+        .args(["service", "run", "--once", "--home"])
+        .arg(h.home())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(t0.elapsed() < Duration::from_secs(2), "the runner waited");
+    // After the endpoint is published: `ensure` and a runner both return at once.
+    assert!(wait_until(Duration::from_secs(15), || {
+        std::os::unix::net::UnixStream::connect(h.paths().socket).is_ok()
+    }));
+    assert!(svc(&h)
+        .args(["service", "ensure"])
+        .status()
+        .unwrap()
+        .success());
+    let st = svc(&h)
+        .args(["service", "run", "--once", "--home"])
+        .arg(h.home())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(procs(&h.home(), "service").is_empty(), "a runner waits");
+    let serves = procs(&h.home(), "serve");
+    assert_eq!(serves.len(), 1, "{serves:?}");
+    assert_eq!(serves[0].0, serve.id() as i32);
+    unsafe { libc::kill(serve.id() as i32, libc::SIGTERM) };
+    let _ = serve.wait();
 }
 
 /// The Desktop's registration starts the normal `serve`, never the helper child.

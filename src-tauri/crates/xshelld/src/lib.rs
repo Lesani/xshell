@@ -145,6 +145,25 @@ pub fn main_entry() -> i32 {
     if !serve {
         return connect::run_connect(&opts, &paths);
     }
+    // Unix: one starter at a time per home, from before the (slow) login-environment
+    // preparation to exit, so a second `serve` (an `ensure`, a Desktop, a `connect`) gives up
+    // at once instead of preparing in parallel. Exit 3: another `serve` will listen.
+    #[cfg(unix)]
+    let _start_lock = match paths::hold_exclusive(&paths::start_path(&home)) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            crate::log!(
+                "INFO",
+                "another xshelld serve is starting or running; exiting"
+            );
+            server::hold_loser_for_tests();
+            return 3;
+        }
+        Err(e) => {
+            eprintln!("xshelld: cannot start: {e}");
+            return 1;
+        }
+    };
     #[cfg(unix)]
     if let Some(m) = std::env::var_os(service::SERVICE_ENV) {
         crate::log!("INFO", "started by the {} service", m.to_string_lossy());

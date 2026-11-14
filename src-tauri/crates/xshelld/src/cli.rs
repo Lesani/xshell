@@ -98,6 +98,9 @@ pub struct ServiceOpts {
     /// `--mechanism`: force one (the environment's `XSHELL_SERVICE_MECHANISM` is read by
     /// `service`, so it stays out of this parse).
     pub mechanism: Option<Mechanism>,
+    /// Hidden `run --once` (what `ensure` starts): give up at once when a Daemon is alive or
+    /// starting, instead of waiting behind it.
+    pub once: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -361,6 +364,7 @@ fn parse_service(
         match flag.as_str() {
             "--home" => opts.home = Some(value()?.into()),
             "--json" if inline.is_none() => opts.json = true,
+            "--once" if inline.is_none() && action == ServiceAction::Run => opts.once = true,
             "--mechanism" => {
                 let v = value()?;
                 let m = v.to_str().and_then(Mechanism::parse).ok_or_else(|| {
@@ -499,6 +503,7 @@ mod tests {
                     home: Some("/h".into()),
                     json: true,
                     mechanism: Some(Mechanism::Profile),
+                    once: false,
                 }
             )
         );

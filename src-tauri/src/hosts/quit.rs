@@ -85,6 +85,39 @@ pub fn plan_stop(shown: &[Uuid], now: &[Uuid]) -> (Vec<Uuid>, Vec<Uuid>) {
     (stop, added)
 }
 
+/// How a "Stop them" ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// `n` of the shown Terminals did not end: the window stays.
+    Failed(usize),
+    /// The shown ones ended, but these were started meanwhile (read after the stop): ask again.
+    Added(Vec<Uuid>),
+    /// Nothing runs any more that was not shown: close.
+    Done,
+}
+
+/// Stop the shown Terminals that still run (`stop` returns how many did not end), then read
+/// the authoritative running set again: anything not shown is `Added`.
+pub fn run_stop(
+    shown: &[Uuid],
+    running: &dyn Fn() -> Option<Vec<Uuid>>,
+    stop: &dyn Fn(&[Uuid]) -> usize,
+) -> StopOutcome {
+    let now = running().unwrap_or_default();
+    let (to_stop, _) = plan_stop(shown, &now);
+    let left = stop(&to_stop);
+    if left > 0 {
+        return StopOutcome::Failed(left);
+    }
+    let after = running().unwrap_or_default();
+    let (_, added) = plan_stop(shown, &after);
+    if added.is_empty() {
+        StopOutcome::Done
+    } else {
+        StopOutcome::Added(added)
+    }
+}
+
 /// A prompt on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -95,6 +128,8 @@ pub struct Pending {
     pub terminals: Vec<Uuid>,
     /// An application quit (not a window close) asked: keep/stop then exit the app.
     pub exit: bool,
+    /// A resolve is working on it: further closes and resolves are refused until it ends.
+    pub in_flight: bool,
 }
 
 /// The `local:quit-prompt` payload.
@@ -155,17 +190,42 @@ impl QuitState {
             label: label.into(),
             terminals,
             exit,
+            in_flight: false,
         });
         Some(ev)
     }
 
-    /// Take the pending prompt if it is `id`.
-    pub fn take(&self, id: &str) -> Result<Pending, String> {
+    /// Start resolving prompt `id`: it stays pending, marked in flight, until [`Self::end`].
+    pub fn start(&self, id: &str) -> Result<Pending, String> {
         let mut g = self.pending.lock().unwrap();
-        match g.as_ref() {
-            Some(p) if p.id == id => Ok(g.take().unwrap()),
+        match g.as_mut() {
+            Some(p) if p.id == id && !p.in_flight => {
+                p.in_flight = true;
+                Ok(p.clone())
+            }
+            Some(p) if p.id == id => Err("busy: this quit prompt is being answered".into()),
             _ => Err("stale: no such quit prompt".into()),
         }
+    }
+
+    /// End a resolution: no prompt, or a new one (Terminals added meanwhile).
+    pub fn end(&self, next: Option<(String, Vec<Uuid>, bool)>) -> Option<PromptEvent> {
+        let mut g = self.pending.lock().unwrap();
+        *g = None;
+        let (label, terminals, exit) = next?;
+        let id = format!("q{}", self.next.fetch_add(1, Ordering::SeqCst));
+        let ev = PromptEvent {
+            id: id.clone(),
+            terminals: terminals.len(),
+        };
+        *g = Some(Pending {
+            id,
+            label,
+            terminals,
+            exit,
+            in_flight: false,
+        });
+        Some(ev)
     }
 
     /// The decision inputs this state knows.
@@ -329,8 +389,10 @@ fn stop_terminals(hosts: &Hosts, ids: &[Uuid]) -> usize {
 }
 
 /// `local_quit_resolve`: `Ok(None)` (done), `Ok(Some({changed:{id, added}}))` (Terminals were
-/// started after the prompt; the shown ones are stopped already and a new prompt counts only
-/// the new ones), or `Err("failed:<n> …")` / `Err("stale…")`.
+/// started while the prompt was up or the stop ran; the shown ones are stopped already and a
+/// new prompt counts only the new ones), or `Err("failed:<n> …")` / `Err("stale…")` /
+/// `Err("busy…")`. The prompt stays pending (in flight) for the whole resolution, so closes
+/// and other resolves are refused meanwhile.
 pub fn resolve(
     app: &AppHandle,
     id: &str,
@@ -342,40 +404,54 @@ pub fn resolve(
     if !matches!(choice, "keep" | "stop" | "cancel") {
         return Err(format!("invalid choice {choice:?}"));
     }
-    let p = q.take(id)?;
+    let p = q.start(id)?;
     match choice {
-        "cancel" => Ok(None),
+        "cancel" => {
+            q.end(None);
+            Ok(None)
+        }
         "keep" => {
             if remember {
-                let store = hosts.store.as_deref().ok_or("settings are unavailable")?;
-                store
-                    .set_saved(
-                        KEEP_SESSIONS_KEY,
-                        serde_json::Value::from(KeepSessions::Always.as_str()),
-                    )
-                    .map_err(|e| format!("failed:0 {e}"))?;
+                let saved = hosts
+                    .store
+                    .as_deref()
+                    .ok_or_else(|| "settings are unavailable".to_string())
+                    .and_then(|store| {
+                        store.set_saved(
+                            KEEP_SESSIONS_KEY,
+                            serde_json::Value::from(KeepSessions::Always.as_str()),
+                        )
+                    });
+                if let Err(e) = saved {
+                    q.end(None);
+                    return Err(format!("failed:0 {e}"));
+                }
             }
+            q.end(None);
             finish(app, &p);
             Ok(None)
         }
-        _ => {
-            let now = local_running(&hosts).unwrap_or_default();
-            let (stop, added) = plan_stop(&p.terminals, &now);
-            let left = stop_terminals(&hosts, &stop);
-            if left > 0 {
-                return Err(format!("failed:{left} sessions did not stop"));
+        _ => match run_stop(&p.terminals, &|| local_running(&hosts), &|ids| {
+            stop_terminals(&hosts, ids)
+        }) {
+            StopOutcome::Failed(left) => {
+                q.end(None);
+                Err(format!("failed:{left} sessions did not stop"))
             }
-            if !added.is_empty() {
+            StopOutcome::Added(added) => {
                 let ev = q
-                    .begin(&p.label, added, p.exit)
-                    .ok_or("another quit prompt is pending")?;
-                return Ok(Some(serde_json::json!({
+                    .end(Some((p.label.clone(), added, p.exit)))
+                    .expect("a new prompt");
+                Ok(Some(serde_json::json!({
                     "changed": { "id": ev.id, "added": ev.terminals }
-                })));
+                })))
             }
-            finish(app, &p);
-            Ok(None)
-        }
+            StopOutcome::Done => {
+                q.end(None);
+                finish(app, &p);
+                Ok(None)
+            }
+        },
     }
 }
 
@@ -429,10 +505,10 @@ mod tests {
         assert_eq!(decide(&i), CloseDecision::Close);
     }
 
-    /// A9: a second close while a prompt is pending is ignored, not taken as Keep, and a
-    /// resolve must name the prompt shown.
+    /// A9: a second close while a prompt is pending begins no second prompt (and is not
+    /// taken as Keep); a resolve must name the prompt shown.
     #[test]
-    fn second_close_while_pending_closes() {
+    fn second_close_while_pending_is_ignored_and_resolve_needs_the_shown_id() {
         let q = QuitState::new(None);
         let a = Uuid::new_v4();
         let ev = q.begin("main", vec![a], false).unwrap();
@@ -442,12 +518,63 @@ mod tests {
             "second prompt begun"
         );
         assert_eq!(q.pending().unwrap().terminals, vec![a]);
-        assert!(q.take("q999").is_err());
-        assert_eq!(q.take(&ev.id).unwrap().id, ev.id);
-        assert!(q.take(&ev.id).is_err(), "taken twice");
+        assert!(q.start("q999").unwrap_err().starts_with("stale"));
+        assert_eq!(q.start(&ev.id).unwrap().id, ev.id);
+        q.end(None);
+        assert!(q.start(&ev.id).is_err(), "resolved twice");
         // A new prompt gets a new id.
         let ev2 = q.begin("main", vec![a], false).unwrap();
         assert_ne!(ev2.id, ev.id);
+    }
+
+    /// P1-a: while a resolution is in flight the prompt stays pending: closes begin nothing
+    /// and a second resolve is refused.
+    #[test]
+    fn close_during_in_flight_resolution_is_ignored() {
+        let q = QuitState::new(None);
+        let a = Uuid::new_v4();
+        let ev = q.begin("main", vec![a], false).unwrap();
+        let p = q.start(&ev.id).unwrap();
+        assert!(p.in_flight);
+        assert!(
+            q.pending().is_some_and(|p| p.in_flight),
+            "pending while in flight"
+        );
+        assert!(
+            q.begin("main", vec![a], false).is_none(),
+            "a close began a prompt"
+        );
+        assert!(q.start(&ev.id).unwrap_err().starts_with("busy"));
+        q.end(None);
+        assert!(q.pending().is_none());
+    }
+
+    /// P1-a: a Terminal opened during the stop wait is reported as added (the window stays);
+    /// the shown ones were stopped.
+    #[test]
+    fn terminal_opened_during_stop_is_added_and_window_stays() {
+        use std::cell::RefCell;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let running = RefCell::new(vec![a, b]);
+        let stopped = RefCell::new(Vec::new());
+        let out = run_stop(&[a, b], &|| Some(running.borrow().clone()), &|ids| {
+            stopped.borrow_mut().extend_from_slice(ids);
+            // The shown ones end; meanwhile c is opened.
+            *running.borrow_mut() = vec![c];
+            0
+        });
+        assert_eq!(out, StopOutcome::Added(vec![c]));
+        assert_eq!(*stopped.borrow(), vec![a, b]);
+        // Only shrank: done, close.
+        let running = RefCell::new(vec![a]);
+        let out = run_stop(&[a, b], &|| Some(running.borrow().clone()), &|_| {
+            running.borrow_mut().clear();
+            0
+        });
+        assert_eq!(out, StopOutcome::Done);
+        // A shown Terminal that would not end: failed, never Added or Done.
+        let out = run_stop(&[a], &|| Some(vec![a]), &|_| 1);
+        assert_eq!(out, StopOutcome::Failed(1));
     }
 
     #[test]

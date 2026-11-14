@@ -1008,6 +1008,7 @@ pub(crate) mod tests {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
+            owner_file: Mutex::new(None),
             store_admission: crate::server::ring::ownership::StoreAdmission::new(ownership),
             #[cfg(any(unix, windows))]
             companion: Mutex::new(None),
