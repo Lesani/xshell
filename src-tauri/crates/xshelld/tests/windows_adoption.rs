@@ -207,7 +207,7 @@ fn decline_creates_no_enrollment_proofs_candidate_or_relay_membership() {
         .unwrap()
         .journal
         .unwrap();
-    assert_eq!(journal.phase, AdoptionPhase::Cancelled);
+    assert_eq!(journal.phase, AdoptionPhase::DeclinedBeforeProof);
     assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
     assert!(computer.ring.chain().is_none());
     assert!(!computer.daemon_dir.join("roster.json").exists());
@@ -415,7 +415,7 @@ fn public_join_and_approve_then_adopted_desktop_approves_third_with_original_off
     assert_eq!(durable["rosters"][2], third_chain.head().token());
 }
 
-fn runtime2_assert_no_guest_proofs(guest: &PublicComputer) {
+fn runtime2_assert_no_guest_proofs(guest: &PublicComputer, expected: AdoptionPhase) {
     let stored = Store::new(guest.desktop.clone())
         .load_profile()
         .unwrap()
@@ -423,7 +423,7 @@ fn runtime2_assert_no_guest_proofs(guest: &PublicComputer) {
         .unwrap();
     assert!(stored.membership.is_none() && stored.pending_join.is_none());
     let journal = stored.journal.unwrap();
-    assert_eq!(journal.phase, AdoptionPhase::Cancelled);
+    assert_eq!(journal.phase, expected);
     assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
     let counterpart: serde_json::Value =
         serde_json::from_slice(&std::fs::read(guest.daemon_dir.join("companion.json")).unwrap())
@@ -456,7 +456,7 @@ fn public_join_decline_releases_no_enrollment_proofs_or_publication() {
         ));
         assert!(approval.join().unwrap().is_err());
     });
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
     let stored = Store::new(host.desktop.clone())
         .load_profile()
         .unwrap()
@@ -533,7 +533,7 @@ fn public_join_expiry_is_terminal_without_regeneration_or_enrollment_proofs() {
         );
         assert!(approval.join().unwrap().is_err());
     });
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::ExpiredBeforeProof);
     assert_eq!(host.ring.chain().unwrap().head().version(), 1);
 }
 #[test]
@@ -563,7 +563,7 @@ fn verified_join_preview_panic_cancels_before_scope_joins_approval() {
         "an early setup failure is not the cleanup control"
     );
     assert!(start.elapsed() < WAIT, "panic cleanup stranded approval");
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::Cancelled);
     assert_eq!(host.ring.chain().unwrap().head().version(), 1);
 }
 
@@ -605,7 +605,7 @@ fn public_join_refuses_wrong_origin_lease_before_proof_release() {
         offer.wait().unwrap();
         assert!(approval.join().unwrap().is_err());
     });
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::DeclinedBeforeProof);
 }
 
 #[test]
@@ -633,7 +633,7 @@ fn dropping_public_join_origin_cancels_and_drains_the_driver_without_proof_relea
         );
         assert!(approval.join().unwrap().is_err());
     });
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::Cancelled);
     let replacement = guest.ring.begin_join(&guest.companion()).unwrap();
     drop(replacement);
     assert_eq!(host.ring.chain().unwrap().head().version(), 1);
@@ -1306,7 +1306,7 @@ fn shared_join_helper_preview_panic_cancels_before_approval_join() {
         );
         rescued
     });
-    runtime2_assert_no_guest_proofs(&guest);
+    runtime2_assert_no_guest_proofs(&guest, AdoptionPhase::Cancelled);
     assert_eq!(host.ring.chain().unwrap().head().version(), 1);
     assert!(
         !rescued,
