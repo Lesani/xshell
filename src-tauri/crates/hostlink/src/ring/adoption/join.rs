@@ -447,7 +447,7 @@ impl DesktopRing {
                 operation: nonce()?,
                 code: DeviceCode::generate().map_err(|e| e.to_string())?,
                 relay_url: self.cfg.default_relay_url.clone(),
-                expires_at: now() + ttl.as_secs(),
+                expires_at: xshell_protocol::ring::pairing::wall_expiry(ttl),
             },
             Instant::now() + ttl,
         )?;

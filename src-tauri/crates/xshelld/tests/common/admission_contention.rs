@@ -112,6 +112,9 @@ struct Output {
     stderr_eof: bool,
     unknown: usize,
     io_errors: usize,
+    stderr_lines: Vec<String>,
+    started: Option<Instant>,
+    events: Vec<(Duration, &'static str)>,
 }
 struct ObservedChild {
     child: Child,
@@ -132,7 +135,10 @@ impl ObservedChild {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let output = Arc::new(Mutex::new(Output::default()));
+        let output = Arc::new(Mutex::new(Output {
+            started: Some(Instant::now()),
+            ..Output::default()
+        }));
         let out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
         let stdout_state = output.clone();
@@ -143,15 +149,19 @@ impl ObservedChild {
                     state.io_errors += 1;
                     break;
                 };
+                let at = state.started.unwrap().elapsed();
                 if line.starts_with("Computer pairing pending.") {
+                    state.events.push((at, "pending"));
                     state.pending = true;
                 } else if let Some(words) = line.strip_prefix("Device code: ") {
+                    state.events.push((at, "words"));
                     if let Ok(code) = DeviceCode::parse(words) {
                         state.words.push(code);
                     } else {
                         state.unknown += 1;
                     }
                 } else if line.starts_with("Pairing request expired.") {
+                    state.events.push((at, "expired"));
                     state.expired = true;
                 } else if line
                     != "In xshell, open Settings -> Hosts -> Ring and enter these eight words."
@@ -170,6 +180,7 @@ impl ObservedChild {
                     state.io_errors += 1;
                     break;
                 };
+                state.stderr_lines.push(line.clone());
                 match line.as_str() {
                     "xshelld: Computer pairing ended without installation" => state.ended_without_installation = true,
                     "xshelld: Pairing cancelled; possible transmitted consent requires reconciliation" => state.cancelled = true,
@@ -194,8 +205,22 @@ impl ObservedChild {
         let state = self.output.lock().unwrap();
         assert!(state.stdout_eof && state.stderr_eof);
         assert_eq!(state.io_errors, 0);
-        assert_eq!(state.unknown, 0, "unclassified CLI output (not printed)");
+        assert_eq!(
+            state.unknown, 0,
+            "unclassified CLI output; stderr: {:?}",
+            state.stderr_lines
+        );
         code
+    }
+    /// How the CLI run went, for failure messages.
+    fn report(&self) -> String {
+        let s = self.output.lock().unwrap();
+        format!(
+            "elapsed {:?}; stdout events {:?}; stderr {:?}",
+            s.started.unwrap().elapsed(),
+            s.events,
+            s.stderr_lines
+        )
     }
     fn cancel(&self) {
         assert_eq!(
@@ -266,7 +291,9 @@ fn forced_registration_contention(ending: Ending) {
     let _manager = f.manager(&ring);
     let mut child = ObservedChild::start(&f, &relay.url());
     wait(|| child.output.lock().unwrap().pending);
-    let original_start = unix_now();
+    let original_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
     assert!(!f.paths.socket.exists());
     gate.state.lock().unwrap().armed = true;
     let _daemon = f.server();
@@ -296,7 +323,8 @@ fn forced_registration_contention(ending: Ending) {
             });
             if child.output.lock().unwrap().words.is_empty() {
                 // RED must prove the actual terminal chain before its positive words assertion.
-                assert_eq!(child.finish(), 1);
+                let exit = child.finish();
+                assert_eq!(exit, 1, "CLI exit; {}", child.report());
                 gate.wait_for(P::OriginDispatchEnded);
                 let output = child.output.lock().unwrap();
                 assert!(
@@ -325,10 +353,17 @@ fn forced_registration_contention(ending: Ending) {
             assert_eq!(pending.intent.expires_at, join.expires_at);
             assert_eq!(pending.relay_url, relay.url());
             assert!(
-                join.expires_at <= original_start + 4,
+                join.expires_at
+                    <= xshell_protocol::ring::pairing::wall_expiry_at(
+                        original_start,
+                        Duration::from_secs(4)
+                    ),
                 "original expiry was renewed"
             );
-            assert!(join.expires_at <= unix_now() + 4);
+            assert!(
+                join.expires_at
+                    <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4))
+            );
             gate.before(P::OriginJoinAdmissionBusy, P::OriginJoinAdmitted);
             gate.before(P::OriginJoinAdmitted, P::JoinBeforeCounterpartStart);
             gate.before(P::JoinBeforeCounterpartStart, P::JoinWorkerStarted);

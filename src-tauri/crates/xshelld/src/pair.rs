@@ -177,11 +177,7 @@ fn registered_computer_pair(
         })?;
     budget.check().map_err(|_| Failure::ComputerExpired)?;
     let operation = uuid::Uuid::new_v4();
-    let expires_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        + duration.as_secs();
+    let expires_at = xshell_protocol::ring::pairing::wall_expiry(duration);
     let offer = JoinOfferInput {
         operation: xshell_protocol::ring::relay::wire::new_nonce().map_err(|e| e.to_string())?,
         code: DeviceCode::generate().map_err(|e| e.to_string())?,

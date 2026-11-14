@@ -646,7 +646,7 @@ impl StandaloneDeadline {
         }
         Ok(Self {
             until: Instant::now() + ttl,
-            expires_at: now() + ttl.as_secs(),
+            expires_at: xshell_protocol::ring::pairing::wall_expiry(ttl),
         })
     }
 }

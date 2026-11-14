@@ -427,7 +427,7 @@ impl DesktopRing {
         let (keys, profile) = self.register_companion_inner(client)?;
         let operation = nonce()?;
         let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
-        let expires_at = now() + ttl.as_secs();
+        let expires_at = xshell_protocol::ring::pairing::wall_expiry(ttl);
         let until = Instant::now() + ttl;
         let intent = AdoptionIntent {
             operation: operation.clone(),

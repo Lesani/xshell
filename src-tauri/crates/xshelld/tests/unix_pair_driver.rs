@@ -1,6 +1,8 @@
 #![cfg(unix)]
 //! Actual Unix CLI + unchanged production workerd. Computer confirmations use private
 //! Rust backend leases, NOT native GUI/window-consent evidence. No v2 roster seeding.
+//! Run with TMPDIR on SSD or RAM, not an HDD: under default test parallelism the fsync-heavy
+//! stores on an HDD push Device-code readiness past the short test TTLs (2-4 s).
 mod common;
 #[path = "desktop/workerd.rs"]
 #[allow(dead_code)]
@@ -117,10 +119,26 @@ impl Fixture {
                 let _ = tx.send(line.unwrap());
             }
         });
+        // Drain stderr so the CLI never blocks on a full pipe, and keep it for failure reports.
+        let err = child.stderr.take().unwrap();
+        let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = stderr.clone();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            for line in BufReader::new(err).lines() {
+                let Ok(line) = line else { break };
+                buf.push_str(&line);
+                buf.push('\n');
+                *sink.lock().unwrap() = buf.clone();
+            }
+        });
         PairChild {
             child,
             lines,
             words: 0,
+            stderr,
+            stderr_reader: Some(stderr_reader),
+            started: Instant::now(),
         }
     }
     fn companion(&self) -> CompanionClient {
@@ -141,20 +159,55 @@ struct PairChild {
     child: Child,
     lines: mpsc::Receiver<String>,
     words: usize,
+    stderr: Arc<std::sync::Mutex<String>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    started: Instant,
 }
 impl PairChild {
     fn code(&mut self) -> DeviceCode {
         let until = Instant::now() + Duration::from_secs(8);
         loop {
-            let line = self
+            let line = match self
                 .lines
                 .recv_timeout(until.saturating_duration_since(Instant::now()))
-                .expect("CLI readiness/output deadline");
+            {
+                Ok(line) => line,
+                Err(e) => self.no_code(e),
+            };
             if let Some(words) = line.strip_prefix("Device code: ") {
                 self.words += 1;
                 return DeviceCode::parse(words).expect("eight words");
             }
         }
+    }
+    /// The CLI gave no Device code: report how it ended (exit status, elapsed, stderr).
+    fn no_code(&mut self, e: mpsc::RecvTimeoutError) -> ! {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut status = None;
+        while Instant::now() < deadline {
+            status = self.child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if status.is_some() {
+            if let Some(r) = self.stderr_reader.take() {
+                let _ = r.join();
+            }
+        }
+        panic!(
+            "CLI gave no Device code ({e:?}) after {:?}; exit status: {}; stderr:\n{}",
+            self.started.elapsed(),
+            status.map_or("still running".into(), |s| format!("{s:?}")),
+            self.stderr.lock().unwrap()
+        );
+    }
+    fn stderr(&mut self) -> String {
+        if let Some(r) = self.stderr_reader.take() {
+            let _ = r.join();
+        }
+        self.stderr.lock().unwrap().clone()
     }
     fn finish(&mut self) -> i32 {
         wait(|| self.child.try_wait().unwrap().is_some());
@@ -306,7 +359,8 @@ fn actual_cli_stopped_owner_manual_open_uses_original_deadline_without_autostart
     let code = child.code();
     let join = controller(&br);
     assert!(join.code.format() == code.format());
-    assert!(join.expires_at <= unix_now() + 4);
+    // No later than an offer of the same TTL created now (wall expiry rounds up).
+    assert!(join.expires_at <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4)));
     assert_eq!(child.finish(), 5);
     assert_eq!(child.words, 1);
     assert!(before.elapsed() < Duration::from_secs(5));
@@ -505,14 +559,7 @@ fn actual_cli_standalone_expiry_and_ctrl_c_do_not_save_membership_or_start_serve
         assert!(!b.paths.socket.exists());
         assert!(!b.paths.ring_dir.join("roster.json").exists());
         assert_no_words_on_disk(&b, &code);
-        let mut stderr = String::new();
-        child
-            .child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
+        let stderr = child.stderr();
         assert!(!stderr.contains(code.format().as_str()));
         b.server().shutdown(); // expiry/Ctrl-C released ownership after offer cleanup
     }
@@ -611,7 +658,8 @@ fn registration_child_cannot_claim_live_driver_readiness_and_manual_daemon_start
     let code = child.code();
     let join = controller(&br);
     assert!(join.code.format() == code.format());
-    assert!(join.expires_at <= unix_now() + 4);
+    // No later than an offer of the same TTL created now (wall expiry rounds up).
+    assert!(join.expires_at <= xshell_protocol::ring::pairing::wall_expiry(Duration::from_secs(4)));
     child.cancel();
     assert_eq!(child.finish(), 1);
     assert_eq!(child.words, 1);
@@ -1431,7 +1479,7 @@ fn offline_pair_final_receipt_failure_is_nonzero_and_exact_accepted_recovery_rem
                             && ok["ring"]["state"].is_string() =>
                     {
                         ok
-                    },
+                    }
                     Outcome::Ok { .. } => panic!("control identity invalid result"),
                     Outcome::Err { .. } => panic!("control identity response error"),
                 },
