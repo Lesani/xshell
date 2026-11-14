@@ -186,8 +186,35 @@ mod win {
 
     /// This process's user (`TokenUser`).
     pub fn current_user_sid() -> io::Result<Sid> {
+        process_user_sid(unsafe { GetCurrentProcess() })
+    }
+
+    /// Whether the client connected to the server end `stream` runs as this process's user
+    /// (its process token's `TokenUser`).
+    pub fn client_user_is_current(stream: &PipeStream) -> io::Result<bool> {
+        use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let pid = {
+            let g = stream.0.handle.read().unwrap();
+            let h = g
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            let mut pid = 0u32;
+            if unsafe { GetNamedPipeClientProcessId(raw(h), &mut pid) } == 0 {
+                return Err(last_error());
+            }
+            pid
+        };
+        let process = owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
+        let theirs = process_user_sid(raw(&process))?;
+        Ok(current_user_sid()?.equals(theirs.as_psid()))
+    }
+
+    fn process_user_sid(process: HANDLE) -> io::Result<Sid> {
         let mut token: HANDLE = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
             return Err(last_error());
         }
         let token = owned(token)?;

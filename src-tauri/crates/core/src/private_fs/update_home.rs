@@ -22,13 +22,13 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirectoryIdentity {
+pub(super) struct DirectoryIdentity {
     volume: u32,
     index_high: u32,
     index_low: u32,
 }
 
-fn identity(h: &OwnedHandle) -> io::Result<DirectoryIdentity> {
+pub(super) fn identity(h: &OwnedHandle) -> io::Result<DirectoryIdentity> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(raw(h), &mut info) } == 0 {
         return Err(last_error());
@@ -40,7 +40,7 @@ fn identity(h: &OwnedHandle) -> io::Result<DirectoryIdentity> {
     })
 }
 
-fn process_profile() -> io::Result<PathBuf> {
+pub(super) fn process_profile() -> io::Result<PathBuf> {
     let mut token = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(last_error());
@@ -67,7 +67,7 @@ fn process_profile() -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_wide(&path[..end])))
 }
 
-fn real_directory(path: &Path) -> io::Result<OwnedHandle> {
+pub(super) fn real_directory(path: &Path) -> io::Result<OwnedHandle> {
     crate::server::no_reparse(path)?;
     let h = open(path, READ_CONTROL, OPEN_EXISTING, None)?
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -78,7 +78,7 @@ fn real_directory(path: &Path) -> io::Result<OwnedHandle> {
     Ok(h)
 }
 
-fn privileged(sid: PSID) -> bool {
+pub(super) fn privileged(sid: PSID) -> bool {
     !sid.is_null()
         && unsafe {
             IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
@@ -89,6 +89,14 @@ fn privileged(sid: PSID) -> bool {
 /// Conservative grant scan, not effective-access evaluation. A deny never excuses a
 /// foreign mutation allow; unusual applicable ACE forms deliberately fail closed.
 fn isolated_profile_dacl(sd: &SecDesc, me: &Sid) -> bool {
+    let read_only = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
+    dacl_grants_within(sd, me, read_only)
+}
+
+/// The conservative grant scan shared by non-repairing validation: the user and the
+/// privileged system principals may hold anything; every other applicable allow ACE may
+/// grant only `foreign_allowed` bits. A missing/NULL DACL grants everyone everything.
+pub(super) fn dacl_grants_within(sd: &SecDesc, me: &Sid, foreign_allowed: u32) -> bool {
     if unsafe { IsValidSecurityDescriptor(sd.0) } == 0 {
         return false;
     }
@@ -139,8 +147,7 @@ fn isolated_profile_dacl(sd: &SecDesc, me: &Sid) -> bool {
             continue;
         }
         let mask = u32::from_le_bytes(ace[4..8].try_into().expect("bounded mask"));
-        let read_only = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
-        if !me.equals(sid) && !privileged(sid) && mask & !read_only != 0 {
+        if !me.equals(sid) && !privileged(sid) && mask & !foreign_allowed != 0 {
             return false;
         }
     }
@@ -162,20 +169,12 @@ fn privileged_profile_policy(
         && isolated_profile_dacl(sd, me)
 }
 
-/// Current-user-owned homes retain their existing policy. A privileged-owned home is
-/// accepted only when it is the actual process-token OS profile and has no observable
-/// foreign mutation grants. This never repairs the home or authorizes private children.
-pub fn check_update_home_anchor(path: &Path) -> io::Result<()> {
-    let me = current_user_sid()?;
-    let candidate = real_directory(path)?;
-    if owner_is(&candidate, &me)? {
-        return Ok(());
-    }
-    let profile = real_directory(&process_profile()?)?;
+/// Owner and DACL of the object behind `h`, freed on drop.
+pub(super) fn descriptor_of(h: &OwnedHandle) -> io::Result<SecDesc> {
     let mut descriptor = std::ptr::null_mut();
     let result = unsafe {
         GetSecurityInfo(
-            raw(&candidate),
+            raw(h),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -188,7 +187,33 @@ pub fn check_update_home_anchor(path: &Path) -> io::Result<()> {
     if result != 0 {
         return Err(os_error(result));
     }
-    let sd = SecDesc(descriptor);
+    Ok(SecDesc(descriptor))
+}
+
+/// Whether the privileged-owned `candidate` is the actual process-token OS profile with no
+/// foreign mutation grants (the only privileged-owned home accepted anywhere).
+pub(super) fn privileged_profile(candidate: &OwnedHandle, me: &Sid) -> io::Result<bool> {
+    let profile = real_directory(&process_profile()?)?;
+    let sd = descriptor_of(candidate)?;
+    Ok(privileged_profile_policy(
+        &sd,
+        me,
+        identity(candidate)?,
+        identity(&profile)?,
+    ))
+}
+
+/// Current-user-owned homes retain their existing policy. A privileged-owned home is
+/// accepted only when it is the actual process-token OS profile and has no observable
+/// foreign mutation grants. This never repairs the home or authorizes private children.
+pub fn check_update_home_anchor(path: &Path) -> io::Result<()> {
+    let me = current_user_sid()?;
+    let candidate = real_directory(path)?;
+    if owner_is(&candidate, &me)? {
+        return Ok(());
+    }
+    let profile = real_directory(&process_profile()?)?;
+    let sd = descriptor_of(&candidate)?;
     if !privileged_profile_policy(&sd, &me, identity(&candidate)?, identity(&profile)?) {
         return Err(refuse(
             path,

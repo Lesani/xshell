@@ -171,11 +171,32 @@ mod native {
     ) -> io::Result<R> {
         exchange_with_identity_until(path, request, budget, None)
     }
+    /// [`exchange_until`] that refuses, before sending anything, an endpoint whose serving
+    /// process is not `server` (a squatter pipe or a successor of the expected Daemon).
+    #[cfg(windows)]
+    pub fn exchange_with_server_until<Q: Serialize, R: DeserializeOwned>(
+        path: &Path,
+        request: &Q,
+        budget: &RequestBudget,
+        server: &super::ServerProcess,
+    ) -> io::Result<R> {
+        exchange_checked_until(path, request, budget, None, Some(server))
+    }
     fn exchange_with_identity_until<Q: Serialize, R: DeserializeOwned>(
         path: &Path,
         request: &Q,
         budget: &RequestBudget,
         expected: Option<Identity>,
+    ) -> io::Result<R> {
+        exchange_checked_until(path, request, budget, expected, None)
+    }
+    fn exchange_checked_until<Q: Serialize, R: DeserializeOwned>(
+        path: &Path,
+        request: &Q,
+        budget: &RequestBudget,
+        expected: Option<Identity>,
+        #[cfg(windows)] server: Option<&super::ServerProcess>,
+        #[cfg(not(windows))] server: Option<&()>,
     ) -> io::Result<R> {
         budget.check()?;
         let before = match expected {
@@ -184,6 +205,12 @@ mod native {
         };
         let until = budget.until.min(Instant::now() + IO);
         let stream = dial_pinned(path, until, before)?;
+        #[cfg(windows)]
+        if let Some(server) = server {
+            server.check_serves(&stream)?;
+        }
+        #[cfg(not(windows))]
+        let _ = server;
         let mut stream = Bounded { stream, until };
         write(&mut stream, request)?;
         let response = read(&mut stream)?;
@@ -526,8 +553,17 @@ mod native {
         pub fn check_path(path: &Path) -> io::Result<()> {
             crate::pipe::check_pipe_name(path)
         }
-        pub(super) fn peer(_: &Stream) -> io::Result<()> {
-            Ok(())
+        /// The connected client runs as this user (its token's user SID), not merely a
+        /// process that could open the user-only pipe.
+        pub(super) fn peer(stream: &Stream) -> io::Result<()> {
+            if crate::pipe::client_user_is_current(stream)? {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "IPC peer user mismatch",
+                ))
+            }
         }
         /// Named pipes have no inode; the pinned identity is the validated name, and
         /// each connect re-verifies the server owner through `crate::pipe::connect`.
@@ -700,8 +736,84 @@ mod native {
         }
     }
 }
+#[cfg(windows)]
+pub use native::exchange_with_server_until;
 #[cfg(unix)]
 pub use native::ProtectedEndpoint;
+
+/// The process expected to serve a protected Windows endpoint (BINDING Decision 4): the
+/// Daemon the Desktop spawned, or the one its private PID record names. The process handle
+/// is opened before any comparison and held for this value's life, so the PID cannot be
+/// reused by another process while it is compared.
+#[cfg(windows)]
+pub struct ServerProcess {
+    pid: u32,
+    handle: std::os::windows::io::OwnedHandle,
+}
+#[cfg(windows)]
+impl ServerProcess {
+    /// Open and hold `pid`. Fails when no such process exists or it has already exited.
+    pub fn open(pid: u32) -> io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+        if pid == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "process id 0"));
+        }
+        let h = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if h.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "expected Daemon process {pid} is gone: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        let server = Self {
+            pid,
+            handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h as _) },
+        };
+        if !server.alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("expected Daemon process {pid} has exited"),
+            ));
+        }
+        Ok(server)
+    }
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+    /// The held process has not exited.
+    pub fn alive(&self) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(self.handle.as_raw_handle() as _, 0) == WAIT_TIMEOUT }
+    }
+    /// `stream`'s serving process is this live process.
+    pub fn check_serves(&self, stream: &crate::pipe::PipeStream) -> io::Result<()> {
+        let served_by = stream.server_process_id()?;
+        if served_by != self.pid || !self.alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "protected endpoint is served by process {served_by}, not the expected Daemon {}",
+                    self.pid
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
 /// Applies a socket timeout result. On macOS and the BSDs, setting a timeout on a socket
 /// whose peer has already closed fails with EINVAL even when its reply is still buffered;
 /// the following read or write then reports the buffered data, EOF or EPIPE truthfully.
@@ -880,6 +992,53 @@ mod windows_tests {
             exchange::<_, String>(&path, &"successor").unwrap(),
             "successor"
         );
+    }
+    /// BINDING Decision 4: an exchange that names the expected serving process refuses,
+    /// before sending anything, a pipe served by any other process, and an exited one.
+    #[test]
+    fn expected_server_process_is_checked_before_any_request() {
+        let dir = store();
+        let path = companion_endpoint(&canonical_store(dir.path()).unwrap()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let _server = serve(path.clone(), move |s: String, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+            s
+        })
+        .unwrap();
+        let budget = || {
+            RequestBudget::for_operation(
+                Instant::now() + Duration::from_secs(5),
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
+        let me = ServerProcess::open(std::process::id()).unwrap();
+        assert_eq!(
+            exchange_with_server_until::<_, String>(&path, &"mine", &budget(), &me).unwrap(),
+            "mine"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Another live process of this user is not the server of this pipe.
+        let mut other = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let expected = ServerProcess::open(other.id()).unwrap();
+        let e = exchange_with_server_until::<_, String>(&path, &"squatted", &budget(), &expected)
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was sent");
+        let _ = other.kill();
+        let _ = other.wait();
+        // The held handle pins the exited PID: it can never match a later server.
+        assert!(!expected.alive());
+        assert!(
+            exchange_with_server_until::<_, String>(&path, &"late", &budget(), &expected).is_err()
+        );
+        assert!(ServerProcess::open(0).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn malformed_oversized_and_partial_frames_never_dispatch_and_shutdown_drains() {

@@ -27,6 +27,14 @@ pub use win::*;
 mod update_home;
 #[cfg(windows)]
 pub use update_home::check_update_home_anchor;
+#[cfg(windows)]
+#[path = "private_fs/no_repair.rs"]
+mod no_repair;
+#[cfg(windows)]
+pub use no_repair::{
+    check_dir_no_repair, create_dir_private, file_identity, open_lock_no_repair,
+    open_read_no_repair, replace_write_through, Exposure,
+};
 
 #[cfg(windows)]
 mod win {
@@ -519,6 +527,79 @@ mod win_tests {
         let e = ensure_dir(&d).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
         assert!(dacl(&security_sddl(&d).unwrap()).contains(";;;WD)"));
+    }
+
+    /// BINDING AMENDMENT 1 §2: validation never repairs. Broad directories and files are
+    /// refused with DACL and content unchanged; private ones pass; the actual
+    /// privileged-owned process profile is acceptable shared ancestry, never private.
+    #[test]
+    fn no_repair_validation_refuses_broad_objects_unchanged() {
+        let t = tempfile::tempdir().unwrap();
+        let sid = user_sid_string().unwrap();
+        let private = t.path().join("private");
+        ensure_dir(&private).unwrap();
+        check_dir_no_repair(&private, Exposure::Private).unwrap();
+        check_dir_no_repair(&private, Exposure::Shared).unwrap();
+        let readable = t.path().join("readable");
+        create_dir_with_sddl(
+            &readable,
+            &format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"),
+        )
+        .unwrap();
+        let writable = t.path().join("writable");
+        create_dir_with_sddl(
+            &writable,
+            &format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;WD)"),
+        )
+        .unwrap();
+        for (path, exposure, ok) in [
+            (&readable, Exposure::Shared, true),
+            (&readable, Exposure::Private, false),
+            (&writable, Exposure::Shared, false),
+            (&writable, Exposure::Private, false),
+        ] {
+            let before = security_sddl(path).unwrap();
+            assert_eq!(
+                check_dir_no_repair(path, exposure).is_ok(),
+                ok,
+                "{path:?} {exposure:?}"
+            );
+            assert_eq!(security_sddl(path).unwrap(), before);
+        }
+        let file = private.join("metadata.json");
+        create_file_with_sddl(&file, &format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"))
+            .unwrap()
+            .write_all(b"opaque")
+            .unwrap();
+        let before = security_sddl(&file).unwrap();
+        assert!(open_read_no_repair(&file).is_err());
+        assert!(open_lock_no_repair(&file).is_err());
+        assert_eq!(security_sddl(&file).unwrap(), before);
+        assert_eq!(std::fs::read(&file).unwrap(), b"opaque");
+        assert!(open_read_no_repair(&private.join("absent"))
+            .unwrap()
+            .is_none());
+        let lock = private.join("ring.lock");
+        open_lock_no_repair(&lock).unwrap();
+        open_lock_no_repair(&lock).unwrap();
+        assert!(open_read_no_repair(&lock).unwrap().is_some());
+        assert!(create_dir_private(&private.join("child")).unwrap());
+        assert!(!create_dir_private(&private.join("child")).unwrap());
+        check_dir_no_repair(&private.join("child"), Exposure::Private).unwrap();
+        if let Some(profile) = dirs::home_dir() {
+            check_dir_no_repair(&profile, Exposure::Shared).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_through_replace_swaps_atomically() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a.tmp"), t.path().join("b.json"));
+        std::fs::write(&b, b"old").unwrap();
+        create_new(&a).unwrap().write_all(b"new").unwrap();
+        replace_write_through(&a, &b).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"new");
+        assert!(!a.exists());
     }
 
     /// A junction where the directory should be, and a symlink where a file should be, are

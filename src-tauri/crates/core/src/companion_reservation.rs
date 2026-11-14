@@ -1,13 +1,18 @@
 //! Deny-only startup metadata. This boundary never reads keys or grants registration,
 //! signing, membership or consent authority. Daemon registration may clear only a
 //! non-uncertain reservation; it cannot resolve an incumbent legacy remote outcome.
-#![cfg(unix)]
+//!
+//! Windows keeps the same semantics with SID/DACL checks instead of uid/mode bits: existing
+//! ancestry, metadata and lock files are validated without repair (a broad or foreign
+//! object is refused unchanged), missing ones are created with the private descriptor, and
+//! a write is a flushed private temp file renamed with `MOVEFILE_WRITE_THROUGH`.
+#![cfg(any(unix, windows))]
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use sys::{create_private_dir, open_lock, open_metadata, owned_directory, sync_directory};
 
 // Policy preparation carries at most the existing 17MiB companion envelope, plus one
 // accepted roster token. Profile paths/names may need six-byte JSON escapes; policy
@@ -70,17 +75,6 @@ pub fn read_reservation(directory: &Path) -> io::Result<Option<CompanionReservat
 fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
-fn owned_directory(path: &Path, private: bool) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || path.canonicalize()? != path {
-        return Err(denied("ambiguous or foreign counterpart directory"));
-    }
-    let forbidden = if private { 0o077 } else { 0o022 };
-    if meta.mode() & forbidden != 0 {
-        return Err(denied("unsafe counterpart directory permissions"));
-    }
-    Ok(())
-}
 /// Shared home/install ancestry may be readable, but must not grant rename authority
 /// to other users. This does not validate private Store directories or IPC parents.
 pub fn validate_shared_ancestor(path: &Path) -> io::Result<()> {
@@ -113,17 +107,6 @@ pub fn validate_daemon_store(directory: &Path) -> io::Result<()> {
 pub fn reserve(home: &Path, desktop_store: &Path) -> io::Result<PathBuf> {
     reserve_with_sync(home, desktop_store, sync_directory)
 }
-fn sync_directory(path: &Path) -> io::Result<()> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
-        return Err(denied("unsafe directory sync target"));
-    }
-    file.sync_all()
-}
 fn prepare_directory(
     home: &Path,
     desktop_store: &Path,
@@ -135,11 +118,8 @@ fn prepare_directory(
     for component in [".xshell", "daemon", "ring"] {
         let parent = dir.clone();
         dir.push(component);
-        match fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
+        // Never repair: an existing component is validated below exactly as found.
+        create_private_dir(&dir)?;
         if component == ".xshell" {
             validate_shared_ancestor(&dir)?;
         } else {
@@ -223,19 +203,7 @@ fn reserve_locked_inner(
     sync(dir)
 }
 fn lock(path: &Path, wait: bool) -> io::Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
-        return Err(denied("unsafe counterpart lock"));
-    }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let file = open_lock(path)?;
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         match file.try_lock() {
@@ -264,21 +232,10 @@ pub fn read_companion_policy_metadata(path: &Path) -> io::Result<Option<Vec<u8>>
 }
 fn read_metadata_bounded(path: &Path, maximum: usize) -> io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    let Some((file, len)) = open_metadata(path)? else {
+        return Ok(None);
     };
-    let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o077 != 0
-        || meta.len() > maximum as u64
-    {
+    if len > maximum as u64 {
         return Err(denied("unsafe counterpart metadata"));
     }
     let mut bytes = Vec::new();
@@ -296,15 +253,11 @@ fn write_metadata(path: &Path, bytes: &[u8]) -> io::Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&temp)?;
+        let mut file = sys::create_new_private(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        drop(file);
+        sys::replace(&temp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp);
@@ -312,9 +265,154 @@ fn write_metadata(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-#[cfg(test)]
+#[cfg(unix)]
+mod sys {
+    use super::denied;
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    pub(super) fn owned_directory(path: &Path, private: bool) -> io::Result<()> {
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || path.canonicalize()? != path
+        {
+            return Err(denied("ambiguous or foreign counterpart directory"));
+        }
+        let forbidden = if private { 0o077 } else { 0o022 };
+        if meta.mode() & forbidden != 0 {
+            return Err(denied("unsafe counterpart directory permissions"));
+        }
+        Ok(())
+    }
+    pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(denied("unsafe directory sync target"));
+        }
+        file.sync_all()
+    }
+    pub(super) fn open_lock(path: &Path) -> io::Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(denied("unsafe counterpart lock"));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    /// Validate the opened object before bounded IO. `None`: absent.
+    pub(super) fn open_metadata(path: &Path) -> io::Result<Option<(fs::File, u64)>> {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err(denied("unsafe counterpart metadata"));
+        }
+        Ok(Some((file, meta.len())))
+    }
+    pub(super) fn create_new_private(path: &Path) -> io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    }
+    pub(super) fn replace(from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use super::denied;
+    use crate::private_fs::{self, Exposure};
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    /// Validation only (Amendment 1 §2): a broad, foreign or reparse-point directory is
+    /// refused with its DACL unchanged. Shared ancestry may be the privileged-owned actual
+    /// process profile; private Store directories must be the user's.
+    pub(super) fn owned_directory(path: &Path, private: bool) -> io::Result<()> {
+        private_fs::check_dir_no_repair(
+            path,
+            if private {
+                Exposure::Private
+            } else {
+                Exposure::Shared
+            },
+        )?;
+        if path.canonicalize()? != path {
+            return Err(denied("ambiguous or foreign counterpart directory"));
+        }
+        Ok(())
+    }
+    pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+        private_fs::create_dir_private(path).map(|_| ())
+    }
+    /// NTFS journals directory entries; renames are written through (`replace`). Still
+    /// re-validate the directory so a later sync point never names a replaced object.
+    pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
+        crate::server::no_reparse(path)?;
+        if !fs::symlink_metadata(path)?.is_dir() {
+            return Err(denied("unsafe directory sync target"));
+        }
+        Ok(())
+    }
+    pub(super) fn open_lock(path: &Path) -> io::Result<fs::File> {
+        private_fs::open_lock_no_repair(path)
+            .map_err(|e| denied(&format!("unsafe counterpart lock: {e}")))
+    }
+    pub(super) fn open_metadata(path: &Path) -> io::Result<Option<(fs::File, u64)>> {
+        let Some(file) = private_fs::open_read_no_repair(path)
+            .map_err(|e| denied(&format!("unsafe counterpart metadata: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let len = file.metadata()?.len();
+        Ok(Some((file, len)))
+    }
+    pub(super) fn create_new_private(path: &Path) -> io::Result<fs::File> {
+        private_fs::create_new(path)
+    }
+    pub(super) fn replace(from: &Path, to: &Path) -> io::Result<()> {
+        private_fs::replace_write_through(from, to)
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
     #[test]
     fn safe_shared_ancestors_classify_and_reserve_without_changing_existing_data() {
@@ -740,5 +838,210 @@ mod tests {
         fs::remove_file(home.join(".xshell")).unwrap();
         fs::set_permissions(&desktop, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(reserve(&home, &desktop).is_err());
+    }
+}
+
+/// Native Windows backend (BINDING Decision 2): the same deny-only semantics with SID/DACL
+/// checks, and no repair of anything that already exists.
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use crate::private_fs::{
+        create_dir_with_sddl, create_file_with_sddl, ensure_dir, security_sddl, user_sid_string,
+    };
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        desktop: PathBuf,
+    }
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        ensure_dir(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let desktop = home.join("desktop");
+        ensure_dir(&desktop).unwrap();
+        Fixture {
+            _root: root,
+            home,
+            desktop,
+        }
+    }
+
+    #[test]
+    fn reserve_creates_private_store_and_is_idempotent_for_the_same_desktop() {
+        let f = fixture();
+        let dir = reserve(&f.home, &f.desktop).unwrap();
+        assert_eq!(dir, f.home.join(".xshell").join("daemon").join("ring"));
+        crate::local_ipc::private_dir(&dir).unwrap();
+        let first = read_reservation(&dir).unwrap().unwrap();
+        assert_eq!(first.desktop_store, f.desktop.to_str().unwrap());
+        assert!(!first.legacy_outcome_uncertain);
+        let bytes = fs::read(dir.join(FILE)).unwrap();
+        let sid = user_sid_string().unwrap();
+        let acl = security_sddl(&dir.join(FILE)).unwrap();
+        assert!(
+            acl.contains(&format!(";;;{sid})")) && !acl.contains(";;;WD)"),
+            "{acl}"
+        );
+        assert_eq!(reserve(&f.home, &f.desktop).unwrap(), dir);
+        let _ring = lock(&dir.join("ring.lock"), true).unwrap();
+        reserve_locked(&dir, &f.desktop).unwrap();
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), bytes);
+        validate_daemon_store(&dir).unwrap();
+        assert!(!dir.join("keys.json").exists());
+    }
+
+    #[test]
+    fn one_claim_per_store_other_desktop_and_malformed_metadata_refused_unchanged() {
+        let f = fixture();
+        let dir = reserve(&f.home, &f.desktop).unwrap();
+        let other = f.home.join("other-desktop");
+        ensure_dir(&other).unwrap();
+        let before = fs::read(dir.join(FILE)).unwrap();
+        assert_eq!(
+            reserve(&f.home, &other).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), before);
+        // Malformed metadata: never overwritten, never treated as absent.
+        fs::write(dir.join(FILE), b"{not json").unwrap();
+        assert!(reserve(&f.home, &f.desktop).is_err());
+        assert!(read_reservation(&dir).is_err());
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn broad_acl_metadata_is_refused_with_acl_and_content_unchanged() {
+        let f = fixture();
+        let dir = reserve(&f.home, &f.desktop).unwrap();
+        fs::remove_file(dir.join(FILE)).unwrap();
+        let sid = user_sid_string().unwrap();
+        let json = serde_json::to_vec(&CompanionReservation {
+            desktop_store: f.desktop.to_str().unwrap().into(),
+            legacy_outcome_uncertain: false,
+        })
+        .unwrap();
+        {
+            use std::io::Write;
+            create_file_with_sddl(
+                &dir.join(FILE),
+                &format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"),
+            )
+            .unwrap()
+            .write_all(&json)
+            .unwrap();
+        }
+        let acl = security_sddl(&dir.join(FILE)).unwrap();
+        assert!(read_reservation(&dir).is_err());
+        assert!(reserve(&f.home, &f.desktop).is_err());
+        assert_eq!(
+            security_sddl(&dir.join(FILE)).unwrap(),
+            acl,
+            "never repaired"
+        );
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), json);
+    }
+
+    #[test]
+    fn broad_or_writable_ancestry_is_refused_before_any_write_and_left_unchanged() {
+        let sid = user_sid_string().unwrap();
+        for (component, sddl) in [
+            (
+                ".xshell",
+                format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;WD)"),
+            ),
+            (
+                "daemon",
+                format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"),
+            ),
+            (
+                "ring",
+                format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;BU)"),
+            ),
+        ] {
+            let f = fixture();
+            let mut path = f.home.clone();
+            for part in [".xshell", "daemon", "ring"] {
+                path.push(part);
+                if part == component {
+                    create_dir_with_sddl(&path, &sddl).unwrap();
+                    break;
+                }
+                ensure_dir(&path).unwrap();
+            }
+            let before = security_sddl(&path).unwrap();
+            let dir = f.home.join(".xshell").join("daemon").join("ring");
+            assert!(reserve(&f.home, &f.desktop).is_err(), "{component}");
+            assert!(validate_daemon_store(&dir).is_err(), "{component}");
+            assert_eq!(
+                security_sddl(&path).unwrap(),
+                before,
+                "{component} repaired"
+            );
+            assert!(!dir.join(FILE).exists(), "{component}");
+        }
+    }
+
+    #[test]
+    fn junction_ancestor_and_non_private_desktop_store_are_refused() {
+        let f = fixture();
+        let target = f.home.join("elsewhere");
+        ensure_dir(&target).unwrap();
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(f.home.join(".xshell"))
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction fixture must execute, not skip");
+        assert!(reserve(&f.home, &f.desktop).is_err());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        fs::remove_dir(f.home.join(".xshell")).unwrap();
+        let sid = user_sid_string().unwrap();
+        let broad = f.home.join("broad-desktop");
+        create_dir_with_sddl(
+            &broad,
+            &format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"),
+        )
+        .unwrap();
+        assert!(reserve(&f.home, &broad).is_err());
+        assert!(!f
+            .home
+            .join(".xshell")
+            .join("daemon")
+            .join("ring")
+            .join(FILE)
+            .exists());
+    }
+
+    #[test]
+    fn active_legacy_offer_lock_makes_denial_uncertain_not_blocked() {
+        let f = fixture();
+        let dir = reserve(&f.home, &f.desktop).unwrap();
+        fs::remove_file(dir.join(FILE)).unwrap();
+        let _offer = lock(&dir.join("ring-legacy-offer.lock"), false).unwrap();
+        reserve(&f.home, &f.desktop).unwrap();
+        assert!(
+            read_reservation(&dir)
+                .unwrap()
+                .unwrap()
+                .legacy_outcome_uncertain
+        );
+    }
+
+    #[test]
+    fn oversized_metadata_is_refused_without_unbounded_read() {
+        let f = fixture();
+        let dir = reserve(&f.home, &f.desktop).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(FILE))
+            .unwrap();
+        file.set_len(1024 * 1024 + 1).unwrap();
+        drop(file);
+        assert!(read_metadata(&dir.join(FILE)).is_err());
+        assert_eq!(fs::metadata(dir.join(FILE)).unwrap().len(), 1024 * 1024 + 1);
     }
 }
