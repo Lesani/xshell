@@ -6981,7 +6981,8 @@ mod v2_edits_tests {
         use xshell_protocol::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
         use xshell_protocol::ring::relay::ChainPin;
         let t = tempfile::tempdir().unwrap();
-        let slot: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
+        type Seam = Box<dyn Fn() + Send + Sync>;
+        let slot: Arc<Mutex<Option<Seam>>> = Arc::new(Mutex::new(None));
         let seam = slot.clone();
         let hook = AdoptionTestHook(Arc::new(move |p| {
             if p == AdoptionTestPoint::RemoveBeforePublish {
