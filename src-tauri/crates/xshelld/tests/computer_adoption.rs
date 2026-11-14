@@ -2077,7 +2077,106 @@ mod unix {
         let journal = stored.journal.unwrap();
         assert_eq!(journal.phase, AdoptionPhase::ConsentMayHaveLeft);
         assert!(journal.accepted.is_empty());
-        assert!(guest.ring.begin_join(&guest.companion()).is_err());
+        // Consent may have left: the pre-proof recovery never retires it, even after
+        // an owner restart; only reconciliation may.
+        let e = guest.ring.begin_join(&guest.companion()).err().unwrap();
+        assert!(e.starts_with("reconciliation_required:"), "{e}");
+        let mut guest = guest;
+        guest.restart_desktop();
+        guest.ring.register_companion(&guest.companion()).unwrap();
+        let e = guest.ring.begin_join(&guest.companion()).err().unwrap();
+        assert!(e.starts_with("reconciliation_required:"), "{e}");
+        assert_eq!(
+            Store::new(guest.desktop.clone())
+                .load_profile()
+                .unwrap()
+                .0
+                .unwrap()
+                .journal
+                .unwrap()
+                .phase,
+            AdoptionPhase::ConsentMayHaveLeft
+        );
+    }
+    /// #87 review P4: a never-approved code whose owner lost its Daemon (the counterpart
+    /// Cancel failed, so the reservation was kept) is retired through the fenced pre-proof
+    /// recovery after the restart, and a new code can be generated.
+    #[test]
+    fn lost_owner_of_a_waiting_code_restarts_and_can_generate_a_new_code() {
+        let relay = Relay::start();
+        let mut guest = Computer::new(&relay);
+        let offer = guest.ring.begin_join(&guest.companion()).unwrap();
+        let operation = offer.operation.clone();
+        // Owner loss with the counterpart unreachable: cleanup cannot cancel it.
+        guest.daemon.stopper().shutdown();
+        assert!(guest
+            .daemon
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .is_some());
+        guest.ring.quit();
+        assert!(offer.wait().is_err());
+        let stored = Store::new(guest.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(
+            stored
+                .pending_join
+                .as_ref()
+                .map(|p| p.intent.operation.clone()),
+            Some(operation.clone()),
+            "the reservation survives an unconfirmed cancellation"
+        );
+        // Restart Daemon and Desktop: the old offer is retired, a new code is generated.
+        let paths = xshelld::paths::resolve(guest._home.path(), None, None);
+        guest.daemon = Server::start(Config::new(guest._home.path().into(), paths)).unwrap();
+        guest.restart_desktop();
+        guest.ring.register_companion(&guest.companion()).unwrap();
+        let fresh = guest.ring.begin_join(&guest.companion()).unwrap();
+        assert_ne!(fresh.operation, operation);
+        fresh.cancel_join();
+        drop(fresh);
+        let stored = Store::new(guest.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(stored.membership.is_none());
+        let policy: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(guest.daemon_dir.join("companion.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(policy["obligation"]["proofs"].is_null());
+    }
+    /// The reconciliation path retires a pending-only reservation the same fenced way.
+    #[test]
+    fn reconciling_a_pending_only_join_after_owner_loss_retires_it() {
+        let relay = Relay::start();
+        let mut guest = Computer::new(&relay);
+        let offer = guest.ring.begin_join(&guest.companion()).unwrap();
+        let operation = offer.operation.clone();
+        guest.daemon.stopper().shutdown();
+        assert!(guest
+            .daemon
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .is_some());
+        guest.ring.quit();
+        assert!(offer.wait().is_err());
+        let paths = xshelld::paths::resolve(guest._home.path(), None, None);
+        guest.daemon = Server::start(Config::new(guest._home.path().into(), paths)).unwrap();
+        guest.restart_desktop();
+        guest
+            .ring
+            .reconcile_adoption(&guest.companion(), &operation)
+            .unwrap();
+        let stored = Store::new(guest.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(stored.pending_join.is_none());
+        assert!(stored.membership.is_none());
     }
     #[test]
     fn outgoing_uncertainty_requires_a_durable_exact_signed_candidate() {

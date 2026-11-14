@@ -314,13 +314,20 @@ impl Drop for Bystander {
 }
 
 /// Replace the PID record as the Daemon writes it (private descriptor, write-through).
+/// The record for `pid` with its real creation time (0 when it is gone).
 fn write_pid_record(home: &Path, pid: u32) {
+    let created = xshell_core::local_ipc::ServerProcess::open(pid)
+        .and_then(|p| p.creation_time())
+        .unwrap_or(0);
+    write_pid_record_with(home, pid, created);
+}
+fn write_pid_record_with(home: &Path, pid: u32, created: u64) {
     let path = xshell_hostlink::local::local_pid_record_path(home);
     let tmp = path.with_extension("test.tmp");
     let _ = std::fs::remove_file(&tmp);
     use std::io::Write;
     let mut f = xshell_core::private_fs::create_new(&tmp).unwrap();
-    writeln!(f, "{pid}").unwrap();
+    writeln!(f, "{pid} {created}").unwrap();
     f.sync_all().unwrap();
     drop(f);
     xshell_core::private_fs::replace_write_through(&tmp, &path).unwrap();
@@ -524,7 +531,10 @@ fn adopted_daemon_registers_through_its_private_pid_record() {
     let external = win::Daemon::start(&a.home);
     let record = xshell_hostlink::local::local_pid_record_path(&a.home.home());
     wait("Daemon PID record", || {
-        xshell_hostlink::local::read_pid_record(&a.home.home()).ok() == Some(external.pid())
+        xshell_hostlink::local::read_pid_record(&a.home.home())
+            .ok()
+            .map(|r| r.0)
+            == Some(external.pid())
     });
     assert!(record.exists());
     assert!(a.daemon.gui_pid().is_none());
@@ -539,7 +549,10 @@ fn stale_and_replaced_pid_records_refuse_before_any_request() {
     let a = WinComputer::new(&relay);
     let external = win::Daemon::start(&a.home);
     wait("Daemon PID record", || {
-        xshell_hostlink::local::read_pid_record(&a.home.home()).ok() == Some(external.pid())
+        xshell_hostlink::local::read_pid_record(&a.home.home())
+            .ok()
+            .map(|r| r.0)
+            == Some(external.pid())
     });
     let client = CompanionClient::for_store(&a.daemon_dir()).unwrap();
     wait("Daemon companion endpoint", || {
@@ -574,6 +587,25 @@ fn stale_and_replaced_pid_records_refuse_before_any_request() {
         "{e}"
     );
     assert!(!policy.exists());
+    // Recycled generation: the real Daemon's PID with another creation time.
+    let (_, created) = {
+        write_pid_record(&a.home.home(), external.pid());
+        xshell_hostlink::local::read_pid_record(&a.home.home()).unwrap()
+    };
+    write_pid_record_with(&a.home.home(), external.pid(), created + 1);
+    let e = a.ring.register_local_companion(&a.daemon).unwrap_err();
+    assert!(
+        e.contains("another generation") || e.contains("pending"),
+        "{e}"
+    );
+    assert!(!policy.exists());
+    // Old pid-only format: refused, never guessed.
+    std::fs::write(
+        xshell_hostlink::local::local_pid_record_path(&a.home.home()),
+        format!("{}\n", external.pid()),
+    )
+    .unwrap();
+    assert!(xshell_hostlink::local::read_pid_record(&a.home.home()).is_err());
     // Malformed: never parsed into a PID.
     std::fs::write(
         xshell_hostlink::local::local_pid_record_path(&a.home.home()),
@@ -1057,4 +1089,197 @@ fn helper_gui_approver() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// #87 review P2: the production profile-based client (`local_companion_client`, as the
+/// join UI and the CLI dispatch build it) proves the Daemon process too. A same-user
+/// process that takes over the companion pipe AFTER startup registration is refused
+/// before any request bytes reach it.
+#[test]
+fn profile_client_refuses_a_pipe_replaced_after_registration() {
+    let relay = Relay::start();
+    let a = WinComputer::new(&relay);
+    let profile = a.register();
+    a.daemon.terminate(Duration::from_secs(10));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let _squatter = xshell_core::local_ipc::serve(
+        std::path::PathBuf::from(&profile.endpoint),
+        move |_: serde_json::Value, _| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            serde_json::json!({"type": "descriptor", "profile": null})
+        },
+    )
+    .unwrap();
+    // The Daemon is gone: its record is stale and no client is built at all.
+    assert!(a.ring.local_companion_client().is_err());
+    // Even a record naming another live process (with its real generation) is refused
+    // at the first exchange.
+    let bystander = Bystander::start();
+    write_pid_record(&a.home.home(), bystander.pid());
+    let client = a.ring.local_companion_client().unwrap();
+    assert_eq!(client.expected_server_pid(), Some(bystander.pid()));
+    assert!(a.ring.begin_join(&client).is_err());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// #87 review P1 through the real entry points: an existing broad-ACL companion policy,
+/// Daemon Store lock or Desktop Store is refused before any normalization, unchanged.
+#[test]
+fn broad_acl_policy_lock_and_desktop_store_refuse_real_entry_points_unchanged() {
+    let relay = Relay::start();
+    let sid = xshell_core::private_fs::user_sid_string().unwrap();
+    let broaden = |path: &Path| {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        use std::io::Write;
+        xshell_core::private_fs::create_file_with_sddl(
+            path,
+            &format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"),
+        )
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+        (bytes, xshell_core::private_fs::security_sddl(path).unwrap())
+    };
+    for name in ["companion.json", "ring.lock"] {
+        let a = WinComputer::new(&relay);
+        a.register();
+        a.daemon.terminate(Duration::from_secs(10));
+        let path = a.daemon_dir().join(name);
+        if !path.exists() {
+            std::fs::write(&path, b"").unwrap();
+        }
+        let (bytes, acl) = broaden(&path);
+        let mut child = a.pair(&relay.url(), 4_000);
+        assert_eq!(child.finish(), 1, "{name}: stdout {:?}", child.stdout());
+        assert!(
+            child.stderr().contains("protected_counterpart_required"),
+            "{name}: {}",
+            child.stderr()
+        );
+        assert_eq!(
+            xshell_core::private_fs::security_sddl(&path).unwrap(),
+            acl,
+            "{name}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+    }
+    // A broad Desktop Store: Desktop startup refuses it before normalizing.
+    let home = TestHome::new();
+    let desktop = home.root().join("desktop");
+    xshell_core::private_fs::create_dir_with_sddl(
+        &desktop,
+        &format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"),
+    )
+    .unwrap();
+    let before = xshell_core::private_fs::security_sddl(&desktop).unwrap();
+    let mut cfg = DesktopRingConfig::new(desktop.clone(), "computer".into());
+    cfg.default_relay_url = relay.url();
+    let ring = DesktopRing::open(cfg, Arc::new(Quiet));
+    let mcfg = ManagerConfig::new(
+        "1.5.0",
+        Arc::new(NoSsh),
+        Arc::new(NoSsh),
+        Arc::new(Events::default()),
+    );
+    let manager = Arc::new(Manager::new(mcfg));
+    assert!(ring.attach_manager(&manager).is_err());
+    assert!(ring
+        .reserve_local_companion(&home.home().canonicalize().unwrap())
+        .is_err());
+    assert_eq!(
+        xshell_core::private_fs::security_sddl(&desktop).unwrap(),
+        before
+    );
+    ring.quit();
+    manager.shutdown();
+}
+
+/// #87 review P4 on Windows: lose the Desktop owner while a CLI code only waits; after a
+/// restart the earlier offer is retired (fenced, pre-proof) and a new code is generated.
+#[test]
+fn lost_owner_of_a_waiting_cli_code_restarts_and_can_pair_again() {
+    let relay = Relay::start();
+    let home = TestHome::new();
+    let daemon = Arc::new(
+        LocalDaemon::new(LocalDaemonConfig {
+            bin: win::bin().into(),
+            env: home.daemon_env(),
+            home: home.home(),
+            socket: home.pipe.clone(),
+            version: "1.5.0".into(),
+            build: None,
+        })
+        .unwrap(),
+    );
+    let desktop = home.root().join("desktop");
+    let pair = |ttl_ms: u64| {
+        let mut command = Command::new(win::bin());
+        command
+            .arg("pair")
+            .args(["--relay", &relay.url()])
+            .env("XSHELLD_HOME", home.home())
+            .env("XSHELLD_SOCKET", &home.pipe)
+            .env("XSHELLD_PAIR_TTL_MS", ttl_ms.to_string());
+        PairChild::spawn(command)
+    };
+    let operation;
+    {
+        let (ring, manager) = open_backend(&desktop, &relay);
+        assert!(ring
+            .reserve_local_companion(&home.home().canonicalize().unwrap())
+            .unwrap());
+        daemon.ensure_spawned().unwrap();
+        ring.register_local_companion(&daemon).unwrap().unwrap();
+        let mut child = pair(30_000);
+        child.code();
+        let join = controller(&ring);
+        operation = join.operation.clone();
+        // Owner loss with the counterpart unreachable (as when xshell dies with its job).
+        daemon.terminate(Duration::from_secs(10));
+        ring.quit();
+        manager.shutdown();
+        drop(join);
+        assert_eq!(child.finish(), 1, "{}", child.stderr());
+    }
+    let stored = xshell_hostlink::ring::store::Store::new(desktop.clone())
+        .load_profile()
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(stored
+        .pending_join
+        .as_ref()
+        .is_some_and(|p| p.intent.operation == operation));
+    // Restart: startup registration retires the never-signed offer; a new code works.
+    let daemon = Arc::new(
+        LocalDaemon::new(LocalDaemonConfig {
+            bin: win::bin().into(),
+            env: home.daemon_env(),
+            home: home.home(),
+            socket: home.pipe.clone(),
+            version: "1.5.0".into(),
+            build: None,
+        })
+        .unwrap(),
+    );
+    let (ring, manager) = open_backend(&desktop, &relay);
+    daemon.ensure_spawned().unwrap();
+    ring.register_local_companion(&daemon).unwrap().unwrap();
+    let stored = xshell_hostlink::ring::store::Store::new(desktop.clone())
+        .load_profile()
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(stored.pending_join.is_none() && stored.membership.is_none());
+    let mut child = pair(30_000);
+    child.code();
+    let join = controller(&ring);
+    assert_ne!(join.operation, operation);
+    join.cancel_join();
+    let _ = child.finish();
+    ring.quit();
+    manager.shutdown();
+    daemon.terminate(Duration::from_secs(10));
 }
