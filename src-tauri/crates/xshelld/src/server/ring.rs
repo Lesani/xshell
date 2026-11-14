@@ -1591,10 +1591,21 @@ impl Ring {
             (Some(guard), None) => Some(guard.current().clone()),
             (None, cached) => cached.cloned(),
         };
-        if current
-            .as_ref()
-            .is_some_and(|c| c.ring_id() != chain.ring_id() || !is_daemon_member(c, &keys))
-        {
+        // A standalone Daemon whose unit the approver retired in this same approval is
+        // regrouped into the Computer the counterpart consented to: the accepted chain
+        // (verified against the counterpart obligation before this call) extends the
+        // retained one and authorizes this Daemon again.
+        #[cfg(any(unix, windows))]
+        let regroup = matches!(origin, JoinOrigin::Companion { .. })
+            && is_daemon_member(&chain, &keys)
+            && current
+                .as_ref()
+                .is_some_and(|c| c.extended(chain.versions()).is_ok());
+        #[cfg(not(any(unix, windows)))]
+        let regroup = false;
+        if current.as_ref().is_some_and(|c| {
+            c.ring_id() != chain.ring_id() || (!is_daemon_member(c, &keys) && !regroup)
+        }) {
             return Err(
                 "leave_required: retained foreign or terminal membership cannot be replaced".into(),
             );
@@ -2451,6 +2462,10 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                         Ok(_) => {
                             removal_at = None;
                             removal_delay = Duration::from_secs(5);
+                        }
+                        // An operation is open: look again soon (it ends by itself).
+                        Err(e) if e.starts_with("busy:") => {
+                            removal_at = Some(now + Duration::from_secs(1));
                         }
                         Err(e) => {
                             crate::log!("INFO", "ring: removal check: {e}; retrying in {removal_delay:?}");

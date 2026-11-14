@@ -3412,6 +3412,18 @@ impl DesktopRing {
     /// [`DesktopRing::remove_member_v2`] for a caller that already holds the membership
     /// mutation reservation (an approval replacing a standalone Daemon unit).
     pub(in crate::ring) fn remove_member_reserved(&self, key: &SignKey) -> Result<RosterChain, String> {
+        // Removing this computer's own unit: the Relay's removed close that follows is
+        // expected; the self-removal sets the membership aside (without a notice).
+        let own = self.lock().state.as_ref().is_some_and(|s| {
+            s.chain
+                .head()
+                .roster()
+                .membership()
+                .ok()
+                .and_then(|m| m.unit_for(key).map(|u| u.members.contains(&s.keys.sign_key())))
+                .unwrap_or(false)
+        });
+        let _self_removal = own.then(|| self.self_removal());
         let mut retried = false;
         loop {
             let (candidate, unit_keys, effective, connector, epoch) = {

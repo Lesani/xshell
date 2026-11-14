@@ -84,8 +84,11 @@ pub(super) fn idle_for_set_aside(store: &Store, keys: &DeviceKeys) -> Result<(),
             return Err("busy: a counterpart operation is still open".into());
         }
     }
-    #[cfg(unix)]
-    super::standalone_journal::refuse_unresolved_standalone(store)?;
+    // A standalone pair command whose consent may have left and that never finished
+    // installing is still open; an installed one (also one removed since) has ended.
+    if super::standalone_journal::load_journal(store)?.is_some_and(|r| !r.installed) {
+        return Err("busy: a standalone pairing is still unresolved".into());
+    }
     Ok(())
 }
 /// Before the roster goes: a replayed accepted install of the departed Ring must find no

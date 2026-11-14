@@ -25,6 +25,9 @@ struct State {
     removal: bool,
     /// The reconciler's last attempt could not reach the Relay.
     offline: bool,
+    /// This Desktop is removing its own unit: the Relay's removed close that follows is
+    /// expected and handled by the self-removal itself (no notice).
+    self_removing: bool,
 }
 
 #[derive(Default)]
@@ -240,6 +243,12 @@ impl DesktopRing {
             });
     }
 
+    /// Marks a removal of this Desktop's own unit in progress (until the guard drops).
+    pub(in crate::ring) fn self_removal(&self) -> SelfRemoval {
+        self.maintenance.lock().self_removing = true;
+        SelfRemoval(self.maintenance.clone())
+    }
+
     /// Run the reconciler now (a Join, Create or approval left something unresolved).
     pub(in crate::ring) fn kick_reconciler(&self) {
         let mut st = self.maintenance.lock();
@@ -271,7 +280,7 @@ impl DesktopRing {
         }
         {
             let mut st = self.maintenance.lock();
-            if st.removal {
+            if st.removal || st.self_removing {
                 return;
             }
             st.removal = true;
@@ -323,5 +332,13 @@ impl DesktopRing {
         if spawned.is_err() {
             self.maintenance.lock().removal = false;
         }
+    }
+}
+
+/// See [`DesktopRing::self_removal`].
+pub(in crate::ring) struct SelfRemoval(Arc<Maintenance>);
+impl Drop for SelfRemoval {
+    fn drop(&mut self) {
+        self.0.lock().self_removing = false;
     }
 }
