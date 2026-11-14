@@ -22,6 +22,9 @@ pub enum ApprovalReadiness {
     NotEnrolled,
     /// Earlier adoption/proposal work is unresolved and needs reconciliation first.
     Unresolved,
+    /// A retained Ring that no longer authorizes this Desktop (removed, or its unit ended)
+    /// while no local adoption record is unresolved: nothing to reconcile, nothing to approve.
+    Removed,
 }
 
 /// The operation ids of the durable adoption records (reservation, journal, outgoing).
@@ -99,8 +102,9 @@ pub(in crate::ring) fn readiness_of(
     } else if desktop {
         ApprovalReadiness::NeedsCompletion
     } else {
-        // Removed or terminal: nothing this Desktop can do but reconcile/leave.
-        ApprovalReadiness::Unresolved
+        // Removed or terminal. Unresolved records were ruled out above, so this is a
+        // definitive removal, not uncertainty.
+        ApprovalReadiness::Removed
     }
 }
 
@@ -177,6 +181,52 @@ impl DesktopRing {
                 }
             }
         }
+    }
+
+    /// Leave this Ring locally after another device removed this Computer: the old Ring
+    /// is not contacted. Refused unless readiness is [`ApprovalReadiness::Removed`] and no
+    /// adoption runs. The Daemon leaves first (idempotent), then the Desktop store sets
+    /// its membership aside atomically. An interruption between the two leaves this
+    /// Desktop Removed, so Leave is offered again; nothing resurrects the old Ring.
+    pub fn leave_removed(&self, client: &CompanionClient) -> Result<(), String> {
+        let _admission = self.reserve_adoption()?;
+        if !self.pairing_ipc_owner() {
+            return Err("another process owns the Desktop counterpart".into());
+        }
+        let removed = |stored: &ProfileState| match readiness_of(Some(stored), |_| false) {
+            ApprovalReadiness::Removed => Ok(()),
+            ApprovalReadiness::Unresolved => {
+                Err("reconciliation_required: earlier Ring work is unresolved".to_string())
+            }
+            _ => Err("not_removed: this Desktop is still a member of its Ring".to_string()),
+        };
+        let stored = self.store.load_profile()?.0;
+        // This Desktop's verified chain is the removal evidence for a Daemon that missed it.
+        let rosters = match stored.as_ref() {
+            Some(stored) if stored.membership.is_some() => {
+                removed(stored)?;
+                stored
+                    .membership
+                    .as_ref()
+                    .map(|m| {
+                        m.chain
+                            .versions()
+                            .iter()
+                            .map(|r| r.token().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            _ => return Err("not_enrolled: this Desktop is not in a Ring".into()),
+        };
+        match client.request(CompanionRequest::LeaveRemoved { rosters })? {
+            CompanionResponse::Left => {}
+            _ => return Err("invalid counterpart Leave response".into()),
+        }
+        self.adoption_test_point(super::super::desktop::AdoptionTestPoint::LeaveDaemonLeft);
+        self.store.leave_removed(removed)?;
+        self.forget_membership();
+        Ok(())
     }
 
     /// Read-only approval readiness from the retained profile.

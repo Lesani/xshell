@@ -135,6 +135,19 @@ describe("Join ring code screen", () => {
     expect(createFailedLine("unavailable: platform")).toBe(S["ring.unsupported"]);
     expect(createFailedLine("relay: down")).toBe("Couldn’t create the Ring: relay: down");
   });
+
+  it("a Join start refused while the local Host is not ready says so, not the raw error", () => {
+    const s = run(JOIN_IDLE, { type: "start", operation: "A" }, { type: "startFailed", operation: "A", error: "not_registered: protected counterpart unavailable: No such file or directory (os error 2)" });
+    expect(outcomeLine(s)?.text).toBe(S["ring.hostNotReady"]);
+  });
+
+  it("dismiss clears only a success line", () => {
+    expect(run(JOIN_IDLE, { type: "create" }, { type: "created" }, { type: "dismiss" })).toEqual(JOIN_IDLE);
+    const installed: JoinUi = { state: "installed" };
+    expect(run(installed, { type: "dismiss" })).toEqual(JOIN_IDLE);
+    const reconcile: JoinUi = { state: "reconcile" };
+    expect(run(reconcile, { type: "dismiss" })).toBe(reconcile);
+  });
 });
 
 describe("pairing window cards (xshelld pair on this computer)", () => {

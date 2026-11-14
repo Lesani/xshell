@@ -195,12 +195,119 @@ describe("unpaired Desktop: Create ring / Join ring", () => {
     expect(q("[data-ring-join-action]")).toBeNull();
   });
 
+  it("while the local Host is not ready, Create/Join are disabled and say so until it is", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      let overview: JoinOverview = { owner: true, unavailable: "not-registered", joins: [] };
+      setup(status(), undefined, { ring_join_overview: () => overview });
+      await mount();
+      expect(text()).toContain(S["ring.hostNotReady"]);
+      expect(q("[data-ring-create]")!.hasAttribute("disabled")).toBe(true);
+      expect(q("[data-ring-join-action]")!.hasAttribute("disabled")).toBe(true);
+      overview = { owner: true, joins: [] };
+      await act(async () => { vi.advanceTimersByTime(2000); });
+      await act(async () => {});
+      expect(q("[data-ring-host-not-ready]")).toBeNull();
+      expect(q("[data-ring-create]")!.hasAttribute("disabled")).toBe(false);
+      expect(q("[data-ring-join-action]")!.hasAttribute("disabled")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Join refused because the local Host is not serving yet shows Host not ready", async () => {
+    setup(status(), undefined, { ring_join_start: () => { throw "not_registered: protected counterpart unavailable: No such file or directory (os error 2)"; } });
+    await mount();
+    await click("[data-ring-join-action]");
+    expect(text()).toContain(S["ring.hostNotReady"]);
+    expect(text()).not.toContain("os error");
+  });
+
   it("platform unavailable says so and disables Create/Join", async () => {
     setup(status(), { owner: true, unavailable: "platform", joins: [] });
     await mount();
     expect(text()).toContain(S["ring.unsupported"]);
     expect(q("[data-ring-create]")!.hasAttribute("disabled")).toBe(true);
     expect(q("[data-ring-join-action]")!.hasAttribute("disabled")).toBe(true);
+  });
+});
+
+describe("removed from the Ring", () => {
+  it("a removal after Create clears the success line and shows no reconcile warning", async () => {
+    setup(status(), undefined, { ring_create_computer: () => enrolled() });
+    await mount();
+    await click("[data-ring-create]");
+    await emit("ring:status", enrolled());
+    expect(text()).toContain(S["ring.created"]);
+    const other: MemberView = { ...me, name: "tower", signKey: "t", thisApp: false, thisComputer: false, enrollmentId: "u2", daemonKey: "tk" };
+    await emit("ring:status", enrolled({ version: 3, members: [other], connection: "stopped", approval: "removed" }));
+    expect(text()).not.toContain(S["ring.created"]);
+    expect(text()).not.toContain(S["ring.joined"]);
+    expect(text()).not.toContain(S["mobile.pair.err.reconcile"]);
+    expect(text()).not.toContain(S["ring.reconciliationRequired"]);
+    expect(text()).toContain(S["mobile.conn.stopped"]);
+  });
+
+  it("a later Ring version also clears a Join success line", async () => {
+    setup(status(), undefined, { ring_join_confirm: () => undefined });
+    await mount();
+    const op = await startJoin();
+    await emit("ring:join", joinEvent(op, "installed"));
+    await emit("ring:status", enrolled());
+    expect(text()).toContain(S["ring.joined"]);
+    await emit("ring:status", enrolled({ version: 3 }));
+    expect(text()).not.toContain(S["ring.joined"]);
+  });
+});
+
+describe("Leave this Ring (removed computer)", () => {
+  const other: MemberView = { ...me, name: "tower", signKey: "t", thisApp: false, thisComputer: false, enrollmentId: "u2", daemonKey: "tk" };
+  const removedStatus = () => enrolled({ version: 3, members: [other], connection: "stopped", approval: "removed" });
+  // In the confirmation dialog (its confirm label equals the Leave button's).
+  const buttonWith = (label: string) => Array.from(container.querySelectorAll(".host-confirm-panel button")).find(b => b.textContent === label) as HTMLButtonElement;
+
+  it("a removed computer is offered Leave; confirming leaves locally and shows Create/Join", async () => {
+    setup(removedStatus(), undefined, { ring_leave_removed: () => status() });
+    await mount();
+    expect(text()).toContain(S["ring.removedExplanation"]);
+    expect(q("[data-ring-create]")).toBeNull();
+    await click("[data-ring-leave]");
+    expect(text()).toContain(S["ring.leaveConfirmTitle"]);
+    expect(text()).toContain(S["ring.leaveConfirmBody"]);
+    expect(buttonWith(S["ring.leaveCancel"])).toBeTruthy();
+    expect(calls()).not.toContain("ring_leave_removed");
+    await act(async () => { buttonWith(S["ring.leaveConfirm"]).click(); });
+    expect(calls()).toContain("ring_leave_removed");
+    expect(text()).toContain(S["ring.left"]);
+    expect(q("[data-ring-create]")).not.toBeNull();
+    expect(q("[data-ring-join-action]")).not.toBeNull();
+    expect(q("[data-ring-removed]")).toBeNull();
+  });
+
+  it("Cancel closes the dialog without leaving", async () => {
+    setup(removedStatus());
+    await mount();
+    await click("[data-ring-leave]");
+    await act(async () => { buttonWith(S["ring.leaveCancel"]).click(); });
+    expect(text()).not.toContain(S["ring.leaveConfirmTitle"]);
+    expect(calls()).not.toContain("ring_leave_removed");
+    expect(q("[data-ring-leave]")).not.toBeNull();
+  });
+
+  it("a failed Leave says why and stays removed", async () => {
+    setup(removedStatus(), undefined, { ring_leave_removed: () => { throw "Host unavailable"; } });
+    await mount();
+    await click("[data-ring-leave]");
+    await act(async () => { buttonWith(S["ring.leaveConfirm"]).click(); });
+    expect(text()).toContain(fmt("ring.leaveFailed", { error: "Host unavailable" }));
+    expect(q("[data-ring-leave]")).not.toBeNull();
+  });
+
+  it("Leave is not offered to a member or to unresolved work", async () => {
+    setup(enrolled({ approval: "unresolved" }));
+    await mount();
+    expect(q("[data-ring-leave]")).toBeNull();
+    expect(text()).not.toContain(S["ring.removedExplanation"]);
   });
 });
 

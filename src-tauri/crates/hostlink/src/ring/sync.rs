@@ -788,6 +788,9 @@ impl SyncWorker {
                 Some(HostOutcome::Full) => self.note(id, "full", None, None),
                 // A v2 Ring: the Host joins through its own enrollment, not this worker.
                 Some(HostOutcome::NeedsEnrollment) => self.clear(id),
+                // A v2 Computer unit's Daemon (this Computer's own included) follows the
+                // Ring itself; it refuses the legacy `ring.join`, so none is sent.
+                Some(HostOutcome::Registered) => self.clear(id),
                 // Decided for a Ring that is gone: look again, against the new one.
                 Some(HostOutcome::RingChanged) => {
                     if self.sync.current(id, r.gen).is_some() {

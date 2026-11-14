@@ -194,6 +194,15 @@ pub enum CompanionRequest {
         operation: String,
         rosters: Vec<String>,
     },
+    /// Local-only Leave after another device removed this Computer: sets the Daemon's
+    /// retained membership aside and retires its last installation authority. `rosters`
+    /// is the Desktop's verified chain: removal evidence for a Daemon that missed the
+    /// removal, accepted only as a verified extension of its own retained ancestry.
+    /// Refused while the Daemon is still an authorized member or an operation is open;
+    /// never contacts a Relay and never grants membership.
+    LeaveRemoved {
+        rosters: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +254,8 @@ pub enum CompanionResponse {
     MembershipSnapshot {
         rosters: Vec<String>,
     },
+    /// `LeaveRemoved` done (or nothing was retained).
+    Left,
     Error {
         message: String,
     },
@@ -298,6 +309,29 @@ impl CompanionPolicy {
             && matches!(proposal.transcript, ConsentTranscript::Local))
         .then(|| obligation.proofs.clone())
         .flatten()
+    }
+    /// Local Leave: the ended last operation can never be used again, in particular no
+    /// replayed accepted install of the departed Ring. The registration profile stays.
+    pub fn retire_last(&mut self) -> Result<(), String> {
+        if !self.idle() {
+            return Err("busy: a counterpart operation is still open".into());
+        }
+        if let Some(old) = self.obligation.take() {
+            if self.retired.len() < 64 {
+                self.retired
+                    .insert(old.intent.operation, old.intent.expires_at);
+            }
+        }
+        Ok(())
+    }
+    /// No open operation: none, or the last one ended (cancelled or installed).
+    pub fn idle(&self) -> bool {
+        self.obligation.as_ref().is_none_or(|o| {
+            matches!(
+                o.phase,
+                CompanionPhase::Cancelled | CompanionPhase::Installed
+            )
+        })
     }
     pub fn phase(&self, operation: &str) -> Result<CompanionPhase, String> {
         Ok(self.operation(operation)?.phase.clone())

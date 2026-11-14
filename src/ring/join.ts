@@ -40,7 +40,9 @@ export type JoinAction =
   | { type: "declined"; operation: string }
   | { type: "cancel"; operation: string }
   // The countdown reached zero.
-  | { type: "tick"; nowMs: number };
+  | { type: "tick"; nowMs: number }
+  // The Ring membership changed after Create/Join succeeded: its success line is stale.
+  | { type: "dismiss" };
 
 export const JOIN_IDLE: JoinUi = { state: "idle" };
 
@@ -139,6 +141,8 @@ export function joinReducer(s: JoinUi, a: JoinAction): JoinUi {
       return joinOperation(s) === a.operation ? { state: "cancelled", operation: a.operation } : s;
     case "tick":
       return (s.state === "code" || s.state === "consent") && secondsLeft(s.expiresAt, a.nowMs) === 0 ? { state: "ended", reason: "expired", operation: s.operation } : s;
+    case "dismiss":
+      return s.state === "installed" || s.state === "created" ? JOIN_IDLE : s;
   }
 }
 
@@ -171,6 +175,7 @@ export function outcomeLine(s: JoinUi): { text: string; error: boolean } | null 
     case "ended":
       if (s.reason === "declined") return { text: fmt("ring.declined"), error: false };
       if (s.reason === "expired") return { text: fmt("ring.expired"), error: true };
+      if (s.error?.startsWith("not_registered")) return { text: fmt("ring.hostNotReady"), error: true };
       return { text: fmt("ring.joinFailed", { error: s.error ?? "" }), error: true };
     case "reconcile": return { text: fmt("ring.reconciliationRequired"), error: true };
     default: return null;

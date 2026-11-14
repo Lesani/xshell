@@ -1172,6 +1172,8 @@ fn an_unresolved_join_stays_unresolved_while_registration_holds_the_admission() 
         b.ring.approval_readiness().unwrap(),
         ApprovalReadiness::Unresolved
     );
+    // Leave is only for a removed Computer, never a way out of unresolved work.
+    assert!(b.ring.leave_removed(&b.companion()).is_err());
     assert!(!b.ring.adoption_busy());
     // The startup registration loop holds the admission: still unresolved, and busy.
     mode.store(2, Ordering::SeqCst);

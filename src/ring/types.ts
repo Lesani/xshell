@@ -56,7 +56,8 @@ export interface RingStatus {
   // The Remote Hosts not in the Ring, and why (empty when every connected Host joined).
   hosts: HostRingState[];
   // Whether this Desktop can add computers (#87): `unavailable` means an upgrade is needed but
-  // cannot run here; `unresolved` means earlier adoption work needs reconciliation.
+  // cannot run here; `unresolved` means earlier adoption work needs reconciliation; `removed`
+  // means the retained Ring no longer includes this Desktop (definitive, nothing to reconcile).
   approval: Approval;
   // The retained Ring's Roster format: a v2 Ring's Relay is fixed (shown read-only).
   format: 1 | 2 | null;
@@ -64,7 +65,7 @@ export interface RingStatus {
   busy: boolean;
 }
 
-export type Approval = "ready" | "needs-upgrade" | "needs-completion" | "unavailable" | "unresolved" | "none";
+export type Approval = "ready" | "needs-upgrade" | "needs-completion" | "unavailable" | "unresolved" | "removed" | "none";
 
 // `other-ring`: paired with another Desktop's devices; `ring_claim_host` pairs it here.
 export type HostRingKind = "too-old" | "other-ring" | "full" | "failed";

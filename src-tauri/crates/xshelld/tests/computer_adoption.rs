@@ -23,6 +23,7 @@ mod unix {
         ring: Arc<DesktopRing>,
         desktop: std::path::PathBuf,
         daemon_dir: std::path::PathBuf,
+        config: DesktopRingConfig,
         // Drop the Daemon/IPC before deleting its private home.
         _home: tempfile::TempDir,
     }
@@ -71,14 +72,30 @@ mod unix {
             if let Some(wait) = publish_wait {
                 config.pair_publish_wait = wait;
             }
-            let ring = DesktopRing::open(config, Arc::new(Observer));
+            let ring = DesktopRing::open(config.clone(), Arc::new(Observer));
             Self {
                 _home: home,
                 daemon,
                 ring,
                 desktop,
                 daemon_dir,
+                config,
             }
+        }
+        /// The Daemon restarts over the same home (the Desktop keeps running).
+        fn restart_daemon(&mut self) {
+            self.daemon.stopper().shutdown();
+            assert!(self
+                .daemon
+                .wait_timeout(std::time::Duration::from_secs(5))
+                .is_some());
+            let paths = xshelld::paths::resolve(self._home.path(), None, None);
+            self.daemon = Server::start(Config::new(self._home.path().into(), paths)).unwrap();
+        }
+        /// The Desktop restarts over the same store (the Daemon keeps running).
+        fn restart_desktop(&mut self) {
+            self.ring.quit();
+            self.ring = DesktopRing::open(self.config.clone(), Arc::new(Observer));
         }
         fn companion(&self) -> CompanionClient {
             CompanionClient::for_store(self.daemon.companion_endpoint().unwrap().parent().unwrap())
@@ -1287,7 +1304,11 @@ mod unix {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(out, vec![("h_aaaaaaaa".to_string(), HostOutcome::Joined)]);
+        // A registered Computer's Daemon: no legacy `ring.join` is sent to it.
+        assert_eq!(
+            out,
+            vec![("h_aaaaaaaa".to_string(), HostOutcome::Registered)]
+        );
         assert_eq!(
             chain.head().version(),
             2,
@@ -1305,6 +1326,11 @@ mod unix {
         assert!(VerifiedRingHost::project(&chain)
             .iter()
             .any(|h| h.id() == relay_host_id(&daemon2)));
+        use xshell_hostlink::ring::ApprovalReadiness;
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Ready
+        );
         // Removing through the Daemon's key removes the whole Computer.
         let removed = original.ring.remove_member(&daemon2).unwrap();
         let head = removed.head();
@@ -1331,6 +1357,17 @@ mod unix {
             entry,
             "the SSH Host entry is untouched"
         );
+        // The removed Computer's Desktop retains its completed adoption journal: that is a
+        // definitive removal, never "reconciliation required".
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.ring.chain().map(|c| c.head().version()) != Some(3) {
+            assert!(std::time::Instant::now() < until, "second never saw v3");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Removed
+        );
         // Either key of the retired unit is now a no-op.
         assert_eq!(
             original
@@ -1340,6 +1377,282 @@ mod unix {
                 .head()
                 .version(),
             3
+        );
+    }
+    /// Removed by another device, this Computer leaves locally (the old Ring is not
+    /// contacted), survives an interrupted Leave and Desktop restarts, and then joins a new
+    /// Ring with both identities. Leave is refused while it is still a member.
+    #[test]
+    fn removed_computer_leaves_locally_and_joins_a_new_ring() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint, ApprovalReadiness};
+        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+        let relay = Relay::start();
+        let original = Computer::new(&relay);
+        runtime2_create(&original);
+        let crash = Arc::new(AtomicBool::new(false));
+        let armed = crash.clone();
+        let hook = AdoptionTestHook(Arc::new(move |point| {
+            if point == AdoptionTestPoint::LeaveDaemonLeft && armed.swap(false, Ordering::SeqCst) {
+                panic!("simulated crash between the Daemon and Desktop Leave");
+            }
+        }));
+        let mut second = Computer::build(&relay.url(), None, None, Some(hook), None);
+        let joined = runtime2_join(&original, &second);
+        let desk2 = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .keys
+            .sign_key();
+        let unit = joined
+            .head()
+            .roster()
+            .membership()
+            .unwrap()
+            .unit_for(&desk2)
+            .unwrap()
+            .clone();
+        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
+        // Still a member: refused on both sides, nothing changed.
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Ready
+        );
+        let refused = second.ring.leave_removed(&second.companion()).unwrap_err();
+        assert!(refused.starts_with("not_removed:"), "{refused}");
+        let refused = second
+            .companion()
+            .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
+            .unwrap_err();
+        assert!(refused.starts_with("not_removed:"), "{refused}");
+        // The current membership is no removal evidence.
+        let refused = second
+            .companion()
+            .request(CompanionRequest::LeaveRemoved {
+                rosters: joined
+                    .versions()
+                    .iter()
+                    .map(|r| r.token().to_string())
+                    .collect(),
+            })
+            .unwrap_err();
+        assert!(refused.contains("does not remove"), "{refused}");
+        // The Join's accepted install authority, for the replay checks after Leave.
+        let operation = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .journal
+            .unwrap()
+            .intent
+            .operation;
+        let replay = || CompanionRequest::InstallAccepted {
+            operation: operation.clone(),
+            rosters: joined
+                .versions()
+                .iter()
+                .map(|r| r.token().to_string())
+                .collect(),
+        };
+        assert!(second.daemon_dir.join("roster.json").exists());
+        // Another device removes the whole Computer.
+        let removed = original.ring.remove_member(&daemon2).unwrap();
+        assert_eq!(removed.head().version(), 3);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.ring.approval_readiness().unwrap() != ApprovalReadiness::Removed {
+            assert!(
+                std::time::Instant::now() < until,
+                "second never saw its removal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let relay_before = relay_version(&relay.target(), removed.ring_id());
+        // Interrupted after the Daemon left, before the Desktop store: still Removed after
+        // a restart (Leave offered again), and the Daemon's membership stays set aside.
+        crash.store(true, Ordering::SeqCst);
+        let (ring, client) = (second.ring.clone(), second.companion());
+        assert!(std::thread::spawn(move || ring.leave_removed(&client))
+            .join()
+            .is_err());
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        second.restart_desktop();
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Removed
+        );
+        // The Daemon side is idempotent; the Desktop side completes.
+        assert!(matches!(
+            second
+                .companion()
+                .request(CompanionRequest::LeaveRemoved { rosters: vec![] })
+                .unwrap(),
+            CompanionResponse::Left
+        ));
+        second.ring.leave_removed(&second.companion()).unwrap();
+        assert!(second.ring.chain().is_none());
+        assert!(!second.ring.view().enabled);
+        second.restart_desktop();
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::NotEnrolled
+        );
+        assert!(second.ring.chain().is_none());
+        let after = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(after.keys.sign_key(), desk2, "the identity is retained");
+        assert!(
+            after.companion.is_some(),
+            "the counterpart stays registered"
+        );
+        let left = |dir: &std::path::Path, prefix: &str| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        };
+        assert!(left(&second.desktop, "ring.json.left-"));
+        assert!(left(&second.daemon_dir, "roster.json.left-"));
+        assert!(second.ring.leave_removed(&second.companion()).is_err());
+        // The departed Ring's accepted install cannot be replayed, before or after a
+        // Daemon restart.
+        let refused = second.companion().request(replay()).unwrap_err();
+        assert!(refused.contains("unknown companion operation"), "{refused}");
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        second.restart_daemon();
+        let refused = second.companion().request(replay()).unwrap_err();
+        assert!(refused.contains("unknown companion operation"), "{refused}");
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        // No Relay contact: the old Ring is unchanged.
+        assert_eq!(
+            relay_version(&relay.target(), removed.ring_id()),
+            relay_before
+        );
+        // A different Computer creates a new Ring; the left Computer joins it with both
+        // identities, without merging or moving the old Ring.
+        let third = Computer::new(&relay);
+        runtime2_create(&third);
+        let fresh = runtime2_join(&third, &second);
+        assert_ne!(fresh.ring_id(), removed.ring_id());
+        let unit = fresh
+            .head()
+            .roster()
+            .membership()
+            .unwrap()
+            .unit_for(&desk2)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            unit.kind,
+            xshell_protocol::ring::membership::EnrollmentKind::Computer
+        );
+        assert_eq!(unit.members.len(), 2);
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Ready
+        );
+        assert_eq!(relay_version(&relay.target(), removed.ring_id()), 3);
+    }
+    /// The Daemon was offline when its Computer was removed, so its own Roster still
+    /// authorizes it. Leave carries the Desktop's verified removal as evidence; forged,
+    /// unrelated and non-removing evidence is refused.
+    #[test]
+    fn offline_daemon_leaves_with_verified_removal_evidence() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use xshell_hostlink::ring::ApprovalReadiness;
+        use xshell_protocol::ring::companion::CompanionRequest;
+        let relay = Relay::start();
+        let original = Computer::new(&relay);
+        runtime2_create(&original);
+        let offline = Arc::new(AtomicBool::new(false));
+        let dropping = offline.clone();
+        let hook = xshelld::server::TestHook(Arc::new(move |_, point| {
+            point == xshelld::server::TestPoint::RosterCallbackAdmitted
+                && dropping.load(Ordering::SeqCst)
+        }));
+        let second = Computer::build(&relay.url(), Some(hook), None, None, None);
+        let joined = runtime2_join(&original, &second);
+        let desk2 = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .keys
+            .sign_key();
+        let unit = joined
+            .head()
+            .roster()
+            .membership()
+            .unwrap()
+            .unit_for(&desk2)
+            .unwrap()
+            .clone();
+        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
+        offline.store(true, Ordering::SeqCst);
+        let removed = original.ring.remove_member(&daemon2).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.ring.approval_readiness().unwrap() != ApprovalReadiness::Removed {
+            assert!(
+                std::time::Instant::now() < until,
+                "Desktop never saw its removal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let roster = |dir: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("roster.json")).unwrap()).unwrap()
+        };
+        let stale = roster(&second.daemon_dir);
+        assert_eq!(
+            stale["rosters"].as_array().unwrap().len(),
+            2,
+            "the Daemon missed its removal"
+        );
+        let tokens = |c: &xshell_protocol::ring::RosterChain| -> Vec<String> {
+            c.versions().iter().map(|r| r.token().to_string()).collect()
+        };
+        let leave = |rosters: Vec<String>| {
+            second
+                .companion()
+                .request(CompanionRequest::LeaveRemoved { rosters })
+        };
+        assert!(leave(vec![]).unwrap_err().starts_with("not_removed:"));
+        assert!(leave(tokens(&joined))
+            .unwrap_err()
+            .contains("does not remove"));
+        let other = Computer::new(&relay);
+        runtime2_create(&other);
+        let unrelated = tokens(&other.ring.chain().unwrap());
+        assert!(leave(unrelated).unwrap_err().contains("another Ring"));
+        let mut forged = tokens(&removed);
+        let last = forged.last_mut().unwrap();
+        let flip = if last.ends_with('A') { 'B' } else { 'A' };
+        last.pop();
+        last.push(flip);
+        assert!(leave(forged).is_err());
+        assert_eq!(roster(&second.daemon_dir), stale, "refusals change nothing");
+        // The Desktop's verified removal is the evidence.
+        second.ring.leave_removed(&second.companion()).unwrap();
+        assert!(!second.daemon_dir.join("roster.json").exists());
+        let left = std::fs::read_dir(&second.daemon_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("roster.json.left-")
+            })
+            .unwrap();
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(left.path()).unwrap()).unwrap();
+        assert_eq!(kept["rosters"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::NotEnrolled
         );
     }
     /// A standalone Daemon enrolled by `approver`: its handle, home and signing key.

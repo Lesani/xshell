@@ -75,6 +75,16 @@ export function useRing() {
     };
   }, []);
 
+  // Registration/startup of the local Host emits no event of its own: re-read until ready.
+  const notRegistered = overview?.unavailable === "not-registered";
+  useEffect(() => {
+    if (!notRegistered) return;
+    const t = setInterval(() => {
+      invoke<JoinOverview>("ring_join_overview").then(o => { if (mounted.current && o) setOverview(o); }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(t);
+  }, [notRegistered]);
+
   const apply = useCallback((s: RingStatus) => { if (mounted.current) setStatus(s); return s; }, []);
 
   // Only to start over after unreadable settings were set aside.
@@ -119,6 +129,7 @@ export function useRing() {
   }, []);
   const createComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })); }, [apply]);
   const upgradeComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_upgrade_computer")); }, [apply]);
+  const leaveRemoved = useCallback(async () => { apply(await invoke<RingStatus>("ring_leave_removed")); }, [apply]);
   const joinStart = useCallback((operation: string) => invoke<JoinStarted>("ring_join_start", { operation, relayUrl: relayRef.current }), []);
   const joinConfirm = useCallback((operation: string) => invoke<void>("ring_join_confirm", { operation }), []);
   const joinDecline = useCallback((operation: string) => invoke<void>("ring_join_decline", { operation }), []);
@@ -126,6 +137,6 @@ export function useRing() {
 
   return {
     status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, approveComputer,
-    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, joinStart, joinConfirm, joinDecline, joinCancel,
+    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, leaveRemoved, joinStart, joinConfirm, joinDecline, joinCancel,
   };
 }

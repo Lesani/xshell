@@ -126,6 +126,15 @@ export const S = {
   "ring.upgrade.failed": "Couldn’t upgrade the Ring: {error}",
   "ring.upgrade.done": "Ring upgraded. This Desktop can now add computers.",
   "ring.upgrade.unavailable": "Upgrading this Ring is not available on this platform or while local Terminals run inside xshell.",
+  "ring.removedExplanation": "Another device removed this computer from the Ring. Leave it locally to create or join a Ring again.",
+  "ring.leave": "Leave this Ring",
+  "ring.leaveConfirmTitle": "Leave this Ring?",
+  "ring.leaveConfirmBody": "This deletes only this computer’s local Ring membership data. Your terminals, projects, SSH Hosts and settings stay unchanged. This cannot be undone. The old Ring will not be contacted because it has already removed this computer.",
+  "ring.leaveConfirm": "Leave this Ring",
+  "ring.leaveCancel": "Cancel",
+  "ring.leaving": "Leaving this Ring…",
+  "ring.left": "Left the Ring locally. You can now create or join a Ring.",
+  "ring.leaveFailed": "Couldn’t leave the Ring: {error}",
 } as const;
 
 export type StringKey = keyof typeof S;
