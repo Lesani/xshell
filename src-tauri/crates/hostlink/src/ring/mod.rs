@@ -14,6 +14,7 @@ pub mod hosts;
 pub mod store;
 pub mod sync;
 
+pub use adoption::ApprovalReadiness;
 pub use desktop::{
     AdoptionTestHook, AdoptionTestPoint, ConfiguredHosts, DesktopRing, DesktopRingConfig,
     FarewellView, HostOutcome, HostRef, LocalIdentity, MemberView, PairingEvent, PairingFlow,

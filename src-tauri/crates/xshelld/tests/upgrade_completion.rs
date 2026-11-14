@@ -962,3 +962,136 @@ fn matching_retained_removal_heads_refuse_finish_before_confirmation_or_proofs()
         .authorized_member(&profile.daemon.sign_key)
         .is_none());
 }
+
+// ── Desktop Ring UI backend (#87) ─────────────────────────────────────────
+
+use xshell_hostlink::ring::adoption::{ApprovalReadiness, JoinStatus};
+
+#[test]
+fn local_companion_client_errors_until_registered_and_readiness_follows_create() {
+    let relay = workerd::Relay::start();
+    let a = Computer::new(&relay);
+    let error = a
+        .ring
+        .local_companion_client()
+        .err()
+        .expect("not registered");
+    assert!(error.starts_with("not_registered"), "{error}");
+    assert_eq!(
+        a.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NoProfile
+    );
+    a.ring.register_companion(&a.companion()).unwrap();
+    let client = a.ring.local_companion_client().unwrap();
+    assert_eq!(client.endpoint(), a.companion().endpoint());
+    assert_eq!(
+        a.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NotEnrolled
+    );
+    // Create through the client the UI uses: the first full member can approve at once.
+    match a.ring.create_computer(&client, confirm).unwrap() {
+        AdoptionOutcome::Installed { .. } => {}
+        _ => panic!("Create not installed"),
+    }
+    assert_eq!(
+        a.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::Ready
+    );
+}
+
+#[test]
+fn legacy_ring_needs_upgrade_then_completion_then_is_ready() {
+    let relay = workerd::Relay::start();
+    let b = Computer::new(&relay);
+    legacy(&b, false);
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NeedsUpgrade
+    );
+    installed(
+        b.ring
+            .upgrade_retained_ring(&b.companion(), confirm)
+            .unwrap(),
+    );
+    // Persisted half-way state: the dispatcher completes only.
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NeedsCompletion
+    );
+    let client = b.ring.local_companion_client().unwrap();
+    installed(b.ring.finish_retained_computer(&client, confirm).unwrap());
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::Ready
+    );
+}
+
+#[test]
+fn cancelled_join_start_aborts_the_ready_wait_and_never_shows_an_offer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint};
+    let relay = workerd::Relay::start();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((reached_tx, release_rx))));
+    let hook_gate = gate.clone();
+    let hook = AdoptionTestHook(Arc::new(move |point| {
+        if point == AdoptionTestPoint::JoinSlotReady {
+            // Only the first start is held at the slot acknowledgment.
+            if let Some((reached, release)) = hook_gate.lock().unwrap().take() {
+                reached.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
+    }));
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.adoption_test_hook = Some(hook));
+    b.ring.register_companion(&b.companion()).unwrap();
+    let client = b.ring.local_companion_client().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (ring, start_client, start_cancel) = (b.ring.clone(), client.clone(), cancel.clone());
+    let start =
+        std::thread::spawn(move || ring.begin_join_cancellable(&start_client, start_cancel));
+    reached_rx.recv_timeout(WAIT).expect("readiness reached");
+    // The UI's cancel command during the start.
+    cancel.store(true, Ordering::Release);
+    release_tx.send(()).unwrap();
+    let error = start
+        .join()
+        .unwrap()
+        .err()
+        .expect("a cancelled start shows no code");
+    assert!(error.starts_with("cancelled"), "{error}");
+    // The cancelled driver ended: its reservation is gone and nothing is uncertain.
+    let store = Store::new(b.home.root().join("desktop"));
+    let stored = store.load_profile().unwrap().0.unwrap();
+    assert!(stored.pending_join.is_none());
+    assert!(stored.membership.is_none());
+    assert!(stored.journal.as_ref().is_none_or(|j| matches!(
+        j.phase,
+        AdoptionPhase::Cancelled | AdoptionPhase::ExpiredBeforeProof
+    )));
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NotEnrolled
+    );
+    // The admission is free again: a new Join starts and waits for its approver.
+    let offer = b
+        .ring
+        .begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)))
+        .unwrap();
+    assert!(offer.is_ready());
+    assert!(matches!(offer.join_status(), JoinStatus::Waiting));
+    offer.cancel_join();
+    drop(offer);
+}
+
+#[test]
+fn approve_needs_an_upgraded_computer_desktop() {
+    let relay = workerd::Relay::start();
+    let a = Computer::new(&relay);
+    legacy(&a, false);
+    let code = xshell_protocol::ring::device_code::DeviceCode::generate().unwrap();
+    let error = a.ring.approve_device_code(&code).unwrap_err();
+    assert!(error.contains("approval requires"), "{error}");
+}

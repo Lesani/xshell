@@ -29,6 +29,8 @@ pub use reconcile::{
 };
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
+mod ui;
+pub use ui::ApprovalReadiness;
 
 struct AdoptionAdmission(Arc<AtomicBool>);
 impl Drop for AdoptionAdmission {
