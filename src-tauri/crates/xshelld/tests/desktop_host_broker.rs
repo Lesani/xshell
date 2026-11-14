@@ -1138,6 +1138,7 @@ fn public_snapshot_and_observer_targets_work_for_owner_and_distinct_follower_dir
 
 #[test]
 #[cfg(feature = "legacy-pair-test-control")]
+#[ignore = "format 1, removed in S7"]
 fn retargeted_configured_representative_attaches_new_canonical_uuid_without_cached_success() {
     use xshell_hostlink::{HostConfig, HostStatus};
     let relay = Relay::start();
@@ -1342,6 +1343,7 @@ fn post_hello_partial_header_expires_and_reclaims_its_slot_while_healthy_client_
 
 #[test]
 #[cfg(feature = "legacy-pair-test-control")]
+#[ignore = "format 1, removed in S7"]
 fn owner_loss_mutable_alias_retarget_does_not_deliver_other_canonical_same_uuid() {
     use xshell_hostlink::HostConfig;
     let relay = Relay::start();
