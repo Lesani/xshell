@@ -750,6 +750,28 @@ pub struct ServerProcess {
     pid: u32,
     handle: std::os::windows::io::OwnedHandle,
 }
+/// The creation time (FILETIME, 100 ns units) of the process behind `process`.
+#[cfg(windows)]
+fn process_creation_time(process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    if unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+/// This process's creation time, as [`process_creation_time`] reads it.
+#[cfg(windows)]
+pub fn current_process_creation_time() -> io::Result<u64> {
+    process_creation_time(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
+}
+
 #[cfg(windows)]
 impl ServerProcess {
     /// Open and hold `pid`. Fails when no such process exists or it has already exited.
@@ -789,8 +811,26 @@ impl ServerProcess {
         }
         Ok(server)
     }
+    /// [`ServerProcess::open`], also requiring the process creation time a PID record
+    /// stored: a recycled PID (another process generation) is refused.
+    pub fn open_expected(pid: u32, creation_time: u64) -> io::Result<Self> {
+        let server = Self::open(pid)?;
+        let actual = server.creation_time()?;
+        if actual != creation_time {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("process {pid} is another generation than the recorded Daemon"),
+            ));
+        }
+        Ok(server)
+    }
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+    /// The held process's creation time (FILETIME, 100 ns units).
+    pub fn creation_time(&self) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        process_creation_time(self.handle.as_raw_handle() as _)
     }
     /// The held process has not exited.
     pub fn alive(&self) -> bool {

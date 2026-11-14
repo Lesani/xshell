@@ -160,3 +160,15 @@ pub fn file_identity(file: &File) -> io::Result<(u32, u64)> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     ))
 }
+
+/// Create the private directory `dir` (parents as usual) or, when it exists, validate it
+/// without repair first and only then normalize it to the exact protected descriptor.
+/// The order is the point: a broad or foreign directory is refused with its DACL unchanged.
+pub fn ensure_dir_validated(dir: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => check_dir_no_repair(dir, Exposure::Private)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    super::ensure_dir(dir)
+}

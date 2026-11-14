@@ -32,8 +32,8 @@ pub use update_home::check_update_home_anchor;
 mod no_repair;
 #[cfg(windows)]
 pub use no_repair::{
-    check_dir_no_repair, create_dir_private, file_identity, open_lock_no_repair,
-    open_read_no_repair, replace_write_through, Exposure,
+    check_dir_no_repair, create_dir_private, ensure_dir_validated, file_identity,
+    open_lock_no_repair, open_read_no_repair, replace_write_through, Exposure,
 };
 
 #[cfg(windows)]

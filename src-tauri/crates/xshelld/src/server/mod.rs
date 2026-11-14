@@ -1075,7 +1075,13 @@ fn write_pid_record(path: &std::path::Path) -> io::Result<()> {
     let tmp = std::path::PathBuf::from(name);
     let r = (|| {
         let mut f = xshell_core::private_fs::create_new(&tmp)?;
-        writeln!(f, "{}", std::process::id())?;
+        // PID and process creation time: a reader refuses a recycled PID (#87 review P3).
+        writeln!(
+            f,
+            "{} {}",
+            std::process::id(),
+            xshell_core::local_ipc::current_process_creation_time()?
+        )?;
         f.sync_all()?;
         drop(f);
         xshell_core::private_fs::replace_write_through(&tmp, path)

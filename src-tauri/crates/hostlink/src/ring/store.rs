@@ -1244,7 +1244,8 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
                 Err(e) => return Err(e),
             }
         }
-        xshell_core::private_fs::ensure_dir(dir)
+        // Validate an existing Store without repair before normalizing it (#87 review P1).
+        xshell_core::private_fs::ensure_dir_validated(dir)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1255,7 +1256,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 pub(crate) fn open_lock(p: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
-        xshell_core::private_fs::open_or_create(p)
+        xshell_core::private_fs::open_lock_no_repair(p)
     }
     #[cfg(not(windows))]
     {
@@ -1275,7 +1276,7 @@ pub(crate) fn open_lock(p: &Path) -> io::Result<fs::File> {
 pub fn read_private(path: &Path) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     #[cfg(windows)]
     {
-        let Some(f) = xshell_core::private_fs::open_read(path)? else {
+        let Some(f) = xshell_core::private_fs::open_read_no_repair(path)? else {
             return Ok(None);
         };
         let len = f.metadata()?.len() as usize;

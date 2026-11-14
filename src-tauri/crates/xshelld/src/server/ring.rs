@@ -126,7 +126,8 @@ pub(crate) fn read_private(
     path: &Path,
     kind: PrivateRingFile,
 ) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
-    let Some(f) = xshell_core::private_fs::open_read(path)? else {
+    // Never repairs (#87 review P1): a broad or foreign file is refused unchanged.
+    let Some(f) = xshell_core::private_fs::open_read_no_repair(path)? else {
         return Ok(None);
     };
     let len = f.metadata()?.len();
@@ -329,7 +330,7 @@ impl Store {
         self.ensure_dir().map_err(|e| e.to_string())?;
         let path = self.dir.join(name);
         #[cfg(windows)]
-        let f = xshell_core::private_fs::open_or_create(&path);
+        let f = xshell_core::private_fs::open_lock_no_repair(&path);
         #[cfg(unix)]
         let f = fs::OpenOptions::new()
             .read(true)
@@ -464,7 +465,7 @@ impl Store {
                     Err(e) => return Err(e),
                 }
             }
-            xshell_core::private_fs::ensure_dir(&self.dir)
+            xshell_core::private_fs::ensure_dir_validated(&self.dir)
         }
         #[cfg(unix)]
         ensure_private_dir(&self.dir)

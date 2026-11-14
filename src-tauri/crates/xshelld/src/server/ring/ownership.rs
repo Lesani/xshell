@@ -196,9 +196,10 @@ impl StoreOwnershipLease {
         }
         #[cfg(windows)]
         {
-            let reopened = xshell_core::private_fs::open_read(&dir.join("runtime-owner.lock"))
-                .map_err(|e| e.to_string())?
-                .ok_or("Daemon ownership lock disappeared")?;
+            let reopened =
+                xshell_core::private_fs::open_read_no_repair(&dir.join("runtime-owner.lock"))
+                    .map_err(|e| e.to_string())?
+                    .ok_or("Daemon ownership lock disappeared")?;
             if windows_file_identity(&file).map_err(|e| e.to_string())?
                 != windows_file_identity(&reopened).map_err(|e| e.to_string())?
             {
