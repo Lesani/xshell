@@ -259,7 +259,7 @@ impl Store {
             }
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn offer_lock(&self) -> Result<StoreLock, String> {
         let file = self.open_lock("ring-legacy-offer.lock")?;
         file.try_lock().map_err(|error| match error {
@@ -290,19 +290,19 @@ impl Store {
         Ok(offer)
     }
     /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
         self.offer_lock()
     }
     pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
-        #[cfg(unix)]
-        super::adoption::refuse_unresolved_standalone(self)?;
+        #[cfg(any(unix, windows))]
+        super::standalone_journal::refuse_unresolved_standalone(self)?;
         if companion_registered(&self.dir) {
             return Err("protected_counterpart_required: registered Computer installation is not a legacy/Host commit".into());
         }
         Ok(())
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn keys_locked(&self) -> Result<DeviceKeys, String> {
         match self.load_keys()? {
             Some(keys) => Ok(keys),
@@ -336,6 +336,17 @@ impl Store {
         // `xshell_core::private_fs`).
         #[cfg(windows)]
         {
+            // Validate the existing ancestor before recursive private creation can traverse it.
+            for ancestor in self.dir.ancestors() {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(_) => {
+                        xshell_core::server::no_reparse(ancestor)?;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             xshell_core::private_fs::ensure_dir(&self.dir)
         }
         #[cfg(unix)]
@@ -474,9 +485,9 @@ impl Store {
             JoinOrigin::Host => self.refuse_registered_join()?,
             #[cfg(unix)]
             JoinOrigin::Standalone { operation } => {
-                super::adoption::validate_standalone_install(self, operation, chain)?
+                super::standalone_journal::validate_standalone_install(self, operation, chain)?
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             JoinOrigin::Companion { operation } => {
                 super::companion::validate_install_locked(self, operation, chain)?
             }
@@ -676,7 +687,7 @@ enum JoinOrigin {
     Standalone {
         operation: String,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Companion {
         operation: String,
     },
@@ -748,7 +759,7 @@ impl Ring {
     }
 
     /// The chain this Host trusts, if it is in a Ring.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn lock_trusted_chain_until<'a>(
         &'a self,
         budget: &xshell_core::local_ipc::RequestBudget,
@@ -951,7 +962,7 @@ impl Ring {
             Some(budget),
         )
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn join_accepted_companion(
         &self,
         tokens: &[String],

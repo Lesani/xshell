@@ -1116,6 +1116,17 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
+        // Validate the existing ancestor before recursive private creation can traverse it.
+        for ancestor in (dir).ancestors() {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    xshell_core::server::no_reparse(ancestor)?;
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
         xshell_core::private_fs::ensure_dir(dir)
     }
     #[cfg(not(any(unix, windows)))]

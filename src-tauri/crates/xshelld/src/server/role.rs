@@ -999,7 +999,7 @@ pub(crate) mod tests {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks: None,

@@ -60,7 +60,8 @@ mod unix {
             }
         }
         fn companion(&self) -> CompanionClient {
-            CompanionClient::new(self.daemon.companion_endpoint().unwrap())
+            CompanionClient::for_store(self.daemon.companion_endpoint().unwrap().parent().unwrap())
+                .unwrap()
         }
     }
     impl Drop for Computer {
@@ -433,7 +434,9 @@ mod unix {
         let paths = xshelld::paths::resolve(home.path(), None, None);
         let daemon_dir = paths.ring_dir.clone();
         let server = Server::start(Config::new(home.path().into(), paths.clone())).unwrap();
-        let client = CompanionClient::new(server.companion_endpoint().unwrap());
+        let client =
+            CompanionClient::for_store(server.companion_endpoint().unwrap().parent().unwrap())
+                .unwrap();
         let desktop = home.path().join("desktop");
         let mut config = DesktopRingConfig::new(desktop.clone(), "computer".into());
         config.default_relay_url = relay.url();
@@ -629,9 +632,12 @@ mod unix {
         drop(old);
         if let Ok(next) = next {
             assert!(host_request(&next, xshell_protocol::msg::ClientMsg::RingIdentity).is_ok());
-            assert!(CompanionClient::new(next.companion_endpoint().unwrap())
-                .request(xshell_protocol::ring::companion::CompanionRequest::Descriptor)
-                .is_ok());
+            assert!(CompanionClient::for_store(
+                next.companion_endpoint().unwrap().parent().unwrap()
+            )
+            .unwrap()
+            .request(xshell_protocol::ring::companion::CompanionRequest::Descriptor)
+            .is_ok());
             next.shutdown();
         }
         assert!(removed && usable, "shutdown completion must drain/remove companion before releasing owner, even while old handle lives");
@@ -715,14 +721,14 @@ mod unix {
         let server = Server::start(config).unwrap();
         let endpoint = server.companion_endpoint().unwrap();
         let holder = ExternalLock::start(&paths.ring_dir.join("ring.lock"));
-        let client = CompanionClient::new(endpoint.clone());
+        let client = CompanionClient::for_store(endpoint.parent().unwrap()).unwrap();
         let started = std::time::Instant::now();
         assert!(client.request(CompanionRequest::Descriptor).is_err());
         let client_bounded = started.elapsed() < std::time::Duration::from_millis(6500);
         admitted
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
-        let pending = CompanionClient::new(endpoint.clone());
+        let pending = CompanionClient::for_store(endpoint.parent().unwrap()).unwrap();
         let pending = std::thread::spawn(move || pending.request(CompanionRequest::Descriptor));
         // Stop a second admitted request while it still has almost its entire budget,
         // rather than proving shutdown only after every request has already timed out.

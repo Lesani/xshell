@@ -1060,7 +1060,8 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             state: &state,
         };
-        let client = CompanionClient::new(dir.path().join("never-used.sock"));
+        crate::ring::store::ensure_private_dir(dir.path()).unwrap();
+        let client = CompanionClient::for_store(dir.path()).unwrap();
         let counterpart = LocalCounterpart {
             principal: &principal,
             client: &client,

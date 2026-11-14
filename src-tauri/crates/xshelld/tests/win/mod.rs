@@ -27,7 +27,20 @@ pub const T: Duration = Duration::from_secs(30);
 pub const DAEMON_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
 
 pub fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_xshelld")
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let Some(path) = std::env::var_os("XSHELLD_TEST_BIN") else {
+            return env!("CARGO_BIN_EXE_xshelld").into();
+        };
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_absolute() && path.is_file(),
+            "XSHELLD_TEST_BIN must be an absolute existing executable"
+        );
+        path.to_str()
+            .expect("test executable path must be Unicode")
+            .to_owned()
+    })
 }
 
 pub fn wait_until(within: Duration, mut f: impl FnMut() -> bool) -> bool {

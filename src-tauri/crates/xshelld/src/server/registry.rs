@@ -31,7 +31,7 @@ pub(crate) struct Daemon {
     pub exit: Mutex<Option<ExitReason>>,
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub companion: Mutex<Option<xshell_core::local_ipc::Server>>,
     pub next_conn: AtomicU64,
     /// How agents report their Agent Status; `None` when they launch without hooks.
@@ -645,7 +645,7 @@ impl Daemon {
         }
         // No registry/Ring/handler lock is held while cancellation drains workers. The
         // endpoint and all admitted requests end before the elected owner can transfer.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let endpoint = { self.companion.lock().unwrap().take() };
             if let Some(mut endpoint) = endpoint {

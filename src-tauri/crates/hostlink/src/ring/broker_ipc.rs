@@ -232,13 +232,18 @@ pub(crate) fn read_limited<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod native {
-    pub use std::os::unix::net::UnixStream as Stream;
+    pub use xshell_core::local_ipc::Stream;
+    #[cfg(unix)]
+    pub fn pair() -> std::io::Result<(Stream, Stream)> {
+        Stream::pair()
+    }
     pub use xshell_core::local_ipc::{protected_connect as connect, ProtectedListener as Listener};
+    #[cfg(windows)]
+    pub use xshell_core::pipe::pair;
 }
-// Windows' protected named-pipe implementation remains in core::pipe. There is deliberately
-// no insecure transport fallback on targets without a validated persistent adapter.
+// Unsupported platforms have no insecure transport fallback.
 #[cfg(test)]
 mod tests {
     use super::*;

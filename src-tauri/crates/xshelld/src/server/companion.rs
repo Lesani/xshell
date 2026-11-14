@@ -1,6 +1,6 @@
 //! Protected counterpart ingress, separate from Host/Relay/Mobile protocols. Registration
 //! survives endpoint/process loss. Only this Daemon's store and keys are ever written here.
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 use super::registry::Daemon;
 use super::ring::{read_private, write_private, Store};
 use std::path::Path;
@@ -55,9 +55,11 @@ fn validate_profile(
     keys: &DeviceKeys,
 ) -> Result<(), String> {
     profile.validate()?;
-    let daemon_dir = store.dir.canonicalize().map_err(|e| e.to_string())?;
+    let daemon_dir =
+        xshell_core::local_ipc::canonical_store(&store.dir).map_err(|e| e.to_string())?;
     if Path::new(&profile.daemon_store) != daemon_dir
-        || Path::new(&profile.endpoint) != daemon_dir.join("companion.sock")
+        || Path::new(&profile.endpoint)
+            != xshell_core::local_ipc::companion_endpoint(&daemon_dir).map_err(|e| e.to_string())?
         || profile.daemon.sign_key != keys.sign_key()
         || profile.daemon.noise_key != keys.noise_key()
     {
@@ -191,7 +193,7 @@ fn dispatch(
             }
         } else {
             let _offer = store.registration_admission()?;
-            super::adoption::refuse_unresolved_standalone(&store)?;
+            super::standalone_journal::refuse_unresolved_standalone(&store)?;
             let registered = CompanionPolicy::new(profile.clone())?;
             budget.check().map_err(|e| e.to_string())?;
             save(&store, &registered)?;
@@ -224,7 +226,7 @@ fn dispatch(
             });
         }
         CompanionRequest::Start { intent } => {
-            super::adoption::refuse_unresolved_standalone(&store)?;
+            super::standalone_journal::refuse_unresolved_standalone(&store)?;
             if trusted(&store)?.is_some() {
                 return Err("leave_required: Create requires an unpaired Daemon".into());
             }
@@ -298,9 +300,9 @@ pub(super) fn serve(
         .ok_or_else(|| std::io::Error::other("Daemon disappeared"))?;
     let store = Store::new(live.cfg.paths.ring_dir.clone());
     store.ensure_dir()?;
-    let directory = store.dir.canonicalize()?;
+    let directory = xshell_core::local_ipc::canonical_store(&store.dir)?;
     xshell_core::local_ipc::private_dir(&directory)?;
-    let path = directory.join("companion.sock");
+    let path = xshell_core::local_ipc::companion_endpoint(&directory)?;
     if let Err(error) = xshell_core::local_ipc::check_path(&path) {
         // Only this exact absent, overlong optional endpoint is unsupported. Unsafe,
         // conflicting or ambiguous existing paths must still fail the Daemon start.

@@ -204,6 +204,32 @@ mod win {
         Ok(())
     }
 
+    /// Validate an existing private store without tightening an arbitrary caller directory.
+    pub fn check_private_dir(path: &Path) -> io::Result<()> {
+        check_owned_dir(path)?;
+        let sid = current_user_sid()?.to_string_sid()?;
+        // Windows adds auto-inheritance bookkeeping to an otherwise identical protected
+        // DACL. Keep every ACE and the protection flag exact; only ignore that bookkeeping.
+        fn normalized(sddl: String) -> String {
+            let Some((owner, dacl)) = sddl.split_once("D:") else {
+                return sddl;
+            };
+            let end = dacl.find('(').unwrap_or(dacl.len());
+            format!(
+                "{owner}D:{}{}",
+                dacl[..end].replace("AI", "").replace("AR", ""),
+                &dacl[end..]
+            )
+        }
+        if normalized(security_sddl(path)?) != normalized(canonical_sddl(&dir_sddl(&sid))?) {
+            return Err(refuse(
+                path,
+                "does not have the protected user-only store DACL",
+            ));
+        }
+        Ok(())
+    }
+
     /// Create `dir` private (its parents as usual), or make an existing one private: refused
     /// when it is a reparse point, not a directory, or owned by someone else.
     pub fn ensure_dir(dir: &Path) -> io::Result<()> {

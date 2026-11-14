@@ -129,7 +129,8 @@ fn retained_daemon_only_pending_while_a_offline_then_completes_without_code() {
     let mut cfg = DesktopRingConfig::new(home.root().join("desktop"), "fresh B".into());
     cfg.default_relay_url = relay.url();
     let b = DesktopRing::open(cfg, Arc::new(Quiet));
-    let client = CompanionClient::new(d.companion_endpoint().unwrap());
+    let client =
+        CompanionClient::for_store(d.companion_endpoint().unwrap().parent().unwrap()).unwrap();
     let operation = b.begin_companion_completion(&client).unwrap();
     assert!(matches!(
         b.confirm_companion_completion(&client, |_, _| panic!("offline A cannot have proposed"))
@@ -294,7 +295,7 @@ impl Retained {
         }
     }
     fn client(&self) -> CompanionClient {
-        CompanionClient::new(self.d.companion_endpoint().unwrap())
+        CompanionClient::for_store(self.d.companion_endpoint().unwrap().parent().unwrap()).unwrap()
     }
     fn begin(&self) {
         self.b.begin_companion_completion(&self.client()).unwrap();
@@ -1000,7 +1001,8 @@ fn standalone_lost_ack_obligation_fences_alternative_starts_after_expiry_and_res
         let home = common::TestHome::new();
         let paths = home.paths();
         let d = Server::start(Config::new(home.home(), paths.clone())).unwrap();
-        let client = CompanionClient::new(d.companion_endpoint().unwrap());
+        let client =
+            CompanionClient::for_store(d.companion_endpoint().unwrap().parent().unwrap()).unwrap();
         let CompanionResponse::Identity { identity, .. } =
             client.request(CompanionRequest::Descriptor).unwrap()
         else {
@@ -1050,7 +1052,8 @@ fn standalone_lost_ack_obligation_fences_alternative_starts_after_expiry_and_res
                 > expires
         });
         let d = Server::start(Config::new(home.home(), paths.clone())).unwrap();
-        let client = CompanionClient::new(d.companion_endpoint().unwrap());
+        let client =
+            CompanionClient::for_store(d.companion_endpoint().unwrap().parent().unwrap()).unwrap();
         let mut cfg = DesktopRingConfig::new(home.root().join("desktop"), "B".into());
         cfg.default_relay_url = relay.url();
         let b = DesktopRing::open(cfg, Arc::new(Quiet));
@@ -1154,7 +1157,8 @@ fn standalone_initial_admission_wait_does_not_extend_wire_expiry_or_publication_
     let home = common::TestHome::new();
     let paths = home.paths();
     let d = Server::start(Config::new(home.home(), paths.clone())).unwrap();
-    let client = CompanionClient::new(d.companion_endpoint().unwrap());
+    let client =
+        CompanionClient::for_store(d.companion_endpoint().unwrap().parent().unwrap()).unwrap();
     client.request(CompanionRequest::Descriptor).unwrap();
     let holder = std::fs::OpenOptions::new()
         .read(true)

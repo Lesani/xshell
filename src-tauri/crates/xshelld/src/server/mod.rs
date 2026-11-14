@@ -23,14 +23,16 @@ pub mod adoption;
 mod agent;
 mod calls;
 mod codex_link;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod companion;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod completion;
 mod conn;
 mod drops;
 mod last_line;
 mod orphans;
+#[cfg(any(unix, windows))]
+mod standalone_journal;
 pub use orphans::Cleanup;
 mod outbox;
 pub mod parent;
@@ -739,7 +741,7 @@ impl Server {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(starting.lock.take()),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks,
@@ -768,7 +770,7 @@ impl Server {
         }
         // The existing Daemon owner lock also owns the distinct private counterpart
         // endpoint. Bind before resuming any Relay client; a second owner fails closed.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let companion = match companion::serve(Arc::downgrade(&d)) {
             Ok(server) => server,
             Err(error) => {
@@ -776,7 +778,7 @@ impl Server {
                 return Err(error.into());
             }
         };
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             *d.companion.lock().unwrap() = companion;
         }
@@ -861,21 +863,16 @@ impl Stopper {
 }
 
 impl ServerHandle {
-    /// Runtime1 Unix counterpart endpoint. Windows protected-pipe wiring is not present.
+    /// Protected local counterpart, derived from the separately retained Daemon store.
     pub fn companion_endpoint(&self) -> io::Result<PathBuf> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            let path = self
-                .d
-                .cfg
-                .paths
-                .ring_dir
-                .canonicalize()?
-                .join("companion.sock");
+            let store = xshell_core::local_ipc::canonical_store(&self.d.cfg.paths.ring_dir)?;
+            let path = xshell_core::local_ipc::companion_endpoint(&store)?;
             xshell_core::local_ipc::check_path(&path)?;
             Ok(path)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

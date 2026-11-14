@@ -150,13 +150,9 @@ impl DesktopRing {
             CompanionResponse::Identity { identity, profile } => (identity, profile),
             _ => return Err("invalid counterpart identity response".into()),
         };
-        let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
-        let daemon_dir = client
-            .endpoint()
-            .parent()
-            .ok_or("counterpart endpoint has no directory")?
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
+        let desktop_dir =
+            xshell_core::local_ipc::canonical_store(self.store.dir()).map_err(|e| e.to_string())?;
+        let daemon_dir = client.daemon_store();
         let profile = CompanionProfile::for_stores(
             desktop_dir
                 .to_str()
