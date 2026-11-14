@@ -456,29 +456,42 @@ pub(super) fn dispatch_pending(
                 if dispatch.cancel.load(Ordering::Acquire) || Instant::now() >= dispatch.until {
                     return Err("origin ended before dispatch".to_string());
                 }
-                let client = super::companion_ipc::CompanionClient::for_profile(&profile);
-                loop {
+                let client = loop {
                     if dispatch.cancel.load(Ordering::Acquire)
                         || Instant::now() >= dispatch.until
                         || !ring.pairing_ipc_owner()
                     {
                         return Err("origin ended before counterpart readiness".to_string());
                     }
-                    match client.request_until(
+                    // The expected Daemon may still be starting: resolve it each round,
+                    // then keep that one client (its process handle) for the operation.
+                    let candidate =
+                        match super::companion_ipc::CompanionClient::for_profile_served(&profile) {
+                            Ok(candidate) => candidate,
+                            Err(_) => {
+                                std::thread::sleep(
+                                    Duration::from_millis(50).min(
+                                        dispatch.until.saturating_duration_since(Instant::now()),
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
+                    match candidate.request_until(
                         xshell_protocol::ring::companion::CompanionRequest::PairDriverReady,
                         dispatch.until.min(Instant::now() + Duration::from_secs(2)),
                         dispatch.cancel.clone(),
                     ) {
                         Ok(xshell_protocol::ring::companion::CompanionResponse::Descriptor {
                             profile: Some(ready),
-                        }) if ready == profile => break,
+                        }) if ready == profile => break candidate,
                         Ok(_) => return Err("counterpart readiness profile changed".into()),
                         Err(_) => std::thread::sleep(
                             Duration::from_millis(50)
                                 .min(dispatch.until.saturating_duration_since(Instant::now())),
                         ),
                     }
-                }
+                };
                 let controller = std::sync::Arc::new(ring.begin_registered_origin_join(
                     &client,
                     dispatch.offer.clone(),

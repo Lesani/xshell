@@ -41,6 +41,24 @@ impl CompanionClient {
             server: None,
         }
     }
+    /// The production client for a retained profile: on Windows every exchange first
+    /// proves the pipe is served by the Daemon the profile's PID record names (handle held
+    /// for this client's life, PID and creation time matched). Elsewhere: [`for_profile`].
+    ///
+    /// [`for_profile`]: CompanionClient::for_profile
+    pub fn for_profile_served(
+        profile: &xshell_protocol::ring::companion::CompanionProfile,
+    ) -> Result<Self, String> {
+        #[allow(unused_mut)]
+        let mut client = Self::for_profile(profile);
+        #[cfg(windows)]
+        {
+            client.server = Some(std::sync::Arc::new(crate::local::recorded_daemon(
+                Path::new(&profile.daemon_store),
+            )?));
+        }
+        Ok(client)
+    }
     /// [`CompanionClient::for_store`] whose every exchange first proves that `server` (the
     /// Daemon process the Desktop spawned or adopted, its handle held) serves the pipe: a
     /// squatter pipe or a successor process is refused before any request is sent.

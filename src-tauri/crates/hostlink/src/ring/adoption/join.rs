@@ -439,6 +439,102 @@ impl DesktopRing {
     }
     /// Starts the actual guest driver. The returned object is the only word-bearing offer
     /// and the local confirmation origin; statuses and durable reservations have no words.
+    /// Fenced pre-proof recovery (#87 review P4). A Join whose consent provably never
+    /// reached signing (a pending reservation, or a Pairing journal still `Prepared`:
+    /// `ConsentMayHaveLeft` is recorded before any signer is allowed) but whose owner or
+    /// Daemon was lost, is terminalized here: the counterpart operation is cancelled and
+    /// read back as `Cancelled` (or unknown: never started), then the local reservation is
+    /// retired without membership reconciliation. Anything past `Prepared` stays an
+    /// uncertainty for reconciliation. The caller holds the adoption admission, so no live
+    /// driver in this process owns the operation; the elected owner excludes other ones.
+    pub(in crate::ring) fn recover_pre_proof_join_admitted(
+        &self,
+        client: &CompanionClient,
+    ) -> Result<bool, String> {
+        if !self.pairing_ipc_owner() {
+            return Ok(false);
+        }
+        let Some(stored) = self.store.load_profile()?.0 else {
+            return Ok(false);
+        };
+        if stored.membership.is_some() {
+            return Ok(false);
+        }
+        let pending = stored
+            .pending_join
+            .as_ref()
+            .filter(|p| p.retained_predecessor.is_empty())
+            .map(|p| p.intent.clone());
+        let prepared = stored
+            .journal
+            .as_ref()
+            .filter(|j| {
+                j.phase == AdoptionPhase::Prepared
+                    && matches!(j.transcript, ConsentTranscript::Pairing { .. })
+            })
+            .map(|j| j.intent.clone());
+        // A journal for another operation past Prepared is never touched here.
+        let intent = match (pending, prepared) {
+            (Some(p), Some(j)) if p.operation != j.operation => return Ok(false),
+            (Some(p), _) => p,
+            (None, Some(j)) => j,
+            (None, None) => return Ok(false),
+        };
+        if let Some(j) = stored
+            .journal
+            .as_ref()
+            .filter(|j| j.intent.operation == intent.operation)
+        {
+            if j.phase != AdoptionPhase::Prepared {
+                return Ok(false);
+            }
+        }
+        let _ = client.request(CompanionRequest::Cancel {
+            operation: intent.operation.clone(),
+        });
+        match client.request(CompanionRequest::Status {
+            operation: intent.operation.clone(),
+        }) {
+            Ok(CompanionResponse::Status {
+                operation,
+                phase: CompanionPhase::Cancelled,
+            }) if operation == intent.operation => {}
+            Err(e) if e.contains("unknown companion operation") => {}
+            Ok(_) => return Err("counterpart operation is not provably pre-proof".into()),
+            Err(e) => return Err(format!("counterpart cancellation unconfirmed: {e}")),
+        }
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained Join profile missing")?;
+            if stored.membership.is_some() {
+                return Err("membership changed during pre-proof recovery".into());
+            }
+            if let Some(journal) = stored
+                .journal
+                .as_mut()
+                .filter(|j| j.intent.operation == intent.operation)
+            {
+                if journal.phase != AdoptionPhase::Prepared {
+                    return Err("Join phase changed during pre-proof recovery".into());
+                }
+                journal.phase = if now() >= journal.intent.expires_at {
+                    AdoptionPhase::ExpiredBeforeProof
+                } else {
+                    AdoptionPhase::Cancelled
+                };
+            }
+            if stored
+                .pending_join
+                .as_ref()
+                .is_some_and(|p| p.intent.operation == intent.operation)
+            {
+                stored.pending_join = None;
+            }
+            Ok((Some(stored), ()))
+        })?;
+        self.reload();
+        Ok(true)
+    }
+
     pub fn begin_join(self: &Arc<Self>, client: &CompanionClient) -> Result<JoinOffer, String> {
         let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
         let offer = self.begin_join_with_offer(
@@ -547,6 +643,10 @@ impl DesktopRing {
         // The same guard continues into the worker; no release/reacquire gap. Re-read all
         // profile, identity and recovery fences only after admission has been acquired.
         self.check_join_origin(&offer, until, &cancel)?;
+        // A lost owner's never-signed offer must not block a new code forever.
+        if let Err(error) = self.recover_pre_proof_join_admitted(client) {
+            return Err(format!("reconciliation_required: {error}"));
+        }
         if let Some(stored) = self.store.load_profile()?.0 {
             if stored.membership.is_some() {
                 return Err("leave_required: Join needs an unpaired Desktop".into());

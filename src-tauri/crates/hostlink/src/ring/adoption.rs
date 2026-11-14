@@ -202,6 +202,9 @@ impl DesktopRing {
         if !self.pairing_ipc_owner() {
             return Ok(false);
         }
+        // Unix only: Windows `~/.xshell` is shared ancestry the reservation itself creates
+        // private or validates without repair.
+        #[cfg(unix)]
         super::store::ensure_private_dir(&home.join(".xshell")).map_err(|e| e.to_string())?;
         let desktop = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
         xshell_core::companion_reservation::reserve(home, &desktop).map_err(|e| e.to_string())?;
@@ -220,7 +223,17 @@ impl DesktopRing {
         }
         let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
         daemon
-            .with_registration_endpoint(&desktop_dir, |client| self.register_companion(client))
+            .with_registration_endpoint(&desktop_dir, |client| {
+                let profile = self.register_companion(client)?;
+                // Startup: a previous owner's never-signed Join is retired (fenced), so a
+                // new code can be generated; uncertainty past Prepared is kept.
+                if let Some(_admission) = self.try_reserve_adoption() {
+                    if let Err(error) = self.recover_pre_proof_join_admitted(client) {
+                        eprintln!("xshell: earlier Join stays unresolved: {error}");
+                    }
+                }
+                Ok(profile)
+            })
             .map(Some)
     }
 

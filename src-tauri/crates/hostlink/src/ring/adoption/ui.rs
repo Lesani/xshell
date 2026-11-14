@@ -121,7 +121,7 @@ impl DesktopRing {
         profile
             .validate()
             .map_err(|e| format!("not_registered: {e}"))?;
-        Ok(CompanionClient::for_profile(&profile))
+        CompanionClient::for_profile_served(&profile).map_err(|e| format!("not_registered: {e}"))
     }
 
     /// [`DesktopRing::begin_join`] with an external cancel flag that also ends the wait for

@@ -260,7 +260,12 @@ impl DesktopRing {
             .as_ref()
             .filter(|j| j.intent.operation == operation)
         {
-            if j.phase == AdoptionPhase::Prepared || j.phase.before_proof_terminal() {
+            if j.phase == AdoptionPhase::Prepared {
+                // Pre-proof: retire it through the fenced counterpart cancellation.
+                self.recover_pre_proof_join_admitted(client)?;
+                return self.adoption_status();
+            }
+            if j.phase.before_proof_terminal() {
                 return status(&stored);
             }
             let profile = stored
@@ -361,6 +366,9 @@ impl DesktopRing {
             .is_some_and(|p| p.intent.operation == operation)
         {
             return Err("unknown adoption operation".into());
+        } else {
+            // A pending-only reservation never reached a proposal: fenced pre-proof retire.
+            self.recover_pre_proof_join_admitted(client)?;
         }
         self.adoption_status()
     }

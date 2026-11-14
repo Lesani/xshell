@@ -89,9 +89,9 @@ pub fn local_pid_record_path(home: &Path) -> PathBuf {
 
 /// Read the protected Windows PID record (BINDING AMENDMENT 1 §3) without repairing
 /// anything: the home and `.xshell` must be safe shared ancestry, `run` and the record
-/// private, none a reparse point; the content one decimal PID line.
+/// private, none a reparse point; the content one line `<pid> <creation-time>`.
 #[cfg(windows)]
-pub fn read_pid_record(home: &Path) -> io::Result<u32> {
+pub fn read_pid_record(home: &Path) -> io::Result<(u32, u64)> {
     use std::io::Read;
     use xshell_core::private_fs::{check_dir_no_repair, open_read_no_repair, Exposure};
     let home = home.canonicalize()?;
@@ -102,13 +102,40 @@ pub fn read_pid_record(home: &Path) -> io::Result<u32> {
     let file = open_read_no_repair(&path)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Daemon PID record"))?;
     let mut text = String::new();
-    file.take(32).read_to_string(&mut text)?;
-    text.strip_suffix('\n')
-        .map(|t| t.strip_suffix('\r').unwrap_or(t))
-        .filter(|t| !t.is_empty() && t.len() <= 10 && t.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|t| t.parse::<u32>().ok())
-        .filter(|pid| *pid != 0)
+    file.take(64).read_to_string(&mut text)?;
+    parse_pid_record(&text)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed Daemon PID record"))
+}
+
+/// `<pid> <creation-time>\n`, both decimal; nothing else.
+pub fn parse_pid_record(text: &str) -> Option<(u32, u64)> {
+    let line = text.strip_suffix('\n')?;
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let (pid, created) = line.split_once(' ')?;
+    let digits = |t: &str, max: usize| {
+        !t.is_empty() && t.len() <= max && t.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !digits(pid, 10) || !digits(created, 20) {
+        return None;
+    }
+    let pid = pid.parse::<u32>().ok().filter(|p| *p != 0)?;
+    Some((pid, created.parse::<u64>().ok()?))
+}
+
+/// Windows: the Daemon process a retained counterpart profile's PID record names, its
+/// handle opened and held, PID and creation time both matching (#87 review P2/P3).
+#[cfg(windows)]
+pub fn recorded_daemon(
+    daemon_store: &Path,
+) -> Result<xshell_core::local_ipc::ServerProcess, String> {
+    let home = daemon_store
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or("invalid Daemon Store association")?;
+    let (pid, created) = read_pid_record(home).map_err(|e| e.to_string())?;
+    xshell_core::local_ipc::ServerProcess::open_expected(pid, created)
+        .map_err(|e| format!("stale Daemon PID record: {e}"))
 }
 
 /// The recorded mode; `None` when there is no marker or it is unreadable.
@@ -484,8 +511,8 @@ impl LocalDaemon {
                 }
             }
         }
-        let pid = read_pid_record(&self.home).map_err(|e| e.to_string())?;
-        xshell_core::local_ipc::ServerProcess::open(pid)
+        let (pid, created) = read_pid_record(&self.home).map_err(|e| e.to_string())?;
+        xshell_core::local_ipc::ServerProcess::open_expected(pid, created)
             .map_err(|e| format!("stale Daemon PID record: {e}"))
     }
 
