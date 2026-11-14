@@ -616,3 +616,195 @@ fn a_phone_cancelled_at_consent_sends_an_authenticated_decline() {
             .is_none());
     }
 }
+
+/// A Desktop whose test seams report every point reached and stop at the one chosen.
+struct Seams {
+    pause: Arc<Mutex<Option<xshell_hostlink::ring::AdoptionTestPoint>>>,
+    reached: std::sync::mpsc::Receiver<xshell_hostlink::ring::AdoptionTestPoint>,
+    resume: std::sync::mpsc::Sender<()>,
+}
+impl Seams {
+    fn computer(relay: &Relay) -> (Computer, Seams) {
+        let pause = Arc::new(Mutex::new(None));
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = Mutex::new(resume_rx);
+        let at = pause.clone();
+        let c = Computer::with_ring_config(relay, move |cfg| {
+            cfg.adoption_test_hook = Some(xshell_hostlink::ring::AdoptionTestHook(Arc::new(
+                move |point| {
+                    // Decide before reporting: the test clears the pause once it hears.
+                    let stop = *at.lock().unwrap() == Some(point);
+                    let _ = reached_tx.send(point);
+                    if stop {
+                        let _ = resume_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(60));
+                    }
+                },
+            )));
+        });
+        (
+            c,
+            Seams {
+                pause,
+                reached,
+                resume,
+            },
+        )
+    }
+    fn wait_for(&self, point: xshell_hostlink::ring::AdoptionTestPoint) {
+        assert!(self.try_wait_for(point), "seam {point:?} not reached");
+    }
+    fn try_wait_for(&self, point: xshell_hostlink::ring::AdoptionTestPoint) -> bool {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.reached.recv_timeout(left) {
+                Ok(p) if p == point => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+/// Relay, Connector (the Desktop's view) and the Desktop store hold the same head.
+fn agree(relay: &Relay, c: &Computer) -> xshell_protocol::ring::SignedRoster {
+    wait("Relay, Connector and store agree", || {
+        let stored = xshell_hostlink::ring::store::Store::new(c.home.root().join("desktop"))
+            .load()
+            .ok()
+            .and_then(|l| l.0)
+            .map(|s| s.chain.head().clone());
+        let held = c.ring.chain().unwrap();
+        relay_head(relay, &held) == held.head().version() && stored.as_ref() == Some(held.head())
+    });
+    c.ring.chain().unwrap().head().clone()
+}
+
+#[test]
+fn a_removal_waits_for_a_paused_phone_publication_and_extends_its_head() {
+    use xshell_hostlink::ring::AdoptionTestPoint as P;
+    let relay = Relay::start();
+    let (a, seams) = Seams::computer(&relay);
+    a.create();
+    connected(&a);
+    let mut removable = vec![];
+    for n in [50, 51] {
+        let (o, _) = offer(&a);
+        let k = phone_keys(n);
+        scan(&o, &k).unwrap();
+        removable.push(k);
+    }
+    for (round, (at, gone)) in [
+        (P::PhoneBeforePublish, &removable[0]),
+        (P::PhonePublishedBeforeReadBack, &removable[1]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = agree(&relay, &a).version();
+        *seams.pause.lock().unwrap() = Some(at);
+        while seams.reached.try_recv().is_ok() {}
+        let (o, _) = offer(&a);
+        let phone = phone_keys(60 + round as u8);
+        let scanner = {
+            let phone = phone.clone();
+            std::thread::spawn(move || scan(&o, &phone))
+        };
+        seams.wait_for(at);
+        *seams.pause.lock().unwrap() = None;
+        // A removal starts while the phone holds the membership-mutation reservation.
+        let ring = a.ring.clone();
+        let key = gone.sign_key();
+        let removal = std::thread::spawn(move || ring.remove_member(&key));
+        std::thread::sleep(Duration::from_millis(300));
+        if removal.is_finished() {
+            panic!("removal did not wait (round {round}): {:?}", removal.join());
+        }
+        seams.resume.send(()).unwrap();
+        let enrolled = scanner.join().unwrap().unwrap();
+        // (The phone's fetched chain may already include the removal that followed.)
+        assert_eq!(enrolled.joined.version, before + 1);
+        let removed = removal.join().unwrap().unwrap();
+        // The removal was built on the phone's head: one linear chain, no fork.
+        assert_eq!(removed.head().version(), before + 2);
+        assert_eq!(
+            removed.head().roster().prev.as_deref(),
+            Some(enrolled.joined.hash.as_str())
+        );
+        let head = agree(&relay, &a);
+        assert_eq!(&head, removed.head());
+        assert_mobile_unit(&removed, &phone.sign_key());
+        assert!(head.member(&gone.sign_key()).is_none());
+    }
+}
+
+#[test]
+fn a_phone_publication_after_a_paused_removal_is_stale_without_a_fork() {
+    use xshell_hostlink::ring::AdoptionTestPoint as P;
+    let relay = Relay::start();
+    let (a, seams) = Seams::computer(&relay);
+    a.create();
+    connected(&a);
+    let (o, _) = offer(&a);
+    let gone = phone_keys(52);
+    scan(&o, &gone).unwrap();
+    let before = agree(&relay, &a).version();
+    // The removal holds the reservation, stopped before its publication.
+    *seams.pause.lock().unwrap() = Some(P::RemoveBeforePublish);
+    let ring = a.ring.clone();
+    let key = gone.sign_key();
+    connected(&a);
+    let removal = std::thread::spawn(move || ring.remove_member(&key));
+    if !seams.try_wait_for(P::RemoveBeforePublish) {
+        panic!(
+            "removal never reached its publication: {:?}",
+            removal.join()
+        );
+    }
+    *seams.pause.lock().unwrap() = None;
+    // Earlier pairings' seam reports are not this phone's.
+    while seams.reached.try_recv().is_ok() {}
+    // A phone consents meanwhile; its publication waits for the reservation.
+    let (o, obs) = offer(&a);
+    let phone = phone_keys(62);
+    let scanner = {
+        let phone = phone.clone();
+        std::thread::spawn(move || scan(&o, &phone))
+    };
+    if !seams.try_wait_for(P::PhoneBeforeReservation) {
+        seams.resume.send(()).unwrap();
+        panic!(
+            "phone never reached the reservation: {:?}; removal {:?}",
+            scanner.join(),
+            removal.join()
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!scanner.is_finished());
+    seams.resume.send(()).unwrap();
+    let removed = removal.join().unwrap().unwrap();
+    assert_eq!(removed.head().version(), before + 1);
+    // The phone's proposal was frozen on the old head: refused as stale, nothing sent.
+    assert_eq!(
+        scanner.join().unwrap().unwrap_err(),
+        PairError::Refused(PairRefusal::Stale)
+    );
+    assert_eq!(
+        obs.outcome(),
+        PairingEvent::Failed {
+            code: "stale".into()
+        }
+    );
+    let head = agree(&relay, &a);
+    assert_eq!(&head, removed.head());
+    assert!(head.member(&phone.sign_key()).is_none());
+    // A fresh offer on the new head pairs it.
+    let (o, _) = offer(&a);
+    let enrolled = scan(&o, &phone).unwrap();
+    assert_eq!(enrolled.chain.head().version(), before + 2);
+    assert_eq!(&agree(&relay, &a), enrolled.chain.head());
+}

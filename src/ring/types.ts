@@ -18,7 +18,16 @@ export interface MemberView {
   // Host's Daemon.
   removable: boolean;
   presence: { kind: PresenceKind; reason?: string; at?: number };
+  // A format-v2 Ring: the member's enrollment unit (null on an older Ring). A Computer is one
+  // row: its Desktop's name and signKey, its Daemon in daemonKey; removing it removes both.
+  enrollmentId: string | null;
+  kind: EnrollmentKind | null;
+  daemonKey: string | null;
+  // A grouped Computer: its Daemon's own presence (presence is online when either key is).
+  daemonPresence: { kind: PresenceKind; reason?: string; at?: number } | null;
 }
+
+export type EnrollmentKind = "computer" | "daemon" | "mobile" | "legacyDesktop";
 
 export interface RingStatus {
   enabled: boolean;

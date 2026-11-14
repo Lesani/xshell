@@ -151,12 +151,18 @@ fn public_create_uses_two_private_stores_only_after_backend_confirmation() {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let view = computer.ring.view();
+            // The Computer is one grouped row (its Desktop and Daemon).
             if view.connection == "connected"
-                && view.members.len() == 2
-                && view
-                    .members
-                    .iter()
-                    .all(|member| member.presence.kind == "online")
+                && view.members.len() == 1
+                && view.members[0].kind
+                    == Some(xshell_protocol::ring::membership::EnrollmentKind::Computer)
+                && view.members[0].daemon_key == Some(profile.daemon.sign_key)
+                && view.members[0].presence.kind == "online"
+                // The Daemon itself, as the Relay reports it (not this app's own presence).
+                && view.members[0]
+                    .daemon_presence
+                    .as_ref()
+                    .is_some_and(|p| p.kind == "online")
             {
                 break;
             }

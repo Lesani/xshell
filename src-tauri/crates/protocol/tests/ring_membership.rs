@@ -68,8 +68,8 @@ fn old_binary_genesis_domain_stays_v1() {
 
 use xshell_protocol::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
 use xshell_protocol::ring::membership::{
-    consent_message, local_consent_context, pairing_consent_context, ConsentProof, Enrollment,
-    EnrollmentKind as Kind, Membership, RingPolicy, RosterChange as Change,
+    consent_message, local_consent_context, pairing_consent_context, remove_unit, ConsentProof,
+    Enrollment, EnrollmentKind as Kind, Membership, RingPolicy, RosterChange as Change,
 };
 use xshell_protocol::ring::{Roster, Signature};
 fn eid(n: u8) -> String {
@@ -438,6 +438,10 @@ fn shared_membership_vectors() {
     let mut t = tokens(&good, &ks[0]);
     t.push(raw(&split, &ks[2]));
     add("computer_cannot_be_split", t, false);
+    let whole = remove_unit(&c, &ks[1], c.roster().issued_at + 1, &eid(5)).unwrap();
+    let mut t = tokens(&good, &ks[0]);
+    t.push(whole.token().to_string());
+    add("desktop_removes_whole_computer", t, true);
     let mut reused = draft(
         &c,
         &ks[1],
@@ -1060,4 +1064,103 @@ mod mobile {
         // A Daemon is not an approver.
         assert!(enroll_proposal(c.head(), ks[2].sign_key(), &i, 103).is_err());
     }
+}
+fn completed() -> (Vec<DeviceKeys>, Vec<SignedRoster>) {
+    let (ks, mut h) = upgrade_multi();
+    let c = signed(&complete(h.last().unwrap(), &ks), &ks[0]);
+    h.push(c);
+    (ks, h)
+}
+fn accepts(h: &[SignedRoster], next: SignedRoster) -> RosterChain {
+    let mut all = h.to_vec();
+    all.push(next);
+    RosterChain::from_chain(all).unwrap()
+}
+
+#[test]
+fn remove_unit_removes_a_whole_computer() {
+    let (ks, h) = completed();
+    let c = h.last().unwrap();
+    let r = remove_unit(c, &ks[1], c.roster().issued_at + 5, &eid(5)).unwrap();
+    let m = r.roster().membership().unwrap();
+    assert_eq!(r.version(), c.version() + 1);
+    assert_eq!(r.roster().prev.as_deref(), Some(c.hash().as_str()));
+    assert!(m.unit(&eid(5)).is_none());
+    assert!(m.retired.contains(&eid(5)));
+    assert!(matches!(m.change, Change::Remove { ref enrollment_id } if *enrollment_id == eid(5)));
+    for k in [&ks[0], &ks[2]] {
+        assert!(r.member(&k.sign_key()).is_none());
+    }
+    let chain = accepts(&h, r);
+    assert_eq!(chain.head().roster().members.len(), 2);
+    // A clock behind the predecessor never rolls issuedAt back.
+    let back = remove_unit(c, &ks[1], 1, &eid(5)).unwrap();
+    assert_eq!(back.roster().issued_at, c.roster().issued_at);
+}
+
+#[test]
+fn remove_unit_removes_a_mobile() {
+    let (ks, h) = upgrade_multi();
+    let p = h.last().unwrap();
+    let r = remove_unit(p, &ks[0], 103, &eid(4)).unwrap();
+    assert!(r.member(&ks[3].sign_key()).is_none());
+    accepts(&h, r);
+}
+
+#[test]
+fn remove_unit_removes_a_standalone_daemon() {
+    let (ks, h) = upgrade_multi();
+    let p = h.last().unwrap();
+    let r = remove_unit(p, &ks[1], 103, &eid(3)).unwrap();
+    assert!(r.member(&ks[2].sign_key()).is_none());
+    assert_eq!(r.roster().membership().unwrap().enrollments.len(), 3);
+    accepts(&h, r);
+}
+
+#[test]
+fn remove_unit_refuses_a_daemon_signer_for_another_unit() {
+    let (ks, h) = upgrade_multi();
+    let p = h.last().unwrap();
+    assert!(remove_unit(p, &ks[2], 103, &eid(2)).is_err());
+    assert!(
+        remove_unit(p, &ks[0], 103, &eid(77)).is_err(),
+        "unknown unit"
+    );
+}
+
+#[test]
+fn half_computer_removal_is_refused() {
+    let (ks, h) = completed();
+    let c = h.last().unwrap();
+    let mut half = draft(
+        c,
+        &ks[1],
+        Change::Remove {
+            enrollment_id: eid(5),
+        },
+    );
+    let mut m = half.membership().unwrap();
+    m.enrollments.retain(|e| e.id != eid(5));
+    m.retired.push(eid(5));
+    half.members.retain(|x| x.sign_key != ks[2].sign_key());
+    half.set_membership(&m);
+    let mut t = h.iter().map(|r| r.token().to_string()).collect::<Vec<_>>();
+    t.push(raw(&half, &ks[1]));
+    assert!(RosterChain::from_tokens(&t).is_err());
+    // Keeping the unit listed with only its Desktop is refused the same way.
+    let mut m = half.membership().unwrap();
+    let mut unit = c
+        .roster()
+        .membership()
+        .unwrap()
+        .unit(&eid(5))
+        .unwrap()
+        .clone();
+    unit.members.retain(|k| *k == ks[0].sign_key());
+    m.enrollments.push(unit);
+    m.retired.retain(|id| *id != eid(5));
+    half.set_membership(&m);
+    t.pop();
+    t.push(raw(&half, &ks[1]));
+    assert!(RosterChain::from_tokens(&t).is_err());
 }

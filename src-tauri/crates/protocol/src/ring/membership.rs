@@ -1,7 +1,8 @@
 //! Format-v2 membership semantics. The signed `membership` field is mandatory and strictly
 //! decoded for xro2; v1's ignored extensions never authorize a v2 operation.
 use super::{
-    b64, verify, Member, Role, Roster, RosterError, SignKey, Signature, SignedRoster, MAX_SAFE_INT,
+    b64, verify, Member, RingError, Role, Roster, RosterError, SignKey, Signature, SignedRoster,
+    Signer, MAX_SAFE_INT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -590,6 +591,40 @@ fn verify_transition_roster(
     }
     Ok(())
 }
+/// The typed successor of `prev` that removes the whole enrollment unit `enrollment_id`
+/// (a Computer's Desktop and Daemon together, never half of it): every member of the unit
+/// goes, its id joins `retired`, and the result must be a valid successor signed by `signer`
+/// (so a Daemon signer removing another unit fails here, not at the Relay).
+pub fn remove_unit(
+    prev: &SignedRoster,
+    signer: &dyn Signer,
+    now: u64,
+    enrollment_id: &str,
+) -> Result<SignedRoster, RingError> {
+    let p = prev.roster();
+    let mut m = p.membership()?;
+    let unit = m
+        .unit(enrollment_id)
+        .cloned()
+        .ok_or_else(|| invalid("removal target"))?;
+    let mut r = p.clone();
+    r.v = 2;
+    r.version = p.version + 1;
+    r.prev = Some(prev.hash());
+    r.signed_by = signer.sign_key();
+    r.issued_at = now.max(p.issued_at);
+    r.members.retain(|x| !unit.members.contains(&x.sign_key));
+    m.enrollments.retain(|e| e.id != unit.id);
+    m.retired.push(unit.id.clone());
+    m.change = RosterChange::Remove {
+        enrollment_id: unit.id,
+    };
+    r.set_membership(&m);
+    let signed = r.sign(signer)?;
+    super::chain::verify_successor(prev, &signed)?;
+    Ok(signed)
+}
+
 /// Worker and consumers that have learned terminal evidence apply this additional gate to
 /// *each* candidate signer, independent of the socket transporting the candidate.
 pub fn verify_terminal_authority(

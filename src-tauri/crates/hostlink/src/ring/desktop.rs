@@ -56,6 +56,7 @@ use std::time::Duration;
 use std::time::Instant;
 use xshell_protocol::pairing_access::enrollment::*;
 use xshell_protocol::pairing_access::{AccessError, MobileRole, ReachabilityPurpose, Scope};
+use xshell_protocol::ring::membership::{remove_unit, EnrollmentKind};
 use xshell_protocol::ring::pairing::{
     JoinRequest, Joined, OfferHead, PairCode, PairError, PairRefusal, PairSecret, PairingOffer,
 };
@@ -72,7 +73,7 @@ use xshell_protocol::ring::roster::MAX_MEMBERS;
 use xshell_protocol::ring::url::{normalize_origin, RelayUrl};
 use xshell_protocol::ring::{
     member_name, verify_genesis, DeviceKeys, Member, NoiseKey, RingError, RingId, Role, Roster,
-    RosterChain, SignKey, SignedRoster,
+    RosterChain, RosterError, SignKey, SignedRoster,
 };
 
 /// The local Daemon's Ring identity, from its `ring.identity` answer.
@@ -124,6 +125,9 @@ pub enum HostOutcome {
     Stale,
     /// The batch was decided for a Ring that is no longer this Desktop's: discarded.
     RingChanged,
+    /// A format-v2 Ring: a Daemon not enrolled yet joins only through an enrollment flow
+    /// (with its own consent), never a Roster this Desktop signs for it.
+    NeedsEnrollment,
 }
 
 /// Per Host id, what [`DesktopRing::ensure_host_daemons`] did.
@@ -156,6 +160,114 @@ fn mapping(s: &RingState) -> BTreeMap<String, (SignKey, String)> {
         m.insert(LOCAL_HOST_ID.to_string(), (k, String::new()));
     }
     m
+}
+
+/// [`plan_hosts`] for a format-v2 Ring, where this Desktop never signs for a Host: the
+/// mapping of Hosts whose key is enrolled still applies, a planned addition is
+/// [`HostOutcome::NeedsEnrollment`] (its Host keeps its previous mapping), and removals and
+/// renames are dropped.
+fn enrolled_only(s: &RingState, p: &mut HostPlan) {
+    let head = s.chain.head().roster();
+    let before = mapping(s);
+    p.remove.clear();
+    p.rename.clear();
+    p.add.clear();
+    let unenrolled: Vec<String> = p
+        .after
+        .iter()
+        .filter(|(_, (k, _))| head.member(k).is_none())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &unenrolled {
+        match before.get(id) {
+            Some(old) => p.after.insert(id.clone(), old.clone()),
+            None => p.after.remove(id),
+        };
+    }
+    for (id, o) in &mut p.outcomes {
+        if *o == HostOutcome::Full || (*o == HostOutcome::Joined && unenrolled.contains(id)) {
+            *o = HostOutcome::NeedsEnrollment;
+        }
+    }
+}
+
+/// The v2 Remove of `key`'s whole enrollment unit on `effective`, signed by `keys`, and the
+/// unit's keys. Checked against `effective` itself, so its terminal evidence fences a
+/// terminal-expired signer. This app's own unit is [`REMOVE_SELF`] (leaving is its own
+/// flow); a configured SSH Host does not block it. `None`: the head does not list the key.
+fn removal_candidate(
+    effective: &RosterChain,
+    keys: &DeviceKeys,
+    key: &SignKey,
+    at: u64,
+) -> Result<Option<(SignedRoster, Vec<SignKey>)>, String> {
+    let membership = effective
+        .head()
+        .roster()
+        .membership()
+        .map_err(|e| e.to_string())?;
+    let Some(unit) = membership.unit_for(key).cloned() else {
+        return Ok(None);
+    };
+    if unit.members.contains(&keys.sign_key()) {
+        return Err(REMOVE_SELF.to_string());
+    }
+    let next = remove_unit(effective.head(), keys, at, &unit.id).map_err(|e| e.to_string())?;
+    effective
+        .extended(std::slice::from_ref(&next))
+        .map_err(|e| e.to_string())?;
+    Ok(Some((next, unit.members)))
+}
+
+/// `s` with the Relay-acknowledged `candidate` (and the `effective` versions before it that
+/// it does not hold yet; the Connector's own report may have stored them already) and
+/// without the Ring mapping of the removed unit's keys.
+fn commit_acknowledged(
+    mut s: RingState,
+    effective: &RosterChain,
+    candidate: &SignedRoster,
+    unit_keys: &[SignKey],
+) -> Result<RingState, String> {
+    let mut newer = effective.since(s.chain.head().version()).to_vec();
+    newer.push(candidate.clone());
+    s.chain = s.chain.extended(&newer).map_err(|e| e.to_string())?.0;
+    if s.chain.get(candidate.version()) != Some(candidate) {
+        return Err(REMOVE_CONFLICT.to_string());
+    }
+    s.host_members
+        .retain(|_, h| !unit_keys.contains(&h.sign_key));
+    if s.local_member.is_some_and(|k| unit_keys.contains(&k)) {
+        s.local_member = None;
+    }
+    Ok(s)
+}
+
+/// `candidate` (its predecessor in `current`) is still within its signer's authority under
+/// `current`'s terminal evidence: a terminal-expired signer may only clean up itself.
+fn still_authorized(current: &RosterChain, candidate: &SignedRoster) -> Result<(), String> {
+    let prev = candidate
+        .version()
+        .checked_sub(1)
+        .and_then(|v| current.get(v))
+        .filter(|p| candidate.roster().prev.as_deref() == Some(p.hash().as_str()))
+        .ok_or(REMOVE_CONFLICT)?;
+    xshell_protocol::ring::membership::verify_terminal_authority(
+        prev,
+        candidate,
+        current.terminal_enrollments(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// A refusal because the Relay holds another head than the candidate's predecessor.
+fn removal_conflict(e: &RingError) -> bool {
+    matches!(
+        e,
+        RingError::Relay {
+            code: ErrorCode::RosterStale | ErrorCode::RosterConflict,
+            ..
+        } | RingError::Roster(RosterError::Stale | RosterError::PrevMismatch | RosterError::Gap)
+    )
 }
 
 /// What the batch changes, decided on the whole batch at once:
@@ -329,6 +441,8 @@ pub enum AdoptionTestPoint {
     CompletionBeforePublish,
     UpgradeBeforeUncertainWrite,
     UpgradeBeforePublish,
+    /// v2 phone pairing: consent received, before the membership-mutation reservation.
+    PhoneBeforeReservation,
     /// v2 phone pairing: predecessor checked and publication marked, before the send.
     PhoneBeforePublish,
     /// v2 phone pairing: candidate sent, before the accepted read-back.
@@ -339,6 +453,8 @@ pub enum AdoptionTestPoint {
     AcceptedBeforeJournal,
     /// Matching durable Daemon receipt received, before the Desktop store transaction.
     CompanionInstalledBeforeDesktop,
+    /// A v2 Remove candidate is built (no Ring lock held), before each publication.
+    RemoveBeforePublish,
 }
 #[derive(Clone)]
 pub struct AdoptionTestHook(pub Arc<dyn Fn(AdoptionTestPoint) + Send + Sync>);
@@ -450,6 +566,24 @@ pub const PAIR_OTHER_WINDOW: &str = "other_window: another xshell window manages
 pub const REMOVE_SELF: &str = "self: this app can't remove itself";
 pub const REMOVE_IN_USE: &str = "in_use: this device belongs to a host in Settings → Hosts";
 
+/// [`DesktopRing::remove_member`] on a format-v2 Ring, refused or not confirmed: nothing
+/// is committed.
+pub const REMOVE_OFFLINE: &str =
+    "remove_offline: removing a device needs a connection to the Relay";
+pub const REMOVE_CONFLICT: &str =
+    "remove_conflict: another device changed your devices at the same time; try again";
+pub const REMOVE_UNCERTAIN: &str =
+    "remove_uncertain: the Relay did not confirm the removal; it applies only if the Relay accepted it";
+
+/// A v2 membership change (removal, phone enrollment) waited for another one in progress
+/// (an adoption, another phone, a removal) and gave up: nothing was sent.
+pub const MEMBERSHIP_BUSY: &str = "busy: another change to your devices is in progress; try again";
+
+/// [`DesktopRing::set_relay_url`] on an enrolled format-v2 Ring: the Relay is part of the
+/// Ring's identity there.
+pub const RELAY_FIXED: &str =
+    "relay_fixed: an enrolled ring keeps its Relay; leave and register in a new ring to change Relays";
+
 /// Whether a Host id is still configured in Settings → Hosts. See
 /// [`DesktopRing::set_configured_hosts`].
 pub type ConfiguredHosts = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -500,9 +634,18 @@ pub struct MemberView {
     /// this member is.
     pub host_id: Option<String>,
     /// Settings → Mobile offers to remove it: not this app, not this computer's Daemon, and
-    /// no configured Host's Daemon.
+    /// no configured Host's Daemon. On a format-v2 Ring: not this app's own unit (a
+    /// configured Host does not block it).
     pub removable: bool,
     pub presence: PresenceView,
+    /// Format v2: the member's enrollment unit. A Computer is one row (its Desktop's name
+    /// and key, its Daemon in `daemon_key`); removing it removes both.
+    pub enrollment_id: Option<String>,
+    pub kind: Option<EnrollmentKind>,
+    pub daemon_key: Option<SignKey>,
+    /// A grouped Computer: its Daemon's own presence as the Relay reports it (`presence` is
+    /// online when either key is).
+    pub daemon_presence: Option<PresenceView>,
 }
 
 /// A farewell still owed to an old Relay (ADR-0012).
@@ -1686,6 +1829,9 @@ impl DesktopRing {
                 if s.chain.head().roster().relay_url == url {
                     return Ok((None, (s, false)));
                 }
+                if s.chain.head().roster().v == 2 {
+                    return Err(RELAY_FIXED.to_string());
+                }
                 let old = s.chain.head().version();
                 let next = s
                     .chain
@@ -1781,7 +1927,10 @@ impl DesktopRing {
                     }
                 }
                 let t = now();
-                let p = plan_hosts(&s, &live, t);
+                let mut p = plan_hosts(&s, &live, t);
+                if s.chain.head().roster().v == 2 {
+                    enrolled_only(&s, &mut p);
+                }
                 outcomes.extend(p.outcomes.iter().cloned());
                 let mut dirty = p.after != mapping(&s);
                 if p.edits_roster() {
@@ -2640,10 +2789,14 @@ impl DesktopRing {
                 let (chain, captured) = loop {
                     live(&scope_expired)?;
                     if let Ok((chain, captured)) = self.proposal_snapshot() {
-                        if chain.head().hash() != initial_head {
+                        if chain.head().hash() == initial_head {
+                            break (chain, captured);
+                        }
+                        // A Connector still catching up to the accepted head is waited
+                        // for; any other head is not the offer's.
+                        if chain.head().version() >= state.chain.head().version() {
                             return Err(refused(PairRefusal::Stale));
                         }
-                        break (chain, captured);
                     }
                     if Instant::now() >= ready_until {
                         return Err(refused(PairRefusal::NotCommitted));
@@ -2667,6 +2820,15 @@ impl DesktopRing {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
+                    .ok_or(refused(PairRefusal::NotCommitted))?;
+                // The shared v2 membership-mutation reservation spans the final predecessor
+                // check, the send and the accepted installation. A removal or adoption in
+                // flight first: wait (within the offer) or give up with nothing sent.
+                self.adoption_test_point(AdoptionTestPoint::PhoneBeforeReservation);
+                let _reservation = self
+                    .reserve_membership_mutation(
+                        until.min(Instant::now() + self.cfg.pair_publish_wait),
+                    )
                     .ok_or(refused(PairRefusal::NotCommitted))?;
                 if cancel.load(Ordering::Acquire) || self.lock().quitting {
                     return Err(refused(PairRefusal::Cancelled));
@@ -2993,6 +3155,14 @@ impl DesktopRing {
     /// the new version, so the old Relays learn of the removal too. Returns the chain, for the
     /// Daemons.
     pub fn remove_member(&self, key: &SignKey) -> Result<RosterChain, String> {
+        let v2 = self
+            .lock()
+            .state
+            .as_ref()
+            .is_some_and(|s| s.chain.head().roster().v == 2);
+        if v2 {
+            return self.remove_member_v2(key);
+        }
         // The configured-Hosts answers, taken before any Ring lock (see the module docs). A
         // Host id mapped to the key that was not asked about counts as configured.
         let ids: Vec<String> = self
@@ -3016,6 +3186,10 @@ impl DesktopRing {
                 let Some(mut s) = cur else {
                     return Err(PAIR_NOT_ENABLED.to_string());
                 };
+                if s.chain.head().roster().v == 2 {
+                    // Upgraded meanwhile: v2 removal is never committed before the Relay.
+                    return Err(REMOVE_CONFLICT.to_string());
+                }
                 if *key == s.keys.sign_key() {
                     return Err(REMOVE_SELF.to_string());
                 }
@@ -3048,6 +3222,120 @@ impl DesktopRing {
             if !changed {
                 return Ok(s.chain);
             }
+            self.hook();
+            self.adopt(s.clone());
+            s.chain
+        };
+        self.emit();
+        Ok(chain)
+    }
+
+    /// [`DesktopRing::remove_member`] on a format-v2 Ring. The key's whole enrollment unit
+    /// goes in one typed Remove, and nothing is accepted here before the Relay has it:
+    /// - the candidate is built under the commit lock on the effective head (the Connector's
+    ///   newer head and same-ancestry terminal evidence included), so a terminal-expired
+    ///   signer or this app's own unit ([`REMOVE_SELF`]) is refused before anything is sent;
+    /// - it needs a connected Relay ([`REMOVE_OFFLINE`]); it is published with no Ring lock
+    ///   held (the Connector's Roster report takes the commit lock), fenced again at each
+    ///   upload by the owner's current terminal evidence ([`Connector::publish_fenced_until`]);
+    /// - on the Relay's acknowledgment, from the same Connector and still authorized under
+    ///   the current evidence, it is committed and the unit's Host mappings are dropped
+    ///   (Settings → Hosts entries stay);
+    /// - a conflicting head is read again and a fresh candidate (a new signature on the new
+    ///   head, never an old one moved) is tried once, then [`REMOVE_CONFLICT`]; no answer
+    ///   is [`REMOVE_UNCERTAIN`]; another refusal is reported. None of them is persisted.
+    ///
+    /// A key the effective head does not list is a no-op.
+    fn remove_member_v2(&self, key: &SignKey) -> Result<RosterChain, String> {
+        // One v2 membership mutation at a time, from the candidate's predecessor through
+        // the accepted commit (a phone enrollment or an adoption controller in flight first
+        // finishes, or this is busy).
+        let _reservation = self
+            .reserve_membership_mutation(Instant::now() + self.cfg.pair_publish_wait)
+            .ok_or(MEMBERSHIP_BUSY)?;
+        let mut retried = false;
+        loop {
+            let (candidate, unit_keys, effective, connector, epoch) = {
+                let _c = self.lock_commit();
+                let s = self.pairing_state()?;
+                let effective = self.adoption_effective_chain()?.ok_or(PAIR_NOT_ENABLED)?;
+                let Some((candidate, unit_keys)) =
+                    removal_candidate(&effective, &s.keys, key, now())?
+                else {
+                    return Ok(effective);
+                };
+                let (connector, link, epoch) = {
+                    let l = self.lock();
+                    (l.connector.clone(), l.link.clone(), l.epoch)
+                };
+                let connector = connector.ok_or(PAIR_OTHER_WINDOW)?;
+                if !matches!(link, Some(LinkState::Connected { .. })) {
+                    return Err(REMOVE_OFFLINE.to_string());
+                }
+                (candidate, unit_keys, effective, connector, epoch)
+            };
+            self.adoption_test_point(AdoptionTestPoint::RemoveBeforePublish);
+            let deadline = Instant::now() + self.cfg.pair_publish_wait;
+            match connector.publish_fenced_until(&candidate, deadline, None) {
+                Ok(()) => {
+                    return self
+                        .commit_removal(&effective, &candidate, &unit_keys, &connector, epoch)
+                }
+                Err(e) if removal_conflict(&e) => {
+                    if retried {
+                        return Err(REMOVE_CONFLICT.to_string());
+                    }
+                    retried = true;
+                    // Read again once the Connector holds the head that won.
+                    let head = effective.head().hash();
+                    while connector
+                        .try_chain()
+                        .is_none_or(|c| c.head().hash() == head)
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(e @ (RingError::Relay { .. } | RingError::Roster(_))) => {
+                    return Err(e.to_string())
+                }
+                Err(_) => return Err(REMOVE_UNCERTAIN.to_string()),
+            }
+        }
+    }
+
+    /// The Relay acknowledged `candidate`: committed (with the effective versions before it),
+    /// unless the owner changed meanwhile ([`REMOVE_UNCERTAIN`]: the new owner learns the
+    /// Relay's head on its own).
+    fn commit_removal(
+        &self,
+        effective: &RosterChain,
+        candidate: &SignedRoster,
+        unit_keys: &[SignKey],
+        connector: &Arc<Connector>,
+        epoch: u64,
+    ) -> Result<RosterChain, String> {
+        let chain = {
+            let _c = self.lock_commit();
+            {
+                let l = self.lock();
+                if l.epoch != epoch
+                    || !l
+                        .connector
+                        .as_ref()
+                        .is_some_and(|c| Arc::ptr_eq(c, connector))
+                {
+                    return Err(REMOVE_UNCERTAIN.to_string());
+                }
+            }
+            // The owner's current evidence, not the one the candidate was built under.
+            let current = self.adoption_effective_chain()?.ok_or(PAIR_NOT_ENABLED)?;
+            still_authorized(&current, candidate)?;
+            let s = self.tx(|cur, _| {
+                let s = cur.ok_or(PAIR_NOT_ENABLED)?;
+                let s = commit_acknowledged(s, effective, candidate, unit_keys)?;
+                Ok((Some(s.clone()), s))
+            })?;
             self.hook();
             self.adopt(s.clone());
             s.chain
@@ -3175,43 +3463,95 @@ impl DesktopRing {
         } else {
             None
         };
+        let presence_of = |key: &SignKey| match &live {
+            _ if *key == me && v.connection == "connected" => {
+                PresenceView::of(&MemberPresence::Online {
+                    since: None,
+                    foreground_until: None,
+                })
+            }
+            Some(list) => list
+                .iter()
+                .find(|x| x.member.sign_key == *key)
+                .map(|x| PresenceView::of(&x.presence))
+                .unwrap_or_else(PresenceView::unknown),
+            None => PresenceView::unknown(),
+        };
+        // `host_members` iterates in id order: the first is the smallest.
+        let host_of = |key: &SignKey| {
+            s.host_members
+                .iter()
+                .find(|(id, h)| h.sign_key == *key && configured.contains(id.as_str()))
+                .map(|(id, _)| id.clone())
+        };
+        let membership = head.roster().membership().ok();
         v.members = head
             .roster()
             .members
             .iter()
-            .map(|m| {
-                let presence = match &live {
-                    _ if m.sign_key == me && v.connection == "connected" => {
-                        PresenceView::of(&MemberPresence::Online {
-                            since: None,
-                            foreground_until: None,
-                        })
-                    }
-                    Some(list) => list
-                        .iter()
-                        .find(|x| x.member.sign_key == m.sign_key)
-                        .map(|x| PresenceView::of(&x.presence))
-                        .unwrap_or_else(PresenceView::unknown),
-                    None => PresenceView::unknown(),
-                };
+            .filter_map(|m| {
                 let this_app = m.sign_key == me;
                 let this_computer = s.local_member == Some(m.sign_key);
-                // `host_members` iterates in id order: the first is the smallest.
-                let host_id = s
-                    .host_members
-                    .iter()
-                    .find(|(id, h)| h.sign_key == m.sign_key && configured.contains(id.as_str()))
-                    .map(|(id, _)| id.clone());
-                MemberView {
+                let Some(unit) = membership.as_ref().and_then(|ms| ms.unit_for(&m.sign_key)) else {
+                    let host_id = host_of(&m.sign_key);
+                    return Some(MemberView {
+                        name: m.name.clone(),
+                        role: m.role,
+                        sign_key: m.sign_key,
+                        this_app,
+                        this_computer,
+                        removable: !this_app && !this_computer && host_id.is_none(),
+                        host_id,
+                        presence: presence_of(&m.sign_key),
+                        enrollment_id: None,
+                        kind: None,
+                        daemon_key: None,
+                        daemon_presence: None,
+                    });
+                };
+                let mine = |k: &SignKey| *k == me || s.local_member == Some(*k);
+                let own = unit.members.iter().any(mine);
+                if unit.kind != EnrollmentKind::Computer {
+                    return Some(MemberView {
+                        name: m.name.clone(),
+                        role: m.role,
+                        sign_key: m.sign_key,
+                        this_app,
+                        this_computer,
+                        host_id: host_of(&m.sign_key),
+                        removable: !own,
+                        presence: presence_of(&m.sign_key),
+                        enrollment_id: Some(unit.id.clone()),
+                        kind: Some(unit.kind.clone()),
+                        daemon_key: None,
+                        daemon_presence: None,
+                    });
+                }
+                // One row per Computer, at its Desktop.
+                if m.role != Role::Desktop {
+                    return None;
+                }
+                let daemon = unit.members.iter().copied().find(|k| *k != m.sign_key);
+                let desktop = presence_of(&m.sign_key);
+                let daemon_presence = daemon.map(|k| presence_of(&k));
+                let presence = match &daemon_presence {
+                    Some(d) if desktop.kind != "online" && d.kind == "online" => d.clone(),
+                    _ => desktop,
+                };
+                Some(MemberView {
                     name: m.name.clone(),
                     role: m.role,
                     sign_key: m.sign_key,
                     this_app,
-                    this_computer,
-                    removable: !this_app && !this_computer && host_id.is_none(),
-                    host_id,
+                    this_computer: own,
+                    host_id: daemon.as_ref().and_then(host_of),
+                    removable: !own,
                     presence,
-                }
+                    enrollment_id: Some(unit.id.clone()),
+                    kind: Some(EnrollmentKind::Computer),
+                    daemon_key: daemon,
+                    daemon_presence,
+                })
             })
             .collect();
         v
@@ -6733,5 +7073,564 @@ mod tests {
             retained.noise_key()
         );
         ring.quit();
+    }
+}
+
+#[cfg(test)]
+mod v2_edits_tests {
+    //! Membership edits on a format-v2 Ring (#87): whole-unit removal, a fixed Relay and a
+    //! Host worker that never signs.
+    use super::*;
+    use xshell_protocol::ring::membership::{
+        consent_message, local_consent_context, pairing_consent_context, ConsentProof, Enrollment,
+        Membership, RingPolicy, RosterChange,
+    };
+    use xshell_protocol::ring::{b64, Signature, Signer};
+
+    const RELAY: &str = "ws://127.0.0.1:9";
+
+    struct Observer;
+    impl RingObserver for Observer {
+        fn changed(&self, _: &RingView) {}
+    }
+
+    struct V2 {
+        ring: Arc<DesktopRing>,
+        keys: Arc<DeviceKeys>,
+        me: SignKey,
+        my_daemon: Arc<DeviceKeys>,
+        desk2: Arc<DeviceKeys>,
+        daemon2: Arc<DeviceKeys>,
+        phone: Arc<DeviceKeys>,
+    }
+
+    fn eid(n: u8) -> String {
+        b64::encode(&[n; 32])
+    }
+
+    fn prove(r: &mut Roster, ks: &[&DeviceKeys]) {
+        let mut m = r.membership().unwrap();
+        let context = if matches!(m.change, RosterChange::Enroll { .. }) {
+            pairing_consent_context(r, &[42; 32]).unwrap()
+        } else {
+            local_consent_context(r).unwrap()
+        };
+        let expires_at = r.issued_at + 600;
+        let ps: Vec<ConsentProof> = ks
+            .iter()
+            .map(|k| ConsentProof {
+                key: k.sign_key(),
+                expires_at,
+                context: context.clone(),
+                signature: Signature::from_bytes(
+                    k.sign(&consent_message(r, expires_at, &context).unwrap())
+                        .unwrap(),
+                ),
+            })
+            .collect();
+        match &mut m.change {
+            RosterChange::Genesis { proofs } | RosterChange::Enroll { proofs, .. } => *proofs = ps,
+            _ => unreachable!(),
+        }
+        r.set_membership(&m);
+    }
+
+    fn enroll(
+        prev: &SignedRoster,
+        by: &DeviceKeys,
+        id: String,
+        kind: EnrollmentKind,
+        added: &[(&DeviceKeys, Role, &str)],
+    ) -> SignedRoster {
+        let mut r = prev.roster().clone();
+        r.version += 1;
+        r.prev = Some(prev.hash());
+        r.signed_by = by.sign_key();
+        r.issued_at += 1;
+        for (k, role, name) in added {
+            r.members.push(Member::new(
+                name,
+                *role,
+                k.sign_key(),
+                k.noise_key(),
+                r.issued_at,
+            ));
+        }
+        let mut m = r.membership().unwrap();
+        m.enrollments.push(Enrollment {
+            id: id.clone(),
+            kind,
+            members: added.iter().map(|(k, _, _)| k.sign_key()).collect(),
+            enrolled_at: r.issued_at,
+        });
+        m.change = RosterChange::Enroll {
+            enrollment_id: id,
+            proofs: vec![],
+        };
+        r.set_membership(&m);
+        let ks: Vec<&DeviceKeys> = added.iter().map(|(k, _, _)| *k).collect();
+        prove(&mut r, &ks);
+        let next = r.sign(by).unwrap();
+        xshell_protocol::ring::verify_successor(prev, &next).unwrap();
+        next
+    }
+
+    /// This Computer (Desktop "desk" + its Daemon), a second Computer and a phone, in a v2
+    /// Ring whose Relay is unreachable (the Connector exists but never connects).
+    fn v2_ring(t: &tempfile::TempDir) -> V2 {
+        v2_ring_with(t, None, Duration::from_millis(10))
+    }
+
+    fn v2_ring_with(
+        t: &tempfile::TempDir,
+        hook: Option<AdoptionTestHook>,
+        backoff: Duration,
+    ) -> V2 {
+        let dir = t.path().join("ring");
+        let store = Store::new(dir.clone());
+        let keys = store.retained_keys().unwrap();
+        let gen = |_| Arc::new(DeviceKeys::generate().unwrap());
+        let (my_daemon, desk2, daemon2, phone) = (gen(0), gen(1), gen(2), gen(3));
+        let mut g = Roster {
+            v: 2,
+            ring_id: RingId::derive(&keys.sign_key()),
+            version: 1,
+            prev: None,
+            relay_url: RELAY.into(),
+            signed_by: keys.sign_key(),
+            issued_at: 1000,
+            members: vec![
+                Member::new(
+                    "desk",
+                    Role::Desktop,
+                    keys.sign_key(),
+                    keys.noise_key(),
+                    1000,
+                ),
+                Member::new(
+                    "desk",
+                    Role::Daemon,
+                    my_daemon.sign_key(),
+                    my_daemon.noise_key(),
+                    1000,
+                ),
+            ],
+            extra: Default::default(),
+        };
+        g.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: eid(1),
+                kind: EnrollmentKind::Computer,
+                members: vec![keys.sign_key(), my_daemon.sign_key()],
+                enrolled_at: 1000,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: Some(30 * 24 * 3600),
+                activity_key: keys.sign_key(),
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        });
+        prove(&mut g, &[&keys, &my_daemon]);
+        let g = g.sign(&*keys).unwrap();
+        let v2 = enroll(
+            &g,
+            &keys,
+            eid(2),
+            EnrollmentKind::Computer,
+            &[
+                (&desk2, Role::Desktop, "laptop"),
+                (&daemon2, Role::Daemon, "laptop"),
+            ],
+        );
+        let v3 = enroll(
+            &v2,
+            &keys,
+            eid(3),
+            EnrollmentKind::Mobile,
+            &[(&phone, Role::Mobile, "phone")],
+        );
+        let chain = RosterChain::from_chain(vec![g, v2, v3]).unwrap();
+        store
+            .transact(|_, _| {
+                Ok((
+                    Some(RingState {
+                        keys: keys.clone(),
+                        chain,
+                        local_member: Some(my_daemon.sign_key()),
+                        farewells: vec![],
+                        held_relays: BTreeSet::new(),
+                        host_members: BTreeMap::new(),
+                    }),
+                    (),
+                ))
+            })
+            .unwrap();
+        let mut c = DesktopRingConfig::new(dir, "desk".into());
+        c.default_relay_url = RELAY.into();
+        c.hosted_relay_url = RELAY.into();
+        c.backoff_unit = backoff;
+        c.adoption_test_hook = hook;
+        let ring = DesktopRing::open(c, Arc::new(Observer));
+        assert_eq!(ring.chain().unwrap().head().version(), 3);
+        V2 {
+            ring,
+            me: keys.sign_key(),
+            keys,
+            my_daemon,
+            desk2,
+            daemon2,
+            phone,
+        }
+    }
+
+    fn stored(t: &tempfile::TempDir) -> RingState {
+        Store::new(t.path().join("ring")).load().unwrap().0.unwrap()
+    }
+
+    fn host(id: &str, k: &DeviceKeys) -> (HostRef, LocalIdentity) {
+        (
+            HostRef {
+                id: id.into(),
+                name: "laptop".into(),
+                target: format!("{id}|"),
+            },
+            LocalIdentity {
+                sign_key: k.sign_key(),
+                noise_key: k.noise_key(),
+                name: "laptop".into(),
+            },
+        )
+    }
+
+    /// The candidate a v2 removal publishes, and the state committed on the Relay's
+    /// acknowledgment.
+    fn removed(t: &tempfile::TempDir, x: &V2, key: &SignKey) -> (SignedRoster, RingState) {
+        let s = stored(t);
+        let (candidate, unit) = removal_candidate(&s.chain, &x.keys, key, now())
+            .unwrap()
+            .unwrap();
+        let committed = commit_acknowledged(s.clone(), &s.chain, &candidate, &unit).unwrap();
+        (candidate, committed)
+    }
+
+    fn assert_computer_removed(x: &V2, candidate: &SignedRoster, s: &RingState) {
+        assert_eq!(candidate.version(), 4);
+        let m = candidate.roster().membership().unwrap();
+        assert!(
+            matches!(m.change, RosterChange::Remove { ref enrollment_id } if *enrollment_id == eid(2))
+        );
+        assert!(m.retired.contains(&eid(2)));
+        assert!(candidate.member(&x.desk2.sign_key()).is_none());
+        assert!(candidate.member(&x.daemon2.sign_key()).is_none());
+        assert_eq!(candidate.roster().members.len(), 3);
+        assert_eq!(s.chain.head(), candidate);
+    }
+
+    #[test]
+    fn v2_remove_member_removes_whole_computer() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        for key in [x.desk2.sign_key(), x.daemon2.sign_key()] {
+            let (candidate, s) = removed(&t, &x, &key);
+            assert_computer_removed(&x, &candidate, &s);
+        }
+        // A key the head does not list is a no-op.
+        let stranger = DeviceKeys::generate().unwrap();
+        assert!(
+            removal_candidate(&stored(&t).chain, &x.keys, &stranger.sign_key(), now())
+                .unwrap()
+                .is_none()
+        );
+        x.ring.quit();
+    }
+
+    #[test]
+    fn v2_remove_member_refuses_own_unit() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        assert_eq!(x.ring.remove_member(&x.me).unwrap_err(), REMOVE_SELF);
+        assert_eq!(
+            x.ring.remove_member(&x.my_daemon.sign_key()).unwrap_err(),
+            REMOVE_SELF
+        );
+        assert_eq!(stored(&t).chain.head().version(), 3, "nothing signed");
+        x.ring.quit();
+    }
+
+    #[test]
+    fn v2_remove_phone_unit() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let (c, s) = removed(&t, &x, &x.phone.sign_key());
+        assert_eq!(c.version(), 4);
+        assert!(c.member(&x.phone.sign_key()).is_none());
+        let m = c.roster().membership().unwrap();
+        assert!(m.retired.contains(&eid(3)));
+        assert_eq!(m.enrollments.len(), 2);
+        assert_eq!(s.chain.head(), &c);
+        x.ring.quit();
+    }
+
+    /// Without a connected Relay nothing is signed into the store, and asking again tries
+    /// again (no silent no-op).
+    #[test]
+    fn v2_remove_offline_is_refused_and_not_persisted() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        for _ in 0..2 {
+            assert_eq!(
+                x.ring.remove_member(&x.desk2.sign_key()).unwrap_err(),
+                REMOVE_OFFLINE
+            );
+            assert_eq!(stored(&t).chain.head().version(), 3);
+            assert_eq!(x.ring.chain().unwrap().head().version(), 3);
+        }
+        x.ring.quit();
+    }
+
+    /// Same-head terminal evidence held by the Connector fences this Desktop's signing
+    /// authority: no Remove is built, published or committed.
+    #[test]
+    fn v2_terminal_expired_signer_cannot_remove() {
+        use xshell_protocol::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
+        use xshell_protocol::ring::relay::ChainPin;
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let connector = x.ring.lock().connector.clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while connector
+            .try_chain()
+            .is_none_or(|c| c.head().version() != 3)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let head = x.ring.chain().unwrap().head().clone();
+        let m = head.roster().membership().unwrap();
+        let evidence = ActivityEvidence {
+            ring_id: head.ring_id().clone(),
+            relay_url: RELAY.into(),
+            policy_head_hash: head.hash(),
+            policy_hash: policy_hash(&m.policy),
+            observed_at: head.roster().issued_at + 31 * 24 * 3600,
+            units: vec![UnitActivity {
+                enrollment_id: eid(1),
+                member_keys: vec![x.me, x.my_daemon.sign_key()],
+                online: false,
+                last_active: 1000,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&*x.keys)
+        .unwrap();
+        connector
+            .test_observe_activity(
+                &ChainPin {
+                    version: 3,
+                    hash: head.hash(),
+                },
+                x.me,
+                &evidence,
+                || {},
+            )
+            .unwrap();
+        assert!(connector.chain().authorized_member(&x.me).is_none());
+        let e = x.ring.remove_member(&x.desk2.sign_key()).unwrap_err();
+        assert!(e.contains("terminal"), "{e}");
+        assert_eq!(stored(&t).chain.head().version(), 3, "nothing committed");
+        assert!(
+            connector.chain().authorized_member(&x.me).is_none(),
+            "the fence stays"
+        );
+        x.ring.quit();
+    }
+
+    #[test]
+    fn v2_set_relay_url_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        assert_eq!(
+            x.ring.set_relay_url("ws://127.0.0.1:10").unwrap_err(),
+            RELAY_FIXED
+        );
+        assert!(RELAY_FIXED.starts_with("relay_fixed: "));
+        // The same URL stays a no-op.
+        assert_eq!(x.ring.set_relay_url(RELAY).unwrap().head().version(), 3);
+        assert_eq!(stored(&t).chain.head().version(), 3);
+        x.ring.quit();
+    }
+
+    #[test]
+    fn v2_ensure_host_daemons_never_signs() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let stranger = DeviceKeys::generate().unwrap();
+        let (c, out) = x
+            .ring
+            .ensure_host_daemons(
+                &[
+                    host("h_aaaaaaaa", &x.daemon2),
+                    host("h_bbbbbbbb", &stranger),
+                ],
+                &|_| true,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.head().version(), 3, "nothing signed");
+        let of = |id: &str| out.iter().find(|(h, _)| h == id).unwrap().1;
+        assert_eq!(of("h_aaaaaaaa"), HostOutcome::Joined);
+        assert_eq!(of("h_bbbbbbbb"), HostOutcome::NeedsEnrollment);
+        let s = stored(&t);
+        assert_eq!(s.chain.head().version(), 3);
+        // The enrolled key's mapping applies; the unenrolled one is not mapped.
+        assert_eq!(s.host_members["h_aaaaaaaa"].sign_key, x.daemon2.sign_key());
+        assert!(!s.host_members.contains_key("h_bbbbbbbb"));
+        // A reinstall (same place, new key) neither removes the old Daemon nor maps the new.
+        let reinstall = DeviceKeys::generate().unwrap();
+        let (c, out) = x
+            .ring
+            .ensure_host_daemons(&[host("h_aaaaaaaa", &reinstall)], &|_| true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.head().version(), 3);
+        assert_eq!(out[0].1, HostOutcome::NeedsEnrollment);
+        assert!(c.head().member(&x.daemon2.sign_key()).is_some());
+        assert_eq!(
+            stored(&t).host_members["h_aaaaaaaa"].sign_key,
+            x.daemon2.sign_key()
+        );
+        x.ring.quit();
+    }
+
+    /// A configured SSH Host does not block a v2 removal (no REMOVE_IN_USE); the committed
+    /// state drops only its Ring mapping. (The Settings file is never touched; the workerd
+    /// test checks that end to end.)
+    #[test]
+    fn v2_remove_keeps_ssh_host_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        x.ring
+            .ensure_host_daemons(&[host("h_aaaaaaaa", &x.daemon2)], &|_| true, None)
+            .unwrap()
+            .unwrap();
+        x.ring.set_configured_hosts(Arc::new(|_: &str| true));
+        assert!(stored(&t).host_members.contains_key("h_aaaaaaaa"));
+        let (candidate, s) = removed(&t, &x, &x.daemon2.sign_key());
+        assert_computer_removed(&x, &candidate, &s);
+        assert!(!s.host_members.contains_key("h_aaaaaaaa"));
+        assert_eq!(s.local_member, Some(x.my_daemon.sign_key()));
+        x.ring.quit();
+    }
+
+    #[test]
+    fn v2_view_groups_computer_unit() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let v = x.ring.view();
+        assert_eq!(
+            v.members.len(),
+            3,
+            "two Computers and a phone: {:?}",
+            v.members
+        );
+        let own = v.members.iter().find(|m| m.sign_key == x.me).unwrap();
+        assert_eq!(own.kind, Some(EnrollmentKind::Computer));
+        assert_eq!(own.daemon_key, Some(x.my_daemon.sign_key()));
+        assert!(own.this_app && own.this_computer && !own.removable);
+        let other = v
+            .members
+            .iter()
+            .find(|m| m.sign_key == x.desk2.sign_key())
+            .unwrap();
+        assert_eq!(other.name, "laptop");
+        assert_eq!(other.role, Role::Desktop);
+        assert_eq!(other.enrollment_id.as_deref(), Some(eid(2).as_str()));
+        assert_eq!(other.daemon_key, Some(x.daemon2.sign_key()));
+        assert!(!other.this_app && !other.this_computer && other.removable);
+        assert!(v.members.iter().all(|m| m.sign_key != x.daemon2.sign_key()));
+        let phone = v
+            .members
+            .iter()
+            .find(|m| m.sign_key == x.phone.sign_key())
+            .unwrap();
+        assert_eq!(phone.kind, Some(EnrollmentKind::Mobile));
+        assert_eq!(phone.daemon_key, None);
+        assert!(phone.removable);
+        let json = serde_json::to_value(other).unwrap();
+        assert_eq!(json["kind"], "computer");
+        assert_eq!(json["daemonKey"], x.daemon2.sign_key().to_string());
+        assert_eq!(json["enrollmentId"], eid(2));
+        x.ring.quit();
+    }
+
+    /// Terminal evidence installed after the candidate was built (at the publication seam)
+    /// refuses the upload: the fenced publication sees it, nothing is committed.
+    #[test]
+    fn v2_terminal_evidence_at_publication_refuses_the_upload() {
+        use xshell_protocol::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
+        use xshell_protocol::ring::relay::ChainPin;
+        let t = tempfile::tempdir().unwrap();
+        type Seam = Box<dyn Fn() + Send + Sync>;
+        let slot: Arc<Mutex<Option<Seam>>> = Arc::new(Mutex::new(None));
+        let seam = slot.clone();
+        let hook = AdoptionTestHook(Arc::new(move |p| {
+            if p == AdoptionTestPoint::RemoveBeforePublish {
+                if let Some(f) = seam.lock().unwrap().as_ref() {
+                    f();
+                }
+            }
+        }));
+        // A long backoff: after the first failed dial the link stays as this test sets it.
+        let x = v2_ring_with(&t, Some(hook), Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while x.ring.view().connection != "waiting" {
+            assert!(Instant::now() < deadline, "{:?}", x.ring.view().connection);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let connector = x.ring.lock().connector.clone().unwrap();
+        let head = x.ring.chain().unwrap().head().clone();
+        let m = head.roster().membership().unwrap();
+        let evidence = ActivityEvidence {
+            ring_id: head.ring_id().clone(),
+            relay_url: RELAY.into(),
+            policy_head_hash: head.hash(),
+            policy_hash: policy_hash(&m.policy),
+            observed_at: head.roster().issued_at + 31 * 24 * 3600,
+            units: vec![UnitActivity {
+                enrollment_id: eid(1),
+                member_keys: vec![x.me, x.my_daemon.sign_key()],
+                online: false,
+                last_active: 1000,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&*x.keys)
+        .unwrap();
+        let (c, me, hash) = (connector.clone(), x.me, head.hash());
+        *slot.lock().unwrap() = Some(Box::new(move || {
+            c.test_with_stable_attempt(|| {
+                c.test_observe_activity(
+                    &ChainPin {
+                        version: 3,
+                        hash: hash.clone(),
+                    },
+                    me,
+                    &evidence,
+                    || {},
+                )
+            })
+            .unwrap();
+        }));
+        // Pretend the link is up so the removal reaches its publication.
+        x.ring.lock().link = Some(LinkState::Connected { limited: false });
+        assert!(connector.chain().authorized_member(&x.me).is_some());
+        let e = x.ring.remove_member(&x.desk2.sign_key()).unwrap_err();
+        assert!(e.contains("terminal"), "{e}");
+        assert_eq!(stored(&t).chain.head().version(), 3, "nothing committed");
+        assert_eq!(x.ring.chain().unwrap().head().version(), 3);
+        assert!(connector.chain().authorized_member(&x.me).is_none());
+        x.ring.quit();
     }
 }
