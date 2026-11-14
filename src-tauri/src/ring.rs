@@ -153,15 +153,16 @@ pub fn setup(app: &AppHandle) {
     }
     // Persist denial before a sidecar/endpoint can fail. This metadata grants no policy
     // or key authority and is also required when local terminals run in-process.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Some(home) = dirs::home_dir().and_then(|h| h.canonicalize().ok()) {
         if let Err(error) = ring.reserve_local_companion(&home) {
             eprintln!("xshell: cannot reserve local Computer association: {error}");
         }
     }
     // Register even before membership. Followers never register another profile. The
-    // registration child cannot start serve or release Computer consent.
-    #[cfg(unix)]
+    // registration child cannot start serve or release Computer consent. Windows registers
+    // in process with the live GUI-bound Daemon (never a child or serve).
+    #[cfg(any(unix, windows))]
     if let Some(daemon) = app
         .try_state::<crate::hosts::Hosts>()
         .and_then(|h| h.local_daemon.clone())
@@ -183,7 +184,7 @@ pub fn setup(app: &AppHandle) {
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let owner_ring = Arc::downgrade(&ring);
         let focus_app = app.clone();

@@ -411,7 +411,6 @@ impl JoinRegistry {
 
     /// The CLI offers seen for the first time: tracked, and returned to watch. Forgets the
     /// tombstones of offers no longer listed.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn track_cli(&self, listed: Vec<(Uuid, Arc<JoinOffer>)>) -> Vec<(Uuid, Arc<JoinEntry>)> {
         let mut inner = self.lock();
         let ids: HashSet<Uuid> = listed.iter().map(|(op, _)| *op).collect();
@@ -498,7 +497,7 @@ fn watch<R: tauri::Runtime>(
 }
 
 /// From the 100 ms owner thread: tracks Joins that `xshelld pair` started on this computer.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn track_cli_joins(app: &AppHandle, ring: &xshell_hostlink::ring::DesktopRing) {
     let Some(state) = app.try_state::<RingState>() else {
         return;
@@ -535,7 +534,7 @@ pub fn refresh_approval(app: &AppHandle) -> &'static str {
     let Some(state) = app.try_state::<RingState>() else {
         return "none";
     };
-    let local = cfg!(unix) && !local_in_process(app);
+    let local = cfg!(any(unix, windows)) && !local_in_process(app);
     let text = state
         .worker
         .ring
@@ -550,7 +549,7 @@ pub fn refresh_approval(app: &AppHandle) -> &'static str {
 }
 
 fn ensure_local(app: &AppHandle) -> Result<(), String> {
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return Err("unavailable: platform".into());
     }
     if local_in_process(app) {
@@ -709,7 +708,7 @@ pub async fn ring_join_cancel(app: AppHandle, operation: Uuid) -> Result<(), Str
 pub async fn ring_join_overview(app: AppHandle) -> Result<JoinOverview, String> {
     let w = worker(&app)?;
     run(move || {
-        let unavailable = if !cfg!(unix) {
+        let unavailable = if !cfg!(any(unix, windows)) {
             Some("platform")
         } else if local_in_process(&app) {
             Some("in-process")
