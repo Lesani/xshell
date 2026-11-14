@@ -426,3 +426,193 @@ fn proposal_contract_mobile_scenarios_on_production_workerd() {
         scenario(&relay.target());
     }
 }
+
+/// A Desktop whose v2 phone pairing stops at `at` until the test resumes it.
+fn paused(
+    relay: &Relay,
+    at: xshell_hostlink::ring::AdoptionTestPoint,
+) -> (
+    Computer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached, reached_rx) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel::<()>();
+    let resume_rx = Mutex::new(resume_rx);
+    let c = Computer::with_ring_config(relay, move |cfg| {
+        cfg.adoption_test_hook = Some(xshell_hostlink::ring::AdoptionTestHook(Arc::new(
+            move |point| {
+                if point == at {
+                    let _ = reached.send(());
+                    let _ = resume_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60));
+                }
+            },
+        )));
+    });
+    (c, reached_rx, resume)
+}
+
+#[test]
+fn scoped_cancel_after_the_send_boundary_is_never_no_commit() {
+    use xshell_protocol::pairing_access::enrollment::{
+        EnrollmentEvidence, EnrollmentParameters, PairOperationId, RecipientIdentity,
+    };
+    use xshell_protocol::pairing_access::MobileRole;
+    let mut relay = Relay::start();
+    let (a, reached, resume) = paused(
+        &relay,
+        xshell_hostlink::ring::AdoptionTestPoint::PhonePublishedBeforeReadBack,
+    );
+    let created = a.create();
+    connected(&a);
+    let version = created.head().version();
+    let scope = a
+        .ring
+        .enrollment_scope(created.ring_id(), "my phone".into())
+        .unwrap();
+    let target = scope.enrollment.clone().unwrap();
+    let phone = phone_keys(40);
+    let parameters = EnrollmentParameters {
+        ring: created.ring_id().clone(),
+        approver: RecipientIdentity {
+            signing: scope.approver,
+            noise: target.approver_noise,
+        },
+        recipient: RecipientIdentity {
+            signing: phone.sign_key(),
+            noise: phone.noise_key(),
+        },
+        relay: target.relay.clone(),
+        role: MobileRole::Mobile,
+        device_name: "my phone".into(),
+        initial_head: target.initial_head.clone(),
+        expires_at: xshell_protocol::ring::relay::contract::now() + 300,
+    };
+    let task = uuid::Uuid::new_v4();
+    let operation = PairOperationId::new(uuid::Uuid::new_v4()).unwrap();
+    let start = a
+        .ring
+        .enrollment_offer(task, operation, parameters)
+        .unwrap();
+    let scoped = PairingOffer::parse(start.offer.expose()).unwrap();
+    assert!(scoped.head.is_some());
+    let scanner = {
+        let phone = phone.clone();
+        std::thread::spawn(move || scan(&scoped, &phone))
+    };
+    reached.recv_timeout(Duration::from_secs(30)).unwrap();
+    // The candidate was handed to the Relay; its acknowledgment is withheld.
+    let evidence = |cancel| {
+        a.ring
+            .enrollment_status(task, operation, cancel)
+            .receipt
+            .map(|r| r.evidence)
+    };
+    assert_eq!(evidence(true), Some(EnrollmentEvidence::OutcomeUnknown));
+    // The accepted read-back then fails too: still uncertain, never no-commit.
+    relay.restart();
+    resume.send(()).unwrap();
+    assert!(scanner.join().unwrap().is_err());
+    assert_eq!(evidence(false), Some(EnrollmentEvidence::OutcomeUnknown));
+    connected(&a);
+    // Whatever the Relay did, the same keys learn it: recovery, or a clean first pairing.
+    let landed = relay_head(&relay, &created) == version + 1;
+    let (o, _) = offer(&a);
+    let again = scan(&o, &phone).unwrap();
+    assert_eq!(again.already_enrolled, landed);
+    assert_mobile_unit(&again.chain, &phone.sign_key());
+}
+
+#[test]
+fn a_head_change_at_the_send_boundary_is_stale_not_uncertain() {
+    let relay = Relay::start();
+    let (a, reached, resume) = paused(
+        &relay,
+        xshell_hostlink::ring::AdoptionTestPoint::PhoneBeforePublish,
+    );
+    a.create();
+    connected(&a);
+    let b = Computer::new(&relay);
+    b.join(&a);
+    connected(&b);
+    let (o, obs) = offer(&a);
+    let phone = phone_keys(41);
+    let scanner = {
+        let phone = phone.clone();
+        std::thread::spawn(move || scan(&o, &phone))
+    };
+    reached.recv_timeout(Duration::from_secs(30)).unwrap();
+    // Between the predecessor check and the send, Desktop B moves the head.
+    let (o2, _) = offer(&b);
+    let moved = scan(&o2, &phone_keys(42)).unwrap();
+    wait_head(&a, moved.chain.head().version());
+    resume.send(()).unwrap();
+    assert_eq!(
+        scanner.join().unwrap().unwrap_err(),
+        PairError::Refused(PairRefusal::Stale)
+    );
+    assert_eq!(
+        obs.outcome(),
+        PairingEvent::Failed {
+            code: "stale".into()
+        }
+    );
+    assert_eq!(
+        relay_head(&relay, &moved.chain),
+        moved.chain.head().version()
+    );
+    let head = a.ring.chain().unwrap().head().clone();
+    assert_eq!(head, *moved.chain.head());
+    assert!(head.member(&phone.sign_key()).is_none());
+}
+
+#[test]
+fn a_phone_cancelled_at_consent_sends_an_authenticated_decline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    let created = a.create();
+    connected(&a);
+    let phone = phone_keys(43);
+    // The user cancels while the consent callback runs; the callback then declines (or,
+    // racing, approves): either way the approver hears an authenticated cancellation.
+    for approve in [false, true] {
+        let (o, obs) = offer(&a);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let r = adopt_mobile_as_guest_with_ready(
+            &MobileAdoptionRequest {
+                offer: &o,
+                keys: phone.clone(),
+                name: "my phone",
+                until: Instant::now() + Duration::from_secs(60),
+            },
+            &PairOptions::default(),
+            Some(&cancel),
+            || Ok(()),
+            move |_| {
+                flag.store(true, Ordering::Release);
+                Ok(approve)
+            },
+        );
+        assert_eq!(r.unwrap_err(), PairError::Cancelled, "approve={approve}");
+        assert_eq!(
+            obs.outcome(),
+            PairingEvent::Failed {
+                code: "cancelled".into()
+            },
+            "approve={approve}"
+        );
+        assert_eq!(relay_head(&relay, &created), created.head().version());
+        assert!(a
+            .ring
+            .chain()
+            .unwrap()
+            .head()
+            .member(&phone.sign_key())
+            .is_none());
+    }
+}

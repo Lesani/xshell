@@ -329,6 +329,10 @@ pub enum AdoptionTestPoint {
     CompletionBeforePublish,
     UpgradeBeforeUncertainWrite,
     UpgradeBeforePublish,
+    /// v2 phone pairing: predecessor checked and publication marked, before the send.
+    PhoneBeforePublish,
+    /// v2 phone pairing: candidate sent, before the accepted read-back.
+    PhonePublishedBeforeReadBack,
     RetainedPublicationAttempt,
     AcceptedBeforeCompanionInstall,
     /// Accepted readback/guest Joined has returned; controller journal/return has not.
@@ -637,6 +641,10 @@ struct EnrollmentOperation {
     response: EnrollmentResponse,
     released: bool,
     reserved: bool,
+    /// A v2 phone candidate may have reached the Relay: from here a cancellation reports an
+    /// unknown outcome, never `NoDesktopCommit`. Set under the commit and Live locks, the
+    /// same synchronization `enrollment_status` cancels under.
+    publishing: bool,
 }
 #[derive(Default)]
 struct Live {
@@ -2028,6 +2036,7 @@ impl DesktopRing {
                 },
                 released: false,
                 reserved: false,
+                publishing: false,
             });
         }
         struct Observer;
@@ -2111,6 +2120,7 @@ impl DesktopRing {
             enrollment.released = true;
         }
         if cancel
+            && !enrollment.publishing
             && matches!(
                 enrollment.response.receipt.as_ref().map(|r| &r.evidence),
                 Some(EnrollmentEvidence::OutcomeUnknown)
@@ -2547,7 +2557,7 @@ impl DesktopRing {
         enrollment: Option<(uuid::Uuid, &EnrollmentParameters)>,
     ) -> Result<JoinRequest, PairError> {
         use xshell_protocol::ring::pairing::adoption::{enroll_proposal, JoinTarget};
-        use xshell_protocol::ring::relay::connector::ProposalConnection;
+        use xshell_protocol::ring::relay::connector::{ProposalConnection, PublishFailure};
         use xshell_protocol::ring::relay::pair::{
             approve_mobile_adoption, MobileHostRequest, Prepared,
         };
@@ -2667,21 +2677,35 @@ impl DesktopRing {
                 {
                     return Err(refused(PairRefusal::Expired));
                 }
-                if captured.check_current().is_err() {
+                let pre_send = |_| {
                     let moved = self
                         .adoption_owner_connector()
                         .is_some_and(|c| c.chain().head().hash() != initial_head);
-                    return Err(refused(if moved {
+                    refused(if moved {
                         PairRefusal::Stale
                     } else {
                         PairRefusal::NotCommitted
-                    }));
-                }
+                    })
+                };
+                captured.check_current().map_err(pre_send)?;
+                let operation = enrollment.map(|(operation, _)| operation);
+                self.begin_phone_publication(cancel, operation)
+                    .map_err(refused)?;
+                self.adoption_test_point(AdoptionTestPoint::PhoneBeforePublish);
                 self.publish_wait_hook();
-                // From here the candidate may be at the Relay: any failure is uncertain.
-                captured
-                    .publish_once(signed)
-                    .map_err(|_| refused(PairRefusal::PublicationUncertain))?;
+                match captured.publish_once_classified(signed) {
+                    Ok(()) => {}
+                    Err(PublishFailure::NotSent(e)) => {
+                        // Proven pre-send termination: nothing can be at the Relay.
+                        self.end_unsent_phone_publication(operation);
+                        return Err(pre_send(e));
+                    }
+                    // From here the candidate may be at the Relay: failures are uncertain.
+                    Err(PublishFailure::MaybeSent(_)) => {
+                        return Err(refused(PairRefusal::PublicationUncertain))
+                    }
+                }
+                self.adoption_test_point(AdoptionTestPoint::PhonePublishedBeforeReadBack);
                 let accepted = captured
                     .read_accepted(signed)
                     .map_err(|_| refused(PairRefusal::PublicationUncertain))?;
@@ -2722,6 +2746,52 @@ impl DesktopRing {
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
             .ok_or(PairError::Cancelled)
+    }
+
+    /// The send boundary of a v2 phone candidate. Atomically with `enrollment_status`
+    /// cancellation (commit lock, then Live lock): a cancellation that came first wins
+    /// (`Cancelled`, nothing sent); otherwise the scoped receipt can no longer become
+    /// `NoDesktopCommit`.
+    fn begin_phone_publication(
+        &self,
+        cancel: &Cancel,
+        operation: Option<uuid::Uuid>,
+    ) -> Result<(), PairRefusal> {
+        let _commit = self.lock_commit();
+        let mut live = self.lock();
+        if cancel.load(Ordering::Acquire) || live.quitting {
+            return Err(PairRefusal::Cancelled);
+        }
+        if let Some(operation) = operation {
+            let Some(enrollment) = live.enrollment.as_mut().filter(|e| {
+                e.response
+                    .progress
+                    .as_ref()
+                    .is_some_and(|p| p.operation.uuid() == operation)
+            }) else {
+                return Err(PairRefusal::Cancelled);
+            };
+            if enrollment.released {
+                return Err(PairRefusal::Cancelled);
+            }
+            enrollment.publishing = true;
+        }
+        Ok(())
+    }
+
+    /// The candidate provably never left: cancellation may again prove no commit.
+    fn end_unsent_phone_publication(&self, operation: Option<uuid::Uuid>) {
+        let Some(operation) = operation else { return };
+        let _commit = self.lock_commit();
+        let mut live = self.lock();
+        if let Some(enrollment) = live.enrollment.as_mut().filter(|e| {
+            e.response
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.operation.uuid() == operation)
+        }) {
+            enrollment.publishing = false;
+        }
     }
 
     /// Installs a Relay-accepted extension of the held chain (committed, adopted, shown).

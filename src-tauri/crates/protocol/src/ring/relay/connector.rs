@@ -2010,25 +2010,34 @@ impl ProposalConnection {
     }
 
     pub fn publish_once(&self, next: &SignedRoster) -> Result<(), RingError> {
-        self.current()?;
+        self.publish_once_classified(next)
+            .map_err(PublishFailure::into_error)
+    }
+
+    /// [`Self::publish_once`], telling whether a failure happened before the candidate could
+    /// reach the Relay ([`PublishFailure::NotSent`]: proven nothing published by this call)
+    /// or at/after the send boundary ([`PublishFailure::MaybeSent`]: outcome unknown).
+    pub fn publish_once_classified(&self, next: &SignedRoster) -> Result<(), PublishFailure> {
+        let not_sent = PublishFailure::NotSent;
+        self.current().map_err(not_sent)?;
         if !self.created.load(std::sync::atomic::Ordering::Acquire)
             || next.roster().prev != Some(self.predecessor.hash())
             || next.version() != self.predecessor.version() + 1
         {
-            return Err(RingError::Invalid(
+            return Err(not_sent(RingError::Invalid(
                 "publication is not the frozen proposal successor".into(),
-            ));
+            )));
         }
         let mut unsigned = next.roster().clone();
-        let mut membership = unsigned.membership()?;
+        let mut membership = unsigned.membership().map_err(|e| not_sent(e.into()))?;
         let proofs = match &mut membership.change {
             crate::ring::membership::RosterChange::Enroll { proofs, .. }
             | crate::ring::membership::RosterChange::CompleteComputer { proofs, .. }
             | crate::ring::membership::RosterChange::Upgrade { proofs } => proofs,
             _ => {
-                return Err(RingError::Invalid(
+                return Err(not_sent(RingError::Invalid(
                     "publication must be frozen adoption".into(),
-                ))
+                )))
             }
         };
         proofs.clear();
@@ -2040,23 +2049,42 @@ impl ProposalConnection {
             .as_ref()
             != Some(&unsigned)
         {
-            return Err(RingError::Invalid(
+            return Err(not_sent(RingError::Invalid(
                 "publication differs from frozen proposal".into(),
-            ));
+            )));
         }
-        crate::ring::verify_successor(&self.predecessor, next)?;
+        crate::ring::verify_successor(&self.predecessor, next).map_err(|e| not_sent(e.into()))?;
         if self
             .published
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            return Err(RingError::Invalid(
+            // An earlier call may already have sent it.
+            return Err(PublishFailure::MaybeSent(RingError::Invalid(
                 "proposal publication is one-shot; reconcile instead".into(),
-            ));
+            )));
         }
         *self
             .published_token
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(next.token().into());
-        self.client.publish_roster(next)
+        self.client
+            .publish_roster(next)
+            .map_err(PublishFailure::MaybeSent)
+    }
+}
+
+/// Why [`ProposalConnection::publish_once_classified`] failed, relative to the send boundary.
+#[derive(Debug)]
+pub enum PublishFailure {
+    /// Refused before the candidate was handed to the socket: nothing was sent.
+    NotSent(RingError),
+    /// The candidate was (or may have been) handed to the Relay: the outcome is unknown.
+    MaybeSent(RingError),
+}
+impl PublishFailure {
+    pub fn into_error(self) -> RingError {
+        match self {
+            Self::NotSent(e) | Self::MaybeSent(e) => e,
+        }
     }
 }

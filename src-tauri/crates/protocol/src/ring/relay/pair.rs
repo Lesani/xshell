@@ -51,6 +51,9 @@ impl Default for PairOptions {
 /// Polled while blocking, so a pairing can be cancelled from another thread.
 pub type Cancel = Arc<AtomicBool>;
 
+/// The bound on a guest's authenticated decline after its consent callback.
+const DECLINE_SEND: Duration = Duration::from_secs(2);
+
 /// How often a blocked read looks at the cancel flag.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -123,6 +126,15 @@ impl PairPipe {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::send`] with at most `max` for this one write (still within the offer deadline).
+    pub fn send_within(&mut self, msg: &[u8], max: Duration) -> Result<(), PairError> {
+        let step = self.opts.step;
+        self.opts.step = step.min(max);
+        let r = self.send(msg);
+        self.opts.step = step;
+        r
     }
 
     pub fn send(&mut self, msg: &[u8]) -> Result<(), PairError> {
@@ -697,15 +709,23 @@ fn adopt_guest(
         until,
         cancel,
     })?;
-    live(until, cancel)?;
-    if !approved {
-        let decision = AdoptionDecision::Cancel {
-            operation: handle.operation.clone(),
-            proposal_hash: consent_proposal_hash(&verified.proposal)
-                .map_err(|e| PairError::Payload(e.to_string()))?,
-        };
-        pipe.send(&guest.encrypt(&serde_json::to_vec(&decision).expect("cancel serializes"))?)?;
+    let cancelled = cancel.is_some_and(|c| c.load(Ordering::Acquire));
+    if !approved || cancelled {
+        // A decline (or a cancellation during consent) is told to the approver,
+        // authenticated, with a short deadline of its own and regardless of the cancel flag.
+        // No consent is ever signed after it.
+        if Instant::now() < until {
+            let decision = AdoptionDecision::Cancel {
+                operation: handle.operation.clone(),
+                proposal_hash: consent_proposal_hash(&verified.proposal)
+                    .map_err(|e| PairError::Payload(e.to_string()))?,
+            };
+            let message =
+                guest.encrypt(&serde_json::to_vec(&decision).expect("cancel serializes"))?;
+            let _ = pipe.send_within(&message, DECLINE_SEND);
+        }
         pipe.close();
+        live(until, None)?;
         return Err(PairError::Cancelled);
     }
     live(until, cancel)?;
