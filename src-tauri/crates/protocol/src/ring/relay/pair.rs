@@ -53,6 +53,9 @@ pub type Cancel = Arc<AtomicBool>;
 
 /// The bound on a guest's authenticated decline after its consent callback.
 const DECLINE_SEND: Duration = Duration::from_secs(2);
+/// How long a v2 phone looks for the approver's authenticated typed refusal after a step
+/// failed (a revoked proposal read, a closed pipe): a refusal already sent wins.
+const REFUSAL_GRACE: Duration = Duration::from_secs(2);
 
 /// How often a blocked read looks at the cancel flag.
 const POLL: Duration = Duration::from_millis(100);
@@ -483,6 +486,20 @@ fn offer_deadline(expires_at: u64, until: Instant) -> Result<Instant, PairError>
         .ok_or(PairError::Expired)?;
     Ok(until.min(Instant::now() + remaining))
 }
+/// `e`, unless the approver's authenticated typed refusal is (or arrives within
+/// [`REFUSAL_GRACE`]) on the pipe: then that refusal.
+fn refusal_or(pipe: &mut PairPipe, guest: &mut Guest, e: PairError) -> PairError {
+    let Ok(m) = pipe.recv_until(Instant::now() + REFUSAL_GRACE, None) else {
+        return e;
+    };
+    match guest.decrypt(&m) {
+        Ok(buf) if is_answer(&buf) => match parse_answer(&buf) {
+            Err(refused @ PairError::Refused(_)) => refused,
+            _ => e,
+        },
+        _ => e,
+    }
+}
 fn check_proposal(
     verified: &VerifiedProposal,
     intent: &AdoptionIntent,
@@ -641,6 +658,13 @@ fn adopt_guest(
         .min(until.saturating_duration_since(Instant::now()));
     let mut pipe = PairPipe::open(req.relay_url, &req.secret.slot(), &bounded_opts)?;
     pipe.limit_until(until);
+    // A QR offer's Desktop holds its slot from before the code was shown (and, after a
+    // cancellation, until the offer expires, to refuse a late phone). Nobody there: the
+    // Desktop is gone; fail now (as v1's `wait: ZERO`) instead of waiting out the offer.
+    if offer.is_some() && !pipe.has_peer() {
+        pipe.close();
+        return Err(PairError::NotFound);
+    }
     live(until, cancel)?;
     ready()?;
     live(until, cancel)?;
@@ -684,10 +708,16 @@ fn adopt_guest(
             .min(until.saturating_duration_since(Instant::now())),
     )
     .map_err(relay_err)?;
-    let verified = reader
+    // The approver may have refused meanwhile (a Desktop cancel revokes the proposal and
+    // sends a typed refusal on the pipe): that refusal is the answer, not the read error.
+    let verified = match reader
         .with_cancel(cancel.cloned())
         .fetch_until(until)
-        .map_err(relay_err)?;
+        .map_err(relay_err)
+    {
+        Ok(v) => v,
+        Err(e) => return Err(refusal_or(&mut pipe, &mut guest, e)),
+    };
     check_proposal(&verified, req.intent, &hash, req.approver)?;
     // The authenticated final Noise responder must be the approving Desktop in the chain.
     if verified
@@ -751,10 +781,17 @@ fn adopt_guest(
         proofs,
     };
     let completed = apply_consent(&verified.proposal, req.intent, &hash, consent.clone())?;
-    pipe.send(&guest.encrypt(
+    let sealed = guest.encrypt(
         &serde_json::to_vec(&AdoptionDecision::Consent { consent }).expect("consent serializes"),
-    )?)?;
-    let joined = guest.finish(&pipe.recv(cancel)?)?;
+    )?;
+    if let Err(e) = pipe.send(&sealed) {
+        return Err(refusal_or(&mut pipe, &mut guest, e));
+    }
+    let answer = match pipe.recv(cancel) {
+        Ok(m) => m,
+        Err(e) => return Err(refusal_or(&mut pipe, &mut guest, e)),
+    };
+    let joined = guest.finish(&answer)?;
     pipe.close();
     if joined.ring_id != handle.ring_id
         || joined.relay_url != handle.relay_url
@@ -931,7 +968,7 @@ pub fn approve_adoption(
         pipe,
         req,
         "computer",
-        false,
+        None,
         cancel,
         |intent, hash| {
             if matches!(
@@ -960,13 +997,19 @@ pub struct MobileHostRequest<'a> {
     pub until: Instant,
     /// The offer's `expiresAt`; a phone intent may not outlive it.
     pub offer_expires_at: u64,
+    /// Stops the exchange outright (the app quits). A `cancel` instead is deferred until
+    /// the phone's intent is read, so the phone always learns `cancelled_by_desktop`
+    /// (authenticated): before that, nothing could tell it why.
+    pub abort: Option<&'a Cancel>,
 }
 
 /// Like [`approve_adoption`] for a phone: only a `Mobile` intent within the offer's expiry
 /// is passed to `prepare`, which may also answer [`Prepared::Enrolled`]. Failures are sent
 /// to the phone as authenticated typed refusals: a `prepare`/`publish` error
 /// `PairError::Refused(r)` sends `r`; a local cancellation or expiry sends `Cancelled` /
-/// `Expired`. Returns the possession-proven intent's join request.
+/// `Expired`. A `cancel` raised before the phone's intent arrived (no phone yet, or the
+/// handshake still running) keeps the exchange going until that intent, bounded by
+/// `until`, and then refuses it with `Cancelled`; only `req.abort` stops it silently.
 pub fn approve_mobile_adoption(
     pipe: PairPipe,
     req: &MobileHostRequest<'_>,
@@ -985,7 +1028,7 @@ pub fn approve_mobile_adoption(
             until: req.until,
         },
         req.name,
-        true,
+        Some(req.abort),
         cancel,
         |intent, hash| {
             if !matches!(
@@ -1014,12 +1057,14 @@ fn typed_refusal(e: &PairError) -> Option<PairRefusal> {
     }
 }
 
+/// `typed`: a v2 phone (`Some(abort)`): failures are sent as typed refusals, and a
+/// `cancel` before the intent is deferred to a `Cancelled` refusal of that intent.
 #[allow(clippy::too_many_arguments)]
 fn approve(
     mut pipe: PairPipe,
     req: &AdoptionHostRequest<'_>,
     name: &str,
-    typed: bool,
+    typed: Option<Option<&Cancel>>,
     cancel: Option<&Cancel>,
     prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<Prepared, PairError>,
     publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
@@ -1032,12 +1077,16 @@ fn approve(
         until,
     } = *req;
     pipe.limit_until(until);
-    pipe.wait_peer(until, cancel)?;
-    live(until, cancel)?;
+    // Until the phone's intent is read only an abort stops a phone exchange: a cancel then
+    // still owes the phone its authenticated refusal.
+    let early = typed.unwrap_or(cancel);
+    pipe.wait_peer(until, early)?;
+    live(until, early)?;
     let mut host = Host::start(keys, secret)?;
-    host.read_start(&pipe.recv(cancel)?)?;
+    host.read_start(&pipe.recv(early)?)?;
     pipe.send(&host.hello(ring, name)?)?;
-    let intent = host.read_adoption(&pipe.recv(cancel)?)?;
+    let intent = host.read_adoption(&pipe.recv(early)?)?;
+    let typed = typed.is_some();
     // Best effort: the phone learns why, authenticated by the finished handshake.
     let refuse = |mut pipe: PairPipe, host: &mut Host, e: &PairError| {
         if let Some(r) = typed.then(|| typed_refusal(e)).flatten() {
@@ -1055,6 +1104,11 @@ fn approve(
         }
     };
     pipe.limit_until(until);
+    if typed && cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        let e = PairError::Cancelled;
+        refuse(pipe, &mut host, &e);
+        return Err(e);
+    }
     let hash = host.final_handshake_hash()?;
     let verified = match prepare(&intent, hash) {
         Ok(Prepared::Proposal(verified)) => *verified,

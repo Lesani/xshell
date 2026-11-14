@@ -1304,7 +1304,11 @@ mod unix {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(out, vec![("h_aaaaaaaa".to_string(), HostOutcome::Joined)]);
+        // A registered Computer's Daemon: no legacy `ring.join` is sent to it.
+        assert_eq!(
+            out,
+            vec![("h_aaaaaaaa".to_string(), HostOutcome::Registered)]
+        );
         assert_eq!(
             chain.head().version(),
             2,

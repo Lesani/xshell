@@ -348,6 +348,7 @@ fn mobile_roundtrip(t: &RelayTarget, accept: bool) {
                 name: "approver",
                 until,
                 offer_expires_at: expires_at,
+                abort: None,
             },
             None,
             |intent, hash| {

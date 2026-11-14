@@ -128,6 +128,10 @@ pub enum HostOutcome {
     /// A format-v2 Ring: a Daemon not enrolled yet joins only through an enrollment flow
     /// (with its own consent), never a Roster this Desktop signs for it.
     NeedsEnrollment,
+    /// A format-v2 Ring: the Daemon is enrolled in a Computer unit (this Computer's own, or
+    /// another registered Computer). It is a registered installation that follows the Ring
+    /// over its own Relay link and refuses the legacy Host RPC `ring.join`: nothing to send.
+    Registered,
 }
 
 /// Per Host id, what [`DesktopRing::ensure_host_daemons`] did.
@@ -184,9 +188,26 @@ fn enrolled_only(s: &RingState, p: &mut HostPlan) {
             None => p.after.remove(id),
         };
     }
+    let registered = |id: &String| {
+        let Some((key, _)) = p.after.get(id) else {
+            return false;
+        };
+        head.membership().ok().is_some_and(|m| {
+            m.unit_for(key)
+                .is_some_and(|u| u.kind == EnrollmentKind::Computer)
+        })
+    };
+    let registered: Vec<String> = p
+        .outcomes
+        .iter()
+        .filter(|(id, o)| *o == HostOutcome::Joined && !unenrolled.contains(id) && registered(id))
+        .map(|(id, _)| id.clone())
+        .collect();
     for (id, o) in &mut p.outcomes {
         if *o == HostOutcome::Full || (*o == HostOutcome::Joined && unenrolled.contains(id)) {
             *o = HostOutcome::NeedsEnrollment;
+        } else if registered.contains(id) {
+            *o = HostOutcome::Registered;
         }
     }
 }
@@ -441,6 +462,9 @@ pub enum AdoptionTestPoint {
     CompletionBeforePublish,
     UpgradeBeforeUncertainWrite,
     UpgradeBeforePublish,
+    /// v2 phone pairing: the phone's intent is read, before the proposal is prepared (the
+    /// phone waits for its proposal handle).
+    PhonePreparing,
     /// v2 phone pairing: consent received, before the membership-mutation reservation.
     PhoneBeforeReservation,
     /// v2 phone pairing: predecessor checked and publication marked, before the send.
@@ -812,6 +836,10 @@ struct Live {
     pairing: Vec<(PairingFlow, uuid::Uuid, Cancel)>,
     // Nonsecret operation tombstones include cancellation before delayed start reservation.
     pairing_operations: Vec<(uuid::Uuid, Instant)>,
+    /// The abort flags of v2 phone offers still on their slot (the current one, and
+    /// cancelled ones waiting to refuse a late phone): quitting raises them all, and at most
+    /// [`PHONE_LINGER_MAX`] are kept.
+    phone_aborts: Vec<Weak<AtomicBool>>,
     enrollment: Option<EnrollmentOperation>,
     quota: Quota,
     /// Bumped for every Connector started: its [`Events`] carry it, and a report of a retired
@@ -2441,14 +2469,43 @@ impl DesktopRing {
         let c = cancel.clone();
         let ring_id = offer.ring_id.clone();
         let offer_expires_at = offer.expires_at;
+        let abort = v2.then(|| self.phone_abort());
         let spawned = std::thread::Builder::new()
             .name("ring-pair-phone".into())
             .spawn(move || {
                 let mut pipe = pipe;
                 observer.pairing(PairingFlow::Phone, &PairingEvent::Waiting);
-                let r = pipe.wait_peer(until, Some(&c)).and_then(|()| {
+                let waited = pipe.wait_peer(until, Some(&c));
+                if let (Err(PairError::Cancelled), Some(abort)) = (&waited, &abort) {
+                    // Cancelled before any phone came: the Desktop's side ends now, but the
+                    // slot stays held until the offer expires, so a phone that still scans
+                    // the code is told `cancelled_by_desktop` (authenticated) at once
+                    // instead of waiting out the offer for nobody.
+                    if let Some(ring) = me.upgrade() {
+                        ring.end_pairing(PairingFlow::Phone, &c);
+                    }
+                    observer.pairing(PairingFlow::Phone, &event_of(Err(PairError::Cancelled)));
+                    if pipe.wait_peer(until, Some(abort)).is_ok() {
+                        if let Some(ring) = me.upgrade() {
+                            let _ = ring.host_mobile_v2(
+                                pipe,
+                                &s.keys,
+                                &secret,
+                                &ring_id,
+                                until,
+                                offer_expires_at,
+                                &c,
+                                abort,
+                                &s.chain.head().hash(),
+                                enrollment.as_ref().map(|p| (operation, p)),
+                            );
+                        }
+                    }
+                    return;
+                }
+                let r = waited.and_then(|()| {
                     let ring = me.upgrade().ok_or(PairError::Cancelled)?;
-                    if v2 {
+                    if let Some(abort) = &abort {
                         return ring.host_mobile_v2(
                             pipe,
                             &s.keys,
@@ -2457,6 +2514,7 @@ impl DesktopRing {
                             until,
                             offer_expires_at,
                             &c,
+                            abort,
                             &s.chain.head().hash(),
                             enrollment.as_ref().map(|p| (operation, p)),
                         );
@@ -2681,6 +2739,24 @@ impl DesktopRing {
             .retain(|(f, op, _)| !(*f == flow && *op == operation));
     }
 
+    /// A new v2 phone offer's abort flag (raised on quit). The oldest cancelled offers
+    /// still waiting to refuse a late phone are let go beyond [`PHONE_LINGER_MAX`].
+    fn phone_abort(&self) -> Cancel {
+        let abort: Cancel = Arc::new(AtomicBool::new(false));
+        let mut live = self.lock();
+        if live.quitting {
+            abort.store(true, Ordering::Release);
+        }
+        live.phone_aborts.retain(|w| w.strong_count() > 0);
+        while live.phone_aborts.len() >= PHONE_LINGER_MAX {
+            if let Some(old) = live.phone_aborts.remove(0).upgrade() {
+                old.store(true, Ordering::Release);
+            }
+        }
+        live.phone_aborts.push(Arc::downgrade(&abort));
+        abort
+    }
+
     fn end_pairing(&self, flow: PairingFlow, c: &Cancel) {
         self.lock()
             .pairing
@@ -2748,6 +2824,7 @@ impl DesktopRing {
         until: Instant,
         offer_expires_at: u64,
         cancel: &Cancel,
+        abort: &Cancel,
         initial_head: &str,
         enrollment: Option<(uuid::Uuid, &EnrollmentParameters)>,
     ) -> Result<JoinRequest, PairError> {
@@ -2769,6 +2846,7 @@ impl DesktopRing {
                 name: &self.cfg.name,
                 until,
                 offer_expires_at,
+                abort: Some(abort),
             },
             Some(cancel),
             |intent, hash| {
@@ -2782,6 +2860,7 @@ impl DesktopRing {
                     name: phone.name.clone(),
                 };
                 *joining.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.clone());
+                self.adoption_test_point(AdoptionTestPoint::PhonePreparing);
                 let live = |stage: &dyn Fn() -> bool| -> Result<(), PairError> {
                     if cancel.load(Ordering::Acquire) || self.lock().quitting {
                         return Err(refused(PairRefusal::Cancelled));
@@ -3798,6 +3877,9 @@ impl DesktopRing {
             for (_, _, cancel) in &live.pairing {
                 cancel.store(true, Ordering::Release);
             }
+            for abort in live.phone_aborts.drain(..).filter_map(|w| w.upgrade()) {
+                abort.store(true, Ordering::Release);
+            }
         }
         // Then wait out any in-flight commit, so none starts unfenced after this point.
         {
@@ -3946,6 +4028,9 @@ fn v2_phone_admission(
     }
     Ok(PhoneAdmission::Enroll)
 }
+
+/// Cancelled v2 phone offers kept on their slot to refuse a late phone (newest kept).
+const PHONE_LINGER_MAX: usize = 8;
 
 fn event_of(r: Result<JoinRequest, PairError>) -> PairingEvent {
     match r {
@@ -7577,6 +7662,7 @@ mod v2_edits_tests {
                 &[
                     host("h_aaaaaaaa", &x.daemon2),
                     host("h_bbbbbbbb", &stranger),
+                    host(LOCAL_HOST_ID, &x.my_daemon),
                 ],
                 &|_| true,
                 None,
@@ -7585,8 +7671,12 @@ mod v2_edits_tests {
             .unwrap();
         assert_eq!(c.head().version(), 3, "nothing signed");
         let of = |id: &str| out.iter().find(|(h, _)| h == id).unwrap().1;
-        assert_eq!(of("h_aaaaaaaa"), HostOutcome::Joined);
+        // Computer-unit Daemons (another Computer's, and this Computer's own local one)
+        // are registered installations: no legacy `ring.join` is ever sent to them.
+        assert_eq!(of("h_aaaaaaaa"), HostOutcome::Registered);
+        assert_eq!(of(LOCAL_HOST_ID), HostOutcome::Registered);
         assert_eq!(of("h_bbbbbbbb"), HostOutcome::NeedsEnrollment);
+        assert_eq!(stored(&t).local_member, Some(x.my_daemon.sign_key()));
         let s = stored(&t);
         assert_eq!(s.chain.head().version(), 3);
         // The enrolled key's mapping applies; the unenrolled one is not mapped.

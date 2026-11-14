@@ -808,3 +808,123 @@ fn a_phone_publication_after_a_paused_removal_is_stale_without_a_fork() {
     assert_eq!(enrolled.chain.head().version(), before + 2);
     assert_eq!(&agree(&relay, &a), enrolled.chain.head());
 }
+
+/// #87 E2E c1: a Desktop cancel at every phase of a v2 phone pairing reaches the phone as an
+/// authenticated `cancelled_by_desktop`, promptly, and creates no membership: before the
+/// phone scanned, while the Desktop waits for the phone's hello, while the phone waits for
+/// its proposal, and after the phone's consent.
+#[test]
+fn a_desktop_cancel_at_every_phase_reaches_the_phone_as_cancelled_by_desktop() {
+    use xshell_hostlink::ring::AdoptionTestPoint as P;
+    let relay = Relay::start();
+    let (a, seams) = Seams::computer(&relay);
+    let created = a.create();
+    connected(&a);
+    let version = created.head().version();
+    let phone = phone_keys(70);
+    let unchanged = |what: &str| {
+        assert_eq!(relay_head(&relay, &created), version, "{what}");
+        assert!(
+            a.ring
+                .chain()
+                .unwrap()
+                .head()
+                .member(&phone.sign_key())
+                .is_none(),
+            "{what}"
+        );
+    };
+    let prompt = |what: &str, started: Instant| {
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(10), "{what}: took {took:?}");
+    };
+    let cancelled = PairError::Refused(PairRefusal::Cancelled);
+    assert_eq!(cancelled.as_code(), "cancelled_by_desktop");
+
+    // 1. Before the phone scanned: the Desktop's side ends at once; the slot stays held,
+    //    so the late phone is refused instead of waiting out the offer.
+    let (o, obs) = offer(&a);
+    a.ring.cancel_pairing(PairingFlow::Phone);
+    assert_eq!(
+        obs.outcome(),
+        PairingEvent::Failed {
+            code: "cancelled".into()
+        }
+    );
+    let started = Instant::now();
+    assert_eq!(scan(&o, &phone).unwrap_err(), cancelled, "before scan");
+    prompt("before scan", started);
+    unchanged("before scan");
+
+    // 2. The phone is on the slot; the Desktop waits for its hello.
+    let (o, _) = offer(&a);
+    let ring = a.ring.clone();
+    let started = Instant::now();
+    let r = adopt_mobile_as_guest_with_ready(
+        &MobileAdoptionRequest {
+            offer: &o,
+            keys: phone.clone(),
+            name: "my phone",
+            until: Instant::now() + Duration::from_secs(60),
+        },
+        &PairOptions::default(),
+        None,
+        move || {
+            ring.cancel_pairing(PairingFlow::Phone);
+            // The Desktop has seen the peer and now waits for message 1.
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(())
+        },
+        |_| panic!("consent requested after a cancel"),
+    );
+    assert_eq!(r.unwrap_err(), cancelled, "waiting for hello");
+    prompt("waiting for hello", started);
+    unchanged("waiting for hello");
+
+    // 3. and 4.: the phone waits for its proposal; the phone has consented.
+    for at in [P::PhonePreparing, P::PhoneBeforeReservation] {
+        while seams.reached.try_recv().is_ok() {}
+        *seams.pause.lock().unwrap() = Some(at);
+        let (o, _) = offer(&a);
+        let scanner = {
+            let (o, phone) = (o.clone(), phone.clone());
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (scan(&o, &phone), started)
+            })
+        };
+        seams.wait_for(at);
+        *seams.pause.lock().unwrap() = None;
+        a.ring.cancel_pairing(PairingFlow::Phone);
+        seams.resume.send(()).unwrap();
+        let (r, started) = scanner.join().unwrap();
+        assert_eq!(r.unwrap_err(), cancelled, "{at:?}");
+        prompt(&format!("{at:?}"), started);
+        unchanged(&format!("{at:?}"));
+    }
+
+    // The Desktop is not stuck: a real pairing works afterwards.
+    let (o, _) = offer(&a);
+    scan(&o, &phone).unwrap();
+    assert_eq!(relay_head(&relay, &created), version + 1);
+}
+
+/// The Desktop is gone from a v2 offer's slot (it crashed, or the Relay lost its socket):
+/// the phone fails at once with `not_found` instead of waiting out the offer.
+#[test]
+fn a_v2_offer_nobody_holds_fails_at_once_with_not_found() {
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    a.create();
+    connected(&a);
+    let (o, _) = offer(&a);
+    a.ring.quit();
+    // The quit lets the offer's slot go (its abort flag).
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    assert_eq!(
+        scan_with(&o, &phone_keys(71), |_| panic!("consent")).unwrap_err(),
+        PairError::NotFound
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
