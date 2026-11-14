@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, countdown, errorCode, expiresLine, failureKey, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validCode, type ComputerState, type PhoneState } from "./pairing";
+import { canSubmit, COMPUTER_IDLE, computerLine, computerReducer, countdown, errorCode, expiresLine, failureKey, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validWords, wordsError, type ComputerState, type PhoneState } from "./pairing";
 import { fmt, S, type StringKey } from "./strings";
 import type { PhoneStart } from "./types";
 
@@ -20,41 +20,30 @@ describe("countdown", () => {
   });
 });
 
-describe("pair code", () => {
-  it("normalizes case, separators and look-alikes", () => {
-    expect(normalizeCode("7kq4-m2xw 9pjr-h3ct")).toBe("7KQ4M2XW9PJRH3CT");
-    expect(normalizeCode("oOiIlL")).toBe("001111");
+describe("eight-word Device Code", () => {
+  const WORDS = "acid baker cable dance eagle fable gamma habit";
+
+  it("normalizeWords lowercases and accepts spaces, hyphens and mixed separators", () => {
+    expect(normalizeWords("Acid BAKER cable-Dance  eagle--fable\tgamma habit")).toBe("acid-baker-cable-dance-eagle-fable-gamma-habit");
+    expect(normalizeWords("  acid-baker ")).toBe("acid-baker");
+    expect(normalizeWords("")).toBe("");
   });
 
-  it("groups the code in fours as typed", () => {
-    expect(formatCode("7kq4m2xw9pjrh3ct")).toBe("7KQ4-M2XW-9PJR-H3CT");
-    expect(formatCode("7kq4")).toBe("7KQ4");
-    expect(formatCode("7kq4-")).toBe("7KQ4");
-    expect(formatCode("7kq4m")).toBe("7KQ4-M");
-  });
-
-  it("accepts 16 Crockford base32 characters only", () => {
-    expect(validCode("7KQ4-M2XW-9PJR-H3CT")).toBe(true);
-    expect(validCode("7kq4 m2xw 9pjr h3ct")).toBe(true);
-    expect(validCode("7KQ4-M2XW-9PJR-H3OI")).toBe(true); // O→0, I→1
-    expect(validCode("7KQ4-M2XW-9PJR-H3C")).toBe(false);
-    expect(validCode("7KQ4-M2XW-9PJR-H3CTX")).toBe(false);
-    expect(validCode("7KQ4-M2XW-9PJR-H3CU")).toBe(false);
-    expect(validCode("")).toBe(false);
+  it("accepts exactly eight words of letters", () => {
+    expect(validWords(WORDS)).toBe(true);
+    expect(validWords(WORDS.toUpperCase().replace(/ /g, "-"))).toBe(true);
+    expect(validWords("acid baker cable dance eagle fable gamma")).toBe(false); // 7
+    expect(validWords(`${WORDS} ivory`)).toBe(false); // 9
+    expect(validWords("acid baker cable dance eagle fable gamma h4bit")).toBe(false); // digits
+    expect(validWords("")).toBe(false);
   });
 
   it("shows the invalid line only once typing on cannot help", () => {
-    expect(codeError("")).toBeNull();
-    expect(codeError("7KQ4")).toBeNull();
-    expect(codeError("7KQ4-M2XW-9PJR-H3CT")).toBeNull();
-    expect(codeError("7KU")).toBe(S["mobile.pair.computer.invalid"]);
-    expect(codeError("7KQ4-M2XW-9PJR-H3CTX")).toBe(S["mobile.pair.computer.invalid"]);
-  });
-
-  it("adds --relay only off the Hosted Relay", () => {
-    expect(computerDesc({ relayUrl: HOSTED, hostedRelayUrl: HOSTED })).toBe("On the computer you want to add, run `xshelld pair`, then enter the code it shows.");
-    expect(computerDesc({ relayUrl: null, hostedRelayUrl: HOSTED })).not.toContain("--relay");
-    expect(computerDesc({ relayUrl: "wss://r.example", hostedRelayUrl: HOSTED })).toBe("On the computer you want to add, run `xshelld pair` --relay wss://r.example, then enter the code it shows.");
+    expect(wordsError("")).toBeNull();
+    expect(wordsError("acid baker")).toBeNull();
+    expect(wordsError(WORDS)).toBeNull();
+    expect(wordsError("acid b4ker")).toBe(S["mobile.pair.computer.invalid"]);
+    expect(wordsError(`${WORDS} ivory`)).toBe(S["mobile.pair.computer.invalid"]);
   });
 });
 
@@ -63,8 +52,11 @@ describe("failures", () => {
     const cases: [string, StringKey][] = [
       ["role", "mobile.pair.err.role"],
       ["full", "mobile.pair.err.full"],
-      ["not_found", "mobile.pair.computer.notFound"],
       ["invalid_code", "mobile.pair.computer.invalid"],
+      ["not_approver", "mobile.pair.err.notApprover"],
+      ["busy", "mobile.pair.err.busy"],
+      ["reconciliation_required", "mobile.pair.err.reconcile"],
+      ["not_found", "mobile.pair.failed"],
       ["expired", "mobile.pair.expired"],
       ["publish_failed", "mobile.pair.err.publishFailed"],
       ["relay", "mobile.pair.failed"],
@@ -124,39 +116,38 @@ describe("phone panel", () => {
 
 describe("computer section", () => {
   const run = (s: ComputerState, ...as: Parameters<typeof computerReducer>[1][]) => as.reduce(computerReducer, s);
-  const CODE = "7KQ4-M2XW-9PJR-H3CT";
+  const WORDS = "acid baker cable dance eagle fable gamma habit";
 
-  it("connects, then pairs", () => {
-    expect(canSubmit("7KQ4", COMPUTER_IDLE)).toBe(false);
-    expect(canSubmit(CODE, COMPUTER_IDLE)).toBe(true);
+  it("connects, then the approved reply adds the computer", () => {
+    expect(canSubmit("acid baker", COMPUTER_IDLE)).toBe(false);
+    expect(canSubmit(WORDS, COMPUTER_IDLE)).toBe(true);
     const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
     expect(c).toEqual({ state: "connecting", operation: "test-op" });
-    expect(canSubmit(CODE, c)).toBe(false);
+    expect(canSubmit(WORDS, c)).toBe(false);
     expect(computerLine(c)).toBe(S["mobile.pair.computer.connecting"]);
-    const p = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "paired", name: "tower", role: "daemon" } });
-    expect(p).toEqual({ state: "paired", name: "tower" });
-    expect(computerLine(p)).toBe("Added tower");
+    const p = run(c, { type: "approved", operation: "test-op", names: ["tower", "tower host"] });
+    expect(p).toEqual({ state: "paired", names: ["tower", "tower host"] });
+    expect(computerLine(p)).toBe("Added to the Ring: tower, tower host.");
+    // A stale reply of another attempt changes nothing.
+    expect(run(c, { type: "approved", operation: "old", names: ["x"] })).toBe(c);
   });
 
-  it("reports not found, invalid and expired", () => {
+  it("not_approver, busy, reconcile and invalid have their own copy", () => {
     const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
-    const nf = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "not_found" } });
-    expect(computerLine(nf)).toBe(S["mobile.pair.computer.notFound"]);
-    const inv = run(c, { type: "submitFailed", operation: "test-op", error: "invalid_code" });
-    expect(computerLine(inv)).toBe(S["mobile.pair.computer.invalid"]);
-    const ex = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "expired" } });
-    expect(computerLine(ex)).toBe(S["mobile.pair.expired"]);
+    const fail = (error: string) => computerLine(run(c, { type: "submitFailed", operation: "test-op", error }));
+    expect(fail("not_approver: approval requires enrolled membership")).toBe(S["mobile.pair.err.notApprover"]);
+    expect(fail("busy: another adoption operation is active")).toBe(S["mobile.pair.err.busy"]);
+    expect(fail("reconciliation_required: x")).toBe(S["mobile.pair.err.reconcile"]);
+    expect(fail("invalid_code: invalid pairing code: unknown device word")).toBe(S["mobile.pair.computer.invalid"]);
+    expect(fail("other: nobody is waiting with this code")).toBe("Couldn't pair the device: nobody is waiting with this code");
   });
 
   it("clears a finished attempt on edit, not a running one", () => {
     const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
     expect(run(c, { type: "edit" })).toBe(c);
-    const f = run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "relay" } });
-    expect(computerLine(f)).toBe("Couldn't pair the device: relay");
+    const f = run(c, { type: "submitFailed", operation: "test-op", error: "relay: down" });
+    expect(computerLine(f)).toBe("Couldn't pair the device: down");
     expect(run(f, { type: "edit" })).toEqual(COMPUTER_IDLE);
-    expect(run(c, { type: "event", event: { operation: "test-op", flow: "phone", state: "expired" } })).toBe(c);
-    expect(run(c, { type: "event", event: { operation: "test-op", flow: "computer", state: "failed", code: "cancelled" } })).toBe(c);
-    expect(run(c, { type: "cancel", operation: "test-op" })).toEqual(COMPUTER_IDLE);
     expect(computerLine(COMPUTER_IDLE)).toBeNull();
   });
 });
@@ -177,7 +168,8 @@ describe("pairing strings", () => {
     "mobile.pair.phone", "mobile.pair.phone.desc", "mobile.pair.phone.expires", "mobile.pair.phone.copy",
     "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired", "mobile.pair.failed",
     "mobile.pair.computer", "mobile.pair.computer.desc", "mobile.pair.computer.label", "mobile.pair.computer.placeholder",
-    "mobile.pair.computer.connecting", "mobile.pair.computer.notFound", "mobile.pair.computer.invalid",
+    "mobile.pair.computer.connecting", "mobile.pair.computer.invalid", "mobile.pair.computer.added",
+    "mobile.pair.err.notApprover", "mobile.pair.err.busy", "mobile.pair.err.reconcile",
     "mobile.pair.err.role", "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
     "mobile.pair.needsRelay", "mobile.pair.needsMember",
   ];
@@ -190,8 +182,9 @@ describe("pairing strings", () => {
     expect(fmt("mobile.pair.phone.expires", { m: 3, ss: "07" })).toBe("Code expires in 3:07");
     expect(fmt("mobile.pair.paired", { name: "Pixel 8" })).toBe("Added Pixel 8");
     expect(fmt("mobile.pair.failed", { error: "relay" })).toBe("Couldn't pair the device: relay");
-    expect(fmt("mobile.pair.computer.desc", { relayArg: "" })).not.toContain("{");
-    for (const k of KEYS) expect(fmt(k, { m: 1, ss: "00", name: "n", error: "e", relayArg: "" }), k).not.toMatch(/\{\w+\}/);
+    expect(fmt("mobile.pair.computer.desc")).not.toContain("{");
+    expect(S["mobile.pair.computer"]).toBeTruthy();
+    for (const k of KEYS) expect(fmt(k, { m: 1, ss: "00", name: "n", error: "e", names: "a, b" }), k).not.toMatch(/\{\w+\}/);
   });
 });
 

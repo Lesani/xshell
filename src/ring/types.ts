@@ -14,7 +14,7 @@ export interface MemberView {
   thisComputer: boolean;
   // The configured Remote Host (still in Settings → Hosts) whose Daemon this member is.
   hostId: string | null;
-  // Settings → Mobile offers to remove it: not this app, not this computer, and no configured
+  // Settings → Hosts → Ring offers to remove it: not this app, not this computer, and no configured
   // Host's Daemon.
   removable: boolean;
   presence: { kind: PresenceKind; reason?: string; at?: number };
@@ -46,7 +46,12 @@ export interface RingStatus {
   local: "daemon" | "in-process" | "too-old";
   // The Remote Hosts not in the Ring, and why (empty when every connected Host joined).
   hosts: HostRingState[];
+  // Whether this Desktop can add computers (#87): `unavailable` means an upgrade is needed but
+  // cannot run here; `unresolved` means earlier adoption work needs reconciliation.
+  approval: Approval;
 }
+
+export type Approval = "ready" | "needs-upgrade" | "needs-completion" | "unavailable" | "unresolved" | "none";
 
 // `other-ring`: paired with another Desktop's devices; `ring_claim_host` pairs it here.
 export type HostRingKind = "too-old" | "other-ring" | "full" | "failed";
@@ -66,7 +71,7 @@ export interface HostRingState {
   error?: string;
 }
 
-// Pairing (#9): what `ring_pair_phone_start` answers and the `ring:pairing` event carries.
+// Phone pairing (#9): what `ring_pair_phone_start` answers and the `ring:pairing` event carries.
 
 // `rows[y][x]` is "1" for a dark module. No quiet zone; the UI adds the margin.
 export interface Qr {
@@ -90,3 +95,47 @@ export type PairingEvent = { operation: string } & (
   | { flow: PairingFlow; state: "paired"; name: string; role: MemberRole }
   | { flow: PairingFlow; state: "expired" }
   | { flow: PairingFlow; state: "failed"; code: string });
+
+// Computer adoption (#87): `ring_join_start`'s reply (the only place the words appear), the
+// `ring:join` event and `ring_join_overview`.
+
+export interface JoinStarted {
+  operation: string;
+  // Eight words joined by `-`.
+  words: string;
+  expiresAt: number;
+}
+
+export type JoinOrigin = "gui" | "cli";
+export type JoinStateName = "waiting" | "awaitingConfirmation" | "completing" | "installed" | "declined" | "expired" | "failed" | "reconciliationRequired" | "cancelled";
+
+export interface JoinPreview {
+  ringId: string;
+  ringShort: string;
+  // The approving device's name.
+  approver: string | null;
+  // This computer's name.
+  computer: string;
+  expiresAt: number;
+}
+
+export interface JoinEvent {
+  operation: string;
+  origin: JoinOrigin;
+  state: JoinStateName;
+  preview?: JoinPreview;
+  error?: string;
+  expiresAt: number;
+}
+
+export interface JoinOverview {
+  unavailable?: "platform" | "in-process" | "not-registered";
+  // This window owns pairing (otherwise another xshell window does).
+  owner: boolean;
+  joins: JoinEvent[];
+}
+
+export interface ApprovedComputer {
+  names: string[];
+  version: number;
+}

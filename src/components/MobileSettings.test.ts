@@ -18,7 +18,7 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
     enabled: true, ringId: "r", version: 2, relayUrl: "wss://r", hostedRelayUrl: "wss://r", connection: "connected",
     retryIn: null, connectionError: null, limited: false, farewells: [], problem: null, problemDetail: null,
-    members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], ...over,
+    members: [me, phone], quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], approval: "ready", ...over,
   };
 }
 
@@ -54,12 +54,11 @@ describe("the device list", () => {
 });
 
 describe("pairing and the connection", () => {
-  const pairing = (pairComputer = vi.fn(async () => {})): Pairing => ({
+  const pairing = (approveComputer = vi.fn(async () => ({ names: [], version: 2 }))): Pairing => ({
     events: { phone: null, computer: null },
     startPhone: async () => { throw new Error("not here"); },
     cancelPhone: async () => {},
-    pairComputer,
-    cancelComputer: async () => {},
+    approveComputer,
   });
   const view = (s: RingStatus) =>
     renderToStaticMarkup(createElement(MobileSettingsView, {
@@ -111,19 +110,20 @@ describe("pairing and the connection", () => {
   });
 
   it("does not add a computer on Enter while pairing is blocked", async () => {
-    const code = "0123-4567-89AB-CDEF";
+    const words = "Acid baker-cable dance eagle fable gamma habit";
     for (const connection of ["waiting", "stopped"] as const) {
-      const pairComputer = vi.fn(async () => {});
+      const approve = vi.fn(async () => ({ names: [], version: 2 }));
       const dispatch = vi.fn();
-      await submitComputer(code, COMPUTER_IDLE, status({ connection }), pairComputer, dispatch);
-      expect(pairComputer, connection).not.toHaveBeenCalled();
+      expect(await submitComputer(words, COMPUTER_IDLE, status({ connection }), approve, dispatch)).toBe(false);
+      expect(approve, connection).not.toHaveBeenCalled();
       expect(dispatch, connection).not.toHaveBeenCalled();
     }
-    const pairComputer = vi.fn(async () => {});
+    const approve = vi.fn(async () => ({ names: ["tower"], version: 3 }));
     const dispatch = vi.fn();
-    await submitComputer(code, COMPUTER_IDLE, status({ connection: "connecting" }), pairComputer, dispatch, "test-op");
-    expect(pairComputer).toHaveBeenCalledWith("0123456789ABCDEF", "test-op");
+    expect(await submitComputer(words, COMPUTER_IDLE, status({ connection: "connecting" }), approve, dispatch, "test-op")).toBe(true);
+    expect(approve).toHaveBeenCalledWith("acid-baker-cable-dance-eagle-fable-gamma-habit");
     expect(dispatch).toHaveBeenCalledWith({ type: "submit", operation: "test-op" });
+    expect(dispatch).toHaveBeenCalledWith({ type: "approved", operation: "test-op", names: ["tower"] });
   });
 });
 
@@ -181,8 +181,7 @@ describe("Cancel pairing", () => {
     events: { phone: null, computer: null },
     startPhone: async () => offer,
     cancelPhone,
-    pairComputer: async () => {},
-    cancelComputer: async () => {},
+    approveComputer: async () => ({ names: [], version: 2 }),
   });
   const panel = (initial: Parameters<typeof PhonePanel>[0]["initial"]) =>
     renderToStaticMarkup(createElement(PhonePanel, { s: status(), p: pairing(), initial }));

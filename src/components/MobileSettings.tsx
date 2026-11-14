@@ -1,23 +1,37 @@
-import { Fragment, useEffect, useReducer, useRef, useState } from "react";
-import { Monitor, Smartphone, Trash2 } from "lucide-react";
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { ArrowUpCircle, LogIn, Monitor, Plus, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
 import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects } from "../ring/pairing";
+import { canSubmit, COMPUTER_IDLE, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects, wordsError } from "../ring/pairing";
+import { cliCardsFrom, cliLine, codeExpiresLine, consentBody, joinBusy, joinOperation, JOIN_IDLE, joinReducer, offersNewCode as joinOffersNewCode, outcomeLine, showsJoinPanel, wordGroups, type JoinAction, type JoinUi } from "../ring/join";
 import { useRing, type PairingEvents } from "../ring/useRing";
-import type { HostRingState, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
+import type { ApprovedComputer, HostRingState, JoinEvent, JoinOverview, JoinPreview, JoinStarted, MemberView, PhoneStart, Qr, RingStatus } from "../ring/types";
 
-// Settings → Mobile (#8, #21): enable Mobile access (creates the Ring), choose its Relay, see
-// the Ring's devices and how they stand, and which Remote Hosts could not join. Pairing (#9):
-// pair a phone by QR code, add a computer by the code `xshelld pair` shows. Removal (#22):
-// remove a device from the list.
+// Settings → Hosts → Ring (#8, #21, #87): Create ring or Join ring (with this computer's
+// local consent), choose the Ring's Relay, see its devices and how they stand, and which
+// Remote Hosts could not join. Pairing (#9): pair a phone by QR code; add a computer by the
+// eight words `xshelld pair` or Join ring shows. Removal (#22): remove a device from the list.
 
 export interface Pairing {
   events: PairingEvents;
   startPhone: (operation: string) => Promise<PhoneStart>;
   cancelPhone: (operation: string) => Promise<void>;
-  pairComputer: (code: string, operation: string) => Promise<void>;
-  cancelComputer: (operation: string) => Promise<void>;
+  // Add computer: the normalized eight words.
+  approveComputer: (words: string) => Promise<ApprovedComputer>;
+}
+
+// Computer adoption (#87): the commands and what they report.
+export interface JoinApi {
+  overview: JoinOverview | null;
+  // The latest `ring:join` event per operation.
+  events: Record<string, JoinEvent>;
+  createComputer: () => Promise<void>;
+  upgradeComputer: () => Promise<void>;
+  start: (operation: string) => Promise<JoinStarted>;
+  confirm: (operation: string) => Promise<void>;
+  decline: (operation: string) => Promise<void>;
+  cancel: (operation: string) => Promise<void>;
 }
 
 // Text with `code` spans, as the copy writes commands.
@@ -129,51 +143,51 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
   );
 }
 
-// "Add a computer", from its button and from Enter alike: nothing while the code is not
-// ready or pairing cannot succeed.
-export async function submitComputer(code: string, st: ComputerState, s: RingStatus, pairComputer: (code: string, operation: string) => Promise<void>, dispatch: (a: ComputerAction) => void, operation: string = crypto.randomUUID()): Promise<void> {
-  if (!canSubmit(code, st) || pairingBlocked(s) !== null) return;
+// "Add computer", from its button and from Enter alike: nothing while the words are not
+// ready or pairing cannot succeed. Resolves true once the computer was added.
+export async function submitComputer(words: string, st: ComputerState, s: RingStatus, approve: (words: string) => Promise<ApprovedComputer>, dispatch: (a: ComputerAction) => void, operation: string = crypto.randomUUID()): Promise<boolean> {
+  if (!canSubmit(words, st) || pairingBlocked(s) !== null) return false;
   dispatch({ type: "submit", operation });
   try {
-    await pairComputer(normalizeCode(code), operation);
+    const added = await approve(normalizeWords(words));
+    dispatch({ type: "approved", operation, names: added.names });
+    return true;
   } catch (e) {
     dispatch({ type: "submitFailed", operation, error: errorText(e) });
+    return false;
   }
 }
 
-function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
-  const [st, dispatch] = useReducer(computerReducer, COMPUTER_IDLE);
-  const [code, setCode] = useState("");
-  useEffect(() => { if (p.events.computer) dispatch({ type: "event", event: p.events.computer }); }, [p.events.computer]);
+export function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
+  const [st, setSt] = useReducer(computerReducer, COMPUTER_IDLE);
+  const [words, setWords] = useState("");
+  // A reply after leaving Settings is not shown.
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const dispatch = (a: ComputerAction) => { if (mounted.current) setSt(a); };
   const connecting = st.state === "connecting";
-  // Leaving Settings while it looks for the computer stops looking.
-  const operation = useRef<string | null>(null);
-  useEffect(() => () => { if (operation.current) p.cancelComputer(operation.current).catch(() => {}); }, []);
 
-  const submit = () => {
-    if (!canSubmit(code, st) || pairingBlocked(s) !== null) return;
-    const owned = crypto.randomUUID();
-    operation.current = owned;
-    return submitComputer(code, st, s, p.pairComputer, dispatch, owned);
+  const submit = async () => {
+    if (await submitComputer(words, st, s, p.approveComputer, dispatch) && mounted.current) setWords("");
   };
   const blocked = pairingBlocked(s) !== null;
-  const invalid = codeError(code);
+  const invalid = wordsError(words);
   const line = computerLine(st);
   return (
     <div className="edit-field">
       <label className="edit-label">{fmt("mobile.pair.computer")}</label>
       <PairingNote s={s} />
-      <div className="edit-hint"><WithCode text={computerDesc(s)} /></div>
+      <div className="edit-hint"><WithCode text={fmt("mobile.pair.computer.desc")} /></div>
       <div className="edit-field">
         <label className="edit-label">{fmt("mobile.pair.computer.label")}</label>
-        <input className="edit-input host-form-mono" value={code} placeholder={fmt("mobile.pair.computer.placeholder")} spellCheck={false}
-          autoCapitalize="characters" autoComplete="off" disabled={connecting}
-          onChange={(e) => { setCode(formatCode(e.target.value)); dispatch({ type: "edit" }); }}
+        <input className="edit-input host-form-mono" value={words} placeholder={fmt("mobile.pair.computer.placeholder")} spellCheck={false}
+          autoCapitalize="none" autoComplete="off" disabled={connecting} data-computer-words
+          onChange={(e) => { setWords(e.target.value); dispatch({ type: "edit" }); }}
           onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
         {invalid && <div className="host-form-error">{invalid}</div>}
       </div>
       <div className="host-row-actions">
-        <button className="btn btn-primary settings-action-btn" disabled={!canSubmit(code, st) || blocked} onClick={submit}>
+        <button className="btn btn-primary settings-action-btn" data-add-computer disabled={!canSubmit(words, st) || blocked} onClick={submit}>
           <Monitor size={11} /> {fmt("mobile.pair.computer")}
         </button>
       </div>
@@ -182,6 +196,134 @@ function ComputerPanel({ s, p }: { s: RingStatus; p: Pairing }) {
   );
 }
 
+// ── Computer adoption (#87) ───────────────────────────────────────────────
+
+// The countdown's clock while `active`.
+function useClock(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [active]);
+  return now;
+}
+
+function Line({ line }: { line: { text: string; error: boolean } | null }) {
+  if (!line) return null;
+  return <div className={line.error ? "host-form-error" : "host-row-note"}>{line.text}</div>;
+}
+
+// Join this Ring? with Confirm/Decline. Read-only when `readOnly` (follower windows).
+export function ConsentCard({ preview, busy, readOnly, nowMs, onConfirm, onDecline }: { preview: JoinPreview; busy: boolean; readOnly?: boolean; nowMs: number; onConfirm: () => void; onDecline: () => void }) {
+  return (
+    <div className="host-row" data-ring-consent>
+      <div className="host-row-head"><div className="host-row-title"><span className="host-row-name">{fmt("ring.consentTitle")}</span></div></div>
+      <div className="host-row-note">{consentBody(preview, "—")}</div>
+      <div className="host-row-note">{codeExpiresLine(preview.expiresAt, nowMs)}</div>
+      {!readOnly && (
+        <div className="host-row-actions">
+          <button className="btn btn-primary settings-action-btn" data-ring-confirm disabled={busy} onClick={onConfirm}>{fmt("ring.confirm")}</button>
+          <button className="btn btn-ghost settings-action-btn" data-ring-decline disabled={busy} onClick={onDecline}>{fmt("ring.decline")}</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The Join ring screen: the words, then consent, then the outcome.
+export function JoinPanel({ st, onCancel, onConfirm, onDecline, onNewCode }: { st: JoinUi; onCancel: () => void; onConfirm: () => void; onDecline: () => void; onNewCode: () => void }) {
+  const counting = st.state === "code" || st.state === "consent" || st.state === "confirming";
+  const now = useClock(counting);
+  const [top, bottom] = st.state === "code" ? wordGroups(st.words) : [[], []];
+  return (
+    <div className="edit-field" data-ring-join>
+      <label className="edit-label">{fmt("ring.joinTitle")}</label>
+      {st.state === "code" && (
+        <>
+          <div className="edit-hint">{fmt("ring.joinInstruction")}</div>
+          <div className="host-form-mono ring-code" data-ring-words style={{ fontSize: "1.5em", lineHeight: 1.6, userSelect: "all" }}>
+            <div>{top.join(" ")}</div>
+            <div>{bottom.join(" ")}</div>
+          </div>
+          <div className="host-row-note">{codeExpiresLine(st.expiresAt, now)}</div>
+          <div className="host-row-note">{fmt("ring.waiting")}</div>
+          <div className="edit-hint">{fmt("ring.codeLifetime")}</div>
+        </>
+      )}
+      {(st.state === "consent" || st.state === "confirming") && (
+        <ConsentCard preview={st.preview} busy={st.state === "confirming"} nowMs={now} onConfirm={onConfirm} onDecline={onDecline} />
+      )}
+      {st.state === "completing" && <div className="host-row-note">{fmt("ring.completing")}</div>}
+      <Line line={outcomeLine(st)} />
+      <div className="host-row-actions">
+        {(st.state === "starting" || st.state === "code" || st.state === "consent") && (
+          <button className="btn btn-ghost settings-action-btn" data-ring-cancel onClick={onCancel}>{fmt("ring.cancel")}</button>
+        )}
+        {joinOffersNewCode(st) && (
+          <button className="btn btn-primary settings-action-btn" data-ring-new-code onClick={onNewCode}>{fmt("ring.generateNewCode")}</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// "Pairing started from the command line on this computer": no words (the terminal shows them).
+export function PairingWindowCard({ event, readOnly, onConfirm, onDecline }: { event: JoinEvent; readOnly: boolean; onConfirm: (operation: string) => Promise<void>; onDecline: (operation: string) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const now = useClock(event.state === "awaitingConfirmation");
+  const act = async (f: (operation: string) => Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await f(event.operation);
+    } catch (e) {
+      setError(fmt("ring.joinFailed", { error: errorText(e) }));
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="edit-field" data-ring-cli={event.operation}>
+      <label className="edit-label">{fmt("ring.cliStarted")}</label>
+      {event.state === "awaitingConfirmation" && event.preview && (
+        <ConsentCard preview={event.preview} busy={busy} readOnly={readOnly} nowMs={now} onConfirm={() => act(onConfirm)} onDecline={() => act(onDecline)} />
+      )}
+      <Line line={cliLine(event)} />
+      {error && <div className="host-form-error">{error}</div>}
+    </div>
+  );
+}
+
+// Upgrade Ring: a Ring made by an older xshell, before this Desktop can add computers.
+export function UpgradeCard({ s, onUpgrade }: { s: RingStatus; onUpgrade: () => Promise<void> }) {
+  const [state, setState] = useState<{ kind: "idle" | "running" | "done" } | { kind: "failed"; error: string }>({ kind: "idle" });
+  const unavailable = s.approval === "unavailable";
+  const upgrade = async () => {
+    setState({ kind: "running" });
+    try {
+      await onUpgrade();
+      setState({ kind: "done" });
+    } catch (e) {
+      setState({ kind: "failed", error: errorText(e) });
+    }
+  };
+  return (
+    <div className="edit-field" data-ring-upgrade>
+      <label className="edit-label">{fmt("ring.upgrade.title")}</label>
+      <div className="edit-hint">{fmt("ring.upgrade.desc")}</div>
+      {unavailable ? <div className="host-row-note host-row-warn">{fmt("ring.upgrade.unavailable")}</div> : (
+        <div className="host-row-actions">
+          <button className="btn btn-primary settings-action-btn" data-ring-upgrade-action disabled={state.kind === "running"} onClick={upgrade}>
+            <ArrowUpCircle size={11} /> {state.kind === "running" ? fmt("ring.upgrade.running") : fmt("ring.upgrade.action")}
+          </button>
+        </div>
+      )}
+      {state.kind === "failed" && <div className="host-form-error">{state.error.startsWith("reconciliation_required") ? fmt("mobile.pair.err.reconcile") : fmt("ring.upgrade.failed", { error: state.error })}</div>}
+    </div>
+  );
+}
 
 function MemberRow({ m, s, removing, onRemove }: { m: MemberView; s: RingStatus; removing: boolean; onRemove: (m: MemberView) => void }) {
   const key = presenceKey(m, s);
@@ -309,10 +451,120 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
   );
 }
 
-export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRemoveMember, pairing }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void>; onRemoveMember: (signKey: string) => Promise<RingStatus>; pairing?: Pairing }) {
+// Create ring / Join ring and the Join screen, while this Desktop is in no Ring. The Join
+// state lives in the parent so the outcome stays visible once the Ring view takes over.
+function UnpairedRing({ s, join, st, onCreate, onStart, unavailable }: { s: RingStatus; join: JoinApi; st: JoinUi; onCreate: () => void; onStart: () => void; unavailable: boolean }) {
+  const busy = joinBusy(st);
+  const blocked = unavailable || s.local === "in-process";
+  return (
+    <div className="edit-field" data-ring-unpaired>
+      <div className="edit-hint">{fmt("ring.description")}</div>
+      <div className="host-row-actions">
+        <button className="btn btn-primary settings-action-btn" data-ring-create disabled={busy || blocked} onClick={onCreate}>
+          <Plus size={11} /> {st.state === "creating" ? fmt("ring.creating") : fmt("ring.create")}
+        </button>
+        <button className="btn settings-action-btn" data-ring-join-action disabled={busy || blocked || !join} onClick={onStart}>
+          <LogIn size={11} /> {fmt("ring.join")}
+        </button>
+      </div>
+      {unavailable && <div className="host-row-note host-row-warn">{fmt("ring.unsupported")}</div>}
+      <div className="edit-hint">{fmt("ring.localHint")}</div>
+    </div>
+  );
+}
+
+export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRemoveMember, pairing, join, visible = true }: { s: RingStatus; onEnable: (startOver: boolean) => Promise<void>; onSaveRelay: (url: string) => Promise<void>; onClaimHost: (host: string) => Promise<void>; onRemoveMember: (signKey: string) => Promise<RingStatus>; pairing?: Pairing; join?: JoinApi; visible?: boolean }) {
   const [enabling, setEnabling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [removal, dispatchRemoval] = useReducer(removalReducer, REMOVAL_IDLE);
+  const [jst, setJst] = useReducer(joinReducer, JOIN_IDLE);
+  const [upgraded, setUpgraded] = useState(false);
+  // Replies after leaving Settings are not shown; the current operation is cancelled.
+  const mounted = useRef(true);
+  const op = useRef<string | null>(null);
+  op.current = joinOperation(jst);
+  const dispatchJoin = useCallback((a: JoinAction) => { if (mounted.current) setJst(a); }, []);
+  const joinRef = useRef(join);
+  joinRef.current = join;
+  const cancelJoin = useCallback(() => {
+    const owned = op.current;
+    if (!owned) return;
+    op.current = null;
+    dispatchJoin({ type: "cancel", operation: owned });
+    joinRef.current?.cancel(owned).catch(() => {});
+  }, [dispatchJoin]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      const owned = op.current;
+      mounted.current = false;
+      if (owned) joinRef.current?.cancel(owned).catch(() => {});
+    };
+  }, []);
+  // The code dies with the screen: hidden Settings, another section, closing the page.
+  useEffect(() => { if (!visible) cancelJoin(); }, [visible, cancelJoin]);
+  useEffect(() => {
+    const onHide = () => cancelJoin();
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, [cancelJoin]);
+  const current = op.current ? join?.events[op.current] : undefined;
+  useEffect(() => { if (current) dispatchJoin({ type: "event", event: current }); }, [current, dispatchJoin]);
+  const counting = jst.state === "code" || jst.state === "consent";
+  useEffect(() => {
+    if (!counting) return;
+    const t = setInterval(() => dispatchJoin({ type: "tick", nowMs: Date.now() }), 1000);
+    return () => clearInterval(t);
+  }, [counting, dispatchJoin]);
+
+  const create = async () => {
+    if (!join || joinBusy(jst)) return;
+    dispatchJoin({ type: "create" });
+    try {
+      await join.createComputer();
+      dispatchJoin({ type: "created" });
+    } catch (e) {
+      dispatchJoin({ type: "createFailed", error: errorText(e) });
+    }
+  };
+  const startJoin = async () => {
+    if (!join || joinBusy(jst)) return;
+    const owned = crypto.randomUUID();
+    op.current = owned;
+    dispatchJoin({ type: "start", operation: owned });
+    try {
+      const started = await join.start(owned);
+      if (!mounted.current || op.current !== owned) {
+        // Left meanwhile: the backend already cancelled it; make sure.
+        join.cancel(owned).catch(() => {});
+        return;
+      }
+      dispatchJoin({ type: "started", started });
+    } catch (e) {
+      dispatchJoin({ type: "startFailed", operation: owned, error: errorText(e) });
+    }
+  };
+  const confirmJoin = async () => {
+    const owned = op.current;
+    if (!join || !owned || jst.state !== "consent") return;
+    dispatchJoin({ type: "confirm", operation: owned });
+    try {
+      await join.confirm(owned);
+    } catch (e) {
+      dispatchJoin({ type: "confirmFailed", operation: owned, error: errorText(e) });
+    }
+  };
+  const declineJoin = async () => {
+    const owned = op.current;
+    if (!join || !owned || jst.state !== "consent") return;
+    try {
+      await join.decline(owned);
+      dispatchJoin({ type: "declined", operation: owned });
+    } catch (e) {
+      dispatchJoin({ type: "confirmFailed", operation: owned, error: errorText(e) });
+    }
+  };
+
   const remove = async () => {
     if (removal.state !== "confirming") return;
     const key = removal.member.signKey;
@@ -335,51 +587,82 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
       setEnabling(false);
     }
   };
+  const follower = s.connection === "other-window" || join?.overview?.owner === false;
+  const unavailable = join?.overview?.unavailable === "platform";
+  const cliCards = join ? Object.values(cliCardsFrom(Object.values(join.events))).filter(e => e.state !== "cancelled") : [];
   const conn = connectionLine(s);
   const quota = quotaLine(s, Date.now());
   const farewells = farewellLines(s);
   const local = localLine(s);
   const problem = problemLine(s);
+  const outcome = outcomeLine(jst);
   return (
-    <div className="settings-section">
+    <div className="settings-section" data-ring-section>
       <div className="settings-section-head">
-        <div className="settings-section-title">{fmt("mobile.section.title")}</div>
+        <div className="settings-section-title">{fmt("ring.section.title")}</div>
         <div className="settings-section-desc">{fmt("mobile.section.desc")}</div>
       </div>
       <div className="settings-section-body">
         {problem && <div className="host-row-note host-row-warn">{problem}</div>}
-        {s.problem || !s.enabled ? (canEnable(s) &&
+        {s.problem ? (canEnable(s) &&
+          // Only after unreadable settings were set aside: a new Ring starts over.
           <div className="host-row-actions">
             <button className="btn btn-primary settings-action-btn" disabled={enabling} onClick={enable}>
               <Smartphone size={11} /> {enabling ? fmt("mobile.enabling") : fmt("mobile.enable")}
             </button>
             {error && <div className="host-form-error">{error}</div>}
           </div>
+        ) : !s.enabled ? (
+          follower ? <div className="host-row-note">{fmt("ring.follower")}</div> : join && (
+            showsJoinPanel(jst)
+              ? <JoinPanel st={jst} onCancel={cancelJoin} onConfirm={confirmJoin} onDecline={declineJoin} onNewCode={startJoin} />
+              : <>
+                  <UnpairedRing s={s} join={join} st={jst} onCreate={create} onStart={startJoin} unavailable={unavailable} />
+                  <Line line={outcome} />
+                </>
+          )
         ) : (
           <>
+            {(jst.state === "installed" || jst.state === "created") && <Line line={outcome} />}
             <RelaySettings s={s} onSave={onSaveRelay} />
             {conn && <div className="host-row-note">{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
             {farewells.map((f, i) => <div key={i} className={`host-row-note ${f.warn ? "host-row-warn" : ""}`}>{f.text}</div>)}
             <MembersSection s={s} removal={removal} onRemove={m => dispatchRemoval({ type: "ask", member: m })} onClaimHost={onClaimHost} />
             {confirm && <ConfirmDialog title={confirm.title} body={confirm.body} confirm={confirm.confirm} onConfirm={remove} onCancel={() => dispatchRemoval({ type: "cancel" })} />}
-            {pairing && s.connection !== "other-window" && (
+            {follower ? <div className="host-row-note">{fmt("ring.follower")}</div> : (
               <>
-                <PhonePanel s={s} p={pairing} />
-                <ComputerPanel s={s} p={pairing} />
+                {join && (s.approval === "needs-upgrade" || s.approval === "needs-completion" || s.approval === "unavailable") && (
+                  <UpgradeCard s={s} onUpgrade={async () => { await join.upgradeComputer(); if (mounted.current) setUpgraded(true); }} />
+                )}
+                {upgraded && s.approval === "ready" && <div className="host-row-note">{fmt("ring.upgrade.done")}</div>}
+                {s.approval === "unresolved" && <div className="host-row-note host-row-warn">{fmt("mobile.pair.err.reconcile")}</div>}
+                {pairing && (
+                  <>
+                    <PhonePanel s={s} p={pairing} />
+                    {s.approval === "ready" && <ComputerPanel s={s} p={pairing} />}
+                  </>
+                )}
               </>
             )}
           </>
         )}
+        {join && cliCards.map(e => <PairingWindowCard key={e.operation} event={e} readOnly={follower} onConfirm={join.confirm} onDecline={join.decline} />)}
         {local && <div className="host-row-note">{local}</div>}
       </div>
     </div>
   );
 }
 
-export function MobileSettings() {
-  const { status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, pairComputer, cancelComputer } = useRing();
-  if (!status) return null;
-  const p: Pairing = { events: pairing, startPhone, cancelPhone, pairComputer, cancelComputer };
-  return <MobileSettingsView s={status} onEnable={enable} onSaveRelay={setRelayUrl} onClaimHost={claimHost} onRemoveMember={removeMember} pairing={p} />;
+// The Ring section of Settings → Hosts. `visible`: Settings is shown on Hosts (Settings stays
+// mounted when hidden, so leaving it must cancel a shown code).
+export function MobileSettings({ visible = true }: { visible?: boolean }) {
+  const r = useRing();
+  if (!r.status) return null;
+  const p: Pairing = { events: r.pairing, startPhone: r.startPhone, cancelPhone: r.cancelPhone, approveComputer: r.approveComputer };
+  const join: JoinApi = {
+    overview: r.overview, events: r.joinEvents, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
+    start: r.joinStart, confirm: r.joinConfirm, decline: r.joinDecline, cancel: r.joinCancel,
+  };
+  return <MobileSettingsView s={r.status} onEnable={r.enable} onSaveRelay={r.setRelayUrl} onClaimHost={r.claimHost} onRemoveMember={r.removeMember} pairing={p} join={join} visible={visible} />;
 }

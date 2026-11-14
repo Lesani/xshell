@@ -76,6 +76,8 @@ it.each(["success", "admission", "abort", "partial-abort", "offline-abort"])("ac
     const method = command === "host_call" ? String(a?.method) : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      // Settings → Hosts mounts the Ring section (#87).
+      case "ring_status": case "ring_join_overview": return null;
       case "hosts_available": return { sequence: 1, hosts: [descriptor] };
       case "hosts_status": return snapshots;
       case "hosts_configure": {

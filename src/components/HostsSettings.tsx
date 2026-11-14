@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap } from "lucide-react";
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
@@ -7,6 +7,7 @@ import { HostBadge } from "./HostBadge";
 import { HostUpdateAction } from "./HostUpdateAction";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LocalDaemonSettings } from "./LocalDaemonSettings";
+import { MobileSettings } from "./MobileSettings";
 import { fmt } from "../hosts/strings";
 import { hintText, toHostConfig, validateHostForm, type HostFormErrors, type HostFormValues } from "../hosts/hostForm";
 import { isUsableStatus } from "../hosts/registry";
@@ -20,6 +21,11 @@ import type { HostConfig, HostStatus, HostTestResult } from "../hosts/types";
 interface Props {
   onSave: (hosts: HostConfig[]) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
+  // The Ring section (#87) is on screen: Settings shown on Hosts. Leaving it cancels a shown
+  // Device Code.
+  ringVisible?: boolean;
+  // Bumped to scroll the Ring section into view (`ring:focus`, old links to Mobile).
+  ringFocus?: number;
 }
 
 type TestState = { busy: boolean; text: string | null; ok: boolean };
@@ -219,7 +225,7 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
   );
 }
 
-export function HostsSettings({ onSave, onRemove }: Props) {
+export function HostsSettings({ onSave, onRemove, ringVisible = true, ringFocus = 0 }: Props) {
   const snap = useHostsSnapshot();
   const hosts = snap.configs;
   const [editing, setEditing] = useState<HostConfig | "new" | null>(null);
@@ -270,6 +276,14 @@ export function HostsSettings({ onSave, onRemove }: Props) {
           onConfirm={() => { const id = removing.id; setRemoving(null); onRemove(id); }} onCancel={() => setRemoving(null)} />
       )}
     </div>
+    <RingAnchor focus={ringFocus}><MobileSettings visible={ringVisible} /></RingAnchor>
     </>
   );
+}
+
+// Settings → Hosts → Ring, scrolled into view whenever `focus` changes (not on first render).
+function RingAnchor({ focus, children }: { focus: number; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (focus) ref.current?.scrollIntoView?.({ block: "start" }); }, [focus]);
+  return <div ref={ref} data-ring-anchor>{children}</div>;
 }

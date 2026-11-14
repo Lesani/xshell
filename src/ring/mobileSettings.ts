@@ -2,7 +2,7 @@ import { fmt, type StringKey } from "./strings";
 import type { HostRingState, MemberRole, MemberView, RingStatus } from "./types";
 import { timeAgo } from "../utils";
 
-// Settings → Mobile, the pure part: status lines, labels and the Relay URL form.
+// Settings → Hosts → Ring, the pure part: status lines, labels and the Relay URL form.
 
 const STATUS_KEY: Record<MemberView["presence"]["kind"], StringKey> = {
   online: "mobile.status.online",
@@ -198,7 +198,7 @@ export function removePendingLine(s: Pick<RingStatus, "connection">, name: strin
   return s.connection === "connected" ? null : fmt("mobile.remove.pending", { name });
 }
 
-// A removal as Settings → Mobile follows it, kept apart from the member list (the row goes
+// A removal as Settings → Hosts → Ring follows it, kept apart from the member list (the row goes
 // away when it succeeds; the notes stay).
 export type Removal =
   | { state: "idle" }

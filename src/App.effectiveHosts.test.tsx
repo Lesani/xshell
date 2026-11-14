@@ -46,6 +46,8 @@ it("actual App discovers/selects Ring history without saved SSH or Local Daemon;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
       case "hosts_configure": expect(a?.hosts).toEqual([]); return;
+      // Settings → Hosts mounts the Ring section (#87).
+      case "ring_status": case "ring_join_overview": return null;
       case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: null };
