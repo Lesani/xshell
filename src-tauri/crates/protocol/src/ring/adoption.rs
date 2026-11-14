@@ -23,12 +23,18 @@ pub enum JoinTarget {
         desktop: PublicIdentity,
         daemon: PublicIdentity,
     },
+    /// A phone joining a v2 Ring by scanning a Desktop's v2 `PairingOffer`. The phone signs
+    /// its own Pairing consent proof; there is no companion.
+    Mobile {
+        phone: PublicIdentity,
+    },
 }
 impl JoinTarget {
     pub fn principal(&self) -> &PublicIdentity {
         match self {
             Self::StandaloneDaemon { daemon } => daemon,
             Self::Computer { desktop, .. } => desktop,
+            Self::Mobile { phone } => phone,
         }
     }
     pub fn identities(&self) -> Vec<(&PublicIdentity, Role)> {
@@ -37,13 +43,26 @@ impl JoinTarget {
             Self::Computer { desktop, daemon } => {
                 vec![(desktop, Role::Desktop), (daemon, Role::Daemon)]
             }
+            Self::Mobile { phone } => vec![(phone, Role::Mobile)],
+        }
+    }
+    /// The enrollment unit kind this target creates.
+    pub fn enrollment_kind(&self) -> EnrollmentKind {
+        match self {
+            Self::StandaloneDaemon { .. } => EnrollmentKind::Daemon,
+            Self::Computer { .. } => EnrollmentKind::Computer,
+            Self::Mobile { .. } => EnrollmentKind::Mobile,
         }
     }
     pub fn validate(&self) -> Result<(), PairError> {
         let identities = self.identities();
+        let fallback = match self {
+            Self::Mobile { .. } => "phone",
+            _ => "computer",
+        };
         if identities
             .iter()
-            .any(|(p, _)| p.name != member_name(&p.name, "computer"))
+            .any(|(p, _)| p.name != member_name(&p.name, fallback))
             || (identities.len() == 2
                 && (identities[0].0.sign_key == identities[1].0.sign_key
                     || identities[0].0.noise_key == identities[1].0.noise_key))
@@ -63,10 +82,7 @@ impl JoinTarget {
         let u = m
             .unit(enrollment_id)
             .ok_or_else(|| PairError::Payload("missing target unit".into()))?;
-        let kind = match self {
-            Self::Computer { .. } => EnrollmentKind::Computer,
-            _ => EnrollmentKind::Daemon,
-        };
+        let kind = self.enrollment_kind();
         let ids = self.identities();
         if u.kind != kind
             || u.members.len() != ids.len()
@@ -89,6 +105,53 @@ impl JoinTarget {
         Ok(())
     }
 }
+/// The honestly unsigned v2 `Enroll` successor of `head` that adds `intent`'s target as one
+/// new unit, issued at `at` and to be signed by `signer`. Structurally verified with
+/// `verify_enroll_proposal`; it carries no proofs (consent is collected afterwards).
+pub fn enroll_proposal(
+    head: &crate::ring::SignedRoster,
+    signer: SignKey,
+    intent: &AdoptionIntent,
+    at: u64,
+) -> Result<Roster, PairError> {
+    use crate::ring::membership::{verify_enroll_proposal, Enrollment};
+    let mut proposal = head.roster().clone();
+    proposal.version += 1;
+    proposal.prev = Some(head.hash());
+    proposal.signed_by = signer;
+    proposal.issued_at = at;
+    for (identity, role) in intent.target.identities() {
+        proposal.members.push(Member::new(
+            &identity.name,
+            role,
+            identity.sign_key,
+            identity.noise_key,
+            at,
+        ));
+    }
+    let mut membership = proposal
+        .membership()
+        .map_err(|e| PairError::Payload(e.to_string()))?;
+    membership.enrollments.push(Enrollment {
+        id: intent.operation.clone(),
+        kind: intent.target.enrollment_kind(),
+        members: intent
+            .target
+            .identities()
+            .iter()
+            .map(|(identity, _)| identity.sign_key)
+            .collect(),
+        enrolled_at: at,
+    });
+    membership.change = RosterChange::Enroll {
+        enrollment_id: intent.operation.clone(),
+        proofs: vec![],
+    };
+    proposal.set_membership(&membership);
+    verify_enroll_proposal(head, &proposal).map_err(|e| PairError::Payload(e.to_string()))?;
+    Ok(proposal)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptionIntent {

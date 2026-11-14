@@ -41,6 +41,14 @@ pub const SCENARIOS: &[MembershipScenario] = &[
         "proposal_human_wait_over_15_seconds",
         proposal_human_wait_over_15_seconds,
     ),
+    (
+        "proposal_mobile_guest_signs_own_enrollment",
+        proposal_mobile_guest_signs_own_enrollment,
+    ),
+    (
+        "proposal_mobile_guest_decline_creates_no_membership",
+        proposal_mobile_guest_decline_creates_no_membership,
+    ),
 ];
 
 fn adoption_draft(
@@ -69,11 +77,7 @@ fn adoption_draft(
     }
     m.enrollments.push(Enrollment {
         id: intent.operation.clone(),
-        kind: if identities.len() == 2 {
-            EnrollmentKind::Computer
-        } else {
-            EnrollmentKind::Daemon
-        },
+        kind: intent.target.enrollment_kind(),
         members: identities.iter().map(|(p, _)| p.sign_key).collect(),
         enrolled_at: r.issued_at,
     });
@@ -294,6 +298,154 @@ fn adoption_roundtrip(
         result.0.head().member(&daemon.sign_key()).is_some(),
         computer
     );
+}
+/// #87: a phone scans a v2 offer (head anchor), reads its frozen `Enroll` through the proposal
+/// reader as the guest, signs its own Pairing consent and gets the published version.
+fn mobile_roundtrip(t: &RelayTarget, accept: bool) {
+    use super::super::pair::{
+        adopt_mobile_as_guest_with_ready, approve_mobile_adoption, MobileAdoptionRequest,
+        MobileHostRequest, PairOptions, PairPipe, Prepared,
+    };
+    use super::super::VerifiedProposal;
+    use crate::ring::pairing::{OfferHead, PairError, PairSecret, PairingOffer};
+    let (ks, chain) = upgraded(t, false);
+    let creator = Arc::new(dial(t, chain.clone(), ks[0].clone()));
+    let phone = keys();
+    let secret = PairSecret::generate().unwrap();
+    let offer = PairingOffer {
+        ring_id: chain.ring_id().clone(),
+        relay_url: chain.head().roster().relay_url.clone(),
+        sign_key: ks[0].sign_key(),
+        noise_key: ks[0].noise_key(),
+        secret: secret.clone(),
+        expires_at: now() + 120,
+        head: Some(OfferHead {
+            version: chain.head().version(),
+            hash: chain.head().hash(),
+        }),
+    };
+    let offer = PairingOffer::parse(&offer.encode()).unwrap();
+    let opts = PairOptions {
+        tls: t.tls.clone(),
+        ..Default::default()
+    };
+    let pipe = PairPipe::open(&t.url, &secret.slot(), &opts).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(110);
+    let (host_keys, host_chain, host_client, ring) = (
+        ks[0].clone(),
+        chain.clone(),
+        creator.clone(),
+        chain.ring_id().clone(),
+    );
+    let expires_at = offer.expires_at;
+    let host = std::thread::spawn(move || {
+        approve_mobile_adoption(
+            pipe,
+            &MobileHostRequest {
+                keys: &host_keys,
+                secret: &secret,
+                ring_id: &ring,
+                name: "approver",
+                until,
+                offer_expires_at: expires_at,
+            },
+            None,
+            |intent, hash| {
+                let proposal = crate::ring::pairing::adoption::enroll_proposal(
+                    host_chain.head(),
+                    host_keys.sign_key(),
+                    intent,
+                    now(),
+                )?;
+                let handle = host_client
+                    .create_proposal(
+                        intent.operation.clone(),
+                        intent.target.principal().sign_key,
+                        hash,
+                        intent.expires_at,
+                        &proposal,
+                    )
+                    .map_err(|e| PairError::Relay(e.to_string()))?;
+                Ok(Prepared::Proposal(Box::new(VerifiedProposal {
+                    chain: host_chain.clone(),
+                    proposal,
+                    handle,
+                })))
+            },
+            |signed| {
+                host_client
+                    .publish_roster(signed)
+                    .map_err(|e| PairError::Relay(e.to_string()))?;
+                Ok(crate::ring::pairing::Joined {
+                    ring_id: signed.ring_id().clone(),
+                    relay_url: signed.roster().relay_url.clone(),
+                    version: signed.version(),
+                    hash: signed.hash(),
+                    signed_by: host_keys.sign_key(),
+                })
+            },
+            |handle| {
+                let _ = host_client.cancel_proposal(handle);
+            },
+        )
+    });
+    let mut confirmations = 0;
+    let result = adopt_mobile_as_guest_with_ready(
+        &MobileAdoptionRequest {
+            offer: &offer,
+            keys: phone.clone(),
+            name: "my phone",
+            until,
+        },
+        &opts,
+        None,
+        || Ok(()),
+        |request| {
+            confirmations += 1;
+            assert_eq!(request.verified.chain.head().hash(), chain.head().hash());
+            let m = request.verified.proposal.membership().unwrap();
+            let RosterChange::Enroll { enrollment_id, .. } = &m.change else {
+                panic!("not Enroll");
+            };
+            let unit = m.unit(enrollment_id).unwrap();
+            assert_eq!(unit.kind, EnrollmentKind::Mobile);
+            assert_eq!(unit.members, vec![phone.sign_key()]);
+            assert_eq!(creator.roster().version(), chain.head().version());
+            Ok(accept)
+        },
+    );
+    let host_result = host.join().unwrap();
+    assert_eq!(confirmations, 1);
+    if !accept {
+        assert_eq!(result.unwrap_err(), PairError::Cancelled);
+        assert_eq!(host_result.unwrap_err(), PairError::Cancelled);
+        assert_eq!(creator.roster().version(), chain.head().version());
+        return;
+    }
+    host_result.unwrap();
+    let enrolled = result.unwrap();
+    assert!(!enrolled.already_enrolled);
+    let head = enrolled.chain.head();
+    assert_eq!(head.version(), chain.head().version() + 1);
+    let member = head.member(&phone.sign_key()).unwrap();
+    assert_eq!(member.role, Role::Mobile);
+    assert_eq!(member.name, "my phone");
+    let RosterChange::Enroll { proofs, .. } = head.roster().membership().unwrap().change else {
+        panic!("not Enroll");
+    };
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs[0].key, phone.sign_key());
+    assert_eq!(
+        proofs[0].context.kind,
+        crate::ring::membership::ConsentFlow::Pairing
+    );
+    assert_eq!(creator.roster().version(), head.version());
+}
+pub fn proposal_mobile_guest_signs_own_enrollment(t: &RelayTarget) {
+    mobile_roundtrip(t, true);
+}
+pub fn proposal_mobile_guest_decline_creates_no_membership(t: &RelayTarget) {
+    mobile_roundtrip(t, false);
 }
 pub fn proposal_continuation_real_noise(t: &RelayTarget) {
     adoption_roundtrip(t, true, std::time::Duration::ZERO, Expected::Approve);
