@@ -64,20 +64,28 @@ impl JoinOfferInput {
     }
 }
 
+/// A Join's progress. There is no confirmation on the joining machine: once the approver's
+/// proposal has verified, it signs and installs by itself.
 #[derive(Clone, Debug)]
 pub enum JoinStatus {
+    /// The code is shown (once ready); nobody has approved yet.
     Waiting,
-    AwaitingConfirmation(Box<ConsentPreview>),
+    /// Approved: proofs released, waiting for publication and installation.
     Completing,
-    Installed { version: u64 },
-    Declined,
-    Failed { error: String },
-    ReconciliationRequired { error: String },
+    Installed {
+        version: u64,
+    },
+    Failed {
+        error: String,
+    },
+    /// The outcome is unknown (crash, lost answer, install error after proofs left): the
+    /// reconciler finishes it automatically ("Finishing…").
+    Finishing {
+        error: String,
+    },
 }
 struct JoinState {
     status: JoinStatus,
-    lease: Option<CreateConfirmationLease>,
-    decision: Option<CreateDecision>,
     ready: bool,
 }
 struct JoinShared {
@@ -119,9 +127,7 @@ impl JoinOffer {
             if state.ready {
                 return Ok(());
             }
-            if let JoinStatus::Failed { error } | JoinStatus::ReconciliationRequired { error } =
-                &state.status
-            {
+            if let JoinStatus::Failed { error } | JoinStatus::Finishing { error } = &state.status {
                 return Err(error.clone());
             }
             if Instant::now() >= until {
@@ -142,64 +148,6 @@ impl JoinOffer {
             .unwrap_or_else(|e| e.into_inner())
             .status
             .clone()
-    }
-    pub fn await_consent(
-        &self,
-        timeout: Duration,
-    ) -> Result<(ConsentPreview, CreateConfirmationLease), String> {
-        let until = Instant::now() + timeout;
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            match &state.status {
-                JoinStatus::AwaitingConfirmation(preview) if state.decision.is_none() => {
-                    return Ok((
-                        (**preview).clone(),
-                        state.lease.clone().ok_or("Join lease missing")?,
-                    ))
-                }
-                JoinStatus::Failed { error } | JoinStatus::ReconciliationRequired { error } => {
-                    return Err(error.clone())
-                }
-                JoinStatus::Installed { .. } | JoinStatus::Declined => {
-                    return Err("Join no longer awaits confirmation".into())
-                }
-                _ => {}
-            }
-            if Instant::now() >= until {
-                return Err("waiting for verified Join preview timed out".into());
-            }
-            state = self
-                .shared
-                .changed
-                .wait_timeout(state, until.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-    pub fn confirm_join(&self, confirmation: CreateConfirmation) -> Result<(), String> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(state.status, JoinStatus::AwaitingConfirmation(_)) || state.decision.is_some()
-        {
-            return Err("Join is not awaiting confirmation".into());
-        }
-        state
-            .lease
-            .as_ref()
-            .ok_or("Join lease missing")?
-            .verify(&confirmation)?;
-        state.decision = Some(CreateDecision::Confirm(confirmation));
-        self.shared.changed.notify_all();
-        Ok(())
-    }
-    pub fn decline_join(&self) -> Result<(), String> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(state.status, JoinStatus::AwaitingConfirmation(_)) || state.decision.is_some()
-        {
-            return Err("Join is not awaiting confirmation".into());
-        }
-        state.decision = Some(CreateDecision::Decline);
-        self.shared.changed.notify_all();
-        Ok(())
     }
     pub fn cancel_join(&self) {
         self.shared.cancel.store(true, Ordering::Release);
@@ -547,9 +495,11 @@ impl DesktopRing {
         // The same guard continues into the worker; no release/reacquire gap. Re-read all
         // profile, identity and recovery fences only after admission has been acquired.
         self.check_join_origin(&offer, until, &cancel)?;
+        // An explicit Join starts over after an unreadable profile.
+        self.store.clear_moved_aside()?;
         if let Some(stored) = self.store.load_profile()?.0 {
             if stored.membership.is_some() {
-                return Err("leave_required: Join needs an unpaired Desktop".into());
+                return Err("already_member: this computer is already in a Ring".into());
             }
             if stored.pending_join.is_some()
                 || stored
@@ -557,7 +507,8 @@ impl DesktopRing {
                     .as_ref()
                     .is_some_and(|journal| !journal.phase.permits_new_operation())
             {
-                return Err("reconciliation_required: an earlier Join is unresolved".into());
+                self.kick_reconciler();
+                return Err("finishing: an earlier Join is being finished".into());
             }
         }
         let (keys, profile) = self.register_companion_inner(client)?;
@@ -579,6 +530,9 @@ impl DesktopRing {
                 intent: intent.clone(),
                 relay_url: relay.clone(),
             });
+            // Joining again: the notices have served their purpose.
+            stored.removed = None;
+            stored.old_ring = None;
             Ok((Some(stored), ()))
         })?;
         // No proof signer has started. Retain the reservation if counterpart admission
@@ -593,8 +547,6 @@ impl DesktopRing {
         let shared = Arc::new(JoinShared {
             state: Mutex::new(JoinState {
                 status: JoinStatus::Waiting,
-                lease: None,
-                decision: None,
                 ready: false,
             }),
             changed: Condvar::new(),
@@ -627,18 +579,18 @@ impl DesktopRing {
                     },
                     &driver,
                 );
-                driver.cancel.store(true, Ordering::Release); // terminal driver ends its confirmation capability
+                driver.cancel.store(true, Ordering::Release); // a terminal driver releases no more proofs
                 let mut state = driver.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.status = match &result {
                     Ok(AdoptionOutcome::Installed { chain, .. }) => JoinStatus::Installed {
                         version: chain.head().version(),
                     },
-                    Ok(AdoptionOutcome::Declined { .. }) => JoinStatus::Declined,
-                    Err(error) if error.starts_with("reconciliation_required:") => {
-                        JoinStatus::ReconciliationRequired {
-                            error: error.clone(),
-                        }
-                    }
+                    Ok(AdoptionOutcome::Declined { .. }) => JoinStatus::Failed {
+                        error: "cancelled: Join cancelled".into(),
+                    },
+                    Err(error) if error.starts_with("finishing:") => JoinStatus::Finishing {
+                        error: error.clone(),
+                    },
                     Err(error) => JoinStatus::Failed {
                         error: error.clone(),
                     },
@@ -688,7 +640,6 @@ impl DesktopRing {
             key: profile.daemon.sign_key,
         };
         let secret = code.secret();
-        let mut declined = false;
         let result = adopt_as_guest_with_ready(
             &AdoptionGuestRequest {
                 relay_url: &relay,
@@ -731,8 +682,6 @@ impl DesktopRing {
                 let hash = b64::decode_array::<32>(&verified.handle.context)
                     .map_err(|_| PairError::Crypto)?;
                 let context = pairing_consent_context(&verified.proposal, &hash)
-                    .map_err(|e| PairError::Payload(e.to_string()))?;
-                let proposal_hash = consent_proposal_hash(&verified.proposal)
                     .map_err(|e| PairError::Payload(e.to_string()))?;
                 let predecessor: Vec<String> = verified
                     .chain
@@ -779,53 +728,33 @@ impl DesktopRing {
                         }),
                     })
                     .map_err(PairError::Relay)?;
-                let lease = CreateConfirmationLease {
-                    operation: intent.operation.clone(),
-                    proposal_hash: proposal_hash.clone(),
-                    until: request.until,
-                    expires_at: intent.expires_at,
-                    cancelled: shared.cancel.clone(),
-                };
-                let preview = ConsentPreview {
-                    operation: intent.operation.clone(),
-                    proposal_hash,
-                    ring_id: verified.proposal.ring_id.clone(),
-                    relay_url: verified.proposal.relay_url.clone(),
-                    profile: profile.clone(),
-                    context: context.clone(),
-                    proposal: verified.proposal.clone(),
-                    expires_at: intent.expires_at,
-                };
-                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.status = JoinStatus::AwaitingConfirmation(Box::new(preview));
-                state.lease = Some(lease.clone());
-                shared.changed.notify_all();
-                let confirmation = loop {
-                    self.create_live(&lease).map_err(PairError::Relay)?;
-                    if let Some(decision) = state.decision.take() {
-                        break decision;
-                    }
-                    state = shared
-                        .changed
-                        .wait_timeout(state, Duration::from_millis(50))
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
-                };
-                if matches!(confirmation, CreateDecision::Decline) {
-                    declined = true;
-                    return Ok(false);
+                // No confirmation on the joining machine (ADR-0016): the approver's
+                // proposal verified against this exact transcript and the code is still
+                // shown (not cancelled, blurred or expired, this process still owns Join),
+                // so the joining keys sign now. Nothing is released otherwise.
+                if shared.cancel.load(Ordering::Acquire)
+                    || Instant::now() >= request.until
+                    || now() >= intent.expires_at
+                    || !self.pairing_ipc_owner()
+                {
+                    return Err(PairError::Cancelled);
                 }
-                let CreateDecision::Confirm(proof) = confirmation else {
-                    unreachable!()
-                };
-                lease.verify(&proof).map_err(PairError::Relay)?;
-                self.create_live(&lease).map_err(PairError::Relay)?;
-                state.status = JoinStatus::Completing;
-                drop(state);
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::JoinBeforeConsent,
+                );
+                {
+                    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.status = JoinStatus::Completing;
+                    shared.changed.notify_all();
+                }
                 self.journal_update(&intent.operation, |journal| {
                     journal.phase = AdoptionPhase::ConsentMayHaveLeft
                 })
                 .map_err(PairError::Relay)?;
+                if shared.cancel.load(Ordering::Acquire) {
+                    // Durably "may have left" already: the reconciler decides.
+                    return Err(PairError::Cancelled);
+                }
                 signing.lock().unwrap_or_else(|e| e.into_inner()).allowed = Some(AllowedConsent {
                     message: consent_message(&verified.proposal, intent.expires_at, &context)
                         .map_err(|e| PairError::Payload(e.to_string()))?,
@@ -836,8 +765,12 @@ impl DesktopRing {
         );
         match result {
             Ok((accepted, _)) => {
-                self.install_joined_computer(client, &intent.operation, &profile, &accepted)
-                    .map_err(|error| format!("reconciliation_required: {error}"))?;
+                if let Err(error) =
+                    self.install_joined_computer(client, &intent.operation, &profile, &accepted)
+                {
+                    self.kick_reconciler();
+                    return Err(format!("finishing: {error}"));
+                }
                 Ok(AdoptionOutcome::Installed {
                     operation: intent.operation,
                     chain: accepted,
@@ -857,13 +790,16 @@ impl DesktopRing {
                         )
                 });
                 if uncertain {
-                    return Err(format!("reconciliation_required: {error}"));
+                    self.kick_reconciler();
+                    return Err(format!("finishing: {error}"));
                 }
-                client
-                    .request(CompanionRequest::Cancel {
-                        operation: intent.operation.clone(),
-                    })
-                    .map_err(|failure| format!("reconciliation_required: {failure}"))?;
+                if let Err(failure) = client.request(CompanionRequest::Cancel {
+                    operation: intent.operation.clone(),
+                }) {
+                    // The reservation stays; the reconciler discards it and cancels again.
+                    self.kick_reconciler();
+                    return Err(format!("finishing: {failure}"));
+                }
                 self.store.transact_profile(|stored, _| {
                     let mut stored = stored.ok_or("retained Join profile missing")?;
                     if let Some(journal) = stored
@@ -871,9 +807,7 @@ impl DesktopRing {
                         .as_mut()
                         .filter(|journal| journal.intent.operation == intent.operation)
                     {
-                        journal.phase = if declined {
-                            AdoptionPhase::DeclinedBeforeProof
-                        } else if now() >= journal.intent.expires_at {
+                        journal.phase = if now() >= journal.intent.expires_at {
                             AdoptionPhase::ExpiredBeforeProof
                         } else {
                             AdoptionPhase::Cancelled
@@ -888,13 +822,7 @@ impl DesktopRing {
                     }
                     Ok((Some(stored), ()))
                 })?;
-                if declined {
-                    Ok(AdoptionOutcome::Declined {
-                        operation: intent.operation,
-                    })
-                } else {
-                    Err(error.to_string())
-                }
+                Err(error.to_string())
             }
         }
     }
@@ -920,10 +848,15 @@ impl DesktopRing {
     }
     /// Entered words authorize only this real exchange/proposal. Publication is a Relay
     /// outcome, never a claim that the guest's two private installations have completed.
+    /// Errors start with a code: `busy`, `other_window`, `finishing`, `not_approver`,
+    /// `offline`, `not_found`, `already_used`, `closed`, `expired`, `cancelled`, `refused`,
+    /// `uncertain`.
     pub fn approve_device_code(&self, code: &DeviceCode) -> Result<ApprovalOutcome, String> {
-        let _admission = self.reserve_adoption()?;
+        let _admission = self
+            .reserve_adoption()
+            .map_err(|e| format!("busy: {e}"))?;
         if !self.pairing_ipc_owner() {
-            return Err("another process owns approval".into());
+            return Err("other_window: another window owns approval".into());
         }
         let stored = self
             .store
@@ -938,11 +871,12 @@ impl DesktopRing {
                 )
             })
         {
-            return Err("reconciliation_required: an earlier proposal is unresolved".into());
+            self.kick_reconciler();
+            return Err("finishing: an earlier approval is being finished".into());
         }
         let member = stored
             .membership
-            .ok_or("approval requires enrolled membership")?;
+            .ok_or("not_approver: this computer is in no Ring")?;
         if member.chain.head().roster().v != 2
             || member
                 .chain
@@ -957,7 +891,7 @@ impl DesktopRing {
                 .authorized_member(&stored.keys.sign_key())
                 .is_some_and(|member| member.role == xshell_protocol::ring::Role::Desktop)
         {
-            return Err("approval requires an authorized v2 Computer Desktop".into());
+            return Err("not_approver: approval requires an authorized Computer".into());
         }
         let until = Instant::now() + self.cfg.pair_ttl.min(Duration::from_secs(600));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -970,12 +904,22 @@ impl DesktopRing {
             ring: self.cfg.timeouts,
             ..Default::default()
         };
-        let pipe = PairPipe::open(&relay, &secret.slot(), &options).map_err(|e| e.to_string())?;
+        let code_of = |e: PairError| {
+            let e = xshell_protocol::ring::relay::approve::pair_error(
+                e,
+                cancel.load(Ordering::Acquire),
+            );
+            format!("{}: {e}", e.as_code())
+        };
+        let pipe = PairPipe::open(&relay, &secret.slot(), &options).map_err(|e| match e {
+            PairError::Relay(_) | PairError::Timeout => format!("offline: {e}"),
+            e => code_of(e),
+        })?;
         // Readiness-gated origins already occupy their slot. An absent peer is an
         // unknown/expired/wrong-Relay code, not a new approver-owned offer to wait on.
         if !pipe.has_peer() {
             pipe.close();
-            return Err(PairError::NotFound.to_string());
+            return Err(format!("not_found: {}", PairError::NotFound));
         }
 
         let lane =
@@ -992,6 +936,29 @@ impl DesktopRing {
             },
             Some(&cancel),
             |intent, hash| {
+                // A machine whose headless Daemon is a standalone member joins as a Computer
+                // in this one approval: its standalone unit is removed first, only now that
+                // possession of the Daemon key was proven in this pairing.
+                let head = self
+                    .adoption_effective_chain()
+                    .map_err(PairError::Relay)?
+                    .ok_or(PairError::Cancelled)?;
+                if xshell_protocol::ring::pairing::adoption::standalone_unit_to_replace(
+                    head.head(),
+                    intent,
+                )?
+                .is_some()
+                {
+                    let xshell_protocol::ring::pairing::adoption::JoinTarget::Computer {
+                        daemon,
+                        ..
+                    } = &intent.target
+                    else {
+                        return Err(PairError::Cancelled);
+                    };
+                    self.remove_member_reserved(&daemon.sign_key)
+                        .map_err(|e| PairError::Relay(format!("standalone removal: {e}")))?;
+                }
                 let ready_until = until.min(Instant::now() + self.cfg.pair_publish_wait);
                 let (chain, captured) = loop {
                     if cancel.load(Ordering::Acquire)
@@ -1190,18 +1157,18 @@ impl DesktopRing {
                 self.outgoing_update(op, |journal| journal.phase = OutgoingPhase::Cancelled)?;
             }
             if phase == Some(OutgoingPhase::PublicationUncertain) {
+                self.kick_reconciler();
                 return Err(format!(
-                    "reconciliation_required: {}",
+                    "finishing: {}",
                     result
                         .err()
                         .map_or_else(|| "publication unresolved".into(), |e| e.to_string())
                 ));
             }
         }
-        Err(result.err().map_or_else(
-            || "approval ended without publication".into(),
-            |e| e.to_string(),
-        ))
+        Err(result
+            .err()
+            .map_or_else(|| "uncertain: approval ended without publication".into(), code_of))
     }
 }
 

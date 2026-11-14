@@ -30,7 +30,7 @@ pub use reconcile::{
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
 mod ui;
-pub use ui::ApprovalReadiness;
+pub use ui::MembershipState;
 
 /// See `DesktopRing::adoption_baseline`.
 pub(in crate::ring) type AdoptionBaseline =
@@ -253,6 +253,9 @@ impl DesktopRing {
                 .and_then(|state| state.chain.head().member(key))
                 .map(|member| member.name.clone())
         };
+        // A registration the Daemon still holds for an earlier identity of this Desktop
+        // (before a set-aside rotated it) only lends its names; the Daemon replaces it.
+        let existing = existing.filter(|p| p.desktop_store == desktop_dir.to_string_lossy());
         let desktop_name = existing
             .as_ref()
             .map(|p| p.desktop.name.clone())
@@ -286,12 +289,6 @@ impl DesktopRing {
                 .into(),
         );
         profile.validate()?;
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing != &profile)
-        {
-            return Err("conflicting retained counterpart registration".into());
-        }
         // Retain the association before registration can escape to the other store. A
         // stopped/unavailable counterpart is never grounds to discard this descriptor.
         self.store.transact_profile(|stored, _| {
@@ -471,21 +468,22 @@ impl DesktopRing {
         xshell_protocol::ring::url::RelayUrl::parse(relay_url).map_err(|e| e.to_string())?;
         let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
-            return Err("another process owns Create".into());
+            return Err("other_window: another window owns Create".into());
         }
+        // An explicit Create starts over after an unreadable profile.
+        self.store.clear_moved_aside()?;
         if let Some(profile) = self.store.load_profile()?.0 {
-            if profile.pending_join.is_some() {
-                return Err("reconciliation_required: an earlier Join is unresolved".into());
-            }
             if profile.membership.is_some() {
-                return Err("leave_required: Create needs an unpaired Desktop".into());
+                return Err("already_member: this computer is already in a Ring".into());
             }
-            if profile
-                .journal
-                .as_ref()
-                .is_some_and(|journal| !journal.phase.permits_new_operation())
+            if profile.pending_join.is_some()
+                || profile
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| !journal.phase.permits_new_operation())
             {
-                return Err("reconciliation_required: an earlier adoption is unresolved".into());
+                self.kick_reconciler();
+                return Err("finishing: an earlier Join or Create is being finished".into());
             }
         }
         let (keys, profile) = self.register_companion_inner(client)?;
@@ -501,7 +499,7 @@ impl DesktopRing {
         let ring_id = RingId::derive(&keys.sign_key());
         let activity_key =
             RingClient::activity_key(relay_url, &ring_id, None, self.cfg.timeouts.connect)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("offline: {e}"))?;
         let at = now();
         let mut proposal = Roster {
             v: 2,
@@ -535,8 +533,10 @@ impl DesktopRing {
                 enrolled_at: at,
             }],
             retired: vec![],
+            // Rings do not expire members (B5): a machine that was off for weeks comes
+            // back by itself; a stale machine goes away with Remove.
             policy: RingPolicy {
-                inactivity_seconds: Some(DEFAULT_INACTIVITY_SECONDS),
+                inactivity_seconds: None,
                 activity_key,
             },
             change: RosterChange::Genesis { proofs: vec![] },
@@ -558,8 +558,10 @@ impl DesktopRing {
         self.store.transact_profile(|stored, _| {
             let mut stored = stored.ok_or("retained profile missing")?;
             if stored.membership.is_some() {
-                return Err("leave_required: membership appeared before Create preparation".into());
+                return Err("already_member: membership appeared before Create preparation".into());
             }
+            stored.removed = None;
+            stored.old_ring = None;
             stored.journal = Some(AdoptionJournal {
                 intent: intent.clone(),
                 predecessor: vec![],
@@ -711,7 +713,8 @@ impl DesktopRing {
                 }
                 return Err(error);
             }
-            return Err(format!("reconciliation_required: {error}"));
+            self.kick_reconciler();
+            return Err(format!("finishing: {error}"));
         }
         result
     }

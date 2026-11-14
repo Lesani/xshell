@@ -64,6 +64,33 @@ pub struct ProfileState {
     pub companion: Option<xshell_protocol::ring::companion::CompanionProfile>,
     pub pending_join: Option<PendingJoin>,
     pub outgoing: Option<OutgoingAdoption>,
+    /// Set when this Desktop learned that another device removed it from its Ring; cleared
+    /// when a Join or Create starts.
+    pub removed: Option<RemovedNotice>,
+    /// When (seconds) a stored format-1 Ring was set aside at start; cleared when a Join or
+    /// Create starts.
+    pub old_ring: Option<u64>,
+}
+
+/// "This machine was removed from your Ring": which Ring, at which version, and when this
+/// Desktop learned it (seconds).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemovedNotice {
+    pub ring_id: xshell_protocol::ring::RingId,
+    pub version: u64,
+    pub at: u64,
+}
+
+/// Why [`Store::set_aside`] sets the stored membership aside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsideReason {
+    /// A format-1 Ring (or a format-1 transition still in the journal): not supported.
+    V1,
+    /// Another device removed this Desktop; the notice is shown until a Join or Create.
+    Removed(RemovedNotice),
+    /// This Desktop removed itself: no notice.
+    SelfRemoved,
 }
 
 /// A conservative durable obligation, not permission to replay a signed mutation.
@@ -94,6 +121,10 @@ pub enum AdoptionPhase {
     Cancelled,
     DeclinedBeforeProof,
     ExpiredBeforeProof,
+    /// After proofs may have left: the offer expired and the Ring's verified history (read
+    /// as this device) shows it never enrolled, or it enrolled and was removed before this
+    /// Desktop installed it. Terminal; nothing of it can install any more.
+    Abandoned,
 }
 impl AdoptionPhase {
     pub(crate) fn before_proof_terminal(&self) -> bool {
@@ -103,7 +134,7 @@ impl AdoptionPhase {
         )
     }
     pub(crate) fn permits_new_operation(&self) -> bool {
-        *self == Self::Installed || self.before_proof_terminal()
+        matches!(self, Self::Installed | Self::Abandoned) || self.before_proof_terminal()
     }
 }
 
@@ -310,7 +341,8 @@ impl AdoptionJournal {
             AdoptionPhase::Installed => 4,
             AdoptionPhase::Cancelled
             | AdoptionPhase::DeclinedBeforeProof
-            | AdoptionPhase::ExpiredBeforeProof => 5,
+            | AdoptionPhase::ExpiredBeforeProof
+            | AdoptionPhase::Abandoned => 5,
         };
         if rank(&new.phase) < rank(&self.phase)
             || (new.phase.before_proof_terminal()
@@ -452,6 +484,11 @@ impl OutgoingAdoption {
                 OutgoingPhase::Prepared => AdoptionPhase::Prepared,
                 OutgoingPhase::PublicationUncertain => AdoptionPhase::PublicationUncertain,
                 OutgoingPhase::Published => AdoptionPhase::Accepted,
+                // A signed candidate that the reconciler found never accepted (another
+                // version took the slot, or it expired unpublished) ends as abandoned.
+                OutgoingPhase::Cancelled if self.signed_candidate.is_some() => {
+                    AdoptionPhase::Abandoned
+                }
                 OutgoingPhase::Cancelled => AdoptionPhase::Cancelled,
             },
             signed_candidate: self.signed_candidate.clone(),
@@ -551,6 +588,10 @@ struct File {
     pending_join: Option<PendingJoin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     outgoing: Option<OutgoingAdoption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removed: Option<RemovedNotice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_ring: Option<u64>,
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -632,7 +673,9 @@ impl Store {
                         journal: profile.as_ref().and_then(|p| p.journal.clone()),
                         companion: profile.as_ref().and_then(|p| p.companion.clone()),
                         pending_join: profile.as_ref().and_then(|p| p.pending_join.clone()),
-                        outgoing: profile.and_then(|p| p.outgoing),
+                        outgoing: profile.as_ref().and_then(|p| p.outgoing.clone()),
+                        removed: None,
+                        old_ring: None,
                     })
                 }
             };
@@ -715,16 +758,20 @@ impl Store {
         out
     }
 
-    /// Local-only Leave of a membership that no longer includes this Desktop. Under both
-    /// locks: `removed` must accept the stored profile (the caller's readiness check), the
-    /// current file is first copied to `ring.json.left-<ms>` (kept as evidence), then the
-    /// profile is rewritten with its identity and counterpart registration only. Atomic:
-    /// an interruption leaves either the old profile (Leave can run again) or the new one.
-    /// No profile or no membership: nothing to leave, a no-op.
-    pub fn leave_removed(
+    /// Sets the stored membership aside and starts over as a new identity that is in no
+    /// Ring. Under both locks: `check` must accept the stored profile, the current file is
+    /// first copied to `ring.json.v1-<ms>` (format 1) or `ring.json.removed-<ms>` (kept as
+    /// evidence), then the profile is rewritten with **new keys**, no counterpart
+    /// registration, no journal, reservation or outgoing record, and the removal notice for
+    /// [`AsideReason::Removed`]. New keys because a Ring's id derives from its creator's key
+    /// (a new Ring needs a new creator) and the Relay keeps refusing a removed key. Atomic:
+    /// an interruption leaves either the old profile or the new one. No profile: nothing to
+    /// set aside, `Ok(false)`.
+    pub fn set_aside(
         &self,
-        removed: impl FnOnce(&ProfileState) -> Result<(), String>,
-    ) -> Result<(), String> {
+        reason: AsideReason,
+        check: impl FnOnce(&ProfileState) -> Result<(), String>,
+    ) -> Result<bool, String> {
         let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         ensure_private_dir(&self.dir).map_err(|e| e.to_string())?;
         let lock = open_lock(&self.dir.join("ring.lock")).map_err(|e| e.to_string())?;
@@ -735,33 +782,84 @@ impl Store {
                 return Err("unreadable retained Ring profile; explicit recovery required".into());
             }
             let Some(profile) = profile else {
-                return Ok(());
+                return Ok(false);
             };
-            if profile.membership.is_none() {
-                return Ok(());
-            }
-            removed(&profile)?;
+            check(&profile)?;
             let bytes = read_private(&self.file())
                 .map_err(|e| e.to_string())?
                 .ok_or("retained Ring profile disappeared")?;
             let aside = self.dir.join(format!(
-                "ring.json.left-{}",
+                "ring.json.{}-{}",
+                if reason == AsideReason::V1 {
+                    "v1"
+                } else {
+                    "removed"
+                },
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis()
             ));
             write_private(&aside, &bytes).map_err(|e| e.to_string())?;
+            let keys = Arc::new(DeviceKeys::generate().map_err(|e| e.to_string())?);
             self.save_locked(&ProfileState {
-                keys: profile.keys,
+                keys,
                 membership: None,
                 journal: None,
-                companion: profile.companion,
+                companion: None,
                 pending_join: None,
                 outgoing: None,
+                old_ring: (reason == AsideReason::V1).then(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                }),
+                removed: match reason {
+                    AsideReason::Removed(notice) => Some(notice),
+                    _ => None,
+                },
             })?;
             self.notify();
-            Ok(())
+            Ok(true)
+        })();
+        let _ = lock.unlock();
+        out
+    }
+
+    /// Drops a counterpart registration that the local Daemon no longer holds (it set its
+    /// own membership aside and rotated its identity), so this Desktop can register again.
+    /// Only while in no Ring and with no unresolved adoption record; `stale` must be the
+    /// stored registration. `Ok(true)`: dropped.
+    pub fn forget_companion(
+        &self,
+        stale: &xshell_protocol::ring::companion::CompanionProfile,
+    ) -> Result<bool, String> {
+        let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_private_dir(&self.dir).map_err(|e| e.to_string())?;
+        let lock = open_lock(&self.dir.join("ring.lock")).map_err(|e| e.to_string())?;
+        lock.lock().map_err(|e| e.to_string())?;
+        let out = (|| {
+            let (profile, _) = self.load_locked()?;
+            let Some(mut profile) = profile else {
+                return Ok(false);
+            };
+            if profile.companion.as_ref() != Some(stale)
+                || profile.membership.is_some()
+                || profile.pending_join.is_some()
+                || profile.outgoing.is_some()
+                || profile
+                    .journal
+                    .as_ref()
+                    .is_some_and(|j| !j.phase.permits_new_operation())
+            {
+                return Ok(false);
+            }
+            profile.companion = None;
+            profile.journal = None;
+            self.save_locked(&profile)?;
+            self.notify();
+            Ok(true)
         })();
         let _ = lock.unlock();
         out
@@ -848,6 +946,26 @@ impl Store {
         }
     }
 
+    /// An explicit Create or Join starts over after an unreadable profile was moved aside:
+    /// every `ring.json.bad-*` is renamed `ring.json.recovered-*` (kept as evidence), so the
+    /// next load starts a new identity instead of reporting the problem again.
+    pub fn clear_moved_aside(&self) -> Result<(), String> {
+        let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return Ok(());
+        };
+        for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(rest) = name.strip_prefix("ring.json.bad-") {
+                fs::rename(&path, self.dir.join(format!("ring.json.recovered-{rest}")))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     /// The newest `ring.json.bad-*` in the directory.
     fn newest_bad(&self) -> Option<PathBuf> {
         let mut bad: Vec<PathBuf> = fs::read_dir(&self.dir)
@@ -882,6 +1000,8 @@ impl Store {
                     companion: None,
                     pending_join: None,
                     outgoing: None,
+                    removed: None,
+                    old_ring: None,
                 }),
                 keys,
             ))
@@ -992,6 +1112,8 @@ impl Store {
         let (sign, noise) = profile.keys.seeds();
         let f = File {
             v: if state.is_some()
+                && profile.removed.is_none()
+                && profile.old_ring.is_none()
                 && profile.journal.is_none()
                 && profile.companion.is_none()
                 && profile.pending_join.is_none()
@@ -1023,6 +1145,8 @@ impl Store {
             companion: profile.companion.clone(),
             pending_join: profile.pending_join.clone(),
             outgoing: profile.outgoing.clone(),
+            removed: profile.removed.clone(),
+            old_ring: profile.old_ring,
         };
         let json = encode(&f)?;
         write_private(&self.file(), &json).map_err(|e| e.to_string())
@@ -1094,7 +1218,9 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
             && (f.adoption.is_some()
                 || f.companion.is_some()
                 || f.pending_join.is_some()
-                || f.outgoing.is_some()))
+                || f.outgoing.is_some()
+                || f.removed.is_some()
+                || f.old_ring.is_some()))
     {
         return Err(format!("unsupported profile format {}", f.v));
     }
@@ -1120,6 +1246,8 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
             companion: f.companion,
             pending_join: f.pending_join,
             outgoing: f.outgoing,
+            removed: f.removed,
+            old_ring: f.old_ring,
         });
     }
     let chain = RosterChain::from_tokens(&f.rosters).map_err(|e| e.to_string())?;
@@ -1160,6 +1288,9 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
         companion: f.companion,
         pending_join: f.pending_join,
         outgoing: f.outgoing,
+        // A notice belongs to a Desktop that is in no Ring.
+        removed: None,
+        old_ring: None,
     })
 }
 
