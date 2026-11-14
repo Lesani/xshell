@@ -1878,6 +1878,167 @@ pub(super) fn storage_test_directory() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// The Daemon's background membership upkeep: the removal check after the Connector
+/// reported a refusal or close as removed (retried with backoff from 5 s to 5 min, and
+/// deferred while a counterpart or standalone operation is open), and, on Unix, the
+/// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
+/// installed when enrolled, ended when not a member once its code expired.
+#[cfg(any(unix, windows))]
+pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
+    let weak = Arc::downgrade(d);
+    let _ = std::thread::Builder::new()
+        .name("ring-maintenance".into())
+        .spawn(move || {
+            let mut removal_at: Option<Instant> = None;
+            let mut removal_delay = Duration::from_secs(5);
+            #[cfg(unix)]
+            let mut standalone_at = Instant::now();
+            #[cfg(unix)]
+            let mut standalone_delay = Duration::from_secs(1);
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let Some(d) = weak.upgrade() else { return };
+                if d.exiting.load(Ordering::Acquire) || d.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = Instant::now();
+                if d.ring.take_removal_signal() && removal_at.is_none() {
+                    removal_at = Some(now);
+                }
+                if removal_at.is_some_and(|at| now >= at) {
+                    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                        now + Duration::from_secs(30),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    match d.ring.check_removal(
+                        &budget,
+                        super::companion::idle_for_set_aside,
+                        super::companion::retire_for_set_aside,
+                    ) {
+                        Ok(_) => {
+                            removal_at = None;
+                            removal_delay = Duration::from_secs(5);
+                        }
+                        // An operation is open: look again soon (it ends by itself).
+                        Err(e) if e.starts_with("busy:") => {
+                            removal_at = Some(now + Duration::from_secs(1));
+                        }
+                        Err(e) => {
+                            crate::log!(
+                                "INFO",
+                                "ring: removal check: {e}; retrying in {removal_delay:?}"
+                            );
+                            removal_at = Some(now + removal_delay);
+                            removal_delay = (removal_delay * 2).min(Duration::from_secs(300));
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                if now >= standalone_at {
+                    // Never a ServerHandle here: dropping one shuts the Daemon down.
+                    let handle = super::adoption::Standalone { d: &d };
+                    match maintain_standalone(&handle) {
+                        Ok(true) => {
+                            standalone_delay = Duration::from_secs(1);
+                            standalone_at = now + Duration::from_secs(60);
+                        }
+                        // A pair command is still running: look again soon, no backoff.
+                        Err(e) if e == STANDALONE_PENDING => {
+                            standalone_at = now + Duration::from_secs(1);
+                        }
+                        Ok(false) | Err(_) => {
+                            standalone_at = now + standalone_delay;
+                            standalone_delay = (standalone_delay * 2).min(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(unix)]
+const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
+
+/// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
+#[cfg(unix)]
+fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool, String> {
+    use super::adoption::StandaloneRecoveryState as S;
+    let Some(status) = handle.standalone_adoption_status()? else {
+        return Ok(true);
+    };
+    let expired = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            >= status.expires_at
+    };
+    // A pair command still running owns its obligation until its code expires: never
+    // compete with it (its own journal writes would see a changed record).
+    if status.state != S::Installed && !expired() {
+        return Err(STANDALONE_PENDING.into());
+    }
+    match status.state {
+        S::Installed => Ok(true),
+        S::Terminal => {
+            abandon_standalone(handle, &status.operation)?;
+            Ok(true)
+        }
+        S::ReconciliationRequired | S::AcceptedInstalling => {
+            match handle.reconcile_standalone_adoption() {
+                Ok(s) if s.state == S::Installed => Ok(true),
+                Ok(s) if s.state == S::Terminal => {
+                    abandon_standalone(handle, &s.operation)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(e)
+                    if expired()
+                        && ["not_member", "bad_signature", "removed", "no_roster"]
+                            .iter()
+                            .any(|c| e.contains(c)) =>
+                {
+                    abandon_standalone(handle, &status.operation)?;
+                    Ok(true)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// The standalone obligation never enrolled (or was removed): its journal is renamed
+/// aside so a new pair command or registration can start.
+#[cfg(unix)]
+fn abandon_standalone(
+    handle: &super::adoption::Standalone<'_>,
+    operation: &str,
+) -> Result<(), String> {
+    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+        Instant::now() + Duration::from_secs(5),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _lock = store.lock_until(&budget)?;
+    let path = store.dir.join("standalone-adoption.json");
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(());
+    }
+    fs::rename(
+        &path,
+        store.dir.join(format!(
+            "standalone-adoption.json.abandoned-{}",
+            super::registry::now_ms()
+        )),
+    )
+    .map_err(|e| e.to_string())?;
+    crate::log!(
+        "INFO",
+        "ring: standalone pairing {operation} ended without membership"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2433,165 +2594,4 @@ mod tests {
         let n = host_name();
         assert!(!n.is_empty() && n.len() <= 64);
     }
-}
-
-/// The Daemon's background membership upkeep: the removal check after the Connector
-/// reported a refusal or close as removed (retried with backoff from 5 s to 5 min, and
-/// deferred while a counterpart or standalone operation is open), and, on Unix, the
-/// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
-/// installed when enrolled, ended when not a member once its code expired.
-#[cfg(any(unix, windows))]
-pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
-    let weak = Arc::downgrade(d);
-    let _ = std::thread::Builder::new()
-        .name("ring-maintenance".into())
-        .spawn(move || {
-            let mut removal_at: Option<Instant> = None;
-            let mut removal_delay = Duration::from_secs(5);
-            #[cfg(unix)]
-            let mut standalone_at = Instant::now();
-            #[cfg(unix)]
-            let mut standalone_delay = Duration::from_secs(1);
-            loop {
-                std::thread::sleep(Duration::from_millis(250));
-                let Some(d) = weak.upgrade() else { return };
-                if d.exiting.load(Ordering::Acquire) || d.stopping.load(Ordering::Acquire) {
-                    return;
-                }
-                let now = Instant::now();
-                if d.ring.take_removal_signal() && removal_at.is_none() {
-                    removal_at = Some(now);
-                }
-                if removal_at.is_some_and(|at| now >= at) {
-                    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
-                        now + Duration::from_secs(30),
-                        Arc::new(AtomicBool::new(false)),
-                    );
-                    match d.ring.check_removal(
-                        &budget,
-                        super::companion::idle_for_set_aside,
-                        super::companion::retire_for_set_aside,
-                    ) {
-                        Ok(_) => {
-                            removal_at = None;
-                            removal_delay = Duration::from_secs(5);
-                        }
-                        // An operation is open: look again soon (it ends by itself).
-                        Err(e) if e.starts_with("busy:") => {
-                            removal_at = Some(now + Duration::from_secs(1));
-                        }
-                        Err(e) => {
-                            crate::log!(
-                                "INFO",
-                                "ring: removal check: {e}; retrying in {removal_delay:?}"
-                            );
-                            removal_at = Some(now + removal_delay);
-                            removal_delay = (removal_delay * 2).min(Duration::from_secs(300));
-                        }
-                    }
-                }
-                #[cfg(unix)]
-                if now >= standalone_at {
-                    // Never a ServerHandle here: dropping one shuts the Daemon down.
-                    let handle = super::adoption::Standalone { d: &d };
-                    match maintain_standalone(&handle) {
-                        Ok(true) => {
-                            standalone_delay = Duration::from_secs(1);
-                            standalone_at = now + Duration::from_secs(60);
-                        }
-                        // A pair command is still running: look again soon, no backoff.
-                        Err(e) if e == STANDALONE_PENDING => {
-                            standalone_at = now + Duration::from_secs(1);
-                        }
-                        Ok(false) | Err(_) => {
-                            standalone_at = now + standalone_delay;
-                            standalone_delay = (standalone_delay * 2).min(Duration::from_secs(60));
-                        }
-                    }
-                }
-            }
-        });
-}
-
-#[cfg(unix)]
-const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
-
-/// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
-#[cfg(unix)]
-fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool, String> {
-    use super::adoption::StandaloneRecoveryState as S;
-    let Some(status) = handle.standalone_adoption_status()? else {
-        return Ok(true);
-    };
-    let expired = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            >= status.expires_at
-    };
-    // A pair command still running owns its obligation until its code expires: never
-    // compete with it (its own journal writes would see a changed record).
-    if status.state != S::Installed && !expired() {
-        return Err(STANDALONE_PENDING.into());
-    }
-    match status.state {
-        S::Installed => Ok(true),
-        S::Terminal => {
-            abandon_standalone(handle, &status.operation)?;
-            Ok(true)
-        }
-        S::ReconciliationRequired | S::AcceptedInstalling => {
-            match handle.reconcile_standalone_adoption() {
-                Ok(s) if s.state == S::Installed => Ok(true),
-                Ok(s) if s.state == S::Terminal => {
-                    abandon_standalone(handle, &s.operation)?;
-                    Ok(true)
-                }
-                Ok(_) => Ok(false),
-                Err(e)
-                    if expired()
-                        && ["not_member", "bad_signature", "removed", "no_roster"]
-                            .iter()
-                            .any(|c| e.contains(c)) =>
-                {
-                    abandon_standalone(handle, &status.operation)?;
-                    Ok(true)
-                }
-                Err(e) => Err(e),
-            }
-        }
-    }
-}
-
-/// The standalone obligation never enrolled (or was removed): its journal is renamed
-/// aside so a new pair command or registration can start.
-#[cfg(unix)]
-fn abandon_standalone(
-    handle: &super::adoption::Standalone<'_>,
-    operation: &str,
-) -> Result<(), String> {
-    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
-    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
-        Instant::now() + Duration::from_secs(5),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let _lock = store.lock_until(&budget)?;
-    let path = store.dir.join("standalone-adoption.json");
-    if fs::symlink_metadata(&path).is_err() {
-        return Ok(());
-    }
-    fs::rename(
-        &path,
-        store.dir.join(format!(
-            "standalone-adoption.json.abandoned-{}",
-            super::registry::now_ms()
-        )),
-    )
-    .map_err(|e| e.to_string())?;
-    crate::log!(
-        "INFO",
-        "ring: standalone pairing {operation} ended without membership"
-    );
-    Ok(())
 }

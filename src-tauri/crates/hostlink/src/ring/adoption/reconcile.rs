@@ -205,17 +205,14 @@ impl DesktopRing {
     ) -> Result<RosterChain, String> {
         let pin = pin(journal)?;
         let classify = |e: xshell_protocol::ring::RingError| match &e {
-            xshell_protocol::ring::RingError::Relay { code, .. }
-                if matches!(
-                    code,
+            xshell_protocol::ring::RingError::Relay {
+                code:
                     ErrorCode::NotMember
-                        | ErrorCode::Removed
-                        | ErrorCode::BadSignature
-                        | ErrorCode::NoRoster
-                ) =>
-            {
-                format!("not_member: {e}")
-            }
+                    | ErrorCode::Removed
+                    | ErrorCode::BadSignature
+                    | ErrorCode::NoRoster,
+                ..
+            } => format!("not_member: {e}"),
             _ => format!("offline: {e}"),
         };
         let observed = if let Some(owner) = self.adoption_owner_connector() {

@@ -170,11 +170,8 @@ impl Computer {
             let offer = offer;
             let approval = scope.spawn(|| approver.ring.approve_device_code(&code));
             let mut cancel_before_join = CancelJoinOnUnwind(Some(&offer));
-            let (p, lease) = offer.await_consent(WAIT).unwrap();
+            // No confirmation on the joining machine any more.
             verified_preview();
-            offer
-                .confirm_join(lease.confirm(&p.proposal_hash).unwrap())
-                .unwrap();
             cancel_before_join.0 = None;
             drop(cancel_before_join);
             let result = offer.wait().unwrap();

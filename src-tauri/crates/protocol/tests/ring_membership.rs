@@ -1213,14 +1213,13 @@ mod rjw {
         let (ks, h) = completed();
         let head = h.last().unwrap();
         // ks[2] is the Computer's Daemon after completion; a standalone Daemon neither.
-        for daemon in [&ks[2]] {
-            assert!(!enroll_approver(head, &daemon.sign_key()));
-            let i = computer(&keys(40), &keys(41), 21);
-            let mut r =
-                enroll_proposal(head, ks[0].sign_key(), &i, head.roster().issued_at + 1).unwrap();
-            r.signed_by = daemon.sign_key();
-            assert!(verify_enroll_proposal(head, &r).is_err());
-        }
+        let daemon = &ks[2];
+        assert!(!enroll_approver(head, &daemon.sign_key()));
+        let i = computer(&keys(40), &keys(41), 21);
+        let mut r =
+            enroll_proposal(head, ks[0].sign_key(), &i, head.roster().issued_at + 1).unwrap();
+        r.signed_by = daemon.sign_key();
+        assert!(verify_enroll_proposal(head, &r).is_err());
         let (ks, h) = upgrade_multi();
         let head = h.last().unwrap();
         assert!(

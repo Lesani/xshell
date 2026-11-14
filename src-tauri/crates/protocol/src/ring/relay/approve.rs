@@ -519,17 +519,14 @@ pub fn check_join(
                 JoinCheck::NotEnrolled
             }
         }
-        Err(RingError::Relay { code, .. })
-            if matches!(
-                code,
+        Err(RingError::Relay {
+            code:
                 super::ErrorCode::NotMember
-                    | super::ErrorCode::Removed
-                    | super::ErrorCode::BadSignature
-                    | super::ErrorCode::NoRoster
-            ) =>
-        {
-            JoinCheck::NotEnrolled
-        }
+                | super::ErrorCode::Removed
+                | super::ErrorCode::BadSignature
+                | super::ErrorCode::NoRoster,
+            ..
+        }) => JoinCheck::NotEnrolled,
         Err(_) => JoinCheck::Retry,
     }
 }
