@@ -94,23 +94,13 @@ fn registration_locked(
 ) -> Result<CompanionResponse, String> {
     budget.check().map_err(|e| e.to_string())?;
     if let CompanionRequest::ReserveRegistration { desktop_store } = &request {
-        #[cfg(unix)]
-        {
-            xshell_core::companion_reservation::reserve_locked(
-                &store.dir.canonicalize().map_err(|e| e.to_string())?,
-                Path::new(desktop_store),
-            )
-            .map_err(|e| e.to_string())?;
-            return Ok(CompanionResponse::Descriptor { profile: None });
-        }
-        // The startup reservation (and the registration child that writes it) is Unix-only.
-        #[cfg(not(unix))]
-        {
-            let _ = desktop_store;
-            return Err(
-                "startup registration reservation is not supported on this platform".into(),
-            );
-        }
+        // Same deny-only boundary on Unix and Windows (BINDING Decision 2).
+        xshell_core::companion_reservation::reserve_locked(
+            &store.dir.canonicalize().map_err(|e| e.to_string())?,
+            Path::new(desktop_store),
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(CompanionResponse::Descriptor { profile: None });
     }
     refuse_legacy_uncertainty(store)?;
     if matches!(request, CompanionRequest::Descriptor) {
@@ -188,8 +178,8 @@ fn registration_locked(
     }
     Err("registration helper refuses non-registration requests".into())
 }
-/// Persist a directory entry change. Windows has no std directory handle to flush; NTFS
-/// journals the rename/unlink metadata itself.
+/// Persist a directory entry change. Windows has no std directory handle to flush: the
+/// policy rename is written through (`write_private`) and NTFS journals the unlink.
 fn sync_store_dir(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -203,33 +193,20 @@ fn sync_store_dir(dir: &Path) -> Result<(), String> {
         Ok(())
     }
 }
-/// Pending startup reservation (desktop store, legacy uncertainty). Only Unix writes one;
-/// elsewhere an existing reservation file is ambiguous and fails closed.
+/// Pending startup reservation (desktop store, legacy uncertainty), on every platform.
 struct Reservation {
     desktop_store: String,
     legacy_outcome_uncertain: bool,
 }
 fn read_reservation(store: &Store) -> Result<Option<Reservation>, String> {
-    #[cfg(unix)]
-    {
-        Ok(
-            xshell_core::companion_reservation::read_reservation(&store.dir)
-                .map_err(|e| e.to_string())?
-                .map(|r| Reservation {
-                    desktop_store: r.desktop_store,
-                    legacy_outcome_uncertain: r.legacy_outcome_uncertain,
-                }),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        match std::fs::symlink_metadata(store.dir.join("companion-pending.json")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            _ => {
-                Err("reconciliation_required: unsupported startup registration reservation".into())
-            }
-        }
-    }
+    Ok(
+        xshell_core::companion_reservation::read_reservation(&store.dir)
+            .map_err(|e| e.to_string())?
+            .map(|r| Reservation {
+                desktop_store: r.desktop_store,
+                legacy_outcome_uncertain: r.legacy_outcome_uncertain,
+            }),
+    )
 }
 fn refuse_legacy_uncertainty(store: &Store) -> Result<(), String> {
     if read_reservation(store)?.is_some_and(|reservation| reservation.legacy_outcome_uncertain) {
@@ -595,8 +572,6 @@ pub(super) fn serve(
 
 /// Read-only classification for the actual CLI. Unreadable association is an error,
 /// never standalone permission; a pending reservation may contain no keys at all.
-/// Used only by the Unix-only `xshelld pair` command.
-#[cfg(unix)]
 pub(crate) fn registered_desktop(
     store: &Store,
     budget: &xshell_core::local_ipc::RequestBudget,
@@ -621,6 +596,8 @@ pub(crate) fn registered_desktop(
 
 /// Registration-only command: no Daemon, Host, Relay, signer RPC or membership runtime.
 /// stdin owns its lifetime; EOF or the original 15-second bound drains the endpoint.
+/// Unix only: Windows has no headless Daemon (ADR-0005), so its Desktop registers in
+/// process with the live GUI-bound Daemon it started instead of a registration child.
 #[cfg(unix)]
 pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
     use std::os::fd::AsRawFd;

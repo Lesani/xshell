@@ -74,7 +74,6 @@ pub(crate) enum PrivateRingFile {
     #[cfg(any(unix, windows))]
     CompletionMailbox,
 }
-#[cfg(unix)]
 const MAX_STORED_TOKEN_ARRAY_JSON_BYTES: usize = xshell_protocol::ring::chain::MAX_CHAIN_LEN
     .checked_mul(
         xshell_protocol::ring::roster::MAX_ROSTER_TOKEN
@@ -84,7 +83,6 @@ const MAX_STORED_TOKEN_ARRAY_JSON_BYTES: usize = xshell_protocol::ring::chain::M
     .expect("stored token history")
     .checked_add(2)
     .expect("array framing");
-#[cfg(unix)]
 impl PrivateRingFile {
     fn maximum(self) -> usize {
         match self {
@@ -126,14 +124,26 @@ impl PrivateRingFile {
 #[cfg(windows)]
 pub(crate) fn read_private(
     path: &Path,
-    _kind: PrivateRingFile,
+    kind: PrivateRingFile,
 ) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let Some(f) = xshell_core::private_fs::open_read(path)? else {
         return Ok(None);
     };
-    let len = f.metadata()?.len() as usize;
-    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(len + 1));
-    (&f).read_to_end(&mut buf)?;
+    let len = f.metadata()?.len();
+    let maximum = kind.maximum();
+    if len > maximum as u64 {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
+    // Sized up front, so no reallocation leaves a copy of a secret behind.
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(len as usize + 1));
+    (&f).take(maximum as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > maximum {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     Ok(Some(buf))
 }
 
@@ -236,6 +246,14 @@ fn write_private_inner(
                 "injected roster commit failure after temp sync",
             ));
         }
+        // Windows: the rename itself is written through, the counterpart of a directory
+        // sync on Unix (a registration must be durable before its denial is removed).
+        #[cfg(windows)]
+        {
+            drop(f);
+            xshell_core::private_fs::replace_write_through(&tmp, path)
+        }
+        #[cfg(unix)]
         fs::rename(&tmp, path)
     })();
     if r.is_err() {
@@ -1669,6 +1687,38 @@ mod tests {
         file.set_len(length).unwrap();
         assert!(read_private(&path, PrivateRingFile::Keys).is_err());
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
+    }
+    /// Windows mirrors the Unix per-kind bound (Decision 7): a sparse oversize file of each
+    /// kind is refused before an unbounded read, and the file is left as found.
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_private_enforces_each_kind_maximum() {
+        let temp = tempfile::tempdir().unwrap();
+        xshell_core::private_fs::ensure_dir(temp.path()).unwrap();
+        for kind in [
+            PrivateRingFile::Keys,
+            PrivateRingFile::RosterHistory,
+            PrivateRingFile::PushRegistrations,
+            PrivateRingFile::CompanionPolicy,
+            PrivateRingFile::StandaloneJournal,
+            PrivateRingFile::CompletionMailbox,
+        ] {
+            let path = temp.path().join("object.json");
+            let _ = fs::remove_file(&path);
+            let file = xshell_core::private_fs::create_new(&path).unwrap();
+            let limit = kind.maximum() as u64;
+            file.set_len(limit + 1).unwrap();
+            drop(file);
+            assert!(read_private(&path, kind).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().len(), limit + 1);
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(limit.min(64)).unwrap();
+            drop(file);
+            assert_eq!(
+                read_private(&path, kind).unwrap().unwrap().len() as u64,
+                limit.min(64)
+            );
+        }
     }
     #[cfg(unix)]
     #[test]

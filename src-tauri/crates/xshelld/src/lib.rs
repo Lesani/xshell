@@ -11,7 +11,7 @@ pub mod env;
 pub mod job_exec;
 pub mod log;
 pub mod maintenance;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod pair;
 pub mod paths;
 pub mod server;
@@ -84,21 +84,20 @@ pub fn main_entry() -> i32 {
                     |()| 0,
                 );
             }
+            // Windows has no headless Daemon (ADR-0005): its Desktop registers in process with
+            // the live GUI-bound Daemon it started, never through a registration child.
             #[cfg(not(unix))]
             {
                 let _ = o;
-                eprintln!("xshelld: protected registration adapter unavailable");
+                eprintln!("xshelld: companion-registration is not used on Windows; xshell registers with its running Daemon");
                 return 1;
             }
         }
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
-        #[cfg(windows)]
-        Command::Pair(_) => {
-            eprintln!("xshelld: pair is not supported on Windows.");
-            return 1;
-        }
-        #[cfg(unix)]
+        // Windows: only a Computer whose xshell Desktop registered its GUI-bound Daemon can
+        // pair (Host-first through that Desktop); there is no standalone headless Host.
+        #[cfg(any(unix, windows))]
         Command::Pair(o) => {
             let Some(home) = o.home.clone().or_else(dirs::home_dir) else {
                 eprintln!("xshelld: cannot determine the home directory; pass --home");

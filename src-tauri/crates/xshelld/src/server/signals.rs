@@ -69,6 +69,73 @@ fn wait_exit_signal() -> i32 {
 #[cfg(windows)]
 pub fn block_exit_signals() {}
 
+/// Pair command lifetime cancellation on Windows: Ctrl+C, Ctrl+Break and the console's
+/// close/logoff/shutdown set `cancel` (no Daemon stop event, no logger). Ctrl+C/Break are
+/// handled so the command can cancel its offer and exit; for a close Windows ends the
+/// process once the handler returns, so it waits (bounded) for that cleanup to finish.
+/// Without an attached console there is nothing to watch.
+#[cfg(windows)]
+pub fn watch_pair_signals(cancel: Arc<std::sync::atomic::AtomicBool>) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCtrlHandler};
+    if pair_win::CANCEL.set(cancel).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Pair cancellation is already watched",
+        ));
+    }
+    if unsafe { GetConsoleCP() } == 0 {
+        return Ok(());
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(pair_win::on_ctrl), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Mark a cancelled Pair command's cleanup finished, so a console close need not wait.
+#[cfg(windows)]
+pub fn pair_cleanup_done() {
+    pair_win::DONE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(windows)]
+mod pair_win {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    use windows_sys::Win32::System::Threading::Sleep;
+
+    pub(super) static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    pub(super) static DONE: AtomicBool = AtomicBool::new(false);
+
+    pub(super) unsafe extern "system" fn on_ctrl(kind: u32) -> windows_sys::core::BOOL {
+        let Some(cancel) = CANCEL.get() else {
+            return 0;
+        };
+        match kind {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                cancel.store(true, Ordering::Release);
+                1
+            }
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                cancel.store(true, Ordering::Release);
+                // Windows allows about five seconds after a close: enough for the bounded
+                // Cancel request, never a renewed offer.
+                for _ in 0..40 {
+                    if DONE.load(Ordering::Acquire) {
+                        break;
+                    }
+                    unsafe { Sleep(100) };
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::sync::atomic::{AtomicUsize, Ordering};

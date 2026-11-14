@@ -49,7 +49,8 @@ mod role;
 mod session_stream;
 pub use role::Role;
 mod signals;
-#[cfg(unix)]
+#[cfg(windows)]
+pub(crate) use signals::pair_cleanup_done;
 pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
@@ -718,15 +719,26 @@ impl Server {
             )
         })?;
         // Holding the lock makes the socket ours: a leftover one is stale.
-        let mut pidf = private_file(
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true),
-        )
-        .open(&paths.pid)?;
-        starting.pid = true;
-        writeln!(pidf, "{}", std::process::id())?;
+        #[cfg(unix)]
+        {
+            let mut pidf = private_file(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true),
+            )
+            .open(&paths.pid)?;
+            starting.pid = true;
+            writeln!(pidf, "{}", std::process::id())?;
+        }
+        // Windows: the PID record identifies this Daemon to a Desktop that adopts it
+        // (BINDING AMENDMENT 1 §3), so it is a protected object: a private-descriptor temp
+        // file, flushed and renamed over the stale record with write-through.
+        #[cfg(windows)]
+        {
+            starting.pid = true;
+            write_pid_record(&paths.pid)?;
+        }
         transport::remove_endpoint(&paths.socket)?;
         let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
@@ -1052,4 +1064,23 @@ fn hold_loser_for_tests() {
     while !std::path::Path::new(&p).exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Writes this process's PID record at `path` (Windows, see [`Server::start`]).
+#[cfg(windows)]
+fn write_pid_record(path: &std::path::Path) -> io::Result<()> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(name);
+    let r = (|| {
+        let mut f = xshell_core::private_fs::create_new(&tmp)?;
+        writeln!(f, "{}", std::process::id())?;
+        f.sync_all()?;
+        drop(f);
+        xshell_core::private_fs::replace_write_through(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }

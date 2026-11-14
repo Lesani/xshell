@@ -35,13 +35,7 @@ pub(crate) fn canonical_store(directory: &Path) -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        xshell_core::private_fs::check_owned_dir(&home)?;
-        let mut dir = home;
-        for component in [".xshell", "daemon", "ring"] {
-            dir.push(component);
-            xshell_core::private_fs::ensure_dir(&dir)?;
-        }
-        Ok(dir)
+        prepare_store_windows(&home)
     }
 }
 
@@ -95,6 +89,39 @@ fn prepare_store(home: &Path) -> io::Result<PathBuf> {
     let dir = &chain.last().unwrap().0;
     validate_store(dir)?;
     Ok(dir.clone())
+}
+
+/// Validate the whole existing namespace without repairing anything (BINDING AMENDMENT 1
+/// §2): a broad, foreign or reparse-point component is refused with its DACL unchanged.
+/// Only after every existing component passed are missing ones created private and the
+/// Store's own components normalized to the exact protected descriptor.
+#[cfg(windows)]
+fn prepare_store_windows(home: &Path) -> io::Result<PathBuf> {
+    use xshell_core::private_fs::{check_dir_no_repair, Exposure};
+    // The home may be the privileged-owned actual process profile (never repaired).
+    xshell_core::companion_reservation::validate_shared_ancestor(home)?;
+    let mut dir = home.to_path_buf();
+    for component in [".xshell", "daemon", "ring"] {
+        dir.push(component);
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => check_dir_no_repair(
+                &dir,
+                if component == ".xshell" {
+                    Exposure::Shared
+                } else {
+                    Exposure::Private
+                },
+            )?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let mut dir = home.to_path_buf();
+    for component in [".xshell", "daemon", "ring"] {
+        dir.push(component);
+        xshell_core::private_fs::ensure_dir(&dir)?;
+    }
+    Ok(dir)
 }
 
 #[cfg(unix)]

@@ -77,9 +77,10 @@ commands:
               Unix may start a Persistent Daemon; Windows attaches only, never starts
               a Daemon. A GUI-bound Daemon needs xshell open; if missing, exit 4.
   serve       run the Daemon in the foreground
-  pair        Unix: request Computer pairing in the registered xshell window,
-              or pair an unregistered standalone Host with eight Device Code words
-              (Settings → Hosts → Ring). Windows Pair is not supported.
+  pair        request Computer pairing in the registered xshell window
+              (Settings → Hosts → Ring). Unix can also pair an unregistered
+              standalone Host with eight Device Code words; Windows needs xshell
+              open and registered.
   maintenance cleanup-installs --home ABS [--reference-home ABS]... [--keep DIR]...
               [--delete --confirm-quiescent]
               Linux only, dry-run by default; see docs/host-daemon-updates.md

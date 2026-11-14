@@ -1,11 +1,12 @@
-//! Explicit Unix Device Code command. Registered Computers forward one ephemeral offer
+//! Explicit Device Code command. Registered Computers forward one ephemeral offer
 //! to their elected Desktop; only owner-local backend consent can complete it. Truly
-//! unregistered Hosts use the standalone v2 transaction, never a Desktop signer.
+//! unregistered Unix Hosts use the standalone v2 transaction, never a Desktop signer.
+//! Windows has no standalone headless Host (ADR-0005): an unregistered Store is refused.
 //! Zero requires accepted membership and the required durable installation receipts.
 
 use crate::cli::Opts;
 use crate::paths::Paths;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::server::ring::is_daemon_member;
 use crate::server::ring::Store;
 use std::io::{self, Write};
@@ -18,13 +19,15 @@ use std::time::{Duration, Instant};
 use xshell_protocol::ring::device_code::DeviceCode;
 use xshell_protocol::ring::pairing::PAIR_TTL_SECS;
 use xshell_protocol::ring::url::{RelayUrl, HOSTED_RELAY_URL};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use xshell_protocol::ring::RosterChain;
 
 /// The exit code when nobody entered the code in time.
 pub const EXPIRED_EXIT: i32 = 5;
 
 enum Failure {
+    /// The standalone (Unix-only) offer expired.
+    #[cfg_attr(windows, allow(dead_code))]
     Expired,
     ComputerExpired,
     Other(String),
@@ -43,7 +46,10 @@ pub fn run_pair(opts: &Opts, paths: &Paths) -> i32 {
         eprintln!("xshelld: cannot watch Pair cancellation: {error}");
         return 1;
     }
-    run_pair_cancel(opts, paths, &mut io::stdout(), &cancel)
+    let code = run_pair_cancel(opts, paths, &mut io::stdout(), &cancel);
+    #[cfg(windows)]
+    crate::server::pair_cleanup_done();
+    code
 }
 
 /// In-process output facade; actual CLI lifetime cancellation is installed by run_pair.
@@ -82,7 +88,7 @@ fn ttl() -> Duration {
         .min(Duration::from_secs(PAIR_TTL_SECS))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
     pair_cancel(opts, paths, out, &Arc::new(AtomicBool::new(false)))
 }
@@ -92,6 +98,13 @@ fn pair_cancel(
     out: &mut dyn Write,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), Failure> {
+    // Windows: a Store no Desktop ever registered gets no directories or files from Pair.
+    #[cfg(windows)]
+    if matches!(std::fs::symlink_metadata(&paths.ring_dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
+        return Err(Failure::Other(NO_REGISTERED_DESKTOP.into()));
+    }
     let mut canonical_paths = paths.clone();
     canonical_paths.ring_dir = crate::server::ring::ownership::canonical_store(&paths.ring_dir)
         .map_err(|e| format!("protected_counterpart_required: unsafe local Store: {e}"))?;
@@ -107,6 +120,29 @@ fn pair_cancel(
     if crate::server::ring::companion_registered(&paths.ring_dir) {
         return registered_computer_pair(&store, &relay, out, cancel);
     }
+    #[cfg(windows)]
+    {
+        let _ = (opts, out);
+        Err(Failure::Other(NO_REGISTERED_DESKTOP.into()))
+    }
+    #[cfg(unix)]
+    standalone_pair(opts, paths, &relay, out, cancel)
+}
+
+/// Windows refusal: never a standalone fallback (BINDING Decision 1).
+#[cfg(windows)]
+const NO_REGISTERED_DESKTOP: &str =
+    "protected_counterpart_required: no registered xshell Desktop; open xshell";
+
+#[cfg(unix)]
+fn standalone_pair(
+    opts: &Opts,
+    paths: &Paths,
+    relay: &str,
+    out: &mut dyn Write,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), Failure> {
+    let relay = relay.to_string();
     let lifetime = ttl();
     let until = Instant::now() + lifetime;
     crate::server::adoption::adopt_standalone_command(
@@ -291,21 +327,21 @@ fn registered_computer_pair(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn legacy_outcome_uncertain(store: &Store) -> bool {
     xshell_core::companion_reservation::read_reservation(&store.dir)
         .ok()
         .flatten()
         .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn uncertain_legacy_failure(message: String) -> Failure {
     Failure::Other(format!("reconciliation_required: legacy pairing remote outcome is uncertain; startup denial does not revoke a transmitted proof or establish nonmembership ({message})"))
 }
 
 /// Stores only an initial membership or an authorized extension of the retained Ring.
 /// Foreign/terminal membership is never a force-replacement or a new enrollment attempt.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn adopt(
     store: &Store,
     fetched: RosterChain,
@@ -350,7 +386,7 @@ fn adopt(
     Ok(next)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use xshell_protocol::ring::{DeviceKeys, Member, Role, SignedRoster};
