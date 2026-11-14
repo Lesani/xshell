@@ -373,8 +373,14 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "ring_remove_member",
     "ring_pair_phone_start",
     "ring_pair_phone_cancel",
-    "ring_pair_computer",
-    "ring_pair_cancel",
+    "ring_create_computer",
+    "ring_join_start",
+    "ring_join_confirm",
+    "ring_join_decline",
+    "ring_join_cancel",
+    "ring_join_overview",
+    "ring_approve_device_code",
+    "ring_upgrade_computer",
     "transfer_download",
     "transfer_upload_path",
     "transfer_cancel",
@@ -735,6 +741,13 @@ pub fn run() {
                 .build()?;
             Ok(())
         })
+        // A GUI Device Code dies when another xshell window gains focus (#87).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(true) = event {
+                use tauri::Manager as _;
+                ring::join::window_focused(window.app_handle(), window.label());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             app_build,
             list_claude_projects,
@@ -837,8 +850,14 @@ pub fn run() {
             ring::ring_remove_member,
             ring::ring_pair_phone_start,
             ring::ring_pair_phone_cancel,
-            ring::ring_pair_computer,
-            ring::ring_pair_cancel
+            ring::join::ring_create_computer,
+            ring::join::ring_join_start,
+            ring::join::ring_join_confirm,
+            ring::join::ring_join_decline,
+            ring::join::ring_join_cancel,
+            ring::join::ring_join_overview,
+            ring::join::ring_approve_device_code,
+            ring::join::ring_upgrade_computer
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -917,7 +936,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 103);
+        assert_eq!(registered.len(), 109);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)
