@@ -183,6 +183,38 @@ impl DesktopRing {
         }
     }
 
+    /// Leave this Ring locally after another device removed this Computer: the old Ring
+    /// is not contacted. Refused unless readiness is [`ApprovalReadiness::Removed`] and no
+    /// adoption runs. The Daemon leaves first (idempotent), then the Desktop store sets
+    /// its membership aside atomically. An interruption between the two leaves this
+    /// Desktop Removed, so Leave is offered again; nothing resurrects the old Ring.
+    pub fn leave_removed(&self, client: &CompanionClient) -> Result<(), String> {
+        let _admission = self.reserve_adoption()?;
+        if !self.pairing_ipc_owner() {
+            return Err("another process owns the Desktop counterpart".into());
+        }
+        let removed = |stored: &ProfileState| match readiness_of(Some(stored), |_| false) {
+            ApprovalReadiness::Removed => Ok(()),
+            ApprovalReadiness::Unresolved => {
+                Err("reconciliation_required: earlier Ring work is unresolved".to_string())
+            }
+            _ => Err("not_removed: this Desktop is still a member of its Ring".to_string()),
+        };
+        let stored = self.store.load_profile()?.0;
+        match stored.as_ref() {
+            Some(stored) if stored.membership.is_some() => removed(stored)?,
+            _ => return Err("not_enrolled: this Desktop is not in a Ring".into()),
+        }
+        match client.request(CompanionRequest::LeaveRemoved)? {
+            CompanionResponse::Left => {}
+            _ => return Err("invalid counterpart Leave response".into()),
+        }
+        self.adoption_test_point(super::super::desktop::AdoptionTestPoint::LeaveDaemonLeft);
+        self.store.leave_removed(removed)?;
+        self.forget_membership();
+        Ok(())
+    }
+
     /// Read-only approval readiness from the retained profile.
     pub fn approval_readiness(&self) -> Result<ApprovalReadiness, String> {
         let stored = self.store.load_profile()?.0;

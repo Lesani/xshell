@@ -715,6 +715,58 @@ impl Store {
         out
     }
 
+    /// Local-only Leave of a membership that no longer includes this Desktop. Under both
+    /// locks: `removed` must accept the stored profile (the caller's readiness check), the
+    /// current file is first copied to `ring.json.left-<ms>` (kept as evidence), then the
+    /// profile is rewritten with its identity and counterpart registration only. Atomic:
+    /// an interruption leaves either the old profile (Leave can run again) or the new one.
+    /// No profile or no membership: nothing to leave, a no-op.
+    pub fn leave_removed(
+        &self,
+        removed: impl FnOnce(&ProfileState) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_private_dir(&self.dir).map_err(|e| e.to_string())?;
+        let lock = open_lock(&self.dir.join("ring.lock")).map_err(|e| e.to_string())?;
+        lock.lock().map_err(|e| e.to_string())?;
+        let out = (|| {
+            let (profile, loaded) = self.load_locked()?;
+            if loaded.moved_aside.is_some() {
+                return Err("unreadable retained Ring profile; explicit recovery required".into());
+            }
+            let Some(profile) = profile else {
+                return Ok(());
+            };
+            if profile.membership.is_none() {
+                return Ok(());
+            }
+            removed(&profile)?;
+            let bytes = read_private(&self.file())
+                .map_err(|e| e.to_string())?
+                .ok_or("retained Ring profile disappeared")?;
+            let aside = self.dir.join(format!(
+                "ring.json.left-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            ));
+            write_private(&aside, &bytes).map_err(|e| e.to_string())?;
+            self.save_locked(&ProfileState {
+                keys: profile.keys,
+                membership: None,
+                journal: None,
+                companion: profile.companion,
+                pending_join: None,
+                outgoing: None,
+            })?;
+            self.notify();
+            Ok(())
+        })();
+        let _ = lock.unlock();
+        out
+    }
+
     /// Tells other instances a commit happened (they watch [`Store::signature`]).
     fn notify(&self) {
         let stamp = format!(

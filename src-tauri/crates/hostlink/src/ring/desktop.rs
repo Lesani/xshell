@@ -455,6 +455,8 @@ pub enum AdoptionTestPoint {
     CompanionInstalledBeforeDesktop,
     /// A v2 Remove candidate is built (no Ring lock held), before each publication.
     RemoveBeforePublish,
+    /// Leave of a removed Computer: the Daemon has left, before the Desktop store.
+    LeaveDaemonLeft,
 }
 #[derive(Clone)]
 pub struct AdoptionTestHook(pub Arc<dyn Fn(AdoptionTestPoint) + Send + Sync>);
@@ -1380,6 +1382,31 @@ impl DesktopRing {
             }
         }
         self.ensure_connector();
+    }
+
+    /// After a local Leave: the Ring held in memory is dropped and its Connector retired,
+    /// as for moved-aside settings but with no recovery problem.
+    pub(in crate::ring) fn forget_membership(&self) {
+        let retire = {
+            let _c = self.lock_commit();
+            let mut l = self.lock();
+            l.state = None;
+            l.state_revision += 1;
+            l.farewells.clear();
+            l.link = None;
+            l.quota.retire();
+            if let Some(owner) = l.routing.take() {
+                owner.stop();
+            }
+            self.queue_routing();
+            l.connector.take()
+        };
+        if let Some(old) = retire {
+            let _ = std::thread::Builder::new()
+                .name("ring-retire".into())
+                .spawn(move || old.stop(ByeReason::quit()));
+        }
+        self.emit();
     }
 
     /// A transaction whose recovery metadata reaches the view, whether it succeeded or not.

@@ -260,6 +260,57 @@ describe("removed from the Ring", () => {
   });
 });
 
+describe("Leave this Ring (removed computer)", () => {
+  const other: MemberView = { ...me, name: "tower", signKey: "t", thisApp: false, thisComputer: false, enrollmentId: "u2", daemonKey: "tk" };
+  const removedStatus = () => enrolled({ version: 3, members: [other], connection: "stopped", approval: "removed" });
+  // In the confirmation dialog (its confirm label equals the Leave button's).
+  const buttonWith = (label: string) => Array.from(container.querySelectorAll(".host-confirm-panel button")).find(b => b.textContent === label) as HTMLButtonElement;
+
+  it("a removed computer is offered Leave; confirming leaves locally and shows Create/Join", async () => {
+    setup(removedStatus(), undefined, { ring_leave_removed: () => status() });
+    await mount();
+    expect(text()).toContain(S["ring.removedExplanation"]);
+    expect(q("[data-ring-create]")).toBeNull();
+    await click("[data-ring-leave]");
+    expect(text()).toContain(S["ring.leaveConfirmTitle"]);
+    expect(text()).toContain(S["ring.leaveConfirmBody"]);
+    expect(buttonWith(S["ring.leaveCancel"])).toBeTruthy();
+    expect(calls()).not.toContain("ring_leave_removed");
+    await act(async () => { buttonWith(S["ring.leaveConfirm"]).click(); });
+    expect(calls()).toContain("ring_leave_removed");
+    expect(text()).toContain(S["ring.left"]);
+    expect(q("[data-ring-create]")).not.toBeNull();
+    expect(q("[data-ring-join-action]")).not.toBeNull();
+    expect(q("[data-ring-removed]")).toBeNull();
+  });
+
+  it("Cancel closes the dialog without leaving", async () => {
+    setup(removedStatus());
+    await mount();
+    await click("[data-ring-leave]");
+    await act(async () => { buttonWith(S["ring.leaveCancel"]).click(); });
+    expect(text()).not.toContain(S["ring.leaveConfirmTitle"]);
+    expect(calls()).not.toContain("ring_leave_removed");
+    expect(q("[data-ring-leave]")).not.toBeNull();
+  });
+
+  it("a failed Leave says why and stays removed", async () => {
+    setup(removedStatus(), undefined, { ring_leave_removed: () => { throw "Host unavailable"; } });
+    await mount();
+    await click("[data-ring-leave]");
+    await act(async () => { buttonWith(S["ring.leaveConfirm"]).click(); });
+    expect(text()).toContain(fmt("ring.leaveFailed", { error: "Host unavailable" }));
+    expect(q("[data-ring-leave]")).not.toBeNull();
+  });
+
+  it("Leave is not offered to a member or to unresolved work", async () => {
+    setup(enrolled({ approval: "unresolved" }));
+    await mount();
+    expect(q("[data-ring-leave]")).toBeNull();
+    expect(text()).not.toContain(S["ring.removedExplanation"]);
+  });
+});
+
 describe("pairing window (xshelld pair on this computer)", () => {
   it("shows the CLI card with Confirm and never the words", async () => {
     const cli = joinEvent("cli-op", "waiting", { origin: "cli" });

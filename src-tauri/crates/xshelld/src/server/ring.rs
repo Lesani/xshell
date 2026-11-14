@@ -743,6 +743,8 @@ struct Persist {
     on_head: std::sync::OnceLock<HeadHook>,
     /// Bumped, with the chain's lock held, every time a chain is adopted.
     epoch: AtomicU64,
+    /// The Ring a local Leave set aside (its id), while no chain is trusted.
+    left: Mutex<Option<String>>,
 }
 
 impl Persist {
@@ -785,6 +787,16 @@ impl Persist {
             if c.ring_id() != chain.ring_id() || c.head().version() >= chain.head().version() {
                 return;
             }
+        } else if self
+            .left
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|left| left == &chain.ring_id().to_string())
+        {
+            // A late callback of the Connector a local Leave retired must not resurrect
+            // the Ring it left.
+            return;
         }
         let saved = self.store.save_chain(chain);
         if let Some(e) = &saved.conflict {
@@ -921,6 +933,7 @@ impl Ring {
                 chain: Mutex::new(None),
                 on_head: std::sync::OnceLock::new(),
                 epoch: AtomicU64::new(0),
+                left: Mutex::new(None),
             }),
             keys: Mutex::new(None),
             life: Mutex::new(Life::default()),
@@ -1056,6 +1069,75 @@ impl Ring {
         }
         budget.check().map_err(|e| e.to_string())?;
         change(store)
+    }
+
+    /// Local-only Leave after this Computer was removed by another device: under the
+    /// lifecycle, runtime-chain and ring.lock order, `check` validates the registration;
+    /// a Daemon still authorized by the durable, cached or Connector chain is refused.
+    /// `roster.json` is renamed aside (`roster.json.left-<ms>`, kept as evidence), the
+    /// cached chain dropped and the Connector retired. Nothing retained: a no-op.
+    #[cfg(any(unix, windows))]
+    pub(super) fn leave_removed(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut life = budget.lock(&self.life).map_err(|e| e.to_string())?;
+        if life.stopped {
+            return Err("Daemon Ring is stopping".into());
+        }
+        let mut cached = self.lock_trusted_chain_until(budget)?;
+        let owner = match &life.joined {
+            Some(joined) => Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = joined.connector.try_accepted_install() {
+                    break guard.current().clone();
+                }
+                std::thread::yield_now();
+            }),
+            None => None,
+        };
+        let store = &self.persist.store;
+        let _lock = store.lock_until(budget)?;
+        let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
+        check(store, &keys)?;
+        let durable = super::companion::trusted(store)?;
+        if [durable.as_ref(), cached.as_ref(), owner.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|chain| is_daemon_member(chain, &keys))
+        {
+            return Err("not_removed: this Host is still a member of its Ring".into());
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        if durable.is_some() {
+            let aside = store
+                .dir
+                .join(format!("roster.json.left-{}", super::registry::now_ms()));
+            fs::rename(store.roster_path(), &aside).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            fs::File::open(&store.dir)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(ring) = durable
+            .as_ref()
+            .or(cached.as_ref())
+            .or(owner.as_ref())
+            .map(|c| c.ring_id().to_string())
+        {
+            *self.persist.left.lock().unwrap_or_else(|e| e.into_inner()) = Some(ring);
+        }
+        *cached = None;
+        self.persist.adopt();
+        let retired = life.joined.take();
+        drop(cached);
+        drop(life);
+        if let Some(old) = retired {
+            old.sessions.stop();
+            old.connector.stop(ByeReason::quit());
+        }
+        Ok(())
     }
 
     pub fn trusted_chain(&self) -> Option<RosterChain> {

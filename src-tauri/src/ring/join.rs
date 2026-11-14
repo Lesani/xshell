@@ -2,7 +2,8 @@
 //! consent, the pairing window for `xshelld pair` started on this computer, Add computer by
 //! eight words, and the explicit Ring upgrade. Commands `ring_create_computer`,
 //! `ring_join_start`, `ring_join_confirm`, `ring_join_decline`, `ring_join_cancel`,
-//! `ring_join_overview`, `ring_approve_device_code` and `ring_upgrade_computer`; the events
+//! `ring_join_overview`, `ring_approve_device_code`, `ring_upgrade_computer` and
+//! `ring_leave_removed`; the events
 //! `ring:join` and `ring:focus`.
 //!
 //! The Device Code words leave Rust exactly once, in the `ring_join_start` reply. They are
@@ -825,6 +826,24 @@ pub async fn ring_upgrade_computer(app: AppHandle) -> Result<RingStatus, String>
                 Ok(())
             }
         })();
+        HOST_SYNC.poke_all();
+        refresh_approval(&app);
+        result.map(|()| status_of(&app, w.ring.view()))
+    })
+    .await
+}
+
+/// Leave this Ring: only after another device removed this computer (approval `removed`).
+/// Local-only cleanup of both identities' membership; the old Ring is not contacted.
+#[tauri::command]
+pub async fn ring_leave_removed(app: AppHandle) -> Result<RingStatus, String> {
+    let w = worker(&app)?;
+    ensure_local(&app)?;
+    run(move || {
+        let result = w
+            .ring
+            .local_companion_client()
+            .and_then(|client| w.ring.leave_removed(&client).map_err(start_error));
         HOST_SYNC.poke_all();
         refresh_approval(&app);
         result.map(|()| status_of(&app, w.ring.view()))

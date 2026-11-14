@@ -129,6 +129,7 @@ export function useRing() {
   }, []);
   const createComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })); }, [apply]);
   const upgradeComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_upgrade_computer")); }, [apply]);
+  const leaveRemoved = useCallback(async () => { apply(await invoke<RingStatus>("ring_leave_removed")); }, [apply]);
   const joinStart = useCallback((operation: string) => invoke<JoinStarted>("ring_join_start", { operation, relayUrl: relayRef.current }), []);
   const joinConfirm = useCallback((operation: string) => invoke<void>("ring_join_confirm", { operation }), []);
   const joinDecline = useCallback((operation: string) => invoke<void>("ring_join_decline", { operation }), []);
@@ -136,6 +137,6 @@ export function useRing() {
 
   return {
     status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, approveComputer,
-    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, joinStart, joinConfirm, joinDecline, joinCancel,
+    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, leaveRemoved, joinStart, joinConfirm, joinDecline, joinCancel,
   };
 }

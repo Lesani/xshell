@@ -194,6 +194,10 @@ pub enum CompanionRequest {
         operation: String,
         rosters: Vec<String>,
     },
+    /// Local-only Leave after another device removed this Computer: sets the Daemon's
+    /// retained membership aside. Refused while the Daemon is still an authorized member
+    /// or an operation is open; never contacts a Relay and never grants membership.
+    LeaveRemoved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +249,8 @@ pub enum CompanionResponse {
     MembershipSnapshot {
         rosters: Vec<String>,
     },
+    /// `LeaveRemoved` done (or nothing was retained).
+    Left,
     Error {
         message: String,
     },
@@ -298,6 +304,15 @@ impl CompanionPolicy {
             && matches!(proposal.transcript, ConsentTranscript::Local))
         .then(|| obligation.proofs.clone())
         .flatten()
+    }
+    /// No open operation: none, or the last one ended (cancelled or installed).
+    pub fn idle(&self) -> bool {
+        self.obligation.as_ref().is_none_or(|o| {
+            matches!(
+                o.phase,
+                CompanionPhase::Cancelled | CompanionPhase::Installed
+            )
+        })
     }
     pub fn phase(&self, operation: &str) -> Result<CompanionPhase, String> {
         Ok(self.operation(operation)?.phase.clone())

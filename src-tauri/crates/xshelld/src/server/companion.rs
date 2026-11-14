@@ -383,6 +383,19 @@ fn dispatch(
             })
         });
     }
+    if matches!(request, CompanionRequest::LeaveRemoved) {
+        daemon.ring.leave_removed(budget, |store, keys| {
+            let policy = load(store)?.ok_or("companion is not registered")?;
+            validate_profile(store, policy.profile(), keys)?;
+            if !policy.idle() {
+                return Err("busy: a counterpart operation is still open".into());
+            }
+            #[cfg(unix)]
+            super::standalone_journal::refuse_unresolved_standalone(store)?;
+            Ok(())
+        })?;
+        return Ok(CompanionResponse::Left);
+    }
     #[cfg(unix)]
     if let CompanionRequest::InstallStandaloneAccepted { operation, rosters } = request {
         if daemon.cfg.gui_bound.is_some() {

@@ -381,6 +381,7 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "ring_join_overview",
     "ring_approve_device_code",
     "ring_upgrade_computer",
+    "ring_leave_removed",
     "transfer_download",
     "transfer_upload_path",
     "transfer_cancel",
@@ -858,7 +859,8 @@ pub fn run() {
             ring::join::ring_join_cancel,
             ring::join::ring_join_overview,
             ring::join::ring_approve_device_code,
-            ring::join::ring_upgrade_computer
+            ring::join::ring_upgrade_computer,
+            ring::join::ring_leave_removed
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -937,7 +939,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 109);
+        assert_eq!(registered.len(), 110);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

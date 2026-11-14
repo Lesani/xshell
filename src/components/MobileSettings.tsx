@@ -33,6 +33,8 @@ export interface JoinApi {
   events: Record<string, JoinEvent>;
   createComputer: () => Promise<void>;
   upgradeComputer: () => Promise<void>;
+  // Leave this Ring locally after another device removed this computer.
+  leaveRemoved: () => Promise<void>;
   start: (operation: string) => Promise<JoinStarted>;
   confirm: (operation: string) => Promise<void>;
   decline: (operation: string) => Promise<void>;
@@ -499,6 +501,8 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
   const [removal, dispatchRemoval] = useReducer(removalReducer, REMOVAL_IDLE);
   const [jst, setJst] = useReducer(joinReducer, JOIN_IDLE);
   const [upgraded, setUpgraded] = useState(false);
+  // Leave this Ring (a removed computer): confirm, run, then the outcome line.
+  const [leave, setLeave] = useState<{ state: "idle" | "confirming" | "leaving" | "left" } | { state: "failed"; error: string }>({ state: "idle" });
   // Replies after leaving Settings are not shown; the current operation is cancelled.
   const mounted = useRef(true);
   const op = useRef<string | null>(null);
@@ -598,6 +602,16 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
     }
   };
 
+  const leaveRing = async () => {
+    if (!join || leave.state !== "confirming") return;
+    setLeave({ state: "leaving" });
+    try {
+      await join.leaveRemoved();
+      if (mounted.current) setLeave({ state: "left" });
+    } catch (e) {
+      if (mounted.current) setLeave({ state: "failed", error: errorText(e) });
+    }
+  };
   const remove = async () => {
     if (removal.state !== "confirming") return;
     const key = removal.member.signKey;
@@ -653,6 +667,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
                 // Durable uncertainty from an earlier Create/Join: no new code or Ring.
                 ? <div className="host-form-error" data-ring-unresolved>{fmt("ring.reconciliationRequired")}</div>
                 : <>
+                    {leave.state === "left" && jst.state === "idle" && <div className="host-row-note" data-ring-left>{fmt("ring.left")}</div>}
                     <UnpairedRing s={s} join={join} st={jst} onCreate={create} onStart={startJoin} unavailable={unavailable} />
                     <Line line={outcome} />
                     <div data-ring-relay-unpaired>
@@ -676,6 +691,20 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
                 )}
                 {upgraded && s.approval === "ready" && <div className="host-row-note">{fmt("ring.upgrade.done")}</div>}
                 {s.approval === "unresolved" && <div className="host-row-note host-row-warn">{fmt("mobile.pair.err.reconcile")}</div>}
+                {join && s.approval === "removed" && (
+                  <div className="edit-field" data-ring-removed>
+                    <div className="host-row-note host-row-warn">{fmt("ring.removedExplanation")}</div>
+                    <div className="host-row-actions">
+                      <button className="btn settings-action-btn" data-ring-leave disabled={leave.state === "leaving" || s.busy} onClick={() => setLeave({ state: "confirming" })}>
+                        {leave.state === "leaving" ? fmt("ring.leaving") : fmt("ring.leave")}
+                      </button>
+                    </div>
+                    {leave.state === "failed" && <div className="host-form-error">{fmt("ring.leaveFailed", { error: leave.error })}</div>}
+                    {leave.state === "confirming" && (
+                      <ConfirmDialog title={fmt("ring.leaveConfirmTitle")} body={fmt("ring.leaveConfirmBody")} confirm={fmt("ring.leaveConfirm")} cancel={fmt("ring.leaveCancel")} onConfirm={leaveRing} onCancel={() => setLeave({ state: "idle" })} />
+                    )}
+                  </div>
+                )}
                 {pairing && (
                   <>
                     <PhonePanel s={s} p={pairing} />
@@ -700,7 +729,7 @@ export function MobileSettings({ visible = true }: { visible?: boolean }) {
   if (!r.status) return null;
   const p: Pairing = { events: r.pairing, startPhone: r.startPhone, cancelPhone: r.cancelPhone, approveComputer: r.approveComputer };
   const join: JoinApi = {
-    overview: r.overview, events: r.joinEvents, relay: r.chosenRelay, relayReady: r.relayReady, setRelay: r.setUnpairedRelay, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer,
+    overview: r.overview, events: r.joinEvents, relay: r.chosenRelay, relayReady: r.relayReady, setRelay: r.setUnpairedRelay, createComputer: r.createComputer, upgradeComputer: r.upgradeComputer, leaveRemoved: r.leaveRemoved,
     start: r.joinStart, confirm: r.joinConfirm, decline: r.joinDecline, cancel: r.joinCancel,
   };
   return <MobileSettingsView s={r.status} onEnable={r.enable} onSaveRelay={r.setRelayUrl} onClaimHost={r.claimHost} onRemoveMember={r.removeMember} pairing={p} join={join} visible={visible} />;
