@@ -687,6 +687,7 @@ fn required_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>
 
 /// Structural verification of an honestly unsigned Enroll; this never verifies or creates
 /// consent. Callers must verify final Noise context and obtain real proofs before signing.
+/// The approver is a Computer's Desktop or a Mobile: a Daemon never approves a Device Code.
 pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), RosterError> {
     n.validate()?;
     let m = n.membership()?;
@@ -694,13 +695,29 @@ pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), Ros
         || n.ring_id != *prev.ring_id()
         || n.version != prev.version() + 1
         || n.prev.as_deref() != Some(&prev.hash())
-        || prev
-            .member(&n.signed_by)
-            .is_none_or(|a| a.role != Role::Desktop)
+        || !enroll_approver(prev, &n.signed_by)
     {
-        return Err(invalid("not an unsigned Desktop Enroll"));
+        return Err(invalid("not an unsigned approver Enroll"));
     }
     verify_transition_roster(prev, n, true)
+}
+
+/// `key` may approve a Device Code on `head`: a Desktop (of a Computer or legacy Desktop
+/// unit), or a Mobile of a Mobile unit (format 2 only). Never a Daemon.
+pub fn enroll_approver(head: &SignedRoster, key: &SignKey) -> bool {
+    let Some(member) = head.member(key) else {
+        return false;
+    };
+    let Ok(m) = head.roster().membership() else {
+        return false;
+    };
+    match (member.role, m.unit_for(key).map(|u| u.kind.clone())) {
+        // A legacy Desktop unit exists only in Rings upgraded from format 1; the Relay
+        // accepts it too, and the Desktop app sets such Rings aside.
+        (Role::Desktop, Some(EnrollmentKind::Computer | EnrollmentKind::LegacyDesktop)) => true,
+        (Role::Mobile, Some(EnrollmentKind::Mobile)) => true,
+        _ => false,
+    }
 }
 
 /// Checks an honestly unsigned local Genesis/Upgrade/CompleteComputer with the same

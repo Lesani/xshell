@@ -1303,6 +1303,7 @@ fn in_process_standalone_driver_finalization_refuses_terminal_after_install() {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn admitted_ring_companion_mutation_retains_store_through_shutdown_and_late_request_refuses() {
     use crate::server::ring::ownership::{StoreOwnership, StoreOwnershipLease};
     use std::sync::{mpsc, Mutex};

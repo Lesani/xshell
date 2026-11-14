@@ -856,6 +856,9 @@ impl Server {
         // A member of a Ring connects to its Relay; the Relay socket is not a connection for
         // idle tracking.
         d.ring.resume();
+        // Removal detection and unfinished standalone pairing are finished in the background.
+        #[cfg(any(unix, windows))]
+        ring::start_membership_maintenance(&d);
         let da = d.clone();
         let ds = d.clone();
         let threads = std::thread::Builder::new()

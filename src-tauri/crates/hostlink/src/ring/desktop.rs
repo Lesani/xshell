@@ -43,7 +43,10 @@
 //! changes, the notice is the old Relay's and is cleared; the Connector reports nothing about
 //! an old Relay's quota (a farewell's refusals are its own).
 
+use super::adoption::MembershipState;
 use super::hosts::{OwnerRouting, RingHosts};
+
+mod maintenance;
 use super::store::{HostMember, RingState, Store};
 use crate::LOCAL_HOST_ID;
 use serde::Serialize;
@@ -214,8 +217,9 @@ fn enrolled_only(s: &RingState, p: &mut HostPlan) {
 
 /// The v2 Remove of `key`'s whole enrollment unit on `effective`, signed by `keys`, and the
 /// unit's keys. Checked against `effective` itself, so its terminal evidence fences a
-/// terminal-expired signer. This app's own unit is [`REMOVE_SELF`] (leaving is its own
-/// flow); a configured SSH Host does not block it. `None`: the head does not list the key.
+/// terminal-expired signer. This app's own unit may be removed too (ADR-0016: the Desktop
+/// then sets its membership aside); a configured SSH Host does not block it. `None`: the
+/// head does not list the key.
 fn removal_candidate(
     effective: &RosterChain,
     keys: &DeviceKeys,
@@ -230,9 +234,6 @@ fn removal_candidate(
     let Some(unit) = membership.unit_for(key).cloned() else {
         return Ok(None);
     };
-    if unit.members.contains(&keys.sign_key()) {
-        return Err(REMOVE_SELF.to_string());
-    }
     let next = remove_unit(effective.head(), keys, at, &unit.id).map_err(|e| e.to_string())?;
     effective
         .extended(std::slice::from_ref(&next))
@@ -454,6 +455,9 @@ pub enum AdoptionTestPoint {
     JoinBeforeCounterpartStart,
     JoinWorkerStarted,
     JoinSlotReady,
+    /// The approver's proposal verified; the joining keys are about to sign (no
+    /// confirmation), before the journal records that proofs may leave.
+    JoinBeforeConsent,
     OriginControllerAttached,
     OriginDispatchEnded,
     ApprovalProofsReceived,
@@ -517,6 +521,10 @@ pub struct DesktopRingConfig {
     /// The same while the quota notice is shown: rarely enough that a day of refusals stays
     /// well under the Relay's close after 32 in a row.
     pub quota_probe_limited: Duration,
+    /// Keep a stored format-1 Ring instead of setting it aside at open. Only for the tests
+    /// of the format-1 code that stays until the cleanup slice deletes it; never set in the
+    /// app.
+    pub keep_format1: bool,
 }
 
 impl DesktopRingConfig {
@@ -537,6 +545,7 @@ impl DesktopRingConfig {
             pair_publish_wait: Duration::from_secs(10),
             quota_probe: Duration::from_secs(10 * 60),
             quota_probe_limited: Duration::from_secs(60 * 60),
+            keep_format1: false,
         }
     }
 }
@@ -659,9 +668,9 @@ pub struct MemberView {
     /// The configured Remote Host (the smallest id still in Settings → Hosts) whose Daemon
     /// this member is.
     pub host_id: Option<String>,
-    /// Settings → Mobile offers to remove it: not this app, not this computer's Daemon, and
-    /// no configured Host's Daemon. On a format-v2 Ring: not this app's own unit (a
-    /// configured Host does not block it).
+    /// The UI offers to remove it. On a format-v2 Ring every row, this computer's own
+    /// included (ADR-0016). (A format-1 Ring is set aside at start; its rule was: not this
+    /// app, not this computer's Daemon, no configured Host's Daemon.)
     pub removable: bool,
     pub presence: PresenceView,
     /// Format v2: the member's enrollment unit. A Computer is one row (its Desktop's name
@@ -708,7 +717,8 @@ pub struct RingView {
     pub retry_in: Option<u64>,
     pub connection_error: Option<String>,
     pub limited: bool,
-    /// The farewells owed to old Relays, by Relay.
+    /// The farewells owed to old Relays, by Relay (format 1 only; not shown any more).
+    #[serde(skip)]
     pub farewells: Vec<FarewellView>,
     /// The stored state could not be used: `recovered` (an unreadable file was moved aside;
     /// Mobile access starts over) or `unreadable` (refused, left in place).
@@ -870,6 +880,8 @@ pub struct DesktopRing {
     /// While an admission is held: the operation ids of the durable adoption records that
     /// existed when it was taken. Records not in it belong to the live operation.
     pub(super) adoption_baseline: super::adoption::AdoptionBaseline,
+    /// The reconciler and the removal check ([`maintenance`]).
+    maintenance: Arc<maintenance::Maintenance>,
     observer: Arc<dyn RingObserver>,
     live: Mutex<Live>,
     routing_manager: Mutex<Option<Weak<crate::Manager>>>,
@@ -991,6 +1003,19 @@ impl ConnectorEvents for Events {
             r.queue_routing();
             r.persist_newer(chain);
             r.emit();
+            // A verified chain that drops this Desktop: the removal check sets it aside.
+            let me = r.lock().state.as_ref().map(|s| s.keys.sign_key());
+            if me.is_some_and(|me| chain.authorized_member(&me).is_none()) {
+                r.spawn_removal_check();
+            }
+        }
+    }
+
+    fn removed(&self) {
+        if let Some(r) = self.ring.upgrade() {
+            if r.lock().epoch == self.epoch {
+                r.spawn_removal_check();
+            }
         }
     }
 
@@ -1058,6 +1083,7 @@ impl DesktopRing {
             adoption: Arc::new(AtomicBool::new(false)),
             adoption_cancel: Mutex::new(None),
             adoption_baseline: Default::default(),
+            maintenance: Default::default(),
             observer,
             live: Mutex::new(Live::default()),
             routing_manager: Mutex::new(None),
@@ -1118,6 +1144,8 @@ impl DesktopRing {
                 }
             })
             .expect("spawn Ring Host projection");
+        // Format-1 or removed state is set aside before anything is adopted.
+        ring.set_aside_stale();
         let mut seen = ring.store.signature();
         ring.reload();
         let weak = Arc::downgrade(&ring);
@@ -3378,6 +3406,30 @@ impl DesktopRing {
         let _reservation = self
             .reserve_membership_mutation(Instant::now() + self.cfg.pair_publish_wait)
             .ok_or(MEMBERSHIP_BUSY)?;
+        self.remove_member_reserved(key)
+    }
+
+    /// [`DesktopRing::remove_member_v2`] for a caller that already holds the membership
+    /// mutation reservation (an approval replacing a standalone Daemon unit).
+    pub(in crate::ring) fn remove_member_reserved(
+        &self,
+        key: &SignKey,
+    ) -> Result<RosterChain, String> {
+        // Removing this computer's own unit: the Relay's removed close that follows is
+        // expected; the self-removal sets the membership aside (without a notice).
+        let own = self.lock().state.as_ref().is_some_and(|s| {
+            s.chain
+                .head()
+                .roster()
+                .membership()
+                .ok()
+                .and_then(|m| {
+                    m.unit_for(key)
+                        .map(|u| u.members.contains(&s.keys.sign_key()))
+                })
+                .unwrap_or(false)
+        });
+        let _self_removal = own.then(|| self.self_removal());
         let mut retried = false;
         loop {
             let (candidate, unit_keys, effective, connector, epoch) = {
@@ -3462,9 +3514,25 @@ impl DesktopRing {
                 Ok((Some(s.clone()), s))
             })?;
             self.hook();
-            self.adopt(s.clone());
-            s.chain
+            if unit_keys.contains(&s.keys.sign_key()) {
+                // This computer removed itself: no Ring to adopt; set aside below.
+                s.chain
+            } else {
+                self.adopt(s.clone());
+                s.chain
+            }
         };
+        if unit_keys.contains(
+            &self
+                .store
+                .load_profile()?
+                .0
+                .map(|p| p.keys.sign_key())
+                .ok_or(PAIR_NOT_ENABLED)?,
+        ) {
+            self.set_aside_self_removed(&chain);
+            return Ok(chain);
+        }
         self.emit();
         Ok(chain)
     }
@@ -3644,7 +3712,8 @@ impl DesktopRing {
                         this_app,
                         this_computer,
                         host_id: host_of(&m.sign_key),
-                        removable: !own,
+                        // Any device removes any unit, itself included (ADR-0016).
+                        removable: true,
                         presence: presence_of(&m.sign_key),
                         enrollment_id: Some(unit.id.clone()),
                         kind: Some(unit.kind.clone()),
@@ -3670,7 +3739,7 @@ impl DesktopRing {
                     this_app,
                     this_computer: own,
                     host_id: daemon.as_ref().and_then(host_of),
-                    removable: !own,
+                    removable: true,
                     presence,
                     enrollment_id: Some(unit.id.clone()),
                     kind: Some(EnrollmentKind::Computer),
@@ -4077,6 +4146,8 @@ mod tests {
 
     fn cfg(dir: &std::path::Path, url: &str) -> DesktopRingConfig {
         let mut c = DesktopRingConfig::new(dir.join("ring"), "desk".into());
+        // These tests drive the format-1 code kept until S7.
+        c.keep_format1 = true;
         c.default_relay_url = url.into();
         c.hosted_relay_url = url.into();
         c.backoff_unit = Duration::from_millis(10);
@@ -4976,7 +5047,9 @@ mod tests {
         a.enable(None, false).unwrap();
         let (b, _) = open(cfg(t.path(), "ws://127.0.0.1:9"));
         wait_view(&b, "follower enrolled", |v| v.enabled);
-        a.store.leave_removed(|_| Ok(())).unwrap();
+        a.store
+            .set_aside(super::super::store::AsideReason::SelfRemoved, |_| Ok(()))
+            .unwrap();
         a.forget_membership();
         assert!(!a.view().enabled);
         wait_view(&b, "follower left", |v| !v.enabled && v.problem.is_none());
@@ -7562,15 +7635,48 @@ mod v2_edits_tests {
     }
 
     #[test]
-    fn v2_remove_member_refuses_own_unit() {
+    fn self_removal_candidate_built_and_commit_sets_aside_without_notice() {
         let t = tempfile::tempdir().unwrap();
         let x = v2_ring(&t);
-        assert_eq!(x.ring.remove_member(&x.me).unwrap_err(), REMOVE_SELF);
-        assert_eq!(
-            x.ring.remove_member(&x.my_daemon.sign_key()).unwrap_err(),
-            REMOVE_SELF
+        // Either key of this computer's own unit builds the Remove of the whole unit.
+        for key in [x.me, x.my_daemon.sign_key()] {
+            let (candidate, s) = removed(&t, &x, &key);
+            assert!(candidate.member(&x.me).is_none());
+            assert!(candidate.member(&x.my_daemon.sign_key()).is_none());
+            assert!(
+                s.local_member.is_none(),
+                "this computer's Daemon mapping goes"
+            );
+        }
+        let (candidate, committed) = removed(&t, &x, &x.me);
+        let before = Store::new(t.path().join("ring"))
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        x.ring.set_aside_self_removed(&committed.chain);
+        assert_eq!(committed.chain.head(), &candidate);
+        let after = Store::new(t.path().join("ring"))
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(after.membership.is_none() && after.companion.is_none());
+        assert!(after.removed.is_none(), "a self-removal shows no notice");
+        assert_ne!(
+            after.keys.sign_key(),
+            before.keys.sign_key(),
+            "new identity"
         );
-        assert_eq!(stored(&t).chain.head().version(), 3, "nothing signed");
+        assert!(x.ring.chain().is_none(), "the live Ring is dropped");
+        assert_eq!(x.ring.membership_state().unwrap(), MembershipState::None);
+        assert!(std::fs::read_dir(t.path().join("ring"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ring.json.removed-")));
         x.ring.quit();
     }
 
@@ -7759,7 +7865,8 @@ mod v2_edits_tests {
         let own = v.members.iter().find(|m| m.sign_key == x.me).unwrap();
         assert_eq!(own.kind, Some(EnrollmentKind::Computer));
         assert_eq!(own.daemon_key, Some(x.my_daemon.sign_key()));
-        assert!(own.this_app && own.this_computer && !own.removable);
+        // ADR-0016: this computer's own row is removable too.
+        assert!(own.this_app && own.this_computer && own.removable);
         let other = v
             .members
             .iter()

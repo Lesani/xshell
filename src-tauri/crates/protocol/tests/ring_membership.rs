@@ -1164,3 +1164,147 @@ fn half_computer_removal_is_refused() {
     t.push(raw(&half, &ks[1]));
     assert!(RosterChain::from_tokens(&t).is_err());
 }
+
+/// Ring just works (S2): who may approve a Device Code, and the standalone Daemon that
+/// joins as a Computer in one approval.
+mod rjw {
+    use super::*;
+    use xshell_protocol::ring::membership::{enroll_approver, verify_enroll_proposal};
+    use xshell_protocol::ring::pairing::adoption::{
+        enroll_proposal, standalone_unit_to_replace, AdoptionIntent, JoinTarget, PublicIdentity,
+    };
+
+    fn identity(k: &DeviceKeys, name: &str) -> PublicIdentity {
+        PublicIdentity {
+            name: name.into(),
+            sign_key: k.sign_key(),
+            noise_key: k.noise_key(),
+        }
+    }
+    fn computer(desktop: &DeviceKeys, daemon: &DeviceKeys, op: u8) -> AdoptionIntent {
+        AdoptionIntent {
+            operation: eid(op),
+            expires_at: 10_000,
+            target: JoinTarget::Computer {
+                desktop: identity(desktop, "laptop"),
+                daemon: identity(daemon, "laptop host"),
+            },
+        }
+    }
+
+    #[test]
+    fn mobile_signed_enroll_proposal_verifies() {
+        let (ks, h) = completed();
+        let head = h.last().unwrap();
+        let mobile = &ks[3];
+        assert!(enroll_approver(head, &mobile.sign_key()));
+        let i = computer(&keys(40), &keys(41), 20);
+        let p = enroll_proposal(head, mobile.sign_key(), &i, head.roster().issued_at + 1).unwrap();
+        verify_enroll_proposal(head, &p).unwrap();
+        // Completed by both joining keys' proofs and signed by the phone, it is a valid
+        // successor (the phone is an admin of the chain rules).
+        let mut done = p.clone();
+        consent(&mut done, &[&keys(40), &keys(41)]);
+        accepts(&h, signed(&done, mobile));
+    }
+
+    #[test]
+    fn daemon_signed_enroll_proposal_refused() {
+        let (ks, h) = completed();
+        let head = h.last().unwrap();
+        // ks[2] is the Computer's Daemon after completion; a standalone Daemon neither.
+        let daemon = &ks[2];
+        assert!(!enroll_approver(head, &daemon.sign_key()));
+        let i = computer(&keys(40), &keys(41), 21);
+        let mut r =
+            enroll_proposal(head, ks[0].sign_key(), &i, head.roster().issued_at + 1).unwrap();
+        r.signed_by = daemon.sign_key();
+        assert!(verify_enroll_proposal(head, &r).is_err());
+        let (ks, h) = upgrade_multi();
+        let head = h.last().unwrap();
+        assert!(
+            !enroll_approver(head, &ks[2].sign_key()),
+            "standalone Daemon"
+        );
+        assert!(
+            !enroll_approver(head, &keys(77).sign_key()),
+            "never a member"
+        );
+    }
+
+    #[test]
+    fn standalone_replace_only_exact_daemon_unit() {
+        let (ks, h) = upgrade_multi();
+        let head = h.last().unwrap();
+        // ks[2] is the standalone Daemon unit eid(3).
+        let new_desktop = keys(50);
+        let exact = computer(&new_desktop, &ks[2], 30);
+        assert_eq!(
+            standalone_unit_to_replace(head, &exact).unwrap(),
+            Some(eid(3))
+        );
+        // Nobody enrolled: nothing to replace.
+        assert_eq!(
+            standalone_unit_to_replace(head, &computer(&keys(51), &keys(52), 31)).unwrap(),
+            None
+        );
+        // Same signing key, another Noise key: not the same Daemon.
+        let mut other_noise = exact.clone();
+        if let JoinTarget::Computer { daemon, .. } = &mut other_noise.target {
+            daemon.noise_key = keys(53).noise_key();
+        }
+        assert!(standalone_unit_to_replace(head, &other_noise).is_err());
+        // The "Desktop" key belongs to another unit: never taken over.
+        assert!(standalone_unit_to_replace(head, &computer(&ks[1], &keys(54), 32)).is_err());
+        // A Daemon that is part of a Computer is not standalone.
+        let (ks, h) = completed();
+        assert!(
+            standalone_unit_to_replace(h.last().unwrap(), &computer(&keys(55), &ks[2], 33))
+                .is_err()
+        );
+        // A Mobile key already enrolled.
+        let phone = AdoptionIntent {
+            operation: eid(34),
+            expires_at: 10_000,
+            target: JoinTarget::Mobile {
+                phone: identity(&ks[3], "my phone"),
+            },
+        };
+        assert!(standalone_unit_to_replace(h.last().unwrap(), &phone).is_err());
+    }
+
+    #[test]
+    fn remove_then_enroll_regroups_standalone_daemon_as_computer() {
+        let (ks, h) = upgrade_multi();
+        let head = h.last().unwrap().clone();
+        let desktop = keys(60);
+        let i = computer(&desktop, &ks[2], 40);
+        let id = standalone_unit_to_replace(&head, &i).unwrap().unwrap();
+        let removed = remove_unit(&head, &ks[0], head.roster().issued_at + 1, &id).unwrap();
+        let chain = accepts(&h, removed.clone());
+        assert!(chain.authorized_member(&ks[2].sign_key()).is_none());
+        // Now nothing of the target is a member: a plain Enroll of the Computer.
+        assert_eq!(standalone_unit_to_replace(&removed, &i).unwrap(), None);
+        let mut p = enroll_proposal(
+            &removed,
+            ks[0].sign_key(),
+            &i,
+            removed.roster().issued_at + 1,
+        )
+        .unwrap();
+        consent(&mut p, &[&desktop, &ks[2]]);
+        let enrolled = signed(&p, &ks[0]);
+        let mut all = h.clone();
+        all.push(removed);
+        let chain = accepts(&all, enrolled);
+        let m = chain.head().roster().membership().unwrap();
+        assert!(
+            m.retired.contains(&id),
+            "the old standalone id stays retired"
+        );
+        let unit = m.unit(&eid(40)).unwrap();
+        assert_eq!(unit.kind, Kind::Computer);
+        assert!(unit.members.contains(&ks[2].sign_key()));
+        assert!(chain.authorized_member(&ks[2].sign_key()).is_some());
+    }
+}

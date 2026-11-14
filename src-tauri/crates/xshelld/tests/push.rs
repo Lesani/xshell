@@ -574,6 +574,7 @@ fn push_register_mobile_only_and_validated() {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn registration_survives_restart_mode_0600() {
     let mut p = harness();
     let path = p.s.h.paths().ring_dir.join("push.json");
@@ -1039,6 +1040,7 @@ fn clock_far_behind() -> u64 {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn a_seq_that_cannot_be_saved_is_never_sent() {
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let f2 = fail.clone();
@@ -1102,6 +1104,7 @@ fn a_seq_that_cannot_be_saved_is_never_sent() {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn shutdown_waits_for_a_held_save() {
     let (mut p, gate) = gated(PushPoint::Save);
     let t = p.open("app", "claude");

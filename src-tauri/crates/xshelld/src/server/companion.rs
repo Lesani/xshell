@@ -75,6 +75,53 @@ fn validate_profile(
     }
     Ok(())
 }
+/// A Daemon sets its membership aside only while no counterpart or standalone operation is
+/// open (the caller defers and retries).
+pub(super) fn idle_for_set_aside(store: &Store, keys: &DeviceKeys) -> Result<(), String> {
+    if let Some(policy) = load(store)? {
+        validate_profile(store, policy.profile(), keys)?;
+        if !policy.idle() {
+            return Err("busy: a counterpart operation is still open".into());
+        }
+    }
+    // A standalone pair command whose consent may have left and that never finished
+    // installing is still open; an installed one (also one removed since) has ended.
+    if super::standalone_journal::load_journal(store)?.is_some_and(|r| !r.installed) {
+        return Err("busy: a standalone pairing is still unresolved".into());
+    }
+    Ok(())
+}
+/// Before the roster goes: a replayed accepted install of the departed Ring must find no
+/// operation, also after a restart.
+pub(super) fn retire_for_set_aside(store: &Store) -> Result<(), String> {
+    if let Some(mut policy) = load(store)? {
+        policy.reset();
+        save(store, &policy)?;
+    }
+    Ok(())
+}
+/// Format reset at start: the policy's open operation is retired unconditionally, and a
+/// startup reservation that recorded an uncertain legacy pairing is renamed aside (format
+/// 1 is not supported any more, so that uncertainty is moot).
+pub(super) fn retire_for_format_reset(store: &Store) -> Result<(), String> {
+    retire_for_set_aside(store)?;
+    if read_reservation(store)
+        .ok()
+        .flatten()
+        .is_some_and(|r| r.legacy_outcome_uncertain)
+    {
+        let from = store.dir.join("companion-pending.json");
+        std::fs::rename(
+            &from,
+            store.dir.join(format!(
+                "companion-pending.json.v1-{}",
+                super::registry::now_ms()
+            )),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 pub(super) fn validate_install_locked(
     store: &Store,
     operation: &str,
@@ -149,13 +196,31 @@ fn registration_locked(
         ) {
             return Err("companion registration possession proof refused".into());
         }
-        if let Some(existing) = &policy {
-            if existing.profile() != &profile {
-                return Err(
-                    "conflicting companion registration; no downgrade or replacement".into(),
-                );
+        let replaceable = |existing: &CompanionPolicy| -> Result<bool, String> {
+            // A registration whose Desktop is not a current member (it set its identity
+            // aside, or was never paired) and that has no open operation is replaced by
+            // a new identity of a Desktop (B1). A current member's registration never is.
+            let desktop = existing.profile().desktop.sign_key;
+            let member = trusted(store)?.is_some_and(|c| c.authorized_member(&desktop).is_some());
+            Ok(!member && existing.idle_or_expired(now()))
+        };
+        let replace = match &policy {
+            Some(existing) if existing.profile() != &profile => {
+                if !replaceable(existing)? {
+                    return Err(
+                        "conflicting companion registration; no downgrade or replacement".into(),
+                    );
+                }
+                true
             }
-        } else {
+            _ => false,
+        };
+        if replace {
+            super::standalone_journal::refuse_unresolved_standalone(store)?;
+            let registered = CompanionPolicy::new(profile.clone())?;
+            budget.check().map_err(|e| e.to_string())?;
+            save(store, &registered)?;
+        } else if policy.is_none() {
             let _offer = store.registration_admission()?;
             super::standalone_journal::refuse_unresolved_standalone(store)?;
             let registered = CompanionPolicy::new(profile.clone())?;
@@ -389,27 +454,42 @@ fn dispatch(
         } else {
             Some(RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?)
         };
-        daemon.ring.leave_removed(
+        daemon.ring.set_aside(
             budget,
+            super::ring::Aside::Removed,
             evidence.as_ref(),
-            |store, keys| {
-                let policy = load(store)?.ok_or("companion is not registered")?;
-                validate_profile(store, policy.profile(), keys)?;
-                if !policy.idle() {
-                    return Err("busy: a counterpart operation is still open".into());
-                }
-                #[cfg(unix)]
-                super::standalone_journal::refuse_unresolved_standalone(store)?;
-                Ok(policy.profile().desktop.sign_key)
-            },
-            |store| {
-                // Before the roster goes: a replayed accepted install of the departed
-                // Ring must find no operation, also after a restart.
-                let mut policy = load(store)?.ok_or("companion is not registered")?;
-                policy.retire_last()?;
-                save(store, &policy)
-            },
+            idle_for_set_aside,
+            retire_for_set_aside,
         )?;
+        return Ok(CompanionResponse::Left);
+    }
+    if let CompanionRequest::AbandonExpired { operation } = request {
+        {
+            let _lock = store.lock_until(budget)?;
+            let mut policy = load(&store)?.ok_or("companion is not registered")?;
+            let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
+            validate_profile(&store, policy.profile(), &keys)?;
+            policy.abandon_expired(&operation, now())?;
+            budget.check().map_err(|e| e.to_string())?;
+            save(&store, &policy)?;
+        }
+        // A partly written membership of the abandoned operation (accepted, written, then
+        // removed before the install finished) goes too, on its own verified chain.
+        let durable = {
+            let _lock = store.lock_until(budget)?;
+            trusted(&store)?
+        };
+        if let (Some(chain), Some(keys)) = (durable, store.load_keys()?) {
+            if !super::ring::is_daemon_member(&chain, &keys) {
+                daemon.ring.set_aside(
+                    budget,
+                    super::ring::Aside::Removed,
+                    Some(&chain),
+                    idle_for_set_aside,
+                    retire_for_set_aside,
+                )?;
+            }
+        }
         return Ok(CompanionResponse::Left);
     }
     #[cfg(unix)]
@@ -492,13 +572,11 @@ fn dispatch(
     validate_profile(&store, policy.profile(), &keys)?;
     budget.check().map_err(|e| e.to_string())?;
     let response = match request {
-        CompanionRequest::CompletionStart { intent } => {
-            super::completion::start(&store, policy, intent)?
+        // Format 1 is set aside at start (D2a); its completion entry points are cut.
+        CompanionRequest::CompletionStart { .. }
+        | CompanionRequest::RetainedCompletionStart { .. } => {
+            return Err("unsupported: format 1".into());
         }
-        CompanionRequest::RetainedCompletionStart {
-            intent,
-            predecessor,
-        } => super::completion::start_retained(&store, policy, intent, predecessor)?,
         CompanionRequest::CompletionStatus => {
             return Ok(CompanionResponse::Completion {
                 pending: super::completion::status(&store, policy)?.map(Box::new),
@@ -517,8 +595,22 @@ fn dispatch(
         }
         CompanionRequest::Start { intent } => {
             super::standalone_journal::refuse_unresolved_standalone(&store)?;
-            if trusted(&store)?.is_some() {
-                return Err("leave_required: Create requires an unpaired Daemon".into());
+            // A standalone member may start a Join as a Computer: the approver removes its
+            // standalone unit in the same approval (checked at Prepare). Any other retained
+            // membership refuses.
+            if let Some(chain) = trusted(&store)? {
+                let standalone = chain
+                    .head()
+                    .roster()
+                    .membership()
+                    .ok()
+                    .and_then(|m| m.unit_for(&keys.sign_key()).cloned())
+                    .is_some_and(|u| {
+                        u.kind == xshell_protocol::ring::membership::EnrollmentKind::Daemon
+                    });
+                if !standalone {
+                    return Err("already_member: this Host is already in a Ring".into());
+                }
             }
             let operation = intent.operation.clone();
             policy.start(intent, now())?;

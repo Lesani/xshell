@@ -354,3 +354,61 @@ impl DepartureClient {
         })
     }
 }
+
+/// What the Relay's signed history says about a device whose connection was refused or
+/// closed as removed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RemovalCheck {
+    /// Still an authorized member; the chain may be newer than the one given.
+    Member(RosterChain),
+    /// A verified, signed Remove or Expire retired this device's unit. The chain is the
+    /// evidence: it extends the retained chain and ends with the unit retired.
+    Removed(RosterChain),
+}
+
+/// Ask the Ring's Relay, as a (possibly former) member, whether `signer`'s unit is still
+/// in the Ring. `chain` is the device's retained verified chain; the target is the newest
+/// unit in it that contains the signer. The Relay is untrusted: only a signed history that
+/// verifies against `chain` and retires the unit gives [`RemovalCheck::Removed`]. A Relay
+/// that merely refuses or claims removal gives an error, never `Removed`.
+///
+/// `tls` is a `rustls::ClientConfig` for `wss://`: pass the same value the device's
+/// `RingClientConfig::tls` holds, which is `None` by default (the Mozilla roots).
+/// `timeout` bounds the connection and each request.
+pub fn check_removal(
+    chain: &RosterChain,
+    signer: Arc<dyn Signer>,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    timeout: Duration,
+) -> Result<RemovalCheck, RingError> {
+    let key = signer.sign_key();
+    let target = chain
+        .versions()
+        .iter()
+        .rev()
+        .find_map(|h| h.roster().membership().ok()?.unit_for(&key).cloned())
+        .ok_or_else(|| RingError::Invalid("this device was never a member of the Ring".into()))?;
+    // A retired unit whose key was enrolled again (a standalone Daemon regrouped into a
+    // Computer) is a member, not removed.
+    let verdict = |chain: &RosterChain| {
+        if chain.authorized_member(&key).is_some() {
+            RemovalCheck::Member(chain.clone())
+        } else {
+            RemovalCheck::Removed(chain.clone())
+        }
+    };
+    // Local evidence first: the retained chain may already retire the unit.
+    if chain
+        .head()
+        .roster()
+        .membership()
+        .is_ok_and(|m| m.retired.contains(&target.id))
+    {
+        return Ok(verdict(chain));
+    }
+    let mut client = DepartureClient::connect(chain.clone(), signer, target, tls, timeout)?;
+    match client.sync()? {
+        DepartureStatus::Active => Ok(RemovalCheck::Member(client.chain().clone())),
+        DepartureStatus::Absent(_) => Ok(verdict(client.chain())),
+    }
+}

@@ -7,7 +7,9 @@
 mod membership;
 #[path = "proposal_client.rs"]
 mod proposal_client;
-pub use membership::{ActivityReport, DepartureClient, DepartureStatus, PolicyPreview};
+pub use membership::{
+    check_removal, ActivityReport, DepartureClient, DepartureStatus, PolicyPreview, RemovalCheck,
+};
 pub use proposal_client::{ProposalReader, VerifiedProposal};
 
 use super::super::chain::RosterChain;

@@ -30,6 +30,7 @@ fn write(store: &Store, pending: &CompletionPending) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())
 }
+#[allow(dead_code)] // format 1: unreachable since Ring just works, deleted in S7
 pub(super) fn start(
     store: &Store,
     policy: &mut CompanionPolicy,
@@ -76,6 +77,7 @@ pub(super) fn start(
 }
 /// Local registered Desktop bootstrap: preparation trust only, not a Host RPC and
 /// not an installation. The policy repeats the identity/head checks before consent.
+#[allow(dead_code)] // format 1: unreachable since Ring just works, deleted in S7
 pub(super) fn start_retained(
     store: &Store,
     policy: &mut CompanionPolicy,
@@ -159,11 +161,18 @@ pub(super) fn status(
         .and_then(|p| policy.completion_proofs(p));
     Ok(Some(pending))
 }
+/// Format-1 completion entry points refuse (Ring just works, D2a); S7 deletes them.
+const FORMAT1_CUT: bool = true;
 pub(super) fn admin(
     daemon: &Daemon,
     peer: Option<SignKey>,
     request: CompanionAdminRequest,
 ) -> Result<Value, String> {
+    // Retained-Daemon completion is a format-1 transition (D2a): cut. The body stays for S7.
+    if FORMAT1_CUT {
+        let _ = (daemon, peer, request);
+        return Err("unsupported: format 1".into());
+    }
     let _operation = daemon.store_admission.admit()?;
     daemon.test_point(uuid::Uuid::nil(), super::TestPoint::RingCompanionAdmitted);
     let store = Store::new(daemon.cfg.paths.ring_dir.clone());

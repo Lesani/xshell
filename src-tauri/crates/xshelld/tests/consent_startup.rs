@@ -164,7 +164,10 @@ fn expired_pending(f: &Fixture) {
     let relay = format!("ws://{}", relay_sentinel.local_addr().unwrap());
     let (mut child, rx) = f.pair_on_relay(450, Some(&relay));
     let line = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(line.starts_with("Computer pairing pending."), "{line}");
+    assert!(
+        line.starts_with("Getting a Device Code from xshell on this computer"),
+        "{line}"
+    );
     assert!(
         child.0.try_wait().unwrap().is_none(),
         "must stay pending, not exit success/error immediately"
@@ -215,7 +218,7 @@ fn fresh_unpaired_startup_registers_then_gui_close_actual_cli_stays_computer_pen
     assert!(rx
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
-        .starts_with("Computer pairing pending."));
+        .starts_with("Getting a Device Code from xshell on this computer"));
     unsafe {
         libc::kill(cancel.0.id() as i32, libc::SIGINT);
     }
@@ -387,7 +390,10 @@ fn protected_administration_before_membership_epoch_cancel_follower_and_owner_de
             .unwrap(),
         S::OwnerFocusRequested
     );
-    wait(|| ring.take_administration_focus_request());
+    // No confirmation card exists any more: the request is acknowledged and changes
+    // nothing (no window is brought forward).
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!ring.take_administration_focus_request());
     assert_eq!(
         follower
             .request(R::InvalidateOrigin {}, administration_deadline())

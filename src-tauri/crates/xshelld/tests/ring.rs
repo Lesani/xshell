@@ -439,6 +439,7 @@ fn join_of_other_ring_requires_explicit_departure() {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn membership_survives_restart() {
     let r = relay();
     let h = TestHome::new();

@@ -150,7 +150,7 @@ impl ObservedChild {
                     break;
                 };
                 let at = state.started.unwrap().elapsed();
-                if line.starts_with("Computer pairing pending.") {
+                if line.starts_with("Getting a Device Code from xshell on this computer") {
                     state.events.push((at, "pending"));
                     state.pending = true;
                 } else if let Some(words) = line.strip_prefix("Device code: ") {
@@ -183,8 +183,8 @@ impl ObservedChild {
                 state.stderr_lines.push(line.clone());
                 match line.as_str() {
                     "xshelld: Computer pairing ended without installation" => state.ended_without_installation = true,
-                    "xshelld: Pairing cancelled; possible transmitted consent requires reconciliation" => state.cancelled = true,
-                    "xshelld: Computer pairing owner/epoch disconnected; the offer will not be reopened. If consent may have left, reconcile in xshell." => state.owner_disconnected = true,
+                    "xshelld: Pairing cancelled" => state.cancelled = true,
+                    "xshelld: xshell on this computer stopped answering; the code is no longer valid. If pairing had begun, xshell finishes it automatically." => state.owner_disconnected = true,
                     _ => state.unknown += 1,
                 }
             }

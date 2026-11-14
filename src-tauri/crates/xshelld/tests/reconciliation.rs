@@ -70,10 +70,6 @@ fn owned_controller_child() {
             // One credential to the invoking parent pipe only; never written to an artifact.
             println!("WORDS:{}", offer.code.format().as_str());
             std::io::stdout().flush().unwrap();
-            let (preview, lease) = offer.await_consent(WAIT).unwrap();
-            offer
-                .confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-                .unwrap();
             offer.wait().unwrap();
         }
         "upgrade" => {
@@ -243,6 +239,43 @@ fn process_recovery(mode: &str, cut: &str, descendant: bool, revoke: bool) {
         });
     }
     restart_controller(&mut b, &relay);
+    if revoke {
+        // The Computer was removed before this Desktop installed it. Read as itself it is
+        // not a member; before the offer's expiry that is "finishing" (the approver could
+        // in principle still publish), never an install, and nothing revives.
+        // With the accepted chain journalled, the removal is evidence at once: abandoned.
+        match b.ring.reconcile_adoption(&b.companion(), &operation) {
+            Ok(r) => {
+                assert_ne!(cut, "accepted-before-journal");
+                assert_eq!(r.local.unwrap().state, AdoptionRecoveryState::Terminal);
+                assert!(
+                    stored(&b).membership.is_none(),
+                    "revocation must not revive Desktop"
+                );
+                assert_eq!(
+                    stored(&b).journal.unwrap().phase,
+                    AdoptionPhase::Abandoned,
+                    "ended for good, so a new Join may start"
+                );
+            }
+            Err(error) => {
+                assert_eq!(cut, "accepted-before-journal");
+                assert!(error.starts_with("finishing:"), "{error}");
+                assert!(
+                    stored(&b).membership.is_none(),
+                    "revocation must not revive Desktop"
+                );
+                assert!(b
+                    .ring
+                    .begin_join(&b.companion())
+                    .err()
+                    .unwrap()
+                    .starts_with("finishing:"));
+            }
+        }
+        let _ = expiry;
+        return;
+    }
     let state = b
         .ring
         .reconcile_adoption(&b.companion(), &operation)
@@ -344,6 +377,7 @@ fn remove_computer(a: &Computer, chain: &RosterChain, key: SignKey) -> RosterCha
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn upgrade_process_death_after_wire_ack_before_controller_journal_recovers_publication_only() {
     let relay = workerd::Relay::start();
     let mut b = Computer::new(&relay);
@@ -564,41 +598,35 @@ fn killed_before_publication_and_expired_stays_uncertain_without_absence_inferen
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(a
-        .ring
+    // The signed candidate is not at its slot and the offer expired: nobody can publish
+    // it any more (only this approver held it). The record ends by itself (B2).
+    a.ring
         .reconcile_adoption(&a.companion(), &outgoing.intent.operation)
-        .is_err());
+        .unwrap();
     assert_eq!(
         a.ring.adoption_status().unwrap().publication.unwrap().state,
-        PublicationRecoveryState::ReconciliationRequired
+        PublicationRecoveryState::CancelledBeforePublication
     );
     let after = stored(&a).outgoing.unwrap();
     assert_eq!(
-        after, outgoing,
-        "expiry/readback at predecessor does not prove nonpublication or permit replay"
-    );
-    assert!(
-        d.daemon
-            .as_ref()
-            .unwrap()
-            .reconcile_standalone_adoption()
-            .is_err(),
-        "authentication refusal is not absence"
+        after.phase,
+        xshell_hostlink::ring::store::OutgoingPhase::Cancelled
     );
     assert_eq!(
+        after.signed_candidate, outgoing.signed_candidate,
+        "never replayed"
+    );
+    // The headless machine's own obligation ends by itself too: not a member after its
+    // code expired (the Daemon's maintenance loop).
+    wait("standalone obligation ended", || {
         d.daemon
             .as_ref()
             .unwrap()
             .standalone_adoption_status()
             .unwrap()
-            .unwrap()
-            .state,
-        StandaloneRecoveryState::ReconciliationRequired
-    );
-    assert!(
-        d.ring.begin_join(&d.companion()).is_err(),
-        "shared unresolved obligation still fences replacement"
-    );
+            .is_none()
+    });
+    let _ = StandaloneRecoveryState::ReconciliationRequired;
     assert_eq!(
         xshell_protocol::ring::relay::contract::relay_version(&relay.target(), original.ring_id()),
         1
@@ -825,6 +853,7 @@ fn declined_and_expired_before_proof_are_not_publication_uncertainty() {
 }
 
 #[test]
+#[ignore = "format 1, removed in S7"]
 fn retained_local_complete_process_death_between_stores_preserves_singleton_history_and_profile() {
     let relay = workerd::Relay::start();
     let mut b = Computer::new(&relay);

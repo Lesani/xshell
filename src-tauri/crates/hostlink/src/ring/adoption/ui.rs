@@ -1,29 +1,24 @@
 //! What the Desktop's Ring UI needs on top of the controllers: the registered local
 //! counterpart's client, a Join whose start the UI can cancel while it waits for the Relay
-//! slot, and a read-only answer to "can this Desktop approve a Device Code?".
+//! slot, and a read-only answer to "where does this Desktop stand in a Ring?".
 use super::*;
 use crate::ring::store::{OutgoingPhase, ProfileState};
 use std::collections::HashSet;
 use xshell_protocol::ring::device_code::DeviceCode;
 
-/// Whether this Desktop can approve a Device Code, and if not, why. Read-only: no admission,
-/// no network, no counterpart request.
+/// Where this Desktop stands in a Ring, for the UI. Read-only: no admission, no network,
+/// no counterpart request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalReadiness {
-    /// An authorized v2 Computer Desktop.
-    Ready,
-    /// A retained v1 Ring: explicit Upgrade, then completion.
-    NeedsUpgrade,
-    /// A v2 Ring where this Desktop is still a singleton: explicit local completion.
-    NeedsCompletion,
-    /// No retained Desktop profile yet.
-    NoProfile,
-    /// A profile without membership (unpaired).
-    NotEnrolled,
-    /// Earlier adoption/proposal work is unresolved and needs reconciliation first.
-    Unresolved,
-    /// A retained Ring that no longer authorizes this Desktop (removed, or its unit ended)
-    /// while no local adoption record is unresolved: nothing to reconcile, nothing to approve.
+pub enum MembershipState {
+    /// In no Ring (never joined, or set aside after a removal it did itself).
+    None,
+    /// An authorized format-2 Computer Desktop: it can approve, remove and pair the phone.
+    Member,
+    /// Earlier Join, Create or approval work is being finished automatically ("Finishing…").
+    /// Create and Join wait until it is done.
+    Finishing,
+    /// Another device removed this machine ("This machine was removed from your Ring").
+    /// Join again or Create clears it.
     Removed,
 }
 
@@ -35,6 +30,14 @@ pub(in crate::ring) fn record_operations(stored: &ProfileState) -> HashSet<Strin
         .map(|p| p.intent.operation.clone())
         .chain(stored.journal.iter().map(|j| j.intent.operation.clone()))
         .chain(stored.outgoing.iter().map(|o| o.intent.operation.clone()))
+        .collect()
+}
+
+/// The operation ids of the unresolved records, owned.
+pub(in crate::ring) fn unresolved(stored: &ProfileState) -> Vec<String> {
+    unresolved_operations(stored)
+        .into_iter()
+        .map(String::from)
         .collect()
 }
 
@@ -63,48 +66,46 @@ fn unresolved_operations(stored: &ProfileState) -> Vec<&str> {
 
 /// `live(op)`: the record belongs to the operation this process is driving right now (made
 /// under the current admission). Only those are live work; any other unresolved record is
-/// uncertainty, whatever admission is held.
-pub(in crate::ring) fn readiness_of(
+/// unfinished work that the reconciler finishes ([`MembershipState::Finishing`]).
+pub(in crate::ring) fn membership_of(
     stored: Option<&ProfileState>,
     live: impl Fn(&str) -> bool,
-) -> ApprovalReadiness {
+) -> MembershipState {
     let Some(stored) = stored else {
-        return ApprovalReadiness::NoProfile;
+        return MembershipState::None;
     };
     if unresolved_operations(stored)
         .into_iter()
         .any(|op| !live(op))
     {
-        return ApprovalReadiness::Unresolved;
+        return MembershipState::Finishing;
+    }
+    if stored.removed.is_some() {
+        return MembershipState::Removed;
     }
     let Some(member) = &stored.membership else {
-        return ApprovalReadiness::NotEnrolled;
+        return MembershipState::None;
     };
     let head = member.chain.head().roster();
-    if head.v == 1 {
-        return ApprovalReadiness::NeedsUpgrade;
-    }
     let me = stored.keys.sign_key();
-    let computer = head
-        .membership()
-        .ok()
-        .and_then(|m| {
+    let computer = head.v == 2
+        && head.membership().ok().is_some_and(|m| {
             m.unit_for(&me)
-                .map(|unit| unit.kind == EnrollmentKind::Computer)
-        })
-        .unwrap_or(false);
+                .is_some_and(|unit| unit.kind == EnrollmentKind::Computer)
+        });
     let desktop = member
         .chain
         .authorized_member(&me)
         .is_some_and(|m| m.role == xshell_protocol::ring::Role::Desktop);
     if computer && desktop {
-        ApprovalReadiness::Ready
+        MembershipState::Member
     } else if desktop {
-        ApprovalReadiness::NeedsCompletion
+        // A format-1 Ring or a singleton Desktop: set aside at the next start.
+        MembershipState::None
     } else {
-        // Removed or terminal. Unresolved records were ruled out above, so this is a
-        // definitive removal, not uncertainty.
-        ApprovalReadiness::Removed
+        // The retained chain no longer authorizes this Desktop: the removal check sets it
+        // aside and shows the notice.
+        MembershipState::Removed
     }
 }
 
@@ -169,7 +170,7 @@ impl DesktopRing {
                 Err(error) => {
                     if matches!(
                         offer.join_status(),
-                        JoinStatus::Failed { .. } | JoinStatus::ReconciliationRequired { .. }
+                        JoinStatus::Failed { .. } | JoinStatus::Finishing { .. }
                     ) {
                         if cancel.load(Ordering::Acquire) {
                             return Err(
@@ -183,54 +184,8 @@ impl DesktopRing {
         }
     }
 
-    /// Leave this Ring locally after another device removed this Computer: the old Ring
-    /// is not contacted. Refused unless readiness is [`ApprovalReadiness::Removed`] and no
-    /// adoption runs. The Daemon leaves first (idempotent), then the Desktop store sets
-    /// its membership aside atomically. An interruption between the two leaves this
-    /// Desktop Removed, so Leave is offered again; nothing resurrects the old Ring.
-    pub fn leave_removed(&self, client: &CompanionClient) -> Result<(), String> {
-        let _admission = self.reserve_adoption()?;
-        if !self.pairing_ipc_owner() {
-            return Err("another process owns the Desktop counterpart".into());
-        }
-        let removed = |stored: &ProfileState| match readiness_of(Some(stored), |_| false) {
-            ApprovalReadiness::Removed => Ok(()),
-            ApprovalReadiness::Unresolved => {
-                Err("reconciliation_required: earlier Ring work is unresolved".to_string())
-            }
-            _ => Err("not_removed: this Desktop is still a member of its Ring".to_string()),
-        };
-        let stored = self.store.load_profile()?.0;
-        // This Desktop's verified chain is the removal evidence for a Daemon that missed it.
-        let rosters = match stored.as_ref() {
-            Some(stored) if stored.membership.is_some() => {
-                removed(stored)?;
-                stored
-                    .membership
-                    .as_ref()
-                    .map(|m| {
-                        m.chain
-                            .versions()
-                            .iter()
-                            .map(|r| r.token().to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-            _ => return Err("not_enrolled: this Desktop is not in a Ring".into()),
-        };
-        match client.request(CompanionRequest::LeaveRemoved { rosters })? {
-            CompanionResponse::Left => {}
-            _ => return Err("invalid counterpart Leave response".into()),
-        }
-        self.adoption_test_point(super::super::desktop::AdoptionTestPoint::LeaveDaemonLeft);
-        self.store.leave_removed(removed)?;
-        self.forget_membership();
-        Ok(())
-    }
-
-    /// Read-only approval readiness from the retained profile.
-    pub fn approval_readiness(&self) -> Result<ApprovalReadiness, String> {
+    /// Where this Desktop stands, from the retained profile.
+    pub fn membership_state(&self) -> Result<MembershipState, String> {
         let stored = self.store.load_profile()?.0;
         let baseline = self
             .adoption_baseline
@@ -238,9 +193,60 @@ impl DesktopRing {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let held = self.adoption.load(Ordering::Acquire);
-        Ok(readiness_of(stored.as_ref(), |op| {
+        Ok(membership_of(stored.as_ref(), |op| {
             held && baseline.as_ref().is_some_and(|b| !b.contains(op))
         }))
+    }
+
+    /// The notices for the UI: another device removed this Desktop, and when a format-1
+    /// Ring was set aside at start (seconds).
+    #[allow(clippy::type_complexity)]
+    pub fn notices(
+        &self,
+    ) -> Result<(Option<crate::ring::store::RemovedNotice>, Option<u64>), String> {
+        Ok(self
+            .store
+            .load_profile()?
+            .0
+            .map(|p| (p.removed, p.old_ring))
+            .unwrap_or_default())
+    }
+
+    /// Whether the startup registration loop must register this Desktop with the local
+    /// Daemon now: no registration is stored, or the Daemon no longer holds it (it was
+    /// replaced, or the Daemon set its membership aside and rotated its identity; a stale
+    /// registration is then dropped while this Desktop is in no Ring). Only the pairing
+    /// owner registers. A Daemon that does not answer needs nothing now.
+    pub fn companion_registration_needed(&self) -> bool {
+        if !self.pairing_ipc_owner() {
+            return false;
+        }
+        let Ok((Some(stored), _)) = self.store.load_profile() else {
+            return true;
+        };
+        let Some(profile) = &stored.companion else {
+            return true;
+        };
+        if profile.desktop.sign_key != stored.keys.sign_key() {
+            return true;
+        }
+        match CompanionClient::for_profile(profile).request(CompanionRequest::Descriptor) {
+            Ok(CompanionResponse::Identity {
+                identity,
+                profile: held,
+            }) => {
+                if held.as_ref() == Some(profile) {
+                    false
+                } else if identity.sign_key == profile.daemon.sign_key
+                    && identity.noise_key == profile.daemon.noise_key
+                {
+                    true
+                } else {
+                    self.store.forget_companion(profile).unwrap_or(false)
+                }
+            }
+            _ => false,
+        }
     }
 
     /// An adoption, approval or registration holds the admission: nothing new can start.
@@ -248,14 +254,87 @@ impl DesktopRing {
     pub fn adoption_busy(&self) -> bool {
         self.adoption.load(Ordering::Acquire)
     }
+}
 
-    /// The retained Ring's Roster format (1 or 2), if this Desktop is in a Ring.
-    pub fn ring_format(&self) -> Result<Option<u8>, String> {
-        Ok(self
-            .store
-            .load_profile()?
-            .0
-            .and_then(|p| p.membership)
-            .map(|m| m.chain.head().roster().v as u8))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ring::store::{PendingJoin, RemovedNotice, RingState};
+    use xshell_protocol::ring::pairing::adoption::{AdoptionIntent, JoinTarget};
+    use xshell_protocol::ring::{RosterChain, SignedRoster};
+
+    fn bare() -> ProfileState {
+        ProfileState {
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+            membership: None,
+            journal: None,
+            companion: None,
+            pending_join: None,
+            outgoing: None,
+            removed: None,
+            old_ring: None,
+        }
+    }
+
+    #[test]
+    fn membership_of_none_member_finishing_removed() {
+        assert_eq!(membership_of(None, |_| false), MembershipState::None);
+        let p = bare();
+        assert_eq!(membership_of(Some(&p), |_| false), MembershipState::None);
+        // A notice: removed.
+        let mut removed = bare();
+        removed.removed = Some(RemovedNotice {
+            ring_id: RingId::derive(&removed.keys.sign_key()),
+            version: 3,
+            at: 1,
+        });
+        assert_eq!(
+            membership_of(Some(&removed), |_| false),
+            MembershipState::Removed
+        );
+        // An unresolved record that is not this process's live work: finishing, even with
+        // a notice.
+        let mut finishing = removed.clone();
+        let daemon = DeviceKeys::generate().unwrap();
+        let identity = |k: &DeviceKeys| PublicIdentity {
+            name: "x".into(),
+            sign_key: k.sign_key(),
+            noise_key: k.noise_key(),
+        };
+        let op = xshell_protocol::ring::b64::encode(&[9; 32]);
+        finishing.pending_join = Some(PendingJoin {
+            retained_predecessor: vec![],
+            intent: AdoptionIntent {
+                operation: op.clone(),
+                expires_at: 10,
+                target: JoinTarget::Computer {
+                    desktop: identity(&finishing.keys),
+                    daemon: identity(&daemon),
+                },
+            },
+            relay_url: "wss://r.example".into(),
+        });
+        assert_eq!(
+            membership_of(Some(&finishing), |_| false),
+            MembershipState::Finishing
+        );
+        // The same record driven live by this process is not "finishing".
+        assert_eq!(
+            membership_of(Some(&finishing), |o| o == op),
+            MembershipState::Removed
+        );
+        // A format-1 member is not a member (set aside at the next start).
+        let mut v1 = bare();
+        let g = SignedRoster::genesis(&*v1.keys, v1.keys.noise_key(), "d", "wss://r.example", 1)
+            .unwrap();
+        v1.membership = Some(RingState {
+            keys: v1.keys.clone(),
+            chain: RosterChain::from_chain(vec![g]).unwrap(),
+            local_member: None,
+            farewells: vec![],
+            held_relays: Default::default(),
+            host_members: Default::default(),
+        });
+        assert_eq!(membership_of(Some(&v1), |_| false), MembershipState::None);
     }
 }

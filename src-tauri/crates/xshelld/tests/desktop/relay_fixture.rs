@@ -159,10 +159,7 @@ impl Computer {
         let code = offer.code.clone();
         std::thread::scope(|scope| {
             let approval = scope.spawn(|| approver.ring.approve_device_code(&code));
-            let (p, lease) = offer.await_consent(WAIT).unwrap();
-            offer
-                .confirm_join(lease.confirm(&p.proposal_hash).unwrap())
-                .unwrap();
+            // No confirmation on the joining machine: it installs by itself.
             let result = offer.wait().unwrap();
             approval.join().unwrap().unwrap();
             match result {

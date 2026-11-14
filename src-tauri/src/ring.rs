@@ -1,8 +1,7 @@
-//! Settings → Hosts → Ring: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status`,
-//! `ring_enable` (only to start over after unreadable settings), `ring_set_relay_url`,
-//! `ring_claim_host` and `ring_remove_member` (#22); the event `ring:status`.
+//! Settings → Ring: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status` and
+//! `ring_remove_member` (any member, this computer included); the event `ring:status`.
 //! Phone pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`; the event
-//! `ring:pairing`. Computer adoption (#87): [`join`].
+//! `ring:pairing`. Create, Join and Add a machine: [`join`].
 //!
 //! Every Host's Daemon (the Local Host's and each Remote Host's) joins the Ring whenever
 //! its Host connects: the Host Observer records the connection in [`HOST_SYNC`], and
@@ -27,6 +26,21 @@ pub fn observe(sync: &HostSync, s: &HostStatus) {
     sync.observe(s);
 }
 
+/// The removal notice: which Ring removed this machine, and when (seconds).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovedView {
+    pub ring_id: String,
+    pub at: u64,
+}
+
+/// A format-1 Ring was set aside at start (seconds).
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OldRingView {
+    pub at: u64,
+}
+
 /// What the frontend gets: the Ring's view plus how this computer's terminals and the
 /// Remote Hosts stand.
 #[derive(Serialize, Clone)]
@@ -34,36 +48,43 @@ pub fn observe(sync: &HostSync, s: &HostStatus) {
 pub struct RingStatus {
     #[serde(flatten)]
     pub view: RingView,
-    /// `daemon` (can join), `in-process` (terminals run inside the app) or `too-old`.
+    /// `daemon` (can join) or `too-old`.
     pub local: &'static str,
     /// The Remote Hosts not in the Ring, and why.
     pub hosts: Vec<HostRingState>,
-    /// Whether this Desktop can add computers: `ready`, `needs-upgrade`, `needs-completion`,
-    /// `unavailable` (an upgrade is needed but cannot run here), `unresolved` (earlier
-    /// adoption work needs reconciliation) or `none` (not in a Ring).
-    pub approval: &'static str,
-    /// The retained Ring's Roster format (1 or 2): a v2 Ring's Relay is fixed (shown
-    /// read-only).
-    pub format: Option<u8>,
-    /// An adoption, approval or registration runs here now: nothing new can start. Not
-    /// durable uncertainty (that is `approval: unresolved`).
+    /// `none` (in no Ring), `member`, `finishing` (earlier Join/Create/approval work is
+    /// finished automatically; Create and Join wait) or `removed` (another device removed
+    /// this machine; Join again or Create).
+    pub membership: &'static str,
+    /// Set while `membership` is `removed`.
+    pub removed: Option<RemovedView>,
+    /// Set after a stored format-1 Ring was set aside at start, until Create or Join.
+    pub old_ring: Option<OldRingView>,
+    /// `membership` is `finishing` and the Relay cannot be reached right now.
+    pub finishing_offline: bool,
+    /// An adoption, approval or registration runs here now: nothing new can start.
     pub busy: bool,
 }
 
 pub struct RingState {
     pub worker: Arc<SyncWorker>,
     pub joins: Arc<join::JoinRegistry>,
-    /// `RingStatus.approval`, cached: computed by commands and the owner thread, never inside
-    /// the RingObserver callback.
-    pub approval: std::sync::Mutex<&'static str>,
-    /// `RingStatus.format`, cached the same way.
-    pub format: std::sync::Mutex<Option<u8>>,
+    /// `RingStatus.membership`, cached: computed by commands and the owner thread, never
+    /// inside the RingObserver callback.
+    pub membership: std::sync::Mutex<&'static str>,
     /// `RingStatus.busy`, cached the same way.
     pub busy: std::sync::Mutex<bool>,
     _pairing_ipc: Option<xshell_pairing_access::local::Server>,
 }
 
+/// The name other members see: `XSHELL_MACHINE_NAME` when set (several test Desktops on
+/// one host), else the hostname.
 fn host_name() -> String {
+    if let Ok(name) = std::env::var("XSHELL_MACHINE_NAME") {
+        if !name.trim().is_empty() {
+            return xshell_protocol::ring::member_name(name.trim(), "this computer");
+        }
+    }
     #[cfg(unix)]
     let raw = {
         let mut buf = [0u8; 256];
@@ -83,23 +104,19 @@ fn host_name() -> String {
 use tauri::{AppHandle, Emitter, Manager as _};
 
 fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
-    let in_process = app.try_state::<crate::hosts::Hosts>().is_some_and(|h| {
-        matches!(
-            h.local_mode,
-            crate::hosts::local::LocalMode::InProcess { .. }
-        )
-    });
-    let approval = app
-        .try_state::<RingState>()
-        .map(|r| *r.approval.lock().unwrap_or_else(|e| e.into_inner()))
+    let state = app.try_state::<RingState>();
+    let membership = state
+        .as_ref()
+        .map(|r| *r.membership.lock().unwrap_or_else(|e| e.into_inner()))
         .unwrap_or("none");
-    let format = app
-        .try_state::<RingState>()
-        .and_then(|r| *r.format.lock().unwrap_or_else(|e| e.into_inner()));
-    let busy = app
-        .try_state::<RingState>()
+    let busy = state
+        .as_ref()
         .is_some_and(|r| *r.busy.lock().unwrap_or_else(|e| e.into_inner()));
-    let worker = app.try_state::<RingState>().map(|r| r.worker.clone());
+    let worker = state.as_ref().map(|r| r.worker.clone());
+    let profile = worker.as_ref().and_then(|w| w.ring.notices().ok());
+    let (removed, old_ring) = profile.unwrap_or_default();
+    let finishing_offline =
+        membership == "finishing" && worker.as_ref().is_some_and(|w| w.ring.finishing_offline());
     let too_old = worker
         .as_ref()
         .is_some_and(|w| w.state_of(LOCAL_HOST_ID) == Some("too-old"));
@@ -112,16 +129,17 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
         .collect();
     RingStatus {
         view,
-        local: if in_process {
-            "in-process"
-        } else if too_old {
-            "too-old"
-        } else {
-            "daemon"
-        },
+        local: if too_old { "too-old" } else { "daemon" },
         hosts,
-        approval,
-        format,
+        removed: removed
+            .filter(|_| membership == "removed")
+            .map(|n| RemovedView {
+                ring_id: n.ring_id.to_string(),
+                at: n.at,
+            }),
+        old_ring: old_ring.map(|at| OldRingView { at }),
+        membership,
+        finishing_offline,
         busy,
     }
 }
@@ -146,6 +164,8 @@ pub fn setup(app: &AppHandle) {
     let mut cfg = DesktopRingConfig::new(dir, host_name());
     cfg.default_relay_url = default_relay_url(&|k| std::env::var(k).ok());
     let ring = DesktopRing::open(cfg, Arc::new(TauriRingObserver(app.clone())));
+    // Unfinished Join, Create and approval work is finished automatically.
+    ring.start_reconciler();
     if let Some(hosts) = app.try_state::<crate::hosts::Hosts>() {
         if let Err(e) = ring.attach_manager(&hosts.manager) {
             eprintln!("xshell: cannot attach Ring Host routing: {e}");
@@ -159,12 +179,14 @@ pub fn setup(app: &AppHandle) {
             eprintln!("xshell: cannot reserve local Computer association: {error}");
         }
     }
-    // Register even before membership. Followers never register another profile. The
+    // Register even before membership, and again whenever the registration is missing or
+    // stale: after a set-aside (removal, format 1) this Desktop has a new identity, and
+    // the Daemon may have rotated its own. Followers never register another profile. The
     // registration child cannot start serve or release Computer consent.
     #[cfg(unix)]
     if let Some(daemon) = app
         .try_state::<crate::hosts::Hosts>()
-        .and_then(|h| h.local_daemon.clone())
+        .and_then(|h| h.local_daemon_now())
     {
         let startup_ring = Arc::downgrade(&ring);
         std::thread::spawn(move || {
@@ -178,8 +200,14 @@ pub fn setup(app: &AppHandle) {
                 if ring.is_quitting() {
                     break;
                 }
+                if !ring.companion_registration_needed() {
+                    last_error = None;
+                    drop(ring);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
                 match ring.register_local_companion(&daemon) {
-                    Ok(Some(_)) => break,
+                    Ok(Some(_)) => last_error = None,
                     Ok(None) => {} // followers wait; only an elected successor may register
                     Err(error) => {
                         if last_error.as_ref() != Some(&error) {
@@ -208,23 +236,13 @@ pub fn setup(app: &AppHandle) {
                 if ring.is_quitting() {
                     break;
                 }
-                // Offers `xshelld pair` started on this computer get the pairing window card.
+                // Offers `xshelld pair` started on this computer are shown in the Ring page.
                 join::track_cli_joins(&focus_app, &ring);
-                if ring.take_administration_focus_request() {
-                    let app = focus_app.clone();
-                    let _ = focus_app.run_on_main_thread(move || {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.set_focus();
-                        }
-                    });
-                    // Open Settings → Hosts → Ring, where the card is.
-                    let _ = focus_app.emit("ring:focus", ());
-                }
                 tick = tick.wrapping_add(1);
                 if tick.is_multiple_of(10) {
                     if let Some(r) = focus_app.try_state::<RingState>() {
                         let before = (
-                            *r.approval.lock().unwrap_or_else(|e| e.into_inner()),
+                            *r.membership.lock().unwrap_or_else(|e| e.into_inner()),
                             *r.busy.lock().unwrap_or_else(|e| e.into_inner()),
                         );
                         let approval = join::refresh_approval(&focus_app);
@@ -281,8 +299,7 @@ pub fn setup(app: &AppHandle) {
     app.manage(RingState {
         worker: worker.clone(),
         joins: Arc::default(),
-        approval: std::sync::Mutex::new("none"),
-        format: std::sync::Mutex::new(None),
+        membership: std::sync::Mutex::new("none"),
         busy: std::sync::Mutex::new(false),
         _pairing_ipc: pairing_ipc.ok(),
     });
@@ -331,58 +348,38 @@ pub async fn ring_status(app: AppHandle) -> Result<RingStatus, String> {
     .await
 }
 
-/// Enables Mobile access: creates the Ring with this computer's Daemon when it can join;
-/// the connected Remote Hosts follow in the next version. After unreadable settings were set
-/// aside, a new Ring needs `startOver`.
-#[tauri::command]
-pub async fn ring_enable(app: AppHandle, start_over: Option<bool>) -> Result<RingStatus, String> {
-    let w = worker(&app)?;
-    run(move || {
-        let local = w.identity_of(LOCAL_HOST_ID);
-        let view = w.ring.enable(local, start_over.unwrap_or(false))?;
-        // Every connected Daemon joins (and is added, if it is not in the Ring yet).
-        HOST_SYNC.poke_all();
-        join::refresh_approval(&app);
-        Ok(status_of(&app, view))
-    })
-    .await
+/// `ring_remove_member`'s error in `code: detail` form: `offline`, `conflict`, `uncertain`,
+/// `busy`, `other_window`, `not_enabled` or `other`.
+pub fn remove_error(error: String) -> String {
+    for (from, to) in [
+        ("remove_offline:", "offline:"),
+        ("remove_conflict:", "conflict:"),
+        ("remove_uncertain:", "uncertain:"),
+    ] {
+        if let Some(rest) = error.strip_prefix(from) {
+            return format!("{to}{rest}");
+        }
+    }
+    if ["busy:", "other_window:", "not_enabled:"]
+        .iter()
+        .any(|c| error.starts_with(c))
+    {
+        return error;
+    }
+    format!("other: {error}")
 }
 
-/// Moves the Ring to `url` at once (ADR-0012): a new Roster version, and the connection and
-/// every connected Daemon follow without waiting for the old Relay. Devices still on an
-/// unreachable old Relay are owed a farewell, which runs in the background (`farewells` in
-/// the status).
-#[tauri::command]
-pub async fn ring_set_relay_url(app: AppHandle, url: String) -> Result<RingStatus, String> {
-    let w = worker(&app)?;
-    run(move || {
-        w.ring.set_relay_url(&url)?;
-        HOST_SYNC.poke_all();
-        Ok(status_of(&app, w.ring.view()))
-    })
-    .await
-}
-
-/// Pairs a Remote Host that is paired with another set of devices with this Desktop's.
-#[tauri::command]
-pub async fn ring_claim_host(app: AppHandle, host: String) -> Result<RingStatus, String> {
-    let w = worker(&app)?;
-    run(move || {
-        w.claim(&host)?;
-        Ok(status_of(&app, w.ring.view()))
-    })
-    .await
-}
-
-/// Removes a device from the Ring (#22): a new Roster version without it. Every Daemon
-/// connected over its Host link is told at once; the others learn it from the Relay.
+/// Removes a device from the Ring: its whole unit goes in one new Roster version, this
+/// computer's own included (it then sets its membership aside and is in no Ring). Needs a
+/// connection to the Relay; nothing is queued.
 #[tauri::command]
 pub async fn ring_remove_member(app: AppHandle, sign_key: String) -> Result<RingStatus, String> {
     let w = worker(&app)?;
     run(move || {
-        let key = SignKey::parse(&sign_key).map_err(|e| e.to_string())?;
-        w.remove_member(&key)?;
+        let key = SignKey::parse(&sign_key).map_err(|e| format!("other: {e}"))?;
+        w.remove_member(&key).map_err(remove_error)?;
         HOST_SYNC.poke_all();
+        join::refresh_approval(&app);
         Ok(status_of(&app, w.ring.view()))
     })
     .await

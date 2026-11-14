@@ -1096,7 +1096,7 @@ fn typed_refusal(e: &PairError) -> Option<PairRefusal> {
 /// `cancel` before the intent is deferred to a `Cancelled` refusal of that intent.
 #[allow(clippy::too_many_arguments)]
 fn approve(
-    mut pipe: PairPipe,
+    pipe: PairPipe,
     req: &AdoptionHostRequest<'_>,
     name: &str,
     typed: Option<Option<&Cancel>>,
@@ -1105,6 +1105,175 @@ fn approve(
     publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
     cancel_read: impl FnOnce(&super::proposal::ProposalHandle),
 ) -> Result<(), PairError> {
+    let cancel_read = std::cell::RefCell::new(Some(cancel_read));
+    let read_done = |h: &super::proposal::ProposalHandle| {
+        if let Some(f) = cancel_read.borrow_mut().take() {
+            f(h)
+        }
+    };
+    match approve_signed(pipe, req, name, typed, cancel, prepare, &read_done)? {
+        None => Ok(()),
+        Some(signed) => {
+            let grant = signed.grant.clone();
+            let result = signed.publish(cancel, publish);
+            read_done(&grant);
+            result
+        }
+    }
+}
+
+/// Best effort: a v2 phone learns why, authenticated by the finished handshake.
+fn refuse_pipe(mut pipe: PairPipe, host: &mut Host, typed: bool, e: &PairError) {
+    if let Some(r) = typed.then(|| typed_refusal(e)).flatten() {
+        if let Ok(m) = host.answer(&Err(r)) {
+            let _ = pipe.send(&m);
+        }
+    }
+    pipe.close();
+}
+
+/// An approver's adoption after the joining keys consented and the approver signed the
+/// exact candidate, before publication: [`SignedAdoption::publish`] gets it to the Relay
+/// and answers the joining machine. Dropping it closes the pipe (the joining machine
+/// learns nothing and its offer ends). The caller cancels [`SignedAdoption::grant`] when
+/// it is done with it.
+pub struct SignedAdoption {
+    pipe: PairPipe,
+    host: Host,
+    typed: bool,
+    until: Instant,
+    signer: SignKey,
+    ring: RingId,
+    pub intent: AdoptionIntent,
+    /// The signed Enroll, with the joining keys' proofs.
+    pub signed: SignedRoster,
+    /// The verified predecessor chain with `signed` accepted on top.
+    pub chain: RosterChain,
+    /// The proposal read grant.
+    pub grant: super::proposal::ProposalHandle,
+}
+
+impl SignedAdoption {
+    /// `publish` must get the candidate to the Relay and return its acknowledgment; then
+    /// the joining machine gets its authenticated answer. A failure is refused to it.
+    pub fn publish(
+        mut self,
+        cancel: Option<&Cancel>,
+        publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
+    ) -> Result<(), PairError> {
+        let result = (|| {
+            live(self.until, cancel)?;
+            let joined = publish(&self.signed)?;
+            if joined.hash != self.signed.hash()
+                || joined.version != self.signed.version()
+                || joined.signed_by != self.signer
+                || joined.ring_id != self.ring
+            {
+                return Err(PairError::Pin);
+            }
+            self.pipe.send(&self.host.answer(&Ok(joined))?)?;
+            Ok(())
+        })();
+        match &result {
+            Ok(()) => self.pipe.close(),
+            Err(e) => refuse_pipe(self.pipe, &mut self.host, self.typed, e),
+        }
+        result
+    }
+}
+
+/// The signing half of [`approve_adoption`]: everything up to the signed candidate, which
+/// is returned unpublished. `cancel_read` is called with the grant on every failure after
+/// the proposal was created.
+pub fn approve_adoption_signed(
+    pipe: PairPipe,
+    req: &AdoptionHostRequest<'_>,
+    cancel: Option<&Cancel>,
+    prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<VerifiedProposal, PairError>,
+    cancel_read: &dyn Fn(&super::proposal::ProposalHandle),
+) -> Result<SignedAdoption, PairError> {
+    approve_signed(
+        pipe,
+        req,
+        "computer",
+        None,
+        cancel,
+        |intent, hash| {
+            if matches!(
+                intent.target,
+                super::super::pairing::adoption::JoinTarget::Mobile { .. }
+            ) {
+                return Err(PairError::Payload(
+                    "a phone joins through a pairing offer".into(),
+                ));
+            }
+            prepare(intent, hash).map(|v| Prepared::Proposal(Box::new(v)))
+        },
+        cancel_read,
+    )?
+    .ok_or_else(|| PairError::Payload("no proposal".into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approve_signed(
+    pipe: PairPipe,
+    req: &AdoptionHostRequest<'_>,
+    name: &str,
+    typed: Option<Option<&Cancel>>,
+    cancel: Option<&Cancel>,
+    prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<Prepared, PairError>,
+    cancel_read: &dyn Fn(&super::proposal::ProposalHandle),
+) -> Result<Option<SignedAdoption>, PairError> {
+    approve_read(pipe, req, name, typed, cancel)?.sign(req.keys, cancel, prepare, cancel_read)
+}
+
+/// An approver's exchange after the joining machine's intent was read and the possession
+/// of its keys verified, before any proposal exists. Nothing was published or created.
+/// [`AdoptionRead::sign`] continues it; dropping it ends the exchange.
+pub struct AdoptionRead {
+    pipe: PairPipe,
+    host: Host,
+    typed: bool,
+    until: Instant,
+    ring: RingId,
+    hash: [u8; 32],
+    /// The joining machine's possession-proven intent.
+    pub intent: AdoptionIntent,
+}
+
+/// The first part of an approval: message 2 and the joining machine's intent, read and
+/// possession-checked. A phone intent (computers approve phones through an offer) is
+/// refused. Publishes and creates nothing.
+pub fn approve_adoption_read(
+    pipe: PairPipe,
+    req: &AdoptionHostRequest<'_>,
+    cancel: Option<&Cancel>,
+) -> Result<AdoptionRead, PairError> {
+    let read = approve_read(pipe, req, "computer", None, cancel)?;
+    if matches!(
+        read.intent.target,
+        super::super::pairing::adoption::JoinTarget::Mobile { .. }
+    ) {
+        let e = PairError::Payload("a phone joins through a pairing offer".into());
+        let AdoptionRead {
+            pipe,
+            mut host,
+            typed,
+            ..
+        } = read;
+        refuse_pipe(pipe, &mut host, typed, &e);
+        return Err(e);
+    }
+    Ok(read)
+}
+
+fn approve_read(
+    mut pipe: PairPipe,
+    req: &AdoptionHostRequest<'_>,
+    name: &str,
+    typed: Option<Option<&Cancel>>,
+    cancel: Option<&Cancel>,
+) -> Result<AdoptionRead, PairError> {
     let AdoptionHostRequest {
         keys,
         secret,
@@ -1122,15 +1291,7 @@ fn approve(
     pipe.send(&host.hello(ring, name)?)?;
     let intent = host.read_adoption(&pipe.recv(early)?)?;
     let typed = typed.is_some();
-    // Best effort: the phone learns why, authenticated by the finished handshake.
-    let refuse = |mut pipe: PairPipe, host: &mut Host, e: &PairError| {
-        if let Some(r) = typed.then(|| typed_refusal(e)).flatten() {
-            if let Ok(m) = host.answer(&Err(r)) {
-                let _ = pipe.send(&m);
-            }
-        }
-        pipe.close();
-    };
+    let refuse = |pipe: PairPipe, host: &mut Host, e: &PairError| refuse_pipe(pipe, host, typed, e);
     let until = match offer_deadline(intent.expires_at, until) {
         Ok(until) => until,
         Err(e) => {
@@ -1145,77 +1306,142 @@ fn approve(
         return Err(e);
     }
     let hash = host.final_handshake_hash()?;
-    let verified = match prepare(&intent, hash) {
-        Ok(Prepared::Proposal(verified)) => *verified,
-        Ok(Prepared::Enrolled(joined)) => {
-            if joined.ring_id != *ring {
-                pipe.close();
-                return Err(PairError::Pin);
-            }
-            let sent = host.answer_enrolled(&joined).and_then(|m| pipe.send(&m));
-            pipe.close();
-            return sent;
-        }
-        Err(e) => {
-            refuse(pipe, &mut host, &e);
-            return Err(e);
-        }
-    };
-    let grant = verified.handle.clone();
-    let result = (|| {
-        check_proposal(&verified, &intent, &hash, Some(keys.sign_key()))?;
-        live(until, cancel)?;
-        pipe.send(
-            &host.encrypt(&serde_json::to_vec(&verified.handle).expect("handle serializes"))?,
-        )?;
-        let bytes = host.decrypt(&pipe.recv_until(until, cancel).map_err(|e| {
-            if e == PairError::Timeout {
-                PairError::Expired
-            } else {
-                e
-            }
-        })?)?;
-        let decision: AdoptionDecision = serde_json::from_slice(&bytes)
-            .map_err(|_| PairError::Payload("consent payload".into()))?;
-        let consent = match decision {
-            AdoptionDecision::Consent { consent } => consent,
-            AdoptionDecision::Cancel {
-                operation,
-                proposal_hash,
-            } if operation == intent.operation
-                && proposal_hash
-                    == consent_proposal_hash(&verified.proposal)
-                        .map_err(|e| PairError::Payload(e.to_string()))? =>
-            {
-                return Err(PairError::Cancelled)
-            }
-            _ => return Err(PairError::Crypto),
-        };
-        live(until, cancel)?;
-        let completed = apply_consent(&verified.proposal, &intent, &hash, consent)?;
-        let signed = completed
-            .sign(keys)
-            .map_err(|e| PairError::Payload(e.to_string()))?;
-        let mut chain = verified.chain;
-        chain
-            .accept(std::slice::from_ref(&signed))
-            .map_err(|e| PairError::Payload(e.to_string()))?;
-        live(until, cancel)?;
-        let joined = publish(&signed)?;
-        if joined.hash != signed.hash()
-            || joined.version != signed.version()
-            || joined.signed_by != keys.sign_key()
-            || joined.ring_id != *ring
-        {
-            return Err(PairError::Pin);
-        }
-        pipe.send(&host.answer(&Ok(joined))?)?;
-        Ok(())
-    })();
-    match &result {
-        Ok(()) => pipe.close(),
-        Err(e) => refuse(pipe, &mut host, e),
+    Ok(AdoptionRead {
+        pipe,
+        host,
+        typed,
+        until,
+        ring: ring.clone(),
+        hash,
+        intent,
+    })
+}
+
+impl AdoptionRead {
+    /// Ends the exchange, telling a phone why (typed refusal) when it is one.
+    pub fn refuse(self, e: &PairError) {
+        let AdoptionRead {
+            pipe,
+            mut host,
+            typed,
+            ..
+        } = self;
+        refuse_pipe(pipe, &mut host, typed, e);
     }
-    cancel_read(&grant);
-    result
+
+    /// The rest of the approval for a computer: `prepare` creates the proposal (the only
+    /// place an approver may publish or create anything first), the joining keys consent
+    /// and the approver signs. Returns the signed, unpublished candidate.
+    pub fn sign_computer(
+        self,
+        keys: &DeviceKeys,
+        cancel: Option<&Cancel>,
+        prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<VerifiedProposal, PairError>,
+        cancel_read: &dyn Fn(&super::proposal::ProposalHandle),
+    ) -> Result<SignedAdoption, PairError> {
+        self.sign(
+            keys,
+            cancel,
+            |intent, hash| prepare(intent, hash).map(|v| Prepared::Proposal(Box::new(v))),
+            cancel_read,
+        )?
+        .ok_or_else(|| PairError::Payload("no proposal".into()))
+    }
+
+    fn sign(
+        self,
+        keys: &DeviceKeys,
+        cancel: Option<&Cancel>,
+        prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<Prepared, PairError>,
+        cancel_read: &dyn Fn(&super::proposal::ProposalHandle),
+    ) -> Result<Option<SignedAdoption>, PairError> {
+        let AdoptionRead {
+            mut pipe,
+            mut host,
+            typed,
+            until,
+            ring,
+            hash,
+            intent,
+        } = self;
+        let ring = &ring;
+        let refuse =
+            |pipe: PairPipe, host: &mut Host, e: &PairError| refuse_pipe(pipe, host, typed, e);
+        let verified = match prepare(&intent, hash) {
+            Ok(Prepared::Proposal(verified)) => *verified,
+            Ok(Prepared::Enrolled(joined)) => {
+                if joined.ring_id != *ring {
+                    pipe.close();
+                    return Err(PairError::Pin);
+                }
+                let sent = host.answer_enrolled(&joined).and_then(|m| pipe.send(&m));
+                pipe.close();
+                return sent.map(|()| None);
+            }
+            Err(e) => {
+                refuse(pipe, &mut host, &e);
+                return Err(e);
+            }
+        };
+        let grant = verified.handle.clone();
+        let result = (|| {
+            check_proposal(&verified, &intent, &hash, Some(keys.sign_key()))?;
+            live(until, cancel)?;
+            pipe.send(
+                &host.encrypt(&serde_json::to_vec(&verified.handle).expect("handle serializes"))?,
+            )?;
+            let bytes = host.decrypt(&pipe.recv_until(until, cancel).map_err(|e| {
+                if e == PairError::Timeout {
+                    PairError::Expired
+                } else {
+                    e
+                }
+            })?)?;
+            let decision: AdoptionDecision = serde_json::from_slice(&bytes)
+                .map_err(|_| PairError::Payload("consent payload".into()))?;
+            let consent = match decision {
+                AdoptionDecision::Consent { consent } => consent,
+                AdoptionDecision::Cancel {
+                    operation,
+                    proposal_hash,
+                } if operation == intent.operation
+                    && proposal_hash
+                        == consent_proposal_hash(&verified.proposal)
+                            .map_err(|e| PairError::Payload(e.to_string()))? =>
+                {
+                    return Err(PairError::Cancelled)
+                }
+                _ => return Err(PairError::Crypto),
+            };
+            live(until, cancel)?;
+            let completed = apply_consent(&verified.proposal, &intent, &hash, consent)?;
+            let signed = completed
+                .sign(keys)
+                .map_err(|e| PairError::Payload(e.to_string()))?;
+            let mut chain = verified.chain;
+            chain
+                .accept(std::slice::from_ref(&signed))
+                .map_err(|e| PairError::Payload(e.to_string()))?;
+            Ok((signed, chain))
+        })();
+        match result {
+            Ok((signed, chain)) => Ok(Some(SignedAdoption {
+                pipe,
+                host,
+                typed,
+                until,
+                signer: keys.sign_key(),
+                ring: ring.clone(),
+                intent,
+                signed,
+                chain,
+                grant,
+            })),
+            Err(e) => {
+                refuse(pipe, &mut host, &e);
+                cancel_read(&grant);
+                Err(e)
+            }
+        }
+    }
 }

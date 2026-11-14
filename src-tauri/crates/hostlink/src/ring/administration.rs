@@ -216,10 +216,9 @@ impl Administration {
                 self.tombstones.insert(key);
                 Ok(S::Cancelled)
             }
-            R::RequestOwnerFocus {} => {
-                self.focus_requested = true;
-                Ok(S::OwnerFocusRequested)
-            }
+            // No confirmation card exists any more (ADR-0016): an older pair command's
+            // request is acknowledged and changes nothing.
+            R::RequestOwnerFocus {} => Ok(S::OwnerFocusRequested),
             R::InvalidateOrigin {} => {
                 self.disconnect(client);
                 self.invalidated.insert(client);
@@ -493,16 +492,11 @@ pub(super) fn dispatch_pending(
                             },
                             false,
                         ),
-                        J::AwaitingConfirmation(_) => {
-                            (AdministrationStatus::AwaitingConfirmation, false)
-                        }
                         J::Completing => (AdministrationStatus::Completing, false),
                         J::Installed { .. } => (AdministrationStatus::Installed, true),
-                        J::Declined => (AdministrationStatus::Declined, true),
                         J::Failed { .. } => (AdministrationStatus::Failed, true),
-                        J::ReconciliationRequired { .. } => {
-                            (AdministrationStatus::ReconciliationRequired, true)
-                        }
+                        // The wire keeps its name; the pair command says "Finishing".
+                        J::Finishing { .. } => (AdministrationStatus::ReconciliationRequired, true),
                     };
                     state.lock().unwrap().update(&dispatch, status);
                     if ended {

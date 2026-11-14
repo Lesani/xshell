@@ -397,21 +397,14 @@ const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "local_migration_guard",
     "local_migration_sync_settings",
     "ring_status",
-    "ring_enable",
-    "ring_set_relay_url",
-    "ring_claim_host",
     "ring_remove_member",
     "ring_pair_phone_start",
     "ring_pair_phone_cancel",
     "ring_create_computer",
     "ring_join_start",
-    "ring_join_confirm",
-    "ring_join_decline",
     "ring_join_cancel",
     "ring_join_overview",
     "ring_approve_device_code",
-    "ring_upgrade_computer",
-    "ring_leave_removed",
     "transfer_download",
     "transfer_upload_path",
     "transfer_cancel",
@@ -903,21 +896,14 @@ pub fn run() {
             local_migration::local_migration_guard,
             local_migration::local_migration_sync_settings,
             ring::ring_status,
-            ring::ring_enable,
-            ring::ring_set_relay_url,
-            ring::ring_claim_host,
             ring::ring_remove_member,
             ring::ring_pair_phone_start,
             ring::ring_pair_phone_cancel,
             ring::join::ring_create_computer,
             ring::join::ring_join_start,
-            ring::join::ring_join_confirm,
-            ring::join::ring_join_decline,
             ring::join::ring_join_cancel,
             ring::join::ring_join_overview,
-            ring::join::ring_approve_device_code,
-            ring::join::ring_upgrade_computer,
-            ring::join::ring_leave_removed
+            ring::join::ring_approve_device_code
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1005,7 +991,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 117);
+        assert_eq!(registered.len(), 110);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

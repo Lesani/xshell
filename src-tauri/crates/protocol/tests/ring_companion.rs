@@ -524,3 +524,230 @@ fn fresh_create_preparation_still_refuses_unrelated_enrollments() {
         .expect_err("fresh Create must remain exactly its local Computer");
     assert!(error.contains("counterpart mismatch"), "{error}");
 }
+
+/// Ring just works (S2): a standalone Daemon that pairs as a Computer, and abandoning a
+/// consented operation that never enrolled.
+mod rjw {
+    use super::*;
+    use xshell_protocol::ring::companion::{CompanionPhase, CompanionProposal, ConsentTranscript};
+    use xshell_protocol::ring::membership::{
+        consent_message, local_consent_context, pairing_consent_context, remove_unit, ConsentProof,
+        Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+    };
+    use xshell_protocol::ring::pairing::adoption::enroll_proposal;
+    use xshell_protocol::ring::{Member, RingId, Role, Roster, RosterChain, Signature, Signer};
+
+    fn proofs(r: &Roster, ks: &[&DeviceKeys], pairing: bool) -> Vec<ConsentProof> {
+        let context = if pairing {
+            pairing_consent_context(r, &[42; 32]).unwrap()
+        } else {
+            local_consent_context(r).unwrap()
+        };
+        ks.iter()
+            .map(|k| ConsentProof {
+                key: k.sign_key(),
+                expires_at: r.issued_at + 600,
+                context: context.clone(),
+                signature: Signature::from_bytes(
+                    k.sign(&consent_message(r, r.issued_at + 600, &context).unwrap())
+                        .unwrap(),
+                ),
+            })
+            .collect()
+    }
+
+    /// v1 genesis of Computer A; v2 Enroll of `daemon` as a standalone Daemon unit.
+    fn standalone_member(
+        a_desk: &DeviceKeys,
+        a_daemon: &DeviceKeys,
+        daemon: &DeviceKeys,
+    ) -> RosterChain {
+        let mut g = Roster {
+            v: 2,
+            ring_id: RingId::derive(&a_desk.sign_key()),
+            version: 1,
+            prev: None,
+            relay_url: "ws://127.0.0.1:7777".into(),
+            signed_by: a_desk.sign_key(),
+            issued_at: 1000,
+            members: vec![
+                Member::new(
+                    "a",
+                    Role::Desktop,
+                    a_desk.sign_key(),
+                    a_desk.noise_key(),
+                    1000,
+                ),
+                Member::new(
+                    "a host",
+                    Role::Daemon,
+                    a_daemon.sign_key(),
+                    a_daemon.noise_key(),
+                    1000,
+                ),
+            ],
+            extra: Default::default(),
+        };
+        let mut m = Membership {
+            enrollments: vec![Enrollment {
+                id: b64::encode(&[1; 32]),
+                kind: EnrollmentKind::Computer,
+                members: vec![a_desk.sign_key(), a_daemon.sign_key()],
+                enrolled_at: 1000,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: None,
+                activity_key: a_desk.sign_key(),
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        };
+        g.set_membership(&m);
+        m.change = RosterChange::Genesis {
+            proofs: proofs(&g, &[a_desk, a_daemon], false),
+        };
+        g.set_membership(&m);
+        let g = g.sign(a_desk).unwrap();
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[2; 32]),
+            expires_at: 1601,
+            target: JoinTarget::StandaloneDaemon {
+                daemon: identity(daemon),
+            },
+        };
+        let mut e = enroll_proposal(&g, a_desk.sign_key(), &intent, 1001).unwrap();
+        let mut em = e.membership().unwrap();
+        em.change = RosterChange::Enroll {
+            enrollment_id: intent.operation.clone(),
+            proofs: proofs(&e, &[daemon], true),
+        };
+        e.set_membership(&em);
+        let e = e.sign(a_desk).unwrap();
+        RosterChain::from_chain(vec![g, e]).unwrap()
+    }
+
+    fn tokens(c: &RosterChain) -> Vec<String> {
+        c.versions().iter().map(|r| r.token().to_string()).collect()
+    }
+
+    /// The new Desktop's policy, possession done, and the Computer proposal on `pred`.
+    fn pairing(
+        desk: &DeviceKeys,
+        daemon: &DeviceKeys,
+        approver: &DeviceKeys,
+        pred: &RosterChain,
+    ) -> (CompanionPolicy, CompanionProposal) {
+        let profile = fixture_profile(desk, daemon);
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[30; 32]),
+            expires_at: 1500,
+            target: profile.target(),
+        };
+        let mut policy = CompanionPolicy::new(profile).unwrap();
+        policy.start(intent.clone(), 1100).unwrap();
+        policy
+            .possession(daemon, &intent.operation, [42; 32], 1100)
+            .unwrap();
+        let proposal = enroll_proposal(pred.head(), approver.sign_key(), &intent, 1003).unwrap();
+        (
+            policy,
+            CompanionProposal {
+                operation: intent.operation,
+                predecessor: tokens(pred),
+                proposal,
+                transcript: ConsentTranscript::Pairing {
+                    final_noise_hash: b64::encode(&[42; 32]),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn pairing_prepare_allows_retired_standalone_unit() {
+        let (a_desk, a_daemon, daemon, desk) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let trusted = standalone_member(&a_desk, &a_daemon, &daemon);
+        let unit = b64::encode(&[2; 32]);
+        let removed = remove_unit(trusted.head(), &a_desk, 1002, &unit).unwrap();
+        let mut pred = trusted.clone();
+        pred.accept(std::slice::from_ref(&removed)).unwrap();
+        let (mut policy, proposal) = pairing(&desk, &daemon, &a_desk, &pred);
+        policy.prepare(proposal, Some(&trusted), 1100).unwrap();
+        assert_eq!(
+            policy.phase(&b64::encode(&[30; 32])).unwrap(),
+            CompanionPhase::Prepared
+        );
+    }
+
+    #[test]
+    fn pairing_prepare_refuses_daemon_still_member() {
+        let (a_desk, a_daemon, daemon, desk) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let trusted = standalone_member(&a_desk, &a_daemon, &daemon);
+        // Its standalone unit is not retired: the Enroll of the Computer is refused (the
+        // Daemon key is still a member), and so is the counterpart's preparation.
+        let target = fixture_profile(&desk, &daemon).target();
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[30; 32]),
+            expires_at: 1500,
+            target,
+        };
+        assert!(enroll_proposal(trusted.head(), a_desk.sign_key(), &intent, 1003).is_err());
+        // Another Ring's predecessor that retires a unit of the same id is refused: it must
+        // extend the retained chain.
+        let unit = b64::encode(&[2; 32]);
+        let (o_desk, o_daemon) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let foreign = standalone_member(&o_desk, &o_daemon, &daemon);
+        let removed = remove_unit(foreign.head(), &o_desk, 1002, &unit).unwrap();
+        let mut pred = foreign.clone();
+        pred.accept(std::slice::from_ref(&removed)).unwrap();
+        let (mut policy, proposal) = pairing(&desk, &daemon, &o_desk, &pred);
+        assert!(policy.prepare(proposal, Some(&trusted), 1100).is_err());
+    }
+
+    #[test]
+    fn abandon_expired_only_after_deadline() {
+        let (mut policy, desktop, daemon, intent, roster) = super::prepared();
+        let context = local_consent_context(&roster).unwrap();
+        let message = consent_message(&roster, intent.expires_at, &context).unwrap();
+        let proof = ConsentProof {
+            key: desktop.sign_key(),
+            expires_at: intent.expires_at,
+            context,
+            signature: Signature::from_bytes(desktop.sign(&message).unwrap()),
+        };
+        // Nothing consented yet: nothing to abandon.
+        assert!(policy.abandon_expired(&intent.operation, 1700).is_err());
+        policy
+            .consent(&daemon, &intent.operation, &proof, 1000)
+            .unwrap();
+        assert!(!policy.idle());
+        assert!(!policy.idle_or_expired(1599));
+        assert!(policy.idle_or_expired(1600));
+        assert!(
+            policy.abandon_expired(&intent.operation, 1599).is_err(),
+            "before the deadline the approver may still publish"
+        );
+        policy.abandon_expired(&intent.operation, 1600).unwrap();
+        assert!(policy.idle());
+        // The abandoned operation can never start again; a new one can.
+        assert!(policy.start(intent.clone(), 1601).is_err());
+        let next = AdoptionIntent {
+            operation: b64::encode(&[78; 32]),
+            expires_at: 2201,
+            target: intent.target.clone(),
+        };
+        policy.start(next, 1601).unwrap();
+    }
+}

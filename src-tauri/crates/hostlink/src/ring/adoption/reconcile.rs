@@ -2,6 +2,7 @@
 //! signed upload, deadline renewal, or credential generation is reachable from here.
 use super::*;
 use crate::ring::store::{OutgoingPhase, ProfileState};
+use xshell_protocol::ring::relay::ErrorCode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdoptionRecoveryState {
@@ -17,6 +18,9 @@ pub enum AdoptionRecoveryState {
     Installed,
     /// Verified accepted history no longer authorizes the recorded local participant(s).
     Terminal,
+    /// Proofs may have left, but the Ring never enrolled it (or removed it again) and the
+    /// offer expired: ended for good.
+    Abandoned,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdoptionRecoveryStatus {
@@ -92,6 +96,7 @@ fn status(stored: &ProfileState) -> Result<AdoptionRecovery, String> {
                 }
                 AdoptionPhase::Accepted => AdoptionRecoveryState::AcceptedInstalling,
                 AdoptionPhase::Installed => AdoptionRecoveryState::Installed,
+                AdoptionPhase::Abandoned => AdoptionRecoveryState::Abandoned,
             };
             if !j.accepted.is_empty() {
                 let mut accepted =
@@ -199,9 +204,20 @@ impl DesktopRing {
         journal: &AdoptionJournal,
     ) -> Result<RosterChain, String> {
         let pin = pin(journal)?;
+        let classify = |e: xshell_protocol::ring::RingError| match &e {
+            xshell_protocol::ring::RingError::Relay {
+                code:
+                    ErrorCode::NotMember
+                    | ErrorCode::Removed
+                    | ErrorCode::BadSignature
+                    | ErrorCode::NoRoster,
+                ..
+            } => format!("not_member: {e}"),
+            _ => format!("offline: {e}"),
+        };
         let observed = if let Some(owner) = self.adoption_owner_connector() {
             // Even an unavailable/reconnecting owner is not permission to compete with it.
-            owner.read_accepted_chain(&pin).map_err(|e| e.to_string())?
+            owner.read_accepted_chain(&pin).map_err(classify)?
         } else {
             RingClient::fetch_chain(
                 &journal.proposal.relay_url,
@@ -211,7 +227,7 @@ impl DesktopRing {
                 None,
                 self.cfg.timeouts,
             )
-            .map_err(|e| e.to_string())?
+            .map_err(classify)?
         };
         let observed = merge(stored.membership.as_ref().map(|m| &m.chain), observed)?;
         let observed = merge(self.adoption_effective_chain()?.as_ref(), observed)?;
@@ -225,22 +241,78 @@ impl DesktopRing {
         }
     }
 
-    /// Reconcile one recorded operation, never resume its live protocol. Fetch/auth/outage
-    /// failure leaves the durable obligation blocked. There is no inference of absence.
+    /// Reconcile one recorded operation automatically (never resume its live protocol):
+    /// - a reservation or a journal still `Prepared` (no proof left): discarded, and the
+    ///   counterpart's operation cancelled;
+    /// - a guest journal after proofs may have left: the Ring's verified history decides.
+    ///   Enrolled: installed. Enrolled and removed since, or another version at its slot:
+    ///   abandoned. Not a member (or the Ring unknown) once the offer expired: abandoned,
+    ///   and the counterpart's operation abandoned too. Before expiry, or the Relay
+    ///   unreachable: an `Err` (try again later);
+    /// - an outgoing (approver) record: `Prepared` ends (nothing left this machine);
+    ///   `PublicationUncertain` is `Published` when the candidate is in the chain and
+    ///   cancelled when another version holds its slot or it expired unpublished.
     pub fn reconcile_adoption(
         &self,
         client: &CompanionClient,
         operation: &str,
     ) -> Result<AdoptionRecovery, String> {
         self.reconcile_adoption_inner(client, operation)
-            .map_err(|e| {
-                if e.starts_with("reconciliation_required:") {
-                    e
-                } else {
-                    format!("reconciliation_required: {e}")
-                }
-            })
     }
+
+    /// Every unresolved record, once. `Ok(true)`: nothing is left unresolved. An `Err` whose
+    /// text starts with `offline:` means the Relay could not be reached.
+    pub fn reconcile_all(&self) -> Result<bool, String> {
+        let Some(stored) = self.store.load_profile()?.0 else {
+            return Ok(true);
+        };
+        let ops = super::ui::unresolved(&stored);
+        if ops.is_empty() {
+            return Ok(true);
+        }
+        let client = self.local_companion_client();
+        let mut last = Ok(());
+        for op in ops {
+            let result = match &client {
+                Ok(client) => self.reconcile_adoption_inner(client, &op).map(|_| ()),
+                // No registered counterpart (it was set aside): records that need none.
+                Err(e) => self
+                    .reconcile_without_counterpart(&op)
+                    .map_err(|_| e.clone()),
+            };
+            if let Err(e) = result {
+                last = Err(e);
+            }
+        }
+        last?;
+        let left = self
+            .store
+            .load_profile()?
+            .0
+            .map(|p| super::ui::unresolved(&p).is_empty())
+            .unwrap_or(true);
+        Ok(left)
+    }
+
+    /// An outgoing record needs no counterpart; a guest record without one cannot be
+    /// finished here.
+    fn reconcile_without_counterpart(&self, operation: &str) -> Result<(), String> {
+        let stored = self
+            .store
+            .load_profile()?
+            .0
+            .ok_or("retained profile missing")?;
+        if stored
+            .outgoing
+            .as_ref()
+            .is_some_and(|o| o.intent.operation == operation)
+        {
+            let _admission = self.reserve_adoption()?;
+            return self.reconcile_outgoing(&stored, operation);
+        }
+        Err("registered counterpart missing".into())
+    }
+
     fn reconcile_adoption_inner(
         &self,
         client: &CompanionClient,
@@ -248,38 +320,65 @@ impl DesktopRing {
     ) -> Result<AdoptionRecovery, String> {
         let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
-            return Err("another process owns reconciliation".into());
+            return Err("other_window: another window owns reconciliation".into());
         }
         let stored = self
             .store
             .load_profile()?
             .0
             .ok_or("retained profile missing")?;
+        // Counterpart requests whose refusal is an answer (the operation is unknown there,
+        // already ended, or it was re-registered) proceed; transport failures retry.
+        let tell = |request: CompanionRequest| match client.request(request) {
+            Err(e) if e.starts_with("protected counterpart") => Err(e),
+            _ => Ok(()),
+        };
         if let Some(j) = stored
             .journal
             .as_ref()
             .filter(|j| j.intent.operation == operation)
         {
-            if j.phase == AdoptionPhase::Prepared || j.phase.before_proof_terminal() {
+            if j.phase.permits_new_operation() {
                 return status(&stored);
             }
-            let profile = stored
-                .companion
-                .as_ref()
-                .ok_or("registered counterpart missing")?;
-            if profile.desktop.sign_key != stored.keys.sign_key()
-                || profile.target() != j.intent.target
-            {
-                return Err("reconciliation retained counterpart mismatch".into());
+            if j.phase == AdoptionPhase::Prepared {
+                tell(CompanionRequest::Cancel {
+                    operation: operation.into(),
+                })?;
+                self.store.transact_profile(|stored, _| {
+                    let mut stored = stored.ok_or("retained profile missing")?;
+                    if let Some(j) = stored
+                        .journal
+                        .as_mut()
+                        .filter(|j| j.intent.operation == operation)
+                    {
+                        j.phase = if now() >= j.intent.expires_at {
+                            AdoptionPhase::ExpiredBeforeProof
+                        } else {
+                            AdoptionPhase::Cancelled
+                        };
+                    }
+                    stored.pending_join = None;
+                    Ok((Some(stored), ()))
+                })?;
+                return self.adoption_status();
             }
+            let abandon = |why: &str| -> Result<AdoptionRecovery, String> {
+                tell(CompanionRequest::AbandonExpired {
+                    operation: operation.into(),
+                })?;
+                self.journal_update(operation, |j| j.phase = AdoptionPhase::Abandoned)?;
+                eprintln!("xshell: Join/Create {operation} abandoned: {why}");
+                self.adoption_status()
+            };
             // Local accepted history can prove terminal disposition even if Relay auth is
             // now refused. This protected snapshot is evidence, never an installation receipt.
-            let snapshot = match client.request(CompanionRequest::MembershipSnapshot)? {
-                CompanionResponse::MembershipSnapshot { rosters } if rosters.is_empty() => None,
-                CompanionResponse::MembershipSnapshot { rosters } => {
-                    Some(RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?)
+            let snapshot = match client.request(CompanionRequest::MembershipSnapshot) {
+                Ok(CompanionResponse::MembershipSnapshot { rosters }) if !rosters.is_empty() => {
+                    RosterChain::from_tokens(&rosters).ok()
                 }
-                _ => return Err("counterpart membership snapshot missing".into()),
+                Err(e) if e.starts_with("protected counterpart") => return Err(e),
+                _ => None,
             };
             let mut evidence = if j.accepted.is_empty() {
                 None
@@ -290,79 +389,162 @@ impl DesktopRing {
                 evidence = Some(merge(evidence.as_ref(), m.chain.clone())?);
             }
             if let Some(snapshot) = snapshot {
-                evidence = Some(merge(evidence.as_ref(), snapshot)?);
+                // A snapshot of another Ring (or a fork) is no evidence for this one.
+                if let Ok(merged) = merge(evidence.as_ref(), snapshot) {
+                    evidence = Some(merged);
+                }
             }
             if let Some(chain) = evidence
                 .as_ref()
                 .filter(|c| c.get(j.proposal.version).is_some())
             {
-                j.verify_accepted(chain)?;
+                if j.verify_accepted(chain).is_err() {
+                    return abandon("another version holds its slot");
+                }
                 if terminal(j, chain) {
                     self.record_reconciled_acceptance(operation, chain)?;
-                    let mut result = self.adoption_status()?;
-                    if let Some(local) = &mut result.local {
-                        local.state = AdoptionRecoveryState::Terminal;
-                    }
-                    return Ok(result);
+                    return abandon("enrolled, then removed");
                 }
             }
-            let accepted = self
-                .read_reconciliation_chain(&stored, j)
-                .map_err(|e| format!("reconciliation_required: {e}"))?;
-            let accepted = merge(evidence.as_ref(), accepted)?;
-            j.verify_accepted(&accepted)?;
+            let accepted = match self.read_reconciliation_chain(&stored, j) {
+                Ok(chain) => merge(evidence.as_ref(), chain)?,
+                // Enrolled (the accepted chain is known here) but refused now: read the
+                // signed history as a former member; a verified removal ends it at once.
+                Err(e)
+                    if e.starts_with("not_member:")
+                        && evidence
+                            .as_ref()
+                            .is_some_and(|c| c.get(j.proposal.version).is_some()) =>
+                {
+                    let known = evidence.as_ref().expect("checked");
+                    match xshell_protocol::ring::relay::check_removal(
+                        known,
+                        stored.keys.clone(),
+                        None,
+                        self.cfg.timeouts.connect,
+                    ) {
+                        Ok(xshell_protocol::ring::relay::RemovalCheck::Removed(chain)) => {
+                            self.record_reconciled_acceptance(operation, &chain)?;
+                            return abandon("enrolled, then removed");
+                        }
+                        Ok(xshell_protocol::ring::relay::RemovalCheck::Member(chain)) => chain,
+                        Err(e) => return Err(format!("offline: {e}")),
+                    }
+                }
+                Err(e) if e.starts_with("not_member:") && now() >= j.intent.expires_at => {
+                    return abandon(&e);
+                }
+                Err(e) if e.starts_with("not_member:") => {
+                    return Err(format!("finishing: not enrolled yet ({e})"));
+                }
+                Err(e) => return Err(e),
+            };
+            if accepted.get(j.proposal.version).is_none() {
+                if now() >= j.intent.expires_at {
+                    return abandon("not enrolled when the offer expired");
+                }
+                return Err("finishing: not enrolled yet".into());
+            }
+            if j.verify_accepted(&accepted).is_err() {
+                return abandon("another version holds its slot");
+            }
             self.record_reconciled_acceptance(operation, &accepted)?;
             if terminal(j, &accepted) {
-                let mut result = self.adoption_status()?;
-                if let Some(local) = &mut result.local {
-                    local.state = AdoptionRecoveryState::Terminal;
-                }
-                return Ok(result);
+                return abandon("enrolled, then removed");
             }
-            self.install_joined_computer(client, operation, profile, &accepted)
-                .map_err(|e| format!("reconciliation_required: {e}"))?;
-        } else if let Some(outgoing) = stored
+            let profile = stored
+                .companion
+                .as_ref()
+                .ok_or("registered counterpart missing")?;
+            if profile.desktop.sign_key != stored.keys.sign_key()
+                || profile.target() != j.intent.target
+            {
+                return abandon("the registered counterpart changed");
+            }
+            self.install_joined_computer(client, operation, profile, &accepted)?;
+        } else if stored
             .outgoing
             .as_ref()
-            .filter(|j| j.intent.operation == operation)
+            .is_some_and(|j| j.intent.operation == operation)
         {
-            if matches!(
-                outgoing.phase,
-                OutgoingPhase::Prepared | OutgoingPhase::Cancelled
-            ) {
-                return status(&stored);
-            }
-            let record = outgoing.validation_record()?;
-            let accepted = self
-                .read_reconciliation_chain(&stored, &record)
-                .map_err(|e| format!("reconciliation_required: {e}"))?;
-            record.verify_accepted(&accepted)?;
-            self.store.transact_profile(|stored, _| {
-                let mut stored = stored.ok_or("retained profile missing")?;
-                let outgoing = stored
-                    .outgoing
-                    .as_mut()
-                    .filter(|j| j.intent.operation == operation)
-                    .ok_or("publication changed")?;
-                outgoing.accepted = tokens(&accepted);
-                outgoing.phase = OutgoingPhase::Published;
-                let membership = stored
-                    .membership
-                    .as_mut()
-                    .ok_or("approver membership missing")?;
-                membership.chain = merge(Some(&membership.chain), accepted)?;
-                membership.retarget_farewells();
-                Ok((Some(stored), ()))
-            })?;
-            self.reload();
-        } else if !stored
+            self.reconcile_outgoing(&stored, operation)?;
+        } else if stored
             .pending_join
             .as_ref()
             .is_some_and(|p| p.intent.operation == operation)
         {
+            // No proposal arrived before the restart: nothing left this machine.
+            tell(CompanionRequest::Cancel {
+                operation: operation.into(),
+            })?;
+            self.store.transact_profile(|stored, _| {
+                let mut stored = stored.ok_or("retained profile missing")?;
+                if stored
+                    .pending_join
+                    .as_ref()
+                    .is_some_and(|p| p.intent.operation == operation)
+                {
+                    stored.pending_join = None;
+                }
+                Ok((Some(stored), ()))
+            })?;
+        } else {
             return Err("unknown adoption operation".into());
         }
         self.adoption_status()
+    }
+
+    /// Under the admission: an approver's outgoing record.
+    fn reconcile_outgoing(&self, stored: &ProfileState, operation: &str) -> Result<(), String> {
+        let outgoing = stored
+            .outgoing
+            .as_ref()
+            .filter(|j| j.intent.operation == operation)
+            .ok_or("publication changed")?;
+        let cancel = || self.outgoing_update(operation, |o| o.phase = OutgoingPhase::Cancelled);
+        match outgoing.phase {
+            OutgoingPhase::Published | OutgoingPhase::Cancelled => return Ok(()),
+            // Nothing left this machine; the proposal grant lapsed with its connection.
+            OutgoingPhase::Prepared => return cancel(),
+            OutgoingPhase::PublicationUncertain => {}
+        }
+        let record = outgoing.validation_record()?;
+        let accepted = match self.read_reconciliation_chain(stored, &record) {
+            Ok(chain) => chain,
+            Err(e) if e.starts_with("not_member:") => {
+                // This approver was removed meanwhile: its candidate can never be accepted.
+                return cancel();
+            }
+            Err(e) => return Err(e),
+        };
+        if accepted.get(record.proposal.version).is_none() {
+            if now() >= record.intent.expires_at {
+                return cancel();
+            }
+            return Err("finishing: publication not observed yet".into());
+        }
+        if record.verify_accepted(&accepted).is_err() {
+            return cancel();
+        }
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained profile missing")?;
+            let outgoing = stored
+                .outgoing
+                .as_mut()
+                .filter(|j| j.intent.operation == operation)
+                .ok_or("publication changed")?;
+            outgoing.accepted = tokens(&accepted);
+            outgoing.phase = OutgoingPhase::Published;
+            let membership = stored
+                .membership
+                .as_mut()
+                .ok_or("approver membership missing")?;
+            membership.chain = merge(Some(&membership.chain), accepted)?;
+            membership.retarget_farewells();
+            Ok((Some(stored), ()))
+        })?;
+        self.reload();
+        Ok(())
     }
 
     fn record_reconciled_acceptance(

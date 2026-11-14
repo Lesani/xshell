@@ -257,10 +257,17 @@ fn controller(ring: &DesktopRing) -> Arc<JoinOffer> {
     });
     result.unwrap()
 }
+/// There is no confirmation on the joining machine any more: the Join continues by itself
+/// once the approver's proposal verifies. Waits until it has left `Waiting`.
 fn confirm_backend(join: &JoinOffer) {
-    let (preview, lease) = join.await_consent(Duration::from_secs(8)).unwrap();
-    join.confirm_join(lease.confirm(&preview.proposal_hash).unwrap())
-        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(8);
+    while matches!(join.join_status(), JoinStatus::Waiting) {
+        assert!(
+            std::time::Instant::now() < until,
+            "Join never continued by itself"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 fn assert_no_words_on_disk(f: &Fixture, code: &DeviceCode) {
     let words = code.format();
@@ -350,7 +357,7 @@ fn actual_cli_stopped_owner_manual_open_uses_original_deadline_without_autostart
     let before = Instant::now();
     let mut child = b.pair(&relay.url(), 4_000);
     let line = child.lines.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(line.starts_with("Computer pairing pending."));
+    assert!(line.starts_with("Getting a Device Code from xshell on this computer"));
     std::thread::sleep(Duration::from_millis(300));
     assert!(child.lines.try_recv().is_err());
     assert!(child.child.try_wait().unwrap().is_none());
@@ -598,10 +605,7 @@ fn actual_cli_durable_desktop_failure_is_reconciliation_not_success_backend_cons
     });
     assert_ne!(child.finish(), 0);
     assert_eq!(child.words, 1);
-    assert!(matches!(
-        join.join_status(),
-        JoinStatus::ReconciliationRequired { .. }
-    ));
+    assert!(matches!(join.join_status(), JoinStatus::Finishing { .. }));
     assert!(b.paths.ring_dir.join("roster.json").exists());
     let saved: serde_json::Value = serde_json::from_slice(
         &std::fs::read(b.desktop.join("receipt-before-failure.json")).unwrap(),
@@ -638,7 +642,7 @@ fn registration_child_cannot_claim_live_driver_readiness_and_manual_daemon_start
         .lines
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
-        .starts_with("Computer pairing pending."));
+        .starts_with("Getting a Device Code from xshell on this computer"));
     std::thread::sleep(Duration::from_millis(250));
     assert!(child.lines.try_recv().is_err());
     assert!(!b.paths.socket.exists());

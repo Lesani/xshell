@@ -188,12 +188,9 @@ fn registered_computer_pair(
         relay_url: relay.into(),
         expires_at,
     };
-    writeln!(
-        out,
-        "Computer pairing pending. Open xshell and continue in the pairing window."
-    )
-    .and_then(|()| out.flush())
-    .map_err(|_| "Pair origin output closed".to_string())?;
+    writeln!(out, "Getting a Device Code from xshell on this computer…")
+        .and_then(|()| out.flush())
+        .map_err(|_| "Pair origin output closed".to_string())?;
     let mut client = None;
     let mut printed = false;
     let mut started = false;
@@ -227,7 +224,7 @@ fn registered_computer_pair(
                 if Instant::now() >= until {
                     break;
                 }
-                result = Err(Failure::Other("Computer pairing owner/epoch disconnected; the offer will not be reopened. If consent may have left, reconcile in xshell.".into()));
+                result = Err(Failure::Other("xshell on this computer stopped answering; the code is no longer valid. If pairing had begun, xshell finishes it automatically.".into()));
                 break;
             }
         };
@@ -245,7 +242,6 @@ fn registered_computer_pair(
                 break;
             }
             printed = true;
-            let _ = connected.request(R::RequestOwnerFocus {}, until);
         }
         match status {
             S::Installed => {
@@ -261,7 +257,7 @@ fn registered_computer_pair(
             S::Expired => break,
             S::ReconciliationRequired => {
                 result = Err(Failure::Other(
-                    "reconciliation_required: continue the recorded operation in xshell".into(),
+                    "Finishing on this computer; xshell completes it automatically".into(),
                 ));
                 break;
             }
@@ -277,9 +273,7 @@ fn registered_computer_pair(
         );
     }
     if cancel.load(Ordering::Acquire) {
-        result = Err(Failure::Other(
-            "Pairing cancelled; possible transmitted consent requires reconciliation".into(),
-        ));
+        result = Err(Failure::Other("Pairing cancelled".into()));
     }
     if let Some(mut connected) = client {
         // Cleanup only: never a fresh Start, owner, offer or lifetime.
