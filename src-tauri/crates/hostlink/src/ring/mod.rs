@@ -17,7 +17,8 @@ pub mod sync;
 pub use desktop::{
     AdoptionTestHook, AdoptionTestPoint, ConfiguredHosts, DesktopRing, DesktopRingConfig,
     FarewellView, HostOutcome, HostRef, LocalIdentity, MemberView, PairingEvent, PairingFlow,
-    PairingObserver, PhoneOffer, PresenceView, RingObserver, RingView, REMOVE_IN_USE, REMOVE_SELF,
+    PairingObserver, PhoneOffer, PresenceView, RingObserver, RingView, RELAY_FIXED, REMOVE_IN_USE,
+    REMOVE_SELF,
 };
 pub use store::HostMember;
 pub use sync::{HostRingState, HostSync, SyncWorker};

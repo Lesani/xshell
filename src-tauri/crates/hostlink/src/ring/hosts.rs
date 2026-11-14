@@ -29,7 +29,7 @@ pub struct VerifiedRingHost {
     pub(crate) enrollment: Option<String>,
 }
 impl VerifiedRingHost {
-    pub(crate) fn project(chain: &RosterChain) -> Vec<Self> {
+    pub fn project(chain: &RosterChain) -> Vec<Self> {
         chain
             .head()
             .roster()

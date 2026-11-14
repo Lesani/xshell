@@ -1175,6 +1175,116 @@ mod unix {
                 .unwrap();
         assert_eq!(durable["rosters"][2], third_chain.head().token());
     }
+    #[test]
+    fn remove_enrolled_computer_revokes_both_identities() {
+        use xshell_hostlink::ring::hosts::{relay_host_id, VerifiedRingHost};
+        use xshell_hostlink::ring::{HostOutcome, HostRef, LocalIdentity};
+        let relay = Relay::start();
+        let original = Computer::new(&relay);
+        runtime2_create(&original);
+        let second = Computer::new(&relay);
+        let joined = runtime2_join(&original, &second);
+        assert_eq!(joined.head().version(), 2);
+        let desk2 = Store::new(second.desktop.clone())
+            .load_profile()
+            .unwrap()
+            .0
+            .unwrap()
+            .keys
+            .sign_key();
+        let membership = joined.head().roster().membership().unwrap();
+        let unit = membership.unit_for(&desk2).unwrap().clone();
+        let daemon2 = *unit.members.iter().find(|k| **k != desk2).unwrap();
+        let daemon2_member = joined.head().member(&daemon2).unwrap().clone();
+        // The second Computer's Daemon is also an SSH Host in the original's Settings.
+        let wait_head = |v: u64| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while original.ring.chain().unwrap().head().version() != v
+                || original.ring.view().connection != "connected"
+            {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "original never held v{v}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait_head(2);
+        let (chain, out) = original
+            .ring
+            .ensure_host_daemons(
+                &[(
+                    HostRef {
+                        id: "h_aaaaaaaa".into(),
+                        name: "laptop".into(),
+                        target: "laptop|".into(),
+                    },
+                    LocalIdentity {
+                        sign_key: daemon2,
+                        noise_key: daemon2_member.noise_key,
+                        name: daemon2_member.name.clone(),
+                    },
+                )],
+                &|_| true,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![("h_aaaaaaaa".to_string(), HostOutcome::Joined)]);
+        assert_eq!(
+            chain.head().version(),
+            2,
+            "the Hosts worker never signs on v2"
+        );
+        let settings = original.desktop.join("settings.json");
+        let entry = r#"{"hosts":[{"id":"h_aaaaaaaa","name":"laptop"}]}"#;
+        std::fs::write(&settings, entry).unwrap();
+        original
+            .ring
+            .set_configured_hosts(xshell_hostlink::ring::configured_hosts(
+                settings.clone(),
+                |_| false,
+            ));
+        assert!(VerifiedRingHost::project(&chain)
+            .iter()
+            .any(|h| h.id() == relay_host_id(&daemon2)));
+        // Removing through the Daemon's key removes the whole Computer.
+        let removed = original.ring.remove_member(&daemon2).unwrap();
+        let head = removed.head();
+        assert_eq!(head.version(), 3);
+        assert!(head.member(&desk2).is_none() && head.member(&daemon2).is_none());
+        let m = head.roster().membership().unwrap();
+        assert!(m.unit(&unit.id).is_none() && m.retired.contains(&unit.id));
+        assert!(
+            matches!(m.change, RosterChange::Remove { ref enrollment_id } if *enrollment_id == unit.id)
+        );
+        assert_eq!(relay_version(&relay.target(), removed.ring_id()), 3);
+        assert!(VerifiedRingHost::project(&removed)
+            .iter()
+            .all(|h| h.id() != relay_host_id(&daemon2)));
+        let saved = Store::new(original.desktop.clone())
+            .load()
+            .unwrap()
+            .0
+            .unwrap();
+        assert_eq!(saved.chain.head().hash(), head.hash());
+        assert!(saved.host_members.is_empty(), "the Ring mapping is cleared");
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            entry,
+            "the SSH Host entry is untouched"
+        );
+        // Either key of the retired unit is now a no-op.
+        assert_eq!(
+            original
+                .ring
+                .remove_member(&desk2)
+                .unwrap()
+                .head()
+                .version(),
+            3
+        );
+    }
     fn runtime2_assert_no_guest_proofs(guest: &Computer, expected: AdoptionPhase) {
         let stored = Store::new(guest.desktop.clone())
             .load_profile()
