@@ -1,25 +1,10 @@
-//! Ephemeral same-host Unix deadline, never a network proposal or durable journal field.
+//! Ephemeral same-host deadline (Unix `CLOCK_MONOTONIC`, Windows performance counter via
+//! `xshell_core::monotonic`), never a network proposal or durable journal field.
 use std::time::{Duration, Instant};
 const MAX: Duration = Duration::from_secs(600);
-#[cfg(unix)]
+/// The receiver's reading (rounded up: never earlier than the true shared time).
 pub(super) fn now_ns() -> Result<u64, String> {
-    let mut value: libc::timespec = unsafe { std::mem::zeroed() };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
-        return Err("Unix monotonic clock unavailable".into());
-    }
-    let seconds = u64::try_from(value.tv_sec).map_err(|_| "invalid monotonic seconds")?;
-    let nanos = u64::try_from(value.tv_nsec).map_err(|_| "invalid monotonic nanoseconds")?;
-    if nanos >= 1_000_000_000 {
-        return Err("invalid monotonic nanoseconds".into());
-    }
-    seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|s| s.checked_add(nanos))
-        .ok_or_else(|| "monotonic clock overflow".into())
-}
-#[cfg(not(unix))]
-pub(super) fn now_ns() -> Result<u64, String> {
-    Err("Unix monotonic adapter unavailable".into())
+    xshell_core::monotonic::now_ns_ceil()
 }
 fn capture_from_samples(tick: u64, remaining: Duration) -> Result<u64, String> {
     if remaining.is_zero() || remaining > MAX {
@@ -31,7 +16,8 @@ fn capture_from_samples(tick: u64, remaining: Duration) -> Result<u64, String> {
 /// Sample the shared clock FIRST, then the remaining original Instant budget: elapsed
 /// time between samples can only shorten the transmitted deadline, never extend it.
 pub fn capture(until: Instant) -> Result<u64, String> {
-    let tick = now_ns()?;
+    // Rounded down: a capture never starts the budget later than the true shared time.
+    let tick = xshell_core::monotonic::now_ns_floor()?;
     let remaining = until
         .checked_duration_since(Instant::now())
         .ok_or("Pair deadline expired")?;

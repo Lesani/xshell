@@ -5,6 +5,10 @@ use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
 pub struct CompanionClient {
     endpoint: PathBuf,
     daemon_store: PathBuf,
+    /// Windows: the process that must serve `endpoint` (BINDING Decision 4), checked on
+    /// every exchange before anything is sent. `None`: owner-SID check only.
+    #[cfg(windows)]
+    server: Option<std::sync::Arc<xshell_core::local_ipc::ServerProcess>>,
 }
 impl CompanionClient {
     pub fn for_store(store: &Path) -> Result<Self, String> {
@@ -17,6 +21,8 @@ impl CompanionClient {
             Ok(Self {
                 endpoint,
                 daemon_store,
+                #[cfg(windows)]
+                server: None,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -31,7 +37,26 @@ impl CompanionClient {
         Self {
             endpoint: PathBuf::from(&profile.endpoint),
             daemon_store: PathBuf::from(&profile.daemon_store),
+            #[cfg(windows)]
+            server: None,
         }
+    }
+    /// [`CompanionClient::for_store`] whose every exchange first proves that `server` (the
+    /// Daemon process the Desktop spawned or adopted, its handle held) serves the pipe: a
+    /// squatter pipe or a successor process is refused before any request is sent.
+    #[cfg(windows)]
+    pub fn for_store_served_by(
+        store: &Path,
+        server: xshell_core::local_ipc::ServerProcess,
+    ) -> Result<Self, String> {
+        let mut client = Self::for_store(store)?;
+        client.server = Some(std::sync::Arc::new(server));
+        Ok(client)
+    }
+    /// The expected serving process's PID, when this client checks one (Windows).
+    #[cfg(windows)]
+    pub fn expected_server_pid(&self) -> Option<u32> {
+        self.server.as_ref().map(|s| s.pid())
     }
     /// The Unix registration child's reserved endpoint inside its canonical Daemon store.
     #[cfg(unix)]
@@ -55,7 +80,8 @@ impl CompanionClient {
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<CompanionResponse, String> {
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel);
-        let response = xshell_core::local_ipc::exchange_until(&self.endpoint, &request, &budget)
+        let response = self
+            .exchange(&request, &budget)
             .map_err(|_| "protected counterpart readiness unavailable".to_string())?;
         match response {
             CompanionResponse::Error { message } => Err(message),
@@ -65,9 +91,13 @@ impl CompanionClient {
     pub fn request(&self, request: CompanionRequest) -> Result<CompanionResponse, String> {
         #[cfg(any(unix, windows))]
         {
-            let response =
-                xshell_core::local_ipc::exchange::<_, CompanionResponse>(&self.endpoint, &request)
-                    .map_err(|e| format!("protected counterpart unavailable: {e}"))?;
+            let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            let response = self
+                .exchange(&request, &budget)
+                .map_err(|e| format!("protected counterpart unavailable: {e}"))?;
             match response {
                 CompanionResponse::Error { message } => Err(message),
                 response => Ok(response),
@@ -78,5 +108,22 @@ impl CompanionClient {
             let _ = request;
             Err("protected counterpart platform adapter is not implemented".into())
         }
+    }
+    #[cfg(any(unix, windows))]
+    fn exchange(
+        &self,
+        request: &CompanionRequest,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> std::io::Result<CompanionResponse> {
+        #[cfg(windows)]
+        if let Some(server) = &self.server {
+            return xshell_core::local_ipc::exchange_with_server_until(
+                &self.endpoint,
+                request,
+                budget,
+                server,
+            );
+        }
+        xshell_core::local_ipc::exchange_until(&self.endpoint, request, budget)
     }
 }

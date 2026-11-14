@@ -182,8 +182,6 @@ impl Outbox {
     }
 }
 /// Small synchronous control sender using exactly the persistent broker framing.
-// Used only by the Unix-only `administration::AdministrationClient`.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn write_control(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.is_empty() || bytes.len() > 4096 {
@@ -253,14 +251,11 @@ pub(crate) mod native {
     use std::time::Instant;
     pub use xshell_core::local_ipc::Stream;
     /// One absolute control-request budget, including partial reads/writes and snapshots.
-    // Used only by the Unix-only `administration::AdministrationClient`.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub struct DeadlineStream<'a> {
         pub stream: &'a mut Stream,
         pub until: Instant,
     }
     impl DeadlineStream<'_> {
-        #[cfg_attr(not(unix), allow(dead_code))]
         fn left(&self) -> io::Result<std::time::Duration> {
             self.until
                 .checked_duration_since(Instant::now())

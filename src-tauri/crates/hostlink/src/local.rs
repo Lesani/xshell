@@ -76,6 +76,41 @@ pub fn local_pid_path(socket: &Path) -> PathBuf {
     socket.parent().unwrap_or(Path::new("/")).join("daemon.pid")
 }
 
+/// How long a Windows Desktop waits for its live Daemon's companion pipe to register.
+#[cfg(windows)]
+const REGISTRATION_WAIT: Duration = SPAWN_WAIT;
+
+/// Windows: the Daemon's PID record, `home/.xshell/run/daemon.pid` as `xshelld`'s
+/// `paths::resolve_windows` places it (not next to the pipe, which has no directory).
+#[cfg(windows)]
+pub fn local_pid_record_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.pid")
+}
+
+/// Read the protected Windows PID record (BINDING AMENDMENT 1 §3) without repairing
+/// anything: the home and `.xshell` must be safe shared ancestry, `run` and the record
+/// private, none a reparse point; the content one decimal PID line.
+#[cfg(windows)]
+pub fn read_pid_record(home: &Path) -> io::Result<u32> {
+    use std::io::Read;
+    use xshell_core::private_fs::{check_dir_no_repair, open_read_no_repair, Exposure};
+    let home = home.canonicalize()?;
+    xshell_core::companion_reservation::validate_shared_ancestor(&home)?;
+    check_dir_no_repair(&home.join(".xshell"), Exposure::Shared)?;
+    check_dir_no_repair(&home.join(".xshell").join("run"), Exposure::Private)?;
+    let path = local_pid_record_path(&home);
+    let file = open_read_no_repair(&path)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Daemon PID record"))?;
+    let mut text = String::new();
+    file.take(32).read_to_string(&mut text)?;
+    text.strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .filter(|t| !t.is_empty() && t.len() <= 10 && t.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|t| t.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed Daemon PID record"))
+}
+
 /// The recorded mode; `None` when there is no marker or it is unreadable.
 pub fn read_local_mode(path: &Path) -> Option<&'static str> {
     match std::fs::read_to_string(path).ok()?.trim() {
@@ -385,6 +420,73 @@ impl LocalDaemon {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Windows (BINDING Decision 3): persist the deny-only reservation, then wait (bounded,
+    /// honouring quit) for the live GUI-bound Daemon's companion pipe and reserve there,
+    /// proving first that the pipe is served by the expected Daemon process (Decision 4).
+    /// Never starts `serve` or a registration child: ADR-0005 has no headless Daemon here.
+    #[cfg(windows)]
+    pub fn with_registration_endpoint<T>(
+        &self,
+        desktop_store: &Path,
+        action: impl FnOnce(&crate::ring::companion_ipc::CompanionClient) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+        let home = self.home.canonicalize().map_err(|e| e.to_string())?;
+        let directory = xshell_core::companion_reservation::reserve(&home, desktop_store)
+            .map_err(|e| e.to_string())?;
+        let desktop = desktop_store
+            .to_str()
+            .ok_or("Desktop store path is not UTF-8")?
+            .to_string();
+        let until = Instant::now() + REGISTRATION_WAIT;
+        loop {
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            let last = match self.expected_server() {
+                Ok(server) => {
+                    let client = crate::ring::companion_ipc::CompanionClient::for_store_served_by(
+                        &directory, server,
+                    )?;
+                    match client.request(CompanionRequest::ReserveRegistration {
+                        desktop_store: desktop.clone(),
+                    }) {
+                        Ok(CompanionResponse::Descriptor { .. }) => return action(&client),
+                        Ok(_) => return Err("invalid counterpart reservation response".into()),
+                        // A pipe served by another process is never retried into success
+                        // by a later squatter-free poll within this attempt: refuse now.
+                        Err(e) if e.contains("not the expected Daemon") => return Err(e),
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e,
+            };
+            if Instant::now() >= until {
+                return Err(format!("counterpart registration pending: {last}"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The Daemon process that must serve this user's pipes: our running GUI-bound child
+    /// (its unreaped `Child` keeps the PID from being reused), else the one the private PID
+    /// record names, its process handle opened and held before any comparison.
+    #[cfg(windows)]
+    fn expected_server(&self) -> Result<xshell_core::local_ipc::ServerProcess, String> {
+        {
+            let mut slot = self.child.lock().unwrap();
+            if let Some(s) = slot.as_mut() {
+                if s.kind == Kind::GuiBound && matches!(s.child.try_wait(), Ok(None)) {
+                    return xshell_core::local_ipc::ServerProcess::open(s.child.id())
+                        .map_err(|e| e.to_string());
+                }
+            }
+        }
+        let pid = read_pid_record(&self.home).map_err(|e| e.to_string())?;
+        xshell_core::local_ipc::ServerProcess::open(pid)
+            .map_err(|e| format!("stale Daemon PID record: {e}"))
     }
 
     /// Before an upgrade or a replacement stops the running Persistent Daemon (#49, C1):

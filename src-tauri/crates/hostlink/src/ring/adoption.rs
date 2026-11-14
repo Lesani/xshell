@@ -192,7 +192,7 @@ impl DesktopRing {
 
     /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared
     /// by Desktop shutdown/cancellation; not evidence of counterpart registration.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn reserve_local_companion(&self, home: &std::path::Path) -> Result<bool, String> {
         if !self.pairing_ipc_owner() {
             return Ok(false);
@@ -203,7 +203,7 @@ impl DesktopRing {
     }
 
     /// The same elected startup path used by Tauri before any adoption action.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn register_local_companion(
         &self,
         daemon: &crate::LocalDaemon,

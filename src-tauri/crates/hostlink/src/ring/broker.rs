@@ -2624,6 +2624,62 @@ mod native_transport {
             assert!(start.elapsed() < Duration::from_secs(2));
             let _successor = Server::bind(path, Broker::new("profile".into(), &manager)).unwrap();
         }
+        /// The Pair CLI's AdministrationClient reaches the owner's real protected broker
+        /// through the shared canonical-store mapping (Unix socket path / Windows SID-bound
+        /// pipe), Welcome-checks the profile, and a broker bound to another profile refuses.
+        #[test]
+        fn administration_client_uses_canonical_endpoint_profile_and_welcome_check() {
+            use crate::ring::administration::{
+                AdministrationClient, AdministrationRequest, AdministrationStatus,
+            };
+            let manager = manager();
+            let dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            #[cfg(windows)]
+            xshell_core::private_fs::ensure_dir(dir.path()).unwrap();
+            let store = xshell_core::local_ipc::canonical_store(dir.path()).unwrap();
+            let path = xshell_core::local_ipc::host_broker_endpoint(&store).unwrap();
+            let profile = xshell_core::local_ipc::host_broker_profile(&store).unwrap();
+            #[cfg(unix)]
+            {
+                use sha2::{Digest, Sha256};
+                assert_eq!(path, store.join("host-broker.sock"));
+                assert_eq!(
+                    profile,
+                    format!("{:x}", Sha256::digest(store.as_os_str().as_encoded_bytes()))
+                );
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            {
+                let server =
+                    Server::bind(path.clone(), Broker::new("other".into(), &manager)).unwrap();
+                assert!(AdministrationClient::connect(dir.path(), until).is_err());
+                drop(server);
+            }
+            let server = Server::bind(path, Broker::new(profile, &manager)).unwrap();
+            let mut client = AdministrationClient::connect(dir.path(), until).unwrap();
+            #[cfg(windows)]
+            assert_eq!(client.server_pid(), std::process::id());
+            assert_eq!(
+                client
+                    .request(AdministrationRequest::RequestOwnerFocus {}, until)
+                    .unwrap(),
+                AdministrationStatus::OwnerFocusRequested
+            );
+            assert!(server
+                .broker
+                .administration
+                .lock()
+                .unwrap()
+                .take_focus_request());
+            drop(client);
+            drop(server);
+        }
         #[test]
         fn hello_has_one_absolute_deadline_and_idle_frame_has_none() {
             let (mut reader, mut writer) = native::pair().unwrap();

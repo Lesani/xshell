@@ -88,7 +88,7 @@ impl Administration {
         let earlier_instant = Instant::now();
         let tick = if matches!(request, AdministrationRequest::Start { .. }) {
             monotonic::now_ns()
-                .map_err(|_| crate::HostError::invalid("Unix monotonic clock unavailable"))?
+                .map_err(|_| crate::HostError::invalid("shared monotonic clock unavailable"))?
         } else {
             0
         };
@@ -235,8 +235,6 @@ impl Administration {
     pub(super) fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
-    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn take_focus_request(&mut self) -> bool {
         std::mem::take(&mut self.focus_requested)
     }
@@ -274,8 +272,6 @@ impl Administration {
             op.status = status;
         }
     }
-    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn controller(
         &self,
         operation: Uuid,
@@ -287,8 +283,6 @@ impl Administration {
             .controller
             .upgrade()
     }
-    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn controllers(&self) -> Vec<(Uuid, std::sync::Arc<super::adoption::JoinOffer>)> {
         self.operations
             .iter()
@@ -314,30 +308,41 @@ impl Administration {
 
 /// Blocking short-request facade over the existing protected broker, not a second election
 /// or a Host/Call tunnel. Connection loss discards this request origin and its pending work.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct AdministrationClient {
     stream: super::broker_ipc::native::Stream,
     assembly: std::sync::Arc<super::broker_ipc::Assembly>,
     epoch: Uuid,
     next: u64,
+    /// Windows: the process serving the broker pipe when this origin connected.
+    #[cfg(windows)]
+    server_pid: u32,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl AdministrationClient {
+    /// The endpoint and Hello profile come from the same canonical-store mapping the owner
+    /// binds (`local_ipc::host_broker_endpoint`/`host_broker_profile`): on Unix exactly the
+    /// store's `host-broker.sock` and the SHA-256 of its path, on Windows the SID/UTF-16
+    /// bound pipe and profile. The Welcome must echo that profile.
     pub fn connect(desktop_store: &std::path::Path, until: Instant) -> Result<Self, String> {
         let io_until = until.min(Instant::now() + Duration::from_secs(2));
         use super::broker::{ClientMessage, Event};
-        use sha2::{Digest, Sha256};
-        let dir = desktop_store.canonicalize().map_err(|e| e.to_string())?;
-        xshell_core::local_ipc::private_dir(&dir).map_err(|e| e.to_string())?;
-        let profile = format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()));
+        let dir =
+            xshell_core::local_ipc::canonical_store(desktop_store).map_err(|e| e.to_string())?;
+        let profile =
+            xshell_core::local_ipc::host_broker_profile(&dir).map_err(|e| e.to_string())?;
+        let endpoint =
+            xshell_core::local_ipc::host_broker_endpoint(&dir).map_err(|e| e.to_string())?;
         let mut stream = super::broker_ipc::native::connect(
-            &dir.join("host-broker.sock"),
+            &endpoint,
             io_until
                 .checked_duration_since(Instant::now())
                 .filter(|left| !left.is_zero())
                 .ok_or("administration caller deadline")?,
         )
         .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let server_pid = stream.server_process_id().map_err(|e| e.to_string())?;
         let assembly = std::sync::Arc::new(super::broker_ipc::Assembly::default());
         let mut bounded = super::broker_ipc::native::DeadlineStream {
             stream: &mut stream,
@@ -367,7 +372,14 @@ impl AdministrationClient {
             assembly,
             epoch,
             next: 0,
+            #[cfg(windows)]
+            server_pid,
         })
+    }
+    /// The PID of the Desktop process serving this origin's broker connection (Windows).
+    #[cfg(windows)]
+    pub fn server_pid(&self) -> u32 {
+        self.server_pid
     }
     pub fn request(
         &mut self,
@@ -404,7 +416,7 @@ impl AdministrationClient {
         }
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for AdministrationClient {
     fn drop(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);

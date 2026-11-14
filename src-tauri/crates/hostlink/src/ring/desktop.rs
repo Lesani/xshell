@@ -2060,7 +2060,7 @@ impl DesktopRing {
     }
 
     /// Focus can request presentation, never confirmation. Consumed only by native setup.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn take_administration_focus_request(&self) -> bool {
         self.host_broker
             .lock()
@@ -2072,7 +2072,7 @@ impl DesktopRing {
 
     /// Owner-local backend controller access. This is not native-window attestation;
     /// C1 must bind its private lease to the actual injected Tauri origin.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn administration_join(
         &self,
         operation: uuid::Uuid,
@@ -2094,7 +2094,7 @@ impl DesktopRing {
     }
 
     /// Private-controller projection for owner-local dispatch/presentation, never IPC DTOs.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn administration_joins(&self) -> Vec<(uuid::Uuid, Arc<super::adoption::JoinOffer>)> {
         if !self.pairing_ipc_owner() {
             return vec![];
