@@ -235,6 +235,35 @@ pub fn approve_error(error: &str) -> String {
     format!("{code}: {error}")
 }
 
+/// A Create/Join/Upgrade start error: a local Host that is registered but not serving yet
+/// (first run, Daemon still starting) is `not_registered:` like a missing registration, so
+/// the page shows "not ready yet" instead of a socket error. Other errors pass unchanged.
+pub fn start_error(error: String) -> String {
+    const NOT_READY: [&str; 2] = [
+        "protected counterpart unavailable",
+        "protected counterpart readiness unavailable",
+    ];
+    if NOT_READY.iter().any(|p| error.starts_with(p)) {
+        format!("not_registered: {error}")
+    } else {
+        error
+    }
+}
+
+/// The local Host's client once it is registered and its endpoint exists (Unix: the socket
+/// file). Before that `not_registered:`, which `ring_join_overview` reports as
+/// `not-registered` so Create/Join stay disabled.
+fn ready_local_client(
+    ring: &xshell_hostlink::ring::DesktopRing,
+) -> Result<xshell_hostlink::ring::companion_ipc::CompanionClient, String> {
+    let client = ring.local_companion_client()?;
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(client.endpoint()).is_err() {
+        return Err("not_registered: this computer's Host is not running yet".into());
+    }
+    Ok(client)
+}
+
 /// `RingStatus.approval`.
 pub fn approval_text(readiness: ApprovalReadiness, local_available: bool) -> &'static str {
     match readiness {
@@ -247,6 +276,7 @@ pub fn approval_text(readiness: ApprovalReadiness, local_available: bool) -> &'s
         ApprovalReadiness::NeedsUpgrade => "needs-upgrade",
         ApprovalReadiness::NeedsCompletion => "needs-completion",
         ApprovalReadiness::Unresolved => "unresolved",
+        ApprovalReadiness::Removed => "removed",
         ApprovalReadiness::NoProfile | ApprovalReadiness::NotEnrolled => "none",
     }
 }
@@ -598,11 +628,12 @@ pub async fn ring_create_computer(
     ensure_local(&app)?;
     let relay = chosen_relay(relay_url)?;
     run(move || {
-        let client = w.ring.local_companion_client()?;
+        let client = ready_local_client(&w.ring)?;
         let outcome = match &relay {
-            Some(url) => w.ring.create_computer_on(&client, url, confirm_local)?,
-            None => w.ring.create_computer(&client, confirm_local)?,
-        };
+            Some(url) => w.ring.create_computer_on(&client, url, confirm_local),
+            None => w.ring.create_computer(&client, confirm_local),
+        }
+        .map_err(start_error)?;
         match outcome {
             xshell_hostlink::ring::adoption::AdoptionOutcome::Installed { .. } => {}
             xshell_hostlink::ring::adoption::AdoptionOutcome::Declined { .. } => {
@@ -634,9 +665,10 @@ pub async fn ring_join_start(
     let flag = joins.reserve(operation)?;
     let watch_app = app.clone();
     run(move || {
-        let offer = w.ring.local_companion_client().and_then(|client| {
+        let offer = ready_local_client(&w.ring).and_then(|client| {
             w.ring
                 .begin_join_cancellable(&client, flag, relay.as_deref())
+                .map_err(start_error)
         });
         let offer = match offer {
             Ok(offer) => Arc::new(offer),
@@ -713,7 +745,7 @@ pub async fn ring_join_overview(app: AppHandle) -> Result<JoinOverview, String> 
             Some("platform")
         } else if local_in_process(&app) {
             Some("in-process")
-        } else if w.ring.local_companion_client().is_err() {
+        } else if ready_local_client(&w.ring).is_err() {
             Some("not-registered")
         } else {
             None
@@ -774,15 +806,22 @@ pub async fn ring_upgrade_computer(app: AppHandle) -> Result<RingStatus, String>
             ApprovalReadiness::NoProfile | ApprovalReadiness::NotEnrolled => {
                 Err("not_enrolled: this Desktop is not in a Ring".to_string())
             }
+            ApprovalReadiness::Removed => {
+                Err("not_enrolled: this Desktop is no longer a member of its Ring".to_string())
+            }
             ApprovalReadiness::NeedsUpgrade => {
-                let client = w.ring.local_companion_client()?;
-                w.ring.upgrade_retained_ring(&client, confirm_local)?;
+                let client = ready_local_client(&w.ring)?;
+                w.ring
+                    .upgrade_retained_ring(&client, confirm_local)
+                    .map_err(start_error)?;
                 w.ring.finish_retained_computer(&client, confirm_local)?;
                 Ok(())
             }
             ApprovalReadiness::NeedsCompletion => {
-                let client = w.ring.local_companion_client()?;
-                w.ring.finish_retained_computer(&client, confirm_local)?;
+                let client = ready_local_client(&w.ring)?;
+                w.ring
+                    .finish_retained_computer(&client, confirm_local)
+                    .map_err(start_error)?;
                 Ok(())
             }
         })();
@@ -1063,6 +1102,26 @@ mod tests {
     }
 
     #[test]
+    fn host_not_serving_yet_is_not_registered() {
+        for raw in [
+            "protected counterpart unavailable: No such file or directory (os error 2)",
+            "protected counterpart unavailable: Connection refused (os error 111)",
+            "protected counterpart readiness unavailable",
+        ] {
+            let mapped = start_error(raw.to_string());
+            assert!(mapped.starts_with("not_registered: "), "{mapped}");
+            assert!(mapped.ends_with(raw));
+        }
+        for kept in [
+            "reconciliation_required: unresolved",
+            "another adoption operation is active",
+            "declined",
+        ] {
+            assert_eq!(start_error(kept.to_string()), kept);
+        }
+    }
+
+    #[test]
     fn approve_error_codes() {
         assert_eq!(
             approve_error("another adoption operation is active"),
@@ -1130,6 +1189,8 @@ mod tests {
         assert_eq!(approval_text(NeedsCompletion, true), "needs-completion");
         assert_eq!(approval_text(NeedsUpgrade, false), "unavailable");
         assert_eq!(approval_text(Unresolved, true), "unresolved");
+        assert_eq!(approval_text(Removed, true), "removed");
+        assert_eq!(approval_text(Removed, false), "removed");
         assert_eq!(approval_text(NotEnrolled, true), "none");
         assert_eq!(approval_text(NoProfile, false), "none");
     }

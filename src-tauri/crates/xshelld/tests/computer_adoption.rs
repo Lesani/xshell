@@ -1305,6 +1305,11 @@ mod unix {
         assert!(VerifiedRingHost::project(&chain)
             .iter()
             .any(|h| h.id() == relay_host_id(&daemon2)));
+        use xshell_hostlink::ring::ApprovalReadiness;
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Ready
+        );
         // Removing through the Daemon's key removes the whole Computer.
         let removed = original.ring.remove_member(&daemon2).unwrap();
         let head = removed.head();
@@ -1330,6 +1335,17 @@ mod unix {
             std::fs::read_to_string(&settings).unwrap(),
             entry,
             "the SSH Host entry is untouched"
+        );
+        // The removed Computer's Desktop retains its completed adoption journal: that is a
+        // definitive removal, never "reconciliation required".
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.ring.chain().map(|c| c.head().version()) != Some(3) {
+            assert!(std::time::Instant::now() < until, "second never saw v3");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            second.ring.approval_readiness().unwrap(),
+            ApprovalReadiness::Removed
         );
         // Either key of the retired unit is now a no-op.
         assert_eq!(

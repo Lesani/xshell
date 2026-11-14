@@ -22,6 +22,9 @@ pub enum ApprovalReadiness {
     NotEnrolled,
     /// Earlier adoption/proposal work is unresolved and needs reconciliation first.
     Unresolved,
+    /// A retained Ring that no longer authorizes this Desktop (removed, or its unit ended)
+    /// while no local adoption record is unresolved: nothing to reconcile, nothing to approve.
+    Removed,
 }
 
 /// The operation ids of the durable adoption records (reservation, journal, outgoing).
@@ -99,8 +102,9 @@ pub(in crate::ring) fn readiness_of(
     } else if desktop {
         ApprovalReadiness::NeedsCompletion
     } else {
-        // Removed or terminal: nothing this Desktop can do but reconcile/leave.
-        ApprovalReadiness::Unresolved
+        // Removed or terminal. Unresolved records were ruled out above, so this is a
+        // definitive removal, not uncertainty.
+        ApprovalReadiness::Removed
     }
 }
 

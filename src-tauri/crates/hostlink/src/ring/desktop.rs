@@ -4840,6 +4840,36 @@ mod tests {
         ring.quit();
     }
 
+    /// First run under a loose umask (an installer made `~/.xshell/bin` 0775, the app data
+    /// dir is group-readable): the startup denial reservation succeeds on the first call.
+    #[cfg(unix)]
+    #[test]
+    fn first_run_reservation_tightens_loose_umask_directories() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mode = |p: &std::path::Path| {
+            std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(p).unwrap()) & 0o777
+        };
+        for loose in [0o775, 0o755] {
+            let t = tempfile::tempdir().unwrap();
+            let home = t.path().canonicalize().unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let app = home.join("app");
+            for d in [home.join(".xshell"), home.join(".xshell/bin"), app.clone()] {
+                std::fs::DirBuilder::new().mode(loose).create(&d).unwrap();
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(loose)).unwrap();
+            }
+            let (ring, _) = open(cfg(&app, "ws://127.0.0.1:9"));
+            assert_eq!(ring.reserve_local_companion(&home), Ok(true), "{loose:o}");
+            assert_eq!(mode(&app.join("ring")), 0o700);
+            assert_eq!(mode(&home.join(".xshell")), 0o700);
+            assert!(home
+                .join(".xshell/daemon/ring")
+                .join(xshell_core::companion_reservation::FILE)
+                .exists());
+            ring.quit();
+        }
+    }
+
     #[test]
     fn unreadable_state_is_moved_aside_and_reported() {
         let t = tempfile::tempdir().unwrap();

@@ -470,9 +470,11 @@ function RelaySettings({ s, onSave }: { s: RingStatus; onSave: (url: string) => 
 // state lives in the parent so the outcome stays visible once the Ring view takes over.
 function UnpairedRing({ s, join, st, onCreate, onStart, unavailable }: { s: RingStatus; join: JoinApi; st: JoinUi; onCreate: () => void; onStart: () => void; unavailable: boolean }) {
   const busy = joinBusy(st);
+  // The local Host is still registering or starting (first run): nothing to adopt yet.
+  const hostNotReady = join.overview?.unavailable === "not-registered";
   // Busy: another adoption, approval or registration runs; not ready: the Relay choice is
   // still loading or being saved.
-  const blocked = unavailable || s.local === "in-process" || s.busy || !join.relayReady;
+  const blocked = unavailable || hostNotReady || s.local === "in-process" || s.busy || !join.relayReady;
   return (
     <div className="edit-field" data-ring-unpaired>
       <div className="edit-hint">{fmt("ring.description")}</div>
@@ -485,6 +487,7 @@ function UnpairedRing({ s, join, st, onCreate, onStart, unavailable }: { s: Ring
         </button>
       </div>
       {unavailable && <div className="host-row-note host-row-warn">{fmt("ring.unsupported")}</div>}
+      {hostNotReady && !unavailable && <div className="host-row-note" data-ring-host-not-ready>{fmt("ring.hostNotReady")}</div>}
       <div className="edit-hint">{fmt("ring.localHint")}</div>
     </div>
   );
@@ -529,6 +532,17 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
   }, [cancelJoin]);
   const current = tracked ? join?.events[tracked] : undefined;
   useEffect(() => { if (current) dispatchJoin({ type: "event", event: current }); }, [current, dispatchJoin]);
+  // The Create/Join success line belongs to the membership it produced: once the Ring
+  // changes (another version, this app removed), it is stale and goes.
+  const succeeded = jst.state === "installed" || jst.state === "created";
+  const membership = s.enabled ? `${s.ringId}/${s.version}/${s.members.some(m => m.thisApp)}` : null;
+  const successMembership = useRef<string | null>(null);
+  useEffect(() => {
+    if (!succeeded) { successMembership.current = null; return; }
+    if (membership === null) return;
+    if (successMembership.current === null) successMembership.current = membership;
+    else if (successMembership.current !== membership) dispatchJoin({ type: "dismiss" });
+  }, [succeeded, membership, dispatchJoin]);
   const counting = jst.state === "code" || jst.state === "consent";
   useEffect(() => {
     if (!counting) return;
@@ -648,7 +662,7 @@ export function MobileSettingsView({ s, onEnable, onSaveRelay, onClaimHost, onRe
           )
         ) : (
           <>
-            {(jst.state === "installed" || jst.state === "created") && <Line line={outcome} />}
+            {succeeded && s.approval !== "removed" && <Line line={outcome} />}
             {s.format === 2 ? <FixedRelay s={s} /> : <RelaySettings s={s} onSave={onSaveRelay} />}
             {conn && <div className="host-row-note">{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}

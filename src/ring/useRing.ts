@@ -75,6 +75,16 @@ export function useRing() {
     };
   }, []);
 
+  // Registration/startup of the local Host emits no event of its own: re-read until ready.
+  const notRegistered = overview?.unavailable === "not-registered";
+  useEffect(() => {
+    if (!notRegistered) return;
+    const t = setInterval(() => {
+      invoke<JoinOverview>("ring_join_overview").then(o => { if (mounted.current && o) setOverview(o); }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(t);
+  }, [notRegistered]);
+
   const apply = useCallback((s: RingStatus) => { if (mounted.current) setStatus(s); return s; }, []);
 
   // Only to start over after unreadable settings were set aside.
