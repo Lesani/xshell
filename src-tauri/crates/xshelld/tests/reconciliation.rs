@@ -51,7 +51,12 @@ fn owned_controller_child() {
         }
     })));
     let ring = DesktopRing::open(cfg, Arc::new(Quiet));
-    let companion = CompanionClient::new(std::env::var_os("XSHELL_R5_ENDPOINT").unwrap().into());
+    let companion = CompanionClient::for_store(
+        std::path::Path::new(&std::env::var_os("XSHELL_R5_ENDPOINT").unwrap())
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
     let confirm = |p: &xshell_hostlink::ring::adoption::ConsentPreview,
                    l: &xshell_hostlink::ring::adoption::CreateConfirmationLease| {
         Ok(CreateDecision::Confirm(l.confirm(&p.proposal_hash)?))

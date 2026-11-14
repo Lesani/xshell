@@ -281,7 +281,9 @@ impl LocalDaemon {
         let directory = xshell_core::companion_reservation::reserve(&home, desktop_store)
             .map_err(|e| e.to_string())?;
         let endpoint = directory.join("companion.sock");
-        let client = crate::ring::companion_ipc::CompanionClient::new(endpoint);
+        let daemon_store = directory.canonicalize().map_err(|e| e.to_string())?;
+        let client =
+            crate::ring::companion_ipc::CompanionClient::for_endpoint_in(daemon_store, endpoint);
         let reserve = || {
             client.request(CompanionRequest::ReserveRegistration {
                 desktop_store: desktop_store

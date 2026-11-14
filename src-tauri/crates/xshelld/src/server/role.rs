@@ -1009,7 +1009,7 @@ pub(crate) mod tests {
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
             store_admission: crate::server::ring::ownership::StoreAdmission::new(ownership),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks: None,

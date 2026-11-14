@@ -504,8 +504,12 @@ mod win {
         owned(h)
     }
 
-    /// Wait until a client connects to the pending instance `h`.
-    fn wait_connected(h: &OwnedHandle) -> io::Result<()> {
+    /// Cancel only this accept operation and complete it before its event/OVERLAPPED dies.
+    fn wait_connected_until(
+        h: &OwnedHandle,
+        deadline: Option<Instant>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
         let ev = event()?;
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = raw(&ev);
@@ -513,18 +517,42 @@ mod win {
             return Ok(());
         }
         match unsafe { GetLastError() } {
-            ERROR_PIPE_CONNECTED => Ok(()),
-            // The client came and went already: it reads as an empty connection.
-            ERROR_NO_DATA => Ok(()),
+            ERROR_PIPE_CONNECTED | ERROR_NO_DATA => Ok(()),
             ERROR_IO_PENDING => {
-                let mut n = 0u32;
-                if unsafe { GetOverlappedResult(raw(h), &ov, &mut n, 1) } == 0 {
-                    return Err(last_error());
+                let reason = loop {
+                    if cancelled() {
+                        break Some(io::ErrorKind::Interrupted);
+                    }
+                    let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+                    if left == Some(Duration::ZERO) {
+                        break Some(io::ErrorKind::TimedOut);
+                    }
+                    let wait = left.unwrap_or(BUSY_WAIT).min(BUSY_WAIT);
+                    if unsafe { WaitForSingleObject(raw(&ev), wait_ms(wait)) } == WAIT_OBJECT_0 {
+                        break None;
+                    }
+                };
+                if reason.is_some() {
+                    unsafe { CancelIoEx(raw(h), &ov) };
                 }
+                let mut n = 0;
+                if unsafe { GetOverlappedResult(raw(h), &ov, &mut n, 1) } == 0 {
+                    let code = unsafe { GetLastError() };
+                    if code == ERROR_OPERATION_ABORTED {
+                        if let Some(reason) = reason {
+                            return Err(io::Error::from(reason));
+                        }
+                    }
+                    return Err(os_error(code));
+                }
+                // A connection winning the cancellation race is retained, not discarded.
                 Ok(())
             }
             code => Err(os_error(code)),
         }
+    }
+    fn wait_connected(h: &OwnedHandle) -> io::Result<()> {
+        wait_connected_until(h, None, &|| false)
     }
 
     /// A named pipe server. While it lives a pending instance always exists, so a client
@@ -574,18 +602,36 @@ mod win {
         /// Wait for the next client. The next pending instance is created before this one is
         /// handed out.
         pub fn accept(&self) -> io::Result<PipeStream> {
+            self.accept_inner(None, &|| false)
+        }
+
+        /// Bounded, cancellation-aware accept. A cancelled pending instance keeps the name
+        /// owned and can be rearmed by the next call; no background accept thread survives.
+        pub fn accept_until(
+            &self,
+            deadline: Instant,
+            cancelled: &dyn Fn() -> bool,
+        ) -> io::Result<PipeStream> {
+            self.accept_inner(Some(deadline), cancelled)
+        }
+
+        fn accept_inner(
+            &self,
+            deadline: Option<Instant>,
+            cancelled: &dyn Fn() -> bool,
+        ) -> io::Result<PipeStream> {
             let mut pending = self.pending.lock().unwrap();
-            let h = match pending.take() {
-                Some(h) => h,
-                None => create_instance(&self.name, &self.sd, false)?,
-            };
-            // On failure this instance is dropped; the next call makes a fresh one.
-            wait_connected(&h)?;
-            match create_instance(&self.name, &self.sd, false) {
-                Ok(next) => *pending = Some(next),
-                // The connected instance keeps the name alive; the next accept retries.
-                Err(e) => eprintln!("cannot create the next instance of {}: {e}", self.display),
+            if pending.is_none() {
+                *pending = Some(create_instance(&self.name, &self.sd, false)?);
             }
+            wait_connected_until(
+                pending.as_ref().expect("pending instance"),
+                deadline,
+                cancelled,
+            )?;
+            // Keep the connected instance until its successor exists, including on error.
+            let next = create_instance(&self.name, &self.sd, false)?;
+            let h = pending.replace(next).expect("connected instance");
             Ok(PipeStream::from_handle(h))
         }
     }
@@ -920,6 +966,54 @@ mod win_tests {
         let c = connect(&name, soon(), &|| false).unwrap();
         assert_eq!(c.server_process_id().unwrap(), std::process::id());
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn bounded_accept_cancels_rearms_and_keeps_first_instance_ownership() {
+        let name = unique();
+        let listener = PipeListener::bind(&name).unwrap();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let e = listener
+                .accept_until(start + Duration::from_millis(30), &|| false)
+                .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+            assert!(start.elapsed() < Duration::from_secs(2));
+            assert_eq!(
+                PipeListener::bind(&name).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
+        let e = listener.accept_until(soon(), &|| true).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+        let mut client = connect(&name, soon(), &|| false).unwrap();
+        let mut server = listener.accept_until(soon(), &|| false).unwrap();
+        client.write_all(b"rearmed").unwrap();
+        let mut bytes = [0; 7];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"rearmed");
+    }
+    #[test]
+    fn timeout_connect_races_do_not_lose_stream_or_pipe_name() {
+        for _ in 0..20 {
+            let name = unique();
+            let listener = PipeListener::bind(&name).unwrap();
+            let client = std::thread::spawn(move || {
+                let mut client = connect(&name, soon(), &|| false).unwrap();
+                client.write_all(b"x").unwrap();
+            });
+            let mut stream = loop {
+                match listener.accept_until(Instant::now() + Duration::from_millis(1), &|| false) {
+                    Ok(stream) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(e) => panic!("accept race: {e}"),
+                }
+            };
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [b'x']);
+            client.join().unwrap();
+        }
     }
 
     /// A pipe owned by someone else (Administrators, where this token may assign that owner)

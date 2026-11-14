@@ -553,6 +553,8 @@ impl Manager {
     /// Synthetic public projection for source-local broker ordering negatives only;
     /// no membership/Noise authority or running Host is manufactured by this fixture.
     #[cfg(test)]
+    // Used only by broker.rs's Unix-only ordering tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn test_publish_broker_target(
         &self,
         cfg: HostConfig,

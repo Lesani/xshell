@@ -175,7 +175,9 @@ impl Fixture {
         let chain = predecessor.extended(&[signed]).unwrap().0;
         let tokens: Vec<String> = chain.versions().iter().map(|r| r.token().into()).collect();
         handle.d.ring.join(&tokens, None).unwrap();
-        let client = CompanionClient::new(handle.companion_endpoint().unwrap());
+        let client =
+            CompanionClient::for_store(handle.companion_endpoint().unwrap().parent().unwrap())
+                .unwrap();
         if standalone {
             let journal = StandaloneJournal {
                 intent,

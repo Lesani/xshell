@@ -82,7 +82,7 @@ pub(super) fn start_retained(
     intent: AdoptionIntent,
     predecessor: Vec<String>,
 ) -> Result<CompanionResponse, String> {
-    super::adoption::refuse_unresolved_standalone(store)?;
+    super::standalone_journal::refuse_unresolved_standalone(store)?;
     if predecessor.len() > 4096
         || predecessor.iter().map(String::len).sum::<usize>() > 16 * 1024 * 1024
     {

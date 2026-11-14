@@ -191,13 +191,10 @@ impl DesktopRing {
             CompanionResponse::Identity { identity, profile } => (identity, profile),
             _ => return Err("invalid counterpart identity response".into()),
         };
-        let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
-        let daemon_dir = client
-            .endpoint()
-            .parent()
-            .ok_or("counterpart endpoint has no directory")?
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
+        let desktop_dir =
+            xshell_core::local_ipc::canonical_store(self.store.dir()).map_err(|e| e.to_string())?;
+        // Windows pipe endpoints have no parent directory; the client carries the store.
+        let daemon_dir = client.daemon_store();
         let membership = self.store.load()?.0;
         let retained_name = |key: &SignKey| {
             membership

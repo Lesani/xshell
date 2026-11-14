@@ -410,7 +410,7 @@ struct AttachmentTarget {
     slot: AttachmentSlot,
     representative: String,
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn test_slot(host: &str, handle: &HostHandle, terminal: Uuid) -> AttachmentTarget {
     static KEY: std::sync::OnceLock<SignKey> = std::sync::OnceLock::new();
     AttachmentTarget {
@@ -1271,6 +1271,10 @@ pub(crate) struct BrokerClient {
     manager: Weak<Manager>,
     stopped: AtomicBool,
     output_bytes: Arc<AtomicUsize>,
+    #[cfg(any(unix, windows))]
+    transport: Mutex<Option<native_transport::Connection>>,
+    #[cfg(any(unix, windows))]
+    transport_drains: Mutex<Vec<Arc<native_transport::WorkerDrain>>>,
 }
 impl BrokerClient {
     pub fn new(profile: String, manager: &Arc<Manager>) -> Arc<Self> {
@@ -1291,6 +1295,10 @@ impl BrokerClient {
             manager: Arc::downgrade(manager),
             stopped: AtomicBool::new(false),
             output_bytes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(unix, windows))]
+            transport: Mutex::new(None),
+            #[cfg(any(unix, windows))]
+            transport_drains: Mutex::new(Vec::new()),
         })
     }
     pub fn has_transport(&self) -> bool {
@@ -1785,6 +1793,8 @@ impl BrokerClient {
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        #[cfg(any(unix, windows))]
+        self.drain_transport();
         self.disconnected();
     }
 }
@@ -2095,8 +2105,8 @@ impl BrokerHostProxy {
     }
 }
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod native_transport {
     use super::*;
     use broker_ipc::native::{self, Stream};
     use std::io;
@@ -2159,26 +2169,113 @@ mod unix {
         pub broker: Arc<Broker>,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        local: Mutex<Vec<Connection>>,
     }
-    fn serve_stream(
-        broker: &Arc<Broker>,
-        mut stream: Stream,
-    ) -> io::Result<(Stream, Arc<AtomicBool>)> {
+    /// Completion belongs to the client even after its transport is taken for draining.
+    /// A worker cannot wait for itself; a later non-worker stop/reconnect must still wait.
+    pub(super) struct WorkerDrain {
+        workers: Vec<std::thread::ThreadId>,
+        joined: Mutex<Option<bool>>,
+        changed: Condvar,
+    }
+    impl WorkerDrain {
+        fn new(workers: &[std::thread::JoinHandle<()>]) -> Arc<Self> {
+            Arc::new(Self {
+                workers: workers.iter().map(|worker| worker.thread().id()).collect(),
+                joined: Mutex::new(None),
+                changed: Condvar::new(),
+            })
+        }
+        fn complete(&self) -> bool {
+            self.joined.lock().unwrap().is_some()
+        }
+        fn wait(&self) {
+            if self.workers.contains(&std::thread::current().id()) {
+                return;
+            }
+            let mut joined = self.joined.lock().unwrap();
+            while joined.is_none() {
+                joined = self.changed.wait(joined).unwrap();
+            }
+        }
+    }
+    struct ReapWorkers {
+        workers: Vec<std::thread::JoinHandle<()>>,
+        drain: Arc<WorkerDrain>,
+    }
+    impl ReapWorkers {
+        fn join(self) {
+            let mut panicked = false;
+            for worker in self.workers {
+                panicked |= worker.join().is_err();
+            }
+            *self.drain.joined.lock().unwrap() = Some(panicked);
+            self.drain.changed.notify_all();
+        }
+        fn defer(self) {
+            // Process-lifetime ownership of the reaper handle, not a detached worker.
+            // Each client separately retains its completion barrier for owner transfer.
+            static REAPER: std::sync::OnceLock<(
+                std::sync::mpsc::Sender<ReapWorkers>,
+                std::thread::JoinHandle<()>,
+            )> = std::sync::OnceLock::new();
+            let (sender, _) = REAPER.get_or_init(|| {
+                let (sender, receiver) = std::sync::mpsc::channel::<ReapWorkers>();
+                let worker = std::thread::Builder::new()
+                    .name("broker-worker-reaper".into())
+                    .spawn(move || {
+                        for workers in receiver {
+                            workers.join();
+                        }
+                    })
+                    .expect("start broker worker reaper");
+                (sender, worker)
+            });
+            sender
+                .send(self)
+                .unwrap_or_else(|_| panic!("broker worker reaper stopped"));
+        }
+    }
+    /// Reader/writer ownership is retained until cancellation and both joins complete.
+    pub(super) struct Connection {
+        stream: Stream,
+        out: Arc<Outbox>,
+        finished: Arc<AtomicBool>,
+        workers: Vec<std::thread::JoinHandle<()>>,
+        drain: Arc<WorkerDrain>,
+    }
+    impl Drop for Connection {
+        fn drop(&mut self) {
+            self.out.stop();
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            let workers = ReapWorkers {
+                workers: std::mem::take(&mut self.workers),
+                drain: self.drain.clone(),
+            };
+            if self.drain.workers.contains(&std::thread::current().id()) {
+                workers.defer();
+            } else {
+                workers.join();
+            }
+        }
+    }
+    fn serve_stream(broker: &Arc<Broker>, mut stream: Stream) -> io::Result<Connection> {
         let shutdown = stream.try_clone()?;
         let mut writer = stream.try_clone()?;
         writer.set_write_timeout(Some(Duration::from_secs(2)))?;
         let out = Outbox::new(broker.assembly.clone());
         let session = broker.session(out.clone());
         let write_session = session.clone();
-        std::thread::spawn(move || {
-            let _ = out.write_to(&mut writer);
+        let write_out = out.clone();
+        let write_worker = std::thread::spawn(move || {
+            let _ = write_out.write_to(&mut writer);
             let _ = writer.shutdown(std::net::Shutdown::Both);
             write_session.disconnect();
         });
         let assembly = broker.assembly.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let done = finished.clone();
-        std::thread::spawn(move || {
+        let read_worker = std::thread::spawn(move || {
             let greeted = match broker_ipc::read_limited(
                 &mut FrameReader::hello(&mut stream),
                 &assembly,
@@ -2224,7 +2321,14 @@ mod unix {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             done.store(true, Ordering::Release);
         });
-        Ok((shutdown, finished))
+        let workers = vec![write_worker, read_worker];
+        Ok(Connection {
+            stream: shutdown,
+            out,
+            finished,
+            drain: WorkerDrain::new(&workers),
+            workers,
+        })
     }
     impl Server {
         /// Called only while DesktopRing holds ring-connector.lock.
@@ -2236,8 +2340,8 @@ mod unix {
             let thread = std::thread::spawn(move || {
                 let mut streams = Vec::new();
                 while !done.load(Ordering::Acquire) {
-                    streams.retain(|(_, done): &(Stream, Arc<AtomicBool>)| {
-                        !done.load(Ordering::Acquire)
+                    streams.retain(|connection: &Connection| {
+                        !connection.finished.load(Ordering::Acquire)
                     });
                     if let Ok(stream) = listener.accept() {
                         if streams.len() < 32 {
@@ -2250,35 +2354,73 @@ mod unix {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 owner.stop();
-                for (stream, _) in streams {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                // Cancel every stream before joining any worker. No handler locks held.
+                for connection in &streams {
+                    connection.out.stop();
+                    let _ = connection.stream.shutdown(std::net::Shutdown::Both);
                 }
+                drop(streams);
             });
             Ok(Self {
                 broker,
                 stop,
                 thread: Some(thread),
+                local: Mutex::new(Vec::new()),
             })
         }
         pub fn local(&self, client: &Arc<BrokerClient>) -> io::Result<()> {
-            let (server, stream) = Stream::pair()?;
-            serve_stream(&self.broker, server)?;
-            client.connect_stream(stream)
+            let (server, stream) = native::pair()?;
+            let connection = serve_stream(&self.broker, server)?;
+            client.connect_stream(stream)?;
+            let mut local = self.local.lock().unwrap();
+            local.retain(|c| !c.finished.load(Ordering::Acquire));
+            local.push(connection);
+            Ok(())
         }
     }
     impl Drop for Server {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            self.broker.stop();
+            let local = std::mem::take(self.local.get_mut().unwrap());
+            for connection in &local {
+                connection.out.stop();
+                let _ = connection.stream.shutdown(std::net::Shutdown::Both);
+            }
+            drop(local);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
         }
     }
     impl BrokerClient {
+        pub(super) fn drain_transport(&self) {
+            let (connection, drains) = {
+                let mut transport = self.transport.lock().unwrap();
+                let mut drains = self.transport_drains.lock().unwrap();
+                drains.retain(|drain| !drain.complete());
+                let connection = transport.take();
+                if let Some(connection) = &connection {
+                    // Publish the barrier before releasing transport ownership, so a
+                    // concurrent non-worker stop cannot miss a worker-origin drain.
+                    drains.push(connection.drain.clone());
+                }
+                (connection, drains.clone())
+            };
+            drop(connection);
+            for drain in drains {
+                drain.wait();
+            }
+        }
         pub fn connect(self: &Arc<Self>, path: &Path) -> io::Result<()> {
             self.connect_stream(native::connect(path, Duration::from_secs(2))?)
         }
         fn connect_stream(self: &Arc<Self>, mut stream: Stream) -> io::Result<()> {
+            self.drain_transport();
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let shutdown = stream.try_clone()?;
             let mut writer = stream.try_clone()?;
             writer.set_write_timeout(Some(Duration::from_secs(2)))?;
             let assembly = Arc::new(Assembly::default());
@@ -2292,11 +2434,14 @@ mod unix {
             )?;
             *self.out.lock().unwrap() = Some(out.clone());
             let client = self.clone();
-            std::thread::spawn(move || {
-                let _ = out.write_to(&mut writer);
+            let write_out = out.clone();
+            let write_worker = std::thread::spawn(move || {
+                let _ = write_out.write_to(&mut writer);
                 let _ = writer.shutdown(std::net::Shutdown::Both);
             });
-            std::thread::spawn(move || {
+            let finished = Arc::new(AtomicBool::new(false));
+            let done = finished.clone();
+            let read_worker = std::thread::spawn(move || {
                 let greeted = match broker_ipc::read_limited(
                     &mut FrameReader::hello(&mut stream),
                     &assembly,
@@ -2308,6 +2453,7 @@ mod unix {
                 if !greeted {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                     client.disconnected();
+                    done.store(true, Ordering::Release);
                     return;
                 }
                 while !client.stopped.load(Ordering::Acquire) {
@@ -2322,7 +2468,23 @@ mod unix {
                 }
                 let _ = stream.shutdown(std::net::Shutdown::Both);
                 client.disconnected();
+                done.store(true, Ordering::Release);
             });
+            let workers = vec![write_worker, read_worker];
+            let connection = Connection {
+                stream: shutdown,
+                out,
+                finished,
+                drain: WorkerDrain::new(&workers),
+                workers,
+            };
+            let mut transport = self.transport.lock().unwrap();
+            if self.stopped.load(Ordering::Acquire) {
+                drop(transport);
+                drop(connection);
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            *transport = Some(connection);
             Ok(())
         }
     }
@@ -2330,9 +2492,157 @@ mod unix {
     mod frame_tests {
         use super::*;
         use std::io::{Read, Write};
+        fn manager() -> Arc<Manager> {
+            Arc::new(Manager::new(crate::manager::tests::test_config(Arc::new(
+                crate::manager::tests::NullObserver,
+            ))))
+        }
+        #[test]
+        fn connection_drop_cancels_and_joins_both_server_workers() {
+            let manager = manager();
+            let broker = Broker::new("profile".into(), &manager);
+            let (server, _idle) = native::pair().unwrap();
+            let connection = serve_stream(&broker, server).unwrap();
+            let done = connection.finished.clone();
+            let start = Instant::now();
+            drop(connection);
+            assert!(done.load(Ordering::Acquire));
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+        #[test]
+        fn last_manager_reference_in_publication_drains_without_joining_its_reader() {
+            struct PublicationBarrier {
+                entered: std::sync::mpsc::SyncSender<()>,
+                release: Mutex<std::sync::mpsc::Receiver<()>>,
+                first: AtomicBool,
+            }
+            impl crate::Observer for PublicationBarrier {
+                fn status(&self, _: &crate::HostStatus) {}
+                fn terminals(&self, _: &str, _: &[xshell_protocol::msg::TerminalInfo]) {}
+                fn available(&self, _: &[AvailableHost]) {
+                    if self.first.swap(false, Ordering::AcqRel) {
+                        self.entered.send(()).unwrap();
+                        self.release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                }
+            }
+            let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            let observer = Arc::new(PublicationBarrier {
+                entered,
+                release: Mutex::new(resume),
+                first: AtomicBool::new(true),
+            });
+            let manager = Arc::new(Manager::new(crate::manager::tests::test_config(observer)));
+            let weak_manager = Arc::downgrade(&manager);
+            let client = BrokerClient::new("profile".into(), &manager);
+            manager.set_broker(client.clone(), true);
+            let (stream, mut peer) = native::pair().unwrap();
+            client.connect_stream(stream).unwrap();
+            let (done, drain) = {
+                let transport = client.transport.lock().unwrap();
+                let connection = transport.as_ref().unwrap();
+                (connection.finished.clone(), connection.drain.clone())
+            };
+            for event in [
+                Event::Welcome {
+                    version: VERSION,
+                    profile_id: "profile".into(),
+                    owner_epoch: Uuid::new_v4(),
+                    client_id: Uuid::new_v4(),
+                },
+                Event::Snapshot {
+                    sequence: 1,
+                    hosts: vec![],
+                    snapshots: vec![],
+                },
+            ] {
+                let bytes = serde_json::to_vec(&event).unwrap();
+                peer.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
+                peer.write_all(&0u64.to_be_bytes()).unwrap();
+                peer.write_all(&bytes).unwrap();
+            }
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                Arc::strong_count(&manager),
+                2,
+                "reader must hold the only temporary Manager reference"
+            );
+            drop(manager);
+            release.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !done.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                done.load(Ordering::Acquire),
+                "reader did not exit after last-Manager destruction"
+            );
+            assert_eq!(weak_manager.strong_count(), 0);
+            client.stop(); // Non-worker teardown must wait for the deferred reader join.
+            assert!(client.transport.lock().unwrap().is_none());
+            assert_eq!(
+                *drain.joined.lock().unwrap(),
+                Some(false),
+                "both workers must join without panic"
+            );
+        }
+
+        #[test]
+        fn stop_drains_owner_local_external_and_client_workers_before_successor() {
+            let manager = manager();
+            let dir = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            #[cfg(windows)]
+            xshell_core::private_fs::ensure_dir(dir.path()).unwrap();
+            let path = xshell_core::local_ipc::host_broker_endpoint(
+                &xshell_core::local_ipc::canonical_store(dir.path()).unwrap(),
+            )
+            .unwrap();
+            let broker = Broker::new("profile".into(), &manager);
+            let server = Server::bind(path.clone(), broker).unwrap();
+            let local = BrokerClient::new("profile".into(), &manager);
+            server.local(&local).unwrap();
+            let external = BrokerClient::new("profile".into(), &manager);
+            external.connect(&path).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let start = Instant::now();
+            local.stop();
+            external.stop();
+            assert!(local.transport.lock().unwrap().is_none());
+            assert!(external.transport.lock().unwrap().is_none());
+            drop(server);
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let _successor = Server::bind(path, Broker::new("profile".into(), &manager)).unwrap();
+        }
+        #[test]
+        fn hello_has_one_absolute_deadline_and_idle_frame_has_none() {
+            let (mut reader, mut writer) = native::pair().unwrap();
+            let mut hello = FrameReader::hello(&mut reader);
+            let until = hello.until.unwrap();
+            writer.write_all(&[0]).unwrap();
+            assert_eq!(hello.read(&mut [0]).unwrap(), 1);
+            assert_eq!(hello.until, Some(until));
+            hello.until = Some(Instant::now() - Duration::from_millis(1));
+            assert_eq!(
+                hello.read(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            let frame = FrameReader::frame(&mut reader);
+            assert!(frame.until.is_none());
+        }
         #[test]
         fn partial_post_hello_header_starts_one_absolute_budget_on_its_first_byte() {
-            let (mut reader, mut writer) = Stream::pair().unwrap();
+            let (mut reader, mut writer) = native::pair().unwrap();
             writer.write_all(&[0]).unwrap();
             let mut framed = FrameReader::frame(&mut reader);
             let mut byte = [0];
@@ -2350,8 +2660,8 @@ mod unix {
         }
     }
 }
-#[cfg(unix)]
-pub(crate) use unix::Server;
+#[cfg(any(unix, windows))]
+pub(crate) use native_transport::Server;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -2648,7 +2958,7 @@ mod subscription_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod review_controls_tests {
     use super::*;
     #[derive(Default)]

@@ -149,9 +149,7 @@ fn wait(mut ready: impl FnMut() -> bool) {
     }
 }
 fn endpoint(f: &Fixture) -> xshell_hostlink::ring::companion_ipc::CompanionClient {
-    xshell_hostlink::ring::companion_ipc::CompanionClient::new(
-        f.daemon_dir().join("companion.sock"),
-    )
+    xshell_hostlink::ring::companion_ipc::CompanionClient::for_store(&f.daemon_dir()).unwrap()
 }
 fn assert_no_membership(f: &Fixture) {
     assert!(!f.daemon_dir().join("roster.json").exists());

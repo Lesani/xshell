@@ -1,8 +1,9 @@
 //! Owned production workerd fixture. Missing explicit inputs are hard failures, not skips.
-#![cfg(unix)]
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -26,6 +27,9 @@ pub struct Relay {
     root: PathBuf,
     bin: PathBuf,
     port: u16,
+    /// Unix passes this reserved listener to workerd. Windows keeps the original
+    /// bind-then-release port probe and `--socket-addr`.
+    #[cfg(unix)]
     listener: TcpListener,
     child: Option<Child>,
 }
@@ -49,11 +53,14 @@ impl Relay {
         std::fs::create_dir(dir.path().join("data")).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        #[cfg(windows)]
+        drop(listener);
         let mut relay = Self {
             dir,
             root,
             bin,
             port,
+            #[cfg(unix)]
             listener,
             child: None,
         };
@@ -71,7 +78,7 @@ impl Relay {
             .current_dir(&self.root)
             .arg("serve")
             .arg("workerd/config.capnp")
-            .arg(format!("--socket-fd=http={}", self.listener.as_raw_fd()))
+            .arg(self.socket_arg())
             .arg(format!(
                 "--directory-path=disk={}",
                 self.dir.path().join("data").display()
@@ -82,9 +89,11 @@ impl Relay {
         for name in CONFIG_VARS {
             command.env_remove(name);
         }
+        #[cfg(unix)]
         let fd = self.listener.as_raw_fd();
         // Only the owned child inherits this listener. Parent CLOEXEC is unchanged;
         // the listener remains reserved even while workerd is stopped for restart.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -128,13 +137,23 @@ impl Relay {
             String::from_utf8_lossy(&header[..length]).starts_with("HTTP/1.1 200")
         })
     }
+    #[cfg(unix)]
+    fn socket_arg(&self) -> String {
+        format!("--socket-fd=http={}", self.listener.as_raw_fd())
+    }
+    #[cfg(windows)]
+    fn socket_arg(&self) -> String {
+        format!("--socket-addr=http=127.0.0.1:{}", self.port)
+    }
     pub fn restart(&mut self) {
         self.kill();
+        #[cfg(unix)]
         assert!(
             matches!(TcpListener::bind(self.listener.local_addr().unwrap()),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
             "owned listener must remain reserved with no workerd child"
         );
+        #[cfg(unix)]
         assert_ne!(
             unsafe { libc::fcntl(self.listener.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
             0,

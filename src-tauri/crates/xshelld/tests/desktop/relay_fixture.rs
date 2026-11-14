@@ -127,7 +127,16 @@ impl Computer {
         }
     }
     pub(super) fn companion(&self) -> CompanionClient {
-        CompanionClient::new(self.daemon.as_ref().unwrap().companion_endpoint().unwrap())
+        CompanionClient::for_store(
+            self.daemon
+                .as_ref()
+                .unwrap()
+                .companion_endpoint()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap()
     }
     pub(super) fn create(&self) -> RosterChain {
         let companion = self.companion();

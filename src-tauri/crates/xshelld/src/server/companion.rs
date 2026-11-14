@@ -1,6 +1,6 @@
 //! Protected counterpart ingress, separate from Host/Relay/Mobile protocols. Registration
 //! survives endpoint/process loss. Only this Daemon's store and keys are ever written here.
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 use super::registry::Daemon;
 use super::ring::{read_private, write_private, PrivateRingFile, Store};
 use std::path::Path;
@@ -58,9 +58,11 @@ fn validate_profile(
     keys: &DeviceKeys,
 ) -> Result<(), String> {
     profile.validate()?;
-    let daemon_dir = store.dir.canonicalize().map_err(|e| e.to_string())?;
+    let daemon_dir =
+        xshell_core::local_ipc::canonical_store(&store.dir).map_err(|e| e.to_string())?;
     if Path::new(&profile.daemon_store) != daemon_dir
-        || Path::new(&profile.endpoint) != daemon_dir.join("companion.sock")
+        || Path::new(&profile.endpoint)
+            != xshell_core::local_ipc::companion_endpoint(&daemon_dir).map_err(|e| e.to_string())?
         || profile.daemon.sign_key != keys.sign_key()
         || profile.daemon.noise_key != keys.noise_key()
     {
@@ -92,12 +94,23 @@ fn registration_locked(
 ) -> Result<CompanionResponse, String> {
     budget.check().map_err(|e| e.to_string())?;
     if let CompanionRequest::ReserveRegistration { desktop_store } = &request {
-        xshell_core::companion_reservation::reserve_locked(
-            &store.dir.canonicalize().map_err(|e| e.to_string())?,
-            Path::new(desktop_store),
-        )
-        .map_err(|e| e.to_string())?;
-        return Ok(CompanionResponse::Descriptor { profile: None });
+        #[cfg(unix)]
+        {
+            xshell_core::companion_reservation::reserve_locked(
+                &store.dir.canonicalize().map_err(|e| e.to_string())?,
+                Path::new(desktop_store),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(CompanionResponse::Descriptor { profile: None });
+        }
+        // The startup reservation (and the registration child that writes it) is Unix-only.
+        #[cfg(not(unix))]
+        {
+            let _ = desktop_store;
+            return Err(
+                "startup registration reservation is not supported on this platform".into(),
+            );
+        }
     }
     refuse_legacy_uncertainty(store)?;
     if matches!(request, CompanionRequest::Descriptor) {
@@ -144,15 +157,13 @@ fn registration_locked(
             }
         } else {
             let _offer = store.registration_admission()?;
-            super::adoption::refuse_unresolved_standalone(store)?;
+            super::standalone_journal::refuse_unresolved_standalone(store)?;
             let registered = CompanionPolicy::new(profile.clone())?;
             budget.check().map_err(|e| e.to_string())?;
             save(store, &registered)?;
         }
         // Commit valid registration durably before removing only its exact denial.
-        std::fs::File::open(&store.dir)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
+        sync_store_dir(&store.dir)?;
         // Debug-only owned-child crash cut: valid policy is durable, denial still exists.
         #[cfg(debug_assertions)]
         if let Some(path) = std::env::var_os("XSHELLD_TEST_REGISTRATION_AFTER_SAVE") {
@@ -167,9 +178,7 @@ fn registration_locked(
         budget.check().map_err(|e| e.to_string())?;
         validate_pending(store, &profile.desktop_store)?;
         match std::fs::remove_file(store.dir.join("companion-pending.json")) {
-            Ok(()) => std::fs::File::open(&store.dir)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?,
+            Ok(()) => sync_store_dir(&store.dir)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
         }
@@ -179,19 +188,57 @@ fn registration_locked(
     }
     Err("registration helper refuses non-registration requests".into())
 }
-fn refuse_legacy_uncertainty(store: &Store) -> Result<(), String> {
-    if xshell_core::companion_reservation::read_reservation(&store.dir)
-        .map_err(|e| e.to_string())?
-        .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
+/// Persist a directory entry change. Windows has no std directory handle to flush; NTFS
+/// journals the rename/unlink metadata itself.
+fn sync_store_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
     {
+        std::fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+/// Pending startup reservation (desktop store, legacy uncertainty). Only Unix writes one;
+/// elsewhere an existing reservation file is ambiguous and fails closed.
+struct Reservation {
+    desktop_store: String,
+    legacy_outcome_uncertain: bool,
+}
+fn read_reservation(store: &Store) -> Result<Option<Reservation>, String> {
+    #[cfg(unix)]
+    {
+        Ok(
+            xshell_core::companion_reservation::read_reservation(&store.dir)
+                .map_err(|e| e.to_string())?
+                .map(|r| Reservation {
+                    desktop_store: r.desktop_store,
+                    legacy_outcome_uncertain: r.legacy_outcome_uncertain,
+                }),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(store.dir.join("companion-pending.json")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => {
+                Err("reconciliation_required: unsupported startup registration reservation".into())
+            }
+        }
+    }
+}
+fn refuse_legacy_uncertainty(store: &Store) -> Result<(), String> {
+    if read_reservation(store)?.is_some_and(|reservation| reservation.legacy_outcome_uncertain) {
         return Err("reconciliation_required: incumbent legacy pairing remote outcome is uncertain; registration cannot resolve or clear this denial".into());
     }
     Ok(())
 }
 fn validate_pending(store: &Store, desktop_store: &str) -> Result<(), String> {
-    if let Some(reservation) = xshell_core::companion_reservation::read_reservation(&store.dir)
-        .map_err(|e| e.to_string())?
-    {
+    if let Some(reservation) = read_reservation(store)? {
         if reservation.desktop_store != desktop_store {
             return Err("conflicting pending counterpart registration".into());
         }
@@ -231,6 +278,17 @@ fn dispatch(
         let _lock = store.lock_until(budget)?;
         return registration_locked(&store, request, budget);
     }
+    // Standalone commands (`xshelld pair` Host-first adoption) exist only on Unix.
+    #[cfg(not(unix))]
+    if matches!(
+        request,
+        CompanionRequest::StandaloneCommandReady
+            | CompanionRequest::PrepareStandaloneCommand { .. }
+            | CompanionRequest::InstallStandaloneAccepted { .. }
+    ) {
+        return Err("standalone command is not supported on this platform".into());
+    }
+    #[cfg(unix)]
     if matches!(request, CompanionRequest::StandaloneCommandReady) {
         if daemon.cfg.gui_bound.is_some() {
             return Err("GUI-bound owner excludes standalone command".into());
@@ -239,6 +297,7 @@ fn dispatch(
             .ring
             .standalone_transaction(budget, |_| Ok(CompanionResponse::StandaloneCommandReady));
     }
+    #[cfg(unix)]
     if let CompanionRequest::PrepareStandaloneCommand { intent, proposal } = request {
         if daemon.cfg.gui_bound.is_some() {
             return Err("GUI-bound owner excludes standalone command".into());
@@ -324,6 +383,7 @@ fn dispatch(
             })
         });
     }
+    #[cfg(unix)]
     if let CompanionRequest::InstallStandaloneAccepted { operation, rosters } = request {
         if daemon.cfg.gui_bound.is_some() {
             return Err("GUI-bound owner excludes standalone installation".into());
@@ -427,7 +487,7 @@ fn dispatch(
             });
         }
         CompanionRequest::Start { intent } => {
-            super::adoption::refuse_unresolved_standalone(&store)?;
+            super::standalone_journal::refuse_unresolved_standalone(&store)?;
             if trusted(&store)?.is_some() {
                 return Err("leave_required: Create requires an unpaired Daemon".into());
             }
@@ -502,9 +562,9 @@ pub(super) fn serve(
         .ok_or_else(|| std::io::Error::other("Daemon disappeared"))?;
     let store = Store::new(live.cfg.paths.ring_dir.clone());
     store.ensure_dir()?;
-    let directory = store.dir.canonicalize()?;
+    let directory = xshell_core::local_ipc::canonical_store(&store.dir)?;
     xshell_core::local_ipc::private_dir(&directory)?;
-    let path = directory.join("companion.sock");
+    let path = xshell_core::local_ipc::companion_endpoint(&directory)?;
     if let Err(error) = xshell_core::local_ipc::check_path(&path) {
         // Only this exact absent, overlong optional endpoint is unsupported. Unsafe,
         // conflicting or ambiguous existing paths must still fail the Daemon start.
@@ -535,6 +595,8 @@ pub(super) fn serve(
 
 /// Read-only classification for the actual CLI. Unreadable association is an error,
 /// never standalone permission; a pending reservation may contain no keys at all.
+/// Used only by the Unix-only `xshelld pair` command.
+#[cfg(unix)]
 pub(crate) fn registered_desktop(
     store: &Store,
     budget: &xshell_core::local_ipc::RequestBudget,
@@ -559,6 +621,7 @@ pub(crate) fn registered_desktop(
 
 /// Registration-only command: no Daemon, Host, Relay, signer RPC or membership runtime.
 /// stdin owns its lifetime; EOF or the original 15-second bound drains the endpoint.
+#[cfg(unix)]
 pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
@@ -656,6 +719,7 @@ pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
         Err(e) => Err(e),
     }
 }
+#[cfg(unix)]
 fn poll_stdin(fd: std::os::fd::RawFd, until: std::time::Instant) -> Result<(), String> {
     let left = until.saturating_duration_since(std::time::Instant::now());
     if left.is_zero() {

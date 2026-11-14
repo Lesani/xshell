@@ -762,13 +762,13 @@ impl Conn {
                     .and_then(|_operation| d.ring.identity()),
             ),
             ClientMsg::RingCompanion { request } => {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 let result = if self.ingress != Ingress::Relay {
                     Err("companion administration requires an authorized Ring link".into())
                 } else {
                     super::completion::admin(&d, self.peer.as_ref().map(|p| p.sign_key), request)
                 };
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 let result = {
                     let _ = request;
                     Err("Unix counterpart required".into())

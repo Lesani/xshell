@@ -235,6 +235,8 @@ impl Administration {
     pub(super) fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
+    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn take_focus_request(&mut self) -> bool {
         std::mem::take(&mut self.focus_requested)
     }
@@ -272,6 +274,8 @@ impl Administration {
             op.status = status;
         }
     }
+    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn controller(
         &self,
         operation: Uuid,
@@ -283,6 +287,8 @@ impl Administration {
             .controller
             .upgrade()
     }
+    // Read only by DesktopRing's Unix-only focus/administration_join(s) accessors.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn controllers(&self) -> Vec<(Uuid, std::sync::Arc<super::adoption::JoinOffer>)> {
         self.operations
             .iter()
@@ -406,7 +412,7 @@ impl Drop for AdministrationClient {
 }
 
 /// Dispatch is owner-local; neither broker messages nor this worker confirm anything.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) fn dispatch_pending(
     ring: &std::sync::Arc<super::DesktopRing>,
     administration: &std::sync::Arc<std::sync::Mutex<Administration>>,
@@ -438,9 +444,7 @@ pub(super) fn dispatch_pending(
                 if dispatch.cancel.load(Ordering::Acquire) || Instant::now() >= dispatch.until {
                     return Err("origin ended before dispatch".to_string());
                 }
-                let client = super::companion_ipc::CompanionClient::new(std::path::PathBuf::from(
-                    &profile.endpoint,
-                ));
+                let client = super::companion_ipc::CompanionClient::for_profile(&profile);
                 loop {
                     if dispatch.cancel.load(Ordering::Acquire)
                         || Instant::now() >= dispatch.until

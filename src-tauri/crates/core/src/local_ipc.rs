@@ -1,4 +1,4 @@
-//! Short, bounded user-private Unix IPC, shared by the counterpart client and Daemon.
+//! Short, bounded user-private native IPC, shared by the counterpart client and Daemon.
 //! Callers must hold their existing process-owner lock before binding or stale cleanup.
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,59 +46,34 @@ impl RequestBudget {
     }
 }
 
-#[cfg(unix)]
-mod unix {
+#[cfg(any(unix, windows))]
+mod native {
     use super::RequestBudget;
     use serde::{de::DeserializeOwned, Serialize};
     use std::io::{self, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     const IO: Duration = Duration::from_secs(5);
     const MAX: usize = xshell_protocol::ring::companion::MAX_COMPANION_FRAME;
-    fn denied(why: &str) -> io::Error {
-        io::Error::new(io::ErrorKind::PermissionDenied, why)
-    }
-    pub fn private_dir(path: &Path) -> io::Result<()> {
-        let meta = std::fs::symlink_metadata(path)?;
-        if !meta.is_dir()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o077 != 0
-            || path.canonicalize()? != path
-        {
-            return Err(denied("non-private or ambiguous IPC directory"));
-        }
-        Ok(())
-    }
-    fn socket_identity(path: &Path) -> io::Result<(u64, u64)> {
-        private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
-        let meta = std::fs::symlink_metadata(path)?;
-        if !meta.file_type().is_socket()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o077 != 0
-        {
-            return Err(denied("foreign, symlink or non-private IPC socket"));
-        }
-        Ok((meta.dev(), meta.ino()))
-    }
+    pub use platform::{check_path, private_dir, protected_connect, ProtectedListener, Stream};
+    use platform::{denied, dial_pinned, endpoint_identity, peer, Identity};
     #[cfg(test)]
     thread_local! {
         static AFTER_PIN_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             std::cell::RefCell::new(None);
     }
     /// Pins local routing identity across a command's exchanges; not wire authority.
+    /// Unix pins the socket inode; Windows pipes have no inode, so the pin is the
+    /// validated pipe name and the owner-SID checks done by every connect.
     pub struct ProtectedEndpoint {
         path: PathBuf,
-        identity: (u64, u64),
+        identity: Identity,
     }
     impl ProtectedEndpoint {
         pub fn pin(path: PathBuf) -> io::Result<Self> {
-            let identity = socket_identity(&path)?;
+            let identity = endpoint_identity(&path)?;
             Ok(Self { path, identity })
         }
         pub fn exchange_until<Q: Serialize, R: DeserializeOwned>(
@@ -107,7 +82,7 @@ mod unix {
             budget: &RequestBudget,
         ) -> io::Result<R> {
             budget.check()?;
-            if socket_identity(&self.path)? != self.identity {
+            if endpoint_identity(&self.path)? != self.identity {
                 return Err(denied("protected owner endpoint replaced"));
             }
             #[cfg(test)]
@@ -119,139 +94,14 @@ mod unix {
             }
             let reply =
                 exchange_with_identity_until(&self.path, request, budget, Some(self.identity))?;
-            if socket_identity(&self.path)? != self.identity {
+            if endpoint_identity(&self.path)? != self.identity {
                 return Err(denied("protected owner endpoint replaced"));
             }
             Ok(reply)
         }
     }
-    fn peer(stream: &UnixStream) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    stream.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    (&mut cred as *mut libc::ucred).cast(),
-                    &mut len,
-                )
-            } != 0
-                || len as usize != std::mem::size_of_val(&cred)
-                || cred.uid != unsafe { libc::geteuid() }
-            {
-                return Err(denied("IPC peer uid mismatch"));
-            }
-            Ok(())
-        }
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        {
-            let (mut uid, mut gid) = (0, 0);
-            if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0
-                || uid != unsafe { libc::geteuid() }
-            {
-                return Err(denied("IPC peer uid mismatch"));
-            }
-            Ok(())
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-        {
-            let _ = stream;
-            Err(denied("IPC peer credentials unsupported on this platform"))
-        }
-    }
-    pub fn check_path(path: &Path) -> io::Result<()> {
-        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        let bytes = path.as_os_str().as_bytes();
-        if bytes.len() >= address.sun_path.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "companion Unix socket path exceeds platform limit",
-            ));
-        }
-        if bytes.is_empty() || bytes.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid IPC path",
-            ));
-        }
-        Ok(())
-    }
-    fn dial(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
-        check_path(path)?;
-        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        let bytes = path.as_os_str().as_bytes();
-        address.sun_family = libc::AF_UNIX as _;
-        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        {
-            address.sun_len = std::mem::size_of_val(&address) as _;
-        }
-        for (to, from) in address.sun_path.iter_mut().zip(bytes) {
-            *to = *from as _;
-        }
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
-            || unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe {
-            libc::connect(
-                fd,
-                (&address as *const libc::sockaddr_un).cast(),
-                std::mem::size_of_val(&address) as _,
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINPROGRESS) {
-                return Err(error);
-            }
-            let mut event = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero()
-                || unsafe {
-                    libc::poll(&mut event, 1, left.as_millis().min(i32::MAX as u128) as i32)
-                } <= 0
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "IPC connect deadline",
-                ));
-            }
-            let (mut error, mut len) = (0_i32, std::mem::size_of::<i32>() as libc::socklen_t);
-            if unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    (&mut error as *mut i32).cast(),
-                    &mut len,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            if error != 0 {
-                return Err(io::Error::from_raw_os_error(error));
-            }
-        }
-        let stream = UnixStream::from(owned);
-        stream.set_nonblocking(false)?;
-        Ok(stream)
-    }
     struct Bounded {
-        stream: UnixStream,
+        stream: Stream,
         until: Instant,
     }
     impl Bounded {
@@ -320,83 +170,20 @@ mod unix {
         path: &Path,
         request: &Q,
         budget: &RequestBudget,
-        expected: Option<(u64, u64)>,
+        expected: Option<Identity>,
     ) -> io::Result<R> {
         budget.check()?;
         let before = match expected {
             Some(identity) => identity,
-            None => socket_identity(path)?,
+            None => endpoint_identity(path)?,
         };
         let until = budget.until.min(Instant::now() + IO);
-        let stream = dial(path, until)?;
-        peer(&stream)?;
-        if socket_identity(path)? != before {
-            return Err(denied("IPC endpoint replaced during connect"));
-        }
+        let stream = dial_pinned(path, until, before)?;
         let mut stream = Bounded { stream, until };
         write(&mut stream, request)?;
         let response = read(&mut stream)?;
         budget.check()?;
         Ok(response)
-    }
-    /// A persistent user-private endpoint. The caller must hold its process-owner lock.
-    /// This shares only protection with companion IPC, not its five-second request budget.
-    pub struct ProtectedListener {
-        listener: UnixListener,
-        path: PathBuf,
-        identity: (u64, u64),
-    }
-    impl ProtectedListener {
-        pub fn bind(path: PathBuf) -> io::Result<Self> {
-            private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
-            check_path(&path)?;
-            if std::fs::symlink_metadata(&path).is_ok() {
-                let old = socket_identity(&path)?;
-                match dial(&path, Instant::now() + IO) {
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AddrInUse,
-                            "IPC endpoint is live or ambiguous",
-                        ))
-                    }
-                }
-                if socket_identity(&path)? != old {
-                    return Err(denied("stale IPC endpoint changed"));
-                }
-                std::fs::remove_file(&path)?;
-            }
-            let listener = UnixListener::bind(&path)?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            let identity = socket_identity(&path)?;
-            listener.set_nonblocking(true)?;
-            Ok(Self {
-                listener,
-                path,
-                identity,
-            })
-        }
-        pub fn accept(&self) -> io::Result<UnixStream> {
-            let (stream, _) = self.listener.accept()?;
-            peer(&stream)?;
-            Ok(stream)
-        }
-    }
-    impl Drop for ProtectedListener {
-        fn drop(&mut self) {
-            if socket_identity(&self.path).ok() == Some(self.identity) {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-    pub fn protected_connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
-        let before = socket_identity(path)?;
-        let stream = dial(path, Instant::now() + timeout)?;
-        peer(&stream)?;
-        if socket_identity(path)? != before {
-            return Err(denied("IPC endpoint replaced during connect"));
-        }
-        Ok(stream)
     }
     pub struct Server {
         stop: Arc<AtomicBool>,
@@ -428,7 +215,7 @@ mod unix {
         let thread = std::thread::Builder::new()
             .name("companion-ipc".into())
             .spawn(move || {
-                let mut workers = Vec::<(std::thread::JoinHandle<()>, UnixStream)>::new();
+                let mut workers = Vec::<(std::thread::JoinHandle<()>, Stream)>::new();
                 while !done.load(Ordering::Acquire) {
                     let mut index = 0;
                     while index < workers.len() {
@@ -479,9 +266,304 @@ mod unix {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(unix)]
+    mod platform {
+        use super::*;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        pub type Stream = UnixStream;
+        pub(super) type Identity = (u64, u64);
+        pub(super) fn endpoint_identity(path: &Path) -> io::Result<Identity> {
+            socket_identity(path)
+        }
+        pub(super) fn dial_pinned(
+            path: &Path,
+            deadline: Instant,
+            before: Identity,
+        ) -> io::Result<Stream> {
+            let stream = dial(path, deadline)?;
+            peer(&stream)?;
+            if socket_identity(path)? != before {
+                return Err(denied("IPC endpoint replaced during connect"));
+            }
+            Ok(stream)
+        }
+        pub(super) fn denied(why: &str) -> io::Error {
+            io::Error::new(io::ErrorKind::PermissionDenied, why)
+        }
+        pub fn private_dir(path: &Path) -> io::Result<()> {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_dir()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o077 != 0
+                || path.canonicalize()? != path
+            {
+                return Err(denied("non-private or ambiguous IPC directory"));
+            }
+            Ok(())
+        }
+        fn socket_identity(path: &Path) -> io::Result<(u64, u64)> {
+            private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.file_type().is_socket()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o077 != 0
+            {
+                return Err(denied("foreign, symlink or non-private IPC socket"));
+            }
+            Ok((meta.dev(), meta.ino()))
+        }
+        pub(super) fn peer(stream: &UnixStream) -> io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+                let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        (&mut cred as *mut libc::ucred).cast(),
+                        &mut len,
+                    )
+                } != 0
+                    || len as usize != std::mem::size_of_val(&cred)
+                    || cred.uid != unsafe { libc::geteuid() }
+                {
+                    return Err(denied("IPC peer uid mismatch"));
+                }
+                Ok(())
+            }
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                let (mut uid, mut gid) = (0, 0);
+                if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0
+                    || uid != unsafe { libc::geteuid() }
+                {
+                    return Err(denied("IPC peer uid mismatch"));
+                }
+                Ok(())
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+            {
+                let _ = stream;
+                Err(denied("IPC peer credentials unsupported on this platform"))
+            }
+        }
+        pub fn check_path(path: &Path) -> io::Result<()> {
+            let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let bytes = path.as_os_str().as_bytes();
+            if bytes.len() >= address.sun_path.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "companion Unix socket path exceeds platform limit",
+                ));
+            }
+            if bytes.is_empty() || bytes.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid IPC path",
+                ));
+            }
+            Ok(())
+        }
+        pub(super) fn dial(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+            check_path(path)?;
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            let bytes = path.as_os_str().as_bytes();
+            address.sun_family = libc::AF_UNIX as _;
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            {
+                address.sun_len = std::mem::size_of_val(&address) as _;
+            }
+            for (to, from) in address.sun_path.iter_mut().zip(bytes) {
+                *to = *from as _;
+            }
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe {
+                libc::connect(
+                    fd,
+                    (&address as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of_val(&address) as _,
+                )
+            } != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                    return Err(error);
+                }
+                let mut event = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero()
+                    || unsafe {
+                        libc::poll(&mut event, 1, left.as_millis().min(i32::MAX as u128) as i32)
+                    } <= 0
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "IPC connect deadline",
+                    ));
+                }
+                let (mut error, mut len) = (0_i32, std::mem::size_of::<i32>() as libc::socklen_t);
+                if unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut error as *mut i32).cast(),
+                        &mut len,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if error != 0 {
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+            }
+            let stream = UnixStream::from(owned);
+            stream.set_nonblocking(false)?;
+            Ok(stream)
+        }
+        /// A persistent user-private endpoint. The caller must hold its process-owner lock.
+        /// This shares only protection with companion IPC, not its five-second request budget.
+        pub struct ProtectedListener {
+            listener: UnixListener,
+            path: PathBuf,
+            identity: (u64, u64),
+        }
+        impl ProtectedListener {
+            pub fn bind(path: PathBuf) -> io::Result<Self> {
+                private_dir(path.parent().ok_or_else(|| denied("socket parent"))?)?;
+                check_path(&path)?;
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    let old = socket_identity(&path)?;
+                    match dial(&path, Instant::now() + IO) {
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AddrInUse,
+                                "IPC endpoint is live or ambiguous",
+                            ))
+                        }
+                    }
+                    if socket_identity(&path)? != old {
+                        return Err(denied("stale IPC endpoint changed"));
+                    }
+                    std::fs::remove_file(&path)?;
+                }
+                let listener = UnixListener::bind(&path)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                let identity = socket_identity(&path)?;
+                listener.set_nonblocking(true)?;
+                Ok(Self {
+                    listener,
+                    path,
+                    identity,
+                })
+            }
+            pub fn accept(&self) -> io::Result<UnixStream> {
+                let (stream, _) = self.listener.accept()?;
+                peer(&stream)?;
+                Ok(stream)
+            }
+        }
+        impl Drop for ProtectedListener {
+            fn drop(&mut self) {
+                if socket_identity(&self.path).ok() == Some(self.identity) {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+        pub fn protected_connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+            let before = socket_identity(path)?;
+            let stream = dial(path, Instant::now() + timeout)?;
+            peer(&stream)?;
+            if socket_identity(path)? != before {
+                return Err(denied("IPC endpoint replaced during connect"));
+            }
+            Ok(stream)
+        }
+    }
+    #[cfg(windows)]
+    mod platform {
+        use super::*;
+        pub use crate::pipe::PipeStream as Stream;
+        pub fn private_dir(path: &Path) -> io::Result<()> {
+            crate::server::no_reparse(path)?;
+            crate::private_fs::check_private_dir(path)?;
+            if path.canonicalize()? != path {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "ambiguous IPC directory",
+                ));
+            }
+            Ok(())
+        }
+        pub fn check_path(path: &Path) -> io::Result<()> {
+            crate::pipe::check_pipe_name(path)
+        }
+        pub(super) fn peer(_: &Stream) -> io::Result<()> {
+            Ok(())
+        }
+        pub(super) fn denied(why: &str) -> io::Error {
+            io::Error::new(io::ErrorKind::PermissionDenied, why)
+        }
+        /// Named pipes have no inode; the pinned identity is the validated name, and
+        /// each connect re-verifies the server owner through `crate::pipe::connect`.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub(super) struct Identity;
+        pub(super) fn endpoint_identity(path: &Path) -> io::Result<Identity> {
+            check_path(path).map(|()| Identity)
+        }
+        pub(super) fn dial_pinned(
+            path: &Path,
+            deadline: Instant,
+            _: Identity,
+        ) -> io::Result<Stream> {
+            crate::pipe::connect(path, deadline, &|| false)
+        }
+        pub fn protected_connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
+            crate::pipe::connect(path, Instant::now() + timeout, &|| false)
+        }
+        pub struct ProtectedListener(crate::pipe::PipeListener);
+        impl ProtectedListener {
+            pub fn bind(path: PathBuf) -> io::Result<Self> {
+                crate::pipe::PipeListener::bind(&path).map(Self)
+            }
+            pub fn accept(&self) -> io::Result<Stream> {
+                self.0
+                    .accept_until(Instant::now() + Duration::from_millis(1), &|| false)
+                    .map_err(|e| {
+                        if e.kind() == io::ErrorKind::TimedOut {
+                            io::Error::from(io::ErrorKind::WouldBlock)
+                        } else {
+                            e
+                        }
+                    })
+            }
+        }
+    }
+    #[cfg(all(test, unix))]
     mod tests {
         use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
         fn directory() -> tempfile::TempDir {
             let dir = tempfile::tempdir().unwrap();
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -613,8 +695,202 @@ mod unix {
         }
     }
 }
-#[cfg(unix)]
-pub use unix::{
+#[cfg(any(unix, windows))]
+pub use native::{
     check_path, exchange, exchange_until, private_dir, protected_connect, serve, ProtectedEndpoint,
-    ProtectedListener, Server,
+    ProtectedListener, Server, Stream,
 };
+
+/// Validate traversed Windows ancestors before canonicalizing a protected store binding.
+#[cfg(any(unix, windows))]
+pub fn canonical_store(path: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::server::no_reparse(path)?;
+        crate::private_fs::check_owned_dir(path)?;
+    }
+    let canonical = path.canonicalize()?;
+    private_dir(&canonical)?;
+    Ok(canonical)
+}
+
+#[cfg(any(unix, windows))]
+pub fn companion_endpoint(store: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    endpoint(store, "companion", "companion.sock")
+}
+#[cfg(any(unix, windows))]
+pub fn host_broker_endpoint(store: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    endpoint(store, "host-broker", "host-broker.sock")
+}
+#[cfg(any(unix, windows))]
+fn endpoint(
+    store: &std::path::Path,
+    kind: &str,
+    unix_name: &str,
+) -> io::Result<std::path::PathBuf> {
+    private_dir(store)?;
+    #[cfg(unix)]
+    {
+        let _ = kind;
+        Ok(store.join(unix_name))
+    }
+    #[cfg(windows)]
+    {
+        let _ = unix_name;
+        let path = std::path::PathBuf::from(format!(
+            r"\\.\pipe\xshell-{kind}-v1-{}",
+            store_identity(store, kind)?
+        ));
+        crate::pipe::check_pipe_name(&path)?;
+        Ok(path)
+    }
+}
+/// The Unix spelling is retained; Windows binds Hello to the same SID/canonical UTF-16
+/// root as the endpoint mapping, not HOME or a display/lossy path.
+#[cfg(any(unix, windows))]
+pub fn host_broker_profile(store: &std::path::Path) -> io::Result<String> {
+    private_dir(store)?;
+    #[cfg(unix)]
+    {
+        use sha2::{Digest, Sha256};
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(store.as_os_str().as_encoded_bytes())
+        ))
+    }
+    #[cfg(windows)]
+    {
+        store_identity(store, "host-broker-profile")
+    }
+}
+#[cfg(windows)]
+fn store_identity(store: &std::path::Path, domain: &str) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
+    let sid = crate::pipe::current_user_sid()?.to_string_sid()?;
+    let path: Vec<u8> = store
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut hash = Sha256::new();
+    for field in [
+        b"xshell-protected-ipc-v1".as_slice(),
+        domain.as_bytes(),
+        sid.as_bytes(),
+        &path,
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    fn store() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::private_fs::ensure_dir(dir.path()).unwrap();
+        dir
+    }
+    #[test]
+    fn endpoints_bind_kind_profile_and_lossless_utf16_root() {
+        use std::os::windows::ffi::OsStringExt;
+        let dir = store();
+        let one = dir.path().join("one");
+        let two = dir.path().join(std::ffi::OsString::from_wide(&[0xd800]));
+        for p in [&one, &two] {
+            crate::private_fs::ensure_dir(p).unwrap();
+        }
+        let one = canonical_store(&one).unwrap();
+        let two = canonical_store(&two).unwrap();
+        let a = companion_endpoint(&one).unwrap();
+        assert_eq!(a, companion_endpoint(&one).unwrap());
+        assert_ne!(a, companion_endpoint(&two).unwrap());
+        assert_ne!(a, host_broker_endpoint(&one).unwrap());
+        assert_ne!(
+            host_broker_profile(&one).unwrap(),
+            host_broker_profile(&two).unwrap()
+        );
+        crate::pipe::check_pipe_name(&a).unwrap();
+    }
+    #[test]
+    fn private_directory_validation_refuses_broad_acl_without_rewriting_it() {
+        let dir = store();
+        let path = dir.path().join("caller-directory");
+        let sid = crate::pipe::current_user_sid()
+            .unwrap()
+            .to_string_sid()
+            .unwrap();
+        crate::private_fs::create_dir_with_sddl(&path, &format!("O:{sid}D:P(A;OICI;FA;;;WD)"))
+            .unwrap();
+        let before = crate::private_fs::security_sddl(&path).unwrap();
+        assert!(
+            private_dir(&path.canonicalize().unwrap()).is_err(),
+            "validation cannot make an arbitrary caller directory private"
+        );
+        assert_eq!(crate::private_fs::security_sddl(&path).unwrap(), before);
+    }
+    #[test]
+    fn junction_ancestor_is_refused_before_canonicalization() {
+        let dir = store();
+        let target = dir.path().join("target");
+        crate::private_fs::ensure_dir(&target.join("child")).unwrap();
+        let junction = dir.path().join("junction");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction fixture must execute, not skip");
+        assert!(canonical_store(&junction.join("child")).is_err());
+        std::fs::remove_dir(junction).unwrap();
+    }
+    #[test]
+    fn private_round_trip_collision_and_successor_after_shutdown() {
+        let dir = store();
+        let path = companion_endpoint(&canonical_store(dir.path()).unwrap()).unwrap();
+        let mut server = serve(path.clone(), |s: String, _| s).unwrap();
+        assert_eq!(exchange::<_, String>(&path, &"hello").unwrap(), "hello");
+        assert!(serve(path.clone(), |s: String, _| s).is_err());
+        server.shutdown();
+        let _successor = serve(path.clone(), |s: String, _| s).unwrap();
+        assert_eq!(
+            exchange::<_, String>(&path, &"successor").unwrap(),
+            "successor"
+        );
+    }
+    #[test]
+    fn malformed_oversized_and_partial_frames_never_dispatch_and_shutdown_drains() {
+        let dir = store();
+        let path = companion_endpoint(&canonical_store(dir.path()).unwrap()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut server = serve(path.clone(), move |s: String, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+            s
+        })
+        .unwrap();
+        for payload in [
+            u32::MAX.to_be_bytes().to_vec(),
+            [1_u32.to_be_bytes().as_slice(), b"!"].concat(),
+        ] {
+            let mut stream = protected_connect(&path, Duration::from_secs(1)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&payload).unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        }
+        let mut partial = protected_connect(&path, Duration::from_secs(1)).unwrap();
+        partial.write_all(&[0]).unwrap();
+        let start = Instant::now();
+        server.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}

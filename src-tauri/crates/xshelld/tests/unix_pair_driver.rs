@@ -142,7 +142,7 @@ impl Fixture {
         }
     }
     fn companion(&self) -> CompanionClient {
-        CompanionClient::new(self.paths.ring_dir.join("companion.sock"))
+        CompanionClient::for_store(&self.paths.ring_dir).unwrap()
     }
     fn chain(&self) -> RosterChain {
         let json: serde_json::Value = serde_json::from_slice(

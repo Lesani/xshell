@@ -67,11 +67,11 @@ pub(crate) enum PrivateRingFile {
     Keys,
     RosterHistory,
     PushRegistrations,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CompanionPolicy,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     StandaloneJournal,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     CompletionMailbox,
 }
 #[cfg(unix)]
@@ -354,7 +354,7 @@ impl Store {
             }
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn offer_lock(&self) -> Result<StoreLock, String> {
         let file = self.open_lock("ring-legacy-offer.lock")?;
         file.try_lock().map_err(|error| match error {
@@ -386,13 +386,13 @@ impl Store {
         Ok(offer)
     }
     /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
         self.offer_lock()
     }
     pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
-        #[cfg(unix)]
-        super::adoption::refuse_unresolved_standalone(self)?;
+        #[cfg(any(unix, windows))]
+        super::standalone_journal::refuse_unresolved_standalone(self)?;
         self.refuse_registered_binding()
     }
     pub(super) fn refuse_registered_binding(&self) -> Result<(), String> {
@@ -401,7 +401,7 @@ impl Store {
         }
         Ok(())
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn keys_locked(&self) -> Result<DeviceKeys, String> {
         match self.load_keys()? {
             Some(keys) => Ok(keys),
@@ -435,6 +435,17 @@ impl Store {
         // `xshell_core::private_fs`).
         #[cfg(windows)]
         {
+            // Validate the existing ancestor before recursive private creation can traverse it.
+            for ancestor in self.dir.ancestors() {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(_) => {
+                        xshell_core::server::no_reparse(ancestor)?;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             xshell_core::private_fs::ensure_dir(&self.dir)
         }
         #[cfg(unix)]
@@ -577,9 +588,9 @@ impl Store {
             JoinOrigin::Host => self.refuse_registered_join()?,
             #[cfg(unix)]
             JoinOrigin::Standalone { operation } => {
-                super::adoption::validate_standalone_install(self, operation, chain)?
+                super::standalone_journal::validate_standalone_install(self, operation, chain)?
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             JoinOrigin::Companion { operation } => {
                 super::companion::validate_install_locked(self, operation, chain)?
             }
@@ -856,7 +867,7 @@ pub(super) enum JoinOrigin {
     Standalone {
         operation: String,
     },
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Companion {
         operation: String,
     },
@@ -946,7 +957,7 @@ impl Ring {
     }
 
     /// The chain this Host trusts, if it is in a Ring.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn lock_trusted_chain_until<'a>(
         &'a self,
         budget: &xshell_core::local_ipc::RequestBudget,
@@ -957,7 +968,7 @@ impl Ring {
     /// Identity and evidence stay fixed through the local read/receipt; no network,
     /// session/event callback or join is allowed in the closure. Observations release
     /// Connector state before calling persistence, so no reverse cache lock is held.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn with_effective_chain_until<T>(
         &self,
         budget: &xshell_core::local_ipc::RequestBudget,
@@ -1007,6 +1018,8 @@ impl Ring {
 
     /// Unit-test coordination at the guarded local-read boundary; never authority.
     #[cfg(test)]
+    // Used only by the Unix-only adoption reconciliation tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn set_effective_query_hook(&self, hook: Box<dyn Fn() + Send>) {
         *self.effective_query_hook.lock().unwrap() = Some(hook);
     }
@@ -1217,6 +1230,8 @@ impl Ring {
         self.join_inner(tokens, expect, JoinOrigin::Host, Some(&budget))
     }
     #[cfg(test)]
+    // Used only by the Unix-only adoption reconciliation tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn test_host_join_until(
         &self,
         tokens: &[String],
@@ -1241,7 +1256,7 @@ impl Ring {
             Some(budget),
         )
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn join_accepted_companion(
         &self,
         tokens: &[String],
@@ -1655,6 +1670,7 @@ mod tests {
         assert!(read_private(&path, PrivateRingFile::Keys).is_err());
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
     }
+    #[cfg(unix)]
     #[test]
     fn private_files_refuse_symlinks_and_tighten_modes() {
         let t = tempfile::tempdir().unwrap();
