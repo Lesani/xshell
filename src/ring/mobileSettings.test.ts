@@ -24,6 +24,9 @@ function status(over: Partial<RingStatus> = {}): RingStatus {
     relayHosted: true,
     local: "daemon",
     hosts: [],
+    approval: "ready",
+    format: null,
+    busy: false,
     ...over,
   };
 }

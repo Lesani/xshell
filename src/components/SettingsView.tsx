@@ -4,9 +4,7 @@ import { hostInvoke } from "../hosts/hostInvoke";
 import { fmt } from "../hosts/strings";
 import type { HostConfig } from "../hosts/types";
 import { HostsSettings } from "./HostsSettings";
-import { MobileSettings } from "./MobileSettings";
-import { fmt as ringFmt } from "../ring/strings";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server, Smartphone } from "lucide-react";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -71,15 +69,19 @@ interface SettingsViewProps {
   showProjectStatsChart: boolean;
   onSetShowProjectStatsChart: (enabled: boolean) => void;
   updateInfo: UpdateInfo;
+  // Settings is the active view (it stays mounted while hidden).
+  visible?: boolean;
+  // Bumped by `ring:focus`: open Hosts and scroll to the Ring section.
+  focusRing?: number;
 }
 
-type Category = "appearance" | "agents" | "hosts" | "mobile" | "terminal" | "behavior" | "about";
+// The Ring (formerly its own Mobile category) is a section of Hosts (#87).
+type Category = "appearance" | "agents" | "hosts" | "terminal" | "behavior" | "about";
 
 const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "agents",     label: "Agents",     icon: Bot },
   { id: "hosts",      label: fmt("settings.nav.hosts"), icon: Server },
-  { id: "mobile",     label: ringFmt("settings.nav.mobile"), icon: Smartphone },
   { id: "terminal",   label: "Terminal",   icon: TerminalIcon },
   { id: "behavior",   label: "Behavior",   icon: SettingsIcon },
   { id: "about",      label: "About",      icon: Info },
@@ -181,8 +183,11 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo, visible: settingsVisible = true, focusRing = 0 }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
+  // `ring:focus` (and anything that used to open Mobile) opens Hosts at the Ring section.
+  useEffect(() => { if (focusRing) setActive("hosts"); }, [focusRing]);
+  const visible = settingsVisible && active === "hosts";
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
   // metrics toggles — there's no point letting users enable features that have no data
@@ -269,8 +274,7 @@ export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSa
             </>
           )}
 
-          {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} />}
-          {active === "mobile" && <MobileSettings />}
+          {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} ringVisible={visible} ringFocus={focusRing} />}
 
           {active === "agents" && (
             <>

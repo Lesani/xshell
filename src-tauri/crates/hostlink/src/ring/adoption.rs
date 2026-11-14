@@ -29,16 +29,24 @@ pub use reconcile::{
 };
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
+mod ui;
+pub use ui::ApprovalReadiness;
 
+/// See `DesktopRing::adoption_baseline`.
+pub(in crate::ring) type AdoptionBaseline =
+    Arc<std::sync::Mutex<Option<std::collections::HashSet<String>>>>;
 /// The one v2 membership-mutation reservation. Every v2 membership publisher holds it from
 /// its final predecessor validation through publication and accepted installation: the
 /// adoption controllers (Create, Join approval, Upgrade, completion, reconciliation) for
 /// their whole operation, v2 phone enrollment and v2 removal (`reserve_membership_mutation`)
 /// around their publication. It is not the commit lock, so a holder may wait on the Relay
-/// while Connector callbacks commit.
-pub(in crate::ring) struct AdoptionAdmission(Arc<AtomicBool>);
+/// while Connector callbacks commit. While held, `adoption_busy` reports busy; the baseline
+/// only scopes which durable adoption records approval readiness attributes to the live
+/// admission (a phone or removal reservation writes none, so readiness is unchanged).
+pub(in crate::ring) struct AdoptionAdmission(Arc<AtomicBool>, AdoptionBaseline);
 impl Drop for AdoptionAdmission {
     fn drop(&mut self) {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.0.store(false, Ordering::Release);
     }
 }
@@ -149,7 +157,20 @@ impl DesktopRing {
         self.adoption
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| AdoptionAdmission(self.adoption.clone()))
+            .map(|_| {
+                // Read-only: which records predate this admission. Unreadable: none is
+                // treated as live (safe: they stay unresolved).
+                let baseline = self
+                    .store
+                    .load_profile()
+                    .ok()
+                    .map(|(p, _)| p.as_ref().map(ui::record_operations).unwrap_or_default());
+                *self
+                    .adoption_baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = baseline;
+                AdoptionAdmission(self.adoption.clone(), self.adoption_baseline.clone())
+            })
     }
 
     /// The membership-mutation reservation for a short publisher: polls (holding no Ring
@@ -425,6 +446,22 @@ impl DesktopRing {
             &CreateConfirmationLease,
         ) -> Result<CreateDecision, String>,
     ) -> Result<AdoptionOutcome, String> {
+        let relay = self.cfg.default_relay_url.clone();
+        self.create_computer_on(client, &relay, confirm)
+    }
+
+    /// [`DesktopRing::create_computer`] on the Relay `relay_url` (the user's own Relay chosen
+    /// before Create), bound into the genesis proposal.
+    pub fn create_computer_on(
+        &self,
+        client: &CompanionClient,
+        relay_url: &str,
+        confirm: impl FnOnce(
+            &ConsentPreview,
+            &CreateConfirmationLease,
+        ) -> Result<CreateDecision, String>,
+    ) -> Result<AdoptionOutcome, String> {
+        xshell_protocol::ring::url::RelayUrl::parse(relay_url).map_err(|e| e.to_string())?;
         let _admission = self.reserve_adoption()?;
         if !self.pairing_ipc_owner() {
             return Err("another process owns Create".into());
@@ -455,20 +492,16 @@ impl DesktopRing {
             target: profile.target(),
         };
         let ring_id = RingId::derive(&keys.sign_key());
-        let activity_key = RingClient::activity_key(
-            &self.cfg.default_relay_url,
-            &ring_id,
-            None,
-            self.cfg.timeouts.connect,
-        )
-        .map_err(|e| e.to_string())?;
+        let activity_key =
+            RingClient::activity_key(relay_url, &ring_id, None, self.cfg.timeouts.connect)
+                .map_err(|e| e.to_string())?;
         let at = now();
         let mut proposal = Roster {
             v: 2,
             ring_id: ring_id.clone(),
             version: 1,
             prev: None,
-            relay_url: self.cfg.default_relay_url.clone(),
+            relay_url: relay_url.to_string(),
             signed_by: keys.sign_key(),
             issued_at: at,
             members: intent

@@ -6273,6 +6273,7 @@ dependencies = [
  "xshell-hostlink",
  "xshell-pairing-access",
  "xshell-protocol",
+ "zeroize",
 ]
 
 [[package]]

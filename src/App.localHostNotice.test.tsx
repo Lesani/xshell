@@ -180,6 +180,8 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
       case "local_host_info": return localInfo;
       // Daemon startup reads this even with no legacy Tabs. Keep migration real.
       case "local_migration_journal_read": return null;
+      // Settings → Hosts mounts the Ring section (#87).
+      case "ring_status": case "ring_join_overview": return null;
       case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return snapshots;

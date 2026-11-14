@@ -1,8 +1,8 @@
-//! Settings → Mobile: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status`,
-//! `ring_enable`, `ring_set_relay_url`, `ring_claim_host` and `ring_remove_member` (#22); the
-//! event `ring:status`.
-//! Pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`, `ring_pair_computer` and
-//! `ring_pair_cancel`; the event `ring:pairing`.
+//! Settings → Hosts → Ring: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status`,
+//! `ring_enable` (only to start over after unreadable settings), `ring_set_relay_url`,
+//! `ring_claim_host` and `ring_remove_member` (#22); the event `ring:status`.
+//! Phone pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`; the event
+//! `ring:pairing`. Computer adoption (#87): [`join`].
 //!
 //! Every Host's Daemon (the Local Host's and each Remote Host's) joins the Ring whenever
 //! its Host connects: the Host Observer records the connection in [`HOST_SYNC`], and
@@ -16,6 +16,8 @@ use xshell_hostlink::ring::{
 };
 use xshell_hostlink::{HostStatus, LOCAL_HOST_ID};
 use xshell_protocol::ring::SignKey;
+
+pub mod join;
 
 /// The one the app's Host Observer feeds.
 pub static HOST_SYNC: HostSync = HostSync::new();
@@ -36,10 +38,28 @@ pub struct RingStatus {
     pub local: &'static str,
     /// The Remote Hosts not in the Ring, and why.
     pub hosts: Vec<HostRingState>,
+    /// Whether this Desktop can add computers: `ready`, `needs-upgrade`, `needs-completion`,
+    /// `unavailable` (an upgrade is needed but cannot run here), `unresolved` (earlier
+    /// adoption work needs reconciliation) or `none` (not in a Ring).
+    pub approval: &'static str,
+    /// The retained Ring's Roster format (1 or 2): a v2 Ring's Relay is fixed (shown
+    /// read-only).
+    pub format: Option<u8>,
+    /// An adoption, approval or registration runs here now: nothing new can start. Not
+    /// durable uncertainty (that is `approval: unresolved`).
+    pub busy: bool,
 }
 
 pub struct RingState {
     pub worker: Arc<SyncWorker>,
+    pub joins: Arc<join::JoinRegistry>,
+    /// `RingStatus.approval`, cached: computed by commands and the owner thread, never inside
+    /// the RingObserver callback.
+    pub approval: std::sync::Mutex<&'static str>,
+    /// `RingStatus.format`, cached the same way.
+    pub format: std::sync::Mutex<Option<u8>>,
+    /// `RingStatus.busy`, cached the same way.
+    pub busy: std::sync::Mutex<bool>,
     _pairing_ipc: Option<xshell_pairing_access::local::Server>,
 }
 
@@ -69,6 +89,16 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
             crate::hosts::local::LocalMode::InProcess { .. }
         )
     });
+    let approval = app
+        .try_state::<RingState>()
+        .map(|r| *r.approval.lock().unwrap_or_else(|e| e.into_inner()))
+        .unwrap_or("none");
+    let format = app
+        .try_state::<RingState>()
+        .and_then(|r| *r.format.lock().unwrap_or_else(|e| e.into_inner()));
+    let busy = app
+        .try_state::<RingState>()
+        .is_some_and(|r| *r.busy.lock().unwrap_or_else(|e| e.into_inner()));
     let worker = app.try_state::<RingState>().map(|r| r.worker.clone());
     let too_old = worker
         .as_ref()
@@ -90,6 +120,9 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
             "daemon"
         },
         hosts,
+        approval,
+        format,
+        busy,
     }
 }
 
@@ -154,21 +187,48 @@ pub fn setup(app: &AppHandle) {
     {
         let owner_ring = Arc::downgrade(&ring);
         let focus_app = app.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let Some(ring) = owner_ring.upgrade() else {
-                break;
-            };
-            if ring.is_quitting() {
-                break;
-            }
-            if ring.take_administration_focus_request() {
-                let app = focus_app.clone();
-                let _ = focus_app.run_on_main_thread(move || {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.set_focus();
+        std::thread::spawn(move || {
+            let mut tick = 0u32;
+            let mut last_owner = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let Some(ring) = owner_ring.upgrade() else {
+                    break;
+                };
+                if ring.is_quitting() {
+                    break;
+                }
+                // Offers `xshelld pair` started on this computer get the pairing window card.
+                join::track_cli_joins(&focus_app, &ring);
+                if ring.take_administration_focus_request() {
+                    let app = focus_app.clone();
+                    let _ = focus_app.run_on_main_thread(move || {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.set_focus();
+                        }
+                    });
+                    // Open Settings → Hosts → Ring, where the card is.
+                    let _ = focus_app.emit("ring:focus", ());
+                }
+                tick = tick.wrapping_add(1);
+                if tick.is_multiple_of(10) {
+                    if let Some(r) = focus_app.try_state::<RingState>() {
+                        let before = (
+                            *r.approval.lock().unwrap_or_else(|e| e.into_inner()),
+                            *r.busy.lock().unwrap_or_else(|e| e.into_inner()),
+                        );
+                        let approval = join::refresh_approval(&focus_app);
+                        let busy = *r.busy.lock().unwrap_or_else(|e| e.into_inner());
+                        // Election ownership can move between windows with no membership
+                        // (an unpaired takeover): the status carries it to the page.
+                        let owner = ring.pairing_ipc_owner();
+                        if (approval, busy) != before || owner != last_owner {
+                            last_owner = owner;
+                            let _ =
+                                focus_app.emit("ring:status", status_of(&focus_app, ring.view()));
+                        }
                     }
-                });
+                }
             }
         });
     }
@@ -210,8 +270,13 @@ pub fn setup(app: &AppHandle) {
     }
     app.manage(RingState {
         worker: worker.clone(),
+        joins: Arc::default(),
+        approval: std::sync::Mutex::new("none"),
+        format: std::sync::Mutex::new(None),
+        busy: std::sync::Mutex::new(false),
         _pairing_ipc: pairing_ipc.ok(),
     });
+    join::refresh_approval(app);
     // Hosts may be connected already: record them before attaching, so the start
     // reconciles them.
     if let Some(h) = app.try_state::<crate::hosts::Hosts>() {
@@ -249,7 +314,11 @@ async fn run<T: Send + 'static>(
 #[tauri::command]
 pub async fn ring_status(app: AppHandle) -> Result<RingStatus, String> {
     let w = worker(&app)?;
-    run(move || Ok(status_of(&app, w.ring.view()))).await
+    run(move || {
+        join::refresh_approval(&app);
+        Ok(status_of(&app, w.ring.view()))
+    })
+    .await
 }
 
 /// Enables Mobile access: creates the Ring with this computer's Daemon when it can join;
@@ -263,6 +332,7 @@ pub async fn ring_enable(app: AppHandle, start_over: Option<bool>) -> Result<Rin
         let view = w.ring.enable(local, start_over.unwrap_or(false))?;
         // Every connected Daemon joins (and is added, if it is not in the Ring yet).
         HOST_SYNC.poke_all();
+        join::refresh_approval(&app);
         Ok(status_of(&app, view))
     })
     .await
@@ -348,11 +418,6 @@ pub struct PhoneStart {
     pub expires_at: u64,
 }
 
-#[derive(Serialize, Clone)]
-pub struct PairingStarted {
-    pub operation: uuid::Uuid,
-}
-
 /// The `ring:pairing` event: `{flow, state, name?, role?, code?}`.
 #[derive(Serialize, Clone)]
 struct PairingPayload<'a> {
@@ -407,35 +472,6 @@ pub async fn ring_pair_phone_cancel(app: AppHandle, operation: uuid::Uuid) -> Re
     let w = worker(&app)?;
     run(move || {
         w.ring.cancel_pairing_owned(PairingFlow::Phone, operation);
-        Ok(())
-    })
-    .await
-}
-
-/// Adds the computer that `xshelld pair` shows `code` on. Returns once the code is valid;
-/// progress arrives as `ring:pairing`.
-#[tauri::command]
-pub async fn ring_pair_computer(
-    app: AppHandle,
-    code: String,
-    operation: uuid::Uuid,
-) -> Result<PairingStarted, String> {
-    let w = worker(&app)?;
-    let obs = pairing_observer(&app, operation);
-    run(move || {
-        w.ring
-            .pair_computer_owned(operation, &code, obs)
-            .map(|()| PairingStarted { operation })
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn ring_pair_cancel(app: AppHandle, operation: uuid::Uuid) -> Result<(), String> {
-    let w = worker(&app)?;
-    run(move || {
-        w.ring
-            .cancel_pairing_owned(PairingFlow::Computer, operation);
         Ok(())
     })
     .await
