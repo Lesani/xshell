@@ -57,7 +57,7 @@ use std::time::Instant;
 use xshell_protocol::pairing_access::enrollment::*;
 use xshell_protocol::pairing_access::{AccessError, MobileRole, ReachabilityPurpose, Scope};
 use xshell_protocol::ring::pairing::{
-    JoinRequest, Joined, PairCode, PairError, PairRefusal, PairSecret, PairingOffer,
+    JoinRequest, Joined, OfferHead, PairCode, PairError, PairRefusal, PairSecret, PairingOffer,
 };
 use xshell_protocol::ring::relay::pair::{
     host_pairing, Cancel, HostRequest, PairOptions, PairPipe, PairingHost,
@@ -2180,6 +2180,9 @@ impl DesktopRing {
             .as_ref()
             .map(|p| Duration::from_secs(p.expires_at.saturating_sub(now())).min(self.cfg.pair_ttl))
             .unwrap_or(self.cfg.pair_ttl);
+        // A v2 (membership) head pairs through the v2 adoption transport: the offer then
+        // carries the head anchor and only a v2-capable phone accepts it.
+        let v2 = head.roster().v == 2;
         let offer = PairingOffer {
             ring_id: head.ring_id().clone(),
             relay_url: head.roster().relay_url.clone(),
@@ -2187,6 +2190,10 @@ impl DesktopRing {
             noise_key: s.keys.noise_key(),
             secret: secret.clone(),
             expires_at: now() + ttl.as_secs(),
+            head: v2.then(|| OfferHead {
+                version: head.version(),
+                hash: head.hash(),
+            }),
         };
         let mut until = Instant::now() + ttl;
         if enrollment.is_some() {
@@ -2228,6 +2235,7 @@ impl DesktopRing {
         let me = self.me.clone();
         let c = cancel.clone();
         let ring_id = offer.ring_id.clone();
+        let offer_expires_at = offer.expires_at;
         let spawned = std::thread::Builder::new()
             .name("ring-pair-phone".into())
             .spawn(move || {
@@ -2235,6 +2243,19 @@ impl DesktopRing {
                 observer.pairing(PairingFlow::Phone, &PairingEvent::Waiting);
                 let r = pipe.wait_peer(until, Some(&c)).and_then(|()| {
                     let ring = me.upgrade().ok_or(PairError::Cancelled)?;
+                    if v2 {
+                        return ring.host_mobile_v2(
+                            pipe,
+                            &s.keys,
+                            &secret,
+                            &ring_id,
+                            until,
+                            offer_expires_at,
+                            &c,
+                            &s.chain.head().hash(),
+                            enrollment.as_ref().map(|p| (operation, p)),
+                        );
+                    }
                     ring.host(
                         pipe,
                         &s.keys,
@@ -2505,6 +2526,225 @@ impl DesktopRing {
         )
     }
 
+    /// The Desktop's side of a v2 phone pairing (#87): the phone's possession-proven
+    /// `Mobile` intent becomes an unsigned `Enroll` proposal frozen at the offer's head on the
+    /// Connector's creator lane, the phone signs its own Pairing consent, and this Desktop
+    /// signs, publishes once and installs the Relay-accepted chain. The checks of
+    /// [`Self::add_paired_member_scoped`] apply ([`v2_phone_admission`]). An exact member
+    /// retrying with retained keys gets an authenticated "already enrolled" completion (no
+    /// new version); every refusal reaches the phone as a typed answer.
+    #[allow(clippy::too_many_arguments)]
+    fn host_mobile_v2(
+        &self,
+        pipe: PairPipe,
+        keys: &Arc<DeviceKeys>,
+        secret: &PairSecret,
+        ring_id: &RingId,
+        until: Instant,
+        offer_expires_at: u64,
+        cancel: &Cancel,
+        initial_head: &str,
+        enrollment: Option<(uuid::Uuid, &EnrollmentParameters)>,
+    ) -> Result<JoinRequest, PairError> {
+        use xshell_protocol::ring::pairing::adoption::{enroll_proposal, JoinTarget};
+        use xshell_protocol::ring::relay::connector::ProposalConnection;
+        use xshell_protocol::ring::relay::pair::{
+            approve_mobile_adoption, MobileHostRequest, Prepared,
+        };
+        use xshell_protocol::ring::relay::VerifiedProposal;
+        let refused = |r: PairRefusal| PairError::Refused(r);
+        let lane = Mutex::new(None::<Arc<ProposalConnection>>);
+        let joining = Mutex::new(None::<JoinRequest>);
+        let result = approve_mobile_adoption(
+            pipe,
+            &MobileHostRequest {
+                keys,
+                secret,
+                ring_id,
+                name: &self.cfg.name,
+                until,
+                offer_expires_at,
+            },
+            Some(cancel),
+            |intent, hash| {
+                let JoinTarget::Mobile { phone } = &intent.target else {
+                    return Err(refused(PairRefusal::Role));
+                };
+                let req = JoinRequest {
+                    role: Role::Mobile,
+                    sign_key: phone.sign_key,
+                    noise_key: phone.noise_key,
+                    name: phone.name.clone(),
+                };
+                *joining.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.clone());
+                let live = |stage: &dyn Fn() -> bool| -> Result<(), PairError> {
+                    if cancel.load(Ordering::Acquire) || self.lock().quitting {
+                        return Err(refused(PairRefusal::Cancelled));
+                    }
+                    if Instant::now() >= until || now() >= offer_expires_at || stage() {
+                        return Err(refused(PairRefusal::Expired));
+                    }
+                    Ok(())
+                };
+                let scope_expired = || enrollment.is_some_and(|(_, p)| now() >= p.expires_at);
+                live(&scope_expired)?;
+                let state = self
+                    .tx(|cur, _| Ok((None, cur)))
+                    .ok()
+                    .flatten()
+                    .ok_or(refused(PairRefusal::NotCommitted))?;
+                match v2_phone_admission(
+                    state.chain.head(),
+                    keys,
+                    &req,
+                    initial_head,
+                    enrollment.map(|(_, p)| p),
+                )
+                .map_err(refused)?
+                {
+                    PhoneAdmission::Enrolled(joined) => {
+                        if let Some((operation, _)) = enrollment {
+                            let head = ChainHead {
+                                version: joined.version,
+                                hash: joined.hash.clone(),
+                            };
+                            self.note_enrollment(
+                                operation,
+                                EnrollmentStage::DesktopCommitted,
+                                EnrollmentEvidence::DesktopCommitted { head: head.clone() },
+                            );
+                            self.note_enrollment(
+                                operation,
+                                EnrollmentStage::PublicationAcknowledged,
+                                EnrollmentEvidence::PublicationAcknowledged { head },
+                            );
+                        }
+                        return Ok(Prepared::Enrolled(joined));
+                    }
+                    PhoneAdmission::Enroll => {}
+                }
+                // The creator lane must sit exactly at the offer's head: a head that moved
+                // is stale; no lane in time means nothing was (or will be) committed.
+                self.hurry_connection();
+                let ready_until = until.min(Instant::now() + self.cfg.pair_publish_wait);
+                let (chain, captured) = loop {
+                    live(&scope_expired)?;
+                    if let Ok((chain, captured)) = self.proposal_snapshot() {
+                        if chain.head().hash() != initial_head {
+                            return Err(refused(PairRefusal::Stale));
+                        }
+                        break (chain, captured);
+                    }
+                    if Instant::now() >= ready_until {
+                        return Err(refused(PairRefusal::NotCommitted));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let proposal = enroll_proposal(chain.head(), keys.sign_key(), intent, now())?;
+                let captured = Arc::new(captured);
+                *lane.lock().unwrap_or_else(|e| e.into_inner()) = Some(captured.clone());
+                let handle = captured
+                    .create(intent, hash, &proposal)
+                    .map_err(|_| refused(PairRefusal::NotCommitted))?;
+                Ok(Prepared::Proposal(Box::new(VerifiedProposal {
+                    chain,
+                    proposal,
+                    handle,
+                })))
+            },
+            |signed| {
+                let captured = lane
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .ok_or(refused(PairRefusal::NotCommitted))?;
+                if cancel.load(Ordering::Acquire) || self.lock().quitting {
+                    return Err(refused(PairRefusal::Cancelled));
+                }
+                if Instant::now() >= until
+                    || now() >= offer_expires_at
+                    || enrollment.is_some_and(|(_, p)| now() >= p.expires_at)
+                {
+                    return Err(refused(PairRefusal::Expired));
+                }
+                if captured.check_current().is_err() {
+                    let moved = self
+                        .adoption_owner_connector()
+                        .is_some_and(|c| c.chain().head().hash() != initial_head);
+                    return Err(refused(if moved {
+                        PairRefusal::Stale
+                    } else {
+                        PairRefusal::NotCommitted
+                    }));
+                }
+                self.publish_wait_hook();
+                // From here the candidate may be at the Relay: any failure is uncertain.
+                captured
+                    .publish_once(signed)
+                    .map_err(|_| refused(PairRefusal::PublicationUncertain))?;
+                let accepted = captured
+                    .read_accepted(signed)
+                    .map_err(|_| refused(PairRefusal::PublicationUncertain))?;
+                self.install_accepted(&accepted)
+                    .map_err(|_| refused(PairRefusal::PublicationUncertain))?;
+                if let Some((operation, _)) = enrollment {
+                    let head = ChainHead {
+                        version: signed.version(),
+                        hash: signed.hash(),
+                    };
+                    self.note_enrollment(
+                        operation,
+                        EnrollmentStage::DesktopCommitted,
+                        EnrollmentEvidence::DesktopCommitted { head: head.clone() },
+                    );
+                    self.note_enrollment(
+                        operation,
+                        EnrollmentStage::PublicationAcknowledged,
+                        EnrollmentEvidence::PublicationAcknowledged { head },
+                    );
+                }
+                Ok(Joined {
+                    ring_id: signed.ring_id().clone(),
+                    relay_url: signed.roster().relay_url.clone(),
+                    version: signed.version(),
+                    hash: signed.hash(),
+                    signed_by: signed.roster().signed_by,
+                })
+            },
+            |handle| {
+                if let Some(lane) = lane.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    let _ = lane.cancel(handle);
+                }
+            },
+        );
+        result?;
+        joining
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .ok_or(PairError::Cancelled)
+    }
+
+    /// Installs a Relay-accepted extension of the held chain (committed, adopted, shown).
+    fn install_accepted(&self, accepted: &RosterChain) -> Result<(), String> {
+        {
+            let _c = self.lock_commit();
+            let s = self.tx(|cur, _| {
+                let mut s = cur.ok_or("no Ring")?;
+                s.chain = s
+                    .chain
+                    .extended(accepted.versions())
+                    .map_err(|e| e.to_string())?
+                    .0;
+                s.retarget_farewells();
+                Ok((Some(s.clone()), s))
+            })?;
+            self.hook();
+            self.adopt(s);
+        }
+        self.emit();
+        Ok(())
+    }
+
     /// Adds a paired device: a new Roster version, committed, adopted and published, and
     /// acknowledged by the Relay. The same keys with the same role again are a member
     /// already, not an error. Waits for the Relay to hold the version (for the connection
@@ -2558,6 +2798,11 @@ impl DesktopRing {
                 }
                 let head = s.chain.head();
                 if head.hash() != initial_head {
+                    return Ok((None, Err(PairRefusal::PublishFailed)));
+                }
+                // `next()` is v1 only: a v2 head is never extended here (not even by the
+                // exact-key retry below); phones pair through `host_mobile_v2`.
+                if head.roster().v != 1 {
                     return Ok((None, Err(PairRefusal::PublishFailed)));
                 }
                 if let Some(m) = head.member(&req.sign_key) {
@@ -3165,6 +3410,74 @@ impl PairingHost for Adder<'_> {
             self.enrollment,
         )
     }
+}
+
+/// What a v2 head allows for a possession-proven phone ([`DesktopRing::host_mobile_v2`]).
+#[derive(Debug, PartialEq)]
+enum PhoneAdmission {
+    /// Not a member yet: build an `Enroll` proposal.
+    Enroll,
+    /// Already this exact Mobile unit in the accepted head: answer "already enrolled".
+    Enrolled(Joined),
+}
+
+/// The checks of `add_paired_member_scoped` for a v2 head, as typed refusals: the scoped
+/// enrollment parameters, the offer's initial head (`Stale`), a member with these keys
+/// (exact own Mobile unit → recovery, anything else → `Duplicate`), a Noise key in use
+/// (`Duplicate`) and `MAX_MEMBERS` (`Full`).
+fn v2_phone_admission(
+    head: &SignedRoster,
+    approver: &DeviceKeys,
+    req: &JoinRequest,
+    initial_head: &str,
+    enrollment: Option<&EnrollmentParameters>,
+) -> Result<PhoneAdmission, PairRefusal> {
+    if let Some(p) = enrollment {
+        if req.sign_key != p.recipient.signing
+            || req.noise_key != p.recipient.noise
+            || req.role != Role::Mobile
+            || req.name != p.device_name
+            || approver.sign_key() != p.approver.signing
+            || approver.noise_key() != p.approver.noise
+            || head.ring_id() != &p.ring
+            || head.roster().relay_url != p.relay
+        {
+            return Err(PairRefusal::Duplicate);
+        }
+    }
+    if head.roster().v != 2 || head.hash() != initial_head {
+        return Err(PairRefusal::Stale);
+    }
+    if let Some(m) = head.member(&req.sign_key) {
+        let own_unit = head.roster().membership().is_ok_and(|m| {
+            m.unit_for(&req.sign_key).is_some_and(|u| {
+                u.kind == xshell_protocol::ring::membership::EnrollmentKind::Mobile
+                    && u.members == [req.sign_key]
+            })
+        });
+        if m.noise_key != req.noise_key || m.role != Role::Mobile || !own_unit {
+            return Err(PairRefusal::Duplicate);
+        }
+        return Ok(PhoneAdmission::Enrolled(Joined {
+            ring_id: head.ring_id().clone(),
+            relay_url: head.roster().relay_url.clone(),
+            version: head.version(),
+            hash: head.hash(),
+            signed_by: head.roster().signed_by,
+        }));
+    }
+    if head
+        .roster()
+        .members
+        .iter()
+        .any(|m| m.noise_key == req.noise_key)
+    {
+        return Err(PairRefusal::Duplicate);
+    }
+    if head.roster().members.len() >= MAX_MEMBERS {
+        return Err(PairRefusal::Full);
+    }
+    Ok(PhoneAdmission::Enroll)
 }
 
 fn event_of(r: Result<JoinRequest, PairError>) -> PairingEvent {
@@ -4965,6 +5278,8 @@ mod tests {
         let offer = ring.pair_phone(obs.clone()).unwrap();
         assert!(offer.payload.starts_with("xsp1."));
         assert!(offer.expires_at > now());
+        // A v1 Ring keeps the v1 QR (no head anchor) and the v1 flow.
+        assert!(PairingOffer::parse(&offer.payload).unwrap().head.is_none());
         let phone = Arc::new(DeviceKeys::generate().unwrap());
         let chain = scan(&offer.payload, &phone).unwrap();
         assert_eq!(
@@ -4986,6 +5301,187 @@ mod tests {
         let again = scan(&offer.payload, &Arc::new(DeviceKeys::generate().unwrap()));
         assert!(again.is_err());
         ring.quit();
+    }
+
+    /// A v2 head: an approving Desktop `a`, `extra` Daemons, and a phone `p` as its own
+    /// Mobile unit.
+    fn v2_head(extra: usize) -> (DeviceKeys, DeviceKeys, SignedRoster) {
+        use xshell_protocol::ring::membership::{
+            Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+        };
+        let a = DeviceKeys::from_seeds(&[1; 32], &[2; 32]);
+        let p = DeviceKeys::from_seeds(&[3; 32], &[4; 32]);
+        let daemons: Vec<DeviceKeys> = (0..extra)
+            .map(|i| DeviceKeys::from_seeds(&[10 + i as u8; 32], &[200 - i as u8; 32]))
+            .collect();
+        let g = SignedRoster::genesis(&a, a.noise_key(), "desk", "ws://127.0.0.1:9", 100).unwrap();
+        let mut r = g.roster().clone();
+        r.members.push(Member::new(
+            "phone",
+            Role::Mobile,
+            p.sign_key(),
+            p.noise_key(),
+            101,
+        ));
+        for (i, d) in daemons.iter().enumerate() {
+            r.members.push(Member::new(
+                &format!("d{i}"),
+                Role::Daemon,
+                d.sign_key(),
+                d.noise_key(),
+                101,
+            ));
+        }
+        r.v = 2;
+        r.version = 2;
+        r.prev = Some(g.hash());
+        r.issued_at = 101;
+        let unit = |n: usize, kind, k: &DeviceKeys| Enrollment {
+            id: xshell_protocol::ring::b64::encode(&[n as u8 + 1; 32]),
+            kind,
+            members: vec![k.sign_key()],
+            enrolled_at: 101,
+        };
+        let mut enrollments = vec![
+            unit(0, EnrollmentKind::LegacyDesktop, &a),
+            unit(1, EnrollmentKind::Mobile, &p),
+        ];
+        for (i, d) in daemons.iter().enumerate() {
+            enrollments.push(unit(i + 2, EnrollmentKind::Daemon, d));
+        }
+        r.set_membership(&Membership {
+            enrollments,
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: Some(2_592_000),
+                activity_key: DeviceKeys::from_seeds(&[99; 32], &[98; 32]).sign_key(),
+            },
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let head = r.sign(&a).unwrap();
+        (a, p, head)
+    }
+
+    fn phone_req(k: &DeviceKeys) -> JoinRequest {
+        JoinRequest {
+            role: Role::Mobile,
+            sign_key: k.sign_key(),
+            noise_key: k.noise_key(),
+            name: "phone".into(),
+        }
+    }
+
+    #[test]
+    fn v2_phone_admission_keeps_the_v1_pairing_checks_as_typed_refusals() {
+        let (a, p, head) = v2_head(1);
+        let fresh = DeviceKeys::from_seeds(&[40; 32], &[41; 32]);
+        let initial = head.hash();
+        assert_eq!(
+            v2_phone_admission(&head, &a, &phone_req(&fresh), &initial, None),
+            Ok(PhoneAdmission::Enroll)
+        );
+        // The offer was issued at another head: stale, nothing committed.
+        assert_eq!(
+            v2_phone_admission(&head, &a, &phone_req(&fresh), "other", None),
+            Err(PairRefusal::Stale)
+        );
+        // Already this exact Mobile unit: authenticated recovery with the accepted head.
+        let Ok(PhoneAdmission::Enrolled(j)) =
+            v2_phone_admission(&head, &a, &phone_req(&p), &initial, None)
+        else {
+            panic!("exact member must recover");
+        };
+        assert_eq!((j.version, j.hash.clone()), (head.version(), head.hash()));
+        assert_eq!(j.signed_by, a.sign_key());
+        // The same signing key under another Noise key, or as another role: duplicate.
+        let mut changed = phone_req(&p);
+        changed.noise_key = fresh.noise_key();
+        assert_eq!(
+            v2_phone_admission(&head, &a, &changed, &initial, None),
+            Err(PairRefusal::Duplicate)
+        );
+        let daemon = head
+            .roster()
+            .members
+            .iter()
+            .find(|m| m.role == Role::Daemon)
+            .unwrap()
+            .clone();
+        let as_daemon = JoinRequest {
+            role: Role::Mobile,
+            sign_key: daemon.sign_key,
+            noise_key: daemon.noise_key,
+            name: "phone".into(),
+        };
+        assert_eq!(
+            v2_phone_admission(&head, &a, &as_daemon, &initial, None),
+            Err(PairRefusal::Duplicate)
+        );
+        // A Noise key in use under another signing key: duplicate.
+        let mut noise = phone_req(&fresh);
+        noise.noise_key = p.noise_key();
+        assert_eq!(
+            v2_phone_admission(&head, &a, &noise, &initial, None),
+            Err(PairRefusal::Duplicate)
+        );
+    }
+
+    #[test]
+    fn v2_phone_admission_refuses_a_full_ring_and_a_v1_head() {
+        let (a, _, head) = v2_head(MAX_MEMBERS - 2);
+        assert_eq!(head.roster().members.len(), MAX_MEMBERS);
+        let fresh = DeviceKeys::from_seeds(&[250; 32], &[251; 32]);
+        assert_eq!(
+            v2_phone_admission(&head, &a, &phone_req(&fresh), &head.hash(), None),
+            Err(PairRefusal::Full)
+        );
+        let v1 = SignedRoster::genesis(&a, a.noise_key(), "desk", "ws://127.0.0.1:9", 100).unwrap();
+        assert_eq!(
+            v2_phone_admission(&v1, &a, &phone_req(&fresh), &v1.hash(), None),
+            Err(PairRefusal::Stale)
+        );
+    }
+
+    #[test]
+    fn v2_phone_admission_holds_a_scoped_enrollment_to_its_parameters() {
+        let (a, _, head) = v2_head(0);
+        let fresh = DeviceKeys::from_seeds(&[40; 32], &[41; 32]);
+        let identity = |k: &DeviceKeys| RecipientIdentity {
+            signing: k.sign_key(),
+            noise: k.noise_key(),
+        };
+        let parameters = EnrollmentParameters {
+            ring: head.ring_id().clone(),
+            approver: identity(&a),
+            recipient: identity(&fresh),
+            relay: head.roster().relay_url.clone(),
+            role: MobileRole::Mobile,
+            device_name: "phone".into(),
+            initial_head: ChainHead {
+                version: head.version(),
+                hash: head.hash(),
+            },
+            expires_at: now() + 60,
+        };
+        assert_eq!(
+            v2_phone_admission(
+                &head,
+                &a,
+                &phone_req(&fresh),
+                &head.hash(),
+                Some(&parameters)
+            ),
+            Ok(PhoneAdmission::Enroll)
+        );
+        let other = DeviceKeys::from_seeds(&[42; 32], &[43; 32]);
+        let mut renamed = phone_req(&fresh);
+        renamed.name = "another".into();
+        for req in [phone_req(&other), renamed] {
+            assert_eq!(
+                v2_phone_admission(&head, &a, &req, &head.hash(), Some(&parameters)),
+                Err(PairRefusal::Duplicate)
+            );
+        }
     }
 
     #[test]

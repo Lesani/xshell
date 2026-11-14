@@ -1014,45 +1014,12 @@ impl DesktopRing {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 };
-                let at = now();
-                let mut proposal = chain.head().roster().clone();
-                proposal.version += 1;
-                proposal.prev = Some(chain.head().hash());
-                proposal.signed_by = stored.keys.sign_key();
-                proposal.issued_at = at;
-                for (identity, role) in intent.target.identities() {
-                    proposal.members.push(Member::new(
-                        &identity.name,
-                        role,
-                        identity.sign_key,
-                        identity.noise_key,
-                        at,
-                    ));
-                }
-                let mut membership = proposal
-                    .membership()
-                    .map_err(|e| PairError::Payload(e.to_string()))?;
-                membership.enrollments.push(Enrollment {
-                    id: intent.operation.clone(),
-                    kind: match intent.target {
-                        xshell_protocol::ring::pairing::adoption::JoinTarget::Computer { .. } => EnrollmentKind::Computer,
-                        xshell_protocol::ring::pairing::adoption::JoinTarget::StandaloneDaemon { .. } => EnrollmentKind::Daemon,
-                    },
-                    members: intent
-                        .target
-                        .identities()
-                        .iter()
-                        .map(|(identity, _)| identity.sign_key)
-                        .collect(),
-                    enrolled_at: at,
-                });
-                membership.change = RosterChange::Enroll {
-                    enrollment_id: intent.operation.clone(),
-                    proofs: vec![],
-                };
-                proposal.set_membership(&membership);
-                verify_enroll_proposal(chain.head(), &proposal)
-                    .map_err(|e| PairError::Payload(e.to_string()))?;
+                let proposal = xshell_protocol::ring::pairing::adoption::enroll_proposal(
+                    chain.head(),
+                    stored.keys.sign_key(),
+                    intent,
+                    now(),
+                )?;
                 self.store
                     .transact_profile(|profile, _| {
                         let mut profile = profile.ok_or("retained approver missing")?;
