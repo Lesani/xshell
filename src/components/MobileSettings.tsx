@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useReducer, useRef, useState } from "react";
 import { Monitor, Smartphone, Trash2 } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeHint, roleKey, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
+import { canClaim, canEnable, canRemove, canSave, connectionLine, errorText, hostLine, initialForm, lastSeenLine, farewellLines, localLine, relayHost, quotaLine, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, removalNote, removalReducer, REMOVAL_IDLE, memberRoleKey, removeConfirm, removeHint, startsOver, targetUrl, urlError, type RelayForm, type Removal } from "../ring/mobileSettings";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { canSubmit, codeError, COMPUTER_IDLE, computerDesc, computerLine, computerReducer, type ComputerAction, type ComputerState, expiresLine, failureLine, formatCode, normalizeCode, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects } from "../ring/pairing";
 import { useRing, type PairingEvents } from "../ring/useRing";
@@ -193,7 +193,7 @@ function MemberRow({ m, s, removing, onRemove }: { m: MemberView; s: RingStatus;
         <div className="host-row-title">
           <span className="host-row-name">{m.name}</span>
           <span className="host-row-target">
-            {fmt(roleKey(m.role))}
+            {fmt(memberRoleKey(m))}
             {m.thisApp ? ` · ${fmt("mobile.member.thisApp")}` : ""}
             {m.thisComputer ? ` · ${fmt("mobile.member.thisComputer")}` : ""}
           </span>

@@ -118,6 +118,7 @@ fn show_qr(
         noise_key: ring.desktop.noise_key(),
         secret: secret.clone(),
         expires_at: contract::now() + 600,
+        head: None,
     };
     let keys = ring.desktop.clone();
     let ring_id = ring.ring_id();
@@ -356,6 +357,7 @@ fn wrong_code_finds_nobody() {
         noise_key: ring.desktop.noise_key(),
         secret: PairSecret::generate().unwrap(),
         expires_at: 0,
+        head: None,
     };
     drop(ring);
     assert_eq!(
@@ -490,4 +492,164 @@ fn valid_noise_wrong_approver_is_rejected_before_chain_fetch() {
     ));
     host.join().unwrap().unwrap();
     assert_eq!(r.roster_gets(), gets);
+}
+
+// #87 BINDING AMENDMENT 1: every QR anchor of a v2 offer is checked against an otherwise
+// valid, structurally verified Mobile proposal before the phone consents.
+mod offer_anchor {
+    use super::*;
+    use xshell_protocol::ring::b64;
+    use xshell_protocol::ring::membership::{
+        Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+    };
+    use xshell_protocol::ring::pairing::adoption::{
+        enroll_proposal, AdoptionIntent, JoinTarget, PublicIdentity,
+    };
+    use xshell_protocol::ring::pairing::OfferHead;
+    use xshell_protocol::ring::relay::pair::{
+        adopt_mobile_as_guest_with_ready, check_offer_anchor, MobileAdoptionRequest,
+    };
+    use xshell_protocol::ring::relay::proposal::ProposalHandle;
+    use xshell_protocol::ring::relay::VerifiedProposal;
+    use xshell_protocol::ring::{RosterChain, SignedRoster};
+
+    fn keys(n: u8) -> DeviceKeys {
+        DeviceKeys::from_seeds(&[n; 32], &[n + 100; 32])
+    }
+    fn fixture() -> (DeviceKeys, VerifiedProposal, PairingOffer) {
+        let a = keys(1);
+        let relay = "wss://relay.example.com";
+        let g = SignedRoster::genesis(&a, a.noise_key(), "desk", relay, 100).unwrap();
+        let mut r = g.roster().clone();
+        r.v = 2;
+        r.version = 2;
+        r.prev = Some(g.hash());
+        r.issued_at = 101;
+        r.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: b64::encode(&[1; 32]),
+                kind: EnrollmentKind::LegacyDesktop,
+                members: vec![a.sign_key()],
+                enrolled_at: 101,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: Some(2_592_000),
+                activity_key: keys(9).sign_key(),
+            },
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let chain = RosterChain::from_chain(vec![g, r.sign(&a).unwrap()]).unwrap();
+        let phone = keys(2);
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[7; 32]),
+            expires_at: 400,
+            target: JoinTarget::Mobile {
+                phone: PublicIdentity {
+                    sign_key: phone.sign_key(),
+                    noise_key: phone.noise_key(),
+                    name: "phone".into(),
+                },
+            },
+        };
+        let proposal = enroll_proposal(chain.head(), a.sign_key(), &intent, 102).unwrap();
+        let handle = ProposalHandle {
+            ring_id: chain.ring_id().clone(),
+            relay_url: relay.into(),
+            operation: intent.operation.clone(),
+            head: chain.head().hash(),
+            version: chain.head().version(),
+            guest: phone.sign_key(),
+            context: b64::encode(&[4; 32]),
+            expires_at: 400,
+            grant: b64::encode(&[5; 32]),
+            resource: b64::encode(&[6; 32]),
+        };
+        let offer = PairingOffer {
+            ring_id: chain.ring_id().clone(),
+            relay_url: relay.into(),
+            sign_key: a.sign_key(),
+            noise_key: a.noise_key(),
+            secret: PairSecret::from_bytes(&[3; 32]),
+            expires_at: 400,
+            head: Some(OfferHead {
+                version: chain.head().version(),
+                hash: chain.head().hash(),
+            }),
+        };
+        (
+            a,
+            VerifiedProposal {
+                chain,
+                proposal,
+                handle,
+            },
+            offer,
+        )
+    }
+
+    #[test]
+    fn each_mismatched_anchor_refuses_an_otherwise_valid_proposal() {
+        let (_, verified, offer) = fixture();
+        check_offer_anchor(&offer, &verified).unwrap();
+        let other = keys(50);
+        type Mutation = Box<dyn Fn(&mut PairingOffer)>;
+        let mutations: Vec<(&str, Mutation)> = vec![
+            ("no anchor (v1)", Box::new(|o| o.head = None)),
+            (
+                "head version",
+                Box::new(|o| o.head.as_mut().unwrap().version += 1),
+            ),
+            (
+                "head hash",
+                Box::new(|o| o.head.as_mut().unwrap().hash = b64::encode(&[8; 32])),
+            ),
+            (
+                "ring",
+                Box::new(|o| {
+                    o.ring_id = xshell_protocol::ring::RingId::derive(&keys(51).sign_key())
+                }),
+            ),
+            (
+                "relay",
+                Box::new(|o| o.relay_url = "wss://other.example.com".into()),
+            ),
+            (
+                "approver signing key",
+                Box::new(move |o| o.sign_key = other.sign_key()),
+            ),
+            (
+                "approver noise key",
+                Box::new(|o| o.noise_key = keys(52).noise_key()),
+            ),
+        ];
+        for (what, mutate) in mutations {
+            let mut o = offer.clone();
+            mutate(&mut o);
+            assert_eq!(
+                check_offer_anchor(&o, &verified),
+                Err(PairError::Pin),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v1_offer_is_not_a_v2_phone_enrollment() {
+        let (_, _, mut offer) = fixture();
+        offer.head = None;
+        let r = adopt_mobile_as_guest_with_ready(
+            &MobileAdoptionRequest {
+                offer: &offer,
+                keys: Arc::new(keys(2)),
+                name: "phone",
+                until: Instant::now() + Duration::from_secs(5),
+            },
+            &opts(),
+            None,
+            || panic!("no socket for a v1 offer"),
+            |_| panic!("no consent for a v1 offer"),
+        );
+        assert!(matches!(r, Err(PairError::Invalid(_))));
+    }
 }

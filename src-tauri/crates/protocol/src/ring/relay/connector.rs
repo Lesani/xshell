@@ -296,6 +296,21 @@ fn removed_close(why: &CloseReason) -> bool {
     }
 }
 
+/// The owner's terminal fence for `next`: when the owner holds `next`'s predecessor, a
+/// signer whose enrollment the owner knows is terminal may only clean up itself.
+fn owner_fence(owner: &RosterChain, next: &SignedRoster) -> Result<(), RingError> {
+    let Some(prev) = next
+        .version()
+        .checked_sub(1)
+        .and_then(|v| owner.get(v))
+        .filter(|p| next.roster().prev.as_deref() == Some(p.hash().as_str()))
+    else {
+        return Ok(());
+    };
+    crate::ring::membership::verify_terminal_authority(prev, next, owner.terminal_enrollments())?;
+    Ok(())
+}
+
 /// Whether the Relay `c` is connected to holds exactly `next` (as far as `c` has seen).
 fn holds(c: &RingClient, next: &SignedRoster) -> bool {
     c.chain()
@@ -1074,6 +1089,74 @@ impl Connector {
         }
     }
 
+    /// [`Connector::publish_until`] for a candidate that is not in the trusted chain yet
+    /// (a v2 Remove the owner commits only once the Relay has it), fenced by this owner's
+    /// effective terminal evidence at every upload: checked against the owner's chain, and
+    /// queued by the client under its state lock with the owner's evidence merged in
+    /// ([`RingClient::publish_roster_start_fenced`]) while this Connector's state is held,
+    /// so no observation lands between the check and the enqueue. Neither lock is held
+    /// while waiting for the Relay's answer. A refusal by the fence is `Err(Roster)`.
+    pub fn publish_fenced_until(
+        &self,
+        next: &SignedRoster,
+        until: Instant,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), RingError> {
+        let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Acquire));
+        let halted = || cancelled() || lock(&self.inner.st).stop.is_some();
+        let closed = || RingError::Closed(CloseReason::Local);
+        let mut kicked = false;
+        let mut last: Option<RingError> = None;
+        loop {
+            if halted() {
+                return Err(closed());
+            }
+            // The owner's fence, even with no connection: never wait to upload a candidate
+            // the owner already refuses.
+            let c = {
+                let st = lock(&self.inner.st);
+                owner_fence(&st.chain, next)?;
+                st.client.clone().filter(|c| !c.is_closed())
+            };
+            match c {
+                Some(c) if holds(&c, next) => {
+                    return if halted() { Err(closed()) } else { Ok(()) };
+                }
+                Some(c) => {
+                    if Instant::now() >= until {
+                        return Err(last.unwrap_or_else(closed));
+                    }
+                    let ticket = {
+                        let st = lock(&self.inner.st);
+                        owner_fence(&st.chain, next)?;
+                        c.publish_roster_start_fenced(next, &st.chain)
+                    };
+                    let r = ticket.and_then(|t| t.wait_until(until, || halted() || c.is_closed()));
+                    if halted() {
+                        return Err(closed());
+                    }
+                    match r {
+                        Ok(()) => return Ok(()),
+                        Err(_) if holds(&c, next) => return Ok(()),
+                        Err(e) if self.retryable(&e, next) => last = Some(e),
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => {
+                    if !kicked {
+                        kicked = true;
+                        self.kick();
+                    }
+                }
+            }
+            if Instant::now() >= until {
+                return Err(last.unwrap_or_else(closed));
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            std::thread::sleep(left.min(Duration::from_millis(25)));
+        }
+    }
+
     /// Whether [`Connector::publish_until`] tries again after `e`: the connection was lost
     /// or the answer did not come, the Relay holds a newer version this client has not seen
     /// yet (the local check then decides), or the client lacks versions before `next` that
@@ -1411,6 +1494,48 @@ mod tests {
         );
         assert_eq!(owner.chain().head(), f.known.head());
         assert!(owner.chain().authorized_member(&f.b.sign_key()).is_none());
+    }
+
+    /// The owner's same-head terminal evidence refuses a fenced candidate before any
+    /// upload is attempted, even with no connection.
+    #[test]
+    #[cfg(feature = "test-relay")]
+    fn fenced_publication_refuses_a_terminal_signer_before_upload() {
+        let (chain, candidate, evidence) = super::super::client::fenced_tests::fixture();
+        let k1 = crate::ring::DeviceKeys::from_seeds(&[11; 32], &[12; 32]);
+        let principal = k1.sign_key();
+        let pin = super::super::ChainPin {
+            version: chain.head().version(),
+            hash: chain.head().hash(),
+        };
+        let connector = Connector {
+            inner: Arc::new(Connector::inner(
+                ConnectorConfig::new(RingClientConfig::new(chain, Arc::new(k1))),
+                Arc::new(Errors::default()),
+            )),
+            thread: Mutex::new(None),
+        };
+        // Authorized: no refusal; with no connection it only runs out of time.
+        let soon = Instant::now() + Duration::from_millis(50);
+        assert!(matches!(
+            connector.publish_fenced_until(&candidate, soon, None),
+            Err(RingError::Closed(_))
+        ));
+        connector
+            .test_with_stable_attempt(|| {
+                connector.test_observe_activity(&pin, principal, &evidence, || {})
+            })
+            .unwrap();
+        let later = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let e = connector
+            .publish_fenced_until(&candidate, later, None)
+            .unwrap_err();
+        assert!(e.to_string().contains("terminal"), "{e}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused at once"
+        );
     }
 
     fn signed_same_head_terminal_fixture() -> (crate::ring::DeviceKeys, RosterChain, String) {
@@ -2010,25 +2135,34 @@ impl ProposalConnection {
     }
 
     pub fn publish_once(&self, next: &SignedRoster) -> Result<(), RingError> {
-        self.current()?;
+        self.publish_once_classified(next)
+            .map_err(PublishFailure::into_error)
+    }
+
+    /// [`Self::publish_once`], telling whether a failure happened before the candidate could
+    /// reach the Relay ([`PublishFailure::NotSent`]: proven nothing published by this call)
+    /// or at/after the send boundary ([`PublishFailure::MaybeSent`]: outcome unknown).
+    pub fn publish_once_classified(&self, next: &SignedRoster) -> Result<(), PublishFailure> {
+        let not_sent = PublishFailure::NotSent;
+        self.current().map_err(not_sent)?;
         if !self.created.load(std::sync::atomic::Ordering::Acquire)
             || next.roster().prev != Some(self.predecessor.hash())
             || next.version() != self.predecessor.version() + 1
         {
-            return Err(RingError::Invalid(
+            return Err(not_sent(RingError::Invalid(
                 "publication is not the frozen proposal successor".into(),
-            ));
+            )));
         }
         let mut unsigned = next.roster().clone();
-        let mut membership = unsigned.membership()?;
+        let mut membership = unsigned.membership().map_err(|e| not_sent(e.into()))?;
         let proofs = match &mut membership.change {
             crate::ring::membership::RosterChange::Enroll { proofs, .. }
             | crate::ring::membership::RosterChange::CompleteComputer { proofs, .. }
             | crate::ring::membership::RosterChange::Upgrade { proofs } => proofs,
             _ => {
-                return Err(RingError::Invalid(
+                return Err(not_sent(RingError::Invalid(
                     "publication must be frozen adoption".into(),
-                ))
+                )))
             }
         };
         proofs.clear();
@@ -2040,23 +2174,42 @@ impl ProposalConnection {
             .as_ref()
             != Some(&unsigned)
         {
-            return Err(RingError::Invalid(
+            return Err(not_sent(RingError::Invalid(
                 "publication differs from frozen proposal".into(),
-            ));
+            )));
         }
-        crate::ring::verify_successor(&self.predecessor, next)?;
+        crate::ring::verify_successor(&self.predecessor, next).map_err(|e| not_sent(e.into()))?;
         if self
             .published
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            return Err(RingError::Invalid(
+            // An earlier call may already have sent it.
+            return Err(PublishFailure::MaybeSent(RingError::Invalid(
                 "proposal publication is one-shot; reconcile instead".into(),
-            ));
+            )));
         }
         *self
             .published_token
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(next.token().into());
-        self.client.publish_roster(next)
+        self.client
+            .publish_roster(next)
+            .map_err(PublishFailure::MaybeSent)
+    }
+}
+
+/// Why [`ProposalConnection::publish_once_classified`] failed, relative to the send boundary.
+#[derive(Debug)]
+pub enum PublishFailure {
+    /// Refused before the candidate was handed to the socket: nothing was sent.
+    NotSent(RingError),
+    /// The candidate was (or may have been) handed to the Relay: the outcome is unknown.
+    MaybeSent(RingError),
+}
+impl PublishFailure {
+    pub fn into_error(self) -> RingError {
+        match self {
+            Self::NotSent(e) | Self::MaybeSent(e) => e,
+        }
     }
 }

@@ -6,8 +6,8 @@
 
 use super::super::chain::RosterChain;
 use super::super::pairing::{
-    valid_slot, Guest, Host, JoinRequest, Joined, PairError, PairRefusal, PairSecret,
-    MAX_PAIR_MESSAGE,
+    is_answer, is_enrolled_answer, parse_answer, valid_slot, Guest, Host, JoinRequest, Joined,
+    PairError, PairRefusal, PairSecret, PairingOffer, MAX_PAIR_MESSAGE,
 };
 use super::super::url::RelayUrl;
 use super::super::{b64, DeviceKeys, NoiseKey, RingError, RingId, Role, SignKey, Signer};
@@ -50,6 +50,9 @@ impl Default for PairOptions {
 
 /// Polled while blocking, so a pairing can be cancelled from another thread.
 pub type Cancel = Arc<AtomicBool>;
+
+/// The bound on a guest's authenticated decline after its consent callback.
+const DECLINE_SEND: Duration = Duration::from_secs(2);
 
 /// How often a blocked read looks at the cancel flag.
 const POLL: Duration = Duration::from_millis(100);
@@ -123,6 +126,15 @@ impl PairPipe {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::send`] with at most `max` for this one write (still within the offer deadline).
+    pub fn send_within(&mut self, msg: &[u8], max: Duration) -> Result<(), PairError> {
+        let step = self.opts.step;
+        self.opts.step = step.min(max);
+        let r = self.send(msg);
+        self.opts.step = step;
+        r
     }
 
     pub fn send(&mut self, msg: &[u8]) -> Result<(), PairError> {
@@ -516,6 +528,110 @@ pub fn adopt_as_guest_with_ready(
     ready: impl FnOnce() -> Result<(), PairError>,
     confirm: impl FnOnce(AdoptionConsentRequest<'_>) -> Result<bool, PairError>,
 ) -> Result<(RosterChain, Joined), PairError> {
+    match adopt_guest(req, None, opts, cancel, ready, confirm)? {
+        GuestOutcome::Adopted(chain, joined) => Ok((chain, joined)),
+        // Only a v2 phone offer pins an anchor that makes this completion meaningful.
+        GuestOutcome::Enrolled(..) => Err(PairError::Payload("unexpected enrolled reply".into())),
+    }
+}
+
+enum GuestOutcome {
+    Adopted(RosterChain, Joined),
+    Enrolled(RosterChain, Joined),
+}
+
+/// The QR anchors of a v2 phone offer (BINDING AMENDMENT 1): the Ring, the Relay, the
+/// approving Desktop's signing and Noise keys and the accepted head the offer was issued at
+/// must all equal the verified proposal's. Called before any consent is requested or signed.
+pub fn check_offer_anchor(
+    offer: &PairingOffer,
+    verified: &VerifiedProposal,
+) -> Result<(), PairError> {
+    let head = verified.chain.head();
+    let anchor = offer.head.as_ref().ok_or(PairError::Pin)?;
+    if head.version() != anchor.version
+        || head.hash() != anchor.hash
+        || verified.chain.ring_id() != &offer.ring_id
+        || verified.proposal.ring_id != offer.ring_id
+        || head.roster().relay_url != offer.relay_url
+        || verified.proposal.relay_url != offer.relay_url
+        || verified.handle.relay_url != offer.relay_url
+        || verified.proposal.signed_by != offer.sign_key
+        || !head
+            .member(&offer.sign_key)
+            .is_some_and(|m| m.role == Role::Desktop && m.noise_key == offer.noise_key)
+    {
+        return Err(PairError::Pin);
+    }
+    Ok(())
+}
+
+/// An "already enrolled" completion is accepted only for the exact offer anchor, from the
+/// pinned Desktop, and only if the authenticated chain lists this phone as its own Mobile
+/// unit. It never carries a new version.
+fn verify_enrolled(
+    offer: &PairingOffer,
+    hello: &super::super::pairing::HostHello,
+    joined: &Joined,
+    keys: &Arc<DeviceKeys>,
+    opts: &PairOptions,
+) -> Result<RosterChain, PairError> {
+    let anchor = offer.head.as_ref().ok_or(PairError::Pin)?;
+    if joined.ring_id != offer.ring_id
+        || hello.ring_id != offer.ring_id
+        || hello.noise_key != offer.noise_key
+        || joined.relay_url != offer.relay_url
+        || joined.version != anchor.version
+        || joined.hash != anchor.hash
+    {
+        return Err(PairError::Pin);
+    }
+    let signer: Arc<dyn Signer> = keys.clone();
+    let chain = RingClient::fetch_chain(
+        &offer.relay_url,
+        &offer.ring_id,
+        signer,
+        &ChainPin {
+            version: joined.version,
+            hash: joined.hash.clone(),
+        },
+        opts.tls.clone(),
+        opts.ring,
+    )
+    .map_err(relay_err)?;
+    let at = chain.get(joined.version).ok_or(PairError::Pin)?;
+    let lists_phone = |r: &SignedRoster| {
+        r.member(&keys.sign_key())
+            .is_some_and(|m| m.role == Role::Mobile && m.noise_key == keys.noise_key())
+            && r.roster().membership().is_ok_and(|m| {
+                m.unit_for(&keys.sign_key()).is_some_and(|u| {
+                    u.kind == super::super::membership::EnrollmentKind::Mobile
+                        && u.members == [keys.sign_key()]
+                })
+            })
+    };
+    if at.hash() != joined.hash
+        || at.roster().signed_by != joined.signed_by
+        || at.roster().v != 2
+        || !lists_phone(at)
+        || !lists_phone(chain.head())
+        || !at
+            .member(&offer.sign_key)
+            .is_some_and(|m| m.role == Role::Desktop && m.noise_key == offer.noise_key)
+    {
+        return Err(PairError::Pin);
+    }
+    Ok(chain)
+}
+
+fn adopt_guest(
+    req: &AdoptionGuestRequest<'_>,
+    offer: Option<&PairingOffer>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    ready: impl FnOnce() -> Result<(), PairError>,
+    confirm: impl FnOnce(AdoptionConsentRequest<'_>) -> Result<bool, PairError>,
+) -> Result<GuestOutcome, PairError> {
     let until = offer_deadline(req.intent.expires_at, req.until)?;
     live(until, cancel)?;
     let relay = RelayUrl::parse(req.relay_url).map_err(|_| PairError::Pin)?;
@@ -529,12 +645,25 @@ pub fn adopt_as_guest_with_ready(
     ready()?;
     live(until, cancel)?;
     pipe.wait_peer(until, cancel)?;
-    let (mut guest, m1) = Guest::start(&req.keys, req.secret, None)?;
+    let (mut guest, m1) = Guest::start(&req.keys, req.secret, offer.map(|o| o.noise_key))?;
     pipe.send(&m1)?;
     let hello = guest.read_hello(&pipe.recv(cancel)?)?;
+    if offer.is_some_and(|o| o.ring_id != hello.ring_id) {
+        return Err(PairError::Pin);
+    }
     pipe.send(&guest.join_adoption(&req.keys, req.intent, &req.signers)?)?;
     let hash = guest.final_handshake_hash()?;
     let message = guest.decrypt(&pipe.recv(cancel)?)?;
+    if is_answer(&message) {
+        // Instead of a proposal: a typed refusal, or (v2 phone) "already enrolled".
+        pipe.close();
+        let joined = parse_answer(&message)?;
+        let offer = offer
+            .filter(|_| is_enrolled_answer(&message))
+            .ok_or_else(|| PairError::Payload("unexpected answer".into()))?;
+        let chain = verify_enrolled(offer, &hello, &joined, &req.keys, opts)?;
+        return Ok(GuestOutcome::Enrolled(chain, joined));
+    }
     let handle: super::proposal::ProposalHandle = serde_json::from_slice(&message)
         .map_err(|_| PairError::Payload("proposal handle".into()))?;
     if handle.operation != req.intent.operation
@@ -570,6 +699,9 @@ pub fn adopt_as_guest_with_ready(
     {
         return Err(PairError::Pin);
     }
+    if let Some(offer) = offer {
+        check_offer_anchor(offer, &verified)?;
+    }
     live(until, cancel)?;
     let approved = confirm(AdoptionConsentRequest {
         verified: &verified,
@@ -577,15 +709,23 @@ pub fn adopt_as_guest_with_ready(
         until,
         cancel,
     })?;
-    live(until, cancel)?;
-    if !approved {
-        let decision = AdoptionDecision::Cancel {
-            operation: handle.operation.clone(),
-            proposal_hash: consent_proposal_hash(&verified.proposal)
-                .map_err(|e| PairError::Payload(e.to_string()))?,
-        };
-        pipe.send(&guest.encrypt(&serde_json::to_vec(&decision).expect("cancel serializes"))?)?;
+    let cancelled = cancel.is_some_and(|c| c.load(Ordering::Acquire));
+    if !approved || cancelled {
+        // A decline (or a cancellation during consent) is told to the approver,
+        // authenticated, with a short deadline of its own and regardless of the cancel flag.
+        // No consent is ever signed after it.
+        if Instant::now() < until {
+            let decision = AdoptionDecision::Cancel {
+                operation: handle.operation.clone(),
+                proposal_hash: consent_proposal_hash(&verified.proposal)
+                    .map_err(|e| PairError::Payload(e.to_string()))?,
+            };
+            let message =
+                guest.encrypt(&serde_json::to_vec(&decision).expect("cancel serializes"))?;
+            let _ = pipe.send_within(&message, DECLINE_SEND);
+        }
         pipe.close();
+        live(until, None)?;
         return Err(PairError::Cancelled);
     }
     live(until, cancel)?;
@@ -646,7 +786,117 @@ pub fn adopt_as_guest_with_ready(
     {
         return Err(PairError::Pin);
     }
-    Ok((chain, joined))
+    Ok(GuestOutcome::Adopted(chain, joined))
+}
+
+/// What a phone needs to join a v2 Ring from a scanned v2 [`PairingOffer`].
+pub struct MobileAdoptionRequest<'a> {
+    /// The parsed QR payload; must be v2 (carry a head anchor).
+    pub offer: &'a PairingOffer,
+    /// The phone's retained identity. A retry after a lost acknowledgment or failed local
+    /// persistence MUST reuse the same keys: that is what makes "already enrolled" recovery
+    /// possible.
+    pub keys: Arc<DeviceKeys>,
+    /// The phone's display name (cleaned up with `member_name(.., "phone")`).
+    pub name: &'a str,
+    /// A local cap; the offer's `expiresAt` (at most 600 s away) also bounds the exchange.
+    pub until: Instant,
+}
+
+/// A completed phone enrollment into a v2 Ring.
+#[derive(Debug)]
+pub struct MobileEnrollment {
+    /// Verified from genesis, pinned at `joined`, and listing this phone as a Mobile unit.
+    pub chain: RosterChain,
+    /// The accepted head that lists the phone: the new Enroll version, or (when
+    /// `already_enrolled`) the offer's anchor head that already listed it.
+    pub joined: Joined,
+    /// `true`: this phone was already a member (an earlier attempt's acknowledgment or local
+    /// persistence was lost); no new version was created. Persist `chain` as usual.
+    pub already_enrolled: bool,
+    /// The operation (enrollment unit ID for a new enrollment).
+    pub operation: String,
+}
+
+/// The phone's intent for `offer`: a fresh operation, the offer's expiry, the phone's
+/// public identity. Exposed for callers that want to show or log the operation.
+pub fn mobile_intent(
+    offer: &PairingOffer,
+    keys: &DeviceKeys,
+    name: &str,
+) -> Result<AdoptionIntent, PairError> {
+    use super::super::pairing::adoption::{JoinTarget, PublicIdentity};
+    let intent = AdoptionIntent {
+        operation: super::wire::new_nonce()
+            .map_err(|e| PairError::Relay(format!("no randomness: {e}")))?,
+        expires_at: offer.expires_at,
+        target: JoinTarget::Mobile {
+            phone: PublicIdentity {
+                sign_key: keys.sign_key(),
+                noise_key: keys.noise_key(),
+                name: super::super::member_name(name, "phone"),
+            },
+        },
+    };
+    intent.validate()?;
+    Ok(intent)
+}
+
+/// The phone's whole side of a v2 pairing (Mobile FFI entry point).
+///
+/// Sequence: open the offer's slot (`ready` runs once the Relay registered this socket),
+/// XXpsk3 with the Desktop's Noise key pinned from the QR, message 3 carries a
+/// [`JoinTarget::Mobile`](super::super::pairing::adoption::JoinTarget) intent with the phone's
+/// possession proof. The Desktop then answers with one of:
+/// - a proposal handle: the phone reads the frozen proposal through the Relay proposal
+///   reader, verifies it structurally and against every QR anchor ([`check_offer_anchor`]),
+///   then calls `confirm`. Scanning the QR is the user's consent (plan decision 3), so the
+///   app's `confirm` returns `Ok(true)` after its own checks; `Ok(false)` sends an
+///   authenticated decline and returns [`PairError::Cancelled`] (no proof is ever signed).
+///   On approval the phone signs its Pairing consent proof, the Desktop signs and publishes,
+///   and the phone fetches and verifies the exact published version;
+/// - "already enrolled" (`already_enrolled = true`): verified against the offer anchor and
+///   the authenticated chain, no consent asked, nothing signed;
+/// - a typed refusal: [`PairError::Refused`] with `Duplicate`, `Full`, `Stale`,
+///   `Cancelled`, `Expired`, `NotCommitted` (nothing committed: retry with a new offer) or
+///   `PublicationUncertain` (retry with a new offer and the same keys; recovery returns
+///   `already_enrolled` if it landed).
+///
+/// A v1 offer is refused with [`PairError::Invalid`]; use `pair_as_guest_pinned_with_joined`.
+pub fn adopt_mobile_as_guest_with_ready(
+    req: &MobileAdoptionRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    ready: impl FnOnce() -> Result<(), PairError>,
+    confirm: impl FnOnce(AdoptionConsentRequest<'_>) -> Result<bool, PairError>,
+) -> Result<MobileEnrollment, PairError> {
+    if req.offer.head.is_none() {
+        return Err(PairError::Invalid("not a v2 offer".into()));
+    }
+    let intent = mobile_intent(req.offer, &req.keys, req.name)?;
+    let guest = AdoptionGuestRequest {
+        relay_url: &req.offer.relay_url,
+        secret: &req.offer.secret,
+        keys: req.keys.clone(),
+        signers: AdoptionSigners {
+            principal: &*req.keys,
+            companion: None,
+        },
+        intent: &intent,
+        until: req.until,
+        approver: Some(req.offer.sign_key),
+    };
+    let (chain, joined, already_enrolled) =
+        match adopt_guest(&guest, Some(req.offer), opts, cancel, ready, confirm)? {
+            GuestOutcome::Adopted(chain, joined) => (chain, joined, false),
+            GuestOutcome::Enrolled(chain, joined) => (chain, joined, true),
+        };
+    Ok(MobileEnrollment {
+        chain,
+        joined,
+        already_enrolled,
+        operation: intent.operation,
+    })
 }
 
 pub struct AdoptionHostRequest<'a> {
@@ -656,13 +906,122 @@ pub struct AdoptionHostRequest<'a> {
     pub until: Instant,
 }
 
+/// What an approver's `prepare` decided for a verified, possession-proven intent.
+pub enum Prepared {
+    /// A frozen proposal to send as the handle.
+    Proposal(Box<VerifiedProposal>),
+    /// v2 phone recovery: the target is already a member of this accepted head; answer
+    /// "already enrolled" with it instead of creating any new version.
+    Enrolled(Joined),
+}
+
 /// Approver's three sends: message 2, encrypted frozen handle, commit acknowledgment.
 /// `prepare` may only freeze metadata. `publish` sees the exact, genuinely consented token.
+/// A phone ([`JoinTarget::Mobile`](super::super::pairing::adoption::JoinTarget)) intent is
+/// refused here: phones join through [`approve_mobile_adoption`].
 pub fn approve_adoption(
-    mut pipe: PairPipe,
+    pipe: PairPipe,
     req: &AdoptionHostRequest<'_>,
     cancel: Option<&Cancel>,
     prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<VerifiedProposal, PairError>,
+    publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
+    cancel_read: impl FnOnce(&super::proposal::ProposalHandle),
+) -> Result<(), PairError> {
+    approve(
+        pipe,
+        req,
+        "computer",
+        false,
+        cancel,
+        |intent, hash| {
+            if matches!(
+                intent.target,
+                super::super::pairing::adoption::JoinTarget::Mobile { .. }
+            ) {
+                return Err(PairError::Payload(
+                    "a phone joins through a pairing offer".into(),
+                ));
+            }
+            prepare(intent, hash).map(|v| Prepared::Proposal(Box::new(v)))
+        },
+        publish,
+        cancel_read,
+    )
+}
+
+/// The Desktop's side of a v2 phone pairing over its offer's pipe (which it opened first).
+pub struct MobileHostRequest<'a> {
+    pub keys: &'a DeviceKeys,
+    pub secret: &'a PairSecret,
+    pub ring_id: &'a RingId,
+    /// This Desktop's name, in message 2.
+    pub name: &'a str,
+    /// The offer's local deadline.
+    pub until: Instant,
+    /// The offer's `expiresAt`; a phone intent may not outlive it.
+    pub offer_expires_at: u64,
+}
+
+/// Like [`approve_adoption`] for a phone: only a `Mobile` intent within the offer's expiry
+/// is passed to `prepare`, which may also answer [`Prepared::Enrolled`]. Failures are sent
+/// to the phone as authenticated typed refusals: a `prepare`/`publish` error
+/// `PairError::Refused(r)` sends `r`; a local cancellation or expiry sends `Cancelled` /
+/// `Expired`. Returns the possession-proven intent's join request.
+pub fn approve_mobile_adoption(
+    pipe: PairPipe,
+    req: &MobileHostRequest<'_>,
+    cancel: Option<&Cancel>,
+    prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<Prepared, PairError>,
+    publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
+    cancel_read: impl FnOnce(&super::proposal::ProposalHandle),
+) -> Result<(), PairError> {
+    let offer_expires_at = req.offer_expires_at;
+    approve(
+        pipe,
+        &AdoptionHostRequest {
+            keys: req.keys,
+            secret: req.secret,
+            ring_id: req.ring_id,
+            until: req.until,
+        },
+        req.name,
+        true,
+        cancel,
+        |intent, hash| {
+            if !matches!(
+                intent.target,
+                super::super::pairing::adoption::JoinTarget::Mobile { .. }
+            ) {
+                return Err(PairError::Refused(PairRefusal::Role));
+            }
+            if intent.expires_at > offer_expires_at {
+                return Err(PairError::Refused(PairRefusal::Expired));
+            }
+            prepare(intent, hash)
+        },
+        publish,
+        cancel_read,
+    )
+}
+
+/// The authenticated typed refusal a v2 phone receives for `e`, if any.
+fn typed_refusal(e: &PairError) -> Option<PairRefusal> {
+    match e {
+        PairError::Refused(r) => Some(*r),
+        PairError::Cancelled => Some(PairRefusal::Cancelled),
+        PairError::Expired => Some(PairRefusal::Expired),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approve(
+    mut pipe: PairPipe,
+    req: &AdoptionHostRequest<'_>,
+    name: &str,
+    typed: bool,
+    cancel: Option<&Cancel>,
+    prepare: impl FnOnce(&AdoptionIntent, [u8; 32]) -> Result<Prepared, PairError>,
     publish: impl FnOnce(&SignedRoster) -> Result<Joined, PairError>,
     cancel_read: impl FnOnce(&super::proposal::ProposalHandle),
 ) -> Result<(), PairError> {
@@ -677,12 +1036,42 @@ pub fn approve_adoption(
     live(until, cancel)?;
     let mut host = Host::start(keys, secret)?;
     host.read_start(&pipe.recv(cancel)?)?;
-    pipe.send(&host.hello(ring, "computer")?)?;
+    pipe.send(&host.hello(ring, name)?)?;
     let intent = host.read_adoption(&pipe.recv(cancel)?)?;
-    let until = offer_deadline(intent.expires_at, until)?;
+    // Best effort: the phone learns why, authenticated by the finished handshake.
+    let refuse = |mut pipe: PairPipe, host: &mut Host, e: &PairError| {
+        if let Some(r) = typed.then(|| typed_refusal(e)).flatten() {
+            if let Ok(m) = host.answer(&Err(r)) {
+                let _ = pipe.send(&m);
+            }
+        }
+        pipe.close();
+    };
+    let until = match offer_deadline(intent.expires_at, until) {
+        Ok(until) => until,
+        Err(e) => {
+            refuse(pipe, &mut host, &e);
+            return Err(e);
+        }
+    };
     pipe.limit_until(until);
     let hash = host.final_handshake_hash()?;
-    let verified = prepare(&intent, hash)?;
+    let verified = match prepare(&intent, hash) {
+        Ok(Prepared::Proposal(verified)) => *verified,
+        Ok(Prepared::Enrolled(joined)) => {
+            if joined.ring_id != *ring {
+                pipe.close();
+                return Err(PairError::Pin);
+            }
+            let sent = host.answer_enrolled(&joined).and_then(|m| pipe.send(&m));
+            pipe.close();
+            return sent;
+        }
+        Err(e) => {
+            refuse(pipe, &mut host, &e);
+            return Err(e);
+        }
+    };
     let grant = verified.handle.clone();
     let result = (|| {
         check_proposal(&verified, &intent, &hash, Some(keys.sign_key()))?;
@@ -732,9 +1121,12 @@ pub fn approve_adoption(
             return Err(PairError::Pin);
         }
         pipe.send(&host.answer(&Ok(joined))?)?;
-        pipe.close();
         Ok(())
     })();
+    match &result {
+        Ok(()) => pipe.close(),
+        Err(e) => refuse(pipe, &mut host, e),
+    }
     cancel_read(&grant);
     result
 }

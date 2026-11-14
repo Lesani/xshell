@@ -786,6 +786,8 @@ impl SyncWorker {
                 ),
                 Some(HostOutcome::Revoked) => self.note(id, "revoked", None, None),
                 Some(HostOutcome::Full) => self.note(id, "full", None, None),
+                // A v2 Ring: the Host joins through its own enrollment, not this worker.
+                Some(HostOutcome::NeedsEnrollment) => self.clear(id),
                 // Decided for a Ring that is gone: look again, against the new one.
                 Some(HostOutcome::RingChanged) => {
                     if self.sync.current(id, r.gen).is_some() {

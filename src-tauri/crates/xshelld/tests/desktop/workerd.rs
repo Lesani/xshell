@@ -161,6 +161,20 @@ impl Relay {
         );
         self.spawn();
     }
+    /// Freezes workerd (SIGSTOP): connections stay open, nothing is answered.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn pause(&self) {
+        let pid = self.child.as_ref().expect("workerd running").id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    }
+    /// Lets a paused workerd go on (SIGCONT); it then handles what was queued.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn unpause(&self) {
+        let pid = self.child.as_ref().expect("workerd running").id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    }
     fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

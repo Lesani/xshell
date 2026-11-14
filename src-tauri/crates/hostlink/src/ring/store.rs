@@ -1114,7 +1114,11 @@ fn parse(bytes: &[u8]) -> Result<ProfileState, String> {
 impl RingState {
     /// After a new version: every farewell now delivers the head, and one the chain no longer
     /// owes (to the Relay the head names, say) is dropped.
+    /// A format-v2 Ring never moves Relays: nothing changes.
     pub fn retarget_farewells(&mut self) {
+        if self.chain.head().roster().v == 2 {
+            return;
+        }
         let head = self.chain.head().version();
         for f in &mut self.farewells {
             f.target = head;

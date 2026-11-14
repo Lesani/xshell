@@ -30,7 +30,13 @@ pub use reconcile::{
 mod join;
 pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
 
-struct AdoptionAdmission(Arc<AtomicBool>);
+/// The one v2 membership-mutation reservation. Every v2 membership publisher holds it from
+/// its final predecessor validation through publication and accepted installation: the
+/// adoption controllers (Create, Join approval, Upgrade, completion, reconciliation) for
+/// their whole operation, v2 phone enrollment and v2 removal (`reserve_membership_mutation`)
+/// around their publication. It is not the commit lock, so a holder may wait on the Relay
+/// while Connector callbacks commit.
+pub(in crate::ring) struct AdoptionAdmission(Arc<AtomicBool>);
 impl Drop for AdoptionAdmission {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -144,6 +150,23 @@ impl DesktopRing {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| AdoptionAdmission(self.adoption.clone()))
+    }
+
+    /// The membership-mutation reservation for a short publisher: polls (holding no Ring
+    /// lock) until `until`, then `None` (busy). See [`AdoptionAdmission`].
+    pub(in crate::ring) fn reserve_membership_mutation(
+        &self,
+        until: Instant,
+    ) -> Option<AdoptionAdmission> {
+        loop {
+            if let Some(admission) = self.try_reserve_adoption() {
+                return Some(admission);
+            }
+            if Instant::now() >= until || self.is_quitting() {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared

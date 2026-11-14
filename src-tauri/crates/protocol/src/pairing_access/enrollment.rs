@@ -459,6 +459,7 @@ mod tests {
             noise_key: desktop.noise_key(),
             secret: PairSecret::from_bytes(&[9; 32]),
             expires_at: 500,
+            head: None,
         };
         let start = EnrollmentStart {
             operation: PairOperationId::new(Uuid::from_u128(1)).unwrap(),

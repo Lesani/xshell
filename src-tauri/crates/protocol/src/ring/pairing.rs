@@ -127,6 +127,18 @@ pub enum PairRefusal {
     Full,
     /// The Desktop could not get the new Roster version to the Relay.
     PublishFailed,
+    /// v2: the Desktop's accepted head moved since the offer (another change landed); scan a
+    /// fresh offer. No version naming this device was committed.
+    Stale,
+    /// v2: the Desktop cancelled the offer (or quit) before any commit.
+    Cancelled,
+    /// v2: the Desktop proved that it committed nothing for this operation (it stopped
+    /// before sending the candidate to the Relay).
+    NotCommitted,
+    /// v2: the Desktop sent the candidate to the Relay but has no acknowledgment: the
+    /// enrollment may or may not have landed. Retrying with the same keys recovers it as an
+    /// authenticated "already enrolled" completion if it did.
+    PublicationUncertain,
 }
 
 const REFUSALS: &[(PairRefusal, &str)] = &[
@@ -136,6 +148,10 @@ const REFUSALS: &[(PairRefusal, &str)] = &[
     (PairRefusal::Duplicate, "duplicate"),
     (PairRefusal::Full, "full"),
     (PairRefusal::PublishFailed, "publish_failed"),
+    (PairRefusal::Stale, "stale"),
+    (PairRefusal::Cancelled, "cancelled_by_desktop"),
+    (PairRefusal::NotCommitted, "not_committed"),
+    (PairRefusal::PublicationUncertain, "publication_uncertain"),
 ];
 
 impl PairRefusal {
@@ -210,8 +226,21 @@ pub fn valid_slot(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// The accepted head a v2 offer was issued at (QR anchor, BINDING AMENDMENT 1 of the #87
+/// phone plan): the phone refuses a proposal whose verified predecessor is any other head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferHead {
+    pub version: u64,
+    /// `b64u(SHA-256(token))` of that version.
+    pub hash: String,
+}
+
 /// What a Desktop's QR code carries: `"xsp1." + b64u(JSON)` with
-/// `{"v":1,"ringId","relayUrl","signKey","noiseKey","secret","expiresAt"}`.
+/// `{"v":1,"ringId","relayUrl","signKey","noiseKey","secret","expiresAt"}`. A Desktop on a
+/// v2 (membership) head emits `"v":2` with the head anchor `"headVersion","headHash"` as
+/// well; the phone then joins through the v2 adoption transport
+/// (`relay::pair::adopt_mobile_as_guest_with_ready`). An old app refuses v2 with
+/// "unsupported version".
 #[derive(Debug, Clone)]
 pub struct PairingOffer {
     pub ring_id: RingId,
@@ -222,9 +251,20 @@ pub struct PairingOffer {
     pub secret: PairSecret,
     /// Unix seconds, shown to the user only: the Desktop enforces the expiry itself.
     pub expires_at: u64,
+    /// `Some` exactly for a v2 offer.
+    pub head: Option<OfferHead>,
 }
 
 impl PairingOffer {
+    /// The offer's format version: 2 when it carries a head anchor.
+    pub fn version(&self) -> u8 {
+        if self.head.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
     pub fn encode(&self) -> String {
         let secret = Zeroizing::new(b64::encode(self.secret.as_bytes()));
         #[derive(serde::Serialize)]
@@ -237,17 +277,23 @@ impl PairingOffer {
             noise_key: NoiseKey,
             secret: &'a str,
             expires_at: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            head_version: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            head_hash: Option<&'a str>,
         }
         // Borrow the credential, never clone it into a serde_json::Value.
         let body = Zeroizing::new(
             serde_json::to_string(&Body {
-                v: 1,
+                v: self.version(),
                 ring_id: &self.ring_id,
                 relay_url: &self.relay_url,
                 sign_key: self.sign_key,
                 noise_key: self.noise_key,
                 secret: &secret,
                 expires_at: self.expires_at,
+                head_version: self.head.as_ref().map(|h| h.version),
+                head_hash: self.head.as_ref().map(|h| h.hash.as_str()),
             })
             .expect("pairing offer fields are serializable"),
         );
@@ -255,8 +301,9 @@ impl PairingOffer {
     }
 
     /// Strict: the prefix, canonical b64u, one JSON object without duplicate keys, every
-    /// field present and typed, `v == 1`, a valid Relay URL and keys, a 32-byte secret.
-    /// Unknown fields are ignored. Surrounding whitespace (a pasted line) is trimmed.
+    /// field present and typed, `v == 1` or `v == 2` (then with `headVersion` ≥ 1 and a
+    /// 32-byte `headHash`), a valid Relay URL and keys, a 32-byte secret. Unknown fields are
+    /// ignored. Surrounding whitespace (a pasted line) is trimmed.
     pub fn parse(s: &str) -> Result<Self, PairError> {
         let bad = |m: &str| PairError::Invalid(m.to_string());
         let s = s.trim();
@@ -275,9 +322,26 @@ impl PairingOffer {
                 .and_then(Value::as_str)
                 .ok_or_else(|| PairError::Invalid(format!("missing {k}")))
         };
-        if obj.0.get("v").and_then(Value::as_u64) != Some(1) {
+        let v = obj.0.get("v").and_then(Value::as_u64);
+        if v != Some(1) && v != Some(2) {
             return Err(bad("unsupported version"));
         }
+        let head = if v == Some(2) {
+            let version = obj
+                .0
+                .get("headVersion")
+                .and_then(Value::as_u64)
+                .filter(|n| (1..=MAX_SAFE_INT).contains(n))
+                .ok_or_else(|| bad("headVersion"))?;
+            let hash = text("headHash")?.to_string();
+            let raw = b64::decode_array::<32>(&hash).map_err(|_| bad("headHash"))?;
+            if b64::encode(&raw) != hash {
+                return Err(bad("headHash"));
+            }
+            Some(OfferHead { version, hash })
+        } else {
+            None
+        };
         let ring_id = RingId::parse(text("ringId")?).map_err(|_| bad("ringId"))?;
         let relay_url = text("relayUrl")?.to_string();
         RelayUrl::parse(&relay_url).map_err(|e| PairError::Invalid(e.to_string()))?;
@@ -298,6 +362,7 @@ impl PairingOffer {
             noise_key,
             secret: PairSecret::from_bytes(&secret[..]),
             expires_at,
+            head,
         })
     }
 }
@@ -649,35 +714,51 @@ impl Guest {
     /// Message 4, the Desktop's answer: the first message that proves it knows the secret.
     pub fn finish(&mut self, msg4: &[u8]) -> Result<Joined, PairError> {
         let buf = self.decrypt(msg4)?;
-        let o = object(&buf)?;
-        match o.get("ok") {
-            Some(Value::Bool(true)) => {}
-            Some(Value::Bool(false)) => {
-                let code = field(&o, "error")?;
-                return Err(PairRefusal::from_code(code)
-                    .map(PairError::Refused)
-                    .unwrap_or_else(|| PairError::Payload(format!("refused: {code}"))));
-            }
-            _ => return Err(PairError::Payload("message 4 without ok".into())),
-        }
-        let relay_url = field(&o, "relayUrl")?.to_string();
-        RelayUrl::parse(&relay_url).map_err(|e| PairError::Payload(e.to_string()))?;
-        let hash = field(&o, "hash")?.to_string();
-        b64::decode_array::<32>(&hash).map_err(|_| PairError::Payload("hash".into()))?;
-        Ok(Joined {
-            ring_id: RingId::parse(field(&o, "ringId")?)
-                .map_err(|_| PairError::Payload("ringId".into()))?,
-            relay_url,
-            version: o
-                .get("version")
-                .and_then(Value::as_u64)
-                .filter(|v| (1..=MAX_SAFE_INT).contains(v))
-                .ok_or_else(|| PairError::Payload("version".into()))?,
-            hash,
-            signed_by: SignKey::parse(field(&o, "signedBy")?)
-                .map_err(|_| PairError::Payload("signedBy".into()))?,
-        })
+        parse_answer(&buf)
     }
+}
+
+/// Whether a decrypted transport message is a message-4 style answer
+/// (`{"ok":true|false,..}`) rather than another payload (a v2 proposal handle).
+pub(crate) fn is_answer(buf: &[u8]) -> bool {
+    object(buf).is_ok_and(|o| o.contains_key("ok"))
+}
+
+/// A decrypted message-4 answer: the Joined head, or the Desktop's typed refusal.
+pub(crate) fn parse_answer(buf: &[u8]) -> Result<Joined, PairError> {
+    let o = object(buf)?;
+    match o.get("ok") {
+        Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => {
+            let code = field(&o, "error")?;
+            return Err(PairRefusal::from_code(code)
+                .map(PairError::Refused)
+                .unwrap_or_else(|| PairError::Payload(format!("refused: {code}"))));
+        }
+        _ => return Err(PairError::Payload("message 4 without ok".into())),
+    }
+    let relay_url = field(&o, "relayUrl")?.to_string();
+    RelayUrl::parse(&relay_url).map_err(|e| PairError::Payload(e.to_string()))?;
+    let hash = field(&o, "hash")?.to_string();
+    b64::decode_array::<32>(&hash).map_err(|_| PairError::Payload("hash".into()))?;
+    Ok(Joined {
+        ring_id: RingId::parse(field(&o, "ringId")?)
+            .map_err(|_| PairError::Payload("ringId".into()))?,
+        relay_url,
+        version: o
+            .get("version")
+            .and_then(Value::as_u64)
+            .filter(|v| (1..=MAX_SAFE_INT).contains(v))
+            .ok_or_else(|| PairError::Payload("version".into()))?,
+        hash,
+        signed_by: SignKey::parse(field(&o, "signedBy")?)
+            .map_err(|_| PairError::Payload("signedBy".into()))?,
+    })
+}
+
+/// A decrypted v2 "already enrolled" completion (`{"ok":true,"enrolled":true,..}`).
+pub(crate) fn is_enrolled_answer(buf: &[u8]) -> bool {
+    object(buf).is_ok_and(|o| o.get("enrolled") == Some(&Value::Bool(true)))
 }
 
 /// The Desktop's side: the Noise responder.
@@ -834,6 +915,24 @@ impl Host {
         .to_string();
         self.encrypt(body.as_bytes())
     }
+
+    /// v2 "already enrolled" completion, sent instead of a proposal handle: `j` is the
+    /// accepted head that already lists the (possession-proven) device. No new version.
+    pub fn answer_enrolled(&mut self, j: &Joined) -> Result<Vec<u8>, PairError> {
+        // Message-4 format (`"v":1`), marked as a recovery completion.
+        let body = json!({
+            "v": 1,
+            "ok": true,
+            "enrolled": true,
+            "ringId": j.ring_id,
+            "relayUrl": j.relay_url,
+            "version": j.version,
+            "hash": j.hash,
+            "signedBy": j.signed_by,
+        })
+        .to_string();
+        self.encrypt(body.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -853,6 +952,7 @@ mod tests {
             noise_key: d.noise_key(),
             secret: PairSecret::from_bytes(&[7; 32]),
             expires_at: 1_767_225_600,
+            head: None,
         }
     }
 
@@ -967,6 +1067,98 @@ mod tests {
         extra["future"] = json!({"x": 1});
         assert!(PairingOffer::parse(&enc(&extra)).is_ok());
         assert_eq!(format!("{:?}", o.secret), "PairSecret(..)");
+    }
+
+    #[test]
+    fn v2_offer_carries_the_head_anchor_and_v1_stays_byte_compatible() {
+        let v1 = offer();
+        let body = |o: &PairingOffer| -> Value {
+            serde_json::from_slice(
+                &b64::decode(o.encode().strip_prefix(OFFER_PREFIX).unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let b1 = body(&v1);
+        assert_eq!(b1["v"], json!(1));
+        assert!(b1.get("headVersion").is_none() && b1.get("headHash").is_none());
+        assert!(PairingOffer::parse(&v1.encode()).unwrap().head.is_none());
+        let mut v2 = offer();
+        v2.head = Some(OfferHead {
+            version: 7,
+            hash: b64::encode(&[3; 32]),
+        });
+        assert_eq!(v2.version(), 2);
+        let b2 = body(&v2);
+        assert_eq!(b2["v"], json!(2));
+        assert_eq!(b2["headVersion"], json!(7));
+        let back = PairingOffer::parse(&v2.encode()).unwrap();
+        assert_eq!(back.head, v2.head);
+        assert_eq!(back.version(), 2);
+        assert_eq!(back.sign_key, v2.sign_key);
+        let enc = |v: &Value| format!("{OFFER_PREFIX}{}", b64::encode(v.to_string().as_bytes()));
+        let mut cases = vec![];
+        for k in ["headVersion", "headHash"] {
+            let mut bad = b2.clone();
+            bad.as_object_mut().unwrap().remove(k);
+            cases.push(bad);
+        }
+        for (k, v) in [
+            ("headVersion", json!(0)),
+            ("headVersion", json!(MAX_SAFE_INT + 1)),
+            ("headVersion", json!("7")),
+            ("headHash", json!(b64::encode(&[3; 31]))),
+            ("headHash", json!("not base64!")),
+            ("v", json!(3)),
+        ] {
+            let mut bad = b2.clone();
+            bad[k] = v;
+            cases.push(bad);
+        }
+        for c in &cases {
+            assert!(PairingOffer::parse(&enc(c)).is_err(), "{c}");
+        }
+    }
+
+    #[test]
+    fn v2_typed_refusals_round_trip_and_enrolled_answers_are_distinct() {
+        for r in [
+            PairRefusal::Duplicate,
+            PairRefusal::Full,
+            PairRefusal::Stale,
+            PairRefusal::Cancelled,
+            PairRefusal::Expired,
+            PairRefusal::NotCommitted,
+            PairRefusal::PublicationUncertain,
+        ] {
+            assert_eq!(PairRefusal::from_code(r.as_code()), Some(r));
+        }
+        let codes: std::collections::HashSet<_> = REFUSALS.iter().map(|(_, c)| *c).collect();
+        assert_eq!(codes.len(), REFUSALS.len());
+        let desk = keys(1);
+        let phone = keys(2);
+        let secret = PairSecret::from_bytes(&[5; 32]);
+        let (mut g, m1) = Guest::start(&phone, &secret, Some(desk.noise_key())).unwrap();
+        let mut h = Host::start(&desk, &secret).unwrap();
+        h.read_start(&m1).unwrap();
+        g.read_hello(&h.hello(&RingId::derive(&desk.sign_key()), "d").unwrap())
+            .unwrap();
+        h.read_join(&g.join(&phone, Role::Mobile, "p").unwrap())
+            .unwrap();
+        let refusal = g
+            .decrypt(&h.answer(&Err(PairRefusal::Stale)).unwrap())
+            .unwrap();
+        assert!(is_answer(&refusal) && !is_enrolled_answer(&refusal));
+        assert_eq!(
+            parse_answer(&refusal),
+            Err(PairError::Refused(PairRefusal::Stale))
+        );
+        let j = joined(&desk);
+        let enrolled = g.decrypt(&h.answer_enrolled(&j).unwrap()).unwrap();
+        assert!(is_answer(&enrolled) && is_enrolled_answer(&enrolled));
+        assert_eq!(parse_answer(&enrolled), Ok(j.clone()));
+        let normal = g.decrypt(&h.answer(&Ok(j)).unwrap()).unwrap();
+        assert!(is_answer(&normal) && !is_enrolled_answer(&normal));
+        assert!(!is_answer(br#"{"ringId":"x"}"#));
     }
 
     #[test]

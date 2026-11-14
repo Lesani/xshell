@@ -29,6 +29,7 @@ export const S = {
   "mobile.role.desktop": "Desktop",
   "mobile.role.daemon": "Host",
   "mobile.role.mobile": "Phone",
+  "mobile.role.computer": "Computer",
   "mobile.status.online": "Connected",
   "mobile.status.closed": "xshell closed",
   "mobile.status.unreachable": "Unreachable",

@@ -947,6 +947,41 @@ impl RingClient {
         })
     }
 
+    /// [`RingClient::publish_roster_start`] fenced by the owner's effective evidence: under
+    /// this client's state lock, the one its own terminal observations are learned under,
+    /// `next` is checked against this client's chain with `fence`'s same-ancestry terminal
+    /// enrollments merged in, and only then queued. An observation is therefore either seen
+    /// by the check or ordered after the upload was queued, never between them. The lock is
+    /// released before any wait for the Relay's answer.
+    pub(crate) fn publish_roster_start_fenced(
+        &self,
+        next: &SignedRoster,
+        fence: &RosterChain,
+    ) -> Result<Ticket, RingError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            if st.closed {
+                return Err(RingError::Closed(CloseReason::Local));
+            }
+            fenced_put(&mut st, fence, next, id, tx, || {
+                self.outbox.send_text(
+                    ClientFrame::RosterPut {
+                        id,
+                        roster: next.token().to_string(),
+                    }
+                    .encode(),
+                )
+            })?;
+        }
+        Ok(Ticket {
+            id,
+            rx,
+            state: self.state.clone(),
+        })
+    }
+
     /// Stores a Push Gateway entitlement token in the Ring's slot on the Relay.
     pub fn put_entitlement(&self, token: &str) -> Result<(), RingError> {
         self.put_entitlement_start(token)?
@@ -1334,5 +1369,168 @@ impl Handler for ClientHandler {
             let _ = w.send(Err(RingError::Closed(why.clone())));
         }
         self.events.closed(why);
+    }
+}
+
+/// The checked half of [`RingClient::publish_roster_start_fenced`], with the client state
+/// locked by the caller: `enqueue` runs only for a `next` that extends the client's chain
+/// under the merged terminal fence.
+fn fenced_put(
+    st: &mut State,
+    fence: &RosterChain,
+    next: &SignedRoster,
+    id: u64,
+    waiter: Waiter,
+    enqueue: impl FnOnce() -> Result<(), RingError>,
+) -> Result<(), RingError> {
+    let mut effective = st.chain.clone();
+    effective.merge_terminal_from(fence);
+    effective.extended(std::slice::from_ref(next))?;
+    st.waiting.insert(
+        id,
+        Pending {
+            waiter,
+            accept: Some(next.token().to_string()),
+            kind: Kind::Request,
+        },
+    );
+    if let Err(e) = enqueue() {
+        st.waiting.remove(&id);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod fenced_tests {
+    use super::*;
+    use crate::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
+    use crate::ring::membership::{
+        remove_unit, Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+    };
+    use crate::ring::{DeviceKeys, Member, Role};
+
+    /// Two retained Desktops (k1, k2) as v2 singletons; `source` signs activity. The
+    /// candidate removes k2's unit, signed by k1: valid until k1 is terminal.
+    pub(crate) fn fixture() -> (RosterChain, SignedRoster, String) {
+        let k1 = DeviceKeys::from_seeds(&[11; 32], &[12; 32]);
+        let k2 = DeviceKeys::from_seeds(&[13; 32], &[14; 32]);
+        let source = DeviceKeys::from_seeds(&[15; 32], &[16; 32]);
+        let g =
+            SignedRoster::genesis(&k1, k1.noise_key(), "one", "ws://127.0.0.1:8787", 100).unwrap();
+        let v1 = g
+            .next(&k1, 100, |d| {
+                d.add(Member::new(
+                    "two",
+                    Role::Desktop,
+                    k2.sign_key(),
+                    k2.noise_key(),
+                    100,
+                ))
+            })
+            .unwrap();
+        let mut r = v1.roster().clone();
+        r.v = 2;
+        r.version = 3;
+        r.prev = Some(v1.hash());
+        r.issued_at = 101;
+        let unit = |n: u8, k: &DeviceKeys| Enrollment {
+            id: b64::encode(&[n; 32]),
+            kind: EnrollmentKind::LegacyDesktop,
+            members: vec![k.sign_key()],
+            enrolled_at: 101,
+        };
+        let policy = RingPolicy {
+            inactivity_seconds: Some(30),
+            activity_key: source.sign_key(),
+        };
+        r.set_membership(&Membership {
+            enrollments: vec![unit(1, &k1), unit(2, &k2)],
+            retired: vec![],
+            policy: policy.clone(),
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let u = r.sign(&k1).unwrap();
+        let chain = RosterChain::from_chain(vec![g, v1, u]).unwrap();
+        let candidate = remove_unit(chain.head(), &k1, 102, &b64::encode(&[2; 32])).unwrap();
+        let evidence = ActivityEvidence {
+            ring_id: chain.ring_id().clone(),
+            relay_url: r.relay_url,
+            policy_head_hash: chain.head().hash(),
+            policy_hash: policy_hash(&policy),
+            observed_at: 140,
+            units: vec![UnitActivity {
+                enrollment_id: b64::encode(&[1; 32]),
+                member_keys: vec![k1.sign_key()],
+                online: false,
+                last_active: 101,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&source)
+        .unwrap();
+        (chain, candidate, evidence)
+    }
+
+    fn state(chain: RosterChain) -> State {
+        State {
+            chain,
+            caps: vec![],
+            presence: HashMap::new(),
+            entitlement: None,
+            limited: false,
+            waiting: HashMap::new(),
+            replies: HashMap::new(),
+            last_error: None,
+            closed: false,
+        }
+    }
+
+    fn put(
+        st: &mut State,
+        fence: &RosterChain,
+        next: &SignedRoster,
+    ) -> (Result<(), RingError>, bool) {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let mut queued = false;
+        let r = fenced_put(st, fence, next, 1, tx, || {
+            queued = true;
+            Ok(())
+        });
+        (r, queued)
+    }
+
+    #[test]
+    fn fenced_put_queues_an_authorized_candidate() {
+        let (chain, candidate, _) = fixture();
+        let mut st = state(chain.clone());
+        let (r, queued) = put(&mut st, &chain, &candidate);
+        r.unwrap();
+        assert!(queued && st.waiting.contains_key(&1));
+    }
+
+    /// Evidence the transport learned after the owner's check (before the enqueue, under
+    /// the client lock) refuses the upload before anything is queued.
+    #[test]
+    fn evidence_arriving_before_enqueue_refuses_the_upload() {
+        let (chain, candidate, evidence) = fixture();
+        let mut st = state(chain.clone());
+        // What the ActivityEvidence handler does, under the same lock.
+        st.chain.observe_activity(&evidence).unwrap();
+        let (r, queued) = put(&mut st, &chain, &candidate);
+        assert!(r.unwrap_err().to_string().contains("terminal"));
+        assert!(!queued && st.waiting.is_empty());
+    }
+
+    /// The owner's (Connector's) same-head evidence fences a client that has not seen it.
+    #[test]
+    fn owner_evidence_fences_the_transport_check() {
+        let (chain, candidate, evidence) = fixture();
+        let mut owner = chain.clone();
+        owner.observe_activity(&evidence).unwrap();
+        let mut st = state(chain);
+        let (r, queued) = put(&mut st, &owner, &candidate);
+        assert!(r.unwrap_err().to_string().contains("terminal"));
+        assert!(!queued && st.waiting.is_empty());
     }
 }
