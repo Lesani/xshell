@@ -32,9 +32,13 @@ pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
 mod ui;
 pub use ui::ApprovalReadiness;
 
-struct AdoptionAdmission(Arc<AtomicBool>);
+/// See `DesktopRing::adoption_baseline`.
+pub(in crate::ring) type AdoptionBaseline =
+    Arc<std::sync::Mutex<Option<std::collections::HashSet<String>>>>;
+struct AdoptionAdmission(Arc<AtomicBool>, AdoptionBaseline);
 impl Drop for AdoptionAdmission {
     fn drop(&mut self) {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.0.store(false, Ordering::Release);
     }
 }
@@ -145,7 +149,20 @@ impl DesktopRing {
         self.adoption
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| AdoptionAdmission(self.adoption.clone()))
+            .map(|_| {
+                // Read-only: which records predate this admission. Unreadable: none is
+                // treated as live (safe: they stay unresolved).
+                let baseline = self
+                    .store
+                    .load_profile()
+                    .ok()
+                    .map(|(p, _)| p.as_ref().map(ui::record_operations).unwrap_or_default());
+                *self
+                    .adoption_baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = baseline;
+                AdoptionAdmission(self.adoption.clone(), self.adoption_baseline.clone())
+            })
     }
 
     /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared

@@ -45,6 +45,9 @@ pub struct RingStatus {
     /// The retained Ring's Roster format (1 or 2): a v2 Ring's Relay is fixed (shown
     /// read-only).
     pub format: Option<u8>,
+    /// An adoption, approval or registration runs here now: nothing new can start. Not
+    /// durable uncertainty (that is `approval: unresolved`).
+    pub busy: bool,
 }
 
 pub struct RingState {
@@ -55,6 +58,8 @@ pub struct RingState {
     pub approval: std::sync::Mutex<&'static str>,
     /// `RingStatus.format`, cached the same way.
     pub format: std::sync::Mutex<Option<u8>>,
+    /// `RingStatus.busy`, cached the same way.
+    pub busy: std::sync::Mutex<bool>,
     _pairing_ipc: Option<xshell_pairing_access::local::Server>,
 }
 
@@ -91,6 +96,9 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
     let format = app
         .try_state::<RingState>()
         .and_then(|r| *r.format.lock().unwrap_or_else(|e| e.into_inner()));
+    let busy = app
+        .try_state::<RingState>()
+        .is_some_and(|r| *r.busy.lock().unwrap_or_else(|e| e.into_inner()));
     let worker = app.try_state::<RingState>().map(|r| r.worker.clone());
     let too_old = worker
         .as_ref()
@@ -114,6 +122,7 @@ fn status_of(app: &AppHandle, view: RingView) -> RingStatus {
         hosts,
         approval,
         format,
+        busy,
     }
 }
 
@@ -180,6 +189,7 @@ pub fn setup(app: &AppHandle) {
         let focus_app = app.clone();
         std::thread::spawn(move || {
             let mut tick = 0u32;
+            let mut last_owner = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 let Some(ring) = owner_ring.upgrade() else {
@@ -203,8 +213,17 @@ pub fn setup(app: &AppHandle) {
                 tick = tick.wrapping_add(1);
                 if tick.is_multiple_of(10) {
                     if let Some(r) = focus_app.try_state::<RingState>() {
-                        let before = *r.approval.lock().unwrap_or_else(|e| e.into_inner());
-                        if join::refresh_approval(&focus_app) != before {
+                        let before = (
+                            *r.approval.lock().unwrap_or_else(|e| e.into_inner()),
+                            *r.busy.lock().unwrap_or_else(|e| e.into_inner()),
+                        );
+                        let approval = join::refresh_approval(&focus_app);
+                        let busy = *r.busy.lock().unwrap_or_else(|e| e.into_inner());
+                        // Election ownership can move between windows with no membership
+                        // (an unpaired takeover): the status carries it to the page.
+                        let owner = ring.pairing_ipc_owner();
+                        if (approval, busy) != before || owner != last_owner {
+                            last_owner = owner;
                             let _ =
                                 focus_app.emit("ring:status", status_of(&focus_app, ring.view()));
                         }
@@ -254,6 +273,7 @@ pub fn setup(app: &AppHandle) {
         joins: Arc::default(),
         approval: std::sync::Mutex::new("none"),
         format: std::sync::Mutex::new(None),
+        busy: std::sync::Mutex::new(false),
         _pairing_ipc: pairing_ipc.ok(),
     });
     join::refresh_approval(app);

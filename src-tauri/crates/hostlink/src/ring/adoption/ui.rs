@@ -3,6 +3,7 @@
 //! slot, and a read-only answer to "can this Desktop approve a Device Code?".
 use super::*;
 use crate::ring::store::{OutgoingPhase, ProfileState};
+use std::collections::HashSet;
 use xshell_protocol::ring::device_code::DeviceCode;
 
 /// Whether this Desktop can approve a Device Code, and if not, why. Read-only: no admission,
@@ -23,24 +24,53 @@ pub enum ApprovalReadiness {
     Unresolved,
 }
 
-/// `in_flight`: a local adoption/approval holds the admission right now, so its durable
-/// journal or reservation is live work, not unresolved uncertainty.
+/// The operation ids of the durable adoption records (reservation, journal, outgoing).
+pub(in crate::ring) fn record_operations(stored: &ProfileState) -> HashSet<String> {
+    stored
+        .pending_join
+        .iter()
+        .map(|p| p.intent.operation.clone())
+        .chain(stored.journal.iter().map(|j| j.intent.operation.clone()))
+        .chain(stored.outgoing.iter().map(|o| o.intent.operation.clone()))
+        .collect()
+}
+
+/// The operation ids of the unresolved records.
+fn unresolved_operations(stored: &ProfileState) -> Vec<&str> {
+    let mut ops = vec![];
+    if let Some(p) = &stored.pending_join {
+        ops.push(p.intent.operation.as_str());
+    }
+    if let Some(j) = stored
+        .journal
+        .as_ref()
+        .filter(|j| !j.phase.permits_new_operation())
+    {
+        ops.push(j.intent.operation.as_str());
+    }
+    if let Some(o) = stored
+        .outgoing
+        .as_ref()
+        .filter(|o| !matches!(o.phase, OutgoingPhase::Published | OutgoingPhase::Cancelled))
+    {
+        ops.push(o.intent.operation.as_str());
+    }
+    ops
+}
+
+/// `live(op)`: the record belongs to the operation this process is driving right now (made
+/// under the current admission). Only those are live work; any other unresolved record is
+/// uncertainty, whatever admission is held.
 pub(in crate::ring) fn readiness_of(
     stored: Option<&ProfileState>,
-    in_flight: bool,
+    live: impl Fn(&str) -> bool,
 ) -> ApprovalReadiness {
     let Some(stored) = stored else {
         return ApprovalReadiness::NoProfile;
     };
-    if !in_flight
-        && (stored.pending_join.is_some()
-            || stored
-                .journal
-                .as_ref()
-                .is_some_and(|j| !j.phase.permits_new_operation())
-            || stored.outgoing.as_ref().is_some_and(|j| {
-                !matches!(j.phase, OutgoingPhase::Published | OutgoingPhase::Cancelled)
-            }))
+    if unresolved_operations(stored)
+        .into_iter()
+        .any(|op| !live(op))
     {
         return ApprovalReadiness::Unresolved;
     }
@@ -153,11 +183,22 @@ impl DesktopRing {
 
     /// Read-only approval readiness from the retained profile.
     pub fn approval_readiness(&self) -> Result<ApprovalReadiness, String> {
-        let in_flight = self.adoption.load(Ordering::Acquire);
-        Ok(readiness_of(
-            self.store.load_profile()?.0.as_ref(),
-            in_flight,
-        ))
+        let stored = self.store.load_profile()?.0;
+        let baseline = self
+            .adoption_baseline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let held = self.adoption.load(Ordering::Acquire);
+        Ok(readiness_of(stored.as_ref(), |op| {
+            held && baseline.as_ref().is_some_and(|b| !b.contains(op))
+        }))
+    }
+
+    /// An adoption, approval or registration holds the admission: nothing new can start.
+    /// Separate from `Unresolved`, which is durable uncertainty.
+    pub fn adoption_busy(&self) -> bool {
+        self.adoption.load(Ordering::Acquire)
     }
 
     /// The retained Ring's Roster format (1 or 2), if this Desktop is in a Ring.

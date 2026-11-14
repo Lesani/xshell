@@ -545,6 +545,7 @@ pub fn refresh_approval(app: &AppHandle) -> &'static str {
     *state.approval.lock().unwrap_or_else(|e| e.into_inner()) = text;
     *state.format.lock().unwrap_or_else(|e| e.into_inner()) =
         state.worker.ring.ring_format().ok().flatten();
+    *state.busy.lock().unwrap_or_else(|e| e.into_inner()) = state.worker.ring.adoption_busy();
     text
 }
 

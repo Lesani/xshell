@@ -1129,3 +1129,96 @@ fn create_and_join_bind_the_chosen_relay_not_the_default() {
     offer.cancel_join();
     drop(offer);
 }
+
+#[test]
+fn an_unresolved_join_stays_unresolved_while_registration_holds_the_admission() {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint};
+    let relay = workerd::Relay::start();
+    // 1: abort a Join after its durable reservation (an earlier, now unresolved Join).
+    // 2: hold the next registration's admission until released.
+    let mode = Arc::new(AtomicU8::new(0));
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((reached_tx, release_rx))));
+    let hook_mode = mode.clone();
+    let hook = AdoptionTestHook(Arc::new(move |point| {
+        match hook_mode.load(Ordering::SeqCst) {
+            1 if point == AdoptionTestPoint::JoinBeforeCounterpartStart => {
+                hook_mode.store(0, Ordering::SeqCst);
+                panic!("simulated crash after the Join reservation");
+            }
+            2 if point == AdoptionTestPoint::RegistrationAdmitted => {
+                if let Some((reached, release)) = gate.lock().unwrap().take() {
+                    reached.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+            _ => {}
+        }
+    }));
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.adoption_test_hook = Some(hook));
+    b.ring.register_companion(&b.companion()).unwrap();
+    mode.store(1, Ordering::SeqCst);
+    let (ring, client) = (b.ring.clone(), b.ring.local_companion_client().unwrap());
+    let crashed = std::thread::spawn(move || {
+        ring.begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)), None)
+            .map(|_| ())
+    })
+    .join();
+    assert!(crashed.is_err(), "the simulated crash ended the start");
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::Unresolved
+    );
+    assert!(!b.ring.adoption_busy());
+    // The startup registration loop holds the admission: still unresolved, and busy.
+    mode.store(2, Ordering::SeqCst);
+    let (ring, companion) = (b.ring.clone(), b.companion());
+    let registering = std::thread::spawn(move || ring.register_companion(&companion));
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("registration admitted");
+    assert!(b.ring.adoption_busy());
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::Unresolved
+    );
+    release_tx.send(()).unwrap();
+    registering.join().unwrap().unwrap();
+    assert!(!b.ring.adoption_busy());
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::Unresolved
+    );
+}
+
+#[test]
+fn a_live_join_is_busy_not_unresolved() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let relay = workerd::Relay::start();
+    let b = Computer::new(&relay);
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b
+        .ring
+        .begin_join_cancellable(
+            &b.ring.local_companion_client().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+    assert!(b.ring.adoption_busy());
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NotEnrolled
+    );
+    offer.cancel_join();
+    drop(offer);
+    assert!(!b.ring.adoption_busy());
+    assert_eq!(
+        b.ring.approval_readiness().unwrap(),
+        ApprovalReadiness::NotEnrolled
+    );
+}

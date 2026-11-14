@@ -686,6 +686,9 @@ pub struct DesktopRing {
     /// Nonblocking admission for one local adoption; never a filesystem lock.
     pub(super) adoption: Arc<AtomicBool>,
     pub(super) adoption_cancel: Mutex<Option<Weak<AtomicBool>>>,
+    /// While an admission is held: the operation ids of the durable adoption records that
+    /// existed when it was taken. Records not in it belong to the live operation.
+    pub(super) adoption_baseline: super::adoption::AdoptionBaseline,
     observer: Arc<dyn RingObserver>,
     live: Mutex<Live>,
     routing_manager: Mutex<Option<Weak<crate::Manager>>>,
@@ -873,6 +876,7 @@ impl DesktopRing {
             store,
             adoption: Arc::new(AtomicBool::new(false)),
             adoption_cancel: Mutex::new(None),
+            adoption_baseline: Default::default(),
             observer,
             live: Mutex::new(Live::default()),
             routing_manager: Mutex::new(None),
