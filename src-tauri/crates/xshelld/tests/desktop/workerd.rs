@@ -1,6 +1,9 @@
 //! Owned production workerd fixture. Missing explicit inputs are hard failures, not skips.
+#![cfg(unix)]
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,6 +26,7 @@ pub struct Relay {
     root: PathBuf,
     bin: PathBuf,
     port: u16,
+    listener: TcpListener,
     child: Option<Child>,
 }
 impl Relay {
@@ -43,16 +47,14 @@ impl Relay {
             .tempdir()
             .unwrap();
         std::fs::create_dir(dir.path().join("data")).unwrap();
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let mut relay = Self {
             dir,
             root,
             bin,
             port,
+            listener,
             child: None,
         };
         relay.spawn();
@@ -69,7 +71,7 @@ impl Relay {
             .current_dir(&self.root)
             .arg("serve")
             .arg("workerd/config.capnp")
-            .arg(format!("--socket-addr=http=127.0.0.1:{}", self.port))
+            .arg(format!("--socket-fd=http={}", self.listener.as_raw_fd()))
             .arg(format!(
                 "--directory-path=disk={}",
                 self.dir.path().join("data").display()
@@ -79,6 +81,18 @@ impl Relay {
             .stderr(log);
         for name in CONFIG_VARS {
             command.env_remove(name);
+        }
+        let fd = self.listener.as_raw_fd();
+        // Only the owned child inherits this listener. Parent CLOEXEC is unchanged;
+        // the listener remains reserved even while workerd is stopped for restart.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let mut child = command.spawn().expect("spawn production workerd");
         let until = Instant::now() + Duration::from_secs(20);
@@ -116,6 +130,16 @@ impl Relay {
     }
     pub fn restart(&mut self) {
         self.kill();
+        assert!(
+            matches!(TcpListener::bind(self.listener.local_addr().unwrap()),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
+            "owned listener must remain reserved with no workerd child"
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(self.listener.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "child inheritance must not change parent CLOEXEC"
+        );
         self.spawn();
     }
     fn kill(&mut self) {

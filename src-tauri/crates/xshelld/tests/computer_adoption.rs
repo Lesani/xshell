@@ -888,6 +888,7 @@ mod unix {
     }
 
     #[test]
+    #[cfg(feature = "legacy-pair-test-control")]
     fn outstanding_legacy_offer_refuses_conflicting_registration_until_it_closes() {
         use std::io::Write;
         use xshell_protocol::ring::pairing::{JoinRequest, Joined, PairCode, PairRefusal};
@@ -938,13 +939,15 @@ mod unix {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let pairing = std::thread::spawn(move || {
-            xshelld::pair::run_pair_to(
+            xshelld::pair::run_legacy_pair_test_control(
                 &options,
                 &paths,
                 &mut Output {
                     line: Vec::new(),
                     code: tx,
                 },
+                std::time::Duration::from_secs(30),
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
         });
         let text = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
@@ -976,7 +979,7 @@ mod unix {
             None
         )
         .is_err());
-        assert_ne!(pairing.join().unwrap(), 0);
+        assert!(pairing.join().unwrap().is_err());
         assert!(
             registration
                 .err()

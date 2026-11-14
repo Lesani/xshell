@@ -31,6 +31,7 @@ pub(crate) struct Daemon {
     pub exit: Mutex<Option<ExitReason>>,
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
+    pub store_admission: Arc<super::ring::ownership::StoreAdmission>,
     #[cfg(unix)]
     pub companion: Mutex<Option<xshell_core::local_ipc::Server>>,
     pub next_conn: AtomicU64,
@@ -640,7 +641,7 @@ impl Daemon {
     /// End every Terminal, close every connection, release the socket and the lock.
     /// Idempotent; only the first caller does the work.
     pub fn exit(self: &Arc<Self>, reason: ExitReason) {
-        if self.exiting.swap(true, Ordering::SeqCst) {
+        if !self.store_admission.close(&self.exiting) {
             return;
         }
         // No registry/Ring/handler lock is held while cancellation drains workers. The
@@ -719,6 +720,7 @@ impl Daemon {
         if let Some(l) = self.lock_file.lock().unwrap().take() {
             let _ = l.unlock();
         }
+        self.store_admission.release();
         *self.exit.lock().unwrap() = Some(reason);
         self.exit_cv.notify_all();
     }

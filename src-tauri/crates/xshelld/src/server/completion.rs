@@ -164,6 +164,8 @@ pub(super) fn admin(
     peer: Option<SignKey>,
     request: CompanionAdminRequest,
 ) -> Result<Value, String> {
+    let _operation = daemon.store_admission.admit()?;
+    daemon.test_point(uuid::Uuid::nil(), super::TestPoint::RingCompanionAdmitted);
     let store = Store::new(daemon.cfg.paths.ring_dir.clone());
     let live = daemon.ring.trusted_chain();
     let _lock = store.lock()?;

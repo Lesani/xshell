@@ -5,11 +5,11 @@ mod common;
 #[allow(dead_code)]
 mod workerd;
 use std::io::Write;
-use xshell_protocol::ring::pairing::PairCode;
+use xshell_protocol::ring::device_code::DeviceCode;
 use xshell_protocol::ring::relay::pair::{PairOptions, PairPipe};
 
 #[test]
-fn legacy_pair_advertises_code_only_after_relay_slot_registration() {
+fn v2_standalone_pair_advertises_code_only_after_relay_slot_registration() {
     struct RegistrationProbe {
         relay: String,
         pending: Vec<u8>,
@@ -22,9 +22,9 @@ fn legacy_pair_advertises_code_only_after_relay_slot_registration() {
                 let line: Vec<_> = self.pending.drain(..=at).collect();
                 if let Some(code) = String::from_utf8_lossy(&line)
                     .trim()
-                    .strip_prefix("Pairing code: ")
+                    .strip_prefix("Device code: ")
                 {
-                    let code = PairCode::parse(code).unwrap();
+                    let code = DeviceCode::parse(code).unwrap();
                     // This Write has not returned: no guest work after advertising can
                     // race ahead and make an unregistered code appear usable by chance.
                     let peer =

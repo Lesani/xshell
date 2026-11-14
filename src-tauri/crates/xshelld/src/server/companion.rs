@@ -209,6 +209,7 @@ fn dispatch(
     request: CompanionRequest,
     budget: &xshell_core::local_ipc::RequestBudget,
 ) -> Result<CompanionResponse, String> {
+    let _operation = daemon.store_admission.admit()?;
     budget.check().map_err(|e| e.to_string())?;
     if daemon.exiting.load(Ordering::Acquire) || daemon.stopping.load(Ordering::Acquire) {
         return Err("Daemon is stopping; registration retained".into());
@@ -229,6 +230,47 @@ fn dispatch(
     ) {
         let _lock = store.lock_until(budget)?;
         return registration_locked(&store, request, budget);
+    }
+    if matches!(request, CompanionRequest::StandaloneCommandReady) {
+        if daemon.cfg.gui_bound.is_some() {
+            return Err("GUI-bound owner excludes standalone command".into());
+        }
+        return daemon
+            .ring
+            .standalone_transaction(budget, |_| Ok(CompanionResponse::StandaloneCommandReady));
+    }
+    if let CompanionRequest::PrepareStandaloneCommand { intent, proposal } = request {
+        if daemon.cfg.gui_bound.is_some() {
+            return Err("GUI-bound owner excludes standalone command".into());
+        }
+        let operation = intent.operation.clone();
+        if let Some(hook) = &daemon.cfg.test_hook {
+            (hook.0)(
+                uuid::Uuid::nil(),
+                super::TestPoint::StandaloneCommandBeforePrepare,
+            );
+        }
+        super::adoption::prepare_standalone_command(&daemon.ring, intent, *proposal, budget)?;
+        if let Some(hook) = &daemon.cfg.test_hook {
+            (hook.0)(
+                uuid::Uuid::nil(),
+                super::TestPoint::StandaloneCommandPreparedBeforeReply,
+            );
+        }
+        return Ok(CompanionResponse::StandalonePrepared { operation });
+    }
+    if matches!(request, CompanionRequest::PairDriverReady) {
+        // No Descriptor fallback: readiness must not create keys or mutate registration.
+        return daemon.ring.with_effective_chain_until(budget, |_| {
+            let _lock = store.lock_until(budget)?;
+            refuse_legacy_uncertainty(&store)?;
+            let policy = load(&store)?.ok_or("registered counterpart not ready")?;
+            let keys = store.load_keys()?.ok_or("registered Daemon keys missing")?;
+            validate_profile(&store, policy.profile(), &keys)?;
+            Ok(CompanionResponse::Descriptor {
+                profile: Some(policy.profile().clone()),
+            })
+        });
     }
     if !matches!(
         request,
@@ -280,6 +322,19 @@ fn dispatch(
             Ok(CompanionResponse::MembershipSnapshot {
                 rosters: chain.versions().iter().map(|r| r.token().into()).collect(),
             })
+        });
+    }
+    if let CompanionRequest::InstallStandaloneAccepted { operation, rosters } = request {
+        if daemon.cfg.gui_bound.is_some() {
+            return Err("GUI-bound owner excludes standalone installation".into());
+        }
+        daemon
+            .ring
+            .join_accepted_standalone(&rosters, &operation, budget)?;
+        let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;
+        super::adoption::finalize_standalone_install(&daemon.ring, &operation, &accepted, budget)?;
+        return Ok(CompanionResponse::Installed {
+            hash: accepted.head().hash(),
         });
     }
     if let CompanionRequest::InstallAccepted { operation, rosters } = request {
@@ -513,7 +568,9 @@ pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
         .or_else(dirs::home_dir)
         .ok_or("home unavailable")?;
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-    let paths = crate::paths::resolve(&home, xdg.as_deref(), opts.socket.as_deref());
+    let mut paths = crate::paths::resolve(&home, xdg.as_deref(), opts.socket.as_deref());
+    paths.ring_dir =
+        super::ring::ownership::canonical_store(&paths.ring_dir).map_err(|e| e.to_string())?;
     let until = Instant::now() + Duration::from_secs(15);
     let stdin = std::io::stdin();
     let mut bytes = Vec::new();
@@ -535,6 +592,12 @@ pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
         bytes.push(byte[0]);
     }
     let desktop_store: String = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let _ownership = match super::ring::ownership::StoreOwnershipLease::acquire(&paths.ring_dir)? {
+        super::ring::ownership::StoreOwnership::Acquired(lease) => lease,
+        super::ring::ownership::StoreOwnership::Busy => {
+            return Err("registration child cannot own Daemon Store".into())
+        }
+    };
     crate::paths::ensure_private_dir(paths.lock.parent().ok_or("lock parent missing")?)
         .map_err(|e| e.to_string())?;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

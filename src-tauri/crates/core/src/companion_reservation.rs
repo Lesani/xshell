@@ -75,10 +75,16 @@ fn owned_directory(path: &Path, private: bool) -> io::Result<()> {
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || path.canonicalize()? != path {
         return Err(denied("ambiguous or foreign counterpart directory"));
     }
-    if private && meta.mode() & 0o077 != 0 {
-        return Err(denied("counterpart directory is not private"));
+    let forbidden = if private { 0o077 } else { 0o022 };
+    if meta.mode() & forbidden != 0 {
+        return Err(denied("unsafe counterpart directory permissions"));
     }
     Ok(())
+}
+/// Shared home/install ancestry may be readable, but must not grant rename authority
+/// to other users. This does not validate private Store directories or IPC parents.
+pub fn validate_shared_ancestor(path: &Path) -> io::Result<()> {
+    owned_directory(path, false)
 }
 /// CLI classification must reject an unsafe local store even when no marker could be
 /// reserved there. This is a path-safety check, not permission to discard a reservation.
@@ -89,11 +95,12 @@ pub fn validate_daemon_store(directory: &Path) -> io::Result<()> {
         .and_then(Path::parent)
         .ok_or_else(|| denied("invalid local Daemon store association"))?
         .canonicalize()?;
-    owned_directory(&home, false)?;
+    validate_shared_ancestor(&home)?;
     let mut path = home;
     for component in [".xshell", "daemon", "ring"] {
         path.push(component);
         match fs::symlink_metadata(&path) {
+            Ok(_) if component == ".xshell" => validate_shared_ancestor(&path)?,
             Ok(_) => owned_directory(&path, true)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
@@ -122,7 +129,7 @@ fn prepare_directory(
     desktop_store: &Path,
     sync: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
-    owned_directory(home, false)?;
+    validate_shared_ancestor(home)?;
     owned_directory(desktop_store, true)?;
     let mut dir = home.to_path_buf();
     for component in [".xshell", "daemon", "ring"] {
@@ -133,7 +140,11 @@ fn prepare_directory(
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        owned_directory(&dir, true)?;
+        if component == ".xshell" {
+            validate_shared_ancestor(&dir)?;
+        } else {
+            owned_directory(&dir, true)?;
+        }
         // Sync existing entries too: a previous attempt may have failed its parent sync.
         sync(&parent)?;
     }
@@ -304,6 +315,136 @@ fn write_metadata(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_shared_ancestors_classify_and_reserve_without_changing_existing_data() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        let desktop = home.join("desktop");
+        fs::DirBuilder::new().mode(0o700).create(&desktop).unwrap();
+        let shared = home.join(".xshell");
+        fs::DirBuilder::new().mode(0o755).create(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = fs::metadata(&shared).unwrap();
+        let home_before = fs::metadata(&home).unwrap();
+        fs::write(shared.join("existing-install"), b"opaque installed bytes").unwrap();
+        let dir = home.join(".xshell/daemon/ring");
+        validate_daemon_store(&dir).unwrap();
+        assert_eq!(reserve(&home, &desktop).unwrap(), dir);
+        for name in ["keys.json", "roster.json", "standalone-adoption.json"] {
+            fs::write(dir.join(name), format!("opaque retained {name}")).unwrap();
+            fs::set_permissions(dir.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let reservation = fs::read(dir.join(FILE)).unwrap();
+        validate_daemon_store(&dir).unwrap();
+        assert_eq!(reserve(&home, &desktop).unwrap(), dir);
+        let _lock = lock(&dir.join("ring.lock"), true).unwrap();
+        reserve_locked(&dir, &desktop).unwrap();
+        assert_eq!(fs::read(dir.join(FILE)).unwrap(), reservation);
+        for name in ["keys.json", "roster.json", "standalone-adoption.json"] {
+            assert_eq!(
+                fs::read(dir.join(name)).unwrap(),
+                format!("opaque retained {name}").as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(shared.join("existing-install")).unwrap(),
+            b"opaque installed bytes"
+        );
+        for (path, before) in [(&shared, before), (&home, home_before)] {
+            let after = fs::metadata(path).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(after.mode() & 0o777, 0o755);
+        }
+        for path in [shared.join("daemon"), dir.clone()] {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        assert_eq!(
+            fs::metadata(dir.join("ring.lock")).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn writable_ancestors_and_readable_private_leaves_refuse_classification_and_reservation() {
+        for (component, mode) in [
+            ("", 0o775),
+            ("", 0o777),
+            (".xshell", 0o775),
+            (".xshell", 0o777),
+            (".xshell/daemon", 0o755),
+            (".xshell/daemon/ring", 0o755),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().canonicalize().unwrap();
+            let desktop = home.join("desktop");
+            fs::DirBuilder::new().mode(0o700).create(&desktop).unwrap();
+            let dir = reserve(&home, &desktop).unwrap();
+            let before = fs::read(dir.join(FILE)).unwrap();
+            let unsafe_path = home.join(component);
+            fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(validate_daemon_store(&dir).is_err(), "{component} {mode:o}");
+            assert!(reserve(&home, &desktop).is_err(), "{component} {mode:o}");
+            assert!(
+                reserve_locked(&dir, &desktop).is_err(),
+                "{component} {mode:o}"
+            );
+            assert_eq!(fs::metadata(&unsafe_path).unwrap().mode() & 0o777, mode);
+            assert_eq!(fs::read(dir.join(FILE)).unwrap(), before);
+            assert!(!dir.join("keys.json").exists());
+        }
+    }
+
+    #[test]
+    fn symlink_nonregular_and_foreign_ancestry_refuse_before_reservation() {
+        for component in [".xshell", ".xshell/daemon", ".xshell/daemon/ring"] {
+            for symlink in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().canonicalize().unwrap();
+                let desktop = home.join("desktop");
+                fs::DirBuilder::new().mode(0o700).create(&desktop).unwrap();
+                let dir = reserve(&home, &desktop).unwrap();
+                let replaced = home.join(component);
+                fs::remove_dir_all(&replaced).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                if symlink {
+                    std::os::unix::fs::symlink(outside.path(), &replaced).unwrap();
+                } else {
+                    fs::write(&replaced, b"not a directory").unwrap();
+                }
+                assert!(validate_daemon_store(&dir).is_err());
+                assert!(reserve(&home, &desktop).is_err());
+                assert!(reserve_locked(&dir, &desktop).is_err());
+                assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+                if !symlink {
+                    assert_eq!(fs::read(replaced).unwrap(), b"not a directory");
+                }
+            }
+        }
+        // A real foreign-owned canonical directory, without privileged chown or mutation.
+        let foreign = Path::new("/");
+        if fs::metadata(foreign).unwrap().uid() != unsafe { libc::geteuid() } {
+            let desktop = tempfile::tempdir().unwrap();
+            let dir = foreign.join(".xshell/daemon/ring");
+            assert!(validate_shared_ancestor(foreign).is_err());
+            assert!(validate_daemon_store(&dir).is_err());
+            assert!(reserve(foreign, desktop.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_shared_ancestor_is_created_private() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let desktop = home.join("desktop");
+        fs::DirBuilder::new().mode(0o700).create(&desktop).unwrap();
+        reserve(&home, &desktop).unwrap();
+        assert_eq!(
+            fs::metadata(home.join(".xshell")).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
     /// Prepared-policy storage compatibility only: no possession/consent or installation.
     #[test]
     fn valid_prepared_policy_with_embedded_history_exceeds_small_metadata_limit() {

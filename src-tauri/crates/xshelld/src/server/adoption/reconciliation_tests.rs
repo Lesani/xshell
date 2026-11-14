@@ -1250,3 +1250,178 @@ fn standalone_final_receipt_replays_cleanup_before_checking_durable_installation
         f.chain.head()
     );
 }
+
+/// Actual production in-process driver install continuation; network/word/consent steps
+/// are not exercised here. Signed effective evidence uses the existing observer seam.
+#[test]
+fn in_process_standalone_driver_finalization_refuses_terminal_after_install() {
+    use std::sync::{mpsc, Mutex};
+    let (at, reached) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Mutex::new(released);
+    let f = Fixture::with_hook(
+        true,
+        Some(crate::server::TestHook(Arc::new(move |_, point| {
+            if point == crate::server::TestPoint::StandaloneInstalledBeforeJournal {
+                at.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            false
+        }))),
+    );
+    let record = set_journal(&f, &f.chain, false);
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let before = std::fs::read(store.dir.join("standalone-adoption.json")).unwrap();
+    let roster = std::fs::read(store.dir.join("roster.json")).unwrap();
+    let driver = StandaloneDriver {
+        store,
+        owner: StandaloneOwner::Runtime(&f.handle.d.ring),
+        exiting: Some(&f.handle.d.exiting),
+    };
+    std::thread::scope(|scope| {
+        let install =
+            scope.spawn(|| driver.install(&record.accepted, &record.intent.operation, &budget()));
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        f.observe_terminal(f.daemon.sign_key());
+        release.send(()).unwrap();
+        assert!(install.join().unwrap().unwrap_err().contains("terminal"));
+    });
+    assert_eq!(
+        std::fs::read(driver.store.dir.join("standalone-adoption.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(driver.store.dir.join("roster.json")).unwrap(),
+        roster
+    );
+}
+
+#[test]
+fn admitted_ring_companion_mutation_retains_store_through_shutdown_and_late_request_refuses() {
+    use crate::server::ring::ownership::{StoreOwnership, StoreOwnershipLease};
+    use std::sync::{mpsc, Mutex};
+    let (at, reached) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Mutex::new(released);
+    let f = Fixture::with_hook(
+        true,
+        Some(crate::server::TestHook(Arc::new(move |_, point| {
+            if point == crate::server::TestPoint::RingCompanionAdmitted {
+                at.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            false
+        }))),
+    );
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let desktop_dir = f._home.path().join("completion-desktop");
+    crate::paths::ensure_private_dir(&desktop_dir).unwrap();
+    let retained_name = &f.chain.head().member(&f.daemon.sign_key()).unwrap().name;
+    let profile = CompanionProfile::for_stores(
+        desktop_dir.to_str().unwrap().into(),
+        store.dir.to_str().unwrap().into(),
+        identity(&f.other, "completion desktop"),
+        identity(&f.daemon, retained_name),
+        f.client.endpoint().to_str().unwrap().into(),
+    );
+    let proof = Signature::from_bytes(f.other.sign(&registration_message(&profile)).unwrap());
+    f.client
+        .request(CompanionRequest::Register { profile, proof })
+        .unwrap();
+    let intent = AdoptionIntent {
+        operation: b64::encode(&[76; 32]),
+        expires_at: now() + 60,
+        target: JoinTarget::Computer {
+            desktop: identity(&f.other, "completion desktop"),
+            daemon: identity(&f.daemon, retained_name),
+        },
+    };
+    f.client
+        .request(CompanionRequest::CompletionStart {
+            intent: intent.clone(),
+        })
+        .unwrap();
+    let mut proposal = f.chain.head().roster().clone();
+    proposal.version += 1;
+    proposal.prev = Some(f.chain.head().hash());
+    proposal.issued_at = now();
+    proposal.members.push(Member::new(
+        "completion desktop",
+        xshell_protocol::ring::Role::Desktop,
+        f.other.sign_key(),
+        f.other.noise_key(),
+        proposal.issued_at,
+    ));
+    let mut membership = proposal.membership().unwrap();
+    let singleton = membership
+        .unit_for(&f.daemon.sign_key())
+        .unwrap()
+        .id
+        .clone();
+    membership.enrollments.retain(|unit| unit.id != singleton);
+    membership.retired.push(singleton.clone());
+    membership.enrollments.push(Enrollment {
+        id: intent.operation.clone(),
+        kind: EnrollmentKind::Computer,
+        members: vec![f.other.sign_key(), f.daemon.sign_key()],
+        enrolled_at: proposal.issued_at,
+    });
+    membership.change = RosterChange::CompleteComputer {
+        replaces: vec![singleton],
+        enrollment_id: intent.operation.clone(),
+        proofs: vec![],
+    };
+    proposal.set_membership(&membership);
+    let proposal = CompanionProposal {
+        operation: intent.operation,
+        predecessor: tokens(&f.chain),
+        proposal,
+        transcript: ConsentTranscript::Local,
+    };
+    let request = CompanionAdminRequest::Propose {
+        proposal: Box::new(proposal.clone()),
+    };
+    let before = std::fs::read(store.dir.join("completion.json")).unwrap();
+    std::thread::scope(|scope| {
+        let admin = scope.spawn(|| {
+            crate::server::completion::admin(
+                &f.handle.d,
+                Some(f.desktop.sign_key()),
+                request.clone(),
+            )
+        });
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        f.handle.d.exit(crate::server::ExitReason::Shutdown);
+        assert!(matches!(
+            StoreOwnershipLease::acquire(&store.dir).unwrap(),
+            StoreOwnership::Busy
+        ));
+        assert!(crate::server::completion::admin(
+            &f.handle.d,
+            Some(f.desktop.sign_key()),
+            request.clone()
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(store.dir.join("completion.json")).unwrap(),
+            before
+        );
+        release.send(()).unwrap();
+        admin.join().unwrap().unwrap();
+    });
+    let pending: CompletionPending =
+        serde_json::from_slice(&std::fs::read(store.dir.join("completion.json")).unwrap()).unwrap();
+    assert_eq!(pending.proposal, Some(proposal));
+    assert!(matches!(
+        StoreOwnershipLease::acquire(&store.dir).unwrap(),
+        StoreOwnership::Acquired(_)
+    ));
+}

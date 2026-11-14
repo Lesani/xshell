@@ -156,8 +156,9 @@ fn refused_attach(c: &mut Client, t: Uuid) {
     assert!(e.starts_with(FORBIDDEN), "{e}");
 }
 
-/// The second computer `h2` (running `srv2`) pairs itself with `xshelld pair`, its code
-/// typed on the Desktop: it never gets a local `ring.join`. Returns once it is online.
+/// Genuine v1 helper control for the second Host, not the production v2 CLI.
+/// Its old code is typed on the Desktop; returns once the Host is online.
+#[cfg(feature = "legacy-pair-test-control")]
 fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: &ServerHandle) {
     let (d2, _, _) = identity(srv2);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -185,7 +186,13 @@ fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: 
     };
     let paths2 = h2.paths();
     let pairing = std::thread::spawn(move || {
-        xshelld::pair::run_pair_to(&opts, &paths2, &mut Lines(tx, Vec::new()))
+        xshelld::pair::run_legacy_pair_test_control(
+            &opts,
+            &paths2,
+            &mut Lines(tx, Vec::new()),
+            Duration::from_secs(30),
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     });
     let code = loop {
         let l = rx.recv_timeout(T).expect("the code is shown");
@@ -196,12 +203,13 @@ fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: 
     std::thread::sleep(Duration::from_millis(200));
     ring.pair_computer(&code, Arc::new(Events::default()))
         .unwrap();
-    assert_eq!(pairing.join().unwrap(), 0);
+    assert!(pairing.join().unwrap().is_ok());
     let id = ring.chain().unwrap().ring_id().clone();
     wait_until("the second daemon is online", T, || online(r, &id, &d2));
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn every_daemon_accepts_new_member_within_seconds() {
     let r = relay();
     let (h1, h2) = (TestHome::new(), TestHome::new());
@@ -461,6 +469,7 @@ fn tampering_relay_end_to_end() {
 /// seconds through the Relay alone (neither gets a local `ring.join` after the removal; the
 /// second never got one). The phone stops, and can neither log in nor open a session again.
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn removing_a_phone_cuts_it_on_every_daemon_within_seconds() {
     let r = relay();
     let (h1, h2) = (TestHome::new(), TestHome::new());

@@ -754,7 +754,13 @@ impl Conn {
             ClientMsg::DaemonUpgrade if d.cfg.gui_bound.is_some() => {
                 reply(&self.ob, id, Err(UPGRADE_REFUSED.to_string()))
             }
-            ClientMsg::RingIdentity => reply(&self.ob, id, d.ring.identity()),
+            ClientMsg::RingIdentity => reply(
+                &self.ob,
+                id,
+                d.store_admission
+                    .admit()
+                    .and_then(|_operation| d.ring.identity()),
+            ),
             ClientMsg::RingCompanion { request } => {
                 #[cfg(unix)]
                 let result = if self.ingress != Ingress::Relay {
@@ -772,13 +778,15 @@ impl Conn {
             ClientMsg::RingJoin { rosters, expect } => {
                 // A Relay session can synchronize retained membership, not establish local
                 // provenance or bootstrap an unpaired counterpart.
-                let result = if super::ring::companion_registered(&d.cfg.paths.ring_dir) {
+                let result = d.store_admission.admit().and_then(|_operation| {
+                if super::ring::companion_registered(&d.cfg.paths.ring_dir) {
                     Err("protected_counterpart_required: registered Computer installation is not a Host RPC".into())
                 } else if self.ingress == Ingress::Relay && d.ring.trusted_chain().is_none() {
                     Err("leave_required: Relay ingress has no retained local membership".into())
                 } else {
                     d.ring.join(&rosters, expect.as_ref())
-                };
+                }
+                });
                 reply(&self.ob, id, result)
             }
             // Only from a Mobile's session: the registration is bound to its Roster entry.

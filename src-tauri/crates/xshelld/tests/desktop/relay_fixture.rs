@@ -160,6 +160,7 @@ impl Computer {
             }
         })
     }
+    #[cfg(feature = "legacy-pair-test-control")]
     pub(super) fn legacy_pair(&self, approver: &Self, relay: &Relay) -> SignKey {
         let (tx, rx) = mpsc::channel();
         struct Lines(Vec<u8>, mpsc::Sender<String>);
@@ -188,11 +189,17 @@ impl Computer {
             ..Default::default()
         };
         let pair = std::thread::spawn(move || {
-            xshelld::pair::run_pair_to(&opts, &paths, &mut Lines(Vec::new(), tx))
+            xshelld::pair::run_legacy_pair_test_control(
+                &opts,
+                &paths,
+                &mut Lines(Vec::new(), tx),
+                Duration::from_secs(30),
+                &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
         });
         let code = rx.recv_timeout(WAIT).unwrap();
         approver.ring.pair_computer(&code, Arc::new(Quiet)).unwrap();
-        assert_eq!(pair.join().unwrap(), 0);
+        assert!(pair.join().unwrap().is_ok());
         common::ring::identity(self.daemon.as_ref().unwrap()).0
     }
     pub(super) fn relay_host(&self, key: SignKey) -> Arc<HostHandle> {

@@ -20,6 +20,18 @@ pub fn watch_exit_signals(stop: Arc<StopLatch>) -> io::Result<()> {
     Ok(())
 }
 
+/// Command lifetime cancellation only; no process-global logger or Daemon is started.
+#[cfg(unix)]
+pub fn watch_pair_signals(cancel: Arc<std::sync::atomic::AtomicBool>) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("pair-signals".into())
+        .spawn(move || {
+            let _ = wait_exit_signal();
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        })?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn exit_signal_set() -> libc::sigset_t {
     unsafe {

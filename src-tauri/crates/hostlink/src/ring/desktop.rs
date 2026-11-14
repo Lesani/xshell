@@ -314,6 +314,15 @@ pub trait RingObserver: Send + Sync {
 /// Deterministic transaction test seams; none supplies authority or alters a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdoptionTestPoint {
+    RegistrationAdmitted,
+    OriginJoinBeforeAdmission,
+    OriginJoinAdmissionBusy,
+    OriginJoinAdmitted,
+    JoinBeforeCounterpartStart,
+    JoinWorkerStarted,
+    JoinSlotReady,
+    OriginControllerAttached,
+    OriginDispatchEnded,
     ApprovalProofsReceived,
     ApprovalBeforePublish,
     CompletionBeforeUncertainWrite,
@@ -663,6 +672,8 @@ struct Live {
 #[cfg(unix)]
 struct HostBrokerBinding {
     generation: Option<u64>,
+    /// The single accepted successor retained only to deliver this Join's receipt.
+    join_receipt_generation: Option<u64>,
     server: Option<super::broker::Server>,
     client: Arc<super::broker::BrokerClient>,
     path: PathBuf,
@@ -1018,6 +1029,22 @@ impl DesktopRing {
         let owner_generation = projection
             .as_ref()
             .and_then(|p| p.owner.as_ref().map(|o| o.generation));
+        #[cfg(unix)]
+        let elected = self.pairing_ipc_owner();
+        #[cfg(unix)]
+        {
+            // This routing worker is the only broker binder/rebinder. Retire old Host
+            // target resolution before publishing a changed authority generation, then
+            // release all guards before Manager callbacks or server retirement/rebind.
+            let binding = self.host_broker.lock().unwrap();
+            if let Some(binding) = binding.as_ref() {
+                if binding.generation != owner_generation || !elected {
+                    if let Some(server) = &binding.server {
+                        server.broker.retire_host_generation();
+                    }
+                }
+            }
+        }
         manager.set_ring_hosts(projection);
         #[cfg(unix)]
         self.maintain_host_broker(&manager, owner_generation);
@@ -1042,6 +1069,7 @@ impl DesktopRing {
             let client = super::broker::BrokerClient::new(profile.clone(), manager);
             *binding = Some(HostBrokerBinding {
                 generation: None,
+                join_receipt_generation: None,
                 server: None,
                 client,
                 path: dir.join("host-broker.sock"),
@@ -1050,8 +1078,70 @@ impl DesktopRing {
         }
         let binding = binding.as_mut().expect("initialized");
         if binding.generation != generation || !elected {
-            binding.server.take();
-            binding.generation = generation;
+            // Preserve only this active guest's own unpaired -> accepted transition,
+            // never an owner loss, revocation or a later membership generation.
+            let defer = elected
+                && binding.generation.is_none()
+                && generation.is_some()
+                && (binding.join_receipt_generation.is_none()
+                    || binding.join_receipt_generation == generation)
+                && binding
+                    .server
+                    .as_ref()
+                    .is_some_and(|server| !server.broker.administration.lock().unwrap().is_empty())
+                && {
+                    let effective = self
+                        .adoption_owner_connector()
+                        .and_then(|owner| owner.try_chain());
+                    let installed_operation = self
+                        .store
+                        .load_profile()
+                        .ok()
+                        .and_then(|(p, _)| p)
+                        .and_then(|p| {
+                            let j = p.journal.as_ref()?;
+                            let m = p.membership.as_ref()?;
+                            let companion = p.companion.as_ref()?;
+                            (j.desktop_installed
+                                && j.daemon_installed
+                                && j.phase == super::store::AdoptionPhase::Installed
+                                && j.accepted.last().map(String::as_str)
+                                    == Some(m.chain.head().token())
+                                && m.chain.authorized_member(&p.keys.sign_key()).is_some()
+                                && m.chain
+                                    .authorized_member(&companion.daemon.sign_key)
+                                    .is_some()
+                                && effective.as_ref().is_some_and(|current| {
+                                    current.head() == m.chain.head()
+                                        && current.authorized_member(&p.keys.sign_key()).is_some()
+                                        && current
+                                            .authorized_member(&companion.daemon.sign_key)
+                                            .is_some()
+                                }))
+                            .then(|| j.intent.operation.clone())
+                        });
+
+                    installed_operation.is_some_and(|operation| {
+                        binding.server.as_ref().is_some_and(|server| {
+                            server
+                                .broker
+                                .administration
+                                .lock()
+                                .unwrap()
+                                .installing_transition(&operation)
+                        })
+                    })
+                };
+            if defer {
+                binding.join_receipt_generation = generation;
+                if let Some(server) = &binding.server {
+                    server.broker.retire_host_generation();
+                }
+            } else {
+                binding.server.take();
+                binding.generation = generation;
+                binding.join_receipt_generation = None;
+            }
         }
         manager.set_broker(binding.client.clone(), !elected);
         if elected && binding.server.is_none() {
@@ -1068,6 +1158,11 @@ impl DesktopRing {
             }
         }
         binding.client.tick();
+        if elected {
+            if let (Some(server), Some(ring)) = (&binding.server, self.me.upgrade()) {
+                super::administration::dispatch_pending(&ring, &server.broker.administration);
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Live> {
@@ -1806,6 +1901,44 @@ impl DesktopRing {
             .as_ref()
             .and_then(|b| b.server.as_ref())
             .is_some_and(|s| s.broker.administration.lock().unwrap().take_focus_request())
+    }
+
+    /// Owner-local backend controller access. This is not native-window attestation;
+    /// C1 must bind its private lease to the actual injected Tauri origin.
+    #[cfg(unix)]
+    pub fn administration_join(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Option<Arc<super::adoption::JoinOffer>> {
+        if !self.pairing_ipc_owner() {
+            return None;
+        }
+        self.host_broker
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .server
+            .as_ref()?
+            .broker
+            .administration
+            .lock()
+            .unwrap()
+            .controller(operation)
+    }
+
+    /// Private-controller projection for owner-local dispatch/presentation, never IPC DTOs.
+    #[cfg(unix)]
+    pub fn administration_joins(&self) -> Vec<(uuid::Uuid, Arc<super::adoption::JoinOffer>)> {
+        if !self.pairing_ipc_owner() {
+            return vec![];
+        }
+        self.host_broker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|b| b.server.as_ref())
+            .map(|s| s.broker.administration.lock().unwrap().controllers())
+            .unwrap_or_default()
     }
 
     pub fn pairing_ipc_owner(&self) -> bool {

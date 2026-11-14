@@ -12,7 +12,9 @@ use xshell_protocol::ring::membership::consent_proposal_hash;
 use xshell_protocol::ring::pairing::adoption::{
     AdoptionIntent, AdoptionSigners, JoinTarget, PublicIdentity,
 };
-use xshell_protocol::ring::relay::pair::{adopt_as_guest, AdoptionGuestRequest, PairOptions};
+use xshell_protocol::ring::relay::pair::{
+    adopt_as_guest_with_ready, AdoptionGuestRequest, PairOptions,
+};
 use xshell_protocol::ring::relay::{ChainPin, RingClient, RingTimeouts};
 use xshell_protocol::ring::RosterChain;
 
@@ -204,6 +206,72 @@ pub(super) fn validate_standalone_install(
     Ok(())
 }
 
+/// Denial-only durable preparation under the actual runtime -> ring.lock fence.
+/// The owner never signs or confirms the command's proposal.
+pub(super) fn prepare_standalone_command(
+    ring: &super::ring::Ring,
+    intent: AdoptionIntent,
+    proposal: CompanionProposal,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<(), String> {
+    let record = StandaloneJournal {
+        intent,
+        proposal,
+        consent_may_have_left: true,
+        accepted: vec![],
+        installed: false,
+    };
+    ring.with_effective_chain_until(budget, |current| {
+        let store = ring.standalone_store();
+        let _lock = store.lock_until(budget)?;
+        prepare_standalone_locked(store, &record, current.as_ref(), budget)
+    })
+}
+
+fn prepare_standalone_locked(
+    store: &Store,
+    record: &StandaloneJournal,
+    current: Option<&RosterChain>,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<(), String> {
+    store.refuse_registered_binding()?;
+    if current.is_some() || super::companion::trusted(store)?.is_some() {
+        return Err("leave_required: standalone command owner retains membership".into());
+    }
+    recorded_predecessor(store, record)?;
+    // The public envelope must name this exact Enroll, not merely the same own-key
+    // target under a different command operation. Accepted installation checks this
+    // too, but preparation must refuse before writing even a conservative obligation.
+    let membership = record
+        .proposal
+        .proposal
+        .membership()
+        .map_err(|e| e.to_string())?;
+    if !matches!(membership.change, xshell_protocol::ring::membership::RosterChange::Enroll { enrollment_id, .. }
+            if enrollment_id == record.intent.operation)
+    {
+        return Err("standalone preparation operation differs from proposal".into());
+    }
+    let left = record.intent.expires_at.saturating_sub(now());
+    if left == 0 || left > 600 {
+        return Err("standalone preparation expired".into());
+    }
+    if let Some(existing) = load_journal(store)? {
+        if &existing == record {
+            return Ok(());
+        }
+        return Err(
+            "reconciliation_required: standalone operation changed or already advanced".into(),
+        );
+    }
+    budget.check().map_err(|e| e.to_string())?;
+    write_private(
+        &store.dir.join("standalone-adoption.json"),
+        &serde_json::to_vec(record).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// An in-process command capability, not a serializable confirmation request.
 pub struct StandaloneLease {
     hash: String,
@@ -271,8 +339,81 @@ fn recovery_status(
         state,
     })
 }
+/// Called only under ring.lock, and (when live) effective runtime guards.
+fn finalize_standalone_receipt_locked(
+    store: &Store,
+    record: &mut StandaloneJournal,
+    accepted: &RosterChain,
+    effective: Option<RosterChain>,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<StandaloneRecoveryStatus, String> {
+    // Preserve the complete-record concurrency fence for both the new receipt
+    // and already-Installed reporting paths.
+    if load_journal(store)?.as_ref() != Some(record) {
+        return Err("standalone reconciliation journal changed before final receipt".into());
+    }
+    let durable =
+        super::companion::trusted(store)?.ok_or("standalone durable installation missing")?;
+    let mut current = effective
+        .unwrap_or_else(|| accepted.clone())
+        .extended(accepted.versions())
+        .map_err(|e| e.to_string())?
+        .0;
+    current.merge_terminal_from(accepted);
+    current = current
+        .extended(durable.versions())
+        .map_err(|e| e.to_string())?
+        .0;
+    if current
+        .authorized_member(&record.intent.target.principal().sign_key)
+        .is_none()
+    {
+        return recovery_status(store, record, Some(&current));
+    }
+    if current.head() != durable.head() {
+        return Err("standalone current accepted ancestry is not durably installed".into());
+    }
+    budget.check().map_err(|e| e.to_string())?;
+    if !record.installed {
+        record.accepted = current
+            .versions()
+            .iter()
+            .map(|r| r.token().into())
+            .collect();
+        record.installed = true;
+        write_private(
+            &store.dir.join("standalone-adoption.json"),
+            &serde_json::to_vec(record).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    recovery_status(store, record, Some(&current))
+}
+
+/// The live command and in-process driver share the reconciliation final receipt.
+pub(super) fn finalize_standalone_install(
+    ring: &super::ring::Ring,
+    operation: &str,
+    accepted: &RosterChain,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<(), String> {
+    ring.with_effective_chain_until(budget, |effective| {
+        let store = ring.standalone_store();
+        let _lock = store.lock_until(budget)?;
+        validate_standalone_install(store, operation, accepted)?;
+        let mut record = load_journal(store)?.ok_or("standalone obligation missing")?;
+        let status =
+            finalize_standalone_receipt_locked(store, &mut record, accepted, effective, budget)?;
+        if status.state != StandaloneRecoveryState::Installed {
+            return Err("reconciliation_required: standalone installation is terminal".into());
+        }
+        Ok(())
+    })
+}
+
 impl ServerHandle {
     pub fn standalone_adoption_status(&self) -> Result<Option<StandaloneRecoveryStatus>, String> {
+        let _operation = self.d.store_admission.admit()?;
         let store = Store::new(self.d.cfg.paths.ring_dir.clone());
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(
             Instant::now() + Duration::from_secs(5),
@@ -315,6 +456,7 @@ impl ServerHandle {
             &ChainPin,
         ) -> Result<RosterChain, String>,
     ) -> Result<StandaloneRecoveryStatus, String> {
+        let _operation = self.d.store_admission.admit()?;
         let store = Store::new(self.d.cfg.paths.ring_dir.clone());
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(
             Instant::now() + Duration::from_secs(5),
@@ -433,49 +575,7 @@ impl ServerHandle {
         }
         self.d.ring.with_effective_chain_until(budget, |effective| {
             let _lock = store.lock_until(budget)?;
-            // Preserve the complete-record concurrency fence for both the new receipt
-            // and already-Installed reporting paths.
-            if load_journal(store)?.as_ref() != Some(record) {
-                return Err(
-                    "standalone reconciliation journal changed before final receipt".into(),
-                );
-            }
-            let durable = super::companion::trusted(store)?
-                .ok_or("standalone durable installation missing")?;
-            let mut current = effective
-                .unwrap_or_else(|| accepted.clone())
-                .extended(accepted.versions())
-                .map_err(|e| e.to_string())?
-                .0;
-            current.merge_terminal_from(accepted);
-            current = current
-                .extended(durable.versions())
-                .map_err(|e| e.to_string())?
-                .0;
-            if current
-                .authorized_member(&record.intent.target.principal().sign_key)
-                .is_none()
-            {
-                return recovery_status(store, record, Some(&current));
-            }
-            if current.head() != durable.head() {
-                return Err("standalone current accepted ancestry is not durably installed".into());
-            }
-            budget.check().map_err(|e| e.to_string())?;
-            if !record.installed {
-                record.accepted = current
-                    .versions()
-                    .iter()
-                    .map(|r| r.token().into())
-                    .collect();
-                record.installed = true;
-                write_private(
-                    &store.dir.join("standalone-adoption.json"),
-                    &serde_json::to_vec(record).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            recovery_status(store, record, Some(&current))
+            finalize_standalone_receipt_locked(store, record, accepted, effective, budget)
         })
     }
 
@@ -496,26 +596,252 @@ impl ServerHandle {
         if self.d.cfg.gui_bound.is_some() {
             return Err("registered GUI ownership excludes standalone adoption".into());
         }
+        let deadline = StandaloneDeadline::new(ttl)?;
+        let _operation = self.d.store_admission.admit_standalone(cancel)?;
+        StandaloneDriver {
+            store: Store::new(self.d.cfg.paths.ring_dir.clone()),
+            owner: StandaloneOwner::Runtime(&self.d.ring),
+            exiting: Some(&self.d.exiting),
+        }
+        .run(
+            relay,
+            &super::ring::host_name(),
+            deadline,
+            cancel,
+            |code| {
+                words(code);
+                Ok(())
+            },
+            confirm,
+        )
+    }
+}
+
+#[cfg(debug_assertions)]
+fn offline_ownership_cut(
+    name: &str,
+    budget: &xshell_core::local_ipc::RequestBudget,
+) -> Result<(), String> {
+    if let Some(path) = std::env::var_os(name) {
+        let path = std::path::PathBuf::from(path);
+        write_private(&path, b"offline-owner-cut").map_err(|e| e.to_string())?;
+        while path.exists() {
+            budget.check().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(())
+}
+
+/// Command-owned Store transaction; no serve, Desktop signer or Relay Connector is made.
+struct StandaloneDeadline {
+    until: Instant,
+    expires_at: u64,
+}
+impl StandaloneDeadline {
+    fn new(ttl: Duration) -> Result<Self, String> {
         let ttl = ttl.min(Duration::from_secs(600));
         if ttl.as_secs() == 0 {
             return Err("standalone deadline is empty".into());
         }
-        let until = Instant::now() + ttl;
-        let expires_at = now() + ttl.as_secs();
+        Ok(Self {
+            until: Instant::now() + ttl,
+            expires_at: now() + ttl.as_secs(),
+        })
+    }
+}
+enum StandaloneOwner<'a> {
+    Offline(super::ring::ownership::StoreOwnershipLease),
+    RunningOwner(xshell_core::local_ipc::ProtectedEndpoint),
+    Runtime(&'a super::ring::Ring),
+}
+struct StandaloneDriver<'a> {
+    store: Store,
+    owner: StandaloneOwner<'a>,
+    exiting: Option<&'a AtomicBool>,
+}
+impl StandaloneDriver<'_> {
+    fn transaction<T>(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        change: impl FnOnce(&Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let StandaloneOwner::Runtime(runtime) = &self.owner {
+            return runtime.standalone_transaction(budget, change);
+        }
+        let refuse_paired_store = || -> Result<(), String> {
+            self.store.refuse_registered_join()?;
+            if super::companion::trusted(&self.store)?.is_some() {
+                return Err(
+                    "leave_required: standalone adoption requires an unpaired Daemon".into(),
+                );
+            }
+            Ok(())
+        };
+        if matches!(self.owner, StandaloneOwner::RunningOwner(_)) {
+            {
+                let _lock = self.store.lock_until(budget)?;
+                // Local denying evidence remains useful even without an owner. Release
+                // the Store lock before IPC; this check never grants no-owner admission.
+                refuse_paired_store()?;
+            }
+            let response = self.command_request(
+                &xshell_protocol::ring::companion::CompanionRequest::StandaloneCommandReady,
+                budget,
+            )?;
+            if !matches!(
+                response,
+                xshell_protocol::ring::companion::CompanionResponse::StandaloneCommandReady
+            ) {
+                return Err("running standalone owner admission unavailable".into());
+            }
+        }
+        let _lock = self.store.lock_until(budget)?;
+        refuse_paired_store()?;
+        budget.check().map_err(|e| e.to_string())?;
+        change(&self.store)
+    }
+    fn command_request(
+        &self,
+        request: &xshell_protocol::ring::companion::CompanionRequest,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<xshell_protocol::ring::companion::CompanionResponse, String> {
+        let StandaloneOwner::RunningOwner(endpoint) = &self.owner else {
+            return Err("running owner route required".into());
+        };
+        match endpoint
+            .exchange_until(request, budget)
+            .map_err(|e| format!("running owner unavailable: {e}"))?
+        {
+            xshell_protocol::ring::companion::CompanionResponse::Error { message } => Err(message),
+            response => Ok(response),
+        }
+    }
+    fn prepare(
+        &self,
+        record: &StandaloneJournal,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<(), String> {
+        if matches!(self.owner, StandaloneOwner::RunningOwner(_)) {
+            return match self.command_request(
+                &xshell_protocol::ring::companion::CompanionRequest::PrepareStandaloneCommand {
+                    intent: record.intent.clone(),
+                    proposal: Box::new(record.proposal.clone()),
+                },
+                budget,
+            )? {
+                xshell_protocol::ring::companion::CompanionResponse::StandalonePrepared {
+                    operation,
+                } if operation == record.intent.operation => Ok(()),
+                _ => Err("standalone preparation receipt missing".into()),
+            };
+        }
+        self.transaction(budget, |store| {
+            prepare_standalone_locked(store, record, None, budget)
+        })
+    }
+
+    fn install(
+        &self,
+        tokens: &[String],
+        operation: &str,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<(), String> {
+        if let StandaloneOwner::Runtime(runtime) = &self.owner {
+            runtime.join_accepted_standalone(tokens, operation, budget)?;
+            runtime.standalone_installed_before_journal();
+            let accepted = RosterChain::from_tokens(tokens).map_err(|e| e.to_string())?;
+            return finalize_standalone_install(runtime, operation, &accepted, budget);
+        }
+        let chain = RosterChain::from_tokens(tokens).map_err(|e| e.to_string())?;
+        if let StandaloneOwner::Offline(_lease) = &self.owner {
+            let saved = self.store.save_join_chain(
+                &chain,
+                None,
+                &super::ring::JoinOrigin::Standalone {
+                    operation: operation.into(),
+                },
+                Some(budget),
+                None,
+            )?;
+            if let Some(error) = saved.conflict.or(saved.write_error) {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        let reply = self.command_request(
+            &xshell_protocol::ring::companion::CompanionRequest::InstallStandaloneAccepted {
+                operation: operation.into(),
+                rosters: tokens.to_vec(),
+            },
+            budget,
+        )?;
+        match reply {
+            xshell_protocol::ring::companion::CompanionResponse::Installed { hash }
+                if hash == chain.head().hash() =>
+            {
+                Ok(())
+            }
+            _ => Err("running owner accepted handoff receipt missing".into()),
+        }
+    }
+    fn run(
+        &self,
+        relay: &str,
+        name: &str,
+        deadline: StandaloneDeadline,
+        cancel: &Arc<AtomicBool>,
+        words: impl FnOnce(&DeviceCode) -> Result<(), String>,
+        confirm: impl FnOnce(
+            &StandalonePreview,
+            &StandaloneLease,
+        ) -> Result<Option<StandaloneConfirmation>, String>,
+    ) -> Result<RosterChain, String> {
+        let StandaloneDeadline { until, expires_at } = deadline;
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel.clone());
-        let store = Store::new(self.d.cfg.paths.ring_dir.clone());
+        let store = &self.store;
+        #[cfg(debug_assertions)]
+        if matches!(self.owner, StandaloneOwner::Offline(_)) {
+            offline_ownership_cut("XSHELLD_TEST_OFFLINE_OWNER_BEFORE_KEYS", &budget)?;
+        }
         let _admission = store.reserve_standalone_offer(&budget)?;
-        let keys = self
-            .d
-            .ring
-            .standalone_transaction(&budget, |store| store.keys_locked().map(Arc::new))?;
+        let owner_identity = if matches!(self.owner, StandaloneOwner::RunningOwner(_)) {
+            self.transaction(&budget, |_| Ok(()))?;
+            match self.command_request(
+                &xshell_protocol::ring::companion::CompanionRequest::Descriptor,
+                &budget,
+            )? {
+                xshell_protocol::ring::companion::CompanionResponse::Identity {
+                    identity,
+                    profile: None,
+                } => Some(identity),
+                _ => return Err("standalone running owner identity unavailable".into()),
+            }
+        } else {
+            None
+        };
+        let keys = self.transaction(&budget, |store| {
+            let keys = if owner_identity.is_some() {
+                store
+                    .load_keys()?
+                    .ok_or("retained running owner keys missing")?
+            } else {
+                store.keys_locked()?
+            };
+            if owner_identity.as_ref().is_some_and(|identity| {
+                identity.sign_key != keys.sign_key() || identity.noise_key != keys.noise_key()
+            }) {
+                return Err("running owner identity changed".into());
+            }
+            Ok(Arc::new(keys))
+        })?;
         let intent = AdoptionIntent {
             operation: xshell_protocol::ring::relay::wire::new_nonce()
                 .map_err(|e| e.to_string())?,
             expires_at,
             target: JoinTarget::StandaloneDaemon {
                 daemon: PublicIdentity {
-                    name: super::ring::host_name(),
+                    name: name.into(),
                     sign_key: keys.sign_key(),
                     noise_key: keys.noise_key(),
                 },
@@ -523,9 +849,8 @@ impl ServerHandle {
         };
         let code = DeviceCode::generate().map_err(|e| e.to_string())?;
         let secret = code.secret();
-        words(&code);
         let mut journal = None;
-        let result = adopt_as_guest(
+        let result = adopt_as_guest_with_ready(
             &AdoptionGuestRequest {
                 keys: keys.clone(),
                 signers: AdoptionSigners {
@@ -540,6 +865,7 @@ impl ServerHandle {
             },
             &PairOptions::default(),
             Some(cancel),
+            || words(&code).map_err(xshell_protocol::ring::pairing::PairError::Relay),
             |request| {
                 let proposal = CompanionProposal {
                     operation: intent.operation.clone(),
@@ -580,7 +906,9 @@ impl ServerHandle {
                 }
                 if cancel.load(Ordering::Acquire)
                     || Instant::now() >= until
-                    || self.d.exiting.load(Ordering::Acquire)
+                    || self
+                        .exiting
+                        .is_some_and(|exiting| exiting.load(Ordering::Acquire))
                 {
                     return Err(xshell_protocol::ring::pairing::PairError::Cancelled);
                 }
@@ -591,18 +919,10 @@ impl ServerHandle {
                     accepted: vec![],
                     installed: false,
                 };
-                self.d
-                    .ring
-                    .standalone_transaction(&budget, |store| {
-                        budget.check().map_err(|e| e.to_string())?;
-                        write_private(
-                            &store.dir.join("standalone-adoption.json"),
-                            &serde_json::to_vec(&record).expect("journal serializes"),
-                        )
-                        .map_err(|e| e.to_string())
-                    })
+                // A lost preparation reply cannot authorize a signing retry or fresh offer.
+                journal = Some(record.clone());
+                self.prepare(&record, &budget)
                     .map_err(xshell_protocol::ring::pairing::PairError::Relay)?;
-                journal = Some(record);
                 Ok(true)
             },
         );
@@ -621,30 +941,87 @@ impl ServerHandle {
         );
         {
             let _lock = store.lock_until(&install_budget)?;
+            let mut prepared = record.clone();
+            prepared.accepted.clear();
+            if load_journal(store)?.as_ref() != Some(&prepared) {
+                return Err("reconciliation_required: standalone prepared record changed".into());
+            }
+            accepted_record(store, &record)?;
             write_private(
                 &store.dir.join("standalone-adoption.json"),
                 &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
         }
-        self.d
-            .ring
-            .join_accepted_standalone(&record.accepted, &record.intent.operation, &install_budget)
-            .map_err(|e| format!("reconciliation_required: {e}"))?;
-        let _lock = store.lock_until(&install_budget)?;
-        let durable =
-            super::companion::trusted(&store)?.ok_or("standalone durable installation missing")?;
-        if durable.head() != chain.head() {
-            return Err("standalone durable head changed".into());
+        #[cfg(debug_assertions)]
+        if matches!(self.owner, StandaloneOwner::Offline(_)) {
+            offline_ownership_cut("XSHELLD_TEST_OFFLINE_OWNER_BEFORE_INSTALL", &install_budget)?;
         }
-        record.installed = true;
-        write_private(
-            &store.dir.join("standalone-adoption.json"),
-            &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+        self.install(&record.accepted, &record.intent.operation, &install_budget)
+            .map_err(|e| format!("reconciliation_required: {e}"))?;
+        if let StandaloneOwner::Offline(_lease) = &self.owner {
+            #[cfg(debug_assertions)]
+            offline_ownership_cut("XSHELLD_TEST_OFFLINE_OWNER_BEFORE_RECEIPT", &install_budget)?;
+            let _lock = store.lock_until(&install_budget)?;
+            validate_standalone_install(store, &record.intent.operation, &chain)?;
+            let status = finalize_standalone_receipt_locked(
+                store,
+                &mut record,
+                &chain,
+                None,
+                &install_budget,
+            )?;
+            if status.state != StandaloneRecoveryState::Installed {
+                return Err("reconciliation_required: standalone installation is terminal".into());
+            }
+        }
         Ok(chain)
     }
+}
+
+pub(crate) fn adopt_standalone_command(
+    paths: &crate::paths::Paths,
+    relay: &str,
+    name: Option<&str>,
+    ttl: Duration,
+    cancel: &Arc<AtomicBool>,
+    words: impl FnOnce(&DeviceCode) -> Result<(), String>,
+) -> Result<RosterChain, String> {
+    let deadline = StandaloneDeadline::new(ttl)?;
+    let directory =
+        super::ring::ownership::canonical_store(&paths.ring_dir).map_err(|e| e.to_string())?;
+    let store = Store::new(directory.clone());
+    // Registered/pending classification has already run, and is repeated at every
+    // transaction/commit. Busy is the only route to an actual protected owner.
+    let owner = match super::ring::ownership::StoreOwnershipLease::acquire(&directory)? {
+        super::ring::ownership::StoreOwnership::Acquired(lease) => StandaloneOwner::Offline(lease),
+        super::ring::ownership::StoreOwnership::Busy => StandaloneOwner::RunningOwner(
+            xshell_core::local_ipc::ProtectedEndpoint::pin(directory.join("companion.sock"))
+                .map_err(|e| format!("running owner unavailable: {e}"))?,
+        ),
+    };
+    StandaloneDriver {
+        store,
+        owner,
+        exiting: None,
+    }
+    .run(
+        relay,
+        &name
+            .map(|name| xshell_protocol::ring::member_name(name, "Host"))
+            .unwrap_or_else(super::ring::host_name),
+        deadline,
+        cancel,
+        words,
+        |preview, lease| {
+            // Only this explicit standalone command grants consent, after the protocol
+            // independently verifies this exact Daemon target and approving proposal.
+            if !matches!(preview.intent.target, JoinTarget::StandaloneDaemon { .. }) {
+                return Err("command cannot authorize Computer consent".into());
+            }
+            lease.confirm(&preview.proposal_hash).map(Some)
+        },
+    )
 }
 
 #[cfg(test)]

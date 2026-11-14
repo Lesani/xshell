@@ -80,3 +80,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[features]
+legacy-pair-test-control = ["xshell-protocol/test-relay"]

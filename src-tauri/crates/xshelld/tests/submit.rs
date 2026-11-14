@@ -1960,6 +1960,238 @@ mod mode_gate {
         })
     }
 
+    /// One real screen wait before the first positive Paste, without changing readiness.
+    #[derive(Clone, Default)]
+    struct OneScreenWait(Arc<(Mutex<ScreenWaitState>, Condvar)>);
+
+    #[derive(Default)]
+    struct ScreenWaitState {
+        armed: bool,
+        at_read: bool,
+        release_read: bool,
+        arm_screen: bool,
+        at_screen: bool,
+        release_screen: bool,
+        acknowledged: usize,
+    }
+
+    struct ReleaseScreenWait(OneScreenWait);
+
+    impl Drop for ReleaseScreenWait {
+        fn drop(&mut self) {
+            let (m, cv) = &*self.0 .0;
+            let mut s = m.lock().unwrap_or_else(|e| e.into_inner());
+            s.release_read = true;
+            s.release_screen = true;
+            cv.notify_all();
+        }
+    }
+
+    impl OneScreenWait {
+        fn hook(&self) -> TestHook {
+            let me = self.clone();
+            TestHook(Arc::new(move |_, point| {
+                let (m, cv) = &*me.0;
+                let mut s = m.lock().unwrap();
+                let read = point == TestPoint::SubmitModeRead && s.armed;
+                let screen = point == TestPoint::ScreenFed && s.arm_screen;
+                if read {
+                    s.armed = false;
+                    s.at_read = true;
+                } else if screen {
+                    s.arm_screen = false;
+                    s.at_screen = true;
+                } else if point == TestPoint::SubmitScreenWait && s.at_screen && !s.release_screen {
+                    s.acknowledged += 1;
+                }
+                if point == TestPoint::SubmitPasteWritten && s.at_read {
+                    assert_eq!(s.acknowledged, 1);
+                    assert!(s.release_screen, "positive Paste before screen release");
+                }
+                cv.notify_all();
+                if read || screen {
+                    let (s, _) = cv
+                        .wait_timeout_while(s, T, |s| {
+                            if read {
+                                !s.release_read
+                            } else {
+                                !s.release_screen
+                            }
+                        })
+                        .unwrap();
+                    assert!(
+                        if read {
+                            s.release_read
+                        } else {
+                            s.release_screen
+                        },
+                        "screen wait hold timed out"
+                    );
+                }
+                false
+            }))
+        }
+
+        fn arm(&self) -> ReleaseScreenWait {
+            self.0 .0.lock().unwrap().armed = true;
+            ReleaseScreenWait(self.clone())
+        }
+
+        fn contend(&self, t: &Term) {
+            let (m, cv) = &*self.0;
+            let (mut s, _) = cv
+                .wait_timeout_while(m.lock().unwrap(), T, |s| !s.at_read)
+                .unwrap();
+            assert!(s.at_read, "mode read not held");
+            s.arm_screen = true;
+            drop(s);
+            // ScreenFed holds only the real screen. Its callback never calls the Daemon.
+            t.run(r"printf '\033]0;submit-screen-wait\007'");
+            let (mut s, _) = cv
+                .wait_timeout_while(m.lock().unwrap(), T, |s| !s.at_screen)
+                .unwrap();
+            assert!(s.at_screen, "screen not held");
+            s.release_read = true;
+            cv.notify_all();
+            let (mut s, _) = cv
+                .wait_timeout_while(s, T, |s| s.acknowledged == 0)
+                .unwrap();
+            assert_eq!(s.acknowledged, 1, "no single real screen WouldBlock");
+            s.release_screen = true;
+            cv.notify_all();
+        }
+    }
+
+    /// Delivery-only accounting: each new VT sample is consumed by one write attempt.
+    #[derive(Clone, Default)]
+    struct DeliveryReads(Arc<Mutex<Option<DeliveryReadState>>>);
+
+    struct DeliveryReadState {
+        baseline: usize,
+        calls: usize,
+        sequence: usize,
+        reading: Option<PendingDeliveryRead>,
+        attempt: Option<DeliveryAttempt>,
+        attempts: usize,
+        last_positive: Option<usize>,
+        enter_attempts: usize,
+        completed: bool,
+    }
+
+    struct PendingDeliveryRead {
+        started: usize,
+        call: Option<usize>,
+        ready: bool,
+    }
+
+    struct DeliveryAttempt {
+        point: TestPoint,
+        call: usize,
+        positive: bool,
+    }
+
+    #[derive(Default)]
+    struct PasteFlipBoundary {
+        calls: Option<usize>,
+        positives: usize,
+        closes: usize,
+        enters: usize,
+    }
+
+    impl DeliveryReads {
+        fn start(&self, calls: usize) {
+            *self.0.lock().unwrap() = Some(DeliveryReadState {
+                baseline: calls,
+                calls,
+                sequence: 0,
+                reading: None,
+                attempt: None,
+                attempts: 0,
+                last_positive: None,
+                enter_attempts: 0,
+                completed: false,
+            });
+        }
+
+        fn fake_call(&self, calls: usize, mode: u32) {
+            let mut state = self.0.lock().unwrap();
+            let s = state.as_mut().expect("delivery accounting not started");
+            let read = s.reading.as_mut().expect("Fake call without SubmitMode");
+            assert!(read.call.is_none() && !read.ready, "unpaired Fake call");
+            assert_eq!(calls, s.calls + 1);
+            assert_eq!(mode, VT);
+            read.call = Some(calls);
+            s.calls = calls;
+        }
+
+        fn observe(&self, point: TestPoint, calls: usize) {
+            let mut state = self.0.lock().unwrap();
+            let Some(s) = state.as_mut() else { return };
+            s.sequence += 1;
+            match point {
+                TestPoint::SubmitMode => {
+                    assert!(s.reading.is_none(), "unconsumed delivery read");
+                    assert_eq!(calls, s.calls);
+                    s.reading = Some(PendingDeliveryRead {
+                        started: s.sequence,
+                        call: None,
+                        ready: false,
+                    });
+                }
+                TestPoint::SubmitModeRead => {
+                    let read = s.reading.as_mut().expect("read without SubmitMode");
+                    assert_eq!(read.call, Some(calls));
+                    assert!(!read.ready, "reused successful sample");
+                    read.ready = true;
+                }
+                TestPoint::SubmitPaste | TestPoint::SubmitEnter => {
+                    let read = s.reading.take().expect("attempt without new read");
+                    assert!(read.ready);
+                    assert_eq!(read.call, Some(calls));
+                    assert_eq!(calls, s.calls);
+                    if point == TestPoint::SubmitEnter {
+                        assert!(
+                            read.started > s.last_positive.expect("Enter before positive Paste"),
+                            "Enter read preceded the last positive Paste"
+                        );
+                        s.enter_attempts += 1;
+                    } else {
+                        assert_eq!(s.enter_attempts, 0, "Paste after Enter");
+                    }
+                    s.attempts += 1;
+                    s.attempt = Some(DeliveryAttempt {
+                        point,
+                        call: calls,
+                        positive: false,
+                    });
+                }
+                TestPoint::SubmitPasteWritten => {
+                    let attempt = s.attempt.as_mut().expect("unpaired positive Paste");
+                    assert_eq!(attempt.point, TestPoint::SubmitPaste);
+                    assert_eq!(attempt.call, calls);
+                    assert_eq!(s.calls, calls);
+                    assert!(!attempt.positive, "sample reused for positive Paste");
+                    assert!(s.reading.is_none());
+                    assert_eq!(s.enter_attempts, 0);
+                    attempt.positive = true;
+                    s.last_positive = Some(s.sequence);
+                }
+                TestPoint::Submitted => {
+                    assert!(s.reading.is_none(), "unmatched read on completion");
+                    assert_eq!(calls, s.calls);
+                    assert_eq!(s.calls - s.baseline, s.attempts);
+                    assert!(s.last_positive.is_some() && s.enter_attempts != 0);
+                    s.completed = true;
+                }
+                _ => {}
+            }
+        }
+
+        fn assert_completed(&self) {
+            assert!(self.0.lock().unwrap().as_ref().unwrap().completed);
+        }
+    }
+
     /// S1: a VT reader gets the reply; the mode is read before the paste (nothing typed
     /// yet) and again before Enter (the paste typed, Enter not).
     #[test]
@@ -2056,8 +2288,29 @@ mod mode_gate {
     /// it is `mode_refusal_ttl` old.
     #[test]
     fn negative_reading_refuses_at_admission_until_it_expires() {
+        negative_reading_refuses(false);
+    }
+
+    #[test]
+    fn negative_reading_refuses_at_admission_until_it_expires_after_screen_wait() {
+        negative_reading_refuses(true);
+    }
+
+    fn negative_reading_refuses(screen_wait: bool) {
+        let wait = OneScreenWait::default();
+        let reads = DeliveryReads::default();
         let fake = Fake::new(RECORDS);
-        let mut e = gated_env(&fake, |c| c.mode_refusal_ttl = ms(400));
+        let (r, f, wait_hook) = (reads.clone(), fake.clone(), wait.hook());
+        let mut e = gated_env(&fake, |c| {
+            c.mode_refusal_ttl = ms(400);
+            c.test_hook = Some(TestHook(Arc::new(move |id, point| {
+                r.observe(point, f.calls());
+                if screen_wait {
+                    (wait_hook.0)(id, point);
+                }
+                false
+            })));
+        });
         let t = e.ready("codex");
         let mut m = e.mobile();
         assert_eq!(submit(&mut m, &t, "1"), Err(SUBMIT_NO_VT_INPUT.into()));
@@ -2068,8 +2321,18 @@ mod mode_gate {
         assert!(t0.elapsed() < ms(400));
         std::thread::sleep(ms(500));
         fake.set(VT);
-        assert_eq!(submit(&mut m, &t, "3"), Ok(Value::Null));
-        assert_eq!(fake.calls(), 3);
+        reads.start(fake.calls());
+        let (r, f) = (reads.clone(), fake.clone());
+        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
+            r.fake_call(f.calls(), f.mode.load(Ordering::SeqCst));
+        }));
+        let _release = screen_wait.then(|| wait.arm());
+        let id = send_submit(&mut m, &t, "3");
+        if screen_wait {
+            wait.contend(&t);
+        }
+        assert_eq!(m.wait_res(id), Ok(Value::Null));
+        reads.assert_completed();
         t.expect_input(&typed("3"));
     }
 
@@ -2230,18 +2493,50 @@ mod mode_gate {
     /// paste was written (within the reading's freshness): the next piece is not written.
     #[test]
     fn a_flip_between_written_pieces_stops_at_the_next_piece() {
+        flip_between_written_pieces(false);
+    }
+
+    #[test]
+    fn a_flip_between_written_pieces_stops_at_the_next_piece_after_screen_wait() {
+        flip_between_written_pieces(true);
+    }
+
+    fn flip_between_written_pieces(screen_wait: bool) {
+        let wait = OneScreenWait::default();
         let fake = Fake::new(VT);
-        let mut e = gated_env(&fake, |c| c.mode_fresh = Duration::from_secs(10));
+        let boundary = Arc::new(Mutex::new(PasteFlipBoundary::default()));
+        let (b, f, wait_hook) = (boundary.clone(), fake.clone(), wait.hook());
+        let mut e = gated_env(&fake, |c| {
+            c.mode_fresh = Duration::from_secs(10);
+            c.test_hook = Some(TestHook(Arc::new(move |id, point| {
+                match point {
+                    TestPoint::SubmitPasteWritten => {
+                        let mut b = b.lock().unwrap();
+                        b.positives += 1;
+                        if b.calls.is_none() {
+                            b.calls = Some(f.calls());
+                            f.set(RECORDS);
+                        }
+                    }
+                    TestPoint::SubmitClose => b.lock().unwrap().closes += 1,
+                    TestPoint::SubmitEnter => b.lock().unwrap().enters += 1,
+                    _ => {}
+                }
+                if screen_wait {
+                    (wait_hook.0)(id, point);
+                }
+                false
+            })));
+        });
         let t = e.ready("claude");
-        let f = fake.clone();
-        *fake.on_read.lock().unwrap() = Some(Box::new(move || {
-            if f.calls() == 2 {
-                f.set(RECORDS);
-            }
-        }));
         let mut m = e.mobile();
         let text = "p".repeat(3000);
-        assert_eq!(submit(&mut m, &t, &text), Err(SUBMIT_UNCONFIRMED.into()));
+        let _release = screen_wait.then(|| wait.arm());
+        let id = send_submit(&mut m, &t, &text);
+        if screen_wait {
+            wait.contend(&t);
+        }
+        assert_eq!(m.wait_res(id), Err(SUBMIT_UNCONFIRMED.into()));
         // The first write (the PTY may take less than a piece: macOS), then the frame closed.
         std::thread::sleep(ms(300));
         let (pastes, keys, inside) = as_agent_reads(&t.input());
@@ -2253,7 +2548,11 @@ mod mode_gate {
         assert_eq!(pastes.len(), 1);
         assert!(!pastes[0].is_empty() && pastes[0].len() <= 1024 - 6);
         assert!(pastes[0].iter().all(|b| *b == b'p'));
-        assert_eq!(fake.calls(), 2);
+        let b = boundary.lock().unwrap();
+        assert_eq!(b.positives, 1, "exactly one positive Paste boundary");
+        assert!(b.closes != 0, "partial frame was not closed");
+        assert_eq!(b.enters, 0, "no Enter attempt after the flip");
+        assert_eq!(fake.calls(), b.calls.expect("no positive Paste") + 1);
     }
 
     /// A1: a wait for the agent's locks spends a reading, however short: the reader holds

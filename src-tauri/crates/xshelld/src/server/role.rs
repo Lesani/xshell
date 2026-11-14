@@ -989,6 +989,15 @@ pub(crate) mod tests {
 
     pub(crate) fn daemon(dir: &Path) -> Arc<Daemon> {
         let paths = crate::paths::resolve(dir, None, None);
+        let ownership =
+            match crate::server::ring::ownership::StoreOwnershipLease::acquire(&paths.ring_dir)
+                .unwrap()
+            {
+                crate::server::ring::ownership::StoreOwnership::Acquired(lease) => lease,
+                crate::server::ring::ownership::StoreOwnership::Busy => {
+                    panic!("test Store already owned")
+                }
+            };
         Arc::new(Daemon {
             cfg: Config::new(dir.into(), paths),
             ctx: Arc::new(HostCtx::with_home(dir, dir)),
@@ -999,6 +1008,7 @@ pub(crate) mod tests {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
+            store_admission: crate::server::ring::ownership::StoreAdmission::new(ownership),
             #[cfg(unix)]
             companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),

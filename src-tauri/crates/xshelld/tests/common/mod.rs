@@ -2,6 +2,8 @@
 //! binary, and a protocol client built only from xshell-protocol's codec.
 #![allow(dead_code)]
 
+#[cfg(feature = "legacy-pair-test-control")]
+pub mod legacy_pair;
 pub mod ring;
 
 use serde_json::{json, Map, Value};

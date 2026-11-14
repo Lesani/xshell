@@ -142,6 +142,14 @@ pub enum CompanionRequest {
         proof: Signature,
     },
     Descriptor,
+    /// Read-only actual Daemon readiness; registration-only children refuse it.
+    PairDriverReady,
+    /// Read-only running-owner admission; neither request can sign or confirm.
+    StandaloneCommandReady,
+    PrepareStandaloneCommand {
+        intent: AdoptionIntent,
+        proposal: Box<CompanionProposal>,
+    },
     CompletionStart {
         intent: AdoptionIntent,
     },
@@ -180,6 +188,12 @@ pub enum CompanionRequest {
         operation: String,
         rosters: Vec<String>,
     },
+    /// Local accepted-only command handoff. Exact durable journal selects authority;
+    /// this cannot sign, confirm, admit a new offer or override a Host origin.
+    InstallStandaloneAccepted {
+        operation: String,
+        rosters: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +215,10 @@ pub enum CompanionPhase {
     deny_unknown_fields
 )]
 pub enum CompanionResponse {
+    StandaloneCommandReady,
+    StandalonePrepared {
+        operation: String,
+    },
     Identity {
         identity: PublicIdentity,
         profile: Option<CompanionProfile>,

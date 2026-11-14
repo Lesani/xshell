@@ -1,5 +1,8 @@
 #![cfg(unix)]
 //! Actual registration child + actual CLI. No roster/auth-row seeding or confirmation.
+#[cfg(feature = "legacy-pair-test-control")]
+#[path = "common/legacy_pair.rs"]
+mod legacy_pair;
 #[path = "desktop/workerd.rs"]
 #[allow(dead_code)]
 mod workerd;
@@ -175,12 +178,11 @@ fn expired_pending(f: &Fixture) {
         "registered pending CLI must not dial the Relay"
     );
     let rest: Vec<_> = rx.iter().collect();
-    assert!(!rest
-        .iter()
-        .any(|line| line.starts_with("Pairing code:") || line.starts_with("Paired as")));
-    assert!(rest
-        .iter()
-        .any(|line| line == "Computer pairing request expired. No pairing code was generated."));
+    assert!(!rest.iter().any(|line| line.starts_with("Pairing code:")
+        || line.starts_with("Device code:")
+        || line.starts_with("Paired as")));
+    assert!(rest.iter().any(|line| line
+        == "Pairing request expired. Reconcile any recorded outcome in xshell before explicitly requesting a new code."));
     assert_no_membership(f);
 }
 #[test]
@@ -349,7 +351,9 @@ fn protected_administration_before_membership_epoch_cancel_follower_and_owner_de
         cli.request(
             R::Start {
                 operation,
-                expires_at
+                expires_at,
+                offer: test_offer(expires_at),
+                monotonic_expires_at_ns: test_monotonic_deadline(),
             },
             administration_deadline()
         )
@@ -370,7 +374,9 @@ fn protected_administration_before_membership_epoch_cancel_follower_and_owner_de
             .request(
                 R::Start {
                     operation: next,
-                    expires_at
+                    expires_at,
+                    offer: test_offer(expires_at),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
                 administration_deadline()
             )
@@ -395,7 +401,9 @@ fn protected_administration_before_membership_epoch_cancel_follower_and_owner_de
             .request(
                 R::Start {
                     operation: next,
-                    expires_at
+                    expires_at,
+                    offer: test_offer(expires_at),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
                 administration_deadline()
             )
@@ -786,7 +794,7 @@ fn stalled_administration_cli(stall_hello: bool) {
         elapsed < Duration::from_millis(600),
         "original 200ms CLI TTL extended by fresh IO budgets: {elapsed:?}"
     );
-    assert!(!rx.iter().any(|line| line.starts_with("Pairing code:")));
+    assert!(!rx.iter().any(|line| line.starts_with("Device code:")));
     assert!(!f.daemon_dir().join("keys.json").exists());
 }
 #[test]
@@ -799,10 +807,19 @@ fn actual_cli_start_response_stall_does_not_release_focus_or_renew_io_deadline()
 }
 
 #[test]
-fn outstanding_actual_legacy_offer_cannot_erase_failed_startup_denial() {
+#[cfg(feature = "legacy-pair-test-control")]
+fn outstanding_legacy_helper_offer_cannot_erase_failed_startup_denial() {
     let relay = workerd::Relay::start();
     let f = Fixture::new();
-    let (mut incumbent, rx) = f.pair_on_relay(30_000, Some(&relay.url()));
+    let mut incumbent = legacy_pair::LegacyPair::start(
+        xshelld::cli::Opts {
+            relay: Some(relay.url()),
+            ..Default::default()
+        },
+        xshelld::paths::resolve(&f.home, None, Some(&f.socket)),
+        Duration::from_secs(30),
+    );
+    let rx = &incumbent.lines;
     let line = rx.recv_timeout(Duration::from_secs(8)).unwrap();
     assert!(line.starts_with("Pairing code:")); // never include the code in artifacts
     let keys = std::fs::read(f.daemon_dir().join("keys.json")).unwrap();
@@ -815,8 +832,8 @@ fn outstanding_actual_legacy_offer_cannot_erase_failed_startup_denial() {
         .is_err());
     let denied = f.daemon_dir().join("companion-pending.json").exists();
     ring.quit();
-    incumbent.0.kill().unwrap();
-    incumbent.0.wait().unwrap();
+    incumbent.cancel();
+    assert!(incumbent.wait().is_err());
     assert!(
         denied,
         "active legacy admission cannot prevent persistent denial"
@@ -830,7 +847,8 @@ fn outstanding_actual_legacy_offer_cannot_erase_failed_startup_denial() {
 }
 
 #[test]
-fn actual_legacy_guest_proof_escape_leaves_sticky_denial_across_restart_and_helper_retry() {
+#[cfg(feature = "legacy-pair-test-control")]
+fn legacy_helper_guest_proof_escape_leaves_sticky_denial_across_restart_and_helper_retry() {
     use xshell_protocol::ring::pairing::{JoinRequest, Joined, PairCode, PairRefusal};
     use xshell_protocol::ring::relay::pair::{
         host_pairing, HostRequest, PairOptions, PairPipe, PairingHost,
@@ -861,7 +879,15 @@ fn actual_legacy_guest_proof_escape_leaves_sticky_denial_across_restart_and_help
     }
     let relay = workerd::Relay::start();
     let f = Fixture::new();
-    let (mut incumbent, rx) = f.pair_on_relay(30_000, Some(&relay.url()));
+    let mut incumbent = legacy_pair::LegacyPair::start(
+        xshelld::cli::Opts {
+            relay: Some(relay.url()),
+            ..Default::default()
+        },
+        xshelld::paths::resolve(&f.home, None, Some(&f.socket)),
+        Duration::from_secs(30),
+    );
+    let rx = &incumbent.lines;
     let line = rx.recv_timeout(Duration::from_secs(8)).unwrap();
     let code = PairCode::parse(line.strip_prefix("Pairing code: ").unwrap()).unwrap();
     let keys = std::fs::read(f.daemon_dir().join("keys.json")).unwrap();
@@ -892,11 +918,8 @@ fn actual_legacy_guest_proof_escape_leaves_sticky_denial_across_restart_and_help
     assert!(approver
         .saw_proof
         .load(std::sync::atomic::Ordering::Acquire));
-    wait(|| incumbent.0.try_wait().unwrap().is_some());
-    assert_eq!(incumbent.0.wait().unwrap().code(), Some(1));
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(incumbent.0.stderr.as_mut().unwrap(), &mut stderr).unwrap();
-    assert!(stderr.contains("remote outcome is uncertain"));
+    let error = incumbent.wait().unwrap_err();
+    assert!(error.contains("remote outcome is uncertain"));
     let denial = std::fs::read(f.daemon_dir().join("companion-pending.json")).unwrap();
     ring.quit();
     let restarted = f.ring();
@@ -976,7 +999,7 @@ fn actual_cli_cancel_cleanup_is_limited_to_explicit_100ms_allowance() {
         elapsed < Duration::from_millis(600),
         "200ms TTL plus explicit 100ms cleanup exceeded margin: {elapsed:?}"
     );
-    assert!(!rx.iter().any(|line| line.starts_with("Pairing code:")));
+    assert!(!rx.iter().any(|line| line.starts_with("Device code:")));
 }
 
 #[test]
@@ -1020,16 +1043,34 @@ fn actual_registered_cli_expires_while_classification_lock_is_still_held() {
     assert!(!f.daemon_dir().join("keys.json").exists());
     assert!(!f.daemon_dir().join("roster.json").exists());
     assert!(f.daemon_dir().join("companion-pending.json").exists());
-    assert!(!lines
-        .iter()
-        .any(|line| line.starts_with("Pairing code:") || line.starts_with("Paired as")));
+    assert!(!lines.iter().any(|line| line.starts_with("Pairing code:")
+        || line.starts_with("Device code:")
+        || line.starts_with("Paired as")));
     drop(lock);
     assert!(
         exited_before_unlock,
         "original 200ms deadline must expire before classification lock release"
     );
     assert_eq!(status.code(), Some(5));
-    assert!(lines
-        .iter()
-        .any(|line| line == "Computer pairing request expired. No pairing code was generated."));
+    assert!(lines.iter().any(|line| line
+        == "Pairing request expired. Reconcile any recorded outcome in xshell before explicitly requesting a new code."));
+}
+
+fn test_offer(expires_at: u64) -> xshell_hostlink::ring::adoption::JoinOfferInput {
+    xshell_hostlink::ring::adoption::JoinOfferInput {
+        operation: xshell_protocol::ring::b64::encode(&[1; 32]),
+        code: xshell_protocol::ring::device_code::DeviceCode::from_bytes([2; 12]),
+        relay_url: "ws://127.0.0.1:9".into(),
+        expires_at,
+    }
+}
+
+fn test_monotonic_deadline() -> u64 {
+    static BOUND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        xshell_hostlink::ring::administration::monotonic::capture(
+            Instant::now() + Duration::from_secs(600),
+        )
+        .unwrap()
+    })
 }

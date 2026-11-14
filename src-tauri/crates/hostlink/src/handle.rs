@@ -916,8 +916,16 @@ impl HostHandle {
     }
 
     /// A dispatch view checks the expected connection under the actual admission lock.
-    pub(crate) fn for_generation(owner: Arc<Self>, target: InputTarget) -> Arc<Self> {
-        Arc::new(Self {
+    pub(crate) fn for_generation(
+        owner: Arc<Self>,
+        target: InputTarget,
+    ) -> Result<Arc<Self>, HostError> {
+        // Refuse a guessed future target before it can escape the broker's resolution
+        // admission. Every later enqueue still rechecks this exact connection.
+        if owner.sh.ep.lock().unwrap().input_target != target {
+            return Err(HostError::offline("the broker connection changed"));
+        }
+        Ok(Arc::new(Self {
             sh: owner.sh.clone(),
             identity_access: owner.identity_access.as_ref().map(|access| IdentityAccess {
                 owner: access.owner.clone(),
@@ -926,7 +934,7 @@ impl HostHandle {
             generation_access: Some(target),
             run: Mutex::new(None),
             retired: AtomicBool::new(true),
-        })
+        }))
     }
 
     fn identity_target(&self) -> Option<IdentityTarget> {

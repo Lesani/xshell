@@ -86,6 +86,45 @@ mod unix {
         }
         Ok((meta.dev(), meta.ino()))
     }
+    #[cfg(test)]
+    thread_local! {
+        static AFTER_PIN_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+    /// Pins local routing identity across a command's exchanges; not wire authority.
+    pub struct ProtectedEndpoint {
+        path: PathBuf,
+        identity: (u64, u64),
+    }
+    impl ProtectedEndpoint {
+        pub fn pin(path: PathBuf) -> io::Result<Self> {
+            let identity = socket_identity(&path)?;
+            Ok(Self { path, identity })
+        }
+        pub fn exchange_until<Q: Serialize, R: DeserializeOwned>(
+            &self,
+            request: &Q,
+            budget: &RequestBudget,
+        ) -> io::Result<R> {
+            budget.check()?;
+            if socket_identity(&self.path)? != self.identity {
+                return Err(denied("protected owner endpoint replaced"));
+            }
+            #[cfg(test)]
+            {
+                let hook = AFTER_PIN_CHECK.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let reply =
+                exchange_with_identity_until(&self.path, request, budget, Some(self.identity))?;
+            if socket_identity(&self.path)? != self.identity {
+                return Err(denied("protected owner endpoint replaced"));
+            }
+            Ok(reply)
+        }
+    }
     fn peer(stream: &UnixStream) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -265,8 +304,30 @@ mod unix {
         stream.write_all(&bytes)
     }
     pub fn exchange<Q: Serialize, R: DeserializeOwned>(path: &Path, request: &Q) -> io::Result<R> {
-        let before = socket_identity(path)?;
-        let until = Instant::now() + IO;
+        let budget =
+            RequestBudget::for_operation(Instant::now() + IO, Arc::new(AtomicBool::new(false)));
+        exchange_until(path, request, &budget)
+    }
+    /// Preserve an accepted operation's original bounded install allowance at local ingress.
+    pub fn exchange_until<Q: Serialize, R: DeserializeOwned>(
+        path: &Path,
+        request: &Q,
+        budget: &RequestBudget,
+    ) -> io::Result<R> {
+        exchange_with_identity_until(path, request, budget, None)
+    }
+    fn exchange_with_identity_until<Q: Serialize, R: DeserializeOwned>(
+        path: &Path,
+        request: &Q,
+        budget: &RequestBudget,
+        expected: Option<(u64, u64)>,
+    ) -> io::Result<R> {
+        budget.check()?;
+        let before = match expected {
+            Some(identity) => identity,
+            None => socket_identity(path)?,
+        };
+        let until = budget.until.min(Instant::now() + IO);
         let stream = dial(path, until)?;
         peer(&stream)?;
         if socket_identity(path)? != before {
@@ -274,7 +335,9 @@ mod unix {
         }
         let mut stream = Bounded { stream, until };
         write(&mut stream, request)?;
-        read(&mut stream)
+        let response = read(&mut stream)?;
+        budget.check()?;
+        Ok(response)
     }
     /// A persistent user-private endpoint. The caller must hold its process-owner lock.
     /// This shares only protection with companion IPC, not its five-second request budget.
@@ -466,6 +529,76 @@ mod unix {
             drop(server);
         }
         #[test]
+        fn pinned_protected_endpoint_refuses_replacement_between_exchanges() {
+            let dir = directory();
+            let path = dir.path().canonicalize().unwrap().join("ipc.sock");
+            let server = serve(path.clone(), |value: String, _| value).unwrap();
+            let endpoint = ProtectedEndpoint::pin(path.clone()).unwrap();
+            let budget =
+                RequestBudget::for_operation(Instant::now() + IO, Arc::new(AtomicBool::new(false)));
+            assert_eq!(
+                endpoint
+                    .exchange_until::<_, String>(&"first", &budget)
+                    .unwrap(),
+                "first"
+            );
+            // Keep the old inode allocated: this is replacement, not inode reuse.
+            let retained = dir.path().join("retained.sock");
+            std::fs::rename(&path, &retained).unwrap();
+            drop(server);
+            let _successor = serve(path.clone(), |value: String, _| value).unwrap();
+            assert!(endpoint
+                .exchange_until::<_, String>(&"second", &budget)
+                .is_err());
+            assert_eq!(
+                exchange::<_, String>(&path, &"successor").unwrap(),
+                "successor"
+            );
+        }
+        #[test]
+        fn pinned_protected_endpoint_refuses_successor_mutation_after_initial_check() {
+            use std::sync::atomic::AtomicUsize;
+            let dir = directory();
+            let path = dir.path().canonicalize().unwrap().join("ipc.sock");
+            let server = serve(path.clone(), |value: String, _| value).unwrap();
+            let endpoint = ProtectedEndpoint::pin(path.clone()).unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let (send, receive) = std::sync::mpsc::channel();
+            let successor_path = path.clone();
+            let retained = dir.path().join("retained.sock");
+            let successor_requests = requests.clone();
+            let successor_mutations = mutations.clone();
+            AFTER_PIN_CHECK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // Keep A's inode allocated and replace it exactly after the pin check.
+                    std::fs::rename(&successor_path, retained).unwrap();
+                    drop(server);
+                    let successor = serve(successor_path, move |value: String, _| {
+                        successor_requests.fetch_add(1, Ordering::SeqCst);
+                        if value == "install" {
+                            successor_mutations.fetch_add(1, Ordering::SeqCst);
+                        }
+                        value
+                    })
+                    .unwrap();
+                    send.send(successor).unwrap();
+                }));
+            });
+            let budget =
+                RequestBudget::for_operation(Instant::now() + IO, Arc::new(AtomicBool::new(false)));
+            let result = endpoint.exchange_until::<_, String>(&"install", &budget);
+            let mut successor = receive.try_recv().expect("replacement hook ran");
+            successor.shutdown();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "successor received request"
+            );
+            assert_eq!(mutations.load(Ordering::SeqCst), 0, "successor mutated");
+        }
+        #[test]
         fn oversized_frame_is_closed_before_handler_and_next_request_still_works() {
             let dir = directory();
             let path = dir.path().canonicalize().unwrap().join("ipc.sock");
@@ -482,5 +615,6 @@ mod unix {
 }
 #[cfg(unix)]
 pub use unix::{
-    check_path, exchange, private_dir, protected_connect, serve, ProtectedListener, Server,
+    check_path, exchange, exchange_until, private_dir, protected_connect, serve, ProtectedEndpoint,
+    ProtectedListener, Server,
 };

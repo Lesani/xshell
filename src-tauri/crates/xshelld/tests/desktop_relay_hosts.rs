@@ -20,6 +20,7 @@ mod fixture;
 use fixture::*;
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn v1_standalone_pairing_discovers_host_without_ssh_or_computer_completion() {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -108,6 +109,7 @@ fn v2_public_join_discovers_existing_hosts_bidirectionally_and_same_names_stay_d
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn relay_host_history_open_attach_input_relaunch_close_once() {
     let mut relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -193,6 +195,7 @@ fn relay_host_history_open_attach_input_relaunch_close_once() {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn offline_signed_host_remains_visible_and_owner_shutdown_fences_retained_handle() {
     let mut relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -225,6 +228,7 @@ fn offline_signed_host_remains_visible_and_owner_shutdown_fences_retained_handle
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn signed_revocation_fences_live_host_and_never_reenrolls_it() {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -290,13 +294,16 @@ impl Drop for ReleaseGate {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn cancelled_owner_shutdown_during_real_host_handshake_never_installs_a_late_link() {
     late_host_link(false);
 }
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn revocation_during_real_host_handshake_never_installs_a_late_link() {
     late_host_link(true);
 }
+#[cfg(feature = "legacy-pair-test-control")]
 fn late_host_link(revoke: bool) {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -330,6 +337,7 @@ fn late_host_link(revoke: bool) {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn relay_only_route_limitation_does_not_hide_desktop_owned_diagnosis() {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -422,6 +430,7 @@ fn independently_local_daemon_identity_resolves_relay_alias_to_local() {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn saved_ssh_configuration_coexists_with_discovery_without_authorizing_same_name_aliases() {
     struct SavedSsh;
     impl TransportFactory for SavedSsh {
@@ -464,6 +473,7 @@ fn saved_ssh_configuration_coexists_with_discovery_without_authorizing_same_name
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn manager_shutdown_closes_only_the_host_session_not_the_elected_connector() {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
@@ -491,6 +501,7 @@ fn manager_shutdown_closes_only_the_host_session_not_the_elected_connector() {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn owner_quit_is_bounded_while_a_real_relay_delivery_is_blocked() {
     struct BlockingSink(Arc<HostGate>);
     impl TermSink for BlockingSink {
@@ -561,6 +572,7 @@ fn owner_quit_is_bounded_while_a_real_relay_delivery_is_blocked() {
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn same_configured_endpoint_with_foreign_live_key_cannot_keep_the_old_ring_alias() {
     // A configured-route negative, not an actual-SSH equivalence positive: the stable
     // endpoint reaches two real Daemons in turn. Ring authority comes only from public

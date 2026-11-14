@@ -77,8 +77,9 @@ commands:
               Unix may start a Persistent Daemon; Windows attaches only, never starts
               a Daemon. A GUI-bound Daemon needs xshell open; if missing, exit 4.
   serve       run the Daemon in the foreground
-  pair        add this computer to your devices: shows a code to enter in xshell
-              on another computer (Settings → Mobile → Add a computer)
+  pair        Unix: request Computer pairing in the registered xshell window,
+              or pair an unregistered standalone Host with eight Device Code words
+              (Settings → Hosts → Ring). Windows Pair is not supported.
   maintenance cleanup-installs --home ABS [--reference-home ABS]... [--keep DIR]...
               [--delete --confirm-quiescent]
               Linux only, dry-run by default; see docs/host-daemon-updates.md
@@ -99,7 +100,7 @@ serve options:
 
 pair options:
   --relay URL   the relay your xshell uses (default: the hosted relay)
-  --name NAME   this computer's name on your other devices (default: hostname)
+  --name NAME   standalone Host name (default: hostname); registered names are retained
   --force       legacy option; cannot replace a retained Ring (Leave required)
 ";
 

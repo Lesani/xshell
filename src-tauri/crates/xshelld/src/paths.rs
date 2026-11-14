@@ -14,7 +14,7 @@ pub struct Paths {
     /// The socket (a pipe name on Windows).
     pub socket: PathBuf,
     /// `daemon.lock`, next to the socket (Windows: in `home/.xshell/run`): held by the one
-    /// running `serve`.
+    /// endpoint owner. Store lifetime exclusion uses `ring/runtime-owner.lock`.
     pub lock: PathBuf,
     /// `daemon.pid` next to the lock, written by `serve`.
     pub pid: PathBuf,

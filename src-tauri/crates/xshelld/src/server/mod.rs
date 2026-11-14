@@ -47,6 +47,8 @@ mod role;
 mod session_stream;
 pub use role::Role;
 mod signals;
+#[cfg(unix)]
+pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
 mod terminal;
@@ -222,6 +224,10 @@ pub enum TestPoint {
     BeforeHostRingJoinCommit,
     /// Decoded companion request before store admission; no handler locks held.
     CompanionRequestAdmitted,
+    /// Admitted roster callback before any persistence/runtime guard.
+    RosterCallbackAdmitted,
+    /// Admitted Host completion administration, before runtime/Store access.
+    RingCompanionAdmitted,
     /// Actual roster write after prerequisite reads (ring.lock held); true injects a write error.
     BeforeRingRosterWrite,
     /// Actual roster temp bytes are written and synced, before rename (file/owner locks
@@ -230,6 +236,12 @@ pub enum TestPoint {
     /// Standalone recovery installed its store, before the final journal lock. No locks
     /// held; may order concurrent recovery without supplying authority or a receipt.
     StandaloneInstalledBeforeJournal,
+    /// Protected command preparation before validation; no locks held. Test ordering
+    /// only, never signing or confirmation authority.
+    StandaloneCommandBeforePrepare,
+    /// Conservative preparation is durable, before its reply; no locks held. A test
+    /// may delay delivery to exercise loss of the acknowledgment under the original budget.
+    StandaloneCommandPreparedBeforeReply,
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
     /// Selected-update commit has been acknowledged; on its worker, outside all locks.
@@ -292,6 +304,12 @@ pub enum TestPoint {
     /// The input thread is about to check that the agent still accepts a `term.submit` reply
     /// and then write (a piece of) its paste (no lock held).
     SubmitPaste,
+    /// A real positive Paste write returned, after all readiness locks were released.
+    /// Observation only: the hook's return value is ignored. Excludes Close and Enter.
+    SubmitPasteWritten,
+    /// A reply's screen try-lock actually would block, before its blocking acquisition.
+    /// No Terminal locks held; observation only, return value ignored.
+    SubmitScreenWait,
     /// The paste was written and the pause is over: the input thread is about to check again
     /// and then write Enter (no lock held).
     SubmitEnter,
@@ -644,7 +662,14 @@ pub struct Server;
 
 impl Server {
     /// Lock, bind, restore the persisted Terminals, then serve in background threads.
-    pub fn start(cfg: Config) -> Result<ServerHandle, StartError> {
+    pub fn start(mut cfg: Config) -> Result<ServerHandle, StartError> {
+        cfg.paths.ring_dir = ring::ownership::canonical_store(&cfg.paths.ring_dir)?;
+        let ownership = match ring::ownership::StoreOwnershipLease::acquire(&cfg.paths.ring_dir)
+            .map_err(io::Error::other)?
+        {
+            ring::ownership::StoreOwnership::Acquired(lease) => lease,
+            ring::ownership::StoreOwnership::Busy => return Err(StartError::AlreadyRunning),
+        };
         let paths = cfg.paths.clone();
         check_endpoint(&paths.socket)?;
         // The lock's directory: the socket's on Unix.
@@ -672,6 +697,7 @@ impl Server {
         let mut starting = Starting {
             paths: &paths,
             lock: Some(lock),
+            ownership: Some(ownership),
             pid: false,
             socket: false,
         };
@@ -747,6 +773,9 @@ impl Server {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(starting.lock.take()),
+            store_admission: ring::ownership::StoreAdmission::new(
+                starting.ownership.take().unwrap(),
+            ),
             #[cfg(unix)]
             companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
@@ -763,6 +792,7 @@ impl Server {
             snap_seq: AtomicU64::new(0),
             session_streams,
         });
+        d.ring.bind_store_admission(&d.store_admission);
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
         d.push.bind(Arc::downgrade(&d));
@@ -832,6 +862,7 @@ struct Starting<'a> {
     paths: &'a Paths,
     /// Taken by the Daemon once it exists; from then on its `exit` cleans up.
     lock: Option<fs::File>,
+    ownership: Option<ring::ownership::StoreOwnershipLease>,
     pid: bool,
     socket: bool,
 }

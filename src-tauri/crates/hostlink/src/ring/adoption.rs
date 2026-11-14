@@ -2,7 +2,7 @@
 //! backend capability, never a Host/Relay request. Retained v1 Upgrade and this Desktop's
 //! local completion are explicit; retained v2 Daemon-only completion uses typed Host
 //! administration. Restart reconciliation is read-only except for missing local stores;
-//! native origins and registered Host-first forwarding remain later.
+//! native window origins remain a separate integration boundary.
 use super::companion_ipc::CompanionClient;
 use super::store::{AdoptionJournal, AdoptionPhase, RingState};
 use super::DesktopRing;
@@ -28,7 +28,7 @@ pub use reconcile::{
     PublicationRecoveryStatus,
 };
 mod join;
-pub use join::{ApprovalOutcome, JoinOffer, JoinStatus};
+pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
 
 struct AdoptionAdmission(Arc<AtomicBool>);
 impl Drop for AdoptionAdmission {
@@ -129,16 +129,21 @@ impl RingEvents for BootstrapEvents {
     fn roster_rejected(&self, _: xshell_protocol::ring::RosterError) {}
 }
 impl DesktopRing {
-    fn adoption_test_point(&self, point: super::desktop::AdoptionTestPoint) {
+    pub(in crate::ring) fn adoption_test_point(&self, point: super::desktop::AdoptionTestPoint) {
         if let Some(hook) = &self.cfg.adoption_test_hook {
             (hook.0)(point);
         }
     }
     fn reserve_adoption(&self) -> Result<AdoptionAdmission, String> {
+        self.try_reserve_adoption()
+            .ok_or_else(|| "another adoption operation is active".into())
+    }
+    // Pure admission only: a failed CAS has no registration or transaction effects.
+    fn try_reserve_adoption(&self) -> Option<AdoptionAdmission> {
         self.adoption
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "another adoption operation is active")?;
-        Ok(AdoptionAdmission(self.adoption.clone()))
+            .ok()
+            .map(|_| AdoptionAdmission(self.adoption.clone()))
     }
 
     /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared
@@ -170,6 +175,7 @@ impl DesktopRing {
 
     pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
         let _admission = self.reserve_adoption()?;
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::RegistrationAdmitted);
         if !self.pairing_ipc_owner() {
             return Err("another process owns the Desktop counterpart".into());
         }

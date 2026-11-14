@@ -504,6 +504,18 @@ pub fn adopt_as_guest(
     cancel: Option<&Cancel>,
     confirm: impl FnOnce(AdoptionConsentRequest<'_>) -> Result<bool, PairError>,
 ) -> Result<(RosterChain, Joined), PairError> {
+    adopt_as_guest_with_ready(req, opts, cancel, || Ok(()), confirm)
+}
+
+/// Readiness is the Relay's pair.wait/pair.peer acknowledgment, not socket creation.
+/// The one-shot callback can refuse output (for example a closed invoking stdout).
+pub fn adopt_as_guest_with_ready(
+    req: &AdoptionGuestRequest<'_>,
+    opts: &PairOptions,
+    cancel: Option<&Cancel>,
+    ready: impl FnOnce() -> Result<(), PairError>,
+    confirm: impl FnOnce(AdoptionConsentRequest<'_>) -> Result<bool, PairError>,
+) -> Result<(RosterChain, Joined), PairError> {
     let until = offer_deadline(req.intent.expires_at, req.until)?;
     live(until, cancel)?;
     let relay = RelayUrl::parse(req.relay_url).map_err(|_| PairError::Pin)?;
@@ -513,6 +525,9 @@ pub fn adopt_as_guest(
         .min(until.saturating_duration_since(Instant::now()));
     let mut pipe = PairPipe::open(req.relay_url, &req.secret.slot(), &bounded_opts)?;
     pipe.limit_until(until);
+    live(until, cancel)?;
+    ready()?;
+    live(until, cancel)?;
     pipe.wait_peer(until, cancel)?;
     let (mut guest, m1) = Guest::start(&req.keys, req.secret, None)?;
     pipe.send(&m1)?;

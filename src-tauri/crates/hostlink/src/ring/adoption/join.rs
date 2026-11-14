@@ -8,12 +8,61 @@ use xshell_protocol::ring::device_code::DeviceCode;
 use xshell_protocol::ring::pairing::adoption::{possession_message, AdoptionSigners};
 use xshell_protocol::ring::pairing::{Joined, PairError};
 use xshell_protocol::ring::relay::pair::{
-    adopt_as_guest, approve_adoption, AdoptionGuestRequest, AdoptionHostRequest, PairOptions,
-    PairPipe,
+    adopt_as_guest_with_ready, approve_adoption, AdoptionGuestRequest, AdoptionHostRequest,
+    PairOptions, PairPipe,
 };
 use xshell_protocol::ring::relay::proposal::ProposalHandle;
 use xshell_protocol::ring::relay::VerifiedProposal;
 use xshell_protocol::ring::{b64, SignError};
+
+/// Immutable, memory-only CLI/desktop offer. No target keys or consent authority.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JoinOfferInput {
+    pub operation: String,
+    #[serde(with = "offer_code")]
+    pub code: DeviceCode,
+    pub relay_url: String,
+    pub expires_at: u64,
+}
+impl std::fmt::Debug for JoinOfferInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JoinOfferInput(..)")
+    }
+}
+mod offer_code {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(code: &DeviceCode, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&code.format())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DeviceCode, D::Error> {
+        let text = zeroize::Zeroizing::new(String::deserialize(d)?);
+        DeviceCode::parse(&text).map_err(|_| serde::de::Error::custom("invalid device code"))
+    }
+}
+impl JoinOfferInput {
+    pub fn validate(&self) -> Result<(), String> {
+        let operation =
+            b64::decode_array::<32>(&self.operation).map_err(|_| "invalid Join wire operation")?;
+        if b64::encode(&operation) != self.operation || self.relay_url.len() > 2048 {
+            return Err("invalid Join offer".into());
+        }
+        xshell_protocol::ring::url::RelayUrl::parse(&self.relay_url)
+            .map_err(|_| "invalid Join Relay")?;
+        let left = self.expires_at.saturating_sub(now());
+        if left == 0 || left > 600 {
+            return Err("Join offer expired or exceeds ten minutes".into());
+        }
+        Ok(())
+    }
+    pub(in crate::ring) fn same_offer(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.expires_at == other.expires_at
+            && self.relay_url == other.relay_url
+            && self.code.format() == other.code.format()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum JoinStatus {
@@ -29,6 +78,7 @@ struct JoinState {
     status: JoinStatus,
     lease: Option<CreateConfirmationLease>,
     decision: Option<CreateDecision>,
+    ready: bool,
 }
 struct JoinShared {
     state: Mutex<JoinState>,
@@ -54,6 +104,37 @@ pub struct JoinOffer {
     worker: Option<JoinHandle<Result<AdoptionOutcome, String>>>,
 }
 impl JoinOffer {
+    pub fn is_ready(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ready
+    }
+    /// Wait for the actual Relay slot acknowledgment before displaying Desktop words.
+    pub fn await_ready(&self, timeout: Duration) -> Result<(), String> {
+        let until = Instant::now() + timeout;
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.ready {
+                return Ok(());
+            }
+            if let JoinStatus::Failed { error } | JoinStatus::ReconciliationRequired { error } =
+                &state.status
+            {
+                return Err(error.clone());
+            }
+            if Instant::now() >= until {
+                return Err("waiting for Join readiness timed out".into());
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, until.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
     pub fn join_status(&self) -> JoinStatus {
         self.shared
             .state
@@ -359,10 +440,113 @@ impl DesktopRing {
     /// Starts the actual guest driver. The returned object is the only word-bearing offer
     /// and the local confirmation origin; statuses and durable reservations have no words.
     pub fn begin_join(self: &Arc<Self>, client: &CompanionClient) -> Result<JoinOffer, String> {
+        let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
+        let offer = self.begin_join_with_offer(
+            client,
+            JoinOfferInput {
+                operation: nonce()?,
+                code: DeviceCode::generate().map_err(|e| e.to_string())?,
+                relay_url: self.cfg.default_relay_url.clone(),
+                expires_at: now() + ttl.as_secs(),
+            },
+            Instant::now() + ttl,
+        )?;
+        offer.await_ready(ttl)?;
+        Ok(offer)
+    }
+
+    /// Inject one already-created origin offer; no replacement code, target or deadline.
+    pub fn begin_join_with_offer(
+        self: &Arc<Self>,
+        client: &CompanionClient,
+        offer: JoinOfferInput,
+        original_until: Instant,
+    ) -> Result<JoinOffer, String> {
+        self.begin_join_with_offer_cancel(
+            client,
+            offer,
+            original_until,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+    pub(in crate::ring) fn begin_join_with_offer_cancel(
+        self: &Arc<Self>,
+        client: &CompanionClient,
+        offer: JoinOfferInput,
+        original_until: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<JoinOffer, String> {
+        offer.validate()?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("Join cancelled before start".into());
+        }
+        let until = original_until
+            .min(Instant::now() + Duration::from_secs(offer.expires_at.saturating_sub(now())));
+        if Instant::now() >= until {
+            return Err("Join offer expired".into());
+        }
         let admission = self.reserve_adoption()?;
+        self.begin_join_admitted(client, offer, until, cancel, admission)
+    }
+
+    /// Only the existing registered-origin dispatch waits for pure admission. Never retry
+    /// registration, reservation, counterpart Start or any other constructor work.
+    pub(in crate::ring) fn begin_registered_origin_join(
+        self: &Arc<Self>,
+        client: &CompanionClient,
+        offer: JoinOfferInput,
+        original_until: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<JoinOffer, String> {
+        offer.validate()?;
+        let until = original_until
+            .min(Instant::now() + Duration::from_secs(offer.expires_at.saturating_sub(now())));
+        self.adoption_test_point(
+            super::super::desktop::AdoptionTestPoint::OriginJoinBeforeAdmission,
+        );
+        let admission = loop {
+            self.check_join_origin(&offer, until, &cancel)?;
+            if let Some(admission) = self.try_reserve_adoption() {
+                break admission;
+            }
+            self.adoption_test_point(
+                super::super::desktop::AdoptionTestPoint::OriginJoinAdmissionBusy,
+            );
+            std::thread::sleep(
+                Duration::from_millis(20).min(until.saturating_duration_since(Instant::now())),
+            );
+        };
+        self.check_join_origin(&offer, until, &cancel)?;
+        self.adoption_test_point(super::super::desktop::AdoptionTestPoint::OriginJoinAdmitted);
+        self.begin_join_admitted(client, offer, until, cancel, admission)
+    }
+
+    fn check_join_origin(
+        &self,
+        offer: &JoinOfferInput,
+        until: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if cancel.load(Ordering::Acquire) || Instant::now() >= until || now() >= offer.expires_at {
+            return Err("Join origin expired/cancelled before reservation".into());
+        }
         if !self.pairing_ipc_owner() {
             return Err("another process owns Join".into());
         }
+        Ok(())
+    }
+
+    fn begin_join_admitted(
+        self: &Arc<Self>,
+        client: &CompanionClient,
+        offer: JoinOfferInput,
+        until: Instant,
+        cancel: Arc<AtomicBool>,
+        admission: super::AdoptionAdmission,
+    ) -> Result<JoinOffer, String> {
+        // The same guard continues into the worker; no release/reacquire gap. Re-read all
+        // profile, identity and recovery fences only after admission has been acquired.
+        self.check_join_origin(&offer, until, &cancel)?;
         if let Some(stored) = self.store.load_profile()?.0 {
             if stored.membership.is_some() {
                 return Err("leave_required: Join needs an unpaired Desktop".into());
@@ -377,15 +561,14 @@ impl DesktopRing {
             }
         }
         let (keys, profile) = self.register_companion_inner(client)?;
-        let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
+        self.check_join_origin(&offer, until, &cancel)?;
         let intent = AdoptionIntent {
-            operation: nonce()?,
-            expires_at: now() + ttl.as_secs(),
+            operation: offer.operation,
+            expires_at: offer.expires_at,
             target: profile.target(),
         };
-        let code = DeviceCode::generate().map_err(|e| e.to_string())?;
-        let until = Instant::now() + ttl;
-        let relay = self.cfg.default_relay_url.clone();
+        let code = offer.code;
+        let relay = offer.relay_url;
         self.store.transact_profile(|stored, _| {
             let mut stored = stored.ok_or("retained profile missing")?;
             if stored.membership.is_some() || stored.pending_join.is_some() {
@@ -400,16 +583,19 @@ impl DesktopRing {
         })?;
         // No proof signer has started. Retain the reservation if counterpart admission
         // is uncertain; outage is not permission to manufacture a replacement offer.
+        self.adoption_test_point(
+            super::super::desktop::AdoptionTestPoint::JoinBeforeCounterpartStart,
+        );
         client.request(CompanionRequest::Start {
             intent: intent.clone(),
         })?;
-        let cancel = Arc::new(AtomicBool::new(false));
         self.record_driver_cancel(&cancel)?;
         let shared = Arc::new(JoinShared {
             state: Mutex::new(JoinState {
                 status: JoinStatus::Waiting,
                 lease: None,
                 decision: None,
+                ready: false,
             }),
             changed: Condvar::new(),
             cancel,
@@ -426,6 +612,9 @@ impl DesktopRing {
             .name("computer-join".into())
             .spawn(move || {
                 let _admission = admission;
+                ring.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::JoinWorkerStarted,
+                );
                 let result = ring.run_join(
                     &companion,
                     JoinDriver {
@@ -500,7 +689,7 @@ impl DesktopRing {
         };
         let secret = code.secret();
         let mut declined = false;
-        let result = adopt_as_guest(
+        let result = adopt_as_guest_with_ready(
             &AdoptionGuestRequest {
                 relay_url: &relay,
                 secret: &secret,
@@ -519,6 +708,15 @@ impl DesktopRing {
                 ..Default::default()
             },
             Some(&shared.cancel),
+            || {
+                if shared.cancel.load(Ordering::Acquire) || !self.pairing_ipc_owner() {
+                    return Err(PairError::Cancelled);
+                }
+                self.adoption_test_point(super::super::desktop::AdoptionTestPoint::JoinSlotReady);
+                shared.state.lock().unwrap_or_else(|e| e.into_inner()).ready = true;
+                shared.changed.notify_all();
+                Ok(())
+            },
             |request| {
                 let verified = request.verified;
                 if signing
@@ -773,6 +971,13 @@ impl DesktopRing {
             ..Default::default()
         };
         let pipe = PairPipe::open(&relay, &secret.slot(), &options).map_err(|e| e.to_string())?;
+        // Readiness-gated origins already occupy their slot. An absent peer is an
+        // unknown/expired/wrong-Relay code, not a new approver-owned offer to wait on.
+        if !pipe.has_peer() {
+            pipe.close();
+            return Err(PairError::NotFound.to_string());
+        }
+
         let lane =
             Mutex::new(None::<Arc<xshell_protocol::ring::relay::connector::ProposalConnection>>);
         let operation = Mutex::new(None::<String>);

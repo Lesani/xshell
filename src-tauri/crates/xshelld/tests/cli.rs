@@ -329,10 +329,10 @@ fn connect_autostarts_after_persistent_handover() {
 
 // ---- `xshelld pair` -------------------------------------------------------------------------
 
-mod pair {
+#[cfg(feature = "legacy-pair-test-control")]
+mod legacy_pair_controls {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::process::Child;
+    use common::legacy_pair::LegacyPair;
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Instant;
@@ -406,27 +406,25 @@ mod pair {
         })
     }
 
-    /// `xshelld pair` with its stdout read line by line.
-    fn pair(h: &TestHome, url: &str, env: &[(&str, &str)]) -> (Child, mpsc::Receiver<String>) {
-        let mut c = bin_cmd(h);
-        c.args(["pair", "--relay", url, "--name", "box"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in env {
-            c.env(k, v);
-        }
-        let mut child = c.spawn().unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for l in BufReader::new(out).lines() {
-                let Ok(l) = l else { return };
-                if tx.send(l).is_err() {
-                    return;
-                }
-            }
-        });
-        (child, rx)
+    /// Genuine v1 helper, not the production Unix CLI.
+    fn pair(h: &TestHome, url: &str, env: &[(&str, &str)]) -> (LegacyPair, mpsc::Receiver<String>) {
+        let ttl = env
+            .iter()
+            .find(|(key, _)| *key == "XSHELLD_PAIR_TTL_MS")
+            .map(|(_, value)| Duration::from_millis(value.parse().unwrap()))
+            .unwrap_or(Duration::from_secs(30));
+        let mut helper = LegacyPair::start(
+            xshelld::cli::Opts {
+                relay: Some(url.into()),
+                name: Some("box".into()),
+                ..Default::default()
+            },
+            h.paths(),
+            ttl,
+        );
+        let (_, empty) = mpsc::channel();
+        let lines = std::mem::replace(&mut helper.lines, empty);
+        (helper, lines)
     }
 
     fn code(rx: &mpsc::Receiver<String>) -> String {
@@ -442,18 +440,75 @@ mod pair {
         rx.iter().collect()
     }
 
-    fn finish(mut child: Child, within: Duration) -> Option<i32> {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(s) = child.try_wait().unwrap() {
-                return s.code();
+    fn finish(helper: LegacyPair, within: Duration) -> Option<i32> {
+        finish_until(helper, Instant::now() + within)
+    }
+
+    fn finish_until(mut helper: LegacyPair, until: Instant) -> Option<i32> {
+        while Instant::now() < until {
+            if helper.worker.as_ref().unwrap().is_finished() && Instant::now() < until {
+                return Some(match helper.wait() {
+                    Ok(()) => 0,
+                    Err(error) if error == "expired" => 5,
+                    Err(_) => 1,
+                });
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(
+                Duration::from_millis(1).min(until.saturating_duration_since(Instant::now())),
+            );
         }
+        helper.cancel();
+        // Drain owned work, but never classify its late result as timely completion.
+        let _ = helper.wait();
+        None
+    }
+
+    #[test]
+    fn legacy_finish_rejects_success_after_bound_and_cancels_and_drains_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicBool::new(false));
+        let saw_cancel = cancelled.clone();
+        let did_drain = drained.clone();
+        let (tokens, token) = mpsc::channel();
+        let helper = LegacyPair::spawn(move |cancel, _| {
+            tokens.send(cancel.clone()).unwrap();
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            saw_cancel.store(true, Ordering::Release);
+            did_drain.store(true, Ordering::Release);
+            Ok(())
+        });
+        let cancellation = token.recv_timeout(T).unwrap();
+        let (results, result) = mpsc::channel();
+        let finisher = std::thread::spawn(move || {
+            let _ = results.send(finish(helper, Duration::from_millis(20)));
+        });
+        let observed = result.recv_timeout(T);
+        // A broken adapter must fail rather than leave the test-owned worker hanging.
+        // This watchdog cannot satisfy the assertion: its timeout is retained below.
+        cancellation.store(true, Ordering::Release);
+        finisher.join().unwrap();
+        assert_eq!(observed, Ok(None));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(drained.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn legacy_finish_rejects_success_started_after_its_fixed_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Establish the deadline before spawning: scheduling cannot move successful
+        // worker completion to before this deadline or renew the adapter's budget.
+        let until = Instant::now();
+        let drained = Arc::new(AtomicBool::new(false));
+        let did_drain = drained.clone();
+        let helper = LegacyPair::spawn(move |_, _| {
+            did_drain.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert_eq!(finish_until(helper, until), None);
+        assert!(drained.load(Ordering::Acquire));
     }
 
     fn stored(h: &TestHome) -> Option<RosterChain> {
@@ -480,7 +535,7 @@ mod pair {
         let h = TestHome::new();
         let (child, rx) = pair(&h, &r.url(), &[]);
         let code = code(&rx);
-        assert_eq!(code.len(), 19, "{code}");
+        assert_eq!(code.len(), 19, "legacy code length");
         // Typed on the Desktop.
         std::thread::sleep(Duration::from_millis(200));
         let ev = Arc::new(Events::default());
@@ -514,7 +569,7 @@ mod pair {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("leave_required:"));
         ring.quit();
     }
 

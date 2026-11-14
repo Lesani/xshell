@@ -21,6 +21,17 @@ Host's selected directory before normal upgrade teardown. Its owning Desktop sta
 selection on reconnect, unless its newly installed bundle is newer. An invalid/unsafe
 selection is a visible failure, not a silent fallback.
 
+## Coordinated private-dogfood Store ownership upgrade
+
+Before using the canonical Store ownership lease on an existing deployment, stop and drain
+all obsolete Daemons and direct Pair/registration commands for that home, including custom
+socket and XDG instances. Disable their restarting launchers and upgrade the related binaries
+and launchers together. Preserve keys, roster, journals, Terminal data and enrollment; do not
+delete mode, lock or identity files to infer absence. The new lease excludes cooperating
+upgraded binaries only, not an already running obsolete process. Existing upgraded state can
+then use explicit standalone Pair without starting a Daemon; actual registration and unresolved
+obligations still require their protected counterpart or exact recovery.
+
 ## Supplying the exact Windows asset to a Linux Desktop build
 
 The existing native Windows CI lane runs the Windows process regressions, then exposes a

@@ -550,6 +550,29 @@ impl Manager {
         self.mc.observer.available(&rows);
     }
 
+    /// Synthetic public projection for source-local broker ordering negatives only;
+    /// no membership/Noise authority or running Host is manufactured by this fixture.
+    #[cfg(test)]
+    pub(crate) fn test_publish_broker_target(
+        &self,
+        cfg: HostConfig,
+        key: xshell_protocol::ring::SignKey,
+    ) -> Arc<HostHandle> {
+        let host = Arc::new(HostHandle::new(cfg.clone(), self.mc.clone(), 1));
+        self.hosts.lock().unwrap().push(host.clone());
+        self.available.lock().unwrap().push(AvailableHost {
+            id: cfg.id.clone(),
+            aliases: vec![cfg.id],
+            name: cfg.name,
+            color: None,
+            daemon_key: Some(key),
+            routes: vec![RouteKind::Ssh],
+            active_route: RouteKind::Ssh,
+            reachability: Reachability::Unknown,
+        });
+        host
+    }
+
     pub fn available_hosts(&self) -> Vec<AvailableHost> {
         let mut rows = self.available.lock().unwrap().clone();
         if self.broker_follower.load(Ordering::Acquire) {

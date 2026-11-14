@@ -4,22 +4,39 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+pub mod monotonic;
+
 const MAX_OPERATIONS: usize = 32;
 const MAX_TOMBSTONES: usize = 64;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum AdministrationRequest {
-    Start { operation: Uuid, expires_at: u64 },
-    Status { operation: Uuid },
-    Cancel { operation: Uuid },
+    Start {
+        operation: Uuid,
+        expires_at: u64,
+        offer: super::adoption::JoinOfferInput,
+        monotonic_expires_at_ns: u64,
+    },
+    Status {
+        operation: Uuid,
+    },
+    Cancel {
+        operation: Uuid,
+    },
     RequestOwnerFocus {},
     InvalidateOrigin {},
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdministrationStatus {
-    /// The prefix has no Pair driver or native confirmation dispatcher yet.
     ComputerPending,
+    SlotReady,
+    AwaitingConfirmation,
+    Completing,
+    Installed,
+    Declined,
+    Failed,
+    ReconciliationRequired,
     Cancelled,
     Expired,
     Unknown,
@@ -29,6 +46,25 @@ pub enum AdministrationStatus {
 struct Operation {
     until: Instant,
     expires_at: u64,
+    monotonic_expires_at_ns: u64,
+    offer: super::adoption::JoinOfferInput,
+    dispatched: bool,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    controller: std::sync::Weak<super::adoption::JoinOffer>,
+    status: AdministrationStatus,
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(super) struct Dispatch {
+    pub client: Uuid,
+    pub operation: Uuid,
+    pub offer: super::adoption::JoinOfferInput,
+    pub until: Instant,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 #[derive(Default)]
 pub(super) struct Administration {
@@ -49,14 +85,40 @@ impl Administration {
         client: Uuid,
         request: AdministrationRequest,
     ) -> Result<AdministrationStatus, crate::HostError> {
+        let earlier_instant = Instant::now();
+        let tick = if matches!(request, AdministrationRequest::Start { .. }) {
+            monotonic::now_ns()
+                .map_err(|_| crate::HostError::invalid("Unix monotonic clock unavailable"))?
+        } else {
+            0
+        };
+        self.request_at_with_clock(client, request, now(), earlier_instant, tick)
+    }
+    #[cfg(test)]
+    fn test_request(
+        &mut self,
+        client: Uuid,
+        request: AdministrationRequest,
+    ) -> Result<AdministrationStatus, crate::HostError> {
         self.request_at(client, request, now(), Instant::now())
     }
+    #[cfg(test)]
     fn request_at(
         &mut self,
         client: Uuid,
         request: AdministrationRequest,
         unix_now: u64,
         monotonic_now: Instant,
+    ) -> Result<AdministrationStatus, crate::HostError> {
+        self.request_at_with_clock(client, request, unix_now, monotonic_now, 0)
+    }
+    fn request_at_with_clock(
+        &mut self,
+        client: Uuid,
+        request: AdministrationRequest,
+        unix_now: u64,
+        monotonic_now: Instant,
+        shared_tick: u64,
     ) -> Result<AdministrationStatus, crate::HostError> {
         use AdministrationRequest as R;
         use AdministrationStatus as S;
@@ -67,53 +129,79 @@ impl Administration {
             R::Start {
                 operation,
                 expires_at,
+                offer,
+                monotonic_expires_at_ns,
             } => {
                 let key = (client, operation);
                 if self.tombstones.contains(&key) {
                     return Ok(S::Cancelled);
                 }
-                if let Some(existing) = self.operations.get(&key) {
+                if let Some(existing) = self.operations.get_mut(&key) {
                     if monotonic_now >= existing.until || unix_now >= existing.expires_at {
                         return Ok(S::Expired);
                     }
-                    if existing.expires_at != expires_at {
-                        return Err(crate::HostError::invalid("operation deadline changed"));
+                    if existing.expires_at != expires_at
+                        || existing.monotonic_expires_at_ns != monotonic_expires_at_ns
+                        || !existing.offer.same_offer(&offer)
+                    {
+                        return Err(crate::HostError::invalid("operation offer changed"));
                     }
-                    return Ok(S::ComputerPending);
+                    return Ok(existing.status.clone());
                 }
+                let origin_until =
+                    monotonic::receive_at(monotonic_expires_at_ns, monotonic_now, shared_tick)
+                        .map_err(|_| {
+                            crate::HostError::invalid("invalid/expired origin monotonic deadline")
+                        })?;
                 let left = expires_at.saturating_sub(unix_now);
-                if left > 600 {
+                if left > 600 || offer.expires_at != expires_at || operation.is_nil() {
                     return Err(crate::HostError::invalid(
-                        "administration deadline exceeds ten minutes",
+                        "invalid administration offer/deadline",
                     ));
                 }
-                // IDs, including already-expired starts, remain fenced until disconnect.
-                // Saturation refuses new admission rather than forgetting terminal IDs.
+                // Validate shape independently of the test clock and terminal handling.
+                if xshell_protocol::ring::b64::decode_array::<32>(&offer.operation).is_err()
+                    || offer.relay_url.len() > 2048
+                    || xshell_protocol::ring::url::RelayUrl::parse(&offer.relay_url).is_err()
+                {
+                    return Err(crate::HostError::invalid("invalid administration offer"));
+                }
                 if self.operations.len() >= MAX_OPERATIONS {
                     return Err(crate::HostError::busy());
                 }
-                self.operations.insert(
-                    key,
-                    Operation {
-                        until: monotonic_now + Duration::from_secs(left),
-                        expires_at,
-                    },
-                );
-                Ok(if left == 0 {
+                let status = if left == 0 {
                     S::Expired
                 } else {
                     S::ComputerPending
-                })
+                };
+                self.operations.insert(
+                    key,
+                    Operation {
+                        until: origin_until.min(monotonic_now + Duration::from_secs(left)),
+                        expires_at,
+                        monotonic_expires_at_ns,
+                        offer,
+                        dispatched: false,
+                        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        controller: std::sync::Weak::new(),
+                        status: status.clone(),
+                    },
+                );
+                Ok(status)
             }
             R::Status { operation } => {
                 let key = (client, operation);
                 Ok(if self.tombstones.contains(&key) {
                     S::Cancelled
-                } else if let Some(op) = self.operations.get(&key) {
-                    if monotonic_now >= op.until || unix_now >= op.expires_at {
+                } else if let Some(op) = self.operations.get_mut(&key) {
+                    // A receipt is truth even if the original offer has just expired.
+                    if matches!(op.status, S::Installed) {
+                        op.status.clone()
+                    } else if monotonic_now >= op.until || unix_now >= op.expires_at {
+                        op.cancel.store(true, std::sync::atomic::Ordering::Release);
                         S::Expired
                     } else {
-                        S::ComputerPending
+                        op.status.clone()
                     }
                 } else {
                     S::Unknown
@@ -144,8 +232,77 @@ impl Administration {
         self.operations.retain(|(owner, _), _| *owner != client);
         self.tombstones.retain(|(owner, _)| *owner != client);
     }
+    pub(super) fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
     pub fn take_focus_request(&mut self) -> bool {
         std::mem::take(&mut self.focus_requested)
+    }
+    pub(super) fn take_pending(&mut self) -> Option<Dispatch> {
+        let (&(client, operation), op) = self
+            .operations
+            .iter_mut()
+            .find(|(_, op)| !op.dispatched && Instant::now() < op.until && now() < op.expires_at)?;
+        op.dispatched = true;
+        Some(Dispatch {
+            client,
+            operation,
+            offer: op.offer.clone(),
+            until: op.until,
+            cancel: op.cancel.clone(),
+        })
+    }
+    pub(super) fn attach(
+        &mut self,
+        dispatch: &Dispatch,
+        controller: &std::sync::Arc<super::adoption::JoinOffer>,
+    ) {
+        if let Some(op) = self
+            .operations
+            .get_mut(&(dispatch.client, dispatch.operation))
+        {
+            op.controller = std::sync::Arc::downgrade(controller);
+        }
+    }
+    pub(super) fn update(&mut self, dispatch: &Dispatch, status: AdministrationStatus) {
+        if let Some(op) = self
+            .operations
+            .get_mut(&(dispatch.client, dispatch.operation))
+        {
+            op.status = status;
+        }
+    }
+    pub(super) fn controller(
+        &self,
+        operation: Uuid,
+    ) -> Option<std::sync::Arc<super::adoption::JoinOffer>> {
+        self.operations
+            .iter()
+            .find(|((_, id), _)| *id == operation)?
+            .1
+            .controller
+            .upgrade()
+    }
+    pub(super) fn controllers(&self) -> Vec<(Uuid, std::sync::Arc<super::adoption::JoinOffer>)> {
+        self.operations
+            .iter()
+            .filter_map(|((_, id), op)| op.controller.upgrade().map(|c| (*id, c)))
+            .collect()
+    }
+    /// Only the Join currently installing its own first membership can defer retirement.
+    pub(super) fn installing_transition(&self, operation: &str) -> bool {
+        self.operations.values().any(|op| {
+            op.offer.operation == operation
+                && Instant::now() < op.until
+                && (matches!(op.status, AdministrationStatus::Installed)
+                    || op.controller.upgrade().is_some_and(|join| {
+                        matches!(
+                            join.join_status(),
+                            super::adoption::JoinStatus::Completing
+                                | super::adoption::JoinStatus::Installed { .. }
+                        )
+                    }))
+        })
     }
 }
 
@@ -248,9 +405,279 @@ impl Drop for AdministrationClient {
     }
 }
 
+/// Dispatch is owner-local; neither broker messages nor this worker confirm anything.
+#[cfg(unix)]
+pub(super) fn dispatch_pending(
+    ring: &std::sync::Arc<super::DesktopRing>,
+    administration: &std::sync::Arc<std::sync::Mutex<Administration>>,
+) {
+    use super::adoption::JoinStatus as J;
+    use std::sync::atomic::Ordering;
+    // Pending startup metadata is denial, not a descriptor or signing identity.
+    let Some(profile) = ring
+        .store
+        .load_profile()
+        .ok()
+        .and_then(|(p, _)| p)
+        .and_then(|p| p.companion)
+    else {
+        return;
+    };
+    let Some(dispatch) = administration.lock().unwrap().take_pending() else {
+        return;
+    };
+    let state = administration.clone();
+    let ring = ring.clone();
+    let failed_origin = (dispatch.client, dispatch.operation);
+    let failed_state = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("computer-pair-origin".into())
+        .spawn(move || {
+            let result = (|| {
+                profile.validate()?;
+                if dispatch.cancel.load(Ordering::Acquire) || Instant::now() >= dispatch.until {
+                    return Err("origin ended before dispatch".to_string());
+                }
+                let client = super::companion_ipc::CompanionClient::new(std::path::PathBuf::from(
+                    &profile.endpoint,
+                ));
+                loop {
+                    if dispatch.cancel.load(Ordering::Acquire)
+                        || Instant::now() >= dispatch.until
+                        || !ring.pairing_ipc_owner()
+                    {
+                        return Err("origin ended before counterpart readiness".to_string());
+                    }
+                    match client.request_until(
+                        xshell_protocol::ring::companion::CompanionRequest::PairDriverReady,
+                        dispatch.until.min(Instant::now() + Duration::from_secs(2)),
+                        dispatch.cancel.clone(),
+                    ) {
+                        Ok(xshell_protocol::ring::companion::CompanionResponse::Descriptor {
+                            profile: Some(ready),
+                        }) if ready == profile => break,
+                        Ok(_) => return Err("counterpart readiness profile changed".into()),
+                        Err(_) => std::thread::sleep(
+                            Duration::from_millis(50)
+                                .min(dispatch.until.saturating_duration_since(Instant::now())),
+                        ),
+                    }
+                }
+                let controller = std::sync::Arc::new(ring.begin_registered_origin_join(
+                    &client,
+                    dispatch.offer.clone(),
+                    dispatch.until,
+                    dispatch.cancel.clone(),
+                )?);
+                state.lock().unwrap().attach(&dispatch, &controller);
+                ring.adoption_test_point(
+                    super::desktop::AdoptionTestPoint::OriginControllerAttached,
+                );
+                loop {
+                    if dispatch.cancel.load(Ordering::Acquire)
+                        || Instant::now() >= dispatch.until
+                        || !ring.pairing_ipc_owner()
+                    {
+                        controller.cancel_join();
+                    }
+                    let (status, ended) = match controller.join_status() {
+                        J::Waiting => (
+                            if controller.is_ready() {
+                                AdministrationStatus::SlotReady
+                            } else {
+                                AdministrationStatus::ComputerPending
+                            },
+                            false,
+                        ),
+                        J::AwaitingConfirmation(_) => {
+                            (AdministrationStatus::AwaitingConfirmation, false)
+                        }
+                        J::Completing => (AdministrationStatus::Completing, false),
+                        J::Installed { .. } => (AdministrationStatus::Installed, true),
+                        J::Declined => (AdministrationStatus::Declined, true),
+                        J::Failed { .. } => (AdministrationStatus::Failed, true),
+                        J::ReconciliationRequired { .. } => {
+                            (AdministrationStatus::ReconciliationRequired, true)
+                        }
+                    };
+                    state.lock().unwrap().update(&dispatch, status);
+                    if ended {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })();
+            ring.adoption_test_point(super::desktop::AdoptionTestPoint::OriginDispatchEnded);
+            if result.is_err() {
+                state
+                    .lock()
+                    .unwrap()
+                    .update(&dispatch, AdministrationStatus::Failed);
+            }
+        });
+    if spawned.is_err() {
+        if let Some(operation) = failed_state
+            .lock()
+            .unwrap()
+            .operations
+            .get_mut(&failed_origin)
+        {
+            operation.cancel.store(true, Ordering::Release);
+            operation.status = AdministrationStatus::Failed;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_monotonic_deadline() -> u64 {
+        600_000_000_000
+    }
+
+    fn test_offer(expires_at: u64) -> crate::ring::adoption::JoinOfferInput {
+        crate::ring::adoption::JoinOfferInput {
+            operation: xshell_protocol::ring::b64::encode(&[1; 32]),
+            code: xshell_protocol::ring::device_code::DeviceCode::from_bytes([2; 12]),
+            relay_url: "ws://127.0.0.1:9".into(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn duplicate_offer_dispatch_is_one_shot_and_rebound_fields_refuse() {
+        let mut state = Administration::default();
+        let client = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let expires_at = now() + 30;
+        let offer = test_offer(expires_at);
+        let start = AdministrationRequest::Start {
+            operation,
+            expires_at,
+            offer: offer.clone(),
+            monotonic_expires_at_ns: test_monotonic_deadline(),
+        };
+        assert_eq!(
+            state.test_request(client, start.clone()).unwrap(),
+            AdministrationStatus::ComputerPending
+        );
+        if let AdministrationRequest::Start {
+            monotonic_expires_at_ns,
+            ..
+        } = &start
+        {
+            let mut rebound = start.clone();
+            if let AdministrationRequest::Start {
+                monotonic_expires_at_ns: changed,
+                ..
+            } = &mut rebound
+            {
+                *changed = monotonic_expires_at_ns.saturating_add(1);
+            }
+            assert!(state.test_request(client, rebound).is_err());
+        }
+        let original = state.operations[&(client, operation)].until;
+        let dispatch = state.take_pending().unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                state.test_request(client, start.clone()).unwrap(),
+                AdministrationStatus::ComputerPending
+            );
+            assert!(state.take_pending().is_none());
+        }
+        assert_eq!(state.operations[&(client, operation)].until, original);
+        assert_eq!(dispatch.offer.operation, offer.operation);
+        assert!(dispatch.offer.code.format() == offer.code.format());
+        for field in 0..3 {
+            let mut rebound = offer.clone();
+            match field {
+                0 => {
+                    rebound.code =
+                        xshell_protocol::ring::device_code::DeviceCode::from_bytes([4; 12])
+                }
+                1 => rebound.operation = xshell_protocol::ring::b64::encode(&[4; 32]),
+                _ => rebound.relay_url = "ws://127.0.0.1:10".into(),
+            }
+            assert!(state
+                .test_request(
+                    client,
+                    AdministrationRequest::Start {
+                        operation,
+                        expires_at,
+                        offer: rebound,
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
+                    }
+                )
+                .is_err());
+        }
+        let words = offer.code.format();
+        assert!(!format!("{start:?}").contains(words.as_str()));
+        assert!(!serde_json::to_string(
+            &state
+                .test_request(client, AdministrationRequest::Status { operation })
+                .unwrap()
+        )
+        .unwrap()
+        .contains(words.as_str()));
+        state
+            .test_request(client, AdministrationRequest::Cancel { operation })
+            .unwrap();
+        assert!(dispatch.cancel.load(std::sync::atomic::Ordering::Acquire));
+        state.update(&dispatch, AdministrationStatus::SlotReady);
+        assert_eq!(
+            state.test_request(client, start).unwrap(),
+            AdministrationStatus::Cancelled
+        );
+        assert!(state.take_pending().is_none());
+    }
+    #[test]
+    fn receipt_retention_is_exact_operation_deadline_read_and_disconnect_bounded() {
+        let mut state = Administration::default();
+        let client = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let expires_at = now() + 30;
+        let offer = test_offer(expires_at);
+        state
+            .test_request(
+                client,
+                AdministrationRequest::Start {
+                    operation,
+                    expires_at,
+                    offer: offer.clone(),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
+                },
+            )
+            .unwrap();
+        let dispatch = state.take_pending().unwrap();
+        // Administration-state unit only: real receipts are separately exercised by actual CLI.
+        state.update(&dispatch, AdministrationStatus::Installed);
+        assert!(state.installing_transition(&offer.operation));
+        assert!(!state.installing_transition(&xshell_protocol::ring::b64::encode(&[5; 32])));
+        assert_eq!(
+            state
+                .test_request(client, AdministrationRequest::Status { operation })
+                .unwrap(),
+            AdministrationStatus::Installed
+        );
+        // Queueing a reply is not proof the origin read it. Its existing Cancel /
+        // disconnect acknowledges terminal delivery; the absolute deadline still caps it.
+        assert!(state.installing_transition(&offer.operation));
+        state
+            .operations
+            .get_mut(&(client, operation))
+            .unwrap()
+            .until = Instant::now();
+        assert!(!state.installing_transition(&offer.operation));
+        state.disconnect(client);
+        assert!(dispatch.cancel.load(std::sync::atomic::Ordering::Acquire));
+        state.update(&dispatch, AdministrationStatus::Installed);
+        assert_eq!(
+            state
+                .test_request(client, AdministrationRequest::Status { operation })
+                .unwrap(),
+            AdministrationStatus::Unknown
+        );
+    }
     #[test]
     fn initially_expired_start_still_consumes_its_id_until_disconnect() {
         let mut state = Administration::default();
@@ -263,7 +690,9 @@ mod tests {
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: 999
+                        expires_at: 999,
+                        offer: test_offer(999),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                     1000,
                     began
@@ -277,7 +706,9 @@ mod tests {
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: 1700
+                        expires_at: 1700,
+                        offer: test_offer(1700),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                     1601,
                     began + Duration::from_secs(601)
@@ -292,7 +723,9 @@ mod tests {
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: 1700
+                        expires_at: 1700,
+                        offer: test_offer(1700),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                     1601,
                     began + Duration::from_secs(601)
@@ -313,6 +746,8 @@ mod tests {
                 AdministrationRequest::Start {
                     operation,
                     expires_at: 1001,
+                    offer: test_offer(1001),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
                 1000,
                 began,
@@ -323,6 +758,8 @@ mod tests {
             AdministrationRequest::Start {
                 operation,
                 expires_at: 1100,
+                offer: test_offer(1100),
+                monotonic_expires_at_ns: test_monotonic_deadline(),
             },
             1010,
             began + Duration::from_secs(10),
@@ -349,7 +786,9 @@ mod tests {
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: 1700
+                        expires_at: 1700,
+                        offer: test_offer(1700),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                     1601,
                     began + Duration::from_secs(601)
@@ -370,6 +809,8 @@ mod tests {
                     AdministrationRequest::Start {
                         operation: Uuid::new_v4(),
                         expires_at: 1001,
+                        offer: test_offer(1001),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                     1000,
                     began,
@@ -381,7 +822,9 @@ mod tests {
                 client,
                 AdministrationRequest::Start {
                     operation: Uuid::new_v4(),
-                    expires_at: 1700
+                    expires_at: 1700,
+                    offer: test_offer(1700),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
                 1601,
                 began + Duration::from_secs(601)
@@ -394,7 +837,9 @@ mod tests {
                 client,
                 AdministrationRequest::Start {
                     operation: Uuid::new_v4(),
-                    expires_at: 1700
+                    expires_at: 1700,
+                    offer: test_offer(1700),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
                 1601,
                 began + Duration::from_secs(601)
@@ -408,17 +853,19 @@ mod tests {
         let operation = Uuid::new_v4();
         assert_eq!(
             state
-                .request(client, AdministrationRequest::Cancel { operation })
+                .test_request(client, AdministrationRequest::Cancel { operation })
                 .unwrap(),
             AdministrationStatus::Cancelled
         );
         assert_eq!(
             state
-                .request(
+                .test_request(
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: now() + 30
+                        expires_at: now() + 30,
+                        offer: test_offer(now() + 30),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     }
                 )
                 .unwrap(),
@@ -427,7 +874,7 @@ mod tests {
         state.disconnect(client);
         assert_eq!(
             state
-                .request(client, AdministrationRequest::Status { operation })
+                .test_request(client, AdministrationRequest::Status { operation })
                 .unwrap(),
             AdministrationStatus::Unknown
         );
@@ -440,11 +887,13 @@ mod tests {
         let expiry = now() + 30;
         assert_eq!(
             state
-                .request(
+                .test_request(
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: expiry
+                        expires_at: expiry,
+                        offer: test_offer(expiry),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     }
                 )
                 .unwrap(),
@@ -452,21 +901,25 @@ mod tests {
         );
         let original = state.operations[&(client, operation)].until;
         state
-            .request(
+            .test_request(
                 client,
                 AdministrationRequest::Start {
                     operation,
                     expires_at: expiry,
+                    offer: test_offer(expiry),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 },
             )
             .unwrap();
         assert_eq!(state.operations[&(client, operation)].until, original);
         assert!(state
-            .request(
+            .test_request(
                 client,
                 AdministrationRequest::Start {
                     operation,
-                    expires_at: expiry + 1
+                    expires_at: expiry + 1,
+                    offer: test_offer(expiry + 1),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 }
             )
             .is_err());
@@ -477,20 +930,22 @@ mod tests {
             .until = Instant::now();
         assert_eq!(
             state
-                .request(client, AdministrationRequest::Status { operation })
+                .test_request(client, AdministrationRequest::Status { operation })
                 .unwrap(),
             AdministrationStatus::Expired
         );
         state
-            .request(client, AdministrationRequest::InvalidateOrigin {})
+            .test_request(client, AdministrationRequest::InvalidateOrigin {})
             .unwrap();
         assert_eq!(
             state
-                .request(
+                .test_request(
                     client,
                     AdministrationRequest::Start {
                         operation,
-                        expires_at: expiry
+                        expires_at: expiry,
+                        offer: test_offer(expiry),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     }
                 )
                 .unwrap(),
@@ -503,27 +958,31 @@ mod tests {
         let client = Uuid::new_v4();
         for _ in 0..MAX_OPERATIONS {
             state
-                .request(
+                .test_request(
                     client,
                     AdministrationRequest::Start {
                         operation: Uuid::new_v4(),
                         expires_at: now() + 30,
+                        offer: test_offer(now() + 30),
+                        monotonic_expires_at_ns: test_monotonic_deadline(),
                     },
                 )
                 .unwrap();
         }
         assert!(state
-            .request(
+            .test_request(
                 client,
                 AdministrationRequest::Start {
                     operation: Uuid::new_v4(),
-                    expires_at: now() + 30
+                    expires_at: now() + 30,
+                    offer: test_offer(now() + 30),
+                    monotonic_expires_at_ns: test_monotonic_deadline(),
                 }
             )
             .is_err());
         for _ in 0..MAX_TOMBSTONES {
             state
-                .request(
+                .test_request(
                     client,
                     AdministrationRequest::Cancel {
                         operation: Uuid::new_v4(),
@@ -532,7 +991,7 @@ mod tests {
                 .unwrap();
         }
         assert!(state
-            .request(
+            .test_request(
                 client,
                 AdministrationRequest::Cancel {
                     operation: Uuid::new_v4()

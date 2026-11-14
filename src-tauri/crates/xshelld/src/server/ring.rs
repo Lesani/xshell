@@ -38,6 +38,8 @@ use xshell_protocol::ring::{
     member_name, DeviceKeys, Role, RosterChain, RosterError, SecretSeed, SignKey,
 };
 
+pub(crate) mod ownership;
+
 /// What a Host is called when its hostname is unusable.
 const FALLBACK_NAME: &str = "this computer";
 
@@ -366,6 +368,7 @@ impl Store {
     /// A nonblocking, process-lifetime admission lease. The Ring transaction lock is
     /// released before the legacy offer waits for a person/network; process death closes it.
     #[cfg(unix)]
+    #[cfg(any(test, feature = "legacy-pair-test-control"))]
     pub(crate) fn reserve_legacy_offer(&self) -> Result<StoreLock, String> {
         let offer = self.offer_lock()?;
         let _ring = self.lock()?;
@@ -390,6 +393,9 @@ impl Store {
     pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
         #[cfg(unix)]
         super::adoption::refuse_unresolved_standalone(self)?;
+        self.refuse_registered_binding()
+    }
+    pub(super) fn refuse_registered_binding(&self) -> Result<(), String> {
         if companion_registered(&self.dir) {
             return Err("protected_counterpart_required: registered Computer installation is not a legacy/Host commit".into());
         }
@@ -555,7 +561,7 @@ impl Store {
         };
         self.settle_locked(chain, None)
     }
-    fn save_join_chain(
+    pub(super) fn save_join_chain(
         &self,
         chain: &RosterChain,
         effective_base: Option<&RosterChain>,
@@ -719,6 +725,8 @@ pub(crate) type HeadHook = Arc<dyn Fn(u64, &RosterChain) + Send + Sync>;
 
 /// The chain the store holds, shared with the Connector's callbacks.
 struct Persist {
+    admission: std::sync::OnceLock<std::sync::Weak<ownership::StoreAdmission>>,
+    test_hook: std::sync::OnceLock<super::TestHook>,
     store: Store,
     chain: Mutex<Option<RosterChain>>,
     on_head: std::sync::OnceLock<HeadHook>,
@@ -747,6 +755,20 @@ impl Persist {
     /// joins hold for the same sequence. A chain not newer than the trusted one (a callback
     /// that lost the race to a local join) changes nothing.
     fn keep_newer(&self, chain: &RosterChain, connector: Option<&Connector>, sessions: &Sessions) {
+        let _operation = if let Some(admission) = self.admission.get() {
+            let Some(admission) = admission.upgrade() else {
+                return;
+            };
+            let Ok(operation) = admission.admit() else {
+                return;
+            };
+            Some(operation)
+        } else {
+            None
+        };
+        if let Some(hook) = self.test_hook.get() {
+            (hook.0)(uuid::Uuid::nil(), super::TestPoint::RosterCallbackAdmitted);
+        }
         let mut cur = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cur.as_ref() {
             if c.ring_id() != chain.ring_id() || c.head().version() >= chain.head().version() {
@@ -828,7 +850,7 @@ struct Life {
     retiring: Vec<JoinHandle<()>>,
 }
 
-enum JoinOrigin {
+pub(super) enum JoinOrigin {
     Host,
     #[cfg(unix)]
     Standalone {
@@ -882,6 +904,8 @@ impl Ring {
         Ring {
             test_hook: std::sync::OnceLock::new(),
             persist: Arc::new(Persist {
+                admission: std::sync::OnceLock::new(),
+                test_hook: std::sync::OnceLock::new(),
                 store: Store { dir },
                 chain: Mutex::new(None),
                 on_head: std::sync::OnceLock::new(),
@@ -903,7 +927,12 @@ impl Ring {
     }
 
     pub(super) fn set_test_hook(&self, hook: super::TestHook) {
+        let _ = self.persist.test_hook.set(hook.clone());
         let _ = self.test_hook.set(hook);
+    }
+
+    pub(super) fn bind_store_admission(&self, admission: &Arc<ownership::StoreAdmission>) {
+        let _ = self.persist.admission.set(Arc::downgrade(admission));
     }
 
     pub fn hub(&self) -> &super::relay_conn::Hub {
@@ -980,6 +1009,21 @@ impl Ring {
     #[cfg(test)]
     pub(super) fn set_effective_query_hook(&self, hook: Box<dyn Fn() + Send>) {
         *self.effective_query_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn standalone_installed_before_journal(&self) {
+        if let Some(hook) = self.test_hook.get() {
+            (hook.0)(
+                uuid::Uuid::nil(),
+                super::TestPoint::StandaloneInstalledBeforeJournal,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn standalone_store(&self) -> &Store {
+        &self.persist.store
     }
 
     /// The established order is runtime chain, then ring.lock. Never hold a file lock

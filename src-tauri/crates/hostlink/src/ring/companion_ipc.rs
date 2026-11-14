@@ -12,6 +12,21 @@ impl CompanionClient {
     pub fn endpoint(&self) -> &Path {
         &self.endpoint
     }
+    #[cfg(unix)]
+    pub fn request_until(
+        &self,
+        request: CompanionRequest,
+        until: std::time::Instant,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<CompanionResponse, String> {
+        let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel);
+        let response = xshell_core::local_ipc::exchange_until(&self.endpoint, &request, &budget)
+            .map_err(|_| "protected counterpart readiness unavailable".to_string())?;
+        match response {
+            CompanionResponse::Error { message } => Err(message),
+            response => Ok(response),
+        }
+    }
     pub fn request(&self, request: CompanionRequest) -> Result<CompanionResponse, String> {
         #[cfg(unix)]
         {

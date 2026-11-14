@@ -446,7 +446,12 @@ pub(crate) struct Broker {
     snapshot: Mutex<Option<Arc<SnapshotFrame>>>,
     stopped: AtomicBool,
     pub assembly: Arc<Assembly>,
-    pub(super) administration: Mutex<super::administration::Administration>,
+    pub(super) administration: Arc<Mutex<super::administration::Administration>>,
+    pub(super) host_generation_retired: AtomicBool,
+    // Serializes retirement with read-only target resolution, never Host dispatch/IO.
+    host_admission: Mutex<()>,
+    #[cfg(test)]
+    before_host_resolution: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     replay_budget: crate::attachments::ReplayBudget,
 }
 impl Broker {
@@ -461,9 +466,17 @@ impl Broker {
             snapshot: Mutex::new(None),
             stopped: AtomicBool::new(false),
             assembly: Arc::new(Assembly::default()),
-            administration: Mutex::new(super::administration::Administration::default()),
+            administration: Arc::new(Mutex::new(super::administration::Administration::default())),
+            host_generation_retired: AtomicBool::new(false),
+            host_admission: Mutex::new(()),
+            #[cfg(test)]
+            before_host_resolution: Mutex::new(None),
             replay_budget: manager.replay_budget(),
         })
+    }
+    pub(super) fn retire_host_generation(&self) {
+        let _admission = self.host_admission.lock().unwrap();
+        self.host_generation_retired.store(true, Ordering::Release);
     }
     fn current_snapshot(&self) -> Option<Arc<SnapshotFrame>> {
         let mut previous = self.snapshot.lock().unwrap();
@@ -786,8 +799,19 @@ impl Session {
                 Ok(())
             }
             ClientMessage::Request(request) => {
+                if broker.host_generation_retired.load(Ordering::Acquire) {
+                    return Err(HostError::offline("Host broker generation retired"));
+                }
                 if !self.greeted.load(Ordering::Acquire) || request.owner_epoch != broker.epoch {
                     return Err(HostError::invalid("broker epoch mismatch"));
+                }
+                #[cfg(test)]
+                if let Some(before) = self
+                    .broker
+                    .upgrade()
+                    .and_then(|b| b.before_host_resolution.lock().unwrap().take())
+                {
+                    before();
                 }
                 let id = request.request_id;
                 {
@@ -830,27 +854,38 @@ impl Session {
             self.finish(request.request_id, Ok(Value::Null));
             return Ok(());
         }
-        let manager = broker
-            .manager
-            .upgrade()
-            .ok_or_else(|| HostError::offline("owner Manager gone"))?;
-        let row = manager
-            .available_hosts()
-            .into_iter()
-            .find(|h| h.aliases.contains(&request.host) && h.daemon_key == Some(request.canonical))
-            .ok_or_else(|| HostError::offline("Host identity no longer available"))?;
-        let raw = manager
-            .host(&request.host)
-            .ok_or_else(|| HostError::unknown_host(&request.host))?;
-        let raw = if raw
-            .relay_route()
-            .is_some_and(|route| route.host.sign_key == request.canonical)
-        {
-            raw
-        } else {
-            HostHandle::for_identity(raw, request.canonical)
+        let (row, raw, h) = {
+            let _admission = broker.host_admission.lock().unwrap();
+            if broker.host_generation_retired.load(Ordering::Acquire) {
+                return Err(HostError::offline("Host broker generation retired"));
+            }
+            let manager = broker
+                .manager
+                .upgrade()
+                .ok_or_else(|| HostError::offline("owner Manager gone"))?;
+            let row = manager
+                .available_hosts()
+                .into_iter()
+                .find(|h| {
+                    h.aliases.contains(&request.host) && h.daemon_key == Some(request.canonical)
+                })
+                .ok_or_else(|| HostError::offline("Host identity no longer available"))?;
+            let raw = manager
+                .host(&request.host)
+                .ok_or_else(|| HostError::unknown_host(&request.host))?;
+            let raw = if raw
+                .relay_route()
+                .is_some_and(|route| route.host.sign_key == request.canonical)
+            {
+                raw
+            } else {
+                HostHandle::for_identity(raw, request.canonical)
+            };
+            let h = HostHandle::for_generation(raw.clone(), request.expected)?;
+            (row, raw, h)
         };
-        let h = HostHandle::for_generation(raw.clone(), request.expected);
+        // Only immutable, currently observed target views escape the admission guard.
+        // Host methods recheck those targets at enqueue; no callback/IO runs under it.
         let id = request.request_id;
         let session = self.clone();
         let done: Waiter = Box::new(move |result| session.finish(id, result));
@@ -2323,6 +2358,137 @@ mod tests {
     use super::*;
     use crate::config::test_host;
     use crate::manager::tests::{test_config, NullObserver};
+    #[test]
+    fn paused_old_request_cannot_resolve_new_projection_target_or_kick_host() {
+        use std::sync::mpsc;
+        let manager = Arc::new(Manager::new(test_config(Arc::new(NullObserver))));
+        let broker = Broker::new("old-projection".into(), &manager);
+        let out = Outbox::new(broker.assembly.clone());
+        let session = broker.session(out.clone());
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let queue = out.clone();
+        let writing = std::thread::spawn(move || queue.write_to(&mut writer));
+        session
+            .receive(ClientMessage::Hello {
+                version: VERSION,
+                profile_id: "old-projection".into(),
+            })
+            .unwrap();
+        for _ in 0..2 {
+            let _: Event = broker_ipc::read(&mut reader, &broker.assembly).unwrap();
+        }
+        let (reached, arrived) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        *broker.before_host_resolution.lock().unwrap() = Some(Box::new(move || {
+            reached.send(()).unwrap();
+            proceed.recv_timeout(Duration::from_secs(2)).unwrap();
+        }));
+        let key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let request = |epoch| {
+            ClientMessage::Request(Box::new(BrokerRequest {
+                owner_epoch: epoch,
+                request_id: 1,
+                host: "h_abcdefgh".into(),
+                canonical: key,
+                expected: InputTarget {
+                    config_generation: 1,
+                    link_generation: 0,
+                },
+                operation: BrokerOperation::Kick,
+            }))
+        };
+        let old = session.clone();
+        let pending = request(broker.epoch);
+        let ingress = std::thread::spawn(move || old.receive(pending));
+        arrived.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Actual retirement admission precedes publication. This synthetic public row
+        // tests local ingress ordering, NOT membership/Noise/native consent provenance.
+        broker.retire_host_generation();
+        let host = manager.test_publish_broker_target(test_host("h_abcdefgh", "new target"), key);
+        assert!(manager
+            .available_hosts()
+            .iter()
+            .any(|row| row.daemon_key == Some(key)));
+        assert!(!host.sh.kick.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        ingress.join().unwrap().unwrap();
+        let reply: Event = broker_ipc::read(&mut reader, &broker.assembly).unwrap();
+        assert!(
+            matches!(reply, Event::Reply { request_id: 1, result: Err(error) } if error.message == "Host broker generation retired")
+        );
+        assert!(
+            !host.sh.kick.load(Ordering::Acquire),
+            "old request must have no Host side effect"
+        );
+        assert!(session.pending.lock().unwrap().is_empty());
+        // The SAME now-present target actually admits the operation on the successor;
+        // the negative above is retirement, not a missing/unusable target shortcut.
+        let successor = Broker::new("new-projection".into(), &manager);
+        let current = successor.session(Outbox::new(successor.assembly.clone()));
+        current
+            .receive(ClientMessage::Hello {
+                version: VERSION,
+                profile_id: "new-projection".into(),
+            })
+            .unwrap();
+        current.receive(request(successor.epoch)).unwrap();
+        assert!(host.sh.kick.load(Ordering::Acquire));
+        successor.stop();
+        broker.stop();
+        out.stop();
+        writing.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn deferred_join_receipt_retains_no_old_or_new_host_generation_authority() {
+        let manager = Arc::new(Manager::new(test_config(Arc::new(NullObserver))));
+        let broker = Broker::new("test-profile".into(), &manager);
+        let session = broker.session(Outbox::new(broker.assembly.clone()));
+        session
+            .receive(ClientMessage::Hello {
+                version: VERSION,
+                profile_id: "test-profile".into(),
+            })
+            .unwrap();
+        broker.retire_host_generation();
+        let key = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        for generation in [0, 1, u64::MAX] {
+            let result = session.receive(ClientMessage::Request(Box::new(BrokerRequest {
+                owner_epoch: broker.epoch,
+                request_id: generation,
+                host: "newly-presented-host".into(),
+                canonical: key,
+                expected: InputTarget {
+                    config_generation: generation,
+                    link_generation: generation,
+                },
+                operation: BrokerOperation::Call {
+                    method: "list_dir".into(),
+                    params: serde_json::json!({}),
+                },
+            })));
+            assert!(result.is_err_and(|e| e.message == "Host broker generation retired"));
+        }
+        assert!(session.pending.lock().unwrap().is_empty());
+        // Denial does not remove the exact origin's ability to read its final receipt.
+        assert!(session
+            .receive(ClientMessage::Administration {
+                owner_epoch: broker.epoch,
+                request_id: 9,
+                request: super::super::administration::AdministrationRequest::Status {
+                    operation: Uuid::new_v4()
+                }
+            })
+            .is_ok());
+        broker.stop();
+    }
     #[test]
     fn shared_sink_reset_precedes_replay_and_preserves_independent_exit_watermarks() {
         let manager = Arc::new(Manager::new(test_config(Arc::new(NullObserver))));
