@@ -3,6 +3,7 @@ import { C } from "../ring/copy";
 import { fmt } from "../ring/strings";
 import { connectionLine, localLine, problemLine, quotaLine, relayUrlError, validRelayUrl } from "../ring/mobileSettings";
 import { useRing, type RingApi } from "../ring/useRing";
+import { useNotAdded } from "../ring/notAdded";
 import { AddMachinePanel } from "./AddMachinePanel";
 import { PhonePanel, type Pairing } from "./PhonePanel";
 import { RingMembers } from "./RingMembers";
@@ -65,6 +66,7 @@ function UnpairedRelay({ chosen, onSave, disabled }: { chosen: string | null; on
 
 export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: RingSettingsProps & { ring: RingApi }) {
   const s = r.status;
+  const { notAdded } = useNotAdded(s);
   // This machine removed itself: the line stays until the next Ring change here.
   const [selfRemoved, setSelfRemoved] = useState(false);
   useEffect(() => { if (s?.membership === "member" || s?.membership === "finishing") setSelfRemoved(false); }, [s?.membership]);
@@ -105,6 +107,7 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
         ) : (
           <>
             {selfRemoved && <div className="host-row-note" data-ring-self-removed>{C["remove.self.done"]}</div>}
+            {notAdded && <div className="host-row-note host-row-warn" data-ring-not-added>{C["finish.notAdded"]}</div>}
             {s.membership === "removed" && !selfRemoved && (
               <div className="edit-field" data-ring-removed>
                 <label className="edit-label">{C["removed.title"]}</label>
@@ -128,8 +131,7 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
                 <div className="host-row-actions">
                   <button className="btn btn-primary settings-action-btn" data-ring-setup-open disabled={platform || s.problem === "unreadable"} onClick={() => onOpenRingSetup()}>{C["first.settings"]}</button>
                 </div>
-                {/* COPY-GAP: no Desktop text for "not available on this platform" (Windows, Stage 2). */}
-                {platform && <div className="host-row-note host-row-warn">{fmt("ring.unsupported")}</div>}
+                {platform && <div className="host-row-note host-row-warn">{C["ring.unsupported"]}</div>}
                 <UnpairedRelay chosen={r.chosenRelay} onSave={r.setUnpairedRelay} disabled={!r.relayReady || s.busy} />
               </>
             )}

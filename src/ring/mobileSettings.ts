@@ -1,5 +1,6 @@
 import { fmt, type StringKey } from "./strings";
 import type { RingStatus } from "./types";
+import { C } from "./copy";
 
 // Settings → Ring, the pure part of the lines kept from the earlier Ring section: the Relay,
 // the connection, the daily quota, and why pairing a phone waits.
@@ -40,17 +41,15 @@ export function quotaLine(
   return fmt(s.relayHosted ? "mobile.quota.hosted" : "mobile.quota.ownRelay", { time: fmtTime(s.quotaResetAt) });
 }
 
-// COPY-GAP: `mobile.local.tooOld` predates the new copy (it says "mobile access"); kept as the
-// nearest approved line for a local Daemon too old to join.
+// This machine's Daemon is too old to join a Ring.
 export function localLine(s: Pick<RingStatus, "local">): string | null {
-  return s.local === "too-old" ? fmt("mobile.local.tooOld") : null;
+  return s.local === "too-old" ? C["mobile.local.tooOld"] : null;
 }
 
-// Refused Ring settings (left in place). COPY-GAP: kept from the earlier copy. A `recovered`
-// file needs no line: Create starts over and clears it.
-export function problemLine(s: Pick<RingStatus, "problem" | "problemDetail">): string | null {
-  if (s.problem === "unreadable") return fmt("mobile.problem.unreadable", { error: s.problemDetail ?? "" });
-  return null;
+// Refused Ring settings (left in place), without the backend's detail. A `recovered` file needs
+// no line: Create starts over and clears it.
+export function problemLine(s: Pick<RingStatus, "problem">): string | null {
+  return s.problem === "unreadable" ? C["mobile.problem.unreadable"] : null;
 }
 
 // ── Pairing a phone and the connection (xshell#38) ──────────────────────────

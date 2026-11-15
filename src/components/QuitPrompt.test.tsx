@@ -82,21 +82,72 @@ describe("quit prompt", () => {
     expect(q("[role=dialog]")).toBeNull();
   });
 
-  it("failed: keeps the dialog open with the count that did not stop", async () => {
+  it("failed: keeps the dialog open with the count that did not stop; the same id then acts", async () => {
     resolveReply = () => { throw "failed:2 sessions did not stop"; };
     await prompt("q1", 3);
     await click("[data-quit-stop]");
     expect(q("[role=dialog]")).not.toBeNull();
     expect(text()).toContain("Couldn't stop 2 terminals.");
     expect(text()).not.toContain("sessions did not stop");
+    // Stop again succeeds under the same id and closes.
+    resolveReply = () => null;
+    await click("[data-quit-stop]");
+    expect(resolves().map(r => [r.id, r.choice])).toEqual([["q1", "stop"], ["q1", "stop"]]);
+    expect(q("[role=dialog]")).toBeNull();
   });
 
-  it("a failed save of Do not ask again says the setting was not saved", async () => {
+  it("after a failed Stop, Keep running and Cancel act on the same id", async () => {
+    resolveReply = () => { throw "failed:1 sessions did not stop"; };
+    await prompt("q1", 1);
+    await click("[data-quit-stop]");
+    resolveReply = () => null;
+    await click("[data-quit-keep]");
+    expect(resolves()[1]).toEqual({ id: "q1", choice: "keep", remember: false });
+    expect(q("[role=dialog]")).toBeNull();
+    resolveReply = () => { throw "failed:1 sessions did not stop"; };
+    await prompt("q2", 1);
+    await click("[data-quit-stop]");
+    await click("[data-quit-cancel]");
+    expect(resolves()[3]).toEqual({ id: "q2", choice: "cancel", remember: false });
+  });
+
+  it("a failed save of Do not ask again closes the dialog and says the setting was not saved", async () => {
     resolveReply = () => { throw "failed:0 disk full"; };
     await prompt("q1", 1);
     await click("[data-quit-remember]");
     await click("[data-quit-keep]");
-    expect(text()).toContain(C["quit.setting.failed"]);
+    // The backend dropped this prompt: no dialog whose buttons would do nothing.
+    expect(q("[role=dialog]")).toBeNull();
+    expect(q("[data-quit-setting-failed]")?.textContent).toContain(C["quit.setting.failed"]);
+    expect(text()).not.toContain("disk full");
+    // The next close asks again.
+    await prompt("q2", 1);
+    expect(q("[data-quit-setting-failed]")).toBeNull();
+    expect(q("[role=dialog]")).not.toBeNull();
+  });
+
+  it("keeps keyboard focus inside, makes the app behind inert and restores focus on cancel", async () => {
+    const outside = document.createElement("button");
+    outside.textContent = "behind";
+    container.prepend(outside);
+    outside.focus();
+    await prompt("q1", 2);
+    const dialog = q("[role=dialog]")!;
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(outside.hasAttribute("inert")).toBe(true);
+    const items = Array.from(dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled])"));
+    const first = items[0], last = items[items.length - 1];
+    last.focus();
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true })); });
+    expect(document.activeElement).toBe(first);
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true })); });
+    expect(document.activeElement).toBe(last);
+    outside.focus(); // even if focus escaped, Tab brings it back inside
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true })); });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    await click("[data-quit-cancel]");
+    expect(outside.hasAttribute("inert")).toBe(false);
+    expect(document.activeElement).toBe(outside);
   });
 
   it("Escape sends cancel; the X and Cancel too", async () => {

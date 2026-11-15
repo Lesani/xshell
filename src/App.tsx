@@ -61,7 +61,9 @@ import { QuitPrompt } from "./components/QuitPrompt";
 import { RingRemovedNotice } from "./components/RingRemovedNotice";
 import { useLocalInfo } from "./local/useLocalInfo";
 import { localView, type LocalStatus } from "./local/localInfo";
+import { awaitLocalReadiness, liveLocalInfo } from "./local/readiness";
 import { useRingStatus } from "./ring/useRingStatus";
+import { useNotAdded } from "./ring/notAdded";
 import { OLD_SEEN_SETTING, SETUP_SKIPPED_SETTING, startView } from "./ring/firstLaunch";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
@@ -162,10 +164,12 @@ async function loadStartup() {
   // before restoring layouts; neither cache nor TS descriptors grant Host access.
   const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
   const localInfo = await invoke<LocalHostInfo>("local_host_info").catch(() => null);
-  // Terminals cannot start on this machine: nothing is migrated, restored or saved; the
-  // blocking view offers Retry, and recovery reloads the window (U5).
-  if (localView(localInfo as LocalStatus | null) === "failed") {
-    startupSuppressed = true;
+  // Terminals cannot start on this machine, or not yet: nothing is migrated, restored or saved;
+  // the blocking view offers Retry, and readiness reloads the window (U5). Live readiness, not
+  // only the first read: a Daemon may fail while it starts.
+  const readiness = await awaitLocalReadiness(localInfo as LocalStatus | null);
+  if (readiness === "failed" || readiness === "timeout") {
+    needsReload = true;
     return null;
   }
   const localDaemon = localInfo?.mode === "daemon";
@@ -173,14 +177,25 @@ async function loadStartup() {
   await registry.init(hostConfigs).catch(() => {});
   if (localDaemon) await registry.setLocal(true).catch(() => {});
   // Local Daemon mode: saved in-process Tabs move into the Daemon before anything mounts.
-  // Restore and persistence wait for it.
+  // Restore and persistence wait for it. The migration's own "not ready" path keeps Tabs
+  // in-process, which a Unix Desktop must never run: that outcome is treated as not ready.
+  let migrationReady = true;
+  const deps: typeof localMigrationDeps = { ...localMigrationDeps, ready: async () => {
+    const live = await localMigrationDeps.ready();
+    if (!live) migrationReady = false;
+    return live;
+  } };
   const migration = localDaemon
     ? await migrateLocalTabsOnce(
         { openTabs: savedTabs, openGroups: savedGroups, zoom: null },
         { fullscreenRendering: fsRender ?? true, forceSyncOutput: syncOut ?? true },
-        localMigrationDeps,
+        deps,
       ).catch(() => ({ ...NO_MIGRATION, writesLayout: false }))
     : NO_MIGRATION;
+  if (localDaemon && (!migrationReady || localView(await liveLocalInfo()) !== "ready")) {
+    needsReload = true;
+    return null;
+  }
   // Restore only in-process tabs that have a real sessionId (not abandoned "New Chat"
   // tabs): in local Daemon mode only those the migration left in-process. Daemon Tabs are not
   // in open_tabs: they come from the cached `terminals` list per Host ("local" too, in local
@@ -197,8 +212,9 @@ async function loadStartup() {
   return { v, hostConfigs, localDaemon, migration, durableGroups, restored, data };
 }
 const startupOnce = singleFlight(loadStartup);
-// The startup returned early because local Terminals could not start.
-let startupSuppressed = false;
+// The startup returned early (or local Terminals failed later in a Daemon-mode window): the
+// window reloads once they can run, so the startup runs again.
+let needsReload = false;
 
 interface HostData<T> { identity: string | null; value: T[] }
 
@@ -1193,6 +1209,8 @@ export default function App() {
   const showRingSetup = activeTabId === RING_SETUP_TAB;
   const [ringSetup, setRingSetup] = useState<{ variant: SetupVariant; initial?: "join"; key: number }>({ variant: "first", key: 0 });
   const ring = useRingStatus();
+  // Remembers a Join/Create being finished even while no Ring screen is open (finishing → none).
+  useNotAdded(ring.status);
   const local = useLocalInfo();
   const ringRef = useRef(ring.status);
   ringRef.current = ring.status;
@@ -1242,9 +1260,14 @@ export default function App() {
       setActiveTabId(RING_SETUP_TAB);
     }
   }, [tabsRestored, setupPrefs, ring.status, ring.overview, local.info]);
-  // Recovery after a suppressed startup: run the startup again in Daemon mode.
+  // Local Terminals failing after start-up in a Daemon-mode window: nothing more is saved
+  // until they run again, and then the window reloads (start-up runs again).
   const localState = localView(local.info);
-  useEffect(() => { if (startupSuppressed && localState === "ready") window.location.reload(); }, [localState]);
+  if (localState === "failed" && localDaemonRef.current && migrationRef.current.writesLayout) {
+    needsReload = true;
+    migrationRef.current = { ...migrationRef.current, ownsOpenTabs: false, writesLayout: false };
+  }
+  useEffect(() => { if (needsReload && localState === "ready") window.location.reload(); }, [localState]);
   const removedAt = ring.status?.membership === "removed" ? (ring.status.removed?.at ?? 0) : null;
   const showRemovedNotice = startViewDecided && removedAt !== null && removedAt !== removedDismissedAt && !showRingSetup;
   const activeTab = tabs.find(t => t.id === activeTabId);

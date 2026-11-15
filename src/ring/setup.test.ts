@@ -76,8 +76,10 @@ describe("setup reducer", () => {
     expect(setupView({ state: "created" }, none)).toEqual({ kind: "done", text: "create.done" });
   });
 
-  it("finishing → none is a join that did not complete (Retry), and abort ends a registration wait", () => {
-    expect(setupView(setupReducer({ state: "finishing" }, { type: "notAdded" }), none)).toEqual({ kind: "ended", text: "join.failed", action: "retry" });
+  it("force (a removal, finishing → none) returns to the choices from every state; a later start works", () => {
+    const states: SetupState[] = [code(), { state: "completing", operation: "A" }, { state: "finishing" }, { state: "creating" }, { state: "installed" }, { state: "ended", reason: "failed", code: "offline" }];
+    for (const st of states) expect(setupReducer(st, { type: "force" }), st.state).toEqual(SETUP_CHOICES);
+    expect(setupReducer(setupReducer({ state: "completing", operation: "A" }, { type: "force" }), { type: "start", operation: "B" })).toEqual({ state: "starting", operation: "B" });
     expect(setupReducer({ state: "starting", operation: "A" }, { type: "abort" })).toEqual(SETUP_CHOICES);
     expect(setupReducer({ state: "creating" }, { type: "abort" })).toEqual(SETUP_CHOICES);
   });

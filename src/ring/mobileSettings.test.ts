@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { connectionLine, formatResetTime, localLine, pairingBlocked, pairingNote, problemLine, quotaLine, relayHost, relayUrlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
+import { C } from "./copy";
 import type { RingStatus } from "./types";
 
 const HOSTED = "wss://relay.xshell.sh";
@@ -67,10 +68,11 @@ describe("connection line", () => {
 
   it("reports local limits and recovery", () => {
     expect(localLine(status())).toBeNull();
-    expect(localLine(status({ local: "too-old" }))).toBe(fmt("mobile.local.tooOld"));
+    expect(localLine(status({ local: "too-old" }))).toBe(C["mobile.local.tooOld"]);
     // Create starts over after a recovery: no line; refused settings say so.
     expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toBeNull();
-    expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).toBe(fmt("mobile.problem.unreadable", { error: "bad json" }));
+    expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).toBe(C["mobile.problem.unreadable"]);
+    expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).not.toContain("bad json");
     expect(problemLine(status())).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { countdown, errorCode, expiresLine, failureKey, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validWords, type PhoneState } from "./pairing";
+import { countdown, errorCode, expiresLine, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validWords, type PhoneState } from "./pairing";
 import { fmt, S, type StringKey } from "./strings";
+import { C } from "./copy";
 import type { PhoneStart } from "./types";
 
 const HOSTED = "wss://relay.xshell.sh";
@@ -40,24 +41,22 @@ describe("eight-word Device Code", () => {
 });
 
 describe("failures", () => {
-  it("maps codes to their lines", () => {
-    const cases: [string, StringKey][] = [
-      ["role", "mobile.pair.err.role"],
-      ["full", "mobile.pair.err.full"],
-      ["busy", "mobile.pair.err.busy"],
-      // No "upgrade this Ring" or reconcile wording any more.
-      ["not_approver", "mobile.pair.failed"],
-      ["reconciliation_required", "mobile.pair.failed"],
-      ["not_found", "mobile.pair.failed"],
-      ["expired", "mobile.pair.expired"],
-      ["publish_failed", "mobile.pair.err.publishFailed"],
-      ["relay", "mobile.pair.failed"],
-      ["other", "mobile.pair.failed"],
+  it("maps codes to fixed lines, never the backend's text or code", () => {
+    const cases: [string, string][] = [
+      ["role", C["mobile.pair.err.role"]],
+      ["full", S["mobile.pair.err.full"]],
+      ["busy", S["mobile.pair.err.busy"]],
+      ["not_approver", C["mobile.pair.err.notApprover"]],
+      ["expired", S["mobile.pair.expired"]],
+      ["publish_failed", S["mobile.pair.err.publishFailed"]],
+      ["reconciliation_required", C["mobile.pair.failed"]],
+      ["not_found", C["mobile.pair.failed"]],
+      ["crypto", C["mobile.pair.failed"]],
+      ["other_window", C["mobile.pair.failed"]],
+      ["other", C["mobile.pair.failed"]],
     ];
-    for (const [code, key] of cases) expect(failureKey(code)).toBe(key);
-    expect(failureLine("crypto")).toBe("Couldn't pair the device: crypto");
-    expect(failureLine("other_window", "other_window: busy")).toBe("Couldn't pair the device: other_window: busy");
-    expect(failureLine("full")).toBe(S["mobile.pair.err.full"]);
+    for (const [code, line] of cases) expect(failureLine(code), code).toBe(line);
+    for (const code of ["crypto", "other_window", "reconciliation_required", "not_found"]) expect(failureLine(code)).not.toContain(code);
   });
 
   it("reads the code a command error starts with", () => {
@@ -92,7 +91,7 @@ describe("phone panel", () => {
     const w = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "started", offer: OFFER });
     expect(run(w, { type: "event", event: { operation: "test-op", flow: "phone", state: "failed", code: "role" } })).toEqual({ state: "failed", code: "role" });
     const f = run(PHONE_IDLE, { type: "start", operation: "test-op" }, { type: "startFailed", operation: "test-op", error: "not_enabled: off" });
-    expect(f).toEqual({ state: "failed", code: "not_enabled", error: "not_enabled: off" });
+    expect(f).toEqual({ state: "failed", code: "not_enabled" });
     expect(offersNewCode(f)).toBe(true);
   });
 
@@ -120,9 +119,9 @@ describe("QR rectangles", () => {
 describe("pairing strings", () => {
   const KEYS: StringKey[] = [
     "mobile.pair.phone", "mobile.pair.phone.desc", "mobile.pair.phone.expires", "mobile.pair.phone.copy",
-    "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired", "mobile.pair.failed",
+    "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired",
     "mobile.pair.err.busy",
-    "mobile.pair.err.role", "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
+    "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
     "mobile.pair.needsRelay", "mobile.pair.needsMember",
   ];
 
@@ -133,7 +132,6 @@ describe("pairing strings", () => {
   it("fills the placeholders", () => {
     expect(fmt("mobile.pair.phone.expires", { m: 3, ss: "07" })).toBe("Code expires in 3:07");
     expect(fmt("mobile.pair.paired", { name: "Pixel 8" })).toBe("Added Pixel 8");
-    expect(fmt("mobile.pair.failed", { error: "relay" })).toBe("Couldn't pair the device: relay");
     for (const k of KEYS) expect(fmt(k, { m: 1, ss: "00", name: "n", error: "e", names: "a, b" }), k).not.toMatch(/\{\w+\}/);
   });
 });

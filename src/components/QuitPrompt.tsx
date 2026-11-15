@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useModal } from "./useModal";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { X } from "lucide-react";
@@ -14,7 +15,7 @@ interface Prompt {
   // Terminals the prompt counts (the follow-up: only the new ones).
   n: number;
   more: boolean;
-  error: { kind: "stop"; n: number } | { kind: "setting" } | null;
+  error: { kind: "stop"; n: number } | null;
   pending: boolean;
 }
 
@@ -26,6 +27,11 @@ export function QuitPrompt() {
   const pRef = useRef<Prompt | null>(null);
   pRef.current = p;
   const keepRef = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  // "Do not ask again" could not be saved: the backend dropped the prompt and the window stays
+  // open with every terminal running; closing again asks again.
+  const [settingFailed, setSettingFailed] = useState(false);
+  useModal(panel, p !== null);
 
   // Listen first, then tell the backend it may ask.
   useEffect(() => {
@@ -35,6 +41,7 @@ export function QuitPrompt() {
       const ev = e.payload;
       if (!ev || typeof ev.id !== "string") return;
       setRemember(false);
+      setSettingFailed(false);
       setP({ id: ev.id, n: ev.terminals, more: false, error: null, pending: false });
     })
       .then(u => {
@@ -64,9 +71,12 @@ export function QuitPrompt() {
       if (choice === "cancel") return;
       const text = errorText(e);
       const failed = /^failed:(\d+)/.exec(text);
-      if (failed) {
-        const n = Number(failed[1]);
-        setP({ ...cur, pending: false, error: n === 0 ? { kind: "setting" } : { kind: "stop", n } });
+      if (failed && Number(failed[1]) > 0) {
+        // The same prompt stays answerable: Stop again, Keep running or Cancel.
+        setP({ ...cur, pending: false, error: { kind: "stop", n: Number(failed[1]) } });
+      } else if (failed) {
+        setP(null);
+        setSettingFailed(true);
       } else if (text.startsWith("busy")) {
         setP({ ...cur, pending: false });
       } else {
@@ -84,12 +94,20 @@ export function QuitPrompt() {
     return () => window.removeEventListener("keydown", onKey);
   }, [p?.id, resolve]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!p) return null;
+  if (!p) {
+    if (!settingFailed) return null;
+    return (
+      <div className="app-notice" role="alert" data-quit-setting-failed>
+        <span className="app-notice-text">{C["quit.setting.failed"]}</span>
+        <button className="app-notice-dismiss" onClick={() => setSettingFailed(false)} aria-label={C["quit.cancel"]}><X size={12} /></button>
+      </div>
+    );
+  }
   const title = p.more ? C["quit.more.title"] : plural("quit.title", p.n);
   const body = p.more ? plural("quit.more", p.n) : C["quit.body"];
   return (
     <div className="settings-overlay quit-prompt-overlay">
-      <div className="settings-panel host-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="quit-prompt-title" aria-describedby="quit-prompt-body" data-quit-prompt={p.more ? "more" : "first"}>
+      <div ref={panel} className="settings-panel host-confirm-panel" role="dialog" aria-modal="true" aria-labelledby="quit-prompt-title" aria-describedby="quit-prompt-body" data-quit-prompt={p.more ? "more" : "first"}>
         <div className="settings-header">
           <span id="quit-prompt-title">{title}</span>
           <button className="settings-close" onClick={() => void resolve("cancel")} aria-label={C["quit.cancel"]}><X size={14} /></button>
@@ -104,7 +122,7 @@ export function QuitPrompt() {
           )}
           {p.error && (
             <p className="host-form-error" role="alert" data-quit-error>
-              {p.error.kind === "stop" ? plural("quit.failed", p.error.n) : C["quit.setting.failed"]}
+              {plural("quit.failed", p.error.n)}
             </p>
           )}
         </div>

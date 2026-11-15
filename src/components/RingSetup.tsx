@@ -5,6 +5,7 @@ import { OLD_SEEN_SETTING, SETUP_SKIPPED_SETTING, type StartView } from "../ring
 import { canStart, countdownLine, liveOperation, setupReducer, setupView, SETUP_CHOICES, trackedOperation, wordGroups, type SetupAction, type SetupState } from "../ring/setup";
 import { errorText } from "../ring/members";
 import { useRing, type RingApi } from "../ring/useRing";
+import { useNotAdded } from "../ring/notAdded";
 import type { JoinOverview } from "../ring/types";
 
 // The setup screen (D9): "This is my first machine" (Create Ring, nothing to fill in) or "Add
@@ -115,6 +116,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
   }, []);
 
   const status = r.status;
+  const { notAdded, clear: clearNotAdded } = useNotAdded(status);
   const follower = status?.connection === "other-window" || r.overview?.owner === false;
   const platform = r.overview?.unavailable === "platform";
   const blocked = !status || status.busy || !r.relayReady || follower || platform || status.problem === "unreadable";
@@ -123,6 +125,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
     if (inflight.current || blocked || !canStart(stRef.current)) return;
     inflight.current = true;
     const my = ++gen.current;
+    clearNotAdded();
     dispatch({ type: "create" });
     const ready = await waitRegistered(my);
     if (ready === "stale") return;
@@ -139,7 +142,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
     } finally {
       if (gen.current === my) inflight.current = false;
     }
-  }, [blocked, dispatch, waitRegistered]);
+  }, [blocked, dispatch, waitRegistered, clearNotAdded]);
 
   const startJoin = useCallback(async () => {
     if (inflight.current || blocked) return;
@@ -147,6 +150,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
     inflight.current = true;
     const my = ++gen.current;
     const op = crypto.randomUUID();
+    clearNotAdded();
     dispatch({ type: "start", operation: op });
     const ready = await waitRegistered(my);
     if (ready === "stale") return;
@@ -170,7 +174,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
     } finally {
       if (gen.current === my) inflight.current = false;
     }
-  }, [blocked, dispatch, waitRegistered]);
+  }, [blocked, dispatch, waitRegistered, clearNotAdded]);
 
   // The backend's progress for the tracked operation.
   const tracked = trackedOperation(st);
@@ -195,8 +199,9 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
   useEffect(() => {
     const prev = prevMembership.current;
     prevMembership.current = membership;
-    if (prev === "finishing" && membership === "none") dispatch({ type: "notAdded" });
+    if (prev === "finishing" && membership === "none") dispatch({ type: "force" });
   }, [membership, dispatch]);
+
   const removedAt = status ? (status.removed?.at ?? null) : undefined;
   const removedSeen = useRef<number | null | undefined>(undefined);
   useEffect(() => {
@@ -204,7 +209,8 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
     if (removedSeen.current === undefined) { removedSeen.current = removedAt; return; }
     if (removedAt === removedSeen.current) return;
     removedSeen.current = removedAt;
-    if (removedAt !== null) { leave(); dispatch({ type: "reset" }); }
+    // Removal decides for every local state, Approved. Finishing… included.
+    if (removedAt !== null) { leave(); dispatch({ type: "force" }); }
   }, [removedAt, leave, dispatch]);
 
   // Join again from a removal notice: the words at once.
@@ -263,6 +269,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
           <p className="ring-setup-body">{old ? C["old.body"] : C["first.body"]}</p>
           {old && <p className="ring-setup-body">{C["old.local"]}</p>}
           {follower && <p className="ring-setup-note">{C["ring.follower"]}</p>}
+          {notAdded && <p className="ring-setup-error" role="alert" data-ring-not-added>{C["finish.notAdded"]}</p>}
           {view.error && <p className="ring-setup-error" role="alert">{fmtc(view.error)}</p>}
           <div className="ring-setup-cards">
             <section className="ring-setup-card" aria-labelledby="ring-setup-create">

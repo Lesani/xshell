@@ -1,4 +1,5 @@
-import { fmt, type StringKey } from "./strings";
+import { fmt } from "./strings";
+import { C } from "./copy";
 import type { PairingEvent, PhoneStart, Qr, RingStatus } from "./types";
 
 // Settings → Ring, pairing, the pure part: the countdown, the eight words as typed (Add a
@@ -55,20 +56,17 @@ export function errorCode(error: string): string {
   return m && CODES.has(m[1]) ? m[1] : "other";
 }
 
-export function failureKey(code: string): StringKey {
+// The fixed line a phone pairing failure shows; never the backend's text or code.
+export function failureLine(code: string): string {
   switch (code) {
-    case "role": return "mobile.pair.err.role";
-    case "full": return "mobile.pair.err.full";
-    case "busy": return "mobile.pair.err.busy";
-    case "expired": return "mobile.pair.expired";
-    case "publish_failed": return "mobile.pair.err.publishFailed";
-    default: return "mobile.pair.failed";
+    case "role": return C["mobile.pair.err.role"];
+    case "full": return fmt("mobile.pair.err.full");
+    case "not_approver": return C["mobile.pair.err.notApprover"];
+    case "busy": return fmt("mobile.pair.err.busy");
+    case "expired": return fmt("mobile.pair.expired");
+    case "publish_failed": return fmt("mobile.pair.err.publishFailed");
+    default: return C["mobile.pair.failed"];
   }
-}
-
-// The line a failure shows. `error` is the command's text, if the failure came from one.
-export function failureLine(code: string, error?: string): string {
-  return fmt(failureKey(code), { error: error ?? code });
 }
 
 export function pairedLine(name: string): string {
@@ -83,7 +81,7 @@ export type PhoneState =
   | { state: "waiting"; offer: PhoneStart }
   | { state: "paired"; name: string }
   | { state: "expired" }
-  | { state: "failed"; code: string; error?: string };
+  | { state: "failed"; code: string };
 
 export type PhoneAction =
   | { type: "start"; operation: string }
@@ -114,7 +112,7 @@ export function phoneReducer(s: PhoneState, a: PhoneAction): PhoneState {
     case "started":
       return s.state === "starting" && s.operation === a.offer.operation ? { state: "waiting", offer: a.offer } : s;
     case "startFailed":
-      return s.state === "starting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
+      return s.state === "starting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error) } : s;
     case "event": {
       if (a.event.flow !== "phone" || (s.state !== "starting" && s.state !== "waiting")) return s;
       const operation = s.state === "starting" ? s.operation : s.offer.operation;

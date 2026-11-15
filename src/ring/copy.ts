@@ -1,5 +1,6 @@
 // Every user-facing string of the "Ring just works" Desktop UI: plans/copy-rjw-desktop.md §1–12
-// and Part A of plans/copy-rjw-gaps.md, keys and wording verbatim (generated from the tables).
+// and Part A of plans/copy-rjw-gaps.md, plus §C of plans/review-rjw-s3-sol.md, keys and wording
+// verbatim (generated from the tables).
 // `{param}` placeholders are filled by fmtc(); counted keys come in `.one`/`.other` pairs.
 
 export const C = {
@@ -149,6 +150,15 @@ export const C = {
   "ring.follower": "This window shows your Ring. Make changes in the first xshell window on this machine.",
   "ring.relay.label": "Self-hosted Relay address (optional)",
   "ring.relay.help": "Advanced: use your own Relay instead of the hosted Relay. Choose its address before creating your Ring.",
+  // plans/review-rjw-s3-sol.md §C (binding).
+  "finish.notAdded": "This machine wasn't added to your Ring. Create a Ring or get new words to join your other devices.",
+  "ring.unsupported": "Creating or joining a Ring is not available on this platform yet.",
+  "mobile.local.tooOld": "Update xshell on this machine, then reopen it to set up your Ring.",
+  "mobile.problem.unreadable": "Couldn't read your Ring settings. Check that xshell can read its settings files, then reopen it.",
+  "mobile.pair.err.notApprover": "This machine can't add phones. Use another machine already in your Ring.",
+  "mobile.pair.failed": "Couldn't pair this phone. Check your device list, then try again.",
+  "mobile.pair.err.role": "This pairing code can't add this type of device. Choose Pair a phone for a new code.",
+  "update.notBack": "{name} hasn't reconnected after the update. Check that machine, then try connecting again.",
 } as const;
 
 export type CopyKey = keyof typeof C;

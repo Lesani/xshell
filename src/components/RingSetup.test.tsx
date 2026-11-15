@@ -258,15 +258,50 @@ describe("registration wait (first start)", () => {
 });
 
 describe("ring:status is authoritative (U3)", () => {
-  it("finishing shows Finishing… with no buttons; finishing → none returns with the not-added line and Retry", async () => {
+  it("finishing shows Finishing… with no buttons; finishing → none returns to the two choices with finish.notAdded", async () => {
     setup(ringStatus({ membership: "finishing", finishingOffline: true }));
     await mount();
     expect(text()).toContain(C["finish.title"]);
     expect(text()).toContain(C["finish.offline"]);
     expect(container.querySelectorAll("button")).toHaveLength(0);
     await emit("ring:status", ringStatus({ membership: "none" }));
-    expect(text()).toContain(C["join.failed"]); // COPY-GAP line for "not added"
-    expect(q("[data-ring-retry]")).not.toBeNull();
+    expect(q("[data-ring-not-added]")?.textContent).toBe(C["finish.notAdded"]);
+    expect(q("[data-ring-create]")).not.toBeNull();
+    expect(q("[data-ring-join-action]")).not.toBeNull();
+    expect(q("[data-ring-retry]")).toBeNull();
+    expect(text()).not.toContain(C["join.failed"]);
+  });
+
+  it("finish.notAdded still shows after a remount (the finishing operation is remembered)", async () => {
+    setup(ringStatus({ membership: "finishing" }));
+    await mount();
+    await act(async () => {});
+    expect(native.settings.get("ring_finishing_pending")).toBe(true);
+    await act(async () => { root.unmount(); });
+    root = createRoot(container);
+    setup(ringStatus({ membership: "none" }));
+    await mount();
+    await act(async () => {});
+    expect(q("[data-ring-not-added]")?.textContent).toBe(C["finish.notAdded"]);
+    // Starting again clears it.
+    commands.ring_join_start = (a) => ({ operation: a.operation, words: WORDS, expiresAt: FAR });
+    await click("[data-ring-join-action]");
+    await act(async () => {});
+    expect(native.settings.get("ring_finishing_pending")).toBe(false);
+  });
+
+  it("a removal during Approved. Finishing… shows the removed screen; Join again then works", async () => {
+    setup(ringStatus());
+    await mount();
+    const op = await showWords();
+    await emit("ring:join", joinEvent(op, "completing"));
+    expect(text()).toContain(C["join.finishing"]);
+    await emit("ring:status", ringStatus({ membership: "removed", removed: { ringId: "r", at: 11 } }));
+    expect(q("h1")?.textContent).toBe(C["removed.title"]);
+    expect(text()).not.toContain(C["join.finishing"]);
+    await click("[data-ring-join-action]");
+    expect(argsOf("ring_join_start")).toHaveLength(2);
+    expect(q("[data-ring-words]")).not.toBeNull();
   });
 
   it("finishing → member shows done", async () => {

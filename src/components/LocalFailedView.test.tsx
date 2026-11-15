@@ -77,4 +77,19 @@ describe("Daemon-failed view", () => {
     await act(async () => { setInfo({ ...failed(), daemon: { state: "starting", error: null, errorKind: null, log: null } }); });
     expect(container.innerHTML).toBe("");
   });
+
+  it("is modal: the app behind is inert and Tab stays on Retry", async () => {
+    const outside = document.createElement("button");
+    document.body.prepend(outside);
+    await act(async () => { root.render(<Harness initial={failed()} retry={async () => null} />); });
+    expect(outside.hasAttribute("inert")).toBe(true);
+    expect(document.activeElement).toBe(q("[data-local-retry]"));
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true })); });
+    expect(document.activeElement).toBe(q("[data-local-retry]"));
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true })); });
+    expect(document.activeElement).toBe(q("[data-local-retry]"));
+    await act(async () => { setInfo({ ...failed(), daemon: { state: "ready", error: null, errorKind: null, log: null } }); });
+    expect(outside.hasAttribute("inert")).toBe(false);
+    outside.remove();
+  });
 });

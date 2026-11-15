@@ -46,10 +46,12 @@ const hostB: HostConfig = { id: "h_bbbbbbbb", name: "Remote B", sshTarget: "fixt
 const localProject: ProjectInfo = { name: "LocalProject", path: "/projects/local", encoded_name: "-projects-local", session_count: 0, last_active: "" };
 const projectA: ProjectInfo = { name: "ProjectA", path: "/projects/a", encoded_name: "-projects-a", session_count: 0, last_active: "", host: hostA.id };
 const projectB: ProjectInfo = { name: "ProjectB", path: "/projects/b", encoded_name: "-projects-b", session_count: 0, last_active: "", host: hostB.id };
-const localInfo: LocalHostInfo = {
+// The Daemon is ready (start-up waits for live readiness in Daemon mode).
+const localInfo = {
   mode: "daemon", reason: null,
   persistent: { supported: true, enabled: true, running: "persistent", log: "/fixture/xshelld.log" },
-};
+  daemon: { state: "ready", error: null, errorKind: null, log: "/fixture/xshelld.log" }, service: null,
+} as LocalHostInfo;
 const eligibleStatus = (host: string): HostStatus => ({
   host, status: "build-differs", phase: null, lastError: null, errorHint: null,
   daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1,

@@ -27,6 +27,9 @@ export function useRing() {
   const relayRef = useRef<string | null>(null);
   const mounted = useRef(false);
   const operations = useRef<Partial<Record<PairingFlow, string>>>({});
+  // Bumped by every `ring:status` event: a read or command reply sent before the latest event
+  // is older than it and is not applied.
+  const statusSeq = useRef(0);
 
   const refreshOverview = useCallback(async (): Promise<JoinOverview | null> => {
     try {
@@ -47,7 +50,7 @@ export function useRing() {
     let cancelled = false;
     const keep = (u: () => void) => { if (cancelled) u(); else unlisten.push(u); };
     // Ownership can move between windows: every status change re-reads it.
-    listen<RingStatus>("ring:status", e => { if (mounted.current) { setStatus(e.payload); void refreshOverview(); } })
+    listen<RingStatus>("ring:status", e => { if (mounted.current) { statusSeq.current++; setStatus(e.payload); void refreshOverview(); } })
       .then(keep)
       .catch(() => {});
     // An unpaired takeover need not change any status: re-read when the window gains focus.
@@ -68,7 +71,8 @@ export function useRing() {
     listen<JoinEvent>("ring:join", e => { if (mounted.current) setJoinEvents(m => ({ ...m, [e.payload.operation]: e.payload })); })
       .then(keep)
       .catch(() => {});
-    invoke<RingStatus>("ring_status").then(s => { if (mounted.current && s) setStatus(s); }).catch(() => {});
+    const at = statusSeq.current;
+    invoke<RingStatus>("ring_status").then(s => { if (mounted.current && s && statusSeq.current === at) setStatus(s); }).catch(() => {});
     void refreshOverview();
     return () => {
       mounted.current = false;
@@ -77,11 +81,17 @@ export function useRing() {
     };
   }, [refreshOverview]);
 
-  const apply = useCallback((s: RingStatus) => { if (mounted.current && s) setStatus(s); return s; }, []);
-  const refreshStatus = useCallback(async () => apply(await invoke<RingStatus>("ring_status")), [apply]);
+  // Runs a command that answers the status; the answer applies only if no event came meanwhile.
+  const fenced = useCallback(async (command: string, args?: Record<string, unknown>) => {
+    const at = statusSeq.current;
+    const s = await invoke<RingStatus>(command, args);
+    if (mounted.current && s && statusSeq.current === at) setStatus(s);
+    return s;
+  }, []);
+  const refreshStatus = useCallback(() => fenced("ring_status"), [fenced]);
 
   // Removes a device, this machine included: a new Roster version without its unit.
-  const removeMember = useCallback(async (signKey: string) => apply(await invoke<RingStatus>("ring_remove_member", { signKey })), [apply]);
+  const removeMember = useCallback((signKey: string) => fenced("ring_remove_member", { signKey }), [fenced]);
 
   const startPhone = useCallback((operation: string) => {
     operations.current.phone = operation;
@@ -107,7 +117,7 @@ export function useRing() {
       if (mounted.current) setRelaySaving(false);
     }
   }, []);
-  const createComputer = useCallback(async () => apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })), [apply]);
+  const createComputer = useCallback(() => fenced("ring_create_computer", { relayUrl: relayRef.current }), [fenced]);
   const joinStart = useCallback((operation: string) => invoke<JoinStarted>("ring_join_start", { operation, relayUrl: relayRef.current }), []);
   const joinCancel = useCallback((operation: string) => invoke<void>("ring_join_cancel", { operation }), []);
 

@@ -98,7 +98,7 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
       )}
       {st.state === "paired" && <div className="host-row-note">{pairedLine(st.name)}</div>}
       {st.state === "expired" && <div className="host-row-note host-row-warn">{fmt("mobile.pair.expired")}</div>}
-      {st.state === "failed" && <div className="host-form-error">{failureLine(st.code, st.error)}</div>}
+      {st.state === "failed" && <div className="host-form-error">{failureLine(st.code)}</div>}
       <div className="host-row-actions">
         {st.state === "waiting" ? (
           <button className="btn btn-ghost settings-action-btn" onClick={() => { navigator.clipboard?.writeText(st.offer.payload).catch(() => {}); }}>

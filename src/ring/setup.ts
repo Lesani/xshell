@@ -40,8 +40,9 @@ export type SetupAction =
   // Left before anything was sent (a registration wait), or a Create whose reply no longer
   // matters: back to the choices.
   | { type: "abort" }
-  // `ring:status` went from `finishing` to `none`: the join did not complete.
-  | { type: "notAdded" };
+  // `ring:status` decided for every local state (a removal, or finishing → none): back to the
+  // choices; a Create or Join the user starts afterwards runs normally.
+  | { type: "force" };
 
 export const SETUP_CHOICES: SetupState = { state: "choices" };
 
@@ -126,8 +127,8 @@ export function setupReducer(s: SetupState, a: SetupAction): SetupState {
       return liveOperation(s) || s.state === "creating" || s.state === "completing" ? s : SETUP_CHOICES;
     case "abort":
       return s.state === "creating" || s.state === "starting" ? SETUP_CHOICES : s;
-    case "notAdded":
-      return { state: "ended", reason: "failed", code: "not_added" };
+    case "force":
+      return SETUP_CHOICES;
   }
 }
 
@@ -159,13 +160,10 @@ const JOIN_ERRORS: Record<string, CopyKey> = {
   other_window: "join.otherWindow",
   not_registered: "join.notRegistered",
   invalid_relay: "join.invalidRelay",
-  // COPY-GAP: no Desktop text for "Finishing ended and this machine is not in a Ring"; the
-  // generic join failure is the nearest approved line.
-  not_added: "join.failed",
 };
 
 // Errors a Retry can fix (the others need something else first).
-const RETRYABLE = new Set(["offline", "busy", "not_registered", "other", "cancelled", "unavailable", "not_added"]);
+const RETRYABLE = new Set(["offline", "busy", "not_registered", "other", "cancelled", "unavailable"]);
 
 export function createErrorKey(code: string): CopyKey {
   return CREATE_ERRORS[code] ?? "create.failed";

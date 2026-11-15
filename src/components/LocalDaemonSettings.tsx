@@ -5,7 +5,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { fmt } from "../hosts/strings";
 import { LOCAL_HOST, type LocalHostInfo, type LocalPersistentInfo } from "../hosts/localHost";
 import { controls, errorCode, initialState, localDaemonLine, localDaemonVisible, otherBuildNote, reduce, startsUpgrade, statusErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
-import { C } from "../ring/copy";
+import { C, fmtc } from "../ring/copy";
 import type { LocalStatus } from "../local/localInfo";
 import { updateTarget, type UpdateTarget } from "../hosts/hostUpdate";
 import { buildText } from "../buildId";
@@ -78,7 +78,9 @@ export function LocalDaemonView({ persistent, keep = false, status, live, state,
   const n = live?.length ?? 0;
   const pending = status?.status === "upgrade-pending" || status?.status === "build-differs" || status?.status === "incompatible";
   const other = otherBuildNote(status, persistent.running);
+  // The backend's diagnostic is not shown (no raw backend text); it goes to the debug console.
   const backendError = statusErrorText(status, state.error);
+  useEffect(() => { if (backendError) console.debug("local Daemon update:", backendError); }, [backendError]);
   const phase = state.phase;
   return (
     <div className="settings-section">
@@ -88,12 +90,6 @@ export function LocalDaemonView({ persistent, keep = false, status, live, state,
       <div className="settings-section-body">
         {keep && <KeepSessionsRow />}
         {state.error && <div className="host-row-error"><span className="host-row-error-text">{state.error}</span></div>}
-        {backendError && (
-          <div className="host-row-error">
-            <span className="host-row-error-label">{fmt("hosts.row.lastError")}</span>
-            <span className="host-row-error-text">{backendError}</span>
-          </div>
-        )}
         {(line || (pending && persistent.enabled)) && (
           <div className="host-row-info">
             {line && <span>{line}</span>}
@@ -161,7 +157,8 @@ export function LocalDaemonSettings() {
     if (startsUpgrade(prev, next)) {
       invoke("host_upgrade", { host: LOCAL_HOST, target: confirmedTarget.current })
         .then(() => dispatch({ type: "upgraded" }))
-        .catch(e => dispatch({ type: "failed", error: fmt("local.persistent.err.failed", { error: errorCode(e) }) }));
+        // COPY-GAP: no text for "the local update failed"; the nearest approved line.
+        .catch(e => { console.debug("local Daemon update failed:", errorCode(e)); dispatch({ type: "failed", error: fmtc("update.notBack", { name: fmt("local.section.title") }) }); });
     }
   }, [status]);
 

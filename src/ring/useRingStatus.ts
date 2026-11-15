@@ -15,6 +15,7 @@ export function useRingStatus(): { status: RingStatus | null; overview: JoinOver
     listen<RingStatus>("ring:status", e => { if (live && e.payload) setStatus(e.payload); })
       .then(u => { if (live) unlisten = u; else u(); })
       .catch(() => {});
+    // An event always wins over the first read (the read may be older).
     invoke<RingStatus>("ring_status").then(s => { if (live && s) setStatus(prev => prev ?? s); }).catch(() => {});
     invoke<JoinOverview>("ring_join_overview").then(o => { if (live) setOverview(o ?? null); }).catch(() => { if (live) setOverview(null); });
     return () => { live = false; unlisten?.(); };

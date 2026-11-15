@@ -218,6 +218,31 @@ describe("Add a machine", () => {
   });
 });
 
+describe("status ordering", () => {
+  it("a ring_status reply older than a ring:status event does not overwrite it", async () => {
+    let reply!: (s: RingStatus) => void;
+    setup(ringStatus(), { ring_status: () => new Promise(r => { reply = r; }) });
+    await mount();
+    await emit("ring:status", member());
+    expect(q("[data-ring-members]")).not.toBeNull();
+    await act(async () => { reply(ringStatus({ membership: "finishing" })); });
+    expect(q("[data-ring-members]")).not.toBeNull();
+    expect(text()).not.toContain(C["finish.title"]);
+  });
+
+  it("a command reply older than an event does not overwrite it (Remove answers after a removal event)", async () => {
+    let reply!: (s: RingStatus) => void;
+    setup(member(), { ring_remove_member: () => new Promise(r => { reply = r; }) });
+    await mount();
+    await click('[aria-label="Remove tower"]');
+    await act(async () => { dialogButton(C["remove.action"]).click(); });
+    await emit("ring:status", ringStatus({ membership: "removed", removed: { ringId: "r", at: 8 } }));
+    await act(async () => { reply(member({ members: [me, phone] })); });
+    expect(text()).toContain(C["removed.title"]);
+    expect(q("[data-ring-members]")).toBeNull();
+  });
+});
+
 describe("other memberships", () => {
   it("finishing shows Finishing… with no buttons", async () => {
     setup(ringStatus({ membership: "finishing" }));
