@@ -87,12 +87,21 @@ fn setup_local(
     home: Option<std::path::PathBuf>,
 ) -> (local::LocalMode, Option<Arc<xshell_hostlink::LocalDaemon>>) {
     let install_bin = own_install_bin(version, home.as_deref());
+    let embedded = binaries::embedded_own().is_some();
+    let matches = |p: &std::path::Path| local::binary_is_build(p, crate::build_id::BUILD.as_ref());
+    if cfg!(unix)
+        && std::env::var_os("XSHELL_DAEMON_BIN").is_none_or(|v| v.is_empty())
+        && local::sidecar_ignored(exe_dir, embedded, &matches)
+    {
+        eprintln!("{}", local::IGNORED_SIDECAR);
+    }
     let mut mode = local::resolve_local(
         exe_dir,
         &|k| std::env::var_os(k),
         cfg!(unix),
-        binaries::embedded_own().is_some(),
+        embedded,
         install_bin.as_deref(),
+        &matches,
     );
     let daemon = match &mode {
         local::LocalMode::Daemon { bin, source } => {
@@ -323,6 +332,9 @@ impl Hosts {
     /// `local_daemon_retry`: clear the start error and dial again; in `Failed` set the
     /// Daemon up again first (A8); rerun the service install when it failed.
     pub fn retry_local(&self) -> local::LocalHostInfo {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let set_up = retry_setup(
             &self.current,
             &self.daemon,
@@ -330,6 +342,7 @@ impl Hosts {
             &self.version,
             &self.service,
             (self.home_of)(),
+            exe_dir.as_deref(),
         );
         if set_up || self.service.get().is_some_and(|s| s.error.is_some()) {
             self.start_service_install();
@@ -400,8 +413,11 @@ fn info_of(
     mode.info(local::PersistentInfo::default(), daemon, service)
 }
 
-/// A Retry: in `Failed`, set the Daemon up again (and add the Local Host); always clear the
-/// start error and kick the Local Host. Returns whether a Daemon was newly set up.
+/// A Retry rebuilds the selection from scratch (Unix; Windows only from `Failed`): the
+/// Daemon binary is resolved again (a stale sidecar may be gone, the home may be known now)
+/// and a new Local Host Daemon set up, which the Local Host's dialer uses from its next
+/// dial. Always clears the start error and kicks the Local Host. Returns whether a Daemon
+/// was set up anew.
 fn retry_setup(
     current: &Mutex<local::LocalMode>,
     slot: &DaemonSlot,
@@ -409,18 +425,19 @@ fn retry_setup(
     version: &str,
     svc: &Arc<service::ServiceState>,
     home: Option<std::path::PathBuf>,
+    exe_dir: Option<&std::path::Path>,
 ) -> bool {
     let mut set_up = false;
     let failed = matches!(*current.lock().unwrap(), local::LocalMode::Failed { .. });
-    if failed {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (mode, daemon) = setup_local(version, exe_dir.as_deref(), svc, home);
+    if failed || cfg!(unix) {
+        let (mode, daemon) = setup_local(version, exe_dir, svc, home);
         *current.lock().unwrap() = mode;
+        let had = slot.lock().unwrap().is_some();
+        *slot.lock().unwrap() = daemon.clone();
         if daemon.is_some() {
-            *slot.lock().unwrap() = daemon;
-            manager.set_local(local_host_config());
+            if !had || manager.access(LOCAL_HOST_ID).is_none() {
+                manager.set_local(local_host_config());
+            }
             set_up = true;
         }
     }
@@ -573,8 +590,52 @@ impl TransportFactory for SshFactory {
         if cfg.id != LOCAL_HOST_ID {
             return None;
         }
-        let daemon = self.local.lock().unwrap().clone()?;
-        Some(Box::new(xshell_hostlink::LocalDialer { daemon }))
+        self.local.lock().unwrap().as_ref()?;
+        Some(Box::new(SlotDialer(self.local.clone())))
+    }
+}
+
+/// The Local Host's dialer: the Local Host Daemon *now* (a Retry may replace it), dialed as
+/// a [`xshell_hostlink::LocalDialer`] on every call.
+struct SlotDialer(DaemonSlot);
+
+impl SlotDialer {
+    fn now(&self) -> Option<xshell_hostlink::LocalDialer> {
+        let daemon = self.0.lock().unwrap().clone()?;
+        Some(xshell_hostlink::LocalDialer { daemon })
+    }
+}
+
+impl xshell_hostlink::Dialer for SlotDialer {
+    fn dial(
+        &self,
+        cancel: &xshell_hostlink::CancelToken,
+    ) -> Result<xshell_hostlink::Dialed, xshell_hostlink::DialError> {
+        match self.now() {
+            Some(d) => d.dial(cancel),
+            None => Err(xshell_hostlink::DialError::failed(
+                "the local Daemon is not set up",
+                None,
+            )),
+        }
+    }
+    fn describe(&self) -> String {
+        self.now().map(|d| d.describe()).unwrap_or_default()
+    }
+    fn authorized(&self) -> bool {
+        self.now().is_some_and(|d| d.authorized())
+    }
+    fn upgradable(&self) -> bool {
+        self.now().is_some_and(|d| d.upgradable())
+    }
+    fn stop_incompatible(
+        &self,
+        cancel: &xshell_hostlink::CancelToken,
+    ) -> Option<Result<(), xshell_hostlink::HostError>> {
+        self.now()?.stop_incompatible(cancel)
+    }
+    fn select_build(&self, dir: &str) -> Option<Result<(), String>> {
+        self.now()?.select_build(dir)
     }
 }
 
@@ -773,7 +834,15 @@ mod local_readiness_tests {
                 .to_string()
         );
         // Still unknown: stays failed, no Local Host.
-        assert!(!retry_setup(&current, &slot, &m, "1.5.0", &svc, None));
+        assert!(!retry_setup(
+            &current,
+            &slot,
+            &m,
+            "1.5.0",
+            &svc,
+            None,
+            Some(t.path())
+        ));
         assert!(m.access(LOCAL_HOST_ID).is_none());
         // Known now: set up, the Local Host exists, the info says daemon.
         let home = t.path().join("home");
@@ -784,7 +853,8 @@ mod local_readiness_tests {
             &m,
             "1.5.0",
             &svc,
-            Some(home.clone())
+            Some(home.clone()),
+            Some(t.path())
         ));
         let d = slot.lock().unwrap().clone().expect("a Daemon");
         assert!(m.access(LOCAL_HOST_ID).is_some());
@@ -798,6 +868,92 @@ mod local_readiness_tests {
             .starts_with(&home.display().to_string()));
         assert!(info.service.is_some());
         d.hang_up();
+        m.shutdown();
+    }
+
+    /// An `xshelld` stand-in answering `--version` with `build` (a real file on disk).
+    fn version_script(path: &std::path::Path, build: &serde_json::Value) {
+        use std::os::unix::fs::PermissionsExt;
+        let line = serde_json::json!({
+            "name": "xshelld", "version": "1.5.0", "protocol": {"min": 1, "max": 1},
+            "os": "Linux", "arch": "x86_64", "build": build
+        });
+        std::fs::write(path, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Retry rebuilds the selection from scratch: after the stale sidecar is renamed away,
+    /// the old resolved path is no longer used.
+    #[test]
+    fn retry_re_resolves_after_the_stale_sidecar_is_gone() {
+        if std::env::var_os("XSHELL_DAEMON_BIN").is_some() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("bin");
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let sidecar = app.join("xshelld");
+        version_script(
+            &sidecar,
+            &serde_json::json!({"commit": "42c9be9636a9", "dirty": null, "time": 1}),
+        );
+        let svc = Arc::new(service::ServiceState::default());
+        let (mode, daemon) = setup_local("1.5.0", Some(&app), &svc, Some(home.clone()));
+        let current = Mutex::new(mode.clone());
+        let slot: DaemonSlot = Arc::new(Mutex::new(daemon));
+        let m = Manager::new(ManagerConfig::new(
+            "1.5.0",
+            Arc::new(SshFactory {
+                local: slot.clone(),
+            }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ));
+        m.set_local(local_host_config());
+        let first = slot.lock().unwrap().clone().unwrap();
+        if binaries::embedded_own().is_none() {
+            // No embedded Daemon: the stale sidecar is selected (and refused at start).
+            assert_eq!(
+                mode,
+                local::LocalMode::Daemon {
+                    bin: sidecar.clone(),
+                    source: local::DaemonSource::File
+                }
+            );
+        }
+        // The cause is removed: the stale file renamed away. Retry selects anew.
+        std::fs::rename(&sidecar, app.join("xshelld.old")).unwrap();
+        assert!(retry_setup(
+            &current,
+            &slot,
+            &m,
+            "1.5.0",
+            &svc,
+            Some(home.clone()),
+            Some(&app)
+        ));
+        let second = slot.lock().unwrap().clone().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the old Daemon setup was kept"
+        );
+        // The stale file is no longer selected: now the embedded Daemon, or (a build without
+        // one) "this build carries no xshelld".
+        assert!(!matches!(
+            &*current.lock().unwrap(),
+            local::LocalMode::Daemon { bin, source: local::DaemonSource::File } if bin == &sidecar
+        ));
+        // The Local Host's dialer follows the new setup at its next dial.
+        let factory = SshFactory {
+            local: slot.clone(),
+        };
+        let dialer = factory.direct(&local_host_config()).unwrap();
+        assert_eq!(
+            dialer.describe(),
+            second.live_socket().display().to_string()
+        );
         m.shutdown();
     }
 }

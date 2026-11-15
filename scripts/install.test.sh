@@ -111,6 +111,10 @@ cmp -s "$h/.xshell/server/$dir_a/xshelld" "$work/xshelld-a" || fail "installed b
 [ -x "$h/.xshell/service/xshelld" ] || fail "no launcher"
 [ "$(serving fresh)" = "$dir_a" ] || fail "$dir_a is not serving" "$out"
 case "$out" in *"Downloading xshell a..."*"Verifying download..."*"Installed xshell a."*) ;; *) fail "unexpected output" "$out" ;; esac
+# The one status line (copy cli.service.*): nothing is verified to restart it here
+# (XSHELL_SERVICE_MECHANISM=none), so never the automatic promise, and no old two-line text.
+case "$out" in *"xshell is running. After this machine restarts, it starts only when you next log in to a shell on this machine."*) ;; *) fail "no status line" "$out" ;; esac
+case "$out" in *"starts after reboot"*|*"sign in with your usual shell"*) fail "old status text" "$out" ;; esac
 [ ! -e "$h/.local/bin/xshelld" ] || fail "linked into a ~/.local/bin that did not exist"
 ok "fresh install: verified, installed, selected, serving (PATH without xshelld; ambient PATH had one: $PATH_HAS)"
 

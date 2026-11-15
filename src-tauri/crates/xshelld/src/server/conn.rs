@@ -910,6 +910,8 @@ impl Conn {
                 // again, C2).
                 #[cfg(target_os = "linux")]
                 let ring = super::ring_connected(&d);
+                // Off Linux nothing in it can fail; the closure stays for the Linux path.
+                #[cfg_attr(not(target_os = "linux"), allow(clippy::redundant_closure_call))]
                 let prepared = (|| -> Result<(), String> {
                     let mut reg = d.reg.lock().unwrap();
                     if !reg.frozen {

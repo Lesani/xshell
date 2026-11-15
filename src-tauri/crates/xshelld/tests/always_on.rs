@@ -184,7 +184,10 @@ fn service_install_profile_fresh_home() {
     assert_eq!(st["running"], false);
     assert!(st.get("changed").is_none());
     let text = svc(&h).args(["service", "status"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&text.stdout).contains("shell profile"));
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout).trim(),
+        "xshell is installed but not running."
+    );
     // Uninstall: the block and the launcher are gone; nothing else was touched.
     let out = svc(&h).args(["service", "uninstall"]).output().unwrap();
     assert!(out.status.success());
@@ -636,5 +639,94 @@ fn serve_first_registration_starts_serve_not_helper() {
     let argv = String::from_utf8_lossy(&argv).replace('\0', " ");
     assert!(argv.contains(" serve --interactive-env"), "{argv}");
     assert!(procs(&root, "companion-registration").is_empty());
+    local.hang_up();
+}
+
+/// The new Desktop's Local Host Daemon setup for `h` (always-on, the test binary).
+fn new_desktop(h: &TestHome) -> xshell_hostlink::LocalDaemon {
+    let local = xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+        bin: bin().into(),
+        home: h.home(),
+        socket: h.paths().socket,
+        env: vec![
+            ("HOME".into(), h.home().into()),
+            ("XDG_RUNTIME_DIR".into(), h.run().into()),
+            ("XSHELLD_LOGIN_ENV".into(), "0".into()),
+        ],
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: xshelld::build_id::BUILD.clone(),
+    })
+    .unwrap();
+    local.set_persistent(true);
+    local.set_serve_first(true);
+    local
+}
+
+/// A previous build's GUI-bound Daemon whose Desktop has quit (here: stopped, so it is still
+/// listening when its parent dies, as one still ending its Terminals or stuck would be) is
+/// taken over by the new Desktop without any user action; the "older window" error is only
+/// for an old Desktop that still runs.
+#[test]
+fn orphaned_gui_bound_daemon_is_taken_over() {
+    let h = TestHome::new();
+    let _reap = Reap(h.home());
+    let mut parent = GuiParent::start(&h, &[]);
+    connect_slow(&h.paths().socket);
+    let old = parent.daemon_pid();
+    // The old Desktop still runs: refused with the older-window error, nothing started.
+    let local = new_desktop(&h);
+    let r = local.connect_or_start(&xshell_hostlink::CancelToken::new());
+    assert!(r.is_err());
+    assert!(local
+        .start_error()
+        .is_some_and(|e| e.starts_with("older-desktop:")));
+    assert!(alive(old));
+    // The old Desktop quits while its Daemon cannot react yet.
+    unsafe { libc::kill(old, libc::SIGSTOP) };
+    parent.kill();
+    assert!(alive(old));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
+    local
+        .connect_or_start(&xshell_hostlink::CancelToken::new())
+        .expect("the new Desktop takes over");
+    assert_eq!(local.start_error(), None);
+    assert!(wait_dead(old, SLOW), "the orphaned Daemon still runs");
+    let serves = procs(h.root(), "serve");
+    assert_eq!(serves.len(), 1, "{serves:?}");
+    assert!(serves[0].1.iter().any(|a| a == "--interactive-env"));
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "persistent"
+    );
+    local.hang_up();
+}
+
+/// Its files left behind (the old Daemon gone: stale socket, pidfile and gui-bound marker):
+/// the new Desktop starts its Daemon without any user action.
+#[test]
+fn files_of_a_previous_gui_bound_daemon_are_no_obstacle() {
+    let h = TestHome::new();
+    let _reap = Reap(h.home());
+    let mut parent = GuiParent::start(&h, &[]);
+    connect_slow(&h.paths().socket);
+    let old = parent.daemon_pid();
+    unsafe { libc::kill(old, libc::SIGSTOP) };
+    parent.kill();
+    kill9(old, &h.home());
+    // Leftovers of a killed old Daemon.
+    assert!(h.paths().socket.exists());
+    assert_eq!(
+        fs::read_to_string(h.paths().mode).unwrap().trim(),
+        "gui-bound"
+    );
+    let local = new_desktop(&h);
+    local
+        .connect_or_start(&xshell_hostlink::CancelToken::new())
+        .expect("the new Desktop starts its Daemon");
+    assert_eq!(local.start_error(), None);
+    assert_eq!(procs(h.root(), "serve").len(), 1);
     local.hang_up();
 }

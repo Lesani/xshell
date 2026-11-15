@@ -566,32 +566,45 @@ pub struct Report {
 impl Report {
     /// One line for people.
     pub fn text(&self) -> String {
-        let how = match self.mechanism {
-            "systemd" => format!(
-                "keeps running via systemd user unit (linger {})",
-                match self.linger {
-                    Some(true) => "on",
-                    Some(false) => "off: it stops when you log out",
-                    None => "unknown",
-                }
-            ),
-            "cron" => "starts at boot via crontab @reboot".into(),
-            "profile" => "starts when you log in (shell profile)".into(),
-            _ => "nothing keeps it running".into(),
-        };
-        let run = if self.running {
-            "running now"
-        } else {
-            "not running now"
-        };
-        let mut s = format!("xshelld {how}; {run}");
+        let mut s = self.status_line().to_string();
         for w in &self.warnings {
             s.push_str("\nwarning: ");
             s.push_str(w);
         }
         s
     }
+
+    /// The one status line (copy `cli.service.*`, binding).
+    pub fn status_line(&self) -> &'static str {
+        if !self.running {
+            return if self.installed.is_empty() {
+                CLI_SERVICE_NOT_INSTALLED
+            } else {
+                CLI_SERVICE_STOPPED
+            };
+        }
+        let automatic = match self.mechanism {
+            "systemd" => self.active && self.linger == Some(true),
+            "cron" => true,
+            _ => false,
+        };
+        if automatic {
+            CLI_SERVICE_AUTOMATIC
+        } else {
+            CLI_SERVICE_SHELL_LOGIN
+        }
+    }
 }
+
+/// `cli.service.automatic`: only when automatic startup is verified.
+pub const CLI_SERVICE_AUTOMATIC: &str =
+    "xshell is running. It starts automatically after this machine restarts.";
+/// `cli.service.shellLogin`.
+pub const CLI_SERVICE_SHELL_LOGIN: &str = "xshell is running. After this machine restarts, it starts only when you next log in to a shell on this machine.";
+/// `cli.service.stopped`.
+pub const CLI_SERVICE_STOPPED: &str = "xshell is installed but not running.";
+/// `cli.service.notInstalled`.
+pub const CLI_SERVICE_NOT_INSTALLED: &str = "xshell is not installed.";
 
 /// What one mechanism has on this machine.
 fn installed(l: &Layout, runner: &dyn Runner, m: Mechanism) -> bool {
@@ -1610,6 +1623,50 @@ mod tests {
         let r = status(&l, &f, Some(Mechanism::Profile));
         assert_eq!(r.installed, vec!["profile"]);
         assert!(r.active);
-        assert!(r.text().contains("shell profile"), "{}", r.text());
+        assert_eq!(r.text(), CLI_SERVICE_STOPPED);
+        let line = |mechanism, installed: Vec<&'static str>, active, linger, running| {
+            Report {
+                mechanism,
+                installed,
+                active,
+                linger,
+                running,
+                serving: None,
+                launcher: String::new(),
+                changed: None,
+                warnings: vec![],
+            }
+            .status_line()
+        };
+        assert_eq!(
+            line("systemd", vec!["systemd"], true, Some(true), true),
+            "xshell is running. It starts automatically after this machine restarts."
+        );
+        assert_eq!(
+            line("cron", vec!["cron"], true, None, true),
+            CLI_SERVICE_AUTOMATIC
+        );
+        // Linger off (or unknown): not verified, so the shell-login promise.
+        assert_eq!(
+            line("systemd", vec!["systemd"], true, Some(false), true),
+            "xshell is running. After this machine restarts, it starts only when you next log in to a shell on this machine."
+        );
+        assert_eq!(
+            line("profile", vec!["profile"], true, None, true),
+            CLI_SERVICE_SHELL_LOGIN
+        );
+        assert_eq!(
+            line("systemd", vec!["systemd"], false, Some(true), false),
+            "xshell is installed but not running."
+        );
+        assert_eq!(
+            line("none", vec![], false, None, false),
+            "xshell is not installed."
+        );
+        // Running with nothing verified to start it again: never the automatic promise.
+        assert_eq!(
+            line("none", vec![], false, None, true),
+            CLI_SERVICE_SHELL_LOGIN
+        );
     }
 }

@@ -13,6 +13,9 @@
 //! [`STAGE_MAX_CHUNK`] decoded bytes and never past the announced length (refused before
 //! any write); a write or sync error aborts the stage and removes its part file. A stage that
 //! gets nothing for the idle time, or whose connection closes, is removed too.
+// Staging over the link is Linux/macOS only: Windows never offers `daemon.stage`, so its
+// machinery is compiled there but unused.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::registry::Daemon;
 use super::{ConnId, TestPoint};
@@ -106,8 +109,30 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
-    /// `daemon.stage-begin`.
+    /// `daemon.stage-begin`. Linux and macOS only: Windows does not offer `daemon.stage`
+    /// (the link refuses it before this is reached) and keeps its own update path.
     pub fn begin(
+        &self,
+        d: &Arc<Daemon>,
+        who: Requester,
+        version: &str,
+        build: &BuildId,
+        sha256: &str,
+        length: u64,
+    ) -> Result<Value, String> {
+        #[cfg(unix)]
+        {
+            self.begin_unix(d, who, version, build, sha256, length)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (d, who, version, build, sha256, length);
+            Err("this xshelld cannot be updated over its link".into())
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_unix(
         &self,
         d: &Arc<Daemon>,
         who: Requester,

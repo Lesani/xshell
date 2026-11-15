@@ -19,6 +19,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use xshell_hostlink::trial::{self, Trial};
 
 /// This build's install directory name.
