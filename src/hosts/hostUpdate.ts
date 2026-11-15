@@ -181,9 +181,8 @@ export class HostUpdates {
       else if (began && s.errorHint === "update-failed" && s.phase === null && s.lastError) end(s.lastError);
     };
     const stop = this.watch(check);
-    // COPY-GAP: no approved text for "did not come back in time" from the UI's own wait;
-    // the backend's error (when it set one) wins, else the nearest approved string.
-    const timer = setTimeout(() => end(this.statusOf(c.host.id)?.lastError ?? fmt("update.offline", { name: c.host.name })), this.settleMs);
+    // The backend's error (when it set one) wins.
+    const timer = setTimeout(() => end(this.statusOf(c.host.id)?.lastError ?? fmt("update.notBack", { name: c.host.name })), this.settleMs);
     return {
       promise,
       cancel: () => { if (!over) { over = true; stop(); clearTimeout(timer); } },

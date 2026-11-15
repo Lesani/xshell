@@ -177,7 +177,7 @@ describe("Update all", () => {
     f.updates.askAll([a, b].map(h => ({ host: h, status: f.statuses[h.id] })));
     await f.updates.confirmAll();
     const r = f.updates.getSnapshot().all!.results;
-    expect(r[0]).toEqual({ host: a, outcome: "failed", error: "box-a is offline. Try updating it when it is online." });
+    expect(r[0]).toEqual({ host: a, outcome: "failed", error: "box-a hasn't reconnected after the update. Check that machine, then try connecting again." });
     expect(r[1]).toEqual({ host: b, outcome: "ok", version: "1.5.0" });
   });
 

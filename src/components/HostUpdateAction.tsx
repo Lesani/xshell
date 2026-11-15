@@ -28,12 +28,10 @@ function useInstallCommand(wanted: boolean): string | null {
 }
 
 /// A machine whose xshell cannot take an update over the Ring: how to update it there.
-// COPY-GAP: no approved text for "this machine's xshell is too old to be updated over the
-// Ring"; nearest approved string `update.noBuild`, followed by the install command.
-export function RingUpdateUnsupported() {
+export function RingUpdateUnsupported({ name }: { name: string }) {
   const command = useInstallCommand(true);
   return <span className="host-update-unsupported">
-    <span>{fmt("update.noBuild")}</span>
+    <span>{fmt("update.tooOld", { name })}</span>
     {command && <CodeCopy text={command} />}
   </span>;
 }
@@ -51,7 +49,7 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
   if (!visible) return null;
   return <div className="host-update-action">
     {description && !busy && status && (action || unavailable) && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
-    {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported />}
+    {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} />}
     {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? "update.restarting" : "update.sending")}</span>
@@ -70,10 +68,8 @@ function resultText(r: AllResult): string {
       switch (r.reason) {
         case "current": return `${r.host.name}: ${fmt("update.current")}`;
         case "offline": return fmt("update.offline", { name: r.host.name });
-        case "unsupported": return `${r.host.name}: ${fmt("update.noBuild")}`;
-        // COPY-GAP: no approved text for a machine already being updated; nearest
-        // approved string `update.sending`.
-        case "busy": return `${r.host.name}: ${fmt("update.sending")}`;
+        case "unsupported": return fmt("update.tooOld", { name: r.host.name });
+        case "busy": return fmt("update.busy", { name: r.host.name });
       }
   }
 }
@@ -108,12 +104,11 @@ export function HostUpdateConfirmation() {
   const { confirmation, all } = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
   const snap = useHostsSnapshot();
   if (all && !all.confirmed) {
-    // COPY-GAP: no approved confirmation text for "Update all"; the bulk action's own label
-    // and the single-update body's wording are the nearest approved strings.
+    // The list of machines stays visible beside the approved body.
     const names = all.queue.map(c => c.host.name).join(", ");
-    return <ConfirmDialog title={fmt("update.all", { n: all.queue.length })}
-      body={`${count(all.queue.length)}: ${names}. ${fmt("hosts.update.confirmBody", { host: names })}`}
-      confirm={fmt("update.action")} onConfirm={hostUpdates.confirmAll} onCancel={hostUpdates.cancelAll} />;
+    return <ConfirmDialog title={fmt("update.all.title")}
+      body={`${fmt("update.all.body", { n: all.queue.length })} ${names}`}
+      confirm={fmt("update.all.confirm")} cancel={fmt("update.all.cancel")} onConfirm={hostUpdates.confirmAll} onCancel={hostUpdates.cancelAll} />;
   }
   if (!confirmation) return null;
   const { host, action } = confirmation;

@@ -84,7 +84,7 @@ it("shows how to update a Ring machine whose xshell cannot take an update over t
   const { fetchInstallCommand } = await import("./HostUpdateAction");
   expect(await fetchInstallCommand()).toContain("/install.sh | sh");
   const html = render({ os: null, routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: null, updateAction: null, status: "upgrade-pending" });
-  expect(html).toContain("This xshell cannot update this type of machine. Update xshell directly on that machine.");
+  expect(html).toContain("Windows fixture is too old to update through your Ring. Update xshell directly on that machine.");
   expect(html).not.toContain("Use this Desktop");
 });
 
