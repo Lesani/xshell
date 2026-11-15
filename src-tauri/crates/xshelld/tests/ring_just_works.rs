@@ -1504,3 +1504,50 @@ fn a_live_join_is_busy_not_finishing() {
     assert!(!b.ring.adoption_busy());
     assert_eq!(b.ring.membership_state().unwrap(), MembershipState::None);
 }
+
+/// Ported from ring.rs `membership_survives_restart` (format 1): a Daemon of a format-2
+/// Computer keeps every version it gets while connected, catches up with the versions
+/// published while it was away, and keeps the whole chain across restarts.
+#[test]
+fn daemon_membership_survives_restart_and_catches_up() {
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    a.create();
+    let mut b = Computer::new(&relay);
+    b.join(&a);
+    connected(&a);
+    // A version published while b's Daemon is connected is stored.
+    let c = Computer::new(&relay);
+    let v3 = c.join(&a).head().version();
+    wait("b's Daemon stored the new version", || {
+        daemon_chain(&b).is_some_and(|ch| ch.head().version() == v3)
+    });
+    let restart = |b: &mut Computer| {
+        b.daemon.take().unwrap().shutdown();
+        let mut cfg = xshelld::server::Config::new(b.home.home(), b.home.paths());
+        cfg.ring_backoff_unit = Duration::from_millis(10);
+        b.daemon = Some(xshelld::server::Server::start(cfg).unwrap());
+    };
+    // Versions published while it is away: it catches up when it connects again.
+    b.daemon.take().unwrap().shutdown();
+    let d = Computer::new(&relay);
+    d.join(&a);
+    let e = Computer::new(&relay);
+    let head = e.join(&a).head().clone();
+    let mut cfg = xshelld::server::Config::new(b.home.home(), b.home.paths());
+    cfg.ring_backoff_unit = Duration::from_millis(10);
+    b.daemon = Some(xshelld::server::Server::start(cfg).unwrap());
+    wait("b's Daemon caught up", || {
+        daemon_chain(&b).is_some_and(|ch| ch.head() == &head)
+    });
+    assert_eq!(
+        daemon_chain(&b).unwrap().versions().len() as u64,
+        head.version()
+    );
+    wait("b's Daemon online", || daemon_online(&b));
+    // And from disk again.
+    restart(&mut b);
+    assert_eq!(daemon_chain(&b).unwrap().head(), &head);
+    wait("b's Daemon online after the restart", || daemon_online(&b));
+    assert_eq!(b.ring.membership_state().unwrap(), MembershipState::Member);
+}
