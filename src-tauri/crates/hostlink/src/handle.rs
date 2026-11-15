@@ -68,6 +68,23 @@ pub const RING_CAPABILITY: &str = "ring";
 /// the expected one.
 pub const RING_CJOIN_CAPABILITY: &str = "ring.cjoin";
 const RING_REFUSED: &str = "this Host's xshelld cannot join a ring; upgrade it first";
+/// A Ring Host whose xshell cannot take an update over the Ring. COPY-GAP: no approved text
+/// for this case; nearest approved string `update.noBuild`.
+pub const RING_UPDATE_UNSUPPORTED: &str =
+    "This xshell cannot update this type of machine. Update xshell directly on that machine.";
+/// This Desktop has no build for the Ring Host's platform (copy `update.noBuild`).
+pub const RING_NO_BUILD: &str =
+    "This xshell cannot update this type of machine. Update xshell directly on that machine.";
+
+/// A Ring Host that is not online (copy `update.offline`).
+pub fn ring_offline(name: &str) -> String {
+    format!("{name} is offline. Try updating it when it is online.")
+}
+
+/// An update that the Ring Host rolled back (copy `update.rolledBack`).
+pub fn ring_rolled_back(name: &str, old: &str) -> String {
+    format!("The update failed. {name} is back on version {old}. Try again.")
+}
 /// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
 ///
 /// [`LaunchSpec`]: xshell_core::launch::LaunchSpec
@@ -188,6 +205,9 @@ pub(crate) struct State {
     pub upgrade_expect: bool,
     pub upgrade_operation: Option<u64>,
     pub upgrade_complete_deadline: Option<Instant>,
+    /// A Ring Host update this Desktop sent (S4): the install directory and when. While set,
+    /// a reconnect of another build asks the Daemon whether that update was rolled back.
+    pub ring_update: Option<(String, Instant)>,
 }
 
 impl State {
@@ -306,16 +326,12 @@ impl Shared {
 
     fn new_definition(cfg: HostDefinition, mc: Arc<ManagerConfig>, config_generation: u64) -> Self {
         mc.action_targets.register(&cfg.id, config_generation);
-        let mut status = HostStatus::initial(
+        let status = HostStatus::initial(
             &cfg.id,
             &mc.desktop_version,
             mc.desktop_build.clone(),
             config_generation,
         );
-        if matches!(cfg.route, HostRoute::Relay(_)) {
-            status.route_update_unavailable =
-                Some(crate::status::RouteUpdateUnavailable::RelayOnly);
-        }
         let down = HostError::offline(format!("{} is reconnecting", cfg.name));
         Self {
             observed_identity: Mutex::new(None),
@@ -350,6 +366,7 @@ impl Shared {
                 upgrade_expect: false,
                 upgrade_operation: None,
                 upgrade_complete_deadline: None,
+                ring_update: None,
             }),
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
@@ -2028,6 +2045,10 @@ impl HostHandle {
             w(Err(error));
             return;
         }
+        // A Ring Host is updated over its link: no SSH, no configured route (S4).
+        if self.sh.relay.is_some() && !mode_switch {
+            return self.upgrade_ring(target, public, w);
+        }
         let once = Once::new(w);
         let reservation = (|| {
             let mut st = self.sh.lock();
@@ -2243,6 +2264,191 @@ impl HostHandle {
         }
     }
 
+    /// The confirmed target must still be what the Host shows (a public request names it by
+    /// the alias-free generations it saw).
+    fn check_target(
+        &self,
+        st: &State,
+        target: Option<UpdateTarget>,
+        public: bool,
+    ) -> Result<(), HostError> {
+        let mut target = target;
+        if public {
+            if let Some(t) = &mut target {
+                let raw = self
+                    .sh
+                    .mc
+                    .action_targets
+                    .direct(
+                        &self.sh.id,
+                        InputTarget {
+                            config_generation: t.config_generation,
+                            link_generation: t.link_generation,
+                        },
+                        InputTarget {
+                            config_generation: st.status.config_generation,
+                            link_generation: st.status.link_generation,
+                        },
+                    )
+                    .map_err(|_| {
+                        HostError::invalid("the Host update target changed; review it again")
+                    })?;
+                t.config_generation = raw.config_generation;
+                t.link_generation = raw.link_generation;
+            }
+        }
+        if let Some(t) = &target {
+            if t.config_generation != st.status.config_generation
+                || t.link_generation != st.status.link_generation
+                || t.daemon_version != st.status.daemon_version
+                || t.daemon_build != st.status.daemon_build
+            {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Invalid,
+                    "the Host update target changed; review it again",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Update a Ring Host over its link (S4; ADR-0019): send this Desktop's build
+    /// (`daemon.stage-*`), then `daemon.upgrade-selected`; the Daemon re-executes itself into
+    /// it and comes back on the same link route. Never touches a configured route.
+    fn upgrade_ring(&self, target: Option<UpdateTarget>, public: bool, w: Waiter) {
+        let once = Once::new(w);
+        let reservation = (|| {
+            let mut st = self.sh.lock();
+            let name = st.cfg.name.clone();
+            if st.status.route_update_unavailable.is_some()
+                || (!st.status.daemon_capabilities.is_empty()
+                    && !st
+                        .status
+                        .daemon_capabilities
+                        .iter()
+                        .any(|c| c == xshell_protocol::cap::DAEMON_STAGE))
+            {
+                return Err(HostError::invalid(RING_UPDATE_UNSUPPORTED));
+            }
+            if st.upgrading {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Busy,
+                    "a Host update is already in progress",
+                ));
+            }
+            self.check_target(&st, target, public)?;
+            if let Some(reason) = st.status.update_unavailable {
+                return Err(
+                    if reason == crate::status::UpdateUnavailable::DesktopOwned {
+                        HostError::invalid(reason.message())
+                    } else {
+                        HostError::offline(reason.message())
+                    },
+                );
+            }
+            let (link, _) = self
+                .usable_link(&st)
+                .map_err(|_| HostError::offline(ring_offline(&name)))?;
+            if !st
+                .status
+                .daemon_capabilities
+                .iter()
+                .any(|c| c == xshell_protocol::cap::DAEMON_STAGE)
+            {
+                return Err(HostError::invalid(RING_UPDATE_UNSUPPORTED));
+            }
+            if !crate::version::update_eligible(
+                &self.sh.mc.desktop_version,
+                self.sh.mc.desktop_build.as_ref(),
+                st.status.daemon_version.as_deref().unwrap_or(""),
+                st.status.daemon_build.as_ref(),
+            ) {
+                return Err(HostError::new(
+                    crate::HostErrorCode::Invalid,
+                    "this Host does not need this Desktop's build",
+                ));
+            }
+            let build = self
+                .sh
+                .mc
+                .desktop_build
+                .clone()
+                .ok_or_else(|| HostError::offline("this Desktop's exact build is unknown"))?;
+            let gen = st.gen;
+            let op = st.next_epoch();
+            st.upgrade_operation = Some(op);
+            st.upgrading = true;
+            st.upgrade_expect = false;
+            st.ring_update = Some((
+                xshell_protocol::build::install_dir_name(&self.sh.mc.desktop_version, Some(&build)),
+                Instant::now(),
+            ));
+            st.status.phase = Some(Phase::Preparing);
+            st.status.last_error = None;
+            st.status.error_hint = None;
+            self.sh.publish(&mut st);
+            Ok((link, gen, op, build, name))
+        })();
+        let (link, gen, op, build, name) = match reservation {
+            Ok(r) => r,
+            Err(e) => return once.call(Err(e)),
+        };
+        let sh = self.sh.clone();
+        let o = once.clone();
+        let cancel = self.cancel_token();
+        let spawned = std::thread::Builder::new()
+            .name("host-ring-upgrade".into())
+            .spawn(move || {
+                let result = (|| {
+                    check_upgrade(&sh, op, gen, &cancel)?;
+                    {
+                        let mut st = sh.lock();
+                        if st.upgrade_operation == Some(op) {
+                            st.status.phase = Some(Phase::Installing);
+                            sh.publish(&mut st);
+                        }
+                    }
+                    crate::stage::stage_over_link(
+                        &link,
+                        &*sh.mc.binaries,
+                        &sh.mc.desktop_version,
+                        &build,
+                        &cancel,
+                        &|| check_upgrade(&sh, op, gen, &cancel),
+                    )
+                    .map_err(|e| match e {
+                        crate::stage::StageError::NoBuild { target, detail } => {
+                            eprintln!("xshell: host {name}: no build for {target}: {detail}");
+                            HostError::offline(RING_NO_BUILD)
+                        }
+                        crate::stage::StageError::Failed(e) => e,
+                    })?;
+                    check_upgrade(&sh, op, gen, &cancel)?;
+                    {
+                        let mut st = sh.lock();
+                        if st.upgrade_operation == Some(op) {
+                            st.status.phase = Some(Phase::Preparing);
+                            sh.publish(&mut st);
+                        }
+                    }
+                    request_upgrade(&sh, &link, op, gen, true, o.clone());
+                    Ok(())
+                })();
+                match result {
+                    Err(e) => {
+                        finish_upgrade(&sh, op, Some(&e));
+                        o.call(Err(e));
+                    }
+                    Ok(()) => wait_upgrade_completion(&sh, op, &cancel),
+                }
+            });
+        if spawned.is_err() {
+            let e = HostError::offline("cannot start the upgrade");
+            finish_upgrade(&self.sh, op, Some(&e));
+            once.call(Err(e));
+        }
+    }
+
     /// The generation of the newest link: it grows with each connection attempt.
     pub fn link_generation(&self) -> u64 {
         self.sh.lock().gen
@@ -2374,7 +2580,13 @@ pub(crate) fn expire_upgrade(sh: &Shared, st: &mut State) {
         st.upgrade_deadline = None;
         st.upgrade_complete_deadline = None;
         st.status.phase = None;
-        st.status.last_error = Some("This Host did not reconnect with this Desktop’s build. Check that xshell is still open there, then reconnect.".into());
+        st.status.last_error = Some(if matches!(st.cfg.route, HostRoute::Relay(_)) {
+            // COPY-GAP: no approved text for a Ring Host that did not come back in time;
+            // nearest approved string `update.offline`.
+            ring_offline(&st.cfg.name)
+        } else {
+            "This Host did not reconnect with this Desktop’s build. Check that xshell is still open there, then reconnect.".into()
+        });
         st.status.error_hint = Some(crate::HostErrorHint::UpdateFailed);
         sh.publish(st);
     }
@@ -2428,10 +2640,10 @@ fn request_upgrade(
     link: &Arc<Link>,
     op: u64,
     original_gen: u64,
-    windows: bool,
+    selected: bool,
     once: Arc<Once<Reply>>,
 ) {
-    let msg = if windows {
+    let msg = if selected {
         let Some(build) = sh.mc.desktop_build.clone() else {
             let e = HostError::offline("this Desktop's exact build is unknown");
             finish_upgrade(sh, op, Some(&e));

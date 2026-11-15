@@ -55,7 +55,9 @@ pub enum UpdateUnavailable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteUpdateUnavailable {
-    RelayOnly,
+    /// A Ring Host whose xshell cannot take an update over the Ring (no `daemon.stage`,
+    /// or no common protocol): update xshell on that machine itself (`install.sh`).
+    RingUpdateUnsupported,
     IdentityBoundAlias,
 }
 

@@ -9,7 +9,9 @@ use crate::handle::Shared;
 use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name, selected_remote};
 use crate::link::{Link, LinkError};
 use crate::process::run_script;
-use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind, UpdateUnavailable};
+use crate::status::{
+    now_ms, IncompatibleReason, Phase, RouteUpdateUnavailable, StatusKind, UpdateUnavailable,
+};
 use crate::transport::{connect_command, sh_wrap, Transport};
 use crate::version::{self, classify, Classified};
 use std::sync::atomic::Ordering;
@@ -100,10 +102,14 @@ struct Sup {
     backoff: Backoff,
     install_verified: bool,
     last_gen: u64,
+    /// A Ring Host reached through the Relay: updated over its link when its Daemon offers
+    /// `daemon.stage` (S4).
+    relay: bool,
 }
 
 pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let cfg = sh.lock().cfg.clone();
+    let relay = matches!(cfg.route, crate::config::HostRoute::Relay(_));
     let (transport, dialer, managed, scripted, override_) = match &cfg.route {
         crate::config::HostRoute::Relay(d) => (
             None,
@@ -146,6 +152,7 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
         backoff: Backoff::default(),
         install_verified: false,
         last_gen: 0,
+        relay,
     };
     s.run();
 }
@@ -516,8 +523,18 @@ impl Sup {
             link.close();
             return Attempt::Cancelled;
         }
-        let upgradable = self.upgradable();
+        let ring_stage = self.relay
+            && hello
+                .capabilities
+                .iter()
+                .any(|c| c == xshell_protocol::cap::DAEMON_STAGE);
+        let upgradable = self.upgradable() || ring_stage;
         let ours_build = mc.desktop_build.as_ref();
+        // A Ring Host that differs from this Desktop and cannot take an update over the Ring
+        // shows how to update it there instead (S4).
+        let ring_unsupported = self.relay
+            && !ring_stage
+            && version::update_eligible(&version, ours_build, &hello.version, hello.build.as_ref());
         let (negotiated, upgrade_pending, build_differs) =
             match classify(&version, ours_build, mc.ours, &hello, upgradable) {
                 Classified::Compatible {
@@ -529,6 +546,11 @@ impl Sup {
                     let mut st = self.sh.lock();
                     st.status.update_unavailable =
                         UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                    if self.relay {
+                        // No common protocol: not over the Ring either.
+                        st.status.route_update_unavailable =
+                            Some(RouteUpdateUnavailable::RingUpdateUnsupported);
+                    }
                     drop(st);
                     link.close();
                     return Attempt::Failed(Failure {
@@ -551,6 +573,7 @@ impl Sup {
                 reinstall: false,
             });
         }
+        let relay = self.relay;
         let adopted = self.sh.adopt(gen, &link, |st| {
             // After an upgrade or a replacement (R7, C4): the Daemon must be this Desktop's
             // version and build. Another Desktop's connector may have won the restart.
@@ -569,6 +592,10 @@ impl Sup {
             });
             st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
             st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+            if relay {
+                st.status.route_update_unavailable =
+                    ring_unsupported.then_some(RouteUpdateUnavailable::RingUpdateUnsupported);
+            }
             st.status.daemon_version = Some(hello.version.clone());
             st.status.daemon_build = hello.build.clone();
             st.status.protocol = Some(negotiated);
@@ -617,6 +644,9 @@ impl Sup {
                 reinstall: false,
             });
         };
+        if ring_stage {
+            self.check_rolled_back(&link, gen, &hello);
+        }
         Attempt::Connected(Connected {
             link,
             conn,
@@ -626,6 +656,50 @@ impl Sup {
         })
     }
 
+    /// After this Desktop updated a Ring Host and another build came back: ask the Daemon
+    /// whether that update was rolled back, and say so (S4, copy `update.rolledBack`).
+    fn check_rolled_back(&self, link: &Arc<Link>, gen: u64, hello: &xshell_protocol::msg::Hello) {
+        const ASK_FOR: Duration = Duration::from_secs(15 * 60);
+        let theirs = xshell_protocol::build::install_dir_name(&hello.version, hello.build.as_ref());
+        let dir = {
+            let mut st = self.sh.lock();
+            match st.ring_update.clone() {
+                Some((_, at)) if at.elapsed() > ASK_FOR => {
+                    st.ring_update = None;
+                    return;
+                }
+                Some((dir, _)) if dir != theirs => dir,
+                _ => return,
+            }
+        };
+        let weak = Arc::downgrade(&self.sh);
+        let old = hello.version.clone();
+        let _ = link.request(
+            xshell_protocol::msg::ClientMsg::DaemonUpdateInfo,
+            self.sh.mc.term_timeout,
+            Box::new(move |r| {
+                let Some(sh) = weak.upgrade() else { return };
+                let Ok(info) = r.and_then(|v| {
+                    serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(v)
+                        .map_err(|e| crate::errors::HostError::offline(e.to_string()))
+                }) else {
+                    return;
+                };
+                if !info.last_failure.is_some_and(|f| f.target == dir) {
+                    return;
+                }
+                let mut st = sh.lock();
+                if st.gen != gen || st.upgrading {
+                    return;
+                }
+                st.ring_update = None;
+                st.status.last_error = Some(crate::handle::ring_rolled_back(&st.cfg.name, &old));
+                st.status.error_hint = Some(HostErrorHint::UpdateFailed);
+                sh.publish(&mut st);
+            }),
+        );
+    }
+
     fn link_failure(&self, conn: &dyn Connection, e: LinkError) -> Failure {
         match e {
             LinkError::Incompatible { hello, message } => {
@@ -633,6 +707,10 @@ impl Sup {
                     let mut st = self.sh.lock();
                     st.status.update_unavailable =
                         UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                    if self.relay {
+                        st.status.route_update_unavailable =
+                            Some(RouteUpdateUnavailable::RingUpdateUnsupported);
+                    }
                 }
                 let reason = match version::classify(
                     &self.sh.mc.desktop_version,
@@ -701,6 +779,7 @@ mod tests {
             backoff: Backoff::default(),
             install_verified: true,
             last_gen: 0,
+            relay: false,
         };
         {
             let mut st = sh.lock();

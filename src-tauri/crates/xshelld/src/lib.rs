@@ -278,7 +278,7 @@ fn fail_restore_for_tests() -> bool {
         && std::env::var("XSHELLD_TEST_FAIL_RESTORE").is_ok_and(|d| d == upgrade::own_dir())
 }
 
-/// Test hook, debug builds only (a release build ignores it): the Windows reply probes
+/// Test hooks, debug builds only (a release build ignores them): the Windows reply probes
 /// (`tests/windows_submit.rs`) let this Daemon take replies without offering
 /// `term.submit` (`XSHELLD_TEST_SUBMIT=1`, before the build gate allows it), and write them
 /// in pieces of at most `XSHELLD_TEST_SUBMIT_PIECE` bytes, refused once
@@ -286,6 +286,11 @@ fn fail_restore_for_tests() -> bool {
 fn submit_probe(cfg: &mut server::Config) {
     if !cfg!(debug_assertions) {
         return;
+    }
+    // `XSHELLD_TEST_HIDE_CAPABILITIES=a,b`: hello does not offer these (a Daemon of an
+    // older build, as far as a Desktop can tell).
+    if let Ok(v) = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES") {
+        cfg.hide_capabilities = v.split(',').map(str::to_string).collect();
     }
     let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     if std::env::var_os("XSHELLD_TEST_SUBMIT").as_deref() == Some("1".as_ref()) {

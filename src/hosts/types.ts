@@ -66,7 +66,9 @@ export interface HostStatus {
   linkGeneration?: number;
   updateAction?: "update" | "replace" | null;
   updateUnavailable?: "windows-owner" | "desktop-owned" | null;
-  routeUpdateUnavailable?: "relay-only" | "identity-bound-alias" | null;
+  // "ring-update-unsupported": a Ring Host whose xshell cannot take an update over the Ring
+  // (no `daemon.stage`, or no common protocol); it is updated with the install command there.
+  routeUpdateUnavailable?: "ring-update-unsupported" | "identity-bound-alias" | null;
   arch: string | null;
   incompatibleReason: "daemon-older" | "daemon-newer" | null;
   nextRetryAt: number | null; // ms epoch

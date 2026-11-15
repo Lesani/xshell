@@ -17,8 +17,9 @@ describe("shared Host update action", () => {
     expect(render()).toContain("Use this Desktop’s build");
   });
   it("shows backend preparation, waiting and failure rather than treating an invocation as completion", () => {
-    expect(render({ phase: "preparing" })).toContain("Preparing this Desktop’s build");
-    expect(render({ phase: "upgrading" })).toContain("Waiting for its Daemon to reconnect");
+    expect(render({ phase: "preparing" })).toContain("Sending update…");
+    expect(render({ phase: "installing" })).toContain("Sending update…");
+    expect(render({ phase: "upgrading" })).toContain("Restarting…");
     expect(render({ lastError: "stage failed", errorHint: "update-failed" })).toContain("stage failed");
     expect(render({ status: "offline", phase: null, lastError: "deadline reached", errorHint: "update-failed" })).toContain("deadline reached");
   });
@@ -72,9 +73,23 @@ describe("shared Host update action", () => {
 
 });
 
-it("keeps Relay transport limits and Desktop-owner diagnosis independently visible with no build action", () => {
-  const html = render({ routeUpdateUnavailable: "relay-only", updateUnavailable: "desktop-owned", updateAction: null });
-  expect(html).toContain("Relay access cannot install or update");
+it("keeps the Ring limitation and Desktop-owner diagnosis independently visible with no build action", () => {
+  const html = render({ routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", updateAction: null });
   expect(html).toContain("Desktop there manages this Daemon");
   expect(html).not.toContain("<button");
+});
+
+it("shows how to update a Ring machine whose xshell cannot take an update over the Ring", async () => {
+  vi.mocked(invoke).mockImplementation(async command => command === "host_install_command" ? "curl -fsSL https://github.com/Lesani/xshell/releases/download/v1.5.0/install.sh | sh" : null);
+  const { fetchInstallCommand } = await import("./HostUpdateAction");
+  expect(await fetchInstallCommand()).toContain("/install.sh | sh");
+  const html = render({ os: null, routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: null, updateAction: null, status: "upgrade-pending" });
+  expect(html).toContain("This xshell cannot update this type of machine. Update xshell directly on that machine.");
+  expect(html).not.toContain("Use this Desktop");
+});
+
+it("offers Retry after a failed update and shows the backend's rollback text", () => {
+  const html = render({ status: "upgrade-pending", updateAction: "update", daemonVersion: "1.4.0", lastError: "The update failed. Windows fixture is back on version 1.4.0. Try again.", errorHint: "update-failed" });
+  expect(html).toContain("Retry");
+  expect(html).toContain("back on version 1.4.0");
 });

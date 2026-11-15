@@ -100,8 +100,22 @@ impl BinarySource for DesktopBinarySource {
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 
+/// Where builds are published (D8: pre-releases on `Lesani/xshell` for now).
 pub fn release_repo() -> &'static str {
-    option_env!("XSHELL_RELEASE_REPO").unwrap_or("MertPROJ/xshell")
+    option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
+}
+
+/// The one command that installs (or updates) xshell on a machine without a window: the
+/// release's `install.sh`, which verifies the download before it runs anything (ADR-0019).
+pub fn install_command(version: &str) -> String {
+    install_command_for(release_repo(), version)
+}
+
+pub fn install_command_for(repo: &str, version: &str) -> String {
+    format!(
+        "curl -fsSL {}/v{version}/install.sh | sh",
+        release_base(repo)
+    )
 }
 
 pub fn release_base(repo: &str) -> String {
@@ -509,6 +523,22 @@ mod tests {
             sha256_url(&base, "1.5.0", "x86_64-unknown-linux-musl"),
             "https://github.com/MertPROJ/xshell/releases/download/v1.5.0/xshelld-x86_64-unknown-linux-musl.sha256"
         );
+    }
+
+    #[test]
+    fn install_command_uses_release_repo() {
+        assert_eq!(
+            release_repo(),
+            option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
+        );
+        assert_eq!(
+            install_command_for("Lesani/xshell", "1.6.0-rjw.2"),
+            "curl -fsSL https://github.com/Lesani/xshell/releases/download/v1.6.0-rjw.2/install.sh | sh"
+        );
+        assert!(install_command("1.6.0").contains(&format!(
+            "/{}/releases/download/v1.6.0/install.sh",
+            release_repo()
+        )));
     }
 
     #[test]

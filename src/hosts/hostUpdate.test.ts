@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { activeUpdateHost, HostUpdates, updateAction } from "./hostUpdate";
+import { activeUpdateHost, HostUpdates, skipReason, updateAction } from "./hostUpdate";
 import type { HostStatus, HostConfig } from "./types";
 import type { LayoutNode } from "../types";
 
@@ -105,11 +105,102 @@ describe("Host update targeting and eligibility", () => {
 
 it("route limitation blocks updates independently of Desktop/Windows ownership, leaving a real SSH control eligible", () => {
   const eligible = { status: "build-differs", updateAction: "replace", phase: null } as HostStatus;
-  for (const routeUpdateUnavailable of ["relay-only", "identity-bound-alias"] as const) {
+  for (const routeUpdateUnavailable of ["ring-update-unsupported", "identity-bound-alias"] as const) {
     expect(updateAction({ ...eligible, routeUpdateUnavailable })).toBeNull();
     for (const updateUnavailable of ["desktop-owned", "windows-owner"] as const) {
       expect(updateAction({ ...eligible, routeUpdateUnavailable, updateUnavailable })).toBeNull();
     }
   }
   expect(updateAction(eligible)).toBe("replace");
+});
+
+describe("Update all", () => {
+  const build = { commit: "85ee920a1b2c", dirty: null, time: 7 };
+  const a = { id: "r_a", name: "box-a" };
+  const b = { id: "r_b", name: "box-b" };
+  const c = { id: "r_c", name: "box-c" };
+  const older = (id: string, gen = 3): HostStatus => status({ host: id, desktopBuild: build, linkGeneration: gen });
+  const healthy = (id: string, gen: number): HostStatus => status({ host: id, status: "connected", updateAction: null, daemonVersion: "1.5.0", daemonBuild: build, desktopBuild: build, linkGeneration: gen });
+
+  function fixture(initial: Record<string, HostStatus>, settleMs = 1000) {
+    const statuses: Record<string, HostStatus> = { ...initial };
+    const listeners = new Set<() => void>();
+    const push = (s: HostStatus) => { statuses[s.host] = s; for (const l of [...listeners]) l(); };
+    const calls: string[] = [];
+    const replies = new Map<string, () => Promise<unknown>>();
+    const invoke = vi.fn(async (_cmd: string, args?: { host: string }) => { calls.push(args!.host); return (replies.get(args!.host) ?? (async () => null))(); });
+    const updates = new HostUpdates(invoke as never, id => statuses[id], l => { listeners.add(l); return () => { listeners.delete(l); }; }, settleMs);
+    return { updates, push, calls, replies, statuses };
+  }
+
+  it("lists what it leaves out and why", () => {
+    expect(skipReason(older("x"))).toBeNull();
+    expect(skipReason(healthy("x", 4))).toBe("current");
+    expect(skipReason(status({ status: "offline" }))).toBe("offline");
+    expect(skipReason(undefined)).toBe("offline");
+    expect(skipReason(status({ routeUpdateUnavailable: "ring-update-unsupported", updateAction: null }))).toBe("unsupported");
+    expect(skipReason(status({ phase: "upgrading" }))).toBe("busy");
+  });
+
+  it("updates one machine after another and reports each", async () => {
+    const f = fixture({ r_a: older("r_a"), r_b: older("r_b"), r_c: healthy("r_c", 9) });
+    // a comes back with this Desktop's build; b's update is rolled back.
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4)), 10); return null; });
+    f.replies.set("r_b", async () => {
+      setTimeout(() => {
+        f.push({ ...older("r_b"), phase: "upgrading" });
+        f.push({ ...older("r_b", 4), phase: null, lastError: "The update failed. box-b is back on version 1.4.0. Try again.", errorHint: "update-failed" });
+      }, 10);
+      return null;
+    });
+    f.updates.askAll([a, b, c].map(h => ({ host: h, status: f.statuses[h.id] })));
+    const run = f.updates.getSnapshot().all!;
+    expect(run.queue.map(q => q.host.id)).toEqual(["r_a", "r_b"]);
+    expect(run.skipped).toEqual([{ host: c, outcome: "skipped", reason: "current" }]);
+    expect(f.calls).toEqual([]);
+    const order: string[] = [];
+    f.updates.subscribe(() => { const cur = f.updates.getSnapshot().all?.current?.id; if (cur && order[order.length - 1] !== cur) order.push(cur); });
+    await f.updates.confirmAll();
+    expect(order).toEqual(["r_a", "r_b"]);
+    expect(f.calls).toEqual(["r_a", "r_b"]);
+    const done = f.updates.getSnapshot().all!;
+    expect(done.done).toBe(true);
+    expect(done.results).toEqual([
+      { host: a, outcome: "ok", version: "1.5.0" },
+      { host: b, outcome: "failed", error: "The update failed. box-b is back on version 1.4.0. Try again." },
+    ]);
+  });
+
+  it("stops waiting for a machine at the time limit and goes on with the next", async () => {
+    const f = fixture({ r_a: older("r_a"), r_b: older("r_b") }, 50);
+    f.replies.set("r_b", async () => { setTimeout(() => f.push(healthy("r_b", 4)), 5); return null; });
+    f.updates.askAll([a, b].map(h => ({ host: h, status: f.statuses[h.id] })));
+    await f.updates.confirmAll();
+    const r = f.updates.getSnapshot().all!.results;
+    expect(r[0]).toEqual({ host: a, outcome: "failed", error: "box-a is offline. Try updating it when it is online." });
+    expect(r[1]).toEqual({ host: b, outcome: "ok", version: "1.5.0" });
+  });
+
+  it("a refused update is that machine's failure; an older update error does not count", async () => {
+    const f = fixture({ r_a: { ...older("r_a"), lastError: "old failure", errorHint: "update-failed" }, r_b: older("r_b") });
+    f.replies.set("r_a", async () => { throw { message: "not online" }; });
+    f.replies.set("r_b", async () => { setTimeout(() => f.push(healthy("r_b", 4)), 5); return null; });
+    f.updates.askAll([a, b].map(h => ({ host: h, status: f.statuses[h.id] })));
+    await f.updates.confirmAll();
+    expect(f.updates.getSnapshot().all!.results).toEqual([
+      { host: a, outcome: "failed", error: "not online" },
+      { host: b, outcome: "ok", version: "1.5.0" },
+    ]);
+  });
+
+  it("does nothing without an eligible machine, and cancel starts nothing", async () => {
+    const f = fixture({ r_c: healthy("r_c", 2) });
+    f.updates.askAll([{ host: c, status: f.statuses.r_c }]);
+    expect(f.updates.getSnapshot().all).toBeNull();
+    const g = fixture({ r_a: older("r_a") });
+    g.updates.askAll([{ host: a, status: g.statuses.r_a }]);
+    g.updates.cancelAll();
+    expect(g.updates.getSnapshot().all).toBeNull();
+    expect(g.calls).toEqual([]);
+  });
 });
