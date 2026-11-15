@@ -272,6 +272,13 @@ type SpawnReply = mpsc::Sender<io::Result<Child>>;
 /// See [`LocalDaemon::set_prepare`].
 pub type PrepareHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+/// See [`LocalDaemon::set_blocker`].
+pub type BlockerHook = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The start error (and its prefix, the UI's `older-desktop` kind) while an older xshell
+/// window runs this computer's terminals.
+pub const OLDER_DESKTOP: &str = "older-desktop: another xshell window of an older version runs this computer's terminals. Close the other xshell window first, then retry.";
+
 /// What [`LocalDaemon`] needs to know about this machine.
 pub struct LocalDaemonConfig {
     /// The app's `xshelld` (the sidecar).
@@ -315,6 +322,9 @@ pub struct LocalDaemon {
     /// Runs once when nothing listens, before anything is spawned (the Desktop installs its
     /// embedded `xshelld` here and waits briefly for the service). An error is the start error.
     prepare: Mutex<Option<PrepareHook>>,
+    /// Asked before starting a Daemon when nothing listens: `Some(reason)` refuses the start
+    /// (an older xshell window still runs and would start its own GUI-bound Daemon).
+    blocker: Mutex<Option<BlockerHook>>,
     /// Registration starts the normal `serve` rather than the registration helper child.
     serve_first: AtomicBool,
     /// Why the last start failed; cleared by a connection.
@@ -363,6 +373,7 @@ impl LocalDaemon {
             #[cfg(unix)]
             registration_child: Mutex::new(None),
             prepare: Mutex::new(None),
+            blocker: Mutex::new(None),
             serve_first: AtomicBool::new(false),
             start_error: Mutex::new(None),
             #[cfg(windows)]
@@ -393,6 +404,11 @@ impl LocalDaemon {
     /// Run `hook` when nothing listens, before spawning (see [`PrepareHook`]).
     pub fn set_prepare(&self, hook: PrepareHook) {
         *self.prepare.lock().unwrap() = Some(hook);
+    }
+
+    /// Ask `hook` before starting a Daemon when nothing listens (see [`BlockerHook`]).
+    pub fn set_blocker(&self, hook: BlockerHook) {
+        *self.blocker.lock().unwrap() = Some(hook);
     }
 
     /// Registration starts the normal `serve` first (ADR-0017), never the helper child.
@@ -461,6 +477,12 @@ impl LocalDaemon {
     pub fn connect_or_start(&self, cancel: &CancelToken) -> Result<LocalStream, DialError> {
         if let Some(s) = self.try_connect(cancel)? {
             return Ok(s);
+        }
+        // An older xshell window still runs (its GUI-bound Daemon not started yet, or between
+        // two of them): starting ours now would take the machine from under it (A10).
+        let blocker = self.blocker.lock().unwrap().clone();
+        if let Some(reason) = blocker.and_then(|b| b()) {
+            return Err(self.fail_start(reason));
         }
         let prepare = self.prepare.lock().unwrap().clone();
         if let Some(p) = prepare {
@@ -562,11 +584,7 @@ impl LocalDaemon {
     fn accept(&self, s: LocalStream) -> Result<LocalStream, DialError> {
         if self.foreign_gui_bound() {
             drop(s);
-            return Err(self.fail_start(
-                "older-desktop: another xshell window of an older version runs this \
-                 computer's terminals. Close the other xshell window first, then retry."
-                    .into(),
-            ));
+            return Err(self.fail_start(OLDER_DESKTOP.into()));
         }
         self.clear_start_error();
         Ok(s)
@@ -2549,6 +2567,44 @@ while True:\n    conns.append(s.accept()[0])\n";
         use std::os::unix::fs::PermissionsExt;
         let m = std::fs::metadata(&mode).unwrap().permissions().mode();
         assert_eq!(m & 0o777, 0o600);
+        if let Some(pid) = d.daemon.pid() {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    /// An older Desktop that still runs without a listening Daemon blocks the start (A10);
+    /// once it is gone, the same Daemon setup starts its Daemon.
+    #[test]
+    fn blocker_refuses_the_start_until_it_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exec sleep 30");
+        d.daemon.set_persistent(true);
+        let older = Arc::new(AtomicBool::new(true));
+        let o = older.clone();
+        d.daemon.set_blocker(Arc::new(move || {
+            o.load(Ordering::SeqCst).then(|| OLDER_DESKTOP.to_string())
+        }));
+        let r = d.dial(&CancelToken::new()).map(|_| ());
+        assert!(
+            matches!(&r, Err(e) if format!("{e:?}").contains("Close the other xshell window first")),
+            "{r:?}"
+        );
+        assert!(d
+            .daemon
+            .start_error()
+            .is_some_and(|e| e.starts_with("older-desktop:")));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            starts(dir.path()).is_empty(),
+            "started despite the older window"
+        );
+        older.store(false, Ordering::SeqCst);
+        let r = d.dial(&cancel_after(500)).map(|_| ());
+        assert!(matches!(r, Err(DialError::Cancelled)), "{r:?}");
+        assert_eq!(
+            wait_starts(dir.path(), 1),
+            vec!["serve --interactive-env".to_string()]
+        );
         if let Some(pid) = d.daemon.pid() {
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }

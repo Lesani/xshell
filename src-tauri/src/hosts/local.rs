@@ -168,6 +168,36 @@ pub fn error_kind(error: Option<&str>) -> Option<&'static str> {
         .map(|_| "older-desktop")
 }
 
+/// Whether the Local Host's Daemon is an older or other build that this Desktop moves the
+/// machine off by itself (Unix, ADR-0017): a Daemon of another build of this version
+/// (`build-differs`), of an older version (`upgrade-pending`, or incompatible as older). Its
+/// running Terminals are restored by the new Daemon, as on any update. Not while an update
+/// already runs.
+pub fn auto_replace_wanted(
+    st: &xshell_hostlink::HostStatus,
+    own_version: &str,
+    own_build: Option<&xshell_protocol::build::BuildId>,
+) -> bool {
+    use xshell_hostlink::StatusKind;
+    if st.host != xshell_hostlink::LOCAL_HOST_ID || st.phase.is_some() {
+        return false;
+    }
+    let other = match st.status {
+        StatusKind::BuildDiffers | StatusKind::UpgradePending => true,
+        StatusKind::Incompatible => matches!(
+            st.incompatible_reason,
+            Some(xshell_hostlink::status::IncompatibleReason::DaemonOlder)
+        ),
+        _ => false,
+    };
+    let same = st.daemon_version.as_deref() == Some(own_version)
+        && match (&st.daemon_build, own_build) {
+            (Some(d), Some(o)) => d.same(o),
+            _ => false,
+        };
+    other && !same
+}
+
 /// The `settings.json` key of the quit prompt's setting.
 pub const KEEP_SESSIONS_KEY: &str = "local_keep_sessions";
 
@@ -744,6 +774,52 @@ mod tests {
             daemon_state(None, Some(&st), false),
             ("failed", Some("hello refused".into()))
         );
+    }
+
+    #[test]
+    fn auto_replace_only_for_an_older_or_other_local_build() {
+        use xshell_hostlink::{HostStatus, StatusKind};
+        let own = xshell_protocol::build::BuildId {
+            commit: "81badb2ccf31".into(),
+            dirty: None,
+            time: 2,
+        };
+        let old = xshell_protocol::build::BuildId {
+            commit: "42c9be9636a9".into(),
+            dirty: None,
+            time: 1,
+        };
+        let mut st = HostStatus::initial("local", "1.5.0", Some(own.clone()), 1);
+        st.daemon_version = Some("1.5.0".into());
+        st.daemon_build = Some(old.clone());
+        st.set_kind(StatusKind::BuildDiffers);
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.set_kind(StatusKind::UpgradePending);
+        st.daemon_version = Some("1.4.0".into());
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.set_kind(StatusKind::Incompatible);
+        st.incompatible_reason = Some(xshell_hostlink::status::IncompatibleReason::DaemonOlder);
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.incompatible_reason = Some(xshell_hostlink::status::IncompatibleReason::DaemonNewer);
+        assert!(
+            !auto_replace_wanted(&st, "1.5.0", Some(&own)),
+            "a newer Daemon is left"
+        );
+        // Our own build, an update already running, a connected Daemon, another Host: no.
+        st.set_kind(StatusKind::BuildDiffers);
+        st.daemon_version = Some("1.5.0".into());
+        st.daemon_build = Some(own.clone());
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.daemon_build = Some(old.clone());
+        st.phase = Some(xshell_hostlink::Phase::Preparing);
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.phase = None;
+        st.set_kind(StatusKind::Connected);
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        let mut remote = HostStatus::initial("h1", "1.5.0", Some(own.clone()), 1);
+        remote.daemon_build = Some(old);
+        remote.set_kind(StatusKind::BuildDiffers);
+        assert!(!auto_replace_wanted(&remote, "1.5.0", Some(&own)));
     }
 
     #[test]
