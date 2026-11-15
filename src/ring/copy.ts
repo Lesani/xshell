@@ -91,6 +91,15 @@ export const C = {
   "quit.more.title": "More terminals started",
   "quit.more.one": "1 more terminal started. Stop it too?",
   "quit.more.other": "{n} more terminals started. Stop them too?",
+  // plans/copy-rjw-windows.md (binding): closing the Windows window that runs this machine's
+  // terminals.
+  "quit.close.title.one": "Close 1 terminal on this machine?",
+  "quit.close.title.other": "Close {n} terminals on this machine?",
+  "quit.close.title.unknown": "Close any terminals running on this machine?",
+  "quit.close.body": "These terminals will end for every device because xshell on Windows cannot yet keep them running after it closes.",
+  "quit.close.body.unknown": "Any terminals running on this machine will end for every device because xshell on Windows cannot yet keep them running after it closes.",
+  "quit.close.confirm": "Close xshell",
+  "update.app.manual": "To update xshell, close it and run the install command from {url} again.",
   "local.failed.title": "Can't start terminals on this machine",
   "local.failed.body": "xshell couldn't start the background process for terminals. Check the log at {path}, then try again.",
   "local.retry": "Retry",
@@ -152,7 +161,6 @@ export const C = {
   "ring.relay.help": "Advanced: use your own Relay instead of the hosted Relay. Choose its address before creating your Ring.",
   // plans/review-rjw-s3-sol.md §C (binding).
   "finish.notAdded": "This machine wasn't added to your Ring. Create a Ring or get new words to join your other devices.",
-  "ring.unsupported": "Creating or joining a Ring is not available on this platform yet.",
   "mobile.local.tooOld": "Update xshell on this machine, then reopen it to set up your Ring.",
   "mobile.problem.unreadable": "Couldn't read your Ring settings. Check that xshell can read its settings files, then reopen it.",
   "mobile.pair.err.notApprover": "This machine can't add phones. Use another machine already in your Ring.",

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 
 const REPO = "MertPROJ/xshell";
@@ -22,6 +23,9 @@ export interface UpdateInfo {
   update: Update | null;
   loading: boolean;
   error: string | null;
+  // This build does not update itself (a fork build: `app_updates_enabled` is false). Nothing is
+  // checked; Settings → About says how to update by hand.
+  disabled: boolean;
   refresh: () => void;
 }
 
@@ -29,13 +33,15 @@ export interface UpdateInfo {
 // and the same Update object is what `useInstaller` calls `downloadAndInstall()` on. We *also*
 // fetch the GitHub Releases list, but only to populate the multi-release changelog in
 // Settings → About. That secondary call is best-effort: a failure there doesn't block the
-// badge or the install button.
+// badge or the install button. A build whose updater is off (`app_updates_enabled` false) checks
+// nothing: the inherited updater would move a fork build to an upstream release.
 export function useUpdateCheck(): UpdateInfo {
   const [currentVersion, setCurrentVersion] = useState("");
   const [update, setUpdate] = useState<Update | null>(null);
   const [releases, setReleases] = useState<ReleaseEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [disabled, setDisabled] = useState(false);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -47,6 +53,14 @@ export function useUpdateCheck(): UpdateInfo {
         const cv = await getVersion();
         if (cancelled) return;
         setCurrentVersion(cv);
+        // Only an explicit `false` turns it off (an older backend has no such command).
+        const enabled = await invoke<boolean>("app_updates_enabled").catch(() => true);
+        if (cancelled) return;
+        if (enabled === false) {
+          setDisabled(true);
+          setUpdate(null);
+          return;
+        }
         const u = await check();
         if (cancelled) return;
         setUpdate(u);
@@ -55,6 +69,7 @@ export function useUpdateCheck(): UpdateInfo {
       } finally {
         if (!cancelled) setLoading(false);
       }
+      if (cancelled) return;
       try {
         const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, { headers: { Accept: "application/vnd.github+json" } });
         if (!res.ok) return;
@@ -81,5 +96,5 @@ export function useUpdateCheck(): UpdateInfo {
   const releaseNotes = update?.body ?? fromChangelog?.notes ?? null;
   const publishedAt = update?.date ?? fromChangelog?.publishedAt ?? null;
   const updateAvailable = update !== null;
-  return { currentVersion, latestVersion, updateAvailable, releaseUrl, releaseNotes, publishedAt, releases, update, loading, error, refresh };
+  return { currentVersion, latestVersion, updateAvailable, releaseUrl, releaseNotes, publishedAt, releases, update, loading, error, disabled, refresh };
 }

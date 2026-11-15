@@ -118,8 +118,7 @@ function RingSetupView({ variant, initial, visible = true, onClose, onDone, ring
   const status = r.status;
   const { notAdded, clear: clearNotAdded } = useNotAdded(status);
   const follower = status?.connection === "other-window" || r.overview?.owner === false;
-  const platform = r.overview?.unavailable === "platform";
-  const blocked = !status || status.busy || !r.relayReady || follower || platform || status.problem === "unreadable";
+  const blocked = !status || status.busy || !r.relayReady || follower || status.problem === "unreadable";
 
   const create = useCallback(async () => {
     if (inflight.current || blocked || !canStart(stRef.current)) return;

@@ -64,7 +64,6 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
   const follower = s.connection === "other-window" || r.overview?.owner === false;
   const problem = problemLine(s);
   const local = localLine(s);
-  const platform = r.overview?.unavailable === "platform";
   const p: Pairing = { events: r.pairing, startPhone: r.startPhone, cancelPhone: r.cancelPhone };
   const conn = connectionLine(s);
   const quota = quotaLine(s, Date.now());
@@ -103,7 +102,7 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
                 <div className="host-row-note">{C["removed.body"]}</div>
                 {!follower && (
                   <div className="host-row-actions">
-                    <button className="btn btn-primary settings-action-btn" data-ring-join-again disabled={s.busy || platform} onClick={() => onOpenRingSetup("join")}>{C["removed.action"]}</button>
+                    <button className="btn btn-primary settings-action-btn" data-ring-join-again disabled={s.busy} onClick={() => onOpenRingSetup("join")}>{C["removed.action"]}</button>
                   </div>
                 )}
               </div>
@@ -118,9 +117,8 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
             {follower ? <div className="host-row-note">{C["ring.follower"]}</div> : (
               <>
                 <div className="host-row-actions">
-                  <button className="btn btn-primary settings-action-btn" data-ring-setup-open disabled={platform || s.problem === "unreadable"} onClick={() => onOpenRingSetup()}>{C["first.settings"]}</button>
+                  <button className="btn btn-primary settings-action-btn" data-ring-setup-open disabled={s.problem === "unreadable"} onClick={() => onOpenRingSetup()}>{C["first.settings"]}</button>
                 </div>
-                {platform && <div className="host-row-note host-row-warn">{C["ring.unsupported"]}</div>}
                 <UnpairedRelay chosen={r.chosenRelay} onSave={r.setUnpairedRelay} disabled={!r.relayReady || s.busy} />
               </>
             )}

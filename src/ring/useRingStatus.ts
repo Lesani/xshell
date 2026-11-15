@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { JoinOverview, RingStatus } from "./types";
 
 // What App needs of the Ring: the status (`ring_status`, then every `ring:status`) for the start
-// view and the removal notice, and whether Create/Join exist on this platform at all.
+// view and the removal notice, and whether Create/Join can start yet (the Join overview).
 export function useRingStatus(): { status: RingStatus | null; overview: JoinOverview | null | undefined } {
   const [status, setStatus] = useState<RingStatus | null>(null);
   // undefined while loading; null when it could not be read.

@@ -191,6 +191,7 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(LOCAL_HOST).desktopBuild };
+      case "app_updates_enabled": return true;
       case "list_claude_projects": return [host === hostA.id ? projectA : host === hostB.id ? projectB : localProject];
       case "list_pi_projects":
       case "get_all_recent_sessions":

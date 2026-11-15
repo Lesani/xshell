@@ -17,6 +17,7 @@ const q = (sel: string) => container.querySelector<HTMLElement>(sel);
 const click = async (sel: string) => { await act(async () => { q(sel)!.click(); }); };
 const text = () => container.textContent ?? "";
 const prompt = async (id: string, terminals: number) => { await act(async () => { native.handlers.get("local:quit-prompt")!({ payload: { id, terminals } }); }); };
+const closePrompt = async (id: string, terminals: number | null) => { await act(async () => { native.handlers.get("local:quit-prompt")!({ payload: { id, terminals, kind: "close" } }); }); };
 
 beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -160,6 +161,52 @@ describe("quit prompt", () => {
     await prompt("q3", 1);
     await click("[data-quit-cancel]");
     expect(resolves().map(r => [r.id, r.choice])).toEqual([["q1", "cancel"], ["q2", "cancel"], ["q3", "cancel"]]);
+  });
+
+  describe("close kind (Windows: closing ends this machine's terminals)", () => {
+    it("asks with the count: no Keep, no Stop, no remember checkbox; Cancel has focus", async () => {
+      await closePrompt("q1", 1);
+      expect(q("[data-quit-prompt]")?.getAttribute("data-quit-prompt")).toBe("close");
+      expect(q("#quit-prompt-title")?.textContent).toBe("Close 1 terminal on this machine?");
+      expect(text()).toContain(C["quit.close.body"]);
+      expect(q("[data-quit-keep]")).toBeNull();
+      expect(q("[data-quit-stop]")).toBeNull();
+      expect(q("[data-quit-remember]")).toBeNull();
+      expect(q("[data-quit-close]")?.textContent).toBe("Close xshell");
+      expect(document.activeElement).toBe(q("[data-quit-cancel]"));
+      await closePrompt("q2", 3);
+      expect(q("#quit-prompt-title")?.textContent).toBe("Close 3 terminals on this machine?");
+    });
+
+    it("an unknown count asks without a number", async () => {
+      await closePrompt("q1", null);
+      expect(q("#quit-prompt-title")?.textContent).toBe(C["quit.close.title.unknown"]);
+      expect(text()).toContain(C["quit.close.body.unknown"]);
+      expect(text()).not.toContain("null");
+    });
+
+    it("Close sends choice close (never remember); the dialog goes", async () => {
+      await closePrompt("q1", 2);
+      await click("[data-quit-close]");
+      expect(resolves()).toEqual([{ id: "q1", choice: "close", remember: false }]);
+      expect(q("[role=dialog]")).toBeNull();
+    });
+
+    it("Escape and Cancel send cancel; the window stays", async () => {
+      await closePrompt("q1", 2);
+      await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })); });
+      expect(resolves()).toEqual([{ id: "q1", choice: "cancel", remember: false }]);
+      expect(q("[role=dialog]")).toBeNull();
+      await closePrompt("q2", null);
+      await click("[data-quit-cancel]");
+      expect(resolves().map(r => [r.id, r.choice])).toEqual([["q1", "cancel"], ["q2", "cancel"]]);
+    });
+
+    it("a prompt without a kind is the keep prompt", async () => {
+      await prompt("q1", 2);
+      expect(q("[data-quit-keep]")).not.toBeNull();
+      expect(q("[data-quit-close]")).toBeNull();
+    });
   });
 
   it("a stale prompt closes the dialog (the window stays)", async () => {

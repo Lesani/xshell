@@ -18,9 +18,8 @@ export interface StartInputs {
   oldSeenAt: number | null;
 }
 
-export function startView({ status, local, overview, skipped, oldSeenAt }: StartInputs): StartView | null {
+export function startView({ status, local, skipped, oldSeenAt }: StartInputs): StartView | null {
   if (!status || !status.membership || local === "failed") return null;
-  if (overview?.unavailable === "platform") return null;
   if (status.membership === "member" || status.membership === "finishing") return null;
   if (status.membership === "removed") return "removed";
   if (status.oldRing && status.oldRing.at !== oldSeenAt) return "old";

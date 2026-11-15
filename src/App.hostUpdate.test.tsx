@@ -74,7 +74,7 @@ function expectNotice(host: HostConfig, owned = false) {
   expect.soft(banner()?.textContent ?? "", `${host.name} notice in production App banner`).toContain(host.name);
   if (owned) {
     expect.soft(banner()?.textContent).toContain(`${host.name}: Update available`);
-    expect.soft(banner()?.textContent).toContain(`Update xshell on ${host.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
+    expect.soft(banner()?.textContent).toContain(`Update xshell on ${host.name}. xshell there manages terminals, so this update must be made on that machine.`);
     expect.soft(banner()?.querySelector("button")).toBeNull();
     expect.soft(container.querySelector(".host-confirm-panel")).toBeNull();
   } else expect.soft(banner()?.querySelector("button")?.textContent ?? "", `${host.name} replacement action`).toBe("Use this Desktop’s build");
@@ -121,6 +121,7 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(hostA.id).desktopBuild };
+      case "app_updates_enabled": return true;
       case "list_claude_projects": return [host === hostA.id ? projectA : host === hostB.id ? projectB : localProject];
       case "list_pi_projects":
       case "get_all_recent_sessions":
@@ -209,7 +210,7 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
   expect(hostsTab).toBeDefined();
   await act(async () => { hostsTab!.click(); });
   const row = [...container.querySelectorAll(".host-row")].find(r => r.textContent?.includes(hostA.name));
-  expect.soft(row?.textContent).toContain(`Update xshell on ${hostA.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
+  expect.soft(row?.textContent).toContain(`Update xshell on ${hostA.name}. xshell there manages terminals, so this update must be made on that machine.`);
   expect.soft(row?.querySelector(".host-update-action button")).toBeNull();
   await click(`[data-drop-path='${keyOf(projectB)}']`);
   expectNotice(hostB);

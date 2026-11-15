@@ -17,11 +17,12 @@ describe("start view", () => {
     expect(startView(base({ skipped: true, oldSeenAt: 7 }, { oldRing: { at: 7 } }))).toBeNull();
     expect(startView(base({ skipped: true, oldSeenAt: 6 }, { oldRing: { at: 7 } }))).toBe("old");
   });
-  it("member/finishing/failed local/unloaded/platform → null", () => {
+  it("member/finishing/failed local/unloaded → null", () => {
     expect(startView(base({}, { membership: "member" }))).toBeNull();
     expect(startView(base({}, { membership: "finishing" }))).toBeNull();
     expect(startView(base({ local: "failed" }))).toBeNull();
     expect(startView({ ...base(), status: null })).toBeNull();
-    expect(startView(base({ overview: { unavailable: "platform" } }))).toBeNull();
+    // Every platform creates and joins: an unregistered local Host still shows the first screen.
+    expect(startView(base({ overview: { unavailable: "not-registered" } }))).toBe("first");
   });
 });

@@ -105,6 +105,7 @@ async function setup(panels: Record<string, unknown>, cachedIds = ["files", "git
       case "detect_session_branch": return null;
       case "probe_statusline_setup": return { stats_dir_present: false, stats_session_count: 0 };
       case "app_build": return { version: "1.5.0", build: { commit: null, dirty: null, time: null } };
+      case "app_updates_enabled": return true;
       default: unexpected.push(method); throw new Error(`Unexpected panel fixture IPC: ${String(method)}`);
     }
   });

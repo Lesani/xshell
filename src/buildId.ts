@@ -36,4 +36,6 @@ export function versionWithBuild(version: string, b: BuildId | null): string {
 export interface AppBuild {
   version: string;
   build: BuildId | null;
+  // This build's release page (Lesani/xshell by default); absent from older backends.
+  releasePage?: string;
 }

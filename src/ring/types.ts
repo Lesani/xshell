@@ -125,7 +125,7 @@ export interface JoinEvent {
 }
 
 export interface JoinOverview {
-  unavailable?: "platform" | "not-registered" | null;
+  unavailable?: "not-registered" | null;
   // This window owns pairing (otherwise another xshell window does).
   owner: boolean;
   joins: JoinEvent[];

@@ -80,7 +80,7 @@ describe("shared Host update action", () => {
 
 it("keeps the Ring limitation and Desktop-owner diagnosis independently visible with no build action", () => {
   const html = render({ routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", updateAction: null });
-  expect(html).toContain("Desktop there manages this Daemon");
+  expect(html).toContain("xshell there manages terminals, so this update must be made on that machine.");
   expect(html).not.toContain("<button");
 });
 

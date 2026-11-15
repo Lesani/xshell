@@ -179,7 +179,7 @@ async function loadStartup() {
   if (localDaemon) await registry.setLocal(true).catch(() => {});
   // Local Daemon mode: saved in-process Tabs move into the Daemon before anything mounts.
   // Restore and persistence wait for it. The migration's own "not ready" path keeps Tabs
-  // in-process, which a Unix Desktop must never run: that outcome is treated as not ready.
+  // in-process, which a Desktop must never run: that outcome is treated as not ready.
   let migrationReady = true;
   const deps: typeof localMigrationDeps = { ...localMigrationDeps, ready: async () => {
     const live = await localMigrationDeps.ready();

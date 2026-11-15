@@ -4,7 +4,8 @@ import { localView, type LocalStatus } from "./localInfo";
 
 // Start-up's live readiness gate (U5): waits until local Terminals can run (`ready`) or cannot
 // (`failed`), from `local:daemon` and repeated `local_host_info` reads. `timeout` when neither
-// happened in time. Outside Daemon mode there is nothing to wait for.
+// happened in time. Outside Daemon mode (only the `XSHELL_LOCAL_DAEMON=0` test switch: a Desktop
+// must never run in-process, on any platform) there is nothing to wait for.
 export type Readiness = "ready" | "failed" | "timeout" | "none";
 
 export const READINESS_WAIT_MS = 30_000;

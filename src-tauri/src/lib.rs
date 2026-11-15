@@ -204,6 +204,9 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 struct AppBuild {
     version: &'static str,
     build: Option<xshell_protocol::build::BuildId>,
+    /// Where this build's releases are published (the manual update line names it).
+    #[serde(rename = "releasePage")]
+    release_page: String,
 }
 
 #[tauri::command]
@@ -211,6 +214,10 @@ fn app_build() -> AppBuild {
     AppBuild {
         version: env!("CARGO_PKG_VERSION"),
         build: build_id::BUILD.clone(),
+        release_page: format!(
+            "https://github.com/{}/releases",
+            hosts::binaries::release_repo()
+        ),
     }
 }
 

@@ -119,6 +119,7 @@ it.each(["success", "admission", "abort", "partial-abort", "offline-abort"])("ac
       case "detect_agent_binary": return { installed: false };
       case "probe_statusline_setup": return { stats_dir_present: false, stats_session_count: 0 };
       case "app_build": return { version: "1.5.0", build: null };
+      case "app_updates_enabled": return true;
       default: unexpected.push(method); throw new Error(`unexpected retarget native call ${method}`);
     }
   });
