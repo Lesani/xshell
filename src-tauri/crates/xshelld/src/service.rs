@@ -340,7 +340,15 @@ valid() {{
   [ -f "$f" ] && [ ! -L "$f" ] && [ -x "$f" ] && private "$f"
 }}
 bin=
-if [ -e "$root/selected" ] || [ -L "$root/selected" ]; then
+# An update trial is open, or was cut off: run the previous build. Its own start path
+# waits while the trial runs and rolls back one nobody owns (S4 C4, C5).
+if [ -f "$root/trial" ] && [ ! -L "$root/trial" ] && private "$root/trial"; then
+  prev=$(sed -n 's/^previous=//p' "$root/trial" 2>/dev/null | head -n 1)
+  if [ -n "$prev" ] && valid "$prev"; then bin="$root/$prev/xshelld"; fi
+fi
+if [ -n "$bin" ]; then
+  :
+elif [ -e "$root/selected" ] || [ -L "$root/selected" ]; then
   name=$(head -n 1 "$root/selected" 2>/dev/null)
   if [ -f "$root/selected" ] && [ ! -L "$root/selected" ] && private "$root/selected" && valid "$name"; then
     bin="$root/$name/xshelld"
@@ -357,7 +365,7 @@ if [ -z "$bin" ]; then
   echo "xshell: no valid installed xshelld under $root" >&2
   exit 127
 fi
-# may-start hook: wait_until_may_start (xshell_hostlink::local) allows at once today.
+# Every Rust start path then waits on trial.lock (wait_until_may_start).
 exec "$bin" "$@"
 "#
     )
@@ -406,7 +414,8 @@ pub fn unit_is_ours(text: &str) -> bool {
     text.lines().next() == Some(UNIT_HEADER)
 }
 
-/// The systemd user unit.
+/// The systemd user unit. `KillMode=process`: the Daemon ends its Terminals itself, and an
+/// update's watchdog (S4 C3) must outlive a trial build that exits.
 pub fn unit_text(l: &Layout) -> String {
     let mut exec = vec![systemd_quote(&l.launcher().to_string_lossy())];
     exec.push("service".into());
@@ -416,7 +425,8 @@ pub fn unit_text(l: &Layout) -> String {
     }
     format!(
         "{UNIT_HEADER}\n[Unit]\nDescription=xshell Daemon (keeps this machine's terminals running)\n\n\
-         [Service]\nType=simple\nExecStart={}\nRestart=always\nRestartSec=2\n\n\
+         [Service]\nType=simple\nExecStart={}\nRestart=always\nRestartSec=2\n\
+         KillMode=process\n\n\
          [Install]\nWantedBy=default.target\n",
         exec.join(" ")
     )
@@ -542,6 +552,10 @@ pub struct Report {
     pub active: bool,
     pub linger: Option<bool>,
     pub running: bool,
+    /// The install directory (`<version>+<build>`) of the Daemon that answers now, when one
+    /// does (S4: `install.sh` waits for the build it installed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving: Option<String>,
     pub launcher: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed: Option<bool>,
@@ -805,6 +819,7 @@ pub fn status(l: &Layout, runner: &dyn Runner, forced: Option<Mechanism>) -> Rep
         active,
         linger,
         running: daemon_alive(&l.home, &l.paths.socket),
+        serving: crate::upgrade::serving_build(&l.home, &l.paths.socket),
         launcher: l.launcher().display().to_string(),
         changed: None,
         warnings,

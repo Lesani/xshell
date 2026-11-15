@@ -17,9 +17,12 @@ pub mod manager;
 pub mod process;
 pub mod ring;
 pub mod ssh_config;
+pub mod stage;
 pub mod status;
 pub mod supervisor;
 pub mod transport;
+#[cfg(unix)]
+pub mod trial;
 pub mod version;
 
 pub use access::HostAccess;

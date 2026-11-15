@@ -18,6 +18,7 @@ pub mod server;
 #[cfg(unix)]
 pub mod service;
 pub mod stage;
+pub mod upgrade;
 
 use cli::Command;
 use std::path::PathBuf;
@@ -33,6 +34,8 @@ pub fn main_entry() -> i32 {
     };
     let (opts, serve) = match cmd {
         Command::Maintenance(opts) => return maintenance::run(opts),
+        Command::UpgradeWatch(args) => return upgrade::watch_main(args),
+        Command::SelfInstall(args) => return upgrade::self_install_main(args),
         #[cfg(unix)]
         Command::Service { action, opts } => return service::main(action, &opts),
         #[cfg(not(unix))]
@@ -168,6 +171,14 @@ pub fn main_entry() -> i32 {
     if let Some(m) = std::env::var_os(service::SERVICE_ENV) {
         crate::log!("INFO", "started by the {} service", m.to_string_lossy());
     }
+    // An update trial (S4): this process may be the build on trial, or find one nobody
+    // owns any more (then it goes back to the previous build).
+    #[cfg(target_os = "linux")]
+    let trial = match upgrade::on_start(&home) {
+        upgrade::Decision::Normal => None,
+        upgrade::Decision::Trial(t) => Some(t),
+        upgrade::Decision::Exec(bin) => return upgrade::exec_previous(&bin),
+    };
     let gui_bound = opts
         .parent_pid
         .map(|parent_pid| server::GuiBound { parent_pid });
@@ -221,7 +232,50 @@ pub fn main_entry() -> i32 {
         }
     }
     submit_probe(&mut cfg);
-    server::run_serve(cfg, stop)
+    #[cfg(target_os = "linux")]
+    {
+        cfg.test_fail_restore = trial.is_some() && fail_restore_for_tests();
+    }
+    let home = cfg.home.clone();
+    let paths = cfg.paths.clone();
+    #[cfg(target_os = "linux")]
+    let in_trial = trial.is_some();
+    #[cfg(target_os = "linux")]
+    let after_start = {
+        let home = home.clone();
+        move |probe: server::DaemonProbe| {
+            if let Some(t) = trial {
+                std::thread::spawn(move || upgrade::report(home, t, probe));
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let after_start = |_probe: server::DaemonProbe| {};
+    let served = server::run_serve_with(cfg, stop, after_start);
+    #[cfg(target_os = "linux")]
+    if in_trial && served.reason == Some(server::ExitReason::Shutdown) {
+        upgrade::stopped_during_trial(&home);
+    }
+    if served.reason == Some(server::ExitReason::Upgrade)
+        && !gui_bound_upgrade(&opts)
+        && upgrade::in_place()
+    {
+        return upgrade::reexec(&home, &paths);
+    }
+    served.code
+}
+
+/// A GUI-bound Daemon is replaced by the app that owns it, never in place.
+fn gui_bound_upgrade(opts: &cli::Opts) -> bool {
+    opts.parent_pid.is_some()
+}
+
+/// Test hook (debug builds): `XSHELLD_TEST_FAIL_RESTORE=<install dir>`: that build, on an
+/// update trial, fails to restore the first Terminal record (S4 C1).
+#[cfg(target_os = "linux")]
+fn fail_restore_for_tests() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("XSHELLD_TEST_FAIL_RESTORE").is_ok_and(|d| d == upgrade::own_dir())
 }
 
 /// Test hook, debug builds only (a release build ignores it): the Windows reply probes

@@ -53,6 +53,7 @@ mod signals;
 pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
+mod staging;
 mod terminal;
 pub use terminal::OPTIONAL_FIELDS_BYTES;
 pub mod transport;
@@ -202,6 +203,11 @@ pub struct Config {
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
+    /// A stage (`daemon.stage-*`) that gets nothing for this long is removed.
+    pub stage_idle: Duration,
+    /// Test hook (S4 C1): restore fails the first Terminal record.
+    #[doc(hidden)]
+    pub test_fail_restore: bool,
     /// Test hook: the range offered in `hello` and negotiated against, as an older or newer
     /// Daemon would.
     #[doc(hidden)]
@@ -248,6 +254,12 @@ pub enum TestPoint {
     StandaloneCommandPreparedBeforeReply,
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
+    /// A staged build is complete and about to be run for validation, before the requester
+    /// is checked again (no lock held; a hook may block).
+    StageBeforeVerify,
+    /// A selected update is about to check its requester again and commit (no lock held;
+    /// a hook may block).
+    UpgradeBeforeCommit,
     /// Selected-update commit has been acknowledged; on its worker, outside all locks.
     UpgradeCommitted,
     /// A Relaunch was accepted and is about to start its worker thread (registry locked: do
@@ -606,6 +618,8 @@ impl Config {
             drop_grace: Duration::from_secs(10 * 60),
             submit_attach_timeout: Duration::from_secs(10),
             hide_capabilities: Vec::new(),
+            stage_idle: Duration::from_secs(120),
+            test_fail_restore: false,
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
             test_hook: None,
@@ -826,6 +840,8 @@ impl Server {
             saves: Mutex::new(registry::SaveStatus::default()),
             snap_seq: AtomicU64::new(0),
             session_streams,
+            staging: Default::default(),
+            restore_failures: std::sync::atomic::AtomicUsize::new(0),
         });
         d.ring.bind_store_admission(&d.store_admission);
         // Sessions through the Relay are served by this Daemon.
@@ -1054,6 +1070,46 @@ impl ServerHandle {
     pub fn stopper(&self) -> Stopper {
         Stopper(self.d.clone())
     }
+
+    /// What an update trial asks of this server (S4).
+    pub fn probe(&self) -> DaemonProbe {
+        DaemonProbe(self.d.clone())
+    }
+
+    /// Test hook: whether a `daemon.stage-*` stage is open.
+    #[doc(hidden)]
+    pub fn stage_active(&self) -> bool {
+        self.d.staging.active()
+    }
+}
+
+/// A running server's answers for an update trial (S4 C1, C2).
+#[derive(Clone)]
+pub struct DaemonProbe(Arc<Daemon>);
+
+impl DaemonProbe {
+    /// Terminal records restore could not start again.
+    pub fn restore_failures(&self) -> usize {
+        self.0.restore_failures.load(Ordering::SeqCst)
+    }
+
+    /// Connected to (authenticated at) its Ring's Relay now.
+    pub fn ring_connected(&self) -> bool {
+        ring_connected(&self.0)
+    }
+
+    pub fn exiting(&self) -> bool {
+        self.0.exiting.load(Ordering::SeqCst)
+    }
+}
+
+/// Whether `d` is connected to its Ring's Relay now (`ring.identity`'s state).
+pub(crate) fn ring_connected(d: &Daemon) -> bool {
+    d.store_admission
+        .admit()
+        .and_then(|_operation| d.ring.identity())
+        .ok()
+        .is_some_and(|v| v["ring"]["state"] == "connected")
 }
 
 impl Drop for ServerHandle {
@@ -1065,25 +1121,56 @@ impl Drop for ServerHandle {
 }
 
 /// `serve` as a process: shut down orderly when `stop` fires (see [`watch_exit_signals`]).
-pub fn run_serve(mut cfg: Config, stop: Arc<StopLatch>) -> i32 {
+pub fn run_serve(cfg: Config, stop: Arc<StopLatch>) -> i32 {
+    run_serve_with(cfg, stop, |_| {}).code
+}
+
+/// How a `serve` ended: its exit code, and why it stopped serving (`None`: it never served).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Served {
+    pub code: i32,
+    pub reason: Option<ExitReason>,
+}
+
+/// [`run_serve`], calling `after_start` once the server serves (restore done).
+pub fn run_serve_with(
+    mut cfg: Config,
+    stop: Arc<StopLatch>,
+    after_start: impl FnOnce(DaemonProbe),
+) -> Served {
     cfg.abort = Some(stop.clone());
     let h = match Server::start(cfg) {
         Ok(h) => h,
         Err(StartError::AlreadyRunning) => {
             crate::log!("INFO", "another xshelld serve holds the lock; exiting");
             hold_loser_for_tests();
-            return 3;
+            return Served {
+                code: 3,
+                reason: None,
+            };
         }
-        Err(StartError::Aborted) => return 0,
+        Err(StartError::Aborted) => {
+            return Served {
+                code: 0,
+                reason: None,
+            }
+        }
         Err(e) => {
             crate::log!("ERROR", "cannot start: {e}");
-            return 1;
+            return Served {
+                code: 1,
+                reason: None,
+            };
         }
     };
     stop.arm(&h);
+    after_start(h.probe());
     let reason = h.wait();
     crate::log!("INFO", "exiting: {reason:?}");
-    0
+    Served {
+        code: 0,
+        reason: Some(reason),
+    }
 }
 
 /// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits

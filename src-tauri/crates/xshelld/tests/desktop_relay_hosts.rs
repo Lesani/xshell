@@ -58,7 +58,8 @@ fn v1_standalone_pairing_discovers_host_without_ssh_or_computer_completion() {
     assert!(Arc::ptr_eq(&host, &owner.manager.host(host.id()).unwrap()));
     assert!(!owner.events.available.lock().unwrap().is_empty());
     call(&host, "list_dir", json!({"path":guest.home.home()}));
-    assert!(host.status().route_update_unavailable.is_some());
+    // Same version and build as this Desktop: nothing to update, and nothing blocks it (S4).
+    assert_eq!(host.status().route_update_unavailable, None);
     assert_eq!(host.status().update_action, None);
     assert_eq!(host.status().os, None, "Relay hello does not prove OS");
     assert!(reply(|w| host.upgrade(w)).is_err());
@@ -341,7 +342,7 @@ fn late_host_link(revoke: bool) {
 
 #[test]
 #[cfg(feature = "legacy-pair-test-control")]
-fn relay_only_route_limitation_does_not_hide_desktop_owned_diagnosis() {
+fn ring_route_keeps_desktop_owned_diagnosis() {
     let relay = Relay::start();
     let owner = Computer::new(&relay);
     owner.ring.enable(None, false).unwrap();
@@ -353,10 +354,9 @@ fn relay_only_route_limitation_does_not_hide_desktop_owned_diagnosis() {
     let key = guest.legacy_pair(&owner, &relay);
     let host = owner.relay_host(key);
     let status = host.status();
-    assert_eq!(
-        status.route_update_unavailable,
-        Some(xshell_hostlink::status::RouteUpdateUnavailable::RelayOnly)
-    );
+    // A GUI-bound Daemon offers no `daemon.stage`; at this Desktop's own version and build
+    // there is nothing to update, so no Ring limitation is shown either (S4).
+    assert_eq!(status.route_update_unavailable, None);
     assert_eq!(
         status.update_unavailable,
         Some(xshell_hostlink::status::UpdateUnavailable::DesktopOwned)

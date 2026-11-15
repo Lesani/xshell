@@ -395,8 +395,29 @@ fn upgrade_restores_same_uuid_new_pid() {
     let old_daemon = fx.daemon_pid().expect("daemon pid");
     let n = fx.a.rec.count();
     upgrade(&h).unwrap();
-    // Until the old Daemon is gone, the Host stays in phase `upgrading`, never connected.
-    assert!(common::wait_dead(old_daemon, Duration::from_secs(10)));
+    // The Daemon updates itself in place (S4): the same process runs this Desktop's
+    // installed build; until then the Host stays in phase `upgrading`, never connected.
+    let ours = fx
+        .home
+        .home()
+        .join(".xshell/server")
+        .join(xshell_protocol::build::install_dir_name(
+            VERSION,
+            Some(current),
+        ))
+        .join("xshelld");
+    let until = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_link(format!("/proc/{old_daemon}/exe"))
+        .ok()
+        .as_ref()
+        != Some(&ours)
+    {
+        assert!(
+            Instant::now() < until,
+            "the Daemon did not re-execute into {ours:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let (c, s) =
         fx.a.rec
             .wait_status_from(n, "connected after the upgrade", |s| {
@@ -414,7 +435,7 @@ fn upgrade_restores_same_uuid_new_pid() {
     );
     assert!(during.iter().any(|s| s.status == StatusKind::Reconnecting));
     let new_daemon = fx.daemon_pid().expect("new daemon pid");
-    assert_ne!(new_daemon, old_daemon);
+    assert_eq!(new_daemon, old_daemon, "updated in place");
     let list = fx.a.rec.wait_list("restored", |l| {
         l.iter()
             .any(|i| i.terminal == t && i.pid.is_some() && i.pid != Some(pid))
@@ -1004,7 +1025,14 @@ fn local_switch_refuses_foreign_gui_bound() {
 fn local_persistent_older_daemon_is_upgrade_pending() {
     let home = common::TestHome::new();
     let _guard = common::DaemonGuard::new(&home);
-    let _serve = common::ServeProc::start(&home, &[("XSHELLD_IDLE_TIMEOUT_MS", "60000")]);
+    // It plays a Daemon from before in-place updates (S4): it exits on the upgrade.
+    let _serve = common::ServeProc::start(
+        &home,
+        &[
+            ("XSHELLD_IDLE_TIMEOUT_MS", "60000"),
+            ("XSHELLD_TEST_NO_REEXEC", "1"),
+        ],
+    );
     common::connect_socket(&home.paths().socket);
     let old = daemon_pid(&home);
     let a = LocalDesk::with(

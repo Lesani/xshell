@@ -177,8 +177,12 @@ pub fn local_daemon_alive(home: &Path, env_socket: &Path) -> bool {
 /// script `xshelld service install` writes mirrors it in `sh`): the build the `selected`
 /// record names; only when there is no record, the newest installed build (by mtime).
 /// `Ok(None)`: nothing installed. `Err`: a record exists but names no valid install.
+///
+/// An update trial is settled first (S4 C4, C5): while one runs this waits; one nobody
+/// owns any more is rolled back, so `selected` names the previous build again.
 #[cfg(unix)]
 pub fn start_binary(home: &Path) -> Result<Option<PathBuf>, String> {
+    crate::trial::settle(home).map_err(|e| e.to_string())?;
     let root = xshell_core::server::server_root(home);
     let record = root.join(xshell_core::server::SELECTED);
     match std::fs::read(&record) {
@@ -214,9 +218,14 @@ pub fn start_binary(home: &Path) -> Result<Option<PathBuf>, String> {
 
 /// The one "may I start a Daemon now" hook every launch path passes (the Desktop's start,
 /// `service run`, `service ensure`; the launcher script has the matching marked spot).
-/// Today it always allows at once; S4 makes it wait on `~/.xshell/server/trial.lock`.
+/// It waits while an update trial holds `~/.xshell/server/trial.lock` and rolls back a trial
+/// nobody owns ([`crate::trial::settle`]).
 #[cfg(unix)]
-pub fn wait_until_may_start(_home: &Path) {}
+pub fn wait_until_may_start(home: &Path) {
+    if let Err(e) = crate::trial::settle(home) {
+        eprintln!("xshell: {e}");
+    }
+}
 
 /// The recorded mode; `None` when there is no marker or it is unreadable.
 pub fn read_local_mode(path: &Path) -> Option<&'static str> {

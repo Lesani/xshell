@@ -87,6 +87,19 @@ fn is_hex12(s: &str) -> bool {
     s.len() == 12 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The release target triple of a Daemon for `os`/`arch` as `uname -s`/`uname -m` (or
+/// Rust's `std::env::consts`) name them: the file name suffix of `xshelld-<triple>`.
+pub fn host_triple(os: &str, arch: &str) -> Result<&'static str, String> {
+    match (os, arch) {
+        ("windows" | "Windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("Linux" | "linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-musl"),
+        ("Linux" | "linux", "aarch64" | "arm64") => Ok("aarch64-unknown-linux-musl"),
+        ("Darwin" | "macos", "arm64" | "aarch64") => Ok("aarch64-apple-darwin"),
+        ("Darwin" | "macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        _ => Err(format!("unsupported host platform: {os} {arch}")),
+    }
+}
+
 /// The directory a Daemon build is installed in under `~/.xshell/server/`: `<version>` when
 /// the build is unknown, else `<version>+<display>`.
 pub fn install_dir_name(version: &str, build: Option<&BuildId>) -> String {
@@ -240,6 +253,24 @@ fn match_at(bytes: &[u8], at: usize) -> Option<(Option<BuildId>, usize)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn host_triple_map() {
+        for (os, arch, want) in [
+            ("Linux", "x86_64", "x86_64-unknown-linux-musl"),
+            ("Linux", "amd64", "x86_64-unknown-linux-musl"),
+            ("linux", "aarch64", "aarch64-unknown-linux-musl"),
+            ("Linux", "arm64", "aarch64-unknown-linux-musl"),
+            ("Darwin", "arm64", "aarch64-apple-darwin"),
+            ("macos", "x86_64", "x86_64-apple-darwin"),
+            ("windows", "x86_64", "x86_64-pc-windows-msvc"),
+        ] {
+            assert_eq!(host_triple(os, arch), Ok(want), "{os} {arch}");
+        }
+        assert!(host_triple("FreeBSD", "x86_64").is_err());
+        assert!(host_triple("Linux", "riscv64").is_err());
+    }
+
     use super::*;
 
     fn id(commit: &str, dirty: Option<&str>, time: u64) -> BuildId {

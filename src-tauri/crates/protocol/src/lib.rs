@@ -42,6 +42,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::DAEMON_UPGRADE,
     cap::DAEMON_UPGRADE_SELECTED,
     cap::DAEMON_DESKTOP_OWNED,
+    cap::DAEMON_STAGE,
     cap::TERM_RELAUNCH,
     cap::LAUNCH_PREFIX,
     cap::AGENT_STATUS,
@@ -87,6 +88,11 @@ pub mod cap {
     /// Positive lifecycle ownership, not a blanket update prohibition: a Windows owner
     /// may also support `DAEMON_UPGRADE_SELECTED`. Absence leaves ownership unknown.
     pub const DAEMON_DESKTOP_OWNED: &str = "daemon.desktop-owned";
+    /// Update over the link (Desktop only): `daemon.update-info`, `daemon.stage-*` and, on
+    /// this Daemon, `daemon.upgrade-selected` that re-executes the Daemon into the selected
+    /// build in place (same process), with a trial that rolls back to the previous build when
+    /// the new one does not come up. Offered by an always-on Linux Daemon only.
+    pub const DAEMON_STAGE: &str = "daemon.stage";
     /// `term.relaunch`.
     pub const TERM_RELAUNCH: &str = "term.relaunch";
     /// Launch prefixes in `term.open`.
@@ -181,6 +187,12 @@ mod tests {
     fn capabilities_include_term_custom_title() {
         assert!(CAPABILITIES.contains(&cap::TERM_CUSTOM_TITLE));
         assert!(CAPABILITIES.contains(&"term.custom-title.mobile"));
+    }
+
+    #[test]
+    fn capabilities_include_daemon_stage() {
+        assert!(CAPABILITIES.contains(&cap::DAEMON_STAGE));
+        assert_eq!(cap::DAEMON_STAGE, "daemon.stage");
     }
 
     #[test]

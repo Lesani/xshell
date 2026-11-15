@@ -42,8 +42,11 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
 pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
     let off = match c {
         "daemon.upgrade-selected" => {
-            !(cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
+            !((cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
+                || (cfg!(target_os = "linux") && cfg.gui_bound.is_none()))
         }
+        // An always-on Linux Daemon updates itself in place (S4).
+        xshell_protocol::cap::DAEMON_STAGE => !cfg!(target_os = "linux") || cfg.gui_bound.is_some(),
         xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
@@ -246,6 +249,8 @@ pub(crate) fn handle(
     }
     // After the connection left the registry: no stream result is queued for it from now on.
     d.session_streams.drop_conn(id);
+    // A build it was sending is removed with its part file.
+    d.staging.drop_conn(id);
     if clean {
         ob.close();
     } else {
@@ -293,6 +298,30 @@ fn refuse_after_end(
 }
 
 impl Conn {
+    /// Who asks, for the checks at an update's effects (C8).
+    fn requester(&self) -> super::staging::Requester {
+        super::staging::Requester {
+            conn: self.id,
+            peer: self
+                .peer
+                .as_ref()
+                .filter(|_| self.ingress == Ingress::Relay)
+                .map(|p| p.sign_key),
+        }
+    }
+
+    /// Update requests are refused while the Daemon is upgrading or exiting.
+    fn refuse_frozen(&self) -> Result<(), String> {
+        let reg = self.d.reg.lock().unwrap();
+        if reg.frozen || self.d.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("xshelld is upgrading or shutting down".into())
+        } else if !offered(&self.d.cfg, xshell_protocol::cap::DAEMON_STAGE) {
+            Err("this xshelld cannot be updated over its link".into())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Run `f` on the Terminal listed under `id`, if this connection's role may act on it,
     /// with the registry still locked. Attach, detach and resize go through here: a Relaunch
     /// moves the attached connections and the size arbiter to the replacement under the same
@@ -688,7 +717,11 @@ impl Conn {
                     if !offered(&d.cfg, xshell_protocol::cap::DAEMON_UPGRADE_SELECTED) {
                         return Err(UPGRADE_REFUSED.into());
                     }
-                    #[cfg(not(windows))]
+                    #[cfg(target_os = "linux")]
+                    {
+                        selected_linux(&d, self.requester(), &version, &build)
+                    }
+                    #[cfg(all(not(windows), not(target_os = "linux")))]
                     {
                         let _ = (version, build);
                         Err(UPGRADE_REFUSED.into())
@@ -818,12 +851,77 @@ impl Conn {
                 let peer = self.peer.as_ref().filter(|_| self.role == Role::Mobile);
                 reply(&self.ob, id, d.push.unregister(peer))
             }
+            ClientMsg::DaemonUpdateInfo => {
+                let r = self.refuse_frozen().and_then(|()| update_info(&d));
+                reply(&self.ob, id, r)
+            }
+            ClientMsg::DaemonStageBegin {
+                version,
+                build,
+                sha256,
+                length,
+            } => {
+                let r = self.refuse_frozen().and_then(|()| {
+                    d.staging
+                        .begin(&d, self.requester(), &version, &build, &sha256, length)
+                });
+                reply(&self.ob, id, r)
+            }
+            ClientMsg::DaemonStageChunk {
+                stage,
+                offset,
+                data,
+            } => {
+                let ob = self.ob.clone();
+                let answer: super::staging::Reply = Box::new(move |r| reply(&ob, id, r));
+                match self.refuse_frozen() {
+                    Err(e) => {
+                        d.staging.abort(self.requester(), stage);
+                        answer(Err(e))
+                    }
+                    Ok(()) => {
+                        let _ = d
+                            .staging
+                            .chunk(self.requester(), stage, offset, &data, answer);
+                    }
+                }
+            }
+            ClientMsg::DaemonStageCommit { stage } => {
+                let ob = self.ob.clone();
+                let answer: super::staging::Reply = Box::new(move |r| reply(&ob, id, r));
+                match self.refuse_frozen() {
+                    Err(e) => {
+                        d.staging.abort(self.requester(), stage);
+                        answer(Err(e))
+                    }
+                    Ok(()) => d.staging.commit(self.requester(), stage, answer),
+                }
+            }
+            ClientMsg::DaemonStageAbort { stage } => {
+                d.staging.abort(self.requester(), stage);
+                reply(&self.ob, id, Ok(Value::Null))
+            }
             ClientMsg::DaemonUpgrade => {
+                // Before the lock: whether the Ring is connected (a trial build must be
+                // again, C2).
+                #[cfg(target_os = "linux")]
+                let ring = super::ring_connected(&d);
                 {
                     let mut reg = d.reg.lock().unwrap();
                     if !reg.frozen {
                         // The last word on disk before the Terminals are ended.
                         d.persist(&reg);
+                        // In place on Linux (S4): a `selected` naming another build gets a
+                        // trial, so a broken one rolls back. Without, the re-exec starts
+                        // whatever is selected.
+                        #[cfg(target_os = "linux")]
+                        if let Some(target) =
+                            selected_other_build(&d.cfg.home).filter(|_| crate::upgrade::in_place())
+                        {
+                            if let Err(e) = crate::upgrade::begin(&d.cfg.home, &target, ring) {
+                                crate::log!("WARN", "upgrading to {target} without a trial: {e}");
+                            }
+                        }
                         reg.frozen = true;
                     }
                 }
@@ -835,4 +933,95 @@ impl Conn {
             }
         }
     }
+}
+
+/// `daemon.update-info`: this Daemon's target and limits, and the last rollback.
+fn update_info(d: &Daemon) -> Result<Value, String> {
+    let target =
+        xshell_protocol::build::host_triple(crate::cli::uname_os(), std::env::consts::ARCH)?;
+    #[cfg(unix)]
+    let last_failure = xshell_hostlink::trial::failure(&d.cfg.home, now_ms());
+    #[cfg(not(unix))]
+    let last_failure = {
+        let _ = d;
+        None
+    };
+    Ok(json!(xshell_protocol::msg::UpdateInfo {
+        target: target.into(),
+        max_bytes: xshell_protocol::msg::STAGE_MAX_BYTES,
+        max_chunk: xshell_protocol::msg::STAGE_MAX_CHUNK,
+        last_failure,
+    }))
+}
+
+/// The install directory `selected` names, when it is a valid install of another build
+/// than this one.
+#[cfg(target_os = "linux")]
+fn selected_other_build(home: &std::path::Path) -> Option<String> {
+    let root = xshell_core::server::server_root(home);
+    let text = std::fs::read_to_string(root.join(xshell_core::server::SELECTED)).ok()?;
+    let name = text.lines().next()?.trim().to_string();
+    (name != crate::upgrade::own_dir()
+        && xshell_core::server::valid_install(&root, &name).is_some())
+    .then_some(name)
+}
+
+/// `daemon.upgrade-selected` on an always-on Linux Daemon (S4): the installed build must
+/// report exactly the requested identity and be newer or another build of this version;
+/// the requester is checked again (C8); then, under the registry lock, the records are
+/// saved, the trial opened (`selected` written) and the Daemon frozen. The worker the
+/// returned sender starts makes it exit for the in-place re-exec.
+#[cfg(target_os = "linux")]
+fn selected_linux(
+    d: &Arc<Daemon>,
+    who: super::staging::Requester,
+    version: &str,
+    build: &xshell_protocol::build::BuildId,
+) -> Result<std::sync::mpsc::Sender<()>, String> {
+    if d.cfg.gui_bound.is_some() || !crate::upgrade::in_place() {
+        return Err(UPGRADE_REFUSED.into());
+    }
+    let dir = xshell_protocol::build::install_dir_name(version, Some(build));
+    let root = xshell_core::server::server_root(&d.cfg.home);
+    let file = xshell_core::server::valid_install(&root, &dir)
+        .ok_or_else(|| format!("{dir} is not installed"))?;
+    let (v, b) = crate::stage::native_identity(&file).map_err(|e| e.to_string())?;
+    if v != version || !b.is_some_and(|b| b.same(build)) {
+        return Err("installed target identity differs".into());
+    }
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+    let target = semver::Version::parse(version).map_err(|e| e.to_string())?;
+    if target.cmp_precedence(&current).is_lt()
+        || (target.cmp_precedence(&current).is_eq()
+            && crate::build_id::BUILD
+                .as_ref()
+                .is_some_and(|b| b.same(build)))
+    {
+        return Err("target is older or already running".into());
+    }
+    d.test_point(Uuid::nil(), TestPoint::UpgradeBeforeCommit);
+    super::staging::authorized(d, who)?;
+    let ring = super::ring_connected(d);
+    let mut reg = d.reg.lock().unwrap();
+    if reg.frozen || d.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("daemon update busy".into());
+    }
+    if d.test_point(Uuid::nil(), TestPoint::UpgradeWorker) {
+        return Err("cannot start selected-update worker".into());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = d.clone();
+    std::thread::Builder::new()
+        .name("selected-upgrade".into())
+        .spawn(move || {
+            if rx.recv().is_ok() {
+                worker.test_point(Uuid::nil(), TestPoint::UpgradeCommitted);
+                worker.exit(ExitReason::Upgrade);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    d.try_persist(&reg)?;
+    crate::upgrade::begin(&d.cfg.home, &dir, ring)?;
+    reg.frozen = true;
+    Ok(tx)
 }

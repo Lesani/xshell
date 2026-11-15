@@ -60,6 +60,11 @@ pub(crate) struct Daemon {
     pub session_streams: super::session_stream::SessionStreams,
     /// The dropped files replies hold, kept out of the sweep.
     pub drops: Arc<super::drops::Drops>,
+    /// A build being received over a link (`daemon.stage-*`, S4).
+    pub staging: super::staging::Staging,
+    /// Terminal records the last restore could not start again (an update trial fails on
+    /// any, S4 C1).
+    pub restore_failures: std::sync::atomic::AtomicUsize,
 }
 
 /// Installed snapshots suppress older prepared writes, but only a confirmed durable
@@ -516,10 +521,20 @@ impl Daemon {
                     );
                     let t = terminal::unresolved(self, p);
                     reg.terminals.insert(t.id, t);
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
             }
             let floor = p.prompt_id_floor.unwrap_or(0);
+            if self.cfg.test_fail_restore && self.restore_failures.load(Ordering::SeqCst) == 0 {
+                crate::log!(
+                    "WARN",
+                    "dropping {}: test hook fails its restore",
+                    p.terminal
+                );
+                self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
             match terminal::spawn(
                 self,
                 p.terminal,
@@ -534,7 +549,10 @@ impl Daemon {
                     t.restore_prompt_floor(floor);
                     reg.terminals.insert(t.id, t);
                 }
-                Err(e) => crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal),
+                Err(e) => {
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                    crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal)
+                }
             }
         }
         if self.aborted() {
