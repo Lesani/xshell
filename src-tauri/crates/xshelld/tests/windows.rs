@@ -1258,14 +1258,18 @@ fn selected_update_owner_restart_restores_uuid_and_preserves_quit() {
 fn native_selected_record_validation_and_valid_older_bundle_fallback() {
     let h = TestHome::new_private_home();
     let (mut bytes, build) = update_fixture_bytes();
+    // This fixture changes only equal-length version literals: `1.x…` becomes `0.x…`.
     let current = env!("CARGO_PKG_VERSION").as_bytes();
-    assert_eq!(current, b"1.5.0"); // This fixture changes only equal-length version literals.
+    assert!(current.starts_with(b"1."), "fixture assumes a 1.x version");
+    let mut older = current.to_vec();
+    older[0] = b'0';
     for i in 0..=bytes.len() - current.len() {
         if bytes[i..].starts_with(current) {
-            bytes[i..i + 5].copy_from_slice(b"1.4.0");
+            bytes[i..i + current.len()].copy_from_slice(&older);
         }
     }
-    let dir = xshell_protocol::build::install_dir_name("1.4.0", Some(&build));
+    let older = String::from_utf8(older).unwrap();
+    let dir = xshell_protocol::build::install_dir_name(&older, Some(&build));
     use sha2::{Digest, Sha256};
     xshelld::stage::stage(
         &h.home(),
@@ -1283,6 +1287,60 @@ fn native_selected_record_validation_and_valid_older_bundle_fallback() {
     let record = xshell_core::server::server_root(&h.home()).join("selected");
     fs::write(&record, "../unsafe\n").unwrap();
     assert!(xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).is_err());
+}
+
+/// A5: a `selected` record of this version but another build (left by a replaced Desktop)
+/// never keeps that build running. With the Desktop's embedded Daemon installed where the
+/// Desktop installs it, that build starts and the record is rewritten to it; a sidecar
+/// elsewhere wins the start but leaves the record; a record of exactly this build is used.
+#[test]
+fn same_version_other_build_selected_record_yields_to_the_embedded_build() {
+    use sha2::{Digest, Sha256};
+    let h = TestHome::new_private_home();
+    let (bytes, build) = update_fixture_bytes();
+    let other = xshell_protocol::build::install_dir_name(env!("CARGO_PKG_VERSION"), Some(&build));
+    xshelld::stage::stage(
+        &h.home(),
+        &other,
+        &format!("{:x}", Sha256::digest(&bytes)),
+        bytes.len() as u64,
+        &mut base64_text(&bytes).as_bytes(),
+    )
+    .unwrap();
+    xshell_core::server::write_windows_selected(&h.home(), &other).unwrap();
+    let record = xshell_core::server::server_root(&h.home()).join("selected");
+    let selected = || fs::read_to_string(&record).unwrap().trim_end().to_string();
+    // The Desktop's own build, installed as the Desktop installs its embedded Daemon.
+    let own_bytes = fs::read(bin()).unwrap();
+    let own_build = xshell_protocol::build::scan_stamp(&own_bytes)
+        .unwrap()
+        .unwrap();
+    assert!(!own_build.same(&build));
+    let own = xshell_protocol::build::install_dir_name(env!("CARGO_PKG_VERSION"), Some(&own_build));
+    let embedded =
+        xshell_hostlink::install::install_local_bytes(&own_bytes, &h.home(), &own).unwrap();
+    assert_eq!(
+        embedded,
+        xshell_hostlink::install::local_server_bin(&h.home(), &own)
+    );
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), &embedded).unwrap(),
+        embedded
+    );
+    assert_eq!(selected(), own, "the record now names this build");
+    // A sidecar elsewhere wins the start but does not rewrite the record.
+    xshell_core::server::write_windows_selected(&h.home(), &other).unwrap();
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        Path::new(bin())
+    );
+    assert_eq!(selected(), other);
+    // A record of exactly this build is honoured.
+    xshell_core::server::write_windows_selected(&h.home(), &own).unwrap();
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        embedded
+    );
 }
 
 #[test]
