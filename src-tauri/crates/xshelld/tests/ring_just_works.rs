@@ -1268,3 +1268,239 @@ fn plain_refusals_keep_membership() {
 fn expiry_refusals_within_less_than_the_span_keep_membership() {
     refusals_keep_membership(3, Some("terminal_expired"), Duration::from_secs(120));
 }
+
+// ── Ported from the format-1 suites (upgrade_completion.rs, deleted in S2): the cases
+// that do not depend on the format. ───────────────────────────────────────────────────
+
+fn create_confirm(
+    p: &xshell_hostlink::ring::adoption::ConsentPreview,
+    lease: &xshell_hostlink::ring::adoption::CreateConfirmationLease,
+) -> Result<CreateDecision, String> {
+    Ok(CreateDecision::Confirm(lease.confirm(&p.proposal_hash)?))
+}
+
+#[test]
+fn local_companion_client_errors_until_registered_and_membership_follows_create() {
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    let error = a
+        .ring
+        .local_companion_client()
+        .err()
+        .expect("not registered");
+    assert!(error.starts_with("not_registered"), "{error}");
+    assert_eq!(a.ring.membership_state().unwrap(), MembershipState::None);
+    a.ring.register_companion(&a.companion()).unwrap();
+    let client = a.ring.local_companion_client().unwrap();
+    assert_eq!(client.endpoint(), a.companion().endpoint());
+    assert_eq!(a.ring.membership_state().unwrap(), MembershipState::None);
+    // Create through the client the UI uses: the first member can approve at once.
+    assert!(matches!(
+        a.ring.create_computer(&client, create_confirm).unwrap(),
+        AdoptionOutcome::Installed { .. }
+    ));
+    assert_eq!(a.ring.membership_state().unwrap(), MembershipState::Member);
+}
+
+#[test]
+fn cancelled_join_start_aborts_the_ready_wait_and_never_shows_an_offer() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint};
+    let relay = Relay::start();
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((reached_tx, release_rx))));
+    let hook = AdoptionTestHook(Arc::new(move |point| {
+        if point == AdoptionTestPoint::JoinSlotReady {
+            // Only the first start is held at the slot acknowledgment.
+            if let Some((reached, release)) = gate.lock().unwrap().take() {
+                reached.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
+    }));
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.adoption_test_hook = Some(hook));
+    b.ring.register_companion(&b.companion()).unwrap();
+    let client = b.ring.local_companion_client().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (ring, start_client, start_cancel) = (b.ring.clone(), client.clone(), cancel.clone());
+    let start =
+        std::thread::spawn(move || ring.begin_join_cancellable(&start_client, start_cancel, None));
+    reached_rx.recv_timeout(WAIT).expect("readiness reached");
+    // The UI's cancel command during the start.
+    cancel.store(true, Ordering::Release);
+    release_tx.send(()).unwrap();
+    let error = start
+        .join()
+        .unwrap()
+        .err()
+        .expect("a cancelled start shows no code");
+    assert!(error.starts_with("cancelled"), "{error}");
+    // The cancelled driver ended: its reservation is gone and nothing is unfinished.
+    let stored = profile(&b);
+    assert!(stored.pending_join.is_none() && stored.membership.is_none());
+    assert!(stored.journal.as_ref().is_none_or(|j| matches!(
+        j.phase,
+        xshell_hostlink::ring::store::AdoptionPhase::Cancelled
+            | xshell_hostlink::ring::store::AdoptionPhase::ExpiredBeforeProof
+    )));
+    assert_eq!(b.ring.membership_state().unwrap(), MembershipState::None);
+    // The admission is free again: a new Join starts and waits for its approver.
+    let offer = b
+        .ring
+        .begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)), None)
+        .unwrap();
+    assert!(offer.is_ready());
+    assert!(matches!(
+        offer.join_status(),
+        xshell_hostlink::ring::adoption::JoinStatus::Waiting
+    ));
+    offer.cancel_join();
+    drop(offer);
+}
+
+#[test]
+fn create_and_join_bind_the_chosen_relay_not_the_default() {
+    let relay = Relay::start();
+    // The default points nowhere: success proves the chosen Relay is bound.
+    let unreachable = "ws://127.0.0.1:9/";
+    let a = Computer::with_ring_config(&relay, |cfg| cfg.default_relay_url = unreachable.into());
+    a.ring.register_companion(&a.companion()).unwrap();
+    let chain = match a
+        .ring
+        .create_computer_on(&a.companion(), &relay.url(), create_confirm)
+        .unwrap()
+    {
+        AdoptionOutcome::Installed { chain, .. } => chain,
+        _ => panic!("Create not installed"),
+    };
+    assert_eq!(chain.head().roster().relay_url, relay.url());
+    assert!(a
+        .ring
+        .create_computer_on(&a.companion(), "not a url", create_confirm)
+        .is_err());
+    // A Join binds to the Relay its code was created for, and completes there.
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.default_relay_url = unreachable.into());
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b
+        .ring
+        .begin_join_cancellable(
+            &b.ring.local_companion_client().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Some(&relay.url()),
+        )
+        .unwrap();
+    assert!(offer.is_ready());
+    connected(&a);
+    let code = offer.code.clone();
+    let joined = std::thread::scope(|scope| {
+        let approval = scope.spawn(|| a.ring.approve_device_code(&code));
+        let outcome = offer.wait().unwrap();
+        approval.join().unwrap().unwrap();
+        outcome
+    });
+    let AdoptionOutcome::Installed { chain, .. } = joined else {
+        panic!("Join not installed");
+    };
+    assert_eq!(chain.head().roster().relay_url, relay.url());
+    assert!(chain
+        .authorized_member(&profile(&b).keys.sign_key())
+        .is_some());
+    // A code made for an unparseable Relay never starts.
+    assert!(b
+        .ring
+        .begin_join_cancellable(
+            &b.ring.local_companion_client().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Some("not a url"),
+        )
+        .is_err());
+}
+
+#[test]
+fn an_unfinished_join_stays_finishing_while_registration_holds_the_admission() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+    use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint};
+    let relay = Relay::start();
+    // 1: abort a Join after its durable reservation (an earlier, now unfinished Join).
+    // 2: hold the next registration's admission until released.
+    let mode = Arc::new(AtomicU8::new(0));
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((reached_tx, release_rx))));
+    let hook_mode = mode.clone();
+    let hook = AdoptionTestHook(Arc::new(move |point| {
+        match hook_mode.load(Ordering::SeqCst) {
+            1 if point == AdoptionTestPoint::JoinBeforeCounterpartStart => {
+                hook_mode.store(0, Ordering::SeqCst);
+                panic!("simulated crash after the Join reservation");
+            }
+            2 if point == AdoptionTestPoint::RegistrationAdmitted => {
+                if let Some((reached, release)) = gate.lock().unwrap().take() {
+                    reached.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+            _ => {}
+        }
+    }));
+    let b = Computer::with_ring_config(&relay, |cfg| cfg.adoption_test_hook = Some(hook));
+    b.ring.register_companion(&b.companion()).unwrap();
+    mode.store(1, Ordering::SeqCst);
+    let (ring, client) = (b.ring.clone(), b.ring.local_companion_client().unwrap());
+    let crashed = std::thread::spawn(move || {
+        ring.begin_join_cancellable(&client, Arc::new(AtomicBool::new(false)), None)
+            .map(|_| ())
+    })
+    .join();
+    assert!(crashed.is_err(), "the simulated crash ended the start");
+    assert_eq!(
+        b.ring.membership_state().unwrap(),
+        MembershipState::Finishing
+    );
+    assert!(!b.ring.adoption_busy());
+    // The registration loop holds the admission: still finishing, and busy.
+    mode.store(2, Ordering::SeqCst);
+    let (ring, companion) = (b.ring.clone(), b.companion());
+    let registering = std::thread::spawn(move || ring.register_companion(&companion));
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("registration admitted");
+    assert!(b.ring.adoption_busy());
+    assert_eq!(
+        b.ring.membership_state().unwrap(),
+        MembershipState::Finishing
+    );
+    release_tx.send(()).unwrap();
+    registering.join().unwrap().unwrap();
+    assert!(!b.ring.adoption_busy());
+    // The reconciler finishes it by itself (the reservation is discarded).
+    b.ring.start_reconciler();
+    wait("the unfinished Join was discarded", || {
+        b.ring.membership_state() == Ok(MembershipState::None)
+    });
+    assert!(profile(&b).pending_join.is_none());
+}
+
+#[test]
+fn a_live_join_is_busy_not_finishing() {
+    let relay = Relay::start();
+    let b = Computer::new(&relay);
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b
+        .ring
+        .begin_join_cancellable(
+            &b.ring.local_companion_client().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+    assert!(b.ring.adoption_busy());
+    assert_eq!(b.ring.membership_state().unwrap(), MembershipState::None);
+    offer.cancel_join();
+    drop(offer);
+    assert!(!b.ring.adoption_busy());
+    assert_eq!(b.ring.membership_state().unwrap(), MembershipState::None);
+}
