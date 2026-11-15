@@ -442,8 +442,14 @@ fn crash_after_accepted_reconciles() {
         assert!(Instant::now() < until, "the Join was never finished");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The reopened Desktop's in-memory chain follows the store a moment later.
+    wait("the finished Join's chain is loaded", || {
+        w.ring.chain().is_some()
+    });
     let chain = w.ring.chain().unwrap();
-    assert_eq!(w.daemon_chain().unwrap().head(), chain.head());
+    wait("the Daemon holds the finished chain", || {
+        w.daemon_chain().is_some_and(|d| d.head() == chain.head())
+    });
     assert!(chain.authorized_member(&w.desktop_key()).is_some());
 }
 

@@ -1088,6 +1088,37 @@ fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
     (bytes, build)
 }
 
+/// [`update_fixture_bytes`] of an older commit: another commit id and an earlier commit
+/// time (equal-length stamp edits only).
+fn older_build_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
+    let mut bytes = fs::read(bin()).unwrap();
+    let original = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
+    let stamp = format!(
+        "@@XSHELL-BUILD-V1:{}:{}@@",
+        original.display(),
+        original.time
+    );
+    let older_time = (original.time - 1).to_string();
+    assert_eq!(older_time.len(), original.time.to_string().len());
+    let mut commit = original.display().into_bytes();
+    commit[0] = if commit[0] == b'0' { b'1' } else { b'0' };
+    let replacement = format!(
+        "@@XSHELL-BUILD-V1:{}:{older_time}@@",
+        String::from_utf8(commit).unwrap()
+    );
+    let mut count = 0;
+    for i in 0..=bytes.len() - stamp.len() {
+        if bytes[i..].starts_with(stamp.as_bytes()) {
+            bytes[i..i + stamp.len()].copy_from_slice(replacement.as_bytes());
+            count += 1;
+        }
+    }
+    assert!(count > 0);
+    let build = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
+    assert!(build.time < original.time && !build.same(&original));
+    (bytes, build)
+}
+
 fn stage_fixture(h: &TestHome, bytes: &[u8], build: &xshell_protocol::build::BuildId) -> String {
     use base64::Engine;
     use sha2::{Digest, Sha256};
@@ -1289,15 +1320,17 @@ fn native_selected_record_validation_and_valid_older_bundle_fallback() {
     assert!(xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).is_err());
 }
 
-/// A5: a `selected` record of this version but another build (left by a replaced Desktop)
-/// never keeps that build running. With the Desktop's embedded Daemon installed where the
-/// Desktop installs it, that build starts and the record is rewritten to it; a sidecar
-/// elsewhere wins the start but leaves the record; a record of exactly this build is used.
+/// A5: a `selected` record of this version but an older build (left by a replaced
+/// Desktop) never keeps that build running. With the Desktop's embedded Daemon installed
+/// where the Desktop installs it, that build starts and the record is rewritten to it; a
+/// sidecar elsewhere wins the start but leaves the record; a record of exactly this build
+/// is used. (A same-version build that is not older is an update and stays selected:
+/// `selected_update_owner_restart_restores_uuid_and_preserves_quit`.)
 #[test]
-fn same_version_other_build_selected_record_yields_to_the_embedded_build() {
+fn same_version_older_build_selected_record_yields_to_the_embedded_build() {
     use sha2::{Digest, Sha256};
     let h = TestHome::new_private_home();
-    let (bytes, build) = update_fixture_bytes();
+    let (bytes, build) = older_build_fixture_bytes();
     let other = xshell_protocol::build::install_dir_name(env!("CARGO_PKG_VERSION"), Some(&build));
     xshelld::stage::stage(
         &h.home(),

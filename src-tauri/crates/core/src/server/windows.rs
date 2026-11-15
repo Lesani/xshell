@@ -191,12 +191,15 @@ pub fn windows_spawn_target(home: &Path, bundled: &Path) -> io::Result<PathBuf> 
     let identity = native_identity(&selected)?;
     let selected_version = semver::Version::parse(&identity.version).map_err(io::Error::other)?;
     let own_version = semver::Version::parse(&own.version).map_err(io::Error::other)?;
-    // Only a newer version (an update made on this machine) or exactly our build is
-    // honoured. An older version, or the same version of another build, is a record left
-    // by a replaced Desktop: never keep that build running; record ours instead.
+    // A newer version (an update made on this machine), exactly our build, or another
+    // build of our version that is not older (an update to that build, #77) is honoured.
+    // An older version, or an older build of our version, is a record left by a replaced
+    // Desktop: never keep that build running; record ours instead (A5).
     let honoured = match selected_version.cmp_precedence(&own_version) {
         std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Equal => identity.build.same(&own.build),
+        std::cmp::Ordering::Equal => {
+            identity.build.same(&own.build) || identity.build.time >= own.build.time
+        }
         std::cmp::Ordering::Less => false,
     };
     if honoured {
