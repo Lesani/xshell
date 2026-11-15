@@ -82,6 +82,7 @@ fn authorized_locked(
 enum Job {
     Write(Vec<u8>, Reply),
     Commit(Reply),
+    Abort(Reply),
 }
 
 struct Active {
@@ -175,6 +176,7 @@ impl Staging {
             file: Some(file),
             verifier: Some(verifier),
             published: false,
+            finished: false,
         };
         let idle = d.cfg.stage_idle;
         std::thread::Builder::new()
@@ -254,13 +256,15 @@ impl Staging {
             Ok(()) => None,
             Err(TrySendError::Full(job)) => {
                 // The disk is slow: wait for a place (bounded by the queue).
-                if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r))) = tx.send(job) {
+                if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r) | Job::Abort(r))) =
+                    tx.send(job)
+                {
                     self.forget(stage);
                     r(Err("the update was stopped".into()));
                 }
                 None
             }
-            Err(TrySendError::Disconnected(Job::Write(_, r) | Job::Commit(r))) => {
+            Err(TrySendError::Disconnected(Job::Write(_, r) | Job::Commit(r) | Job::Abort(r))) => {
                 self.forget(stage);
                 r(Err("the update was stopped".into()));
                 None
@@ -283,7 +287,8 @@ impl Staging {
         let Some(tx) = tx else {
             return reply(Err("unknown update stage".into()));
         };
-        if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r))) = tx.send(Job::Commit(reply))
+        if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r) | Job::Abort(r))) =
+            tx.send(Job::Commit(reply))
         {
             self.forget(stage);
             r(Err("the update was stopped".into()));
@@ -291,13 +296,24 @@ impl Staging {
     }
 
     /// `daemon.stage-abort`: answered `null` also for an unknown stage.
-    pub fn abort(&self, who: Requester, stage: Uuid) {
-        let mut slot = self.slot.lock().unwrap();
-        if slot
-            .as_ref()
-            .is_some_and(|a| a.id == stage && a.conn == who.conn && !a.committing)
+    /// The answer comes once the stage's reservation is released and its part file is gone
+    /// (after a commit in progress, when there is one), so a client that got it can always
+    /// begin again.
+    pub fn abort(&self, who: Requester, stage: Uuid, reply: Reply) {
+        let tx = {
+            let slot = self.slot.lock().unwrap();
+            slot.as_ref()
+                .filter(|a| a.id == stage && a.conn == who.conn)
+                .map(|a| a.tx.clone())
+        };
+        let Some(tx) = tx else {
+            return reply(Ok(Value::Null));
+        };
+        // A worker that is gone already finished its cleanup.
+        if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r) | Job::Abort(r))) =
+            tx.send(Job::Abort(reply))
         {
-            *slot = None;
+            r(Ok(Value::Null));
         }
     }
 
@@ -408,9 +424,12 @@ struct Worker {
     file: Option<fs::File>,
     verifier: Option<crate::stage::Verifier>,
     published: bool,
+    finished: bool,
 }
 
 impl Worker {
+    /// Every final answer is sent after [`Worker::finish`]: the reservation is released and
+    /// the part file gone before the client hears back.
     fn run(mut self, rx: mpsc::Receiver<Job>, idle: Duration) {
         loop {
             match rx.recv_timeout(idle) {
@@ -418,8 +437,9 @@ impl Worker {
                     Ok(received) => reply(Ok(json!(StageReceived { received }))),
                     Err(e) => {
                         crate::log!("WARN", "update stage {}: {e}", self.id);
+                        self.finish();
                         reply(Err(format!("{e}; the update was stopped")));
-                        return;
+                        return drain(&rx);
                     }
                 },
                 Ok(Job::Commit(reply)) => {
@@ -427,15 +447,38 @@ impl Worker {
                     if let Err(e) = &r {
                         crate::log!("WARN", "update stage {}: {e}", self.id);
                     }
+                    self.finish();
                     reply(r.map(|dir| json!(StageCommitted { dir })));
-                    return;
+                    return drain(&rx);
+                }
+                Ok(Job::Abort(reply)) => {
+                    self.finish();
+                    reply(Ok(Value::Null));
+                    return drain(&rx);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     crate::log!("INFO", "update stage {}: idle; removed", self.id);
-                    return;
+                    return self.finish();
                 }
-                // Aborted, replaced, or its connection closed.
-                Err(RecvTimeoutError::Disconnected) => return,
+                // Replaced, or its connection closed.
+                Err(RecvTimeoutError::Disconnected) => return self.finish(),
+            }
+        }
+    }
+
+    /// Release the reservation and remove the part file (unless published). Once.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if !self.published {
+            let _ = fs::remove_file(&self.part);
+        }
+        if let Some(slot) = self.slot.upgrade() {
+            let mut slot = slot.lock().unwrap();
+            if slot.as_ref().is_some_and(|a| a.id == self.id) {
+                *slot = None;
             }
         }
     }
@@ -530,16 +573,18 @@ impl Worker {
     }
 }
 
+/// Answer what was queued behind a final job: the stage is over.
+fn drain(rx: &mpsc::Receiver<Job>) {
+    while let Ok(job) = rx.try_recv() {
+        match job {
+            Job::Abort(r) => r(Ok(Value::Null)),
+            Job::Write(_, r) | Job::Commit(r) => r(Err("the update was stopped".into())),
+        }
+    }
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(&self.part);
-        }
-        if let Some(slot) = self.slot.upgrade() {
-            let mut slot = slot.lock().unwrap();
-            if slot.as_ref().is_some_and(|a| a.id == self.id) {
-                *slot = None;
-            }
-        }
+        self.finish();
     }
 }
