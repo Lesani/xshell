@@ -775,3 +775,63 @@ fn transitional_stores_on_both_sides_are_set_aside_and_create_works() {
     assert_ne!(new_daemon, old_daemon_key, "the Daemon rotated too");
     assert!(created.authorized_member(&new_daemon).is_some());
 }
+
+#[test]
+fn approver_removed_between_consent_and_publication_cannot_publish() {
+    use xshell_hostlink::ring::{AdoptionTestHook, AdoptionTestPoint};
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    a.create();
+    // b approves, paused after the joining keys' proofs arrived, before publication.
+    let gate = Arc::new((
+        std::sync::Mutex::new((false, false)),
+        std::sync::Condvar::new(),
+    ));
+    let hook_gate = gate.clone();
+    let b = Computer::with_ring_config(&relay, move |c| {
+        c.adoption_test_hook = Some(AdoptionTestHook(Arc::new(move |p| {
+            if p == AdoptionTestPoint::ApprovalProofsReceived {
+                let (lock, cv) = &*hook_gate;
+                let mut st = lock.lock().unwrap();
+                st.0 = true;
+                cv.notify_all();
+                while !st.1 {
+                    st = cv.wait(st).unwrap();
+                }
+            }
+        })));
+    });
+    b.join(&a);
+    connected(&b);
+    connected(&a);
+    let b_key = profile(&b).keys.sign_key();
+    let c = Computer::new(&relay);
+    let offer = c.ring.begin_join(&c.companion()).unwrap();
+    let code = offer.code.clone();
+    std::thread::scope(|scope| {
+        let approval = scope.spawn(|| b.ring.approve_device_code(&code));
+        {
+            let (lock, cv) = &*gate;
+            let mut st = lock.lock().unwrap();
+            while !st.0 {
+                st = cv.wait_timeout(st, Duration::from_millis(50)).unwrap().0;
+            }
+        }
+        // Meanwhile another device removes the approver.
+        a.ring.remove_member(&b_key).unwrap();
+        {
+            let (lock, cv) = &*gate;
+            lock.lock().unwrap().1 = true;
+            cv.notify_all();
+        }
+        assert!(
+            approval.join().unwrap().is_err(),
+            "a removed approver cannot publish"
+        );
+        assert!(offer.wait().is_err(), "the joining machine is not enrolled");
+    });
+    let head = a.ring.chain().unwrap();
+    assert!(head
+        .authorized_member(&profile(&c).keys.sign_key())
+        .is_none());
+}
