@@ -268,7 +268,7 @@ export default function App() {
   const setRecentSessions = useCallback((local: SessionInfo[]) => setRecentByHost(prev => ({ ...prev, local: { identity: null, value: local } })), []);
   // Effective Host status, independent of saved SSH configurations.
   const localAgentStatuses = useLocalAgentStatuses();
-  const [notice, setNotice] = useState<{ id: number; text: string } | null>(null);
+  const [notice, setNotice] = useState<{ id: number; text: string; good?: boolean } | null>(null);
   const showNotice = useCallback((text: string) => setNotice({ id: Date.now(), text }), []);
   const dismissNotice = useCallback(() => setNotice(null), []);
   const configuredHostsRef = useRef<HostConfig[]>([]);
@@ -1229,8 +1229,8 @@ export default function App() {
   }, []);
   const ringSetupDone = useCallback((text: string) => {
     setActiveTabId(id => (id === RING_SETUP_TAB ? "home" : id));
-    showNotice(text);
-  }, [showNotice]);
+    setNotice({ id: Date.now(), text, good: true });
+  }, []);
   // At the end of startup: the setup screen when this machine is in no Ring (D9), after old Ring
   // data was set aside, or after a removal.
   const [setupPrefs, setSetupPrefs] = useState<{ skipped: boolean; oldSeenAt: number | null } | null>(null);

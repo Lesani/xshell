@@ -55,10 +55,10 @@ export interface RemoveDialog {
 
 export function removeDialog(m: MemberView, members: MemberView[]): RemoveDialog {
   const self = isThisMachine(m);
-  if (isPhone(m)) return { title: fmtc("remove.phone.title"), body: fmtc("remove.phone.body", { name: m.name }), self };
+  if (isPhone(m)) return { title: fmtc("remove.phone.title", { name: m.name }), body: fmtc("remove.phone.body", { name: m.name }), self };
   if (members.filter(isMachine).length === 1) return { title: fmtc("remove.last.title"), body: fmtc("remove.last.body"), self };
   if (self) return { title: fmtc("remove.self.title"), body: fmtc("remove.self.body"), self };
-  return { title: fmtc("remove.other.title"), body: fmtc("remove.other.body", { name: m.name }), self };
+  return { title: fmtc("remove.other.title", { name: m.name }), body: fmtc("remove.other.body", { name: m.name }), self };
 }
 
 const REMOVE_ERRORS: Record<string, CopyKey> = {

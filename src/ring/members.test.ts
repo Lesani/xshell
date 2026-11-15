@@ -31,9 +31,9 @@ describe("Ring members", () => {
     expect(removeDialog(me, all).title).toBe(fmtc("remove.self.title"));
     expect(removeDialog(me, all).body).toBe(fmtc("remove.self.body"));
     expect(removeDialog(me, all).self).toBe(true);
-    expect(removeDialog(phone, all)).toEqual({ title: "Remove this phone?", body: fmtc("remove.phone.body", { name: "Pixel" }), self: false });
+    expect(removeDialog(phone, all)).toEqual({ title: "Remove Pixel?", body: fmtc("remove.phone.body", { name: "Pixel" }), self: false });
     expect(removeDialog(me, [me, phone]).title).toBe("Remove the last machine?");
-    expect(removeDialog(tower, all)).toEqual({ title: "Remove this machine?", body: fmtc("remove.other.body", { name: "tower" }), self: false });
+    expect(removeDialog(tower, all)).toEqual({ title: "Remove tower?", body: fmtc("remove.other.body", { name: "tower" }), self: false });
   });
 
   it("errors: offline/conflict/uncertain and the gaps → their keys, never raw text", () => {

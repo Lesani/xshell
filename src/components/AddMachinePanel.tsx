@@ -85,7 +85,7 @@ export function AddMachinePanel({ approve, disabled = false }: { approve: (words
       </div>
       <div id={noteId} aria-live="polite">
         {st.kind === "checking" && <div className="host-row-note">{C["add.checking"]}</div>}
-        {st.kind === "done" && <div className="host-row-note" data-add-done>{fmtc("add.done", { name: st.names.join(", ") })}</div>}
+        {st.kind === "done" && <div className="host-row-note" data-add-done>{fmtc("add.done", { name: [...new Set(st.names)].join(", ") })}</div>}
         {st.kind === "failed" && <div className="host-form-error" role="alert">{fmtc(st.key)}</div>}
       </div>
     </div>
