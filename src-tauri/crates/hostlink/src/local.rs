@@ -523,10 +523,39 @@ impl LocalDaemon {
     /// nothing listens.
     fn try_connect(&self, cancel: &CancelToken) -> Result<Option<LocalStream>, DialError> {
         match connect_local(&self.live_socket(), cancel, CONNECT_TIMEOUT) {
+            // A previous build's GUI-bound Daemon whose Desktop is gone (still ending, or
+            // stuck): taken over without asking anyone; then nothing listens.
+            #[cfg(target_os = "linux")]
+            Ok(s) if self.foreign_gui_bound() && self.take_over_orphan(&s) => Ok(None),
             Ok(s) => self.accept(s).map(Some),
             Err(e) if e.no_listener() => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// The GUI-bound Daemon serving `s` has lost its Desktop (its `--parent-pid` is gone, or
+    /// no longer its parent): end it (SIGCONT, SIGTERM through a handle pinned to it) and wait
+    /// until it is gone. `false`: its Desktop still runs (A10), or it is not ours to end.
+    #[cfg(target_os = "linux")]
+    fn take_over_orphan(&self, s: &LocalStream) -> bool {
+        let Ok(pinned) = Pinned::peer(s) else {
+            return false;
+        };
+        if !gui_bound_orphan(pinned.pid) {
+            return false;
+        }
+        let socket = self.live_socket();
+        let _ = pinned.signal(&socket, libc::SIGCONT);
+        if pinned.signal(&socket, libc::SIGTERM).is_err() {
+            return pinned.exited();
+        }
+        wait_for(Instant::now() + STOP_WAIT, || {
+            pinned.exited()
+                || matches!(
+                    connect_local(&socket, &CancelToken::new(), Duration::from_millis(200)),
+                    Err(e) if e.no_listener()
+                )
+        })
     }
 
     /// A Daemon answered: usable unless it is another Desktop's GUI-bound one (A10).
@@ -1319,6 +1348,32 @@ fn wait_or_kill(mut c: Child, deadline: Instant) {
     let _ = c.wait();
 }
 
+/// Whether `pid`, a `serve --gui-bound --parent-pid P`, has lost its Desktop: P is gone or
+/// is no longer its parent (it was reparented). Anything unreadable: not an orphan.
+#[cfg(target_os = "linux")]
+fn gui_bound_orphan(pid: i32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    let Some(parent) = argv
+        .iter()
+        .position(|a| *a == b"--parent-pid")
+        .and_then(|i| argv.get(i + 1))
+        .and_then(|p| std::str::from_utf8(p).ok()?.parse::<i32>().ok())
+    else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let ppid = stat
+        .rfind(')')
+        .and_then(|i| stat[i + 1..].split_whitespace().nth(1))
+        .and_then(|p| p.parse::<i32>().ok());
+    ppid != Some(parent)
+}
+
 /// Ask a GUI-bound child to shut down in order: SIGTERM, on Windows its stop event. A child
 /// that has no stop event yet has started nothing, so it is killed.
 #[cfg(unix)]
@@ -1577,7 +1632,7 @@ fn spawn_retrying(cmd: &mut Command) -> io::Result<Child> {
 const VERSION_WAIT: Duration = Duration::from_secs(10);
 
 /// The build `bin --version` reports (`None`: unknown, or not an xshelld's answer).
-fn bin_build(bin: &Path) -> io::Result<Option<BuildId>> {
+pub fn bin_build(bin: &Path) -> io::Result<Option<BuildId>> {
     let mut cmd = Command::new(bin);
     cmd.arg("--version")
         .stdin(Stdio::null())

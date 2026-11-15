@@ -370,6 +370,7 @@ pub fn resolve_local(
     unix: bool,
     embedded: bool,
     install_bin: Option<&Path>,
+    sidecar_matches: &dyn Fn(&Path) -> bool,
 ) -> LocalMode {
     if !unix {
         return match resolve_daemon_binary(exe_dir, env) {
@@ -393,7 +394,12 @@ pub fn resolve_local(
         return file(PathBuf::from(p));
     }
     let sidecar = exe_dir.map(|d| d.join(daemon_file_name()));
-    if let Some(s) = sidecar.as_ref().filter(|s| s.is_file()) {
+    // A sidecar of another build (an older xshell's, left in ~/.xshell/bin) is ignored when
+    // this Desktop carries its own Daemon; without one it is used, and refused at start.
+    if let Some(s) = sidecar
+        .as_ref()
+        .filter(|s| s.is_file() && (!embedded || sidecar_matches(s)))
+    {
         return file(s.clone());
     }
     if embedded {
@@ -415,6 +421,33 @@ pub fn resolve_local(
     }
 }
 
+/// Logged when a sidecar of another build is ignored for the embedded Daemon.
+pub const IGNORED_SIDECAR: &str = "The older background program beside the app cannot be used.";
+
+/// Whether the sidecar in `exe_dir` is ignored: it exists, this Desktop embeds its own
+/// Daemon, and the sidecar is another build.
+pub fn sidecar_ignored(
+    exe_dir: Option<&Path>,
+    embedded: bool,
+    sidecar_matches: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let Some(s) = exe_dir.map(|d| d.join(daemon_file_name())) else {
+        return false;
+    };
+    embedded && s.is_file() && !sidecar_matches(&s)
+}
+
+/// Whether the binary at `p` reports `build` (`--version`); an unknown own build matches.
+pub fn binary_is_build(p: &Path, build: Option<&xshell_protocol::build::BuildId>) -> bool {
+    match build {
+        None => true,
+        Some(b) => xshell_hostlink::local::bin_build(p)
+            .ok()
+            .flatten()
+            .is_some_and(|f| f.same(b)),
+    }
+}
+
 /// The Daemon's file name on this platform.
 pub fn daemon_file_name() -> String {
     format!("xshelld{}", std::env::consts::EXE_SUFFIX)
@@ -433,7 +466,7 @@ mod tests {
 
     fn resolve_win(dir: Option<&Path>, env: &[(&str, &str)]) -> LocalMode {
         let env = env_of(env);
-        resolve_local(dir, &|k| env.get(k).cloned(), false, true, None)
+        resolve_local(dir, &|k| env.get(k).cloned(), false, true, None, &|_| true)
     }
 
     fn resolve_unix(
@@ -443,7 +476,14 @@ mod tests {
         install: Option<&Path>,
     ) -> LocalMode {
         let env = env_of(env);
-        resolve_local(dir, &|k| env.get(k).cloned(), true, embedded, install)
+        resolve_local(
+            dir,
+            &|k| env.get(k).cloned(),
+            true,
+            embedded,
+            install,
+            &|_| true,
+        )
     }
 
     fn file(bin: PathBuf) -> LocalMode {
@@ -521,6 +561,86 @@ mod tests {
             ),
             LocalMode::InProcess { .. }
         ));
+    }
+
+    /// A real stale sidecar (another build's `--version`) is ignored when this Desktop
+    /// embeds its Daemon; a matching one and `XSHELL_DAEMON_BIN` keep winning; without an
+    /// embedded Daemon the stale one is selected (and refused at start).
+    #[cfg(unix)]
+    #[test]
+    fn stale_sidecar_is_ignored_for_the_embedded_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("bin");
+        std::fs::create_dir(&app).unwrap();
+        let sidecar = app.join("xshelld");
+        let install = t
+            .path()
+            .join("home/.xshell/server/1.5.0+48511d0d3473/xshelld");
+        let own = xshell_protocol::build::BuildId {
+            commit: "48511d0d3473".into(),
+            dirty: None,
+            time: 2,
+        };
+        let write = |commit: &str| {
+            let line = serde_json::json!({
+                "name": "xshelld", "version": "1.5.0", "protocol": {"min": 1, "max": 1},
+                "os": "Linux", "arch": "x86_64",
+                "build": {"commit": commit, "dirty": null, "time": 1}
+            });
+            std::fs::write(&sidecar, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let matches = |p: &Path| binary_is_build(p, Some(&own));
+        let env: HashMap<String, OsString> = HashMap::new();
+        let resolve = |embedded: bool| {
+            resolve_local(
+                Some(&app),
+                &|k| env.get(k).cloned(),
+                true,
+                embedded,
+                Some(&install),
+                &matches,
+            )
+        };
+        write("42c9be9636a9");
+        assert!(!binary_is_build(&sidecar, Some(&own)));
+        assert!(sidecar_ignored(Some(&app), true, &matches));
+        assert_eq!(
+            resolve(true),
+            LocalMode::Daemon {
+                bin: install.clone(),
+                source: DaemonSource::Embedded
+            }
+        );
+        assert_eq!(
+            IGNORED_SIDECAR,
+            "The older background program beside the app cannot be used."
+        );
+        // No embedded Daemon: the mismatching sidecar is selected, never ignored.
+        assert!(!sidecar_ignored(Some(&app), false, &matches));
+        assert_eq!(resolve(false), file(sidecar.clone()));
+        // A matching sidecar wins (development), and so does XSHELL_DAEMON_BIN.
+        write("48511d0d3473");
+        assert!(!sidecar_ignored(Some(&app), true, &matches));
+        assert_eq!(resolve(true), file(sidecar.clone()));
+        write("42c9be9636a9");
+        let env2: HashMap<String, OsString> = [(
+            "XSHELL_DAEMON_BIN".to_string(),
+            OsString::from("/dev/xshelld"),
+        )]
+        .into();
+        assert_eq!(
+            resolve_local(
+                Some(&app),
+                &|k| env2.get(k).cloned(),
+                true,
+                true,
+                Some(&install),
+                &matches
+            ),
+            file("/dev/xshelld".into())
+        );
     }
 
     #[test]

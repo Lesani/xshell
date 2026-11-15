@@ -108,7 +108,6 @@ else
 fi
 
 report=$("$bin" service install --json)
-mechanism=$(printf '%s\n' "$report" | sed -n 's/.*"mechanism":"\([a-z]*\)".*/\1/p')
 
 # A running xshelld of another build moves onto this one: in place where it can; an older
 # one is asked to exit and waited for, then this build is selected (P1-3).
@@ -129,13 +128,8 @@ while :; do
   sleep 0.5
 done
 
-case "$mechanism" in
-  systemd) echo "xshell is running and starts after reboot (systemd)." ;;
-  cron) echo "xshell is running and starts after reboot (cron)." ;;
-  profile)
-    echo "xshell is running, but will not start automatically after this machine restarts."
-    echo "After this machine restarts, sign in with your usual shell to start xshell." ;;
-esac
+# The status line (copy cli.service.*), as `xshelld service status` prints it.
+"$bin" service status | head -n 1
 
 if [ -d "$HOME/.local/bin" ]; then
   ln -sf "$launcher" "$HOME/.local/bin/xshelld"
