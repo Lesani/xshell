@@ -209,7 +209,7 @@ impl DesktopRing {
     }
 
     /// The same elected startup path used by Tauri before any adoption action.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn register_local_companion(
         &self,
         daemon: &crate::LocalDaemon,

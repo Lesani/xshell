@@ -648,7 +648,7 @@ pub fn select_remote(
 pub fn local_server_bin(home: &std::path::Path, dir: &str) -> PathBuf {
     xshell_core::server::server_root(home)
         .join(dir)
-        .join("xshelld")
+        .join(format!("xshelld{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Copy the app's `xshelld` (`src`) to [`local_server_bin`] unless an identical private copy
@@ -724,6 +724,80 @@ pub fn install_local_bytes(
         let _ = std::fs::remove_file(&tmp);
     }
     r.map(|_| dest)
+}
+
+/// Windows [`install_local`]: reads `src` and installs its bytes.
+#[cfg(windows)]
+pub fn install_local(
+    src: &std::path::Path,
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(src)?;
+    install_local_bytes(&bytes, home, dir_name)
+}
+
+/// Windows [`install_local`] from bytes in memory (the Desktop's embedded `xshelld.exe`):
+/// `home\.xshell\server\<dir_name>\xshelld.exe`, every directory private to this user
+/// and no reparse point on the way. An identical file is left alone (a running Daemon of
+/// this build keeps running from it); otherwise a new private file is written, synced and
+/// renamed over it. A destination that cannot be replaced because it runs is accepted
+/// when it reports this build's identity.
+#[cfg(windows)]
+pub fn install_local_bytes(
+    bytes: &[u8],
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    if !valid_version(dir_name) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid version string {dir_name:?}"),
+        ));
+    }
+    let dir = xshell_core::server::windows_server_root(home)?.join(dir_name);
+    xshell_core::private_fs::ensure_dir(&dir)?;
+    xshell_core::server::no_reparse(&dir)?;
+    let dest = dir.join("xshelld.exe");
+    if let Ok(m) = std::fs::symlink_metadata(&dest) {
+        let same = m.file_type().is_file()
+            && m.len() == bytes.len() as u64
+            && std::fs::read(&dest).is_ok_and(|b| b == bytes);
+        if same {
+            return Ok(dest);
+        }
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".xshelld.{}.{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let r = (|| {
+        let mut f = xshell_core::private_fs::create_new(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &dest)
+    })();
+    match r {
+        Ok(()) => Ok(dest),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // A running image cannot be replaced; one of this very version and build is
+            // what we wanted to install anyway.
+            match xshell_core::server::native_identity(&dest) {
+                Ok(id)
+                    if xshell_protocol::build::install_dir_name(&id.version, Some(&id.build))
+                        == dir_name =>
+                {
+                    Ok(dest)
+                }
+                _ => Err(e),
+            }
+        }
+    }
 }
 
 /// `home/.xshell/server/<dir_name>`, created where missing: every directory on the way 0700
@@ -844,6 +918,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn local_server_bin_exe_suffix() {
+        let bin = local_server_bin(std::path::Path::new("/h"), "1.6.0+abc");
+        assert_eq!(
+            bin,
+            xshell_core::server::server_root(std::path::Path::new("/h"))
+                .join("1.6.0+abc")
+                .join(if cfg!(windows) {
+                    "xshelld.exe"
+                } else {
+                    "xshelld"
+                })
+        );
+    }
 
     #[cfg(unix)]
     #[test]

@@ -122,6 +122,27 @@ pub(super) fn retire_for_format_reset(store: &Store) -> Result<(), String> {
     }
     Ok(())
 }
+/// A startup reservation found on Windows can only come from an unmerged x87 build (this
+/// build never writes one). It would block registration and the format-1 set-aside for
+/// good, so it is renamed aside at start, as [`retire_for_format_reset`] does on Unix. A
+/// local deny-only marker; no Ring state changes.
+#[cfg(windows)]
+pub(super) fn set_aside_stale_reservation(store: &Store) -> Result<(), String> {
+    let from = store.dir.join("companion-pending.json");
+    match std::fs::symlink_metadata(&from) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => {}
+    }
+    std::fs::rename(
+        &from,
+        store.dir.join(format!(
+            "companion-pending.json.v1-{}",
+            super::registry::now_ms()
+        )),
+    )
+    .map_err(|e| e.to_string())
+}
 pub(super) fn validate_install_locked(
     store: &Store,
     operation: &str,

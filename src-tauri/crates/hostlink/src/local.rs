@@ -66,6 +66,11 @@ pub fn local_log_path(home: &Path) -> PathBuf {
     home.join(".xshell").join("log").join("xshelld.log")
 }
 
+/// The Daemon's Ring store, as `xshelld`'s `paths::resolve` places it.
+pub fn local_daemon_ring_dir(home: &Path) -> PathBuf {
+    home.join(".xshell").join("daemon").join("ring")
+}
+
 /// The mode marker (`gui-bound` / `persistent`): how the Daemon that last held the lock runs.
 pub fn local_mode_path(home: &Path) -> PathBuf {
     home.join(".xshell").join("daemon").join("mode")
@@ -786,6 +791,38 @@ impl LocalDaemon {
                 return Err("counterpart registration pending: helper deadline".into());
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Windows: waits for the live GUI-bound Daemon's counterpart pipe, then runs `action`
+    /// on it. Never starts anything (no reservation, no registration child): the Local
+    /// Host's dialer owns the start, its failure view and Retry; the caller retries.
+    #[cfg(windows)]
+    pub fn with_registration_endpoint<T>(
+        &self,
+        _desktop_store: &Path,
+        action: impl FnOnce(&crate::ring::companion_ipc::CompanionClient) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use xshell_protocol::ring::companion::CompanionRequest;
+        let daemon_store = local_daemon_ring_dir(&self.home);
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            let last = match crate::ring::companion_ipc::CompanionClient::for_store(&daemon_store) {
+                Ok(client) => match client.request(CompanionRequest::Descriptor) {
+                    Ok(_) => return action(&client),
+                    Err(e) => e,
+                },
+                Err(e) => e,
+            };
+            if Instant::now() >= until {
+                return Err(format!(
+                    "protected counterpart readiness unavailable: {last}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -1855,6 +1892,10 @@ mod tests {
             PathBuf::from("/h/.xshell/log/xshelld.log")
         );
         assert_eq!(local_mode_path(h), PathBuf::from("/h/.xshell/daemon/mode"));
+        assert_eq!(
+            local_daemon_ring_dir(h),
+            PathBuf::from("/h/.xshell/daemon/ring")
+        );
         assert_eq!(
             local_pid_path(Path::new("/r/xshell/daemon.sock")),
             PathBuf::from("/r/xshell/daemon.pid")

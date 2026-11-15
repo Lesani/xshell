@@ -702,6 +702,14 @@ impl Server {
             ring::ownership::StoreOwnership::Acquired(lease) => lease,
             ring::ownership::StoreOwnership::Busy => return Err(StartError::AlreadyRunning),
         };
+        // Only an unmerged x87 build wrote a Windows startup reservation; it would block
+        // registration for good.
+        #[cfg(windows)]
+        if let Err(e) =
+            companion::set_aside_stale_reservation(&ring::Store::new(cfg.paths.ring_dir.clone()))
+        {
+            crate::log!("ERROR", "ring: cannot set the stale reservation aside: {e}");
+        }
         let paths = cfg.paths.clone();
         check_endpoint(&paths.socket)?;
         // The lock's directory: the socket's on Unix.
