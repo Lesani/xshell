@@ -985,6 +985,8 @@ fn selected_linux(
     let root = xshell_core::server::server_root(&d.cfg.home);
     let file = xshell_core::server::valid_install(&root, &dir)
         .ok_or_else(|| format!("{dir} is not installed"))?;
+    // C8: before the installed build runs at all.
+    super::staging::authorized(d, who)?;
     let (v, b) = crate::stage::native_identity(&file).map_err(|e| e.to_string())?;
     if v != version || !b.is_some_and(|b| b.same(build)) {
         return Err("installed target identity differs".into());
