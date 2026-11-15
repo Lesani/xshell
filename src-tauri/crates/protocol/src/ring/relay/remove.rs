@@ -214,10 +214,14 @@ fn publish_once(
     }
 }
 
-/// Read the Relay's accepted chain on `connector`'s connection and decide what became of
-/// `op`. Never publishes. A self-removal that was accepted closes this device's
-/// connection: that read then gives [`Resume::Retry`], and the owner learns the outcome
-/// from [`super::check_removal`] instead.
+/// What became of a stored `op`, from the Relay's accepted chain on `connector`'s
+/// connection. The removal is in the chain (or the unit is retired anyway): `Done`. The
+/// head moved past the record's predecessor without it: `NotDone` (the stored candidate
+/// can never be accepted). The head is still the predecessor: the identical stored signed
+/// candidate is sent again (idempotent; it completes the user's own action and is no new
+/// operation): `Done` once the Relay holds it, `Retry` when offline. A self-removal that
+/// was accepted closes this device's connection: the read then gives [`Resume::Retry`],
+/// and the owner learns the outcome from [`super::check_removal`].
 pub fn resume_removal(connector: &Connector, op: &RemovalOp) -> Resume<RosterChain> {
     let (Ok(candidate), Ok(pin)) = (op.candidate(), op.predecessor()) else {
         return Resume::NotDone {
@@ -227,19 +231,39 @@ pub fn resume_removal(connector: &Connector, op: &RemovalOp) -> Resume<RosterCha
     let Ok(accepted) = connector.read_accepted_chain(&pin) else {
         return Resume::Retry;
     };
-    let retired = accepted
-        .head()
-        .roster()
-        .membership()
-        .is_ok_and(|m| m.retired.contains(&op.enrollment_id));
-    if accepted.get(candidate.version()) == Some(&candidate) || retired {
-        Resume::Done(accepted)
-    } else {
-        Resume::NotDone {
+    let retired = |c: &RosterChain| {
+        c.head()
+            .roster()
+            .membership()
+            .is_ok_and(|m| m.retired.contains(&op.enrollment_id))
+    };
+    if accepted.get(candidate.version()) == Some(&candidate) || retired(&accepted) {
+        return Resume::Done(accepted);
+    }
+    if accepted.head().version() != pin.version {
+        return Resume::NotDone {
             standalone_removed: false,
+        };
+    }
+    match publish_once(connector, op, Instant::now() + RESEND_WAIT) {
+        Ok(chain) => Resume::Done(chain),
+        Err(RemoveError::Conflict | RemoveError::Refused(_)) => {
+            match connector.read_accepted_chain(&pin) {
+                Ok(c) if c.get(candidate.version()) == Some(&candidate) || retired(&c) => {
+                    Resume::Done(c)
+                }
+                Ok(_) => Resume::NotDone {
+                    standalone_removed: false,
+                },
+                Err(_) => Resume::Retry,
+            }
         }
+        Err(_) => Resume::Retry,
     }
 }
+
+/// How long [`resume_removal`] waits for the Relay to take the re-sent candidate.
+const RESEND_WAIT: Duration = Duration::from_secs(15);
 
 /// [`prepare_removal`] + [`publish_removal`]; a lost answer is resolved by one
 /// [`resume_removal`]. A unit already gone is done. Needs a connected Relay: offline is

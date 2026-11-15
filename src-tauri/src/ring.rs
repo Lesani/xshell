@@ -184,14 +184,13 @@ pub fn setup(app: &AppHandle) {
     // the Daemon may have rotated its own. Followers never register another profile. The
     // registration child cannot start serve or release Computer consent.
     #[cfg(unix)]
-    if let Some(daemon) = app
-        .try_state::<crate::hosts::Hosts>()
-        .and_then(|h| h.local_daemon.clone())
     {
         let startup_ring = Arc::downgrade(&ring);
+        let registration_app = app.clone();
         std::thread::spawn(move || {
             // Retried every 2 s; a lasting refusal (e.g. an unsafe directory the owner has
-            // to fix) is logged once, not on every attempt.
+            // to fix) is logged once, not on every attempt. The Local Daemon is looked up
+            // on every turn: it can appear later (Retry after a failed start).
             let mut last_error = None;
             loop {
                 let Some(ring) = startup_ring.upgrade() else {
@@ -200,12 +199,15 @@ pub fn setup(app: &AppHandle) {
                 if ring.is_quitting() {
                     break;
                 }
-                if !ring.companion_registration_needed() {
+                let daemon = registration_app
+                    .try_state::<crate::hosts::Hosts>()
+                    .and_then(|h| h.local_daemon.clone());
+                let Some(daemon) = daemon.filter(|_| ring.companion_registration_needed()) else {
                     last_error = None;
                     drop(ring);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     continue;
-                }
+                };
                 match ring.register_local_companion(&daemon) {
                     Ok(Some(_)) => last_error = None,
                     Ok(None) => {} // followers wait; only an elected successor may register

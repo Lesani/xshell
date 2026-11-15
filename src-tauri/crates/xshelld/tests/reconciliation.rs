@@ -257,6 +257,41 @@ fn process_recovery(mode: &str, cut: &str, descendant: bool, revoke: bool) {
                     AdoptionPhase::Abandoned,
                     "ended for good, so a new Join may start"
                 );
+                // No restart and no user step: the counterpart is free again (it set its
+                // removed membership aside and rotated), and a new Join succeeds.
+                wait("the Daemon set its removed membership aside", || {
+                    !b.home.paths().ring_dir.join("roster.json").exists()
+                });
+                // The approver's Desktop starts again (remove_computer stopped it).
+                let mut cfg = xshell_hostlink::ring::DesktopRingConfig::new(
+                    a.home.root().join("desktop"),
+                    "same name".into(),
+                );
+                cfg.default_relay_url = relay.url();
+                let approver =
+                    xshell_hostlink::ring::DesktopRing::open(cfg, Arc::new(fixture::Quiet));
+                wait("the approver is connected", || {
+                    approver.view().connection == "connected"
+                });
+                let client = b.companion();
+                b.ring.register_companion(&client).unwrap();
+                let offer = b.ring.begin_join(&client).unwrap();
+                let code = offer.code.clone();
+                let installed = std::thread::scope(|scope| {
+                    let approval = scope.spawn(|| approver.approve_device_code(&code));
+                    let outcome = offer.wait().unwrap();
+                    approval.join().unwrap().unwrap();
+                    outcome
+                });
+                let xshell_hostlink::ring::adoption::AdoptionOutcome::Installed { chain, .. } =
+                    installed
+                else {
+                    panic!("not installed");
+                };
+                assert!(chain
+                    .authorized_member(&stored(&b).keys.sign_key())
+                    .is_some());
+                approver.quit();
             }
             Err(error) => {
                 assert_eq!(cut, "accepted-before-journal");

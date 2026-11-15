@@ -208,6 +208,10 @@ pub enum CompanionRequest {
     /// written Daemon membership of it. Never grants or installs membership.
     AbandonExpired {
         operation: String,
+        /// Signed evidence (Roster tokens) that lets an unexpired operation be abandoned:
+        /// see [`CompanionPolicy::abandon`]. Empty: only after expiry.
+        #[serde(default)]
+        rosters: Vec<String>,
     },
 }
 
@@ -375,15 +379,47 @@ impl CompanionPolicy {
     /// enrolled (the caller verified that). It is retired so it can never install, which
     /// frees the counterpart for a new registration or Join. Refused before expiry.
     pub fn abandon_expired(&mut self, operation: &str, now: u64) -> Result<(), String> {
-        let o = self.operation(operation)?;
+        self.abandon(operation, now, None)
+    }
+    /// [`CompanionPolicy::abandon_expired`], or before expiry with signed evidence that the
+    /// operation can never install: `evidence` extends the operation's recorded predecessor
+    /// past its proposal's version, its head has no unit of the operation (another version
+    /// took the slot, or the unit was enrolled and removed), and it does not authorize this
+    /// Daemon. Error texts: `not_expired:` (retry at expiry), `unknown:` (nothing to do).
+    pub fn abandon(
+        &mut self,
+        operation: &str,
+        now: u64,
+        evidence: Option<&RosterChain>,
+    ) -> Result<(), String> {
+        let o = self
+            .operation(operation)
+            .map_err(|e| format!("unknown: {e}"))?;
         if now < o.intent.expires_at {
-            return Err("operation has not expired".into());
+            let proven = evidence.is_some_and(|chain| {
+                o.proposal.as_ref().is_some_and(|p| {
+                    p.predecessor.iter().enumerate().all(|(i, t)| {
+                        chain.versions().get(i).map(|r| r.token()) == Some(t.as_str())
+                    }) && chain.head().version() >= p.proposal.version
+                        && chain
+                            .head()
+                            .roster()
+                            .membership()
+                            .is_ok_and(|m| m.unit(operation).is_none())
+                        && chain
+                            .authorized_member(&self.profile.daemon.sign_key)
+                            .is_none()
+                })
+            });
+            if !proven {
+                return Err("not_expired: operation has not expired".into());
+            }
         }
         if !matches!(
             o.phase,
             CompanionPhase::ConsentMayHaveLeft | CompanionPhase::Accepted
         ) {
-            return Err("no consented operation to abandon".into());
+            return Err("unknown: no consented operation to abandon".into());
         }
         let old = self.obligation.take().expect("checked operation");
         if self.retired.len() < 64 {

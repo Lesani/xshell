@@ -73,7 +73,7 @@ fn daemon_chain(c: &Computer) -> Option<RosterChain> {
 }
 
 /// A phone in `c`'s Ring (through its v2 QR offer), with its own running Connector.
-fn phone(c: &Computer, n: u8) -> (Arc<DeviceKeys>, Connector) {
+fn phone(c: &Computer, n: u8) -> (Arc<DeviceKeys>, Arc<Connector>) {
     connected(c);
     let keys = Arc::new(DeviceKeys::from_seeds(&[n; 32], &[n.wrapping_add(100); 32]));
     let shown = c.ring.pair_phone(Arc::new(Quiet)).unwrap();
@@ -96,7 +96,8 @@ fn phone(c: &Computer, n: u8) -> (Arc<DeviceKeys>, Connector) {
         connect: Duration::from_secs(5),
         ..RingTimeouts::default()
     };
-    let connector = Connector::start(ConnectorConfig::new(client), Arc::new(NoEvents)).unwrap();
+    let connector =
+        Arc::new(Connector::start(ConnectorConfig::new(client), Arc::new(NoEvents)).unwrap());
     wait("phone connected", || {
         matches!(connector.state(), LinkState::Connected { .. })
     });
@@ -403,7 +404,7 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
     let chain = join_with(&b, |code| {
         let head = connector.chain().head().version();
         let prepared = prepare_approval(
-            &connector,
+            connector.clone(),
             phone_keys.clone(),
             code,
             &PairOptions::default(),
@@ -455,10 +456,22 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
         chain.head().version(),
         "prepare publishes nothing"
     );
-    let removed = publish_removal(&connector, &*phone_keys, &op, Instant::now() + WAIT).unwrap();
+    // The app died after storing the record, before sending anything: the head is still
+    // the record's predecessor, so resume sends the identical stored candidate (P1-4).
+    let removed = match resume_removal(&connector, &op) {
+        Resume::Done(chain) => chain,
+        other => panic!("{other:?}"),
+    };
     assert!(removed.authorized_member(&me).is_none());
-    // A lost answer: resume reads the chain and finds it done.
+    assert_eq!(
+        removed.get(op.candidate().unwrap().version()),
+        Some(&op.candidate().unwrap()),
+        "exactly the stored candidate"
+    );
+    // A lost answer after it landed: resume reads the chain and finds it done; a second
+    // publication of the same bytes is harmless.
     assert!(matches!(resume_removal(&connector, &op), Resume::Done(_)));
+    publish_removal(&connector, &*phone_keys, &op, Instant::now() + WAIT).unwrap();
     // Already gone: done, not an error.
     assert_eq!(
         prepare_removal(&connector, &*phone_keys, &unit.id).unwrap_err(),
@@ -548,7 +561,7 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
     let a = Computer::new(&relay);
     a.create();
     let (phone_keys, connector) = phone(&a, 32);
-    let b = Computer::new(&relay);
+    let b = Computer::with_ring_config(&relay, |c| c.pair_ttl = Duration::from_secs(6));
     standalone(b.daemon.as_ref().unwrap(), &a, &relay.url());
     wait("phone has the standalone head", || {
         connector.chain().head().version() == a.ring.chain().unwrap().head().version()
@@ -559,7 +572,7 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
     let op = std::thread::scope(|scope| {
         let joining = scope.spawn(|| offer.wait());
         let prepared = prepare_approval(
-            &connector,
+            connector.clone(),
             phone_keys.clone(),
             &code,
             &PairOptions::default(),
@@ -590,6 +603,23 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
         );
         op
     });
+    // Absent while the code is unexpired: a publication could still land (P1-4).
+    if (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs())
+        < op.expires_at
+    {
+        assert!(matches!(resume_approval(&connector, &op), Resume::Retry));
+    }
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        < op.expires_at
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     match resume_approval(&connector, &op) {
         Resume::NotDone { standalone_removed } => assert!(standalone_removed),
         other => panic!("{other:?}"),
@@ -637,4 +667,111 @@ fn removed_approver_cannot_publish() {
     assert!(offer.wait().is_err());
     let _ = CompanionResponse::Left;
     let _ = CreateDecision::Decline;
+}
+
+#[test]
+fn transitional_stores_on_both_sides_are_set_aside_and_create_works() {
+    use xshell_protocol::ring::membership::{Enrollment, Membership, RingPolicy, RosterChange};
+    use xshell_protocol::ring::{Member, Role, SignedRoster};
+    let relay = Relay::start();
+    let mut c = Computer::new(&relay);
+    let desk = Store::new(c.home.root().join("desktop"))
+        .retained_keys()
+        .unwrap();
+    let daemon = match c.companion().request(CompanionRequest::Descriptor).unwrap() {
+        CompanionResponse::Identity { identity, .. } => identity,
+        _ => panic!("no identity"),
+    };
+    let old_daemon_key = daemon.sign_key;
+    // A format-2 Ring that still carries a format-1 shape: an Upgrade without the local
+    // completion (a legacy Desktop unit next to a standalone Daemon unit).
+    let g = SignedRoster::genesis(&*desk, desk.noise_key(), "old", &relay.url(), 100).unwrap();
+    let v1 = g
+        .next(&*desk, 101, |r| {
+            r.add(Member::new(
+                "host",
+                Role::Daemon,
+                daemon.sign_key,
+                daemon.noise_key,
+                101,
+            ));
+        })
+        .unwrap();
+    let mut r = v1.roster().clone();
+    r.v = 2;
+    r.version = 3;
+    r.prev = Some(v1.hash());
+    r.issued_at = 102;
+    let unit = |n: u8, kind, key| Enrollment {
+        id: xshell_protocol::ring::b64::encode(&[n; 32]),
+        kind,
+        members: vec![key],
+        enrolled_at: 102,
+    };
+    r.set_membership(&Membership {
+        enrollments: vec![
+            unit(1, EnrollmentKind::LegacyDesktop, desk.sign_key()),
+            unit(2, EnrollmentKind::Daemon, daemon.sign_key),
+        ],
+        retired: vec![],
+        policy: RingPolicy {
+            inactivity_seconds: None,
+            activity_key: desk.sign_key(),
+        },
+        change: RosterChange::Upgrade { proofs: vec![] },
+    });
+    let up = r.sign(&*desk).unwrap();
+    let chain = RosterChain::from_chain(vec![g, v1, up]).unwrap();
+    assert!(xshell_protocol::ring::membership::unsupported_stored_membership(chain.head()));
+    // Both sides store it; then both start again.
+    c.ring.quit();
+    c.daemon.take().unwrap().shutdown();
+    Store::new(c.home.root().join("desktop"))
+        .transact(|_, _| {
+            Ok((
+                Some(xshell_hostlink::ring::store::RingState {
+                    keys: desk.clone(),
+                    chain: chain.clone(),
+                    local_member: Some(daemon.sign_key),
+                    farewells: vec![],
+                    held_relays: Default::default(),
+                    host_members: Default::default(),
+                }),
+                (),
+            ))
+        })
+        .unwrap();
+    let tokens: Vec<String> = chain
+        .versions()
+        .iter()
+        .map(|r| r.token().to_string())
+        .collect();
+    let ring_dir = c.home.paths().ring_dir;
+    std::fs::write(
+        ring_dir.join("roster.json"),
+        serde_json::to_vec(&serde_json::json!({"v": 1, "rosters": tokens})).unwrap(),
+    )
+    .unwrap();
+    let mut cfg = xshelld::server::Config::new(c.home.home(), c.home.paths());
+    cfg.ring_backoff_unit = Duration::from_millis(10);
+    c.daemon = Some(xshelld::server::Server::start(cfg).unwrap());
+    assert!(
+        !ring_dir.join("roster.json").exists(),
+        "the Daemon set it aside"
+    );
+    assert!(files(&ring_dir, "roster.json.v1-") == 1);
+    let mut rc = xshell_hostlink::ring::DesktopRingConfig::new(
+        c.home.root().join("desktop"),
+        "same name".into(),
+    );
+    rc.default_relay_url = relay.url();
+    c.ring = xshell_hostlink::ring::DesktopRing::open(rc, Arc::new(fixture::Quiet));
+    assert!(c.ring.chain().is_none(), "the Desktop set it aside");
+    assert!(c.ring.notices().unwrap().1.is_some(), "old-Ring notice");
+    // A new Desktop identity registers with the Daemon's new identity, and Create works.
+    c.ring.register_companion(&c.companion()).unwrap();
+    let created = c.create();
+    let new_daemon = profile(&c).companion.unwrap().daemon.sign_key;
+    assert_ne!(new_daemon, old_daemon_key, "the Daemon rotated too");
+    assert!(created.authorized_member(&new_daemon).is_some());
 }

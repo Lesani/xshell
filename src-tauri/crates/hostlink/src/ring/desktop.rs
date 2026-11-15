@@ -7635,6 +7635,31 @@ mod v2_edits_tests {
     }
 
     #[test]
+    fn delayed_removal_evidence_for_an_old_identity_is_discarded() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let store = Store::new(t.path().join("ring"));
+        let before = store.load_profile().unwrap().0.unwrap();
+        let fence = super::maintenance::RemovalFence::of(&before).unwrap();
+        // Evidence that removes this identity's unit.
+        let (_, mine) = removed(&t, &x, &x.me);
+        let evidence = mine.chain.clone();
+        assert!(fence.admits_for_test(&before, &evidence).is_ok());
+        // Evidence that removes another unit is never accepted for this one.
+        let (_, other) = removed(&t, &x, &x.phone.sign_key());
+        assert!(fence.admits_for_test(&before, &other.chain).is_err());
+        // Meanwhile this Desktop removed itself and became identity B: the delayed
+        // evidence about A must not set B aside.
+        store
+            .set_aside(super::super::store::AsideReason::SelfRemoved, |_| Ok(()))
+            .unwrap();
+        let after = store.load_profile().unwrap().0.unwrap();
+        assert_ne!(after.keys.sign_key(), before.keys.sign_key());
+        assert!(fence.admits_for_test(&after, &evidence).is_err());
+        x.ring.quit();
+    }
+
+    #[test]
     fn self_removal_candidate_built_and_commit_sets_aside_without_notice() {
         let t = tempfile::tempdir().unwrap();
         let x = v2_ring(&t);
