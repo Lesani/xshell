@@ -678,9 +678,13 @@ impl Machine {
             if let Ok(s) = std::os::unix::net::UnixStream::connect(self.socket()) {
                 let r = s.try_clone().unwrap();
                 let mut c = Client::from_io(r, s);
-                let (hello, list) = c.hello(range(1, 1));
-                if install_dir_name(&hello.version, hello.build.as_ref()) == want {
-                    return (c, hello, list);
+                // A Daemon on its way out (an update's re-exec) still accepts and says hello,
+                // then refuses with `shutting_down` and closes: retry, as the Desktop's
+                // supervisor does, until the successor serves.
+                if let Some((hello, list)) = try_hello(&mut c) {
+                    if install_dir_name(&hello.version, hello.build.as_ref()) == want {
+                        return (c, hello, list);
+                    }
                 }
             }
             assert!(
@@ -1586,4 +1590,37 @@ fn self_install_never_selects_beside_a_running_daemon_or_trial() {
     assert_eq!(selected(&m.h).as_deref(), Some(dir.as_str()));
     m.wait_trial_closed();
     assert_eq!(selected(&m.h).as_deref(), Some(dir.as_str()));
+}
+
+/// `hello`, or `None` when the Daemon refuses (`shutting_down`) or closes instead of
+/// sending its Terminal list.
+fn try_hello(
+    c: &mut Client,
+) -> Option<(
+    xshell_protocol::msg::Hello,
+    Vec<xshell_protocol::msg::TerminalInfo>,
+)> {
+    use xshell_protocol::msg::{Hello, ServerMsg};
+    c.send(
+        &ClientMsg::Hello(Hello {
+            protocol: range(1, 1),
+            version: "test".into(),
+            capabilities: vec!["call".into(), "term".into()],
+            build: None,
+        }),
+        None,
+    );
+    let Some(ServerMsg::Hello(h)) = c.try_msg(WAIT, |m| matches!(m, ServerMsg::Hello(_))) else {
+        return None;
+    };
+    match c.try_msg(WAIT, |m| {
+        matches!(m, ServerMsg::Terminals { .. } | ServerMsg::Error { .. })
+    })? {
+        ServerMsg::Terminals { list } => Some((h, list)),
+        ServerMsg::Error { code, .. } => {
+            assert_eq!(code, "shutting_down", "unexpected refusal");
+            None
+        }
+        _ => None,
+    }
 }
