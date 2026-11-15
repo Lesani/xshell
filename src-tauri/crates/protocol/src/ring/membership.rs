@@ -702,6 +702,20 @@ pub fn verify_enroll_proposal(prev: &SignedRoster, n: &Roster) -> Result<(), Ros
     verify_transition_roster(prev, n, true)
 }
 
+/// A stored membership this build no longer supports (Ring just works, D2a): a format-1
+/// head, or a format-2 Ring that still carries a format-1 shape (a legacy Desktop unit,
+/// left by an Upgrade without the local completion). The Desktop and the Daemon both set
+/// such a membership aside at start (and rotate their identities), so a new Desktop
+/// identity can always register with its Daemon.
+pub fn unsupported_stored_membership(head: &SignedRoster) -> bool {
+    head.roster().v != 2
+        || head.roster().membership().map_or(true, |m| {
+            m.enrollments
+                .iter()
+                .any(|e| e.kind == EnrollmentKind::LegacyDesktop)
+        })
+}
+
 /// `key` may approve a Device Code on `head`: a Desktop (of a Computer or legacy Desktop
 /// unit), or a Mobile of a Mobile unit (format 2 only). Never a Daemon.
 pub fn enroll_approver(head: &SignedRoster, key: &SignKey) -> bool {

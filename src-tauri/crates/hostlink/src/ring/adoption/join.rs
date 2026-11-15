@@ -1015,6 +1015,9 @@ impl DesktopRing {
                     .map_err(PairError::Relay)?;
                 *operation.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(intent.operation.clone());
+                self.adoption_test_point(
+                    super::super::desktop::AdoptionTestPoint::ApprovalPreparedBeforeProposal,
+                );
                 let captured = Arc::new(captured);
                 *lane.lock().unwrap_or_else(|e| e.into_inner()) = Some(captured.clone());
                 let handle = captured

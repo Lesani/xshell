@@ -41,6 +41,7 @@ fn owned_controller_child() {
             "accepted-before-journal" => p == AdoptionTestPoint::AcceptedBeforeJournal,
             "between-stores" => p == AdoptionTestPoint::CompanionInstalledBeforeDesktop,
             "before-publication" => p == AdoptionTestPoint::ApprovalBeforePublish,
+            "prepared-before-proposal" => p == AdoptionTestPoint::ApprovalPreparedBeforeProposal,
             _ => panic!("unknown cut"),
         };
         if hit {
@@ -257,6 +258,41 @@ fn process_recovery(mode: &str, cut: &str, descendant: bool, revoke: bool) {
                     AdoptionPhase::Abandoned,
                     "ended for good, so a new Join may start"
                 );
+                // No restart and no user step: the counterpart is free again (it set its
+                // removed membership aside and rotated), and a new Join succeeds.
+                wait("the Daemon set its removed membership aside", || {
+                    !b.home.paths().ring_dir.join("roster.json").exists()
+                });
+                // The approver's Desktop starts again (remove_computer stopped it).
+                let mut cfg = xshell_hostlink::ring::DesktopRingConfig::new(
+                    a.home.root().join("desktop"),
+                    "same name".into(),
+                );
+                cfg.default_relay_url = relay.url();
+                let approver =
+                    xshell_hostlink::ring::DesktopRing::open(cfg, Arc::new(fixture::Quiet));
+                wait("the approver is connected", || {
+                    approver.view().connection == "connected"
+                });
+                let client = b.companion();
+                b.ring.register_companion(&client).unwrap();
+                let offer = b.ring.begin_join(&client).unwrap();
+                let code = offer.code.clone();
+                let installed = std::thread::scope(|scope| {
+                    let approval = scope.spawn(|| approver.approve_device_code(&code));
+                    let outcome = offer.wait().unwrap();
+                    approval.join().unwrap().unwrap();
+                    outcome
+                });
+                let xshell_hostlink::ring::adoption::AdoptionOutcome::Installed { chain, .. } =
+                    installed
+                else {
+                    panic!("not installed");
+                };
+                assert!(chain
+                    .authorized_member(&stored(&b).keys.sign_key())
+                    .is_some());
+                approver.quit();
             }
             Err(error) => {
                 assert_eq!(cut, "accepted-before-journal");
@@ -1036,4 +1072,70 @@ fn concurrent_standalone_recoveries_never_overwrite_a_newer_accepted_journal_pre
             "stale invocation must refuse its final write"
         );
     });
+}
+
+/// B2: the approver dies right after its outgoing record became `Prepared`, before the
+/// proposal was created (nothing left the machine). After the restart the record ends by
+/// itself, with no user step, and a new approval of fresh words succeeds.
+#[test]
+fn approver_process_death_with_outgoing_prepared_ends_by_itself_then_new_approval_works() {
+    use xshell_hostlink::ring::adoption::{AdoptionOutcome, MembershipState};
+    use xshell_hostlink::ring::store::OutgoingPhase;
+    let relay = workerd::Relay::start();
+    let mut a = Computer::new(&relay);
+    let original = a.create();
+    let c = Computer::new(&relay);
+    c.ring.register_companion(&c.companion()).unwrap();
+    let mut controller = spawn_controller(&a, &relay, "approve", "prepared-before-proposal");
+    let offer = c.ring.begin_join(&c.companion()).unwrap();
+    writeln!(
+        controller.0.stdin.take().unwrap(),
+        "{}",
+        offer.code.format().as_str()
+    )
+    .unwrap();
+    kill_at_cut(&mut controller, &a);
+    let outgoing = stored(&a).outgoing.unwrap();
+    assert_eq!(outgoing.phase, OutgoingPhase::Prepared);
+    assert!(outgoing.signed_candidate.is_none() && outgoing.accepted.is_empty());
+    // The joining machine never got a proposal: its Join ends, nothing was released.
+    assert!(offer.wait().is_err());
+    let guest = stored(&c);
+    assert!(guest.membership.is_none());
+    assert!(guest
+        .journal
+        .as_ref()
+        .is_none_or(|j| j.signed_candidate.is_none() && j.accepted.is_empty()));
+    // The approver starts again, as the app does (with its reconciler).
+    restart_controller(&mut a, &relay);
+    a.ring.start_reconciler();
+    wait("the orphaned Prepared record ended by itself", || {
+        stored(&a)
+            .outgoing
+            .is_some_and(|o| o.phase == OutgoingPhase::Cancelled)
+    });
+    assert_eq!(a.ring.membership_state().unwrap(), MembershipState::Member);
+    wait("restarted approver connected", || {
+        a.ring.view().connection == "connected"
+    });
+    // A new approval of fresh words succeeds.
+    let offer = c.ring.begin_join(&c.companion()).unwrap();
+    let code = offer.code.clone();
+    let installed = std::thread::scope(|scope| {
+        let approval = scope.spawn(|| a.ring.approve_device_code(&code));
+        let outcome = offer.wait().unwrap();
+        approval.join().unwrap().unwrap();
+        outcome
+    });
+    let AdoptionOutcome::Installed { chain, .. } = installed else {
+        panic!("not installed");
+    };
+    assert_eq!(chain.head().version(), 2);
+    assert!(chain
+        .authorized_member(&stored(&c).keys.sign_key())
+        .is_some());
+    assert_eq!(
+        xshell_protocol::ring::relay::contract::relay_version(&relay.target(), original.ring_id()),
+        2
+    );
 }

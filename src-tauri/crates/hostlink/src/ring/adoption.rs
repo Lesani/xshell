@@ -289,6 +289,18 @@ impl DesktopRing {
                 .into(),
         );
         profile.validate()?;
+        // The Daemon answered with another identity than the one stored here: it set its
+        // own membership aside and rotated. A stale binding of a Desktop in no Ring goes
+        // (refused while a membership or an unresolved record exists).
+        if let Some(stale) = self
+            .store
+            .load_profile()?
+            .0
+            .and_then(|p| p.companion)
+            .filter(|c| c.daemon.sign_key != profile.daemon.sign_key)
+        {
+            self.store.forget_companion(&stale)?;
+        }
         // Retain the association before registration can escape to the other store. A
         // stopped/unavailable counterpart is never grounds to discard this descriptor.
         self.store.transact_profile(|stored, _| {

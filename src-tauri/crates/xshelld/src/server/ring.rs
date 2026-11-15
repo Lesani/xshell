@@ -244,6 +244,82 @@ fn write_private_inner(
     r
 }
 
+/// The files one identity reset moves aside, in this order.
+const RESET_FILES: [&str; 4] = [
+    "roster.json",
+    "keys.json",
+    "companion.json",
+    // A finished standalone obligation belongs to the membership set aside.
+    "standalone-adoption.json",
+];
+const RESET_OBLIGATION: &str = "reset-pending.json";
+
+#[derive(Serialize, Deserialize)]
+struct ResetObligation {
+    suffix: String,
+    stamp: u64,
+}
+
+#[cfg(test)]
+static RESET_STOP_AFTER: Mutex<Option<usize>> = Mutex::new(None);
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Records, durably, that this Store's identity is being reset (temp, fsync, rename,
+/// fsync of the directory). Under ring.lock.
+fn write_reset_obligation(store: &Store, suffix: &str, stamp: u64) -> Result<(), String> {
+    let bytes = serde_json::to_vec(&ResetObligation {
+        suffix: suffix.into(),
+        stamp,
+    })
+    .map_err(|e| e.to_string())?;
+    write_private(&store.dir.join(RESET_OBLIGATION), &bytes).map_err(|e| e.to_string())?;
+    sync_dir(&store.dir)
+}
+
+/// Finishes an identity reset that a crash interrupted: every file still in place is moved
+/// aside, then the obligation goes. `Ok(true)`: there was one. Run at Daemon start (before
+/// the counterpart endpoint serves and before the Ring resumes) and by the registration
+/// child, so the old keys are never used again.
+pub(crate) fn complete_pending_reset(store: &Store) -> Result<bool, String> {
+    complete_pending_reset_until(store, None)
+}
+
+fn complete_pending_reset_until(store: &Store, stop: Option<usize>) -> Result<bool, String> {
+    let path = store.dir.join(RESET_OBLIGATION);
+    let Some(bytes) = read_private(&path, PrivateRingFile::Keys).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let o: ResetObligation =
+        serde_json::from_slice(&bytes).map_err(|e| format!("unreadable reset obligation: {e}"))?;
+    for (n, name) in RESET_FILES.iter().enumerate() {
+        if stop.is_some_and(|s| n >= s) {
+            return Ok(true);
+        }
+        let from = store.dir.join(name);
+        if fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        fs::rename(
+            &from,
+            store.dir.join(format!("{name}.{}-{}", o.suffix, o.stamp)),
+        )
+        .map_err(|e| e.to_string())?;
+        sync_dir(&store.dir)?;
+    }
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    sync_dir(&store.dir)?;
+    Ok(true)
+}
+
 /// This Host's name for the Roster: `XSHELL_MACHINE_NAME` when set (several test
 /// machines on one host), else its hostname, cleaned up.
 pub(crate) fn host_name() -> String {
@@ -834,6 +910,7 @@ struct Events {
     persist: Arc<Persist>,
     sessions: Sessions,
     removal_signal: Arc<AtomicBool>,
+    last_refusal: Arc<Mutex<Option<String>>>,
     /// The Connector these events are of (set once it exists).
     connector: Arc<std::sync::OnceLock<std::sync::Weak<Connector>>>,
 }
@@ -850,6 +927,7 @@ impl ConnectorEvents for Events {
                 "ring: relay connection failed ({error}); retrying in {retry_in:?}"
             ),
             LinkState::Stopped { error: Some(e) } => {
+                *self.last_refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
                 crate::log!("WARN", "ring: no longer connecting: {e}")
             }
             LinkState::Connecting { .. } | LinkState::Stopped { error: None } => {}
@@ -896,8 +974,25 @@ struct Life {
 /// Why [`Ring::set_aside`] sets the membership aside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Aside {
+    /// An unsupported stored membership (format 1 or a transitional shape).
     V1,
+    /// A verified removal.
     Removed,
+    /// The Relay kept refusing this Host for terminal expiry (a Ring with a finite policy
+    /// from an earlier build) although the signed chain still lists it: see the
+    /// maintenance loop. Never inferred from a plain refusal.
+    Expired,
+}
+
+/// What [`Ring::check_removal`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RemovalOutcome {
+    NoMembership,
+    SetAside,
+    /// Still a member, and the signed head moved: reconnected at once.
+    MemberChanged,
+    /// Still a member at the same head: the caller reconnects with backoff.
+    MemberSame,
 }
 
 pub(super) enum JoinOrigin {
@@ -928,6 +1023,8 @@ pub(crate) struct Ring {
     timeouts: RingTimeouts,
     /// Set by the Connector's `removed` report; taken by the maintenance loop.
     removal_signal: Arc<AtomicBool>,
+    /// The text of the Connector's last stop, as the Relay gave it.
+    last_refusal: Arc<Mutex<Option<String>>>,
     /// Test hook: runs in `join` between the `stopped` check and the install.
     #[cfg(test)]
     install_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -971,6 +1068,7 @@ impl Ring {
             backoff_unit,
             timeouts,
             removal_signal: Arc::default(),
+            last_refusal: Arc::default(),
             #[cfg(test)]
             install_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1147,7 +1245,7 @@ impl Ring {
         check(store, &keys)?;
         let durable = match reason {
             Aside::V1 => store.read_chain().ok().flatten(),
-            Aside::Removed => super::companion::trusted(store)?,
+            Aside::Removed | Aside::Expired => super::companion::trusted(store)?,
         };
         // Every retained view that still authorizes this Daemon must be superseded by the
         // evidence; the merged removal is what is settled.
@@ -1168,8 +1266,12 @@ impl Ring {
                     settled = Some(merged);
                 }
             }
-        } else if durable.as_ref().is_none_or(|c| c.head().roster().v != 1) {
-            return Err("no format-1 membership to set aside".into());
+        } else if reason == Aside::V1
+            && durable.as_ref().is_none_or(|c| {
+                !xshell_protocol::ring::membership::unsupported_stored_membership(c.head())
+            })
+        {
+            return Err("no unsupported membership to set aside".into());
         }
         budget.check().map_err(|e| e.to_string())?;
         retire(store)?;
@@ -1179,31 +1281,17 @@ impl Ring {
         }
         let suffix = match reason {
             Aside::V1 => "v1",
-            Aside::Removed => "removed",
+            Aside::Removed | Aside::Expired => "removed",
         };
-        let stamp = super::registry::now_ms();
-        let mut renamed = false;
-        for (name, present) in [
-            ("roster.json", durable.is_some()),
-            ("keys.json", true),
-            ("companion.json", true),
-            // A finished standalone obligation belongs to the membership set aside.
-            ("standalone-adoption.json", true),
-        ] {
-            let from = store.dir.join(name);
-            if !present || fs::symlink_metadata(&from).is_err() {
-                continue;
-            }
-            fs::rename(&from, store.dir.join(format!("{name}.{suffix}-{stamp}")))
-                .map_err(|e| e.to_string())?;
-            renamed = true;
+        // Durable first (P1-3): the reset obligation is written before the first rename,
+        // and startup finishes an interrupted reset before anything can use the old keys.
+        write_reset_obligation(store, suffix, super::registry::now_ms())?;
+        #[cfg(test)]
+        if let Some(stop) = *RESET_STOP_AFTER.lock().unwrap() {
+            complete_pending_reset_until(store, Some(stop))?;
+            return Err("test: reset interrupted".into());
         }
-        if renamed {
-            #[cfg(unix)]
-            fs::File::open(&store.dir)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
-        }
+        complete_pending_reset(store)?;
         if let Some(ring) = durable
             .as_ref()
             .or(cached.as_ref())
@@ -1235,6 +1323,22 @@ impl Ring {
         self.removal_signal.swap(false, Ordering::AcqRel)
     }
 
+    /// The Relay's text of the Connector's last stop.
+    pub(super) fn last_refusal(&self) -> Option<String> {
+        self.last_refusal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Lets a stopped Connector dial again (after the removal check found this Host still a
+    /// member).
+    pub(super) fn kick_connector(&self) {
+        if let Some(j) = self.lock_life().joined.as_ref() {
+            j.connector.kick();
+        }
+    }
+
     /// Ask the Relay, as a (possibly former) member, for the signed history. Removed: the
     /// membership is set aside (deferred with an `Err("busy: …")` while a counterpart or
     /// standalone operation is open). Still a member: the newer chain is kept and the
@@ -1246,13 +1350,22 @@ impl Ring {
         budget: &xshell_core::local_ipc::RequestBudget,
         check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
         retire: impl FnOnce(&Store) -> Result<(), String>,
-    ) -> Result<bool, String> {
+    ) -> Result<RemovalOutcome, String> {
         let Some(chain) = self.trusted_chain() else {
-            return Ok(false);
+            return Ok(RemovalOutcome::NoMembership);
         };
         let Some(keys) = self.keys(false)? else {
-            return Ok(false);
+            return Ok(RemovalOutcome::NoMembership);
         };
+        // What this check is about, captured now (P1-1): the identity and its unit.
+        let captured = keys.sign_key();
+        let unit = chain.versions().iter().rev().find_map(|h| {
+            h.roster()
+                .membership()
+                .ok()?
+                .unit_for(&captured)
+                .map(|u| u.id.clone())
+        });
         let signer: Arc<dyn xshell_protocol::ring::Signer> = keys.clone();
         match xshell_protocol::ring::relay::check_removal(
             &chain,
@@ -1263,8 +1376,34 @@ impl Ring {
         .map_err(|e| e.to_string())?
         {
             xshell_protocol::ring::relay::RemovalCheck::Removed(evidence) => {
-                self.set_aside(budget, Aside::Removed, Some(&evidence), check, retire)?;
-                Ok(true)
+                // Delayed evidence is discarded unless it still concerns this identity and
+                // unit and extends the chain stored now.
+                let fenced = |store: &Store, keys: &DeviceKeys| -> Result<(), String> {
+                    let refuse = |why: &str| Err(format!("removal evidence discarded: {why}"));
+                    if keys.sign_key() != captured {
+                        return refuse("this Host's identity changed");
+                    }
+                    let Some(durable) = super::companion::trusted(store)? else {
+                        return refuse("no stored membership any more");
+                    };
+                    let Ok((merged, _)) = durable.extended(evidence.versions()) else {
+                        return refuse("it does not extend the stored chain");
+                    };
+                    let retired = merged
+                        .head()
+                        .roster()
+                        .membership()
+                        .map(|m| m.retired)
+                        .unwrap_or_default();
+                    if merged.authorized_member(&captured).is_some()
+                        || unit.as_ref().is_none_or(|u| !retired.contains(u))
+                    {
+                        return refuse("it does not remove this Host's unit");
+                    }
+                    check(store, keys)
+                };
+                self.set_aside(budget, Aside::Removed, Some(&evidence), fenced, retire)?;
+                Ok(RemovalOutcome::SetAside)
             }
             xshell_protocol::ring::relay::RemovalCheck::Member(newer) => {
                 let joined = self
@@ -1272,11 +1411,18 @@ impl Ring {
                     .joined
                     .as_ref()
                     .map(|j| (j.connector.clone(), j.sessions.clone()));
+                let same = newer.head() == chain.head();
                 if let Some((connector, sessions)) = joined {
                     self.persist.keep_newer(&newer, Some(&connector), &sessions);
-                    connector.kick();
+                    if !same {
+                        connector.kick();
+                    }
                 }
-                Ok(false)
+                Ok(if same {
+                    RemovalOutcome::MemberSame
+                } else {
+                    RemovalOutcome::MemberChanged
+                })
             }
         }
     }
@@ -1303,6 +1449,11 @@ impl Ring {
 
     /// At start: rejoin the stored Ring, if this Host is a member of it.
     pub fn resume(&self) {
+        match complete_pending_reset(&self.persist.store) {
+            Ok(true) => crate::log!("INFO", "ring: finished an interrupted identity reset"),
+            Ok(false) => {}
+            Err(e) => crate::log!("ERROR", "ring: cannot finish an identity reset: {e}"),
+        }
         let keys = match self.persist.store.load_keys() {
             Ok(Some(k)) => Arc::new(k),
             Ok(None) => return,
@@ -1330,7 +1481,7 @@ impl Ring {
                 Instant::now() + Duration::from_secs(10),
                 Arc::new(AtomicBool::new(false)),
             );
-            if chain.head().roster().v == 1 {
+            if xshell_protocol::ring::membership::unsupported_stored_membership(chain.head()) {
                 match self.set_aside(
                     &budget,
                     Aside::V1,
@@ -1420,6 +1571,7 @@ impl Ring {
                 persist: self.persist.clone(),
                 sessions: sessions.clone(),
                 removal_signal: self.removal_signal.clone(),
+                last_refusal: self.last_refusal.clone(),
                 connector: slot.clone(),
             }),
         )
@@ -1884,17 +2036,30 @@ pub(super) fn storage_test_directory() -> tempfile::TempDir {
 /// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
 /// installed when enrolled, ended when not a member once its code expired.
 #[cfg(any(unix, windows))]
-pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
+/// `expiry_span`: how long the terminal-expiry refusals must span before the Daemon stops
+/// waiting (10 minutes in production).
+pub(crate) fn start_membership_maintenance(
+    d: &Arc<super::registry::Daemon>,
+    expiry_span: Duration,
+) {
     let weak = Arc::downgrade(d);
     let _ = std::thread::Builder::new()
         .name("ring-maintenance".into())
         .spawn(move || {
             let mut removal_at: Option<Instant> = None;
             let mut removal_delay = Duration::from_secs(5);
+            let mut kick_at: Option<Instant> = None;
+            let mut member_delay = Duration::from_secs(5);
+            let mut expiries: Vec<Instant> = Vec::new();
             #[cfg(unix)]
             let mut standalone_at = Instant::now();
             #[cfg(unix)]
             let mut standalone_delay = Duration::from_secs(1);
+            // The standalone journal as it was when the last step found nothing to do: a
+            // new or changed obligation (a pair command that ended unresolved) is looked at
+            // on the next tick instead of after the idle minute.
+            #[cfg(unix)]
+            let mut standalone_idle: Option<Option<std::time::SystemTime>> = None;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 let Some(d) = weak.upgrade() else { return };
@@ -1904,6 +2069,10 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                 let now = Instant::now();
                 if d.ring.take_removal_signal() && removal_at.is_none() {
                     removal_at = Some(now);
+                }
+                if kick_at.is_some_and(|at| now >= at) {
+                    kick_at = None;
+                    d.ring.kick_connector();
                 }
                 if removal_at.is_some_and(|at| now >= at) {
                     let budget = xshell_core::local_ipc::RequestBudget::for_operation(
@@ -1915,9 +2084,51 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                         super::companion::idle_for_set_aside,
                         super::companion::retire_for_set_aside,
                     ) {
-                        Ok(_) => {
+                        Ok(RemovalOutcome::MemberSame) => {
+                            // The Relay refused but the signed head did not move: reconnect
+                            // with backoff, never in a tight loop (P2-6).
+                            removal_at = None;
+                            kick_at = Some(now + member_delay);
+                            member_delay = (member_delay * 2).min(Duration::from_secs(300));
+                            // A refusal that names terminal expiry while the chain still
+                            // lists this Host (a finite-policy Ring of an earlier build):
+                            // after 3 of them over at least 10 minutes, stop waiting.
+                            if d.ring.last_refusal().is_some_and(|e| e.contains("expir")) {
+                                expiries.push(now);
+                                if expiries.len() >= 3
+                                    && now.duration_since(expiries[expiries.len() - 3])
+                                        >= expiry_span
+                                {
+                                    let budget =
+                                        xshell_core::local_ipc::RequestBudget::for_operation(
+                                            now + Duration::from_secs(30),
+                                            Arc::new(AtomicBool::new(false)),
+                                        );
+                                    match d.ring.set_aside(
+                                        &budget,
+                                        Aside::Expired,
+                                        None,
+                                        super::companion::idle_for_set_aside,
+                                        super::companion::retire_for_set_aside,
+                                    ) {
+                                        Ok(()) => {
+                                            kick_at = None;
+                                            expiries.clear();
+                                        }
+                                        Err(e) => {
+                                            crate::log!("INFO", "ring: expiry set-aside: {e}")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(outcome) => {
                             removal_at = None;
                             removal_delay = Duration::from_secs(5);
+                            if outcome != RemovalOutcome::MemberSame {
+                                member_delay = Duration::from_secs(5);
+                                expiries.clear();
+                            }
                         }
                         // An operation is open: look again soon (it ends by itself).
                         Err(e) if e.starts_with("busy:") => {
@@ -1934,13 +2145,22 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                     }
                 }
                 #[cfg(unix)]
-                if now >= standalone_at {
+                let journal = || {
+                    fs::metadata(d.cfg.paths.ring_dir.join("standalone-adoption.json"))
+                        .and_then(|m| m.modified())
+                        .ok()
+                };
+                #[cfg(unix)]
+                if now >= standalone_at || standalone_idle.is_some_and(|seen| seen != journal()) {
+                    let seen = journal();
+                    standalone_idle = None;
                     // Never a ServerHandle here: dropping one shuts the Daemon down.
                     let handle = super::adoption::Standalone { d: &d };
                     match maintain_standalone(&handle) {
                         Ok(true) => {
                             standalone_delay = Duration::from_secs(1);
                             standalone_at = now + Duration::from_secs(60);
+                            standalone_idle = Some(seen);
                         }
                         // A pair command is still running: look again soon, no backoff.
                         Err(e) if e == STANDALONE_PENDING => {
@@ -2042,6 +2262,41 @@ fn abandon_standalone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_identity_reset_is_finished_and_old_keys_never_return() {
+        for stop in 0..RESET_FILES.len() {
+            let dir = storage_test_directory();
+            let store = Store::new(dir.path().join("ring"));
+            store.ensure_dir().unwrap();
+            let old = store.load_or_create_keys().unwrap();
+            for name in ["roster.json", "companion.json", "standalone-adoption.json"] {
+                write_private(&store.dir.join(name), b"{}").unwrap();
+            }
+            write_reset_obligation(&store, "removed", 7).unwrap();
+            // The crash: only the first `stop` files were moved.
+            complete_pending_reset_until(&store, Some(stop)).unwrap();
+            assert!(store.dir.join(RESET_OBLIGATION).exists(), "cut {stop}");
+            // Startup finishes it before anything reads the keys.
+            assert!(complete_pending_reset(&store).unwrap());
+            assert!(!store.dir.join(RESET_OBLIGATION).exists());
+            for name in RESET_FILES {
+                assert!(!store.dir.join(name).exists(), "{name} after cut {stop}");
+                assert!(store.dir.join(format!("{name}.removed-7")).exists());
+            }
+            assert!(
+                store.load_keys().unwrap().is_none(),
+                "old keys gone at cut {stop}"
+            );
+            let new = store.load_or_create_keys().unwrap();
+            assert_ne!(
+                new.sign_key(),
+                old.sign_key(),
+                "a new identity at cut {stop}"
+            );
+            assert!(!complete_pending_reset(&store).unwrap(), "idempotent");
+        }
+    }
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 

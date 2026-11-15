@@ -460,6 +460,9 @@ pub enum AdoptionTestPoint {
     JoinBeforeConsent,
     OriginControllerAttached,
     OriginDispatchEnded,
+    /// The approver's outgoing record is durably `Prepared`, before the proposal is
+    /// created on the Relay (nothing has left this machine yet).
+    ApprovalPreparedBeforeProposal,
     ApprovalProofsReceived,
     ApprovalBeforePublish,
     CompletionBeforeUncertainWrite,
@@ -525,6 +528,10 @@ pub struct DesktopRingConfig {
     /// of the format-1 code that stays until the cleanup slice deletes it; never set in the
     /// app.
     pub keep_format1: bool,
+    /// How long the Relay's refusals naming terminal expiry must keep coming (three of them,
+    /// at an unchanged signed head) before this Desktop stops waiting and shows the removed
+    /// state (10 minutes; tests shorten it).
+    pub expiry_span: Duration,
 }
 
 impl DesktopRingConfig {
@@ -546,6 +553,7 @@ impl DesktopRingConfig {
             quota_probe: Duration::from_secs(10 * 60),
             quota_probe_limited: Duration::from_secs(60 * 60),
             keep_format1: false,
+            expiry_span: Duration::from_secs(600),
         }
     }
 }
@@ -7631,6 +7639,31 @@ mod v2_edits_tests {
                 .unwrap()
                 .is_none()
         );
+        x.ring.quit();
+    }
+
+    #[test]
+    fn delayed_removal_evidence_for_an_old_identity_is_discarded() {
+        let t = tempfile::tempdir().unwrap();
+        let x = v2_ring(&t);
+        let store = Store::new(t.path().join("ring"));
+        let before = store.load_profile().unwrap().0.unwrap();
+        let fence = super::maintenance::RemovalFence::of(&before).unwrap();
+        // Evidence that removes this identity's unit.
+        let (_, mine) = removed(&t, &x, &x.me);
+        let evidence = mine.chain.clone();
+        assert!(fence.admits_for_test(&before, &evidence).is_ok());
+        // Evidence that removes another unit is never accepted for this one.
+        let (_, other) = removed(&t, &x, &x.phone.sign_key());
+        assert!(fence.admits_for_test(&before, &other.chain).is_err());
+        // Meanwhile this Desktop removed itself and became identity B: the delayed
+        // evidence about A must not set B aside.
+        store
+            .set_aside(super::super::store::AsideReason::SelfRemoved, |_| Ok(()))
+            .unwrap();
+        let after = store.load_profile().unwrap().0.unwrap();
+        assert_ne!(after.keys.sign_key(), before.keys.sign_key());
+        assert!(fence.admits_for_test(&after, &evidence).is_err());
         x.ring.quit();
     }
 

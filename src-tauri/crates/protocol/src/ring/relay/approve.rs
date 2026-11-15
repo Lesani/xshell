@@ -177,10 +177,11 @@ fn approved(op: &ApprovalOp, chain: RosterChain) -> ApprovedDevice {
     }
 }
 
-/// What became of a stored `op`, from the Relay's chain on `connector`'s connection.
-/// Never publishes or signs. `Done`: the new unit (id = the operation) is in the chain.
-/// `NotDone { standalone_removed }`: it is not, and says whether the machine's standalone
-/// Daemon unit was removed already.
+/// What became of a stored `op`, from the Relay's chain on `connector`'s connection. Only
+/// reads; never publishes or signs. `Done`: the new unit (id = the operation) is in the
+/// chain. Absent while the joining machine's code is unexpired (`op.expires_at`): `Retry`
+/// (a publication may still land). Absent after expiry: `NotDone { standalone_removed }`,
+/// read from the chain (whether the machine's standalone Daemon unit was removed already).
 pub fn resume_approval(connector: &Connector, op: &ApprovalOp) -> Resume<ApprovedDevice> {
     let pin = ChainPin {
         version: op.predecessor_version,
@@ -197,6 +198,9 @@ pub fn resume_approval(connector: &Connector, op: &ApprovalOp) -> Resume<Approve
     if enrolled {
         return Resume::Done(approved(op, chain));
     }
+    if now() < op.expires_at {
+        return Resume::Retry;
+    }
     let standalone_removed = op.replaced.as_ref().is_some_and(|r| {
         chain
             .head()
@@ -210,15 +214,15 @@ pub fn resume_approval(connector: &Connector, op: &ApprovalOp) -> Resume<Approve
 /// An approval whose joining machine is on the pipe with a possession-proven intent.
 /// Nothing is published yet. Store [`PreparedApproval::op`], then call
 /// [`publish_approval`]. Dropping it publishes nothing and ends the exchange.
-pub struct PreparedApproval<'c> {
+pub struct PreparedApproval {
     op: ApprovalOp,
     read: AdoptionRead,
-    connector: &'c Connector,
+    connector: Arc<Connector>,
     keys: Arc<DeviceKeys>,
     cancel: Option<Cancel>,
 }
 
-impl PreparedApproval<'_> {
+impl PreparedApproval {
     pub fn op(&self) -> &ApprovalOp {
         &self.op
     }
@@ -228,13 +232,13 @@ impl PreparedApproval<'_> {
 /// device's identity in the Ring `connector` runs; it must be an approver (a Mobile, or a
 /// Computer's Desktop). Publishes nothing: a standalone Daemon unit to replace is only
 /// signed for removal, into the returned operation.
-pub fn prepare_approval<'c>(
-    connector: &'c Connector,
+pub fn prepare_approval(
+    connector: Arc<Connector>,
     keys: Arc<DeviceKeys>,
     code: &DeviceCode,
     opts: &PairOptions,
     cancel: Option<&Cancel>,
-) -> Result<PreparedApproval<'c>, ApproveError> {
+) -> Result<PreparedApproval, ApproveError> {
     let me = keys.sign_key();
     let start = connector.chain();
     if start.head().roster().v != 2
@@ -313,7 +317,7 @@ pub fn prepare_approval<'c>(
 /// and the answer to the joining machine. [`ApproveError::Uncertain`]: the Enroll may have
 /// been published; [`resume_approval`] decides. [`ApproveError::Conflict`]: the head moved
 /// after consent; nothing was enrolled.
-pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice, ApproveError> {
+pub fn publish_approval(prepared: PreparedApproval) -> Result<ApprovedDevice, ApproveError> {
     let PreparedApproval {
         op,
         read,
@@ -330,7 +334,7 @@ pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice
             read.refuse(&PairError::Cancelled);
             return Err(ApproveError::Cancelled);
         }
-        match publish_removal(connector, &*keys, removal, deadline) {
+        match publish_removal(&connector, &*keys, removal, deadline) {
             Ok(chain) => after = chain.head().version(),
             Err(e) => {
                 let e = match e {
@@ -404,13 +408,26 @@ pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice
             return Err(PairError::Expired);
         }
         *maybe_sent.borrow_mut() = true;
-        lane.publish_once(candidate).map_err(|e| {
-            if let RingError::Relay { code, .. } = &e {
+        let conflicted = |e: &RingError| {
+            matches!(
+                e,
+                RingError::Relay {
+                    code: super::ErrorCode::RosterConflict | super::ErrorCode::RosterStale,
+                    ..
+                }
+            )
+        };
+        // A conflict is retried once with the same signed bytes (the joining keys'
+        // consent binds this exact candidate; a new head would need a new approval).
+        let first = lane.publish_once(candidate);
+        let result = match first {
+            Err(e) if conflicted(&e) => lane.publish_once(candidate),
+            r => r,
+        };
+        result.map_err(|e| {
+            if let RingError::Relay { .. } = &e {
                 *maybe_sent.borrow_mut() = false;
-                *conflict.borrow_mut() = matches!(
-                    code,
-                    super::ErrorCode::RosterConflict | super::ErrorCode::RosterStale
-                );
+                *conflict.borrow_mut() = conflicted(&e);
             }
             PairError::Relay(e.to_string())
         })?;
@@ -442,13 +459,13 @@ pub fn publish_approval(prepared: PreparedApproval<'_>) -> Result<ApprovedDevice
 /// [`prepare_approval`] + [`publish_approval`]; a lost answer is resolved by one
 /// [`resume_approval`].
 pub fn approve_device_code(
-    connector: &Connector,
+    connector: &Arc<Connector>,
     keys: Arc<DeviceKeys>,
     code: &DeviceCode,
     opts: &PairOptions,
     cancel: Option<&Cancel>,
 ) -> Result<ApprovedDevice, ApproveError> {
-    let prepared = prepare_approval(connector, keys, code, opts, cancel)?;
+    let prepared = prepare_approval(connector.clone(), keys, code, opts, cancel)?;
     let op = prepared.op().clone();
     match publish_approval(prepared) {
         Err(ApproveError::Uncertain) => match resume_approval(connector, &op) {

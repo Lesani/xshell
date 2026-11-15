@@ -28,6 +28,10 @@ struct State {
     /// This Desktop is removing its own unit: the Relay's removed close that follows is
     /// expected and handled by the self-removal itself (no notice).
     self_removing: bool,
+    /// The backoff before a stopped Connector dials again at an unchanged head.
+    member_delay: Duration,
+    /// When the Relay refused this Desktop for terminal expiry at an unchanged head.
+    expiries: Vec<Instant>,
 }
 
 #[derive(Default)]
@@ -48,6 +52,8 @@ const RECONCILE_MAX: Duration = Duration::from_secs(60);
 /// The removal check's retry delays.
 const REMOVAL_MIN: Duration = Duration::from_secs(5);
 const REMOVAL_MAX: Duration = Duration::from_secs(300);
+/// The first reconnect delay after a refusal at an unchanged head.
+const MEMBER_MIN: Duration = Duration::from_secs(5);
 
 /// Format-1 state this build no longer supports (D2a): a format-1 head, a singleton Desktop
 /// of a format-2 Ring (it needed the old local completion), or format-1 work (Upgrade, local
@@ -56,7 +62,7 @@ fn format1(stored: &ProfileState) -> bool {
     let me = stored.keys.sign_key();
     let head_v1 = stored.membership.as_ref().is_some_and(|m| {
         let head = m.chain.head();
-        head.roster().v == 1
+        xshell_protocol::ring::membership::unsupported_stored_membership(head)
             || (m.chain.authorized_member(&me).is_some()
                 && head
                     .roster()
@@ -123,7 +129,8 @@ impl DesktopRing {
         {
             let evidence = member.chain.clone();
             self.tell_daemon_left(&stored, Some(&evidence));
-            if let Err(e) = self.set_aside_removed(&evidence) {
+            let fence = RemovalFence::of(&stored);
+            if let Err(e) = fence.and_then(|f| self.set_aside_removed(&evidence, &f)) {
                 eprintln!("xshell: cannot set the removed membership aside: {e}");
             }
         }
@@ -145,17 +152,35 @@ impl DesktopRing {
 
     /// Sets the membership aside after a verified removal: `evidence` must be this Ring's
     /// chain, retiring this Desktop. Shows the notice; the live Ring is dropped.
-    fn set_aside_removed(&self, evidence: &RosterChain) -> Result<(), String> {
-        let me = self.store.load_profile()?.0.map(|p| p.keys.sign_key());
-        if me.is_none_or(|me| evidence.authorized_member(&me).is_some()) {
-            return Err("not removed".into());
-        }
+    fn set_aside_removed(
+        &self,
+        evidence: &RosterChain,
+        fence: &RemovalFence,
+    ) -> Result<(), String> {
         let notice = RemovedNotice {
             ring_id: evidence.ring_id().clone(),
             version: evidence.head().version(),
             at: now(),
         };
-        let ring = evidence.ring_id().clone();
+        self.store
+            .set_aside(AsideReason::Removed(notice), |p| fence.admits(p, evidence))?;
+        self.forget_membership();
+        self.emit();
+        Ok(())
+    }
+
+    /// The Relay kept refusing this Desktop for terminal expiry at an unchanged signed head
+    /// (only Rings with a finite policy from earlier builds): set aside with the notice.
+    fn set_aside_expired(&self, chain: &RosterChain) -> Result<(), String> {
+        let notice = RemovedNotice {
+            ring_id: chain.ring_id().clone(),
+            version: chain.head().version(),
+            at: now(),
+        };
+        let ring = chain.ring_id().clone();
+        if let Ok((Some(stored), _)) = self.store.load_profile() {
+            self.tell_daemon_left(&stored, None);
+        }
         self.store
             .set_aside(AsideReason::Removed(notice), |p| match &p.membership {
                 Some(m) if m.chain.ring_id() == &ring => Ok(()),
@@ -303,6 +328,17 @@ impl DesktopRing {
                     let Some(state) = ring.lock().state.clone() else {
                         break;
                     };
+                    // What this check is about, captured now: delayed evidence must still
+                    // concern the same identity, unit and stored chain when it arrives.
+                    let fence = match ring
+                        .store
+                        .load_profile()
+                        .and_then(|(p, _)| p.ok_or_else(|| "no profile".to_string()))
+                        .and_then(|p| RemovalFence::of(&p))
+                    {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
                     match check_removal(
                         &state.chain,
                         state.keys.clone(),
@@ -314,13 +350,48 @@ impl DesktopRing {
                             if let Ok((Some(stored), _)) = ring.store.load_profile() {
                                 ring.tell_daemon_left(&stored, Some(&evidence));
                             }
-                            if let Err(e) = ring.set_aside_removed(&evidence) {
+                            if let Err(e) = ring.set_aside_removed(&evidence, &fence) {
                                 eprintln!("xshell: removal detected but not set aside: {e}");
                             }
                             break;
                         }
                         Ok(RemovalCheck::Member(newer)) => {
+                            let same = newer.head() == state.chain.head();
                             ring.persist_newer(&newer);
+                            if same {
+                                // Refused although the signed head did not move: reconnect
+                                // with backoff, never in a tight loop (P2-6).
+                                let refusal = match ring.lock().link.clone() {
+                                    Some(LinkState::Stopped { error: Some(e) }) => Some(e),
+                                    _ => None,
+                                };
+                                let (wait, expired) = {
+                                    let mut st = maintenance.lock();
+                                    let wait = st.member_delay.max(MEMBER_MIN);
+                                    st.member_delay = (wait * 2).min(REMOVAL_MAX);
+                                    if refusal.as_deref().is_some_and(|e| e.contains("expir")) {
+                                        st.expiries.push(Instant::now());
+                                    }
+                                    let n = st.expiries.len();
+                                    let expired = n >= 3
+                                        && st.expiries[n - 1].duration_since(st.expiries[n - 3])
+                                            >= ring.cfg.expiry_span;
+                                    (wait, expired)
+                                };
+                                if expired {
+                                    // A finite-policy Ring of an earlier build keeps denying
+                                    // service for expiry: stop waiting, show "removed".
+                                    if let Err(e) = ring.set_aside_expired(&state.chain) {
+                                        eprintln!("xshell: expiry set-aside: {e}");
+                                    }
+                                    break;
+                                }
+                                std::thread::sleep(wait);
+                            } else {
+                                let mut st = maintenance.lock();
+                                st.member_delay = MEMBER_MIN;
+                                st.expiries.clear();
+                            }
                             if let Some(c) = ring.lock().connector.clone() {
                                 c.kick();
                             }
@@ -346,5 +417,93 @@ pub(in crate::ring) struct SelfRemoval(Arc<Maintenance>);
 impl Drop for SelfRemoval {
     fn drop(&mut self) {
         self.0.lock().self_removing = false;
+    }
+}
+
+/// What a removal check is about, captured when it starts: the identity, the unit that
+/// held it and the stored head. Evidence that arrives later sets the membership aside only
+/// while all three still hold, the evidence extends the current stored chain, and it
+/// retires exactly that unit (P1-1).
+pub(in crate::ring) struct RemovalFence {
+    key: SignKey,
+    unit: String,
+    head: String,
+}
+
+impl RemovalFence {
+    pub(in crate::ring) fn of(stored: &ProfileState) -> Result<Self, String> {
+        let member = stored.membership.as_ref().ok_or("in no Ring")?;
+        let key = stored.keys.sign_key();
+        let unit = member
+            .chain
+            .versions()
+            .iter()
+            .rev()
+            .find_map(|h| {
+                h.roster()
+                    .membership()
+                    .ok()?
+                    .unit_for(&key)
+                    .map(|u| u.id.clone())
+            })
+            .ok_or("never a member")?;
+        Ok(Self {
+            key,
+            unit,
+            head: member.chain.head().hash(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::ring) fn admits_for_test(
+        &self,
+        current: &ProfileState,
+        evidence: &RosterChain,
+    ) -> Result<(), String> {
+        self.admits(current, evidence)
+    }
+
+    fn admits(&self, current: &ProfileState, evidence: &RosterChain) -> Result<(), String> {
+        let refuse = |why: &str| Err(format!("removal evidence discarded: {why}"));
+        if current.keys.sign_key() != self.key {
+            return refuse("this Desktop's identity changed");
+        }
+        let Some(member) = &current.membership else {
+            return refuse("no membership any more");
+        };
+        // The stored chain may have grown since the capture, but never forked away.
+        if !member
+            .chain
+            .versions()
+            .iter()
+            .any(|r| r.hash() == self.head)
+        {
+            return refuse("the stored chain changed");
+        }
+        if member.chain.ring_id() != evidence.ring_id() {
+            return refuse("another Ring");
+        }
+        let merged = match member.chain.extended(evidence.versions()) {
+            Ok((merged, _)) => merged,
+            Err(_) => return refuse("it does not extend the stored chain"),
+        };
+        let unit_now = merged.versions().iter().rev().find_map(|h| {
+            h.roster()
+                .membership()
+                .ok()?
+                .unit_for(&self.key)
+                .map(|u| u.id.clone())
+        });
+        if unit_now.as_deref() != Some(self.unit.as_str())
+            || merged.authorized_member(&self.key).is_some()
+            || !merged
+                .head()
+                .roster()
+                .membership()
+                .is_ok_and(|m| m.retired.contains(&self.unit))
+        {
+            return refuse("it does not remove this Desktop's unit");
+        }
+        Ok(())
     }
 }

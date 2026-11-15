@@ -1035,6 +1035,12 @@ impl ConnectorEvents for SessionEvents {
         }
     }
 
+    fn removed(&self) {
+        if let Some(n) = &self.next {
+            n.removed();
+        }
+    }
+
     fn entitlement(&self, token: Option<&str>) {
         if let Some(n) = &self.next {
             n.entitlement(token);

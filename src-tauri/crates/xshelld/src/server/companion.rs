@@ -463,13 +463,21 @@ fn dispatch(
         )?;
         return Ok(CompanionResponse::Left);
     }
-    if let CompanionRequest::AbandonExpired { operation } = request {
+    if let CompanionRequest::AbandonExpired { operation, rosters } = request {
+        let evidence = if rosters.is_empty() {
+            None
+        } else {
+            Some(RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?)
+        };
         {
             let _lock = store.lock_until(budget)?;
-            let mut policy = load(&store)?.ok_or("companion is not registered")?;
-            let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
+            // No registration (set aside meanwhile): nothing of the operation is left.
+            let mut policy = load(&store)?.ok_or("unknown: companion is not registered")?;
+            let keys = store
+                .load_keys()?
+                .ok_or("unknown: retained Daemon keys missing")?;
             validate_profile(&store, policy.profile(), &keys)?;
-            policy.abandon_expired(&operation, now())?;
+            policy.abandon(&operation, now(), evidence.as_ref())?;
             budget.check().map_err(|e| e.to_string())?;
             save(&store, &policy)?;
         }
@@ -685,6 +693,8 @@ pub(super) fn serve(
     store.ensure_dir()?;
     let directory = xshell_core::local_ipc::canonical_store(&store.dir)?;
     xshell_core::local_ipc::private_dir(&directory)?;
+    // An interrupted identity reset is finished before the endpoint can hand out keys.
+    super::ring::complete_pending_reset(&store).map_err(std::io::Error::other)?;
     let path = xshell_core::local_ipc::companion_endpoint(&directory)?;
     if let Err(error) = xshell_core::local_ipc::check_path(&path) {
         // Only this exact absent, overlong optional endpoint is unsupported. Unsafe,
@@ -804,6 +814,7 @@ pub fn registration_child(opts: &crate::cli::Opts) -> Result<(), String> {
     xshell_core::companion_reservation::reserve(&home, Path::new(&desktop_store))
         .map_err(|e| e.to_string())?;
     let store = Store::new(paths.ring_dir);
+    super::ring::complete_pending_reset(&store)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, stop);
     {

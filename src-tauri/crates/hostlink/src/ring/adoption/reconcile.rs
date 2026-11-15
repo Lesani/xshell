@@ -363,14 +363,33 @@ impl DesktopRing {
                 })?;
                 return self.adoption_status();
             }
-            let abandon = |why: &str| -> Result<AdoptionRecovery, String> {
-                tell(CompanionRequest::AbandonExpired {
-                    operation: operation.into(),
-                })?;
-                self.journal_update(operation, |j| j.phase = AdoptionPhase::Abandoned)?;
-                eprintln!("xshell: Join/Create {operation} abandoned: {why}");
-                self.adoption_status()
-            };
+            // The counterpart must really have retired the operation (or not have it any
+            // more) before this Desktop drops its obligation: "not expired" keeps it.
+            let abandon_with =
+                |why: &str, evidence: Option<&RosterChain>| -> Result<AdoptionRecovery, String> {
+                    let rosters = evidence
+                        .map(|c| c.versions().iter().map(|r| r.token().to_string()).collect())
+                        .unwrap_or_default();
+                    match client.request(CompanionRequest::AbandonExpired {
+                        operation: operation.into(),
+                        rosters,
+                    }) {
+                        Ok(_) => {}
+                        Err(e)
+                            if e.starts_with("unknown:")
+                                || e.contains("association mismatch")
+                                || e.contains("not registered") => {}
+                        Err(e) if e.starts_with("not_expired:") => {
+                            return Err(format!(
+                                "finishing: {why}; the counterpart waits for expiry"
+                            ))
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    self.journal_update(operation, |j| j.phase = AdoptionPhase::Abandoned)?;
+                    eprintln!("xshell: Join/Create {operation} abandoned: {why}");
+                    self.adoption_status()
+                };
             // Local accepted history can prove terminal disposition even if Relay auth is
             // now refused. This protected snapshot is evidence, never an installation receipt.
             let snapshot = match client.request(CompanionRequest::MembershipSnapshot) {
@@ -399,11 +418,11 @@ impl DesktopRing {
                 .filter(|c| c.get(j.proposal.version).is_some())
             {
                 if j.verify_accepted(chain).is_err() {
-                    return abandon("another version holds its slot");
+                    return abandon_with("another version holds its slot", Some(chain));
                 }
                 if terminal(j, chain) {
                     self.record_reconciled_acceptance(operation, chain)?;
-                    return abandon("enrolled, then removed");
+                    return abandon_with("enrolled, then removed", Some(chain));
                 }
             }
             let accepted = match self.read_reconciliation_chain(&stored, j) {
@@ -425,14 +444,14 @@ impl DesktopRing {
                     ) {
                         Ok(xshell_protocol::ring::relay::RemovalCheck::Removed(chain)) => {
                             self.record_reconciled_acceptance(operation, &chain)?;
-                            return abandon("enrolled, then removed");
+                            return abandon_with("enrolled, then removed", Some(&chain));
                         }
                         Ok(xshell_protocol::ring::relay::RemovalCheck::Member(chain)) => chain,
                         Err(e) => return Err(format!("offline: {e}")),
                     }
                 }
                 Err(e) if e.starts_with("not_member:") && now() >= j.intent.expires_at => {
-                    return abandon(&e);
+                    return abandon_with(&e, None);
                 }
                 Err(e) if e.starts_with("not_member:") => {
                     return Err(format!("finishing: not enrolled yet ({e})"));
@@ -441,16 +460,16 @@ impl DesktopRing {
             };
             if accepted.get(j.proposal.version).is_none() {
                 if now() >= j.intent.expires_at {
-                    return abandon("not enrolled when the offer expired");
+                    return abandon_with("not enrolled when the offer expired", None);
                 }
                 return Err("finishing: not enrolled yet".into());
             }
             if j.verify_accepted(&accepted).is_err() {
-                return abandon("another version holds its slot");
+                return abandon_with("another version holds its slot", Some(&accepted));
             }
             self.record_reconciled_acceptance(operation, &accepted)?;
             if terminal(j, &accepted) {
-                return abandon("enrolled, then removed");
+                return abandon_with("enrolled, then removed", Some(&accepted));
             }
             let profile = stored
                 .companion
@@ -459,7 +478,7 @@ impl DesktopRing {
             if profile.desktop.sign_key != stored.keys.sign_key()
                 || profile.target() != j.intent.target
             {
-                return abandon("the registered counterpart changed");
+                return abandon_with("the registered counterpart changed", None);
             }
             self.install_joined_computer(client, operation, profile, &accepted)?;
         } else if stored
