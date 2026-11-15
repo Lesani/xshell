@@ -135,6 +135,7 @@ impl Fixture {
         PairChild {
             child,
             lines,
+            seen: Vec::new(),
             words: 0,
             stderr,
             stderr_reader: Some(stderr_reader),
@@ -158,6 +159,8 @@ impl Fixture {
 struct PairChild {
     child: Child,
     lines: mpsc::Receiver<String>,
+    /// Every stdout line read so far (by `code` and `finish`).
+    seen: Vec<String>,
     words: usize,
     stderr: Arc<std::sync::Mutex<String>>,
     stderr_reader: Option<std::thread::JoinHandle<()>>,
@@ -174,9 +177,10 @@ impl PairChild {
                 Ok(line) => line,
                 Err(e) => self.no_code(e),
             };
-            if let Some(words) = line.strip_prefix("Device code: ") {
+            self.seen.push(line.clone());
+            if let Ok(code) = DeviceCode::parse(&line) {
                 self.words += 1;
-                return DeviceCode::parse(words).expect("eight words");
+                return code;
             }
         }
     }
@@ -213,9 +217,10 @@ impl PairChild {
         wait(|| self.child.try_wait().unwrap().is_some());
         let code = self.child.wait().unwrap().code().unwrap();
         for line in self.lines.iter() {
-            if line.starts_with("Device code: ") {
+            if DeviceCode::parse(&line).is_ok() {
                 self.words += 1;
             }
+            self.seen.push(line);
         }
         code
     }
@@ -357,7 +362,7 @@ fn actual_cli_stopped_owner_manual_open_uses_original_deadline_without_autostart
     let before = Instant::now();
     let mut child = b.pair(&relay.url(), 4_000);
     let line = child.lines.recv_timeout(Duration::from_secs(3)).unwrap();
-    assert!(line.starts_with("Getting a Device Code from xshell on this computer"));
+    assert_eq!(line, "Waiting for another device to add this machine...");
     std::thread::sleep(Duration::from_millis(300));
     assert!(child.lines.try_recv().is_err());
     assert!(child.child.try_wait().unwrap().is_none());
@@ -432,6 +437,25 @@ fn standalone_install(running: bool, different_socket: bool, existing: bool) {
         assert!(ar.approve_device_code(&code).is_ok());
         assert_eq!(child.finish(), 0);
         assert_eq!(child.words, 1);
+        // The approved copy (cli.pair.*), the words on a line of their own.
+        assert_eq!(
+            child.seen,
+            [
+                code.format().as_str(),
+                "Type these eight words on a machine or phone already in your Ring. On a machine, open Settings > Ring > Add a machine.",
+                "These words work once, for 10 minutes, while this command is running.",
+                "Waiting for another device to add this machine...",
+                "Added this machine to your Ring. Your Ring has 2 machines.",
+            ]
+        );
+        // Again on a machine already in the Ring: no words, success.
+        let mut again = b.pair(&relay.url(), 30_000);
+        assert_eq!(again.finish(), 0);
+        assert_eq!(again.words, 0);
+        assert_eq!(
+            again.seen,
+            ["This machine is already in your Ring. Your Ring has 2 machines."]
+        );
         if let Some((keys, dev, ino)) = retained {
             let shared = b.home.path().join(".xshell");
             let after = std::fs::metadata(&shared).unwrap();
@@ -638,11 +662,10 @@ fn registration_child_cannot_claim_live_driver_readiness_and_manual_daemon_start
     }).unwrap();
     let _manager = b.manager(&br);
     let mut child = b.pair(&relay.url(), 4_000);
-    assert!(child
-        .lines
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap()
-        .starts_with("Getting a Device Code from xshell on this computer"));
+    assert!(
+        child.lines.recv_timeout(Duration::from_secs(3)).unwrap()
+            == "Waiting for another device to add this machine..."
+    );
     std::thread::sleep(Duration::from_millis(250));
     assert!(child.lines.try_recv().is_err());
     assert!(!b.paths.socket.exists());

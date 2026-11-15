@@ -20,11 +20,7 @@ fn v2_standalone_pair_advertises_code_only_after_relay_slot_registration() {
             self.pending.extend_from_slice(bytes);
             while let Some(at) = self.pending.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<_> = self.pending.drain(..=at).collect();
-                if let Some(code) = String::from_utf8_lossy(&line)
-                    .trim()
-                    .strip_prefix("Device code: ")
-                {
-                    let code = DeviceCode::parse(code).unwrap();
+                if let Ok(code) = DeviceCode::parse(String::from_utf8_lossy(&line).trim()) {
                     // This Write has not returned: no guest work after advertising can
                     // race ahead and make an unregistered code appear usable by chance.
                     let peer =
