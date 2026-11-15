@@ -73,10 +73,11 @@ pub async fn local_daemon_retry(
     .map_err(|e| e.to_string())?
 }
 
-/// The frontend listens for `local:quit-prompt`: closing may now ask.
+/// The frontend listens for `local:quit-prompt`: closing may now ask, and a window-bound
+/// prompt raised before this is shown now.
 #[tauri::command]
-pub fn local_quit_prompt_ready(quit: State<'_, super::quit::QuitState>) {
-    quit.set_attached();
+pub fn local_quit_prompt_ready(app: tauri::AppHandle) {
+    super::quit::prompt_ready(&app);
 }
 
 /// Whether closing now would ask, and why (informational).

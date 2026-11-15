@@ -1,12 +1,21 @@
-//! The quit prompt (ADR-0017): closing the last Desktop window on this machine while the
-//! Local Host has running Terminals asks "Keep N sessions running?" (Keep running / Stop
-//! them / cancel, with "Do not ask again" for Keep). "Stop them" ends exactly the Terminals
-//! the prompt counted (A9); the Daemon itself keeps running either way.
+//! The quit prompt.
 //!
-//! Interception is off until the frontend calls `local_quit_prompt_ready` (after it listens
-//! for `local:quit-prompt`), and never on Windows (Stage 2) or after `local_quit_bypass` (the
-//! updater's relaunch). An OS shutdown sends SIGTERM without a close request: no prompt, the
-//! sessions are kept.
+//! Always-on Daemon (Linux, macOS; ADR-0017), kind `keep`: closing the last Desktop window
+//! on this machine while the Local Host has running Terminals asks "Keep N sessions
+//! running?" (Keep running / Stop them / cancel, with "Do not ask again" for Keep). "Stop
+//! them" ends exactly the Terminals the prompt counted (A9); the Daemon itself keeps running
+//! either way. Interception is off until the frontend calls `local_quit_prompt_ready` (after
+//! it listens for `local:quit-prompt`). An OS shutdown sends SIGTERM without a close
+//! request: no prompt, the sessions are kept.
+//!
+//! Window-bound Daemon (Windows; W4), kind `close`: closing the process that owns the Local
+//! Host's Daemon (its last window) while that Daemon has Terminals, or may have (the count is
+//! asked for at close, briefly; still unknown asks without a number, A2), confirms "This will
+//! close N sessions" (Close / Cancel). A process that does not own the Daemon, the updater's
+//! relaunch and an OS shutdown or logoff close without asking. A prompt raised before the
+//! frontend listens is held and shown when it does.
+//!
+//! Never after `local_quit_bypass` (the updater's relaunch).
 
 use super::local::{read_keep_sessions, KeepSessions, KEEP_SESSIONS_KEY};
 use super::presence::Presence;
@@ -25,12 +34,34 @@ const STOP_WAIT: Duration = Duration::from_secs(10);
 /// How long a closing Desktop waits for another one's election.
 const ELECTION_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a close waits for the Local Host's Terminal list when it is not known yet
+/// (window-bound, A2).
+const LIST_WAIT: Duration = Duration::from_secs(2);
+
+/// How the Local Host's Daemon lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifetime {
+    /// Linux and macOS: the always-on Daemon outlives every window (ADR-0017).
+    AlwaysOn,
+    /// Windows: the Daemon ends with the Desktop process that started it (W1).
+    WindowBound,
+}
+
+impl Lifetime {
+    pub fn of_platform() -> Lifetime {
+        if cfg!(windows) {
+            Lifetime::WindowBound
+        } else {
+            Lifetime::AlwaysOn
+        }
+    }
+}
+
 /// What decides whether closing asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloseInputs {
-    /// Linux or macOS (Windows confirms in Stage 2).
-    pub unix: bool,
-    /// The frontend listens for the prompt.
+    pub lifetime: Lifetime,
+    /// The frontend listens for the prompt (always-on only: a window-bound prompt waits).
     pub attached: bool,
     /// The updater relaunches.
     pub bypass: bool,
@@ -41,20 +72,34 @@ pub struct CloseInputs {
     pub last_window: bool,
     /// Running Terminals of the Local Host; `None` while their list is unknown.
     pub running: Option<usize>,
+    /// This process started the running window-bound Daemon: closing it ends the Daemon.
+    pub owner: bool,
+    /// The OS is shutting down or logging off.
+    pub session_ending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseDecision {
     Close,
+    /// Always-on: "Keep N sessions running?".
     Ask(usize),
+    /// Window-bound: "This will close N sessions"; `None`: the count is unknown.
+    Confirm(Option<usize>),
 }
 
 /// Asks only when every gate holds.
 pub fn decide(i: &CloseInputs) -> CloseDecision {
+    if i.lifetime == Lifetime::WindowBound {
+        // Unknown is not zero (A2): only known-zero, the updater and the OS close silently.
+        return match i.running {
+            _ if i.bypass || i.session_ending || !i.owner || !i.last_window => CloseDecision::Close,
+            Some(0) => CloseDecision::Close,
+            n => CloseDecision::Confirm(n),
+        };
+    }
     match i.running {
         Some(n)
             if n > 0
-                && i.unix
                 && i.attached
                 && !i.bypass
                 && i.keep == KeepSessions::Ask
@@ -118,30 +163,73 @@ pub fn run_stop(
     }
 }
 
+/// Which question a prompt asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// Always-on: Keep running / Stop them.
+    Keep,
+    /// Window-bound: Close (ends them) / Cancel.
+    Close,
+}
+
+impl PromptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptKind::Keep => "keep",
+            PromptKind::Close => "close",
+        }
+    }
+}
+
+/// Whether `choice` answers a prompt of `kind`.
+pub fn valid_choice(kind: PromptKind, choice: &str) -> bool {
+    match kind {
+        PromptKind::Keep => matches!(choice, "keep" | "stop" | "cancel"),
+        PromptKind::Close => matches!(choice, "close" | "cancel"),
+    }
+}
+
 /// A prompt on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     pub id: String,
     /// The window it was shown in.
     pub label: String,
+    pub kind: PromptKind,
     /// The Terminals it counted.
     pub terminals: Vec<Uuid>,
+    /// The number shown; `None`: unknown (a `close` prompt only).
+    pub count: Option<usize>,
     /// An application quit (not a window close) asked: keep/stop then exit the app.
     pub exit: bool,
     /// A resolve is working on it: further closes and resolves are refused until it ends.
     pub in_flight: bool,
 }
 
-/// The `local:quit-prompt` payload.
+impl Pending {
+    fn event(&self) -> PromptEvent {
+        PromptEvent {
+            id: self.id.clone(),
+            terminals: self.count,
+            kind: self.kind.as_str(),
+        }
+    }
+}
+
+/// The `local:quit-prompt` payload. `terminals` is `null` only for a `close` prompt whose
+/// count is unknown.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PromptEvent {
     pub id: String,
-    pub terminals: usize,
+    pub terminals: Option<usize>,
+    pub kind: &'static str,
 }
 
 pub struct QuitState {
     attached: AtomicBool,
     bypass: AtomicBool,
+    /// A window-bound close waits for the Terminal list on a worker: further closes wait.
+    deciding: AtomicBool,
     pending: Mutex<Option<Pending>>,
     next: AtomicU64,
     presence: Option<Presence>,
@@ -152,6 +240,7 @@ impl QuitState {
         Self {
             attached: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
+            deciding: AtomicBool::new(false),
             pending: Mutex::new(None),
             next: AtomicU64::new(1),
             presence,
@@ -160,6 +249,15 @@ impl QuitState {
 
     pub fn set_attached(&self) {
         self.attached.store(true, Ordering::SeqCst);
+    }
+
+    pub fn attached(&self) -> bool {
+        self.attached.load(Ordering::SeqCst)
+    }
+
+    /// A close is being decided off the UI thread (A2).
+    pub fn deciding(&self) -> bool {
+        self.deciding.load(Ordering::SeqCst)
     }
 
     pub fn set_bypass(&self) {
@@ -174,25 +272,56 @@ impl QuitState {
         self.pending.lock().unwrap().clone()
     }
 
-    /// Start a prompt; `None` when one is already pending (a second close is ignored, A9).
+    /// Start a `keep` prompt; `None` when one is already pending (a second close is
+    /// ignored, A9).
     pub fn begin(&self, label: &str, terminals: Vec<Uuid>, exit: bool) -> Option<PromptEvent> {
+        let count = Some(terminals.len());
+        self.begin_kind(label, PromptKind::Keep, terminals, count, exit)
+    }
+
+    /// Start a `close` prompt (window-bound) for `count` Terminals (`None`: unknown).
+    pub fn begin_close(
+        &self,
+        label: &str,
+        terminals: Vec<Uuid>,
+        count: Option<usize>,
+        exit: bool,
+    ) -> Option<PromptEvent> {
+        self.begin_kind(label, PromptKind::Close, terminals, count, exit)
+    }
+
+    fn begin_kind(
+        &self,
+        label: &str,
+        kind: PromptKind,
+        terminals: Vec<Uuid>,
+        count: Option<usize>,
+        exit: bool,
+    ) -> Option<PromptEvent> {
         let mut g = self.pending.lock().unwrap();
         if g.is_some() {
             return None;
         }
-        let id = format!("q{}", self.next.fetch_add(1, Ordering::SeqCst));
-        let ev = PromptEvent {
-            id: id.clone(),
-            terminals: terminals.len(),
-        };
-        *g = Some(Pending {
-            id,
+        let p = Pending {
+            id: format!("q{}", self.next.fetch_add(1, Ordering::SeqCst)),
             label: label.into(),
+            kind,
             terminals,
+            count,
             exit,
             in_flight: false,
-        });
+        };
+        let ev = p.event();
+        *g = Some(p);
         Some(ev)
+    }
+
+    /// The pending prompt not being answered, to show again once the frontend listens.
+    pub fn replay(&self) -> Option<(String, PromptEvent)> {
+        let g = self.pending.lock().unwrap();
+        g.as_ref()
+            .filter(|p| !p.in_flight)
+            .map(|p| (p.label.clone(), p.event()))
     }
 
     /// Start resolving prompt `id`: it stays pending, marked in flight, until [`Self::end`].
@@ -221,33 +350,61 @@ impl QuitState {
         let mut g = self.pending.lock().unwrap();
         *g = None;
         let (label, terminals, exit) = next?;
-        let id = format!("q{}", self.next.fetch_add(1, Ordering::SeqCst));
-        let ev = PromptEvent {
-            id: id.clone(),
-            terminals: terminals.len(),
-        };
-        *g = Some(Pending {
-            id,
+        let p = Pending {
+            id: format!("q{}", self.next.fetch_add(1, Ordering::SeqCst)),
             label,
+            kind: PromptKind::Keep,
+            count: Some(terminals.len()),
             terminals,
             exit,
             in_flight: false,
-        });
+        };
+        let ev = p.event();
+        *g = Some(p);
         Some(ev)
     }
 
     /// The decision inputs this state knows.
-    fn inputs(&self, keep: KeepSessions, last_window: bool, running: Option<usize>) -> CloseInputs {
+    fn inputs(
+        &self,
+        lifetime: Lifetime,
+        keep: KeepSessions,
+        last_window: bool,
+        running: Option<usize>,
+        owner: bool,
+    ) -> CloseInputs {
         CloseInputs {
-            unix: cfg!(unix),
-            attached: self.attached.load(Ordering::SeqCst),
+            lifetime,
+            attached: self.attached(),
             bypass: self.bypassed(),
             keep,
             last_desktop: true,
             last_window,
             running,
+            owner,
+            session_ending: session_ending(),
         }
     }
+}
+
+/// The OS is shutting down or logging off (Windows: `SM_SHUTTINGDOWN`). Elsewhere an OS
+/// shutdown sends no close request at all.
+fn session_ending() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+        unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// This process started the Local Host's running window-bound Daemon (it is in our Job):
+/// closing this process ends it. A Desktop that only connected to it does not own it.
+fn owns_daemon(hosts: &Hosts) -> bool {
+    hosts.local_daemon_now().and_then(|d| d.gui_pid()).is_some()
 }
 
 /// The Local Host's running Terminals, when known.
@@ -256,24 +413,83 @@ fn local_running(hosts: &Hosts) -> Option<Vec<Uuid>> {
     running_ids(snap.terminals.as_deref())
 }
 
+/// The Local Host's running Terminals, waiting up to `wait` for a list that is not known
+/// yet (the Local Host may still be connecting).
+fn local_running_within(hosts: &Hosts, wait: Duration) -> Option<Vec<Uuid>> {
+    let deadline = Instant::now() + wait;
+    if let Some(h) = hosts.manager.access(LOCAL_HOST_ID) {
+        h.kick();
+    }
+    loop {
+        if let Some(r) = local_running(hosts) {
+            return Some(r);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// What a close (or quit) request comes to.
+enum Evaluated {
+    Close,
+    /// A prompt was begun: keep the window. Shown now when the frontend listens, else when
+    /// it does.
+    Prompt(PromptEvent),
+    /// Window-bound with an unknown count: decided on a worker (A2); keep the window.
+    Deferred,
+}
+
 /// The decision for closing (or quitting) from window `label`. On Ask the prompt is begun
 /// and its event returned; on Close, when this process goes, its presence is left while the
 /// election is still held (A6).
-fn evaluate(app: &AppHandle, label: &str, last_window: bool, exit: bool) -> Option<PromptEvent> {
-    let q = app.try_state::<QuitState>()?;
-    let hosts = app.try_state::<Hosts>()?;
+fn evaluate(app: &AppHandle, label: &str, last_window: bool, exit: bool) -> Evaluated {
+    let (Some(q), Some(hosts)) = (app.try_state::<QuitState>(), app.try_state::<Hosts>()) else {
+        return Evaluated::Close;
+    };
+    let lifetime = Lifetime::of_platform();
     let running = local_running(&hosts);
     let keep = read_keep_sessions(hosts.store.as_deref());
-    let mut inputs = q.inputs(keep, last_window, running.as_ref().map(Vec::len));
+    let owner = owns_daemon(&hosts);
+    let mut inputs = q.inputs(
+        lifetime,
+        keep,
+        last_window,
+        running.as_ref().map(Vec::len),
+        owner,
+    );
     // Only elect when everything else would ask: a cheap close stays cheap.
     let pre = decide(&inputs);
+    if pre == CloseDecision::Confirm(None) {
+        // Unknown is not zero (A2): ask for the list off the UI thread, the window open.
+        q.deciding.store(true, Ordering::SeqCst);
+        let worker_app = app.clone();
+        let worker_label = label.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("quit-decide".into())
+            .spawn(move || decide_later(&worker_app, &worker_label, inputs, exit));
+        if spawned.is_err() {
+            // No worker: ask without a number rather than close unasked.
+            q.deciding.store(false, Ordering::SeqCst);
+            return q
+                .begin_close(label, Vec::new(), None, exit)
+                .map_or(Evaluated::Close, Evaluated::Prompt);
+        }
+        return Evaluated::Deferred;
+    }
     let election = match (pre, &q.presence) {
         (CloseDecision::Ask(_), Some(p)) => Some(p.elect(ELECTION_WAIT)),
         _ => None,
     };
     inputs.last_desktop = election.as_ref().is_none_or(|e| e.last);
     match decide(&inputs) {
-        CloseDecision::Ask(_) => q.begin(label, running.unwrap_or_default(), exit),
+        CloseDecision::Ask(_) => q
+            .begin(label, running.unwrap_or_default(), exit)
+            .map_or(Evaluated::Close, Evaluated::Prompt),
+        CloseDecision::Confirm(n) => q
+            .begin_close(label, running.unwrap_or_default(), n, exit)
+            .map_or(Evaluated::Close, Evaluated::Prompt),
         CloseDecision::Close => {
             if last_window || exit {
                 if let Some(p) = &q.presence {
@@ -281,8 +497,64 @@ fn evaluate(app: &AppHandle, label: &str, last_window: bool, exit: bool) -> Opti
                 }
             }
             drop(election);
-            None
+            Evaluated::Close
         }
+    }
+}
+
+/// The worker half of a window-bound close whose Terminal count was unknown: wait briefly
+/// for the list, decide again, then close or show the `close` prompt (with or without a
+/// number).
+fn decide_later(app: &AppHandle, label: &str, mut inputs: CloseInputs, exit: bool) {
+    let (Some(q), Some(hosts)) = (app.try_state::<QuitState>(), app.try_state::<Hosts>()) else {
+        return;
+    };
+    let running = local_running_within(&hosts, LIST_WAIT);
+    inputs.running = running.as_ref().map(Vec::len);
+    inputs.bypass = q.bypassed();
+    inputs.session_ending = session_ending();
+    let decision = decide(&inputs);
+    q.deciding.store(false, Ordering::SeqCst);
+    match decision {
+        CloseDecision::Confirm(n) => {
+            if let Some(ev) = q.begin_close(label, running.unwrap_or_default(), n, exit) {
+                show(app, &q, label, ev);
+            }
+        }
+        _ => close_now(app, label, exit),
+    }
+}
+
+/// Emit `local:quit-prompt` to window `label` once the frontend listens; until then the
+/// prompt stays pending and `local_quit_prompt_ready` shows it.
+fn show(app: &AppHandle, q: &QuitState, label: &str, ev: PromptEvent) {
+    if q.attached() {
+        let _ = app.emit_to(label, "local:quit-prompt", ev);
+    }
+}
+
+/// `local_quit_prompt_ready`: the frontend listens now; a prompt held for it is shown.
+pub fn prompt_ready(app: &AppHandle) {
+    let Some(q) = app.try_state::<QuitState>() else {
+        return;
+    };
+    q.set_attached();
+    if let Some((label, ev)) = q.replay() {
+        let _ = app.emit_to(label.as_str(), "local:quit-prompt", ev);
+    }
+}
+
+/// Close window `label` (or quit the app) without asking: the deferred decision came to
+/// Close.
+fn close_now(app: &AppHandle, label: &str, exit: bool) {
+    let q = app.state::<QuitState>();
+    if exit {
+        q.set_bypass();
+        app.exit(0);
+        return;
+    }
+    if let Some(w) = app.get_webview_window(label) {
+        let _ = w.destroy();
     }
 }
 
@@ -292,15 +564,20 @@ pub fn close_requested(window: &tauri::Window, api: &tauri::CloseRequestApi) {
     let Some(q) = app.try_state::<QuitState>() else {
         return;
     };
-    if q.pending().is_some() {
-        // A prompt is on screen: a second close is ignored (A9), never taken as Keep.
+    if q.pending().is_some() || q.deciding() {
+        // A prompt is on screen (or being decided): a second close is ignored (A9), never
+        // taken as an answer.
         api.prevent_close();
         return;
     }
     let last_window = app.webview_windows().len() <= 1;
-    if let Some(ev) = evaluate(app, window.label(), last_window, false) {
-        api.prevent_close();
-        let _ = app.emit_to(window.label(), "local:quit-prompt", ev);
+    match evaluate(app, window.label(), last_window, false) {
+        Evaluated::Close => {}
+        Evaluated::Deferred => api.prevent_close(),
+        Evaluated::Prompt(ev) => {
+            api.prevent_close();
+            show(app, &q, window.label(), ev);
+        }
     }
 }
 
@@ -310,18 +587,19 @@ pub fn exit_requested(app: &AppHandle) -> bool {
     let Some(q) = app.try_state::<QuitState>() else {
         return false;
     };
-    if q.pending().is_some() {
+    if q.pending().is_some() || q.deciding() {
         return true;
     }
     let Some(label) = app.webview_windows().keys().next().cloned() else {
         return false;
     };
     match evaluate(app, &label, true, true) {
-        Some(ev) => {
-            let _ = app.emit_to(label.as_str(), "local:quit-prompt", ev);
+        Evaluated::Close => false,
+        Evaluated::Deferred => true,
+        Evaluated::Prompt(ev) => {
+            show(app, &q, &label, ev);
             true
         }
-        None => false,
     }
 }
 
@@ -330,6 +608,8 @@ pub fn exit_requested(app: &AppHandle) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct QuitCheck {
     pub ask: bool,
+    /// Which prompt closing would show: `keep` or `close`.
+    pub kind: &'static str,
     pub terminals: usize,
     pub last_desktop: bool,
     pub keep_sessions: &'static str,
@@ -338,19 +618,26 @@ pub struct QuitCheck {
 pub fn check(app: &AppHandle) -> Option<QuitCheck> {
     let q = app.try_state::<QuitState>()?;
     let hosts = app.try_state::<Hosts>()?;
+    let lifetime = Lifetime::of_platform();
     let running = local_running(&hosts);
     let keep = read_keep_sessions(hosts.store.as_deref());
     let last_desktop = q.presence.as_ref().is_none_or(|p| p.others_alive() == 0);
     let mut i = q.inputs(
+        lifetime,
         keep,
         app.webview_windows().len() <= 1,
         running.as_ref().map(Vec::len),
+        owns_daemon(&hosts),
     );
     // A check is informational: ask as if the frontend listened.
     i.attached = true;
     i.last_desktop = last_desktop;
     Some(QuitCheck {
-        ask: matches!(decide(&i), CloseDecision::Ask(_)),
+        ask: !matches!(decide(&i), CloseDecision::Close),
+        kind: match lifetime {
+            Lifetime::AlwaysOn => PromptKind::Keep.as_str(),
+            Lifetime::WindowBound => PromptKind::Close.as_str(),
+        },
         terminals: running.map_or(0, |r| r.len()),
         last_desktop,
         keep_sessions: keep.as_str(),
@@ -409,13 +696,28 @@ pub fn resolve(
 ) -> Result<Option<serde_json::Value>, String> {
     let q = app.state::<QuitState>();
     let hosts = app.state::<Hosts>();
-    if !matches!(choice, "keep" | "stop" | "cancel") {
+    if !matches!(choice, "keep" | "stop" | "close" | "cancel") {
         return Err(format!("invalid choice {choice:?}"));
+    }
+    if let Some(kind) = q.pending().filter(|p| p.id == id).map(|p| p.kind) {
+        if !valid_choice(kind, choice) {
+            return Err(format!(
+                "invalid choice {choice:?} for a {} prompt",
+                kind.as_str()
+            ));
+        }
     }
     let p = q.start(id)?;
     match choice {
         "cancel" => {
             q.end(None);
+            Ok(None)
+        }
+        // Window-bound: this process ends, and with it the Daemon and every Terminal
+        // (`Hosts::quit` at exit). `remember` does not apply.
+        "close" => {
+            q.end(None);
+            finish(app, &p);
             Ok(None)
         }
         "keep" => {
@@ -497,13 +799,25 @@ mod tests {
 
     fn base() -> CloseInputs {
         CloseInputs {
-            unix: true,
+            lifetime: Lifetime::AlwaysOn,
             attached: true,
             bypass: false,
             keep: KeepSessions::Ask,
             last_desktop: true,
             last_window: true,
             running: Some(2),
+            owner: false,
+            session_ending: false,
+        }
+    }
+
+    /// Window-bound (W4, A2): the owner's last window confirms; the count unknown still
+    /// confirms (without a number); keep/presence/attachment do not apply.
+    fn window_bound() -> CloseInputs {
+        CloseInputs {
+            lifetime: Lifetime::WindowBound,
+            owner: true,
+            ..base()
         }
     }
 
@@ -511,8 +825,7 @@ mod tests {
     fn decide_table() {
         assert_eq!(decide(&base()), CloseDecision::Ask(2));
         type Gate = (&'static str, fn(&mut CloseInputs));
-        let gates: [Gate; 8] = [
-            ("windows", |i| i.unix = false),
+        let gates: [Gate; 7] = [
             ("unattached", |i| i.attached = false),
             ("bypass", |i| i.bypass = true),
             ("always keep", |i| i.keep = KeepSessions::Always),
@@ -526,19 +839,112 @@ mod tests {
             f(&mut i);
             assert_eq!(decide(&i), CloseDecision::Close, "{what}");
         }
+        // Owner and session state do not change the always-on decision.
+        let mut i = base();
+        i.owner = true;
+        i.session_ending = true;
+        assert_eq!(decide(&i), CloseDecision::Ask(2));
+
+        // Window-bound.
+        assert_eq!(decide(&window_bound()), CloseDecision::Confirm(Some(2)));
+        let asks: [Gate; 4] = [
+            ("always keep is ignored", |i| i.keep = KeepSessions::Always),
+            ("presence is ignored", |i| i.last_desktop = false),
+            ("unattached still asks (held)", |i| i.attached = false),
+            ("a terminal of another window counts", |i| {
+                i.running = Some(1)
+            }),
+        ];
+        for (what, f) in asks {
+            let mut i = window_bound();
+            f(&mut i);
+            assert!(
+                matches!(decide(&i), CloseDecision::Confirm(Some(_))),
+                "{what}"
+            );
+        }
+        let mut i = window_bound();
+        i.running = None;
+        assert_eq!(
+            decide(&i),
+            CloseDecision::Confirm(None),
+            "unknown is not zero"
+        );
+        let closes: [Gate; 5] = [
+            ("not the owner", |i| i.owner = false),
+            ("session ending", |i| i.session_ending = true),
+            ("updater bypass", |i| i.bypass = true),
+            ("nothing running", |i| i.running = Some(0)),
+            ("other window", |i| i.last_window = false),
+        ];
+        for (what, f) in closes {
+            let mut i = window_bound();
+            f(&mut i);
+            assert_eq!(decide(&i), CloseDecision::Close, "{what}");
+            // These close with the count unknown too.
+            if what != "nothing running" {
+                i.running = None;
+                assert_eq!(decide(&i), CloseDecision::Close, "{what}, count unknown");
+            }
+        }
+    }
+
+    /// A `close` prompt takes only Close and Cancel; a `keep` prompt never takes Close.
+    #[test]
+    fn close_kind_accepts_only_close_and_cancel() {
+        assert!(valid_choice(PromptKind::Close, "close"));
+        assert!(valid_choice(PromptKind::Close, "cancel"));
+        assert!(!valid_choice(PromptKind::Close, "keep"));
+        assert!(!valid_choice(PromptKind::Close, "stop"));
+        assert!(valid_choice(PromptKind::Keep, "keep"));
+        assert!(valid_choice(PromptKind::Keep, "stop"));
+        assert!(valid_choice(PromptKind::Keep, "cancel"));
+        assert!(!valid_choice(PromptKind::Keep, "close"));
+        let q = QuitState::new(None);
+        let ev = q.begin_close("main", vec![], None, false).unwrap();
+        assert_eq!(ev.kind, "close");
+        assert_eq!(ev.terminals, None);
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({"id": ev.id, "terminals": null, "kind": "close"})
+        );
+        // One prompt at a time, whatever its kind.
+        assert!(q.begin("main", vec![Uuid::new_v4()], false).is_none());
+        assert_eq!(q.pending().unwrap().kind, PromptKind::Close);
+        q.end(None);
+        let ev = q.begin("main", vec![Uuid::new_v4()], false).unwrap();
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({"id": ev.id, "terminals": 1, "kind": "keep"})
+        );
+    }
+
+    /// A prompt begun before the frontend listened is replayed once it does (A2), but not
+    /// while it is being answered.
+    #[test]
+    fn held_prompt_is_replayed_when_the_frontend_listens() {
+        let q = QuitState::new(None);
+        assert!(q.replay().is_none());
+        let ev = q
+            .begin_close("main", vec![Uuid::new_v4(), Uuid::new_v4()], Some(2), false)
+            .unwrap();
+        assert_eq!(q.replay(), Some(("main".to_string(), ev.clone())));
+        q.start(&ev.id).unwrap();
+        assert!(q.replay().is_none());
+        q.release();
+        assert_eq!(q.replay().unwrap().1.terminals, Some(2));
     }
 
     #[test]
     fn unattached_never_intercepts() {
         let q = QuitState::new(None);
-        let i = q.inputs(KeepSessions::Ask, true, Some(3));
-        assert_eq!(decide(&i), CloseDecision::Close);
+        let inputs =
+            |q: &QuitState| q.inputs(Lifetime::AlwaysOn, KeepSessions::Ask, true, Some(3), false);
+        assert_eq!(decide(&inputs(&q)), CloseDecision::Close);
         q.set_attached();
-        let i = q.inputs(KeepSessions::Ask, true, Some(3));
-        assert_eq!(decide(&i), CloseDecision::Ask(3));
+        assert_eq!(decide(&inputs(&q)), CloseDecision::Ask(3));
         q.set_bypass();
-        let i = q.inputs(KeepSessions::Ask, true, Some(3));
-        assert_eq!(decide(&i), CloseDecision::Close);
+        assert_eq!(decide(&inputs(&q)), CloseDecision::Close);
     }
 
     /// A9: a second close while a prompt is pending begins no second prompt (and is not
@@ -548,7 +954,7 @@ mod tests {
         let q = QuitState::new(None);
         let a = Uuid::new_v4();
         let ev = q.begin("main", vec![a], false).unwrap();
-        assert_eq!(ev.terminals, 1);
+        assert_eq!(ev.terminals, Some(1));
         assert!(
             q.begin("main", vec![a], false).is_none(),
             "second prompt begun"

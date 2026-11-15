@@ -167,6 +167,13 @@ pub fn local_migration_sync_settings(app: AppHandle) -> Result<(), String> {
 }
 
 pub fn sync_file(path: &Path) -> io::Result<()> {
+    // Windows: `FlushFileBuffers` needs write access; opened without truncating (A4).
+    #[cfg(windows)]
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()?;
     path.parent().map_or(Ok(()), sync_dir)
 }
@@ -251,6 +258,20 @@ mod tests {
         clear_journal(&path).unwrap();
         assert!(sync_file(&path).is_err());
         assert_eq!(read_journal(&path).unwrap(), None);
+    }
+
+    /// A4 on Windows: syncing settings.json (the migration's commit point) succeeds and
+    /// leaves its bytes as they were.
+    #[cfg(windows)]
+    #[test]
+    fn sync_file_flushes_without_truncating_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let body = br#"{"open_tabs":[{"id":"x"}]}"#;
+        std::fs::write(&path, body).unwrap();
+        sync_file(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert!(sync_file(&dir.path().join("missing.json")).is_err());
     }
 
     /// B cached A's saved Tabs; A closed one and regrouped; B then saves another setting.

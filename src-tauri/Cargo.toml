@@ -71,7 +71,8 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Already in the tree (xshell-core): file identity for the open-copies install check.
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# Win32_UI_WindowsAndMessaging: `GetSystemMetrics(SM_SHUTTINGDOWN)` for the close prompt.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

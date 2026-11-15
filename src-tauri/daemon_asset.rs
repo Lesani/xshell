@@ -1,5 +1,5 @@
 //! Shared by build.rs and the embedded own-target BinarySource: the checks an embedded
-//! Linux/macOS `xshelld` must pass (ADR-0017: the Desktop carries its own Daemon).
+//! Linux/macOS/Windows `xshelld` must pass (ADR-0017: the Desktop carries its own Daemon).
 use sha2::{Digest, Sha256};
 use xshell_protocol::build::{scan_stamp, BuildId};
 
@@ -51,6 +51,13 @@ pub fn verify_own(
                     "embedded Daemon must be a 64-bit Mach-O executable with a {target_arch} slice"
                 ));
             }
+        }
+        "windows" => {
+            if target_arch != "x86_64" {
+                return Err(format!("no embedded Daemon for Windows {target_arch}"));
+            }
+            // The PE, size, hash and clean exact-build checks of the Windows asset.
+            return super::windows_asset::verify(bytes, sha256.trim(), expected);
         }
         other => return Err(format!("no embedded own-target Daemon on {other}")),
     }

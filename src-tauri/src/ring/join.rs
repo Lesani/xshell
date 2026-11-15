@@ -97,7 +97,7 @@ impl Serialize for JoinStarted {
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinOverview {
-    /// `platform` or `not-registered`.
+    /// `not-registered` (Create/Join wait for this computer's Host).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<&'static str>,
     pub owner: bool,
@@ -244,8 +244,9 @@ pub fn start_error(error: String) -> String {
 }
 
 /// The local Host's client once it is registered and its endpoint exists (Unix: the socket
-/// file). Before that `not_registered:`, which `ring_join_overview` reports as
-/// `not-registered` so Create/Join stay disabled.
+/// file; a Windows pipe is not a file, so a Daemon that is not serving yet surfaces as the
+/// `not_registered:` start error instead). Before that `not_registered:`, which
+/// `ring_join_overview` reports as `not-registered` so Create/Join stay disabled.
 fn ready_local_client(
     ring: &xshell_hostlink::ring::DesktopRing,
 ) -> Result<xshell_hostlink::ring::companion_ipc::CompanionClient, String> {
@@ -496,13 +497,6 @@ pub fn refresh_approval(app: &AppHandle) -> &'static str {
     text
 }
 
-fn ensure_local() -> Result<(), String> {
-    if !cfg!(unix) {
-        return Err("unavailable: platform".into());
-    }
-    Ok(())
-}
-
 /// The Create click is the local consent for exactly the genesis the backend presents.
 fn confirm_local(
     p: &ConsentPreview,
@@ -538,7 +532,6 @@ pub async fn ring_create_computer(
     relay_url: Option<String>,
 ) -> Result<RingStatus, String> {
     let w = worker(&app)?;
-    ensure_local()?;
     let relay = chosen_relay(relay_url)?;
     run(move || {
         let client = ready_local_client(&w.ring)?;
@@ -569,7 +562,6 @@ pub async fn ring_join_start(
     relay_url: Option<String>,
 ) -> Result<JoinStarted, String> {
     let w = worker(&app)?;
-    ensure_local()?;
     let relay = chosen_relay(relay_url)?;
     let joins = app
         .try_state::<RingState>()
@@ -625,13 +617,9 @@ pub async fn ring_join_cancel(app: AppHandle, operation: Uuid) -> Result<(), Str
 pub async fn ring_join_overview(app: AppHandle) -> Result<JoinOverview, String> {
     let w = worker(&app)?;
     run(move || {
-        let unavailable = if !cfg!(unix) {
-            Some("platform")
-        } else if ready_local_client(&w.ring).is_err() {
-            Some("not-registered")
-        } else {
-            None
-        };
+        let unavailable = ready_local_client(&w.ring)
+            .is_err()
+            .then_some("not-registered");
         let joins = app
             .try_state::<RingState>()
             .map(|s| s.joins.events())

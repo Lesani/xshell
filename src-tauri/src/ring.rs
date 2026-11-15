@@ -182,8 +182,9 @@ pub fn setup(app: &AppHandle) {
     // Register even before membership, and again whenever the registration is missing or
     // stale: after a set-aside (removal, format 1) this Desktop has a new identity, and
     // the Daemon may have rotated its own. Followers never register another profile. The
-    // registration child cannot start serve or release Computer consent.
-    #[cfg(unix)]
+    // registration child cannot start serve or release Computer consent. Windows registers
+    // with the live GUI-bound Daemon over its pipe, the same way (W3).
+    #[cfg(any(unix, windows))]
     {
         let startup_ring = Arc::downgrade(&ring);
         let registration_app = app.clone();
@@ -223,7 +224,7 @@ pub fn setup(app: &AppHandle) {
             }
         });
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let owner_ring = Arc::downgrade(&ring);
         let focus_app = app.clone();
@@ -238,7 +239,9 @@ pub fn setup(app: &AppHandle) {
                 if ring.is_quitting() {
                     break;
                 }
-                // Offers `xshelld pair` started on this computer are shown in the Ring page.
+                // Offers `xshelld pair` started on this computer are shown in the Ring page
+                // (no `xshelld pair` on Windows).
+                #[cfg(unix)]
                 join::track_cli_joins(&focus_app, &ring);
                 tick = tick.wrapping_add(1);
                 if tick.is_multiple_of(10) {
@@ -293,17 +296,24 @@ pub fn setup(app: &AppHandle) {
         }
         Err(e) => eprintln!("xshell: cannot find settings.json: {e}"),
     }
-    let pairing_ipc = xshell_pairing_access::local::endpoint()
-        .and_then(|path| xshell_pairing_access::local::serve(worker.ring.clone(), path));
-    if let Err(error) = &pairing_ipc {
-        eprintln!("xshell: pairing access: {error}");
-    }
+    // The pairing facade exists on Linux only; elsewhere it would only log a failure.
+    #[cfg(target_os = "linux")]
+    let pairing_ipc = {
+        let r = xshell_pairing_access::local::endpoint()
+            .and_then(|path| xshell_pairing_access::local::serve(worker.ring.clone(), path));
+        if let Err(error) = &r {
+            eprintln!("xshell: pairing access: {error}");
+        }
+        r.ok()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let pairing_ipc: Option<xshell_pairing_access::local::Server> = None;
     app.manage(RingState {
         worker: worker.clone(),
         joins: Arc::default(),
         membership: std::sync::Mutex::new("none"),
         busy: std::sync::Mutex::new(false),
-        _pairing_ipc: pairing_ipc.ok(),
+        _pairing_ipc: pairing_ipc,
     });
     join::refresh_approval(app);
     // Hosts may be connected already: record them before attaching, so the start

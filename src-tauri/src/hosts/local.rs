@@ -1,13 +1,11 @@
 //! How the Local Host runs its Terminals.
 //!
-//! Linux and macOS (ADR-0017): always in the one always-on Daemon of this machine. The
+//! Always in a Daemon of this machine: on Linux and macOS the one always-on Daemon
+//! (ADR-0017), on Windows the GUI-bound Daemon in this Desktop's Job (ADR-0005, W1). The
 //! Desktop embeds its own `xshelld` and installs it under `~/.xshell/server/<dir>/`; a
 //! sidecar or `XSHELL_DAEMON_BIN` wins for development and tests. In-process Terminals are
-//! unreachable there (`XSHELL_LOCAL_DAEMON=0` remains, for tests only): failing to start the
+//! unreachable (`XSHELL_LOCAL_DAEMON=0` remains, for tests only): failing to start the
 //! Daemon is an error with the log path and Retry, never a fallback.
-//!
-//! Windows (unchanged): a GUI-bound Daemon (ADR-0005, #24) when the app finds its `xshelld`,
-//! otherwise in this process.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -34,9 +32,9 @@ pub enum LocalMode {
     /// New local Tabs are Terminals of a Daemon started from `bin`.
     Daemon { bin: PathBuf, source: DaemonSource },
     /// Local Tabs run in this process; `reason` is logged and returned to the frontend.
-    /// Windows without a Daemon; on Unix only `XSHELL_LOCAL_DAEMON=0` (tests).
+    /// Only `XSHELL_LOCAL_DAEMON=0` (tests).
     InProcess { reason: String },
-    /// Unix: the Local Host's Daemon cannot even be set up (no home directory, …).
+    /// The Local Host's Daemon cannot even be set up (no home directory, …).
     Failed { reason: String },
 }
 
@@ -113,7 +111,7 @@ impl LocalMode {
                 daemon: None,
                 service: None,
             },
-            // The Daemon object is kept (Unix): the error view needs the log path.
+            // The Daemon object is kept: the error view needs the log path.
             LocalMode::Failed { reason } => LocalHostInfo {
                 mode: "failed",
                 reason: Some(reason.clone()),
@@ -346,71 +344,19 @@ pub fn apply_switch(
     }
 }
 
-/// The Daemon binary, in this order:
-/// 1. `XSHELL_DAEMON_BIN` (development and tests);
-/// 2. `xshelld` (`xshelld.exe` on Windows) next to the app's executable: the bundled sidecar
-///    (Tauri strips the target triple from sidecar names), the one in the portable zip, and
-///    `target/debug/xshelld` under `tauri dev`.
-///
-/// `XSHELL_LOCAL_DAEMON=0` keeps local Tabs in this process, as does an app without one
-/// (the bare portable `xshell.exe`).
-pub fn resolve_daemon_binary(
-    exe_dir: Option<&Path>,
-    env: &dyn Fn(&str) -> Option<OsString>,
-) -> LocalMode {
-    let in_process = |reason: String| LocalMode::InProcess { reason };
-    if env("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
-        return in_process("XSHELL_LOCAL_DAEMON=0".into());
-    }
-    if let Some(p) = env("XSHELL_DAEMON_BIN").filter(|p| !p.is_empty()) {
-        let p = PathBuf::from(p);
-        return if p.is_file() {
-            LocalMode::Daemon {
-                bin: p,
-                source: DaemonSource::File,
-            }
-        } else {
-            in_process(format!("XSHELL_DAEMON_BIN {} is not a file", p.display()))
-        };
-    }
-    let Some(dir) = exe_dir else {
-        return in_process("the app's directory is unknown".into());
-    };
-    let bin = dir.join(daemon_file_name());
-    if bin.is_file() {
-        LocalMode::Daemon {
-            bin,
-            source: DaemonSource::File,
-        }
-    } else {
-        in_process(format!("no xshelld in {}", dir.display()))
-    }
-}
-
-/// Which Daemon the Local Host uses. Windows (`unix == false`): exactly
-/// [`resolve_daemon_binary`]. Unix, in this order:
+/// Which Daemon the Local Host uses, the same on every platform (Windows too, W2):
 /// 1. `XSHELL_LOCAL_DAEMON=0`: in-process (tests only);
 /// 2. `XSHELL_DAEMON_BIN`, even if it is not a file (the start then reports it);
-/// 3. the sidecar next to the app;
+/// 3. the sidecar next to the app (`xshelld`, `xshelld.exe` on Windows);
 /// 4. the embedded Daemon, installed at `install_bin` (`~/.xshell/server/<dir>/xshelld`);
 /// 5. otherwise `Missing`: every start fails with the reason, and Retry shows it.
 pub fn resolve_local(
     exe_dir: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
-    unix: bool,
     embedded: bool,
     install_bin: Option<&Path>,
     sidecar_matches: &dyn Fn(&Path) -> bool,
 ) -> LocalMode {
-    if !unix {
-        return match resolve_daemon_binary(exe_dir, env) {
-            LocalMode::Daemon { bin, .. } => LocalMode::Daemon {
-                bin,
-                source: DaemonSource::File,
-            },
-            other => other,
-        };
-    }
     if env("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
         return LocalMode::InProcess {
             reason: "XSHELL_LOCAL_DAEMON=0".into(),
@@ -494,26 +440,14 @@ mod tests {
             .collect()
     }
 
-    fn resolve_win(dir: Option<&Path>, env: &[(&str, &str)]) -> LocalMode {
-        let env = env_of(env);
-        resolve_local(dir, &|k| env.get(k).cloned(), false, true, None, &|_| true)
-    }
-
-    fn resolve_unix(
+    fn resolve(
         dir: Option<&Path>,
         env: &[(&str, &str)],
         embedded: bool,
         install: Option<&Path>,
     ) -> LocalMode {
         let env = env_of(env);
-        resolve_local(
-            dir,
-            &|k| env.get(k).cloned(),
-            true,
-            embedded,
-            install,
-            &|_| true,
-        )
+        resolve_local(dir, &|k| env.get(k).cloned(), embedded, install, &|_| true)
     }
 
     fn file(bin: PathBuf) -> LocalMode {
@@ -523,48 +457,60 @@ mod tests {
         }
     }
 
+    /// One order on every platform (W2): never in-process except the test switch.
     #[test]
-    fn resolve_unix_order() {
+    fn resolve_order_same_on_every_platform() {
         let t = tempfile::tempdir().unwrap();
         let exe_dir = t.path().join("app");
         std::fs::create_dir(&exe_dir).unwrap();
         let other = t.path().join("dev-xshelld");
         std::fs::write(&other, "").unwrap();
         let other_s = other.to_str().unwrap();
-        let install = t.path().join("home/.xshell/server/1.5.0+abc/xshelld");
+        let install = t
+            .path()
+            .join("home/.xshell/server/1.5.0+abc")
+            .join(daemon_file_name());
         // Nothing beside the app, nothing embedded: Missing, with the reason, never in-process.
-        match resolve_unix(Some(&exe_dir), &[], false, Some(&install)) {
+        match resolve(Some(&exe_dir), &[], false, Some(&install)) {
             LocalMode::Daemon {
                 source: DaemonSource::Missing(r),
                 bin,
             } => {
                 assert!(r.contains("carries no xshelld"), "{r}");
-                assert_eq!(bin, exe_dir.join("xshelld"));
+                assert_eq!(bin, exe_dir.join(daemon_file_name()));
             }
             m => panic!("{m:?}"),
         }
         // Embedded: installed under the home.
         assert_eq!(
-            resolve_unix(Some(&exe_dir), &[], true, Some(&install)),
+            resolve(Some(&exe_dir), &[], true, Some(&install)),
             LocalMode::Daemon {
                 bin: install.clone(),
                 source: DaemonSource::Embedded
             }
         );
         assert!(matches!(
-            resolve_unix(Some(&exe_dir), &[], true, None),
+            resolve(Some(&exe_dir), &[], true, None),
             LocalMode::Failed { .. }
         ));
+        // Nothing beside the app and no home: never in-process either.
+        assert!(matches!(
+            resolve(None, &[], false, None),
+            LocalMode::Daemon {
+                source: DaemonSource::Missing(_),
+                ..
+            }
+        ));
         // The sidecar wins over the embedded copy.
-        let sidecar = exe_dir.join("xshelld");
+        let sidecar = exe_dir.join(daemon_file_name());
         std::fs::write(&sidecar, "").unwrap();
         assert_eq!(
-            resolve_unix(Some(&exe_dir), &[], true, Some(&install)),
+            resolve(Some(&exe_dir), &[], true, Some(&install)),
             file(sidecar.clone())
         );
         // The environment wins, even a path that is not a file (the start reports it).
         assert_eq!(
-            resolve_unix(
+            resolve(
                 Some(&exe_dir),
                 &[("XSHELL_DAEMON_BIN", other_s)],
                 true,
@@ -573,7 +519,7 @@ mod tests {
             file(other.clone())
         );
         assert_eq!(
-            resolve_unix(
+            resolve(
                 Some(&exe_dir),
                 &[("XSHELL_DAEMON_BIN", "/nonexistent/xshelld")],
                 true,
@@ -583,7 +529,7 @@ mod tests {
         );
         // The test switch wins over everything.
         assert!(matches!(
-            resolve_unix(
+            resolve(
                 Some(&exe_dir),
                 &[("XSHELL_LOCAL_DAEMON", "0"), ("XSHELL_DAEMON_BIN", other_s)],
                 true,
@@ -627,7 +573,6 @@ mod tests {
             resolve_local(
                 Some(&app),
                 &|k| env.get(k).cloned(),
-                true,
                 embedded,
                 Some(&install),
                 &matches,
@@ -665,43 +610,11 @@ mod tests {
                 Some(&app),
                 &|k| env2.get(k).cloned(),
                 true,
-                true,
                 Some(&install),
                 &matches
             ),
             file("/dev/xshelld".into())
         );
-    }
-
-    #[test]
-    fn resolve_windows_unchanged() {
-        let t = tempfile::tempdir().unwrap();
-        let exe_dir = t.path().join("app");
-        std::fs::create_dir(&exe_dir).unwrap();
-        // Every fallback stays in-process; nothing embedded applies.
-        assert!(
-            matches!(&resolve_win(Some(&exe_dir), &[]), LocalMode::InProcess { reason } if reason.contains("no xshelld"))
-        );
-        assert_eq!(
-            resolve_win(None, &[]),
-            LocalMode::InProcess {
-                reason: "the app's directory is unknown".into()
-            }
-        );
-        assert!(matches!(
-            resolve_win(
-                Some(&exe_dir),
-                &[("XSHELL_DAEMON_BIN", "/nonexistent/xshelld")]
-            ),
-            LocalMode::InProcess { .. }
-        ));
-        let sidecar = exe_dir.join(daemon_file_name());
-        std::fs::write(&sidecar, "").unwrap();
-        assert_eq!(resolve_win(Some(&exe_dir), &[]), file(sidecar));
-        assert!(matches!(
-            resolve_win(Some(&exe_dir), &[("XSHELL_LOCAL_DAEMON", "0")]),
-            LocalMode::InProcess { .. }
-        ));
     }
 
     #[test]

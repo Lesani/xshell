@@ -89,8 +89,7 @@ fn setup_local(
     let install_bin = own_install_bin(version, home.as_deref());
     let embedded = binaries::embedded_own().is_some();
     let matches = |p: &std::path::Path| local::binary_is_build(p, crate::build_id::BUILD.as_ref());
-    if cfg!(unix)
-        && std::env::var_os("XSHELL_DAEMON_BIN").is_none_or(|v| v.is_empty())
+    if std::env::var_os("XSHELL_DAEMON_BIN").is_none_or(|v| v.is_empty())
         && local::sidecar_ignored(exe_dir, embedded, &matches)
     {
         eprintln!("{}", local::IGNORED_SIDECAR);
@@ -98,7 +97,6 @@ fn setup_local(
     let mut mode = local::resolve_local(
         exe_dir,
         &|k| std::env::var_os(k),
-        cfg!(unix),
         embedded,
         install_bin.as_deref(),
         &matches,
@@ -111,11 +109,8 @@ fn setup_local(
                     Some(d)
                 }
                 Err(reason) => {
-                    mode = if cfg!(unix) {
-                        local::LocalMode::Failed { reason }
-                    } else {
-                        local::LocalMode::InProcess { reason }
-                    };
+                    // Never in-process (W2): the error view with the log path and Retry.
+                    mode = local::LocalMode::Failed { reason };
                     None
                 }
             }
@@ -138,7 +133,8 @@ fn setup_local(
 
 /// Before the Local Host starts dialing. Unix: always-on (ADR-0017), `serve` first, and a
 /// prepare hook that installs the embedded Daemon (or reports that there is none) and waits
-/// once, briefly, for the service. Windows: the stored GUI-bound mode as before.
+/// once, briefly, for the service. Windows: GUI-bound in this Desktop's Job (W1), with a
+/// prepare hook that installs the embedded Daemon (or reports that there is none).
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn configure(
     d: &Arc<xshell_hostlink::LocalDaemon>,
@@ -190,13 +186,29 @@ fn configure(
         };
         d.set_prepare(hook);
     }
-    // Windows: GUI-bound only (the Persistent setting is not offered there).
+    // Windows: GUI-bound only (W1). No service and no blocker: a Daemon another window
+    // started is used as it is.
     #[cfg(not(unix))]
-    d.set_persistent(false);
+    {
+        d.set_persistent(false);
+        match source.clone() {
+            local::DaemonSource::Missing(reason) => {
+                d.set_prepare(Arc::new(move || Err(reason.clone())));
+            }
+            local::DaemonSource::Embedded => {
+                let bin = d.bin().to_path_buf();
+                if let Err(e) = install_embedded(&bin) {
+                    eprintln!("xshell: {e}");
+                }
+                d.set_prepare(Arc::new(move || install_embedded(&bin).map(drop)));
+            }
+            local::DaemonSource::File => {}
+        }
+    }
 }
 
-/// Install the embedded Daemon at `bin` (`~/.xshell/server/<dir>/xshelld`).
-#[cfg(unix)]
+/// Install the embedded Daemon at `bin` (`~/.xshell/server/<dir>/xshelld`, `xshelld.exe`
+/// on Windows).
 fn install_embedded(bin: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let bytes = binaries::embedded_own().ok_or("this build carries no xshelld")?;
     let dir = bin
@@ -366,6 +378,7 @@ impl Hosts {
             &self.service,
             (self.home_of)(),
             exe_dir.as_deref(),
+            quit::Lifetime::of_platform(),
         );
         if set_up || self.service.get().is_some_and(|s| s.error.is_some()) {
             self.start_service_install();
@@ -400,7 +413,7 @@ fn info_of(
 ) -> local::LocalHostInfo {
     let daemon = match (mode, d) {
         // No LocalDaemon could be built: still the error with this home's real log path.
-        (local::LocalMode::Failed { reason }, _) if cfg!(unix) => {
+        (local::LocalMode::Failed { reason }, _) => {
             let error = Some(reason.clone());
             Some(local::DaemonInfo {
                 state: "failed",
@@ -436,11 +449,14 @@ fn info_of(
     mode.info(local::PersistentInfo::default(), daemon, service)
 }
 
-/// A Retry rebuilds the selection from scratch (Unix; Windows only from `Failed`): the
-/// Daemon binary is resolved again (a stale sidecar may be gone, the home may be known now)
-/// and a new Local Host Daemon set up, which the Local Host's dialer uses from its next
-/// dial. Always clears the start error and kicks the Local Host. Returns whether a Daemon
-/// was set up anew.
+/// A Retry rebuilds the selection from scratch (always-on; window-bound only from `Failed`,
+/// A1): the Daemon binary is resolved again (a stale sidecar may be gone, the home may be
+/// known now) and a new Local Host Daemon set up, which the Local Host's dialer uses from
+/// its next dial. A window-bound `LocalDaemon` is never replaced: dropping it closes its Job
+/// and would end the Daemon it started with every Terminal; Retry then only redials (and
+/// respawns in the same Job). Always clears the start error and kicks the Local Host.
+/// Returns whether a Daemon was set up anew.
+#[allow(clippy::too_many_arguments)]
 fn retry_setup(
     current: &Mutex<local::LocalMode>,
     slot: &DaemonSlot,
@@ -449,10 +465,11 @@ fn retry_setup(
     svc: &Arc<service::ServiceState>,
     home: Option<std::path::PathBuf>,
     exe_dir: Option<&std::path::Path>,
+    lifetime: quit::Lifetime,
 ) -> bool {
     let mut set_up = false;
     let failed = matches!(*current.lock().unwrap(), local::LocalMode::Failed { .. });
-    if failed || cfg!(unix) {
+    if failed || lifetime == quit::Lifetime::AlwaysOn {
         let (mode, daemon) = setup_local(version, exe_dir, svc, home);
         *current.lock().unwrap() = mode;
         let had = slot.lock().unwrap().is_some();
@@ -779,6 +796,376 @@ mod channel_sink_tests {
     }
 }
 
+/// The Local Host's setup and Retry, the same on every platform (W2, A1).
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    struct Quiet;
+    impl Observer for Quiet {
+        fn status(&self, _: &HostStatus) {}
+        fn terminals(&self, _: &str, _: &[TerminalInfo]) {}
+    }
+    struct NoBinaries;
+    impl xshell_hostlink::BinarySource for NoBinaries {
+        fn fetch(
+            &self,
+            _: &xshell_hostlink::Wanted,
+            _: &xshell_hostlink::CancelToken,
+        ) -> Result<xshell_hostlink::Fetched, String> {
+            Err("none".into())
+        }
+    }
+
+    fn manager(slot: &DaemonSlot) -> Manager {
+        Manager::new(ManagerConfig::new(
+            "1.5.0",
+            Arc::new(SshFactory {
+                local: slot.clone(),
+            }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ))
+    }
+
+    /// A Daemon that cannot be set up is the error view with this home's log, on every
+    /// platform (never in-process).
+    #[test]
+    fn failed_info_names_the_log_on_every_platform() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = Arc::new(service::ServiceState::default());
+        let slot: DaemonSlot = Arc::new(Mutex::new(None));
+        let m = manager(&slot);
+        let mode = local::LocalMode::Failed {
+            reason: "the home directory is unknown".into(),
+        };
+        let info = info_of(&mode, None, &m, &svc, Some(t.path()));
+        assert_eq!(info.mode, "failed");
+        let d = info.daemon.expect("daemon info in mode failed");
+        assert_eq!(d.state, "failed");
+        assert_eq!(
+            d.log,
+            Some(
+                xshell_hostlink::local::local_log_path(t.path())
+                    .display()
+                    .to_string()
+            )
+        );
+        assert_eq!(info.service, None);
+        // Without a home: no Daemon, and still not in-process.
+        let (mode, daemon) = setup_local("1.5.0", Some(t.path()), &svc, None);
+        assert!(daemon.is_none());
+        assert!(
+            matches!(&mode, local::LocalMode::Failed { reason } if reason.contains("home directory is unknown")),
+            "{mode:?}"
+        );
+    }
+
+    /// A1: Retry never replaces a window-bound `LocalDaemon` (dropping it would close its
+    /// Job and end the Daemon it started); it only clears the error and redials. From
+    /// `Failed` (no `LocalDaemon` was ever built) it sets one up.
+    #[test]
+    fn retry_never_replaces_a_window_bound_daemon() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let svc = Arc::new(service::ServiceState::default());
+        let d = local_daemon(t.path().join("no-xshelld"), "1.5.0", Some(home.clone())).unwrap();
+        let slot: DaemonSlot = Arc::new(Mutex::new(Some(d.clone())));
+        let m = manager(&slot);
+        m.set_local(local_host_config());
+        let current = Mutex::new(local::LocalMode::Daemon {
+            bin: t.path().join("no-xshelld"),
+            source: local::DaemonSource::File,
+        });
+        assert!(!retry_setup(
+            &current,
+            &slot,
+            &m,
+            "1.5.0",
+            &svc,
+            Some(home.clone()),
+            Some(t.path()),
+            quit::Lifetime::WindowBound
+        ));
+        let kept = slot.lock().unwrap().clone().unwrap();
+        assert!(
+            Arc::ptr_eq(&kept, &d),
+            "the window-bound Daemon was replaced"
+        );
+        // From Failed: set up.
+        *slot.lock().unwrap() = None;
+        *current.lock().unwrap() = local::LocalMode::Failed {
+            reason: "the home directory is unknown".into(),
+        };
+        assert!(retry_setup(
+            &current,
+            &slot,
+            &m,
+            "1.5.0",
+            &svc,
+            Some(home.clone()),
+            Some(t.path()),
+            quit::Lifetime::WindowBound
+        ));
+        assert!(slot.lock().unwrap().is_some());
+        assert!(!matches!(
+            &*current.lock().unwrap(),
+            local::LocalMode::Failed { .. }
+        ));
+        m.shutdown();
+    }
+}
+
+/// Native Windows tests of the window-bound Local Host (W8). A test build must embed the
+/// `xshelld.exe` of the same build (`XSHELL_DAEMON_ASSET`/`_SHA256`).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct Quiet;
+    impl Observer for Quiet {
+        fn status(&self, _: &HostStatus) {}
+        fn terminals(&self, _: &str, _: &[TerminalInfo]) {}
+    }
+    struct NoBinaries;
+    impl xshell_hostlink::BinarySource for NoBinaries {
+        fn fetch(
+            &self,
+            _: &xshell_hostlink::Wanted,
+            _: &xshell_hostlink::CancelToken,
+        ) -> Result<xshell_hostlink::Fetched, String> {
+            Err("none".into())
+        }
+    }
+
+    fn unique_pipe() -> std::path::PathBuf {
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\xshell-desktop-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// A user-owned private test home (an elevated token's default owner may be
+    /// Administrators).
+    fn private_home(t: &tempfile::TempDir) -> std::path::PathBuf {
+        let home = t.path().join("home");
+        xshell_core::private_fs::ensure_dir(&home).unwrap();
+        xshell_core::private_fs::ensure_dir(&home.join(".xshell")).unwrap();
+        home
+    }
+
+    /// A `LocalDaemon` on its own pipe and home, as `local_daemon` builds it.
+    fn test_daemon(
+        bin: std::path::PathBuf,
+        home: &std::path::Path,
+        pipe: &std::path::Path,
+    ) -> Arc<xshell_hostlink::LocalDaemon> {
+        Arc::new(
+            xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+                bin,
+                env: vec![
+                    ("XSHELLD_HOME".into(), home.as_os_str().to_owned()),
+                    ("XSHELLD_SOCKET".into(), pipe.as_os_str().to_owned()),
+                ],
+                home: home.to_path_buf(),
+                socket: pipe.to_path_buf(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                build: crate::build_id::BUILD.clone(),
+            })
+            .unwrap(),
+        )
+    }
+
+    fn manager_for(d: &Arc<xshell_hostlink::LocalDaemon>) -> Manager {
+        let slot: DaemonSlot = Arc::new(Mutex::new(Some(d.clone())));
+        let m = Manager::new(ManagerConfig::new(
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(SshFactory { local: slot }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ));
+        m.set_local(local_host_config());
+        m
+    }
+
+    fn embedded() -> &'static [u8] {
+        binaries::embedded_own()
+            .expect("build the Windows Desktop tests with XSHELL_DAEMON_ASSET/_SHA256 set")
+    }
+
+    /// W2: a Daemon that cannot start is the failed state with the log path, never
+    /// in-process.
+    #[test]
+    fn no_in_process_fallback_when_daemon_cannot_start() {
+        let t = tempfile::tempdir().unwrap();
+        let home = private_home(&t);
+        let not_a_daemon = t.path().join("not-xshelld.exe");
+        std::fs::write(&not_a_daemon, b"MZ not a Daemon").unwrap();
+        let env: std::collections::HashMap<&str, std::ffi::OsString> =
+            [("XSHELL_DAEMON_BIN", not_a_daemon.clone().into_os_string())].into();
+        let mode = local::resolve_local(
+            Some(t.path()),
+            &|k| env.get(k).cloned(),
+            true,
+            None,
+            &|_| true,
+        );
+        assert_eq!(
+            mode,
+            local::LocalMode::Daemon {
+                bin: not_a_daemon.clone(),
+                source: local::DaemonSource::File
+            }
+        );
+        let d = test_daemon(not_a_daemon.clone(), &home, &unique_pipe());
+        let m = manager_for(&d);
+        let svc = Arc::new(service::ServiceState::default());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let info = loop {
+            let info = info_of(&mode, Some(&d), &m, &svc, Some(&home));
+            if info.daemon.as_ref().is_some_and(|d| d.state == "failed")
+                || Instant::now() >= deadline
+            {
+                break info;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(info.mode, "daemon");
+        let daemon = info.daemon.expect("daemon info");
+        assert_eq!(daemon.state, "failed", "{daemon:?}");
+        assert_eq!(
+            daemon.log,
+            Some(
+                xshell_hostlink::local::local_log_path(&home)
+                    .display()
+                    .to_string()
+            )
+        );
+        assert_eq!(info.service, None);
+        m.shutdown();
+    }
+
+    /// W2: the embedded `xshelld.exe` is installed privately under
+    /// `~\.xshell\server\<dir>`; installing again while it runs leaves it alone; the
+    /// GUI-bound spawn runs that very file.
+    #[test]
+    fn embedded_install_and_start() {
+        let t = tempfile::tempdir().unwrap();
+        let home = private_home(&t);
+        let dir = xshell_protocol::build::install_dir_name(
+            env!("CARGO_PKG_VERSION"),
+            crate::build_id::BUILD.as_ref(),
+        );
+        let bin = xshell_hostlink::install::install_local_bytes(embedded(), &home, &dir).unwrap();
+        assert_eq!(bin, xshell_hostlink::install::local_server_bin(&home, &dir));
+        assert_eq!(
+            own_install_bin(env!("CARGO_PKG_VERSION"), Some(&home)),
+            Some(bin.clone())
+        );
+        assert_eq!(std::fs::read(&bin).unwrap(), embedded());
+        let id = xshell_core::server::native_identity(&bin).unwrap();
+        assert_eq!(id.version, env!("CARGO_PKG_VERSION"));
+        let d = test_daemon(bin.clone(), &home, &unique_pipe());
+        let pid = d.ensure_spawned().unwrap();
+        assert_eq!(d.gui_pid(), Some(pid));
+        let before = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        // Installed again while it runs: accepted, not rewritten.
+        assert_eq!(
+            install_embedded(&bin).unwrap(),
+            bin,
+            "a second install while it runs"
+        );
+        assert_eq!(std::fs::metadata(&bin).unwrap().modified().unwrap(), before);
+        d.hang_up();
+        d.reap(Instant::now() + Duration::from_secs(10));
+    }
+
+    /// W4: the process whose `LocalDaemon` spawned the Daemon owns it (closing asks); a
+    /// second `LocalDaemon` that only connected to it does not (closing never asks).
+    #[test]
+    fn close_decision_owner_vs_non_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let home = private_home(&t);
+        let dir = xshell_protocol::build::install_dir_name(
+            env!("CARGO_PKG_VERSION"),
+            crate::build_id::BUILD.as_ref(),
+        );
+        let bin = xshell_hostlink::install::install_local_bytes(embedded(), &home, &dir).unwrap();
+        let pipe = unique_pipe();
+        let first = test_daemon(bin.clone(), &home, &pipe);
+        let cancel = xshell_hostlink::CancelToken::new();
+        drop(first.connect_or_start(&cancel).unwrap());
+        let second = test_daemon(bin.clone(), &home, &pipe);
+        drop(second.connect_or_start(&cancel).unwrap());
+        let inputs = |d: &xshell_hostlink::LocalDaemon| quit::CloseInputs {
+            lifetime: quit::Lifetime::WindowBound,
+            attached: true,
+            bypass: false,
+            keep: local::KeepSessions::Ask,
+            last_desktop: true,
+            last_window: true,
+            running: Some(1),
+            owner: d.gui_pid().is_some(),
+            session_ending: false,
+        };
+        assert_eq!(
+            quit::decide(&inputs(&first)),
+            quit::CloseDecision::Confirm(Some(1))
+        );
+        assert_eq!(quit::decide(&inputs(&second)), quit::CloseDecision::Close);
+        first.hang_up();
+        first.reap(Instant::now() + Duration::from_secs(10));
+    }
+
+    /// A1: Retry while the dial is spawning leaves the one `LocalDaemon` (and its Daemon)
+    /// in place; this process stays the owner.
+    #[test]
+    fn retry_while_spawning_keeps_one_daemon_and_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let home = private_home(&t);
+        let dir = xshell_protocol::build::install_dir_name(
+            env!("CARGO_PKG_VERSION"),
+            crate::build_id::BUILD.as_ref(),
+        );
+        let bin = xshell_hostlink::install::install_local_bytes(embedded(), &home, &dir).unwrap();
+        let d = test_daemon(bin.clone(), &home, &unique_pipe());
+        let slot: DaemonSlot = Arc::new(Mutex::new(Some(d.clone())));
+        let m = Manager::new(ManagerConfig::new(
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(SshFactory {
+                local: slot.clone(),
+            }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        ));
+        m.set_local(local_host_config());
+        let current = Mutex::new(local::LocalMode::Daemon {
+            bin: bin.clone(),
+            source: local::DaemonSource::File,
+        });
+        let svc = Arc::new(service::ServiceState::default());
+        let pid = d.ensure_spawned().unwrap();
+        assert!(!retry_setup(
+            &current,
+            &slot,
+            &m,
+            env!("CARGO_PKG_VERSION"),
+            &svc,
+            Some(home.clone()),
+            Some(t.path()),
+            quit::Lifetime::of_platform()
+        ));
+        let kept = slot.lock().unwrap().clone().unwrap();
+        assert!(Arc::ptr_eq(&kept, &d));
+        assert_eq!(kept.gui_pid(), Some(pid), "the spawned Daemon still runs");
+        m.shutdown();
+        d.hang_up();
+        d.reap(Instant::now() + Duration::from_secs(10));
+    }
+}
+
 /// A8 with real parts: hostlink's Manager dials a Local Host Daemon that refuses hello.
 #[cfg(all(test, unix))]
 mod local_readiness_tests {
@@ -918,7 +1305,8 @@ mod local_readiness_tests {
             "1.5.0",
             &svc,
             None,
-            Some(t.path())
+            Some(t.path()),
+            quit::Lifetime::AlwaysOn
         ));
         assert!(m.access(LOCAL_HOST_ID).is_none());
         // Known now: set up, the Local Host exists, the info says daemon.
@@ -931,7 +1319,8 @@ mod local_readiness_tests {
             "1.5.0",
             &svc,
             Some(home.clone()),
-            Some(t.path())
+            Some(t.path()),
+            quit::Lifetime::AlwaysOn
         ));
         let d = slot.lock().unwrap().clone().expect("a Daemon");
         assert!(m.access(LOCAL_HOST_ID).is_some());
@@ -1168,7 +1557,8 @@ mod local_readiness_tests {
             "1.5.0",
             &svc,
             Some(home.clone()),
-            Some(&app)
+            Some(&app),
+            quit::Lifetime::AlwaysOn
         ));
         let second = slot.lock().unwrap().clone().unwrap();
         assert!(

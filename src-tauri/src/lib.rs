@@ -214,6 +214,18 @@ fn app_build() -> AppBuild {
     }
 }
 
+/// Whether this build updates itself in the app. A fork build sets
+/// `XSHELL_DISABLE_UPDATER` at build time: the inherited updater would move it to an
+/// upstream release (W7). Settings → About then says how to update by hand.
+fn updates_enabled() -> bool {
+    option_env!("XSHELL_DISABLE_UPDATER").is_none()
+}
+
+#[tauri::command]
+fn app_updates_enabled() -> bool {
+    updates_enabled()
+}
+
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     use std::process::Command;
@@ -261,11 +273,11 @@ impl local_pty::Sink for ChannelSink {
     }
 }
 
-/// A4 (ADR-0017): on Linux and macOS every local Terminal runs in the Daemon; the in-process
-/// PTY commands refuse unless the test override `XSHELL_LOCAL_DAEMON=0` is set. Windows
-/// keeps them (a Desktop without its Daemon runs Terminals in this process).
+/// A4 (ADR-0017, W2): every local Terminal runs in the Daemon, on Windows too (in-process
+/// Terminals are invisible to the Ring); the in-process PTY commands refuse unless the test
+/// override `XSHELL_LOCAL_DAEMON=0` is set.
 fn in_process_allowed(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<(), String> {
-    if cfg!(unix) && env("XSHELL_LOCAL_DAEMON").as_deref() != Some("0".as_ref()) {
+    if env("XSHELL_LOCAL_DAEMON").as_deref() != Some("0".as_ref()) {
         return Err(
             "in-process: local terminals run in this computer's Daemon (host \"local\")".into(),
         );
@@ -385,6 +397,7 @@ async fn relaunch_terminal(
 #[cfg(test)]
 const DESKTOP_ONLY_COMMANDS: &[&str] = &[
     "app_build",
+    "app_updates_enabled",
     "open_url",
     "reveal_in_explorer",
     "read_image_base64",
@@ -734,14 +747,20 @@ async fn upload_abort(upload_id: String) -> Result<(), String> {
 
 pub fn run() {
     xshell_core::files::cleanup_old_dropped_files(&ctx());
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_store::Builder::new()
                 .default_serialize_fn(local_migration::serialize_settings)
                 .build(),
-        )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        );
+    // Not registered at all when this build must not update itself (W7).
+    let builder = if updates_enabled() {
+        builder.plugin(tauri_plugin_updater::Builder::new().build())
+    } else {
+        builder
+    };
+    builder
         .plugin(tauri_plugin_process::init())
         .manage(local_migration::MigrationLock::default())
         .manage(transfer::Transfers::default())
@@ -758,6 +777,7 @@ pub fn run() {
             let presence = hosts::presence::Presence::register(&hosts::presence::default_dir())
                 .map_err(|e| eprintln!("xshell: quit prompt presence unavailable: {e}"))
                 .ok();
+            // Windows: no election; closing confirms by Daemon ownership instead (W4).
             #[cfg(not(unix))]
             let presence = None;
             app.manage(hosts::quit::QuitState::new(presence));
@@ -796,6 +816,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_build,
+            app_updates_enabled,
             list_claude_projects,
             get_sessions,
             get_all_recent_sessions,
@@ -993,7 +1014,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 111);
+        assert_eq!(registered.len(), 112);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)
@@ -1006,7 +1027,7 @@ mod tests {
     /// A4 through the real command: `spawn_terminal` invoked over (mock) IPC refuses on Unix;
     /// without the guard it would start the Terminal and answer `null`.
     #[test]
-    fn spawn_terminal_command_refuses_on_unix() {
+    fn spawn_terminal_command_refuses_on_every_platform() {
         use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
         if std::env::var_os("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
             return;
@@ -1049,19 +1070,15 @@ mod tests {
             "write_terminal",
             serde_json::json!({"id": "t1", "data": "x"}),
         );
-        if cfg!(unix) {
-            let e = r.expect_err("spawn_terminal must refuse on Unix");
-            assert!(e.to_string().contains("in-process:"), "{e}");
-            assert!(w2.unwrap_err().to_string().contains("in-process:"));
-        } else {
-            assert!(r.is_ok(), "{r:?}");
-        }
+        let e = r.expect_err("spawn_terminal must refuse");
+        assert!(e.to_string().contains("in-process:"), "{e}");
+        assert!(w2.unwrap_err().to_string().contains("in-process:"));
     }
 
-    /// A4: the in-process PTY commands refuse on Unix (unless the test override is set), and
-    /// nothing starts.
+    /// A4: the in-process PTY commands refuse on every platform (unless the test override is
+    /// set), and nothing starts.
     #[test]
-    fn in_process_commands_refuse_on_unix() {
+    fn in_process_commands_refuse_on_every_platform() {
         let ptys = Arc::new(LocalPtys::new(Arc::new(|spec, hooks| {
             xshell_core::plan_command_with(&ctx(), spec, hooks)
         })));
@@ -1089,18 +1106,12 @@ mod tests {
             ptys.spawn("t1".into(), spec.clone(), 80, 24, sink.clone())
         });
         let w = local_pty_command(&none, || ptys.write("t1", b"x"));
-        if cfg!(unix) {
-            assert!(r.unwrap_err().starts_with("in-process:"));
-            assert!(w.unwrap_err().starts_with("in-process:"));
-            assert!(in_process_allowed(&none).is_err());
-            // Nothing was spawned.
-            assert!(!ran, "the PTY was started");
-            assert!(in_process_allowed(&off).is_ok());
-        } else {
-            assert!(ran);
-            assert!(in_process_allowed(&none).is_ok());
-            ptys.close("t1");
-        }
+        assert!(r.unwrap_err().starts_with("in-process:"));
+        assert!(w.unwrap_err().starts_with("in-process:"));
+        assert!(in_process_allowed(&none).is_err());
+        // Nothing was spawned.
+        assert!(!ran, "the PTY was started");
+        assert!(in_process_allowed(&off).is_ok());
     }
 
     #[test]
