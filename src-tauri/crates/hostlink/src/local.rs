@@ -321,7 +321,8 @@ pub struct LocalDaemon {
     persistent: AtomicBool,
     keeper: Mutex<mpsc::Sender<(Command, SpawnReply)>>,
     child: Mutex<Option<Spawned>>,
-    quitting: AtomicBool,
+    /// Shared, so a registration request in flight is cancelled by quitting too.
+    quitting: Arc<AtomicBool>,
     #[cfg(unix)]
     registration_child: Mutex<Option<std::sync::Weak<Mutex<Child>>>>,
     /// Runs once when nothing listens, before anything is spawned (the Desktop installs its
@@ -374,7 +375,7 @@ impl LocalDaemon {
             persistent: AtomicBool::new(false),
             keeper: Mutex::new(tx),
             child: Mutex::new(None),
-            quitting: AtomicBool::new(false),
+            quitting: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             registration_child: Mutex::new(None),
             prepare: Mutex::new(None),
@@ -805,22 +806,36 @@ impl LocalDaemon {
     ) -> Result<T, String> {
         use xshell_protocol::ring::companion::CompanionRequest;
         let daemon_store = local_daemon_ring_dir(&self.home);
+        // One readiness deadline for every attempt; quitting cancels a request in flight.
         let until = Instant::now() + Duration::from_secs(10);
+        let late = |last: &str| format!("protected counterpart readiness unavailable: {last}");
         loop {
             if self.quitting.load(Ordering::Acquire) {
                 return Err("Desktop is quitting".into());
             }
             let last = match crate::ring::companion_ipc::CompanionClient::for_store(&daemon_store) {
-                Ok(client) => match client.request(CompanionRequest::Descriptor) {
-                    Ok(_) => return action(&client),
-                    Err(e) => e,
-                },
+                Ok(client) => {
+                    match client.request_until(
+                        CompanionRequest::Descriptor,
+                        until,
+                        self.quitting.clone(),
+                    ) {
+                        Ok(_) => {
+                            if self.quitting.load(Ordering::Acquire) {
+                                return Err("Desktop is quitting".into());
+                            }
+                            if Instant::now() >= until {
+                                return Err(late("the Daemon answered after the deadline"));
+                            }
+                            return action(&client);
+                        }
+                        Err(e) => e,
+                    }
+                }
                 Err(e) => e,
             };
             if Instant::now() >= until {
-                return Err(format!(
-                    "protected counterpart readiness unavailable: {last}"
-                ));
+                return Err(late(&last));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -996,6 +1011,20 @@ impl LocalDaemon {
     /// Our GUI-bound child's pid while it runs.
     pub fn gui_pid(&self) -> Option<u32> {
         self.running_child(Some(Kind::GuiBound))
+    }
+
+    /// [`LocalDaemon::gui_pid`] without waiting: `None` while a start holds the child slot
+    /// (validating or spawning, which may take seconds), `Some(gui_pid)` otherwise.
+    pub fn try_gui_pid(&self) -> Option<Option<u32>> {
+        let mut slot = match self.child.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        Some(slot.as_mut().and_then(|s| {
+            (s.kind == Kind::GuiBound && matches!(s.child.try_wait(), Ok(None)))
+                .then(|| s.child.id())
+        }))
     }
 
     /// Quitting: stop a GUI-bound child in order (SIGTERM; Windows: its stop event), which

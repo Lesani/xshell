@@ -760,11 +760,10 @@ pub fn install_local_bytes(
     xshell_core::private_fs::ensure_dir(&dir)?;
     xshell_core::server::no_reparse(&dir)?;
     let dest = dir.join("xshelld.exe");
-    if let Ok(m) = std::fs::symlink_metadata(&dest) {
-        let same = m.file_type().is_file()
-            && m.len() == bytes.len() as u64
-            && std::fs::read(&dest).is_ok_and(|b| b == bytes);
-        if same {
+    // An existing file is used only through `open_read`: ours, not a reparse point, and its
+    // DACL made private again, before its bytes count as installed.
+    if let Some(existing) = xshell_core::private_fs::open_read(&dest)? {
+        if same_bytes(&existing, bytes)? {
             return Ok(dest);
         }
     }
@@ -786,7 +785,10 @@ pub fn install_local_bytes(
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             // A running image cannot be replaced; one of this very version and build is
-            // what we wanted to install anyway.
+            // what we wanted to install anyway, once it is checked like any existing file.
+            if xshell_core::private_fs::open_read(&dest)?.is_none() {
+                return Err(e);
+            }
             match xshell_core::server::native_identity(&dest) {
                 Ok(id)
                     if xshell_protocol::build::install_dir_name(&id.version, Some(&id.build))
@@ -798,6 +800,18 @@ pub fn install_local_bytes(
             }
         }
     }
+}
+
+/// Whether the open file `f` holds exactly `bytes`.
+#[cfg(windows)]
+fn same_bytes(f: &std::fs::File, bytes: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    if f.metadata()?.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut got = Vec::with_capacity(bytes.len());
+    f.take(bytes.len() as u64 + 1).read_to_end(&mut got)?;
+    Ok(got == bytes)
 }
 
 /// `home/.xshell/server/<dir_name>`, created where missing: every directory on the way 0700
@@ -932,6 +946,65 @@ mod tests {
                     "xshelld"
                 })
         );
+    }
+
+    /// A private test home (the profile's owner may be Administrators).
+    #[cfg(windows)]
+    fn windows_home(t: &tempfile::TempDir) -> std::path::PathBuf {
+        let home = t.path().join("home");
+        xshell_core::private_fs::ensure_dir(&home).unwrap();
+        home
+    }
+
+    /// B1: an identical existing `xshelld.exe` whose DACL lets everyone write is not taken
+    /// as installed as it is: its DACL is made private first.
+    #[cfg(windows)]
+    #[test]
+    fn windows_identical_install_with_a_broad_dacl_is_repaired() {
+        let t = tempfile::tempdir().unwrap();
+        let home = windows_home(&t);
+        let bytes = b"MZ fake daemon bytes";
+        let dest = install_local_bytes(bytes, &home, "1.6.0+abc").unwrap();
+        assert_eq!(dest, local_server_bin(&home, "1.6.0+abc"));
+        let status = std::process::Command::new("icacls.exe")
+            .arg(&dest)
+            .args(["/grant", "*S-1-1-0:F"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let broad = xshell_core::private_fs::security_sddl(&dest).unwrap();
+        assert!(broad.contains(";;;WD)"), "{broad}");
+        assert_eq!(
+            install_local_bytes(bytes, &home, "1.6.0+abc").unwrap(),
+            dest
+        );
+        let after = xshell_core::private_fs::security_sddl(&dest).unwrap();
+        assert!(!after.contains("WD"), "{after}");
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        // Other bytes replace it, privately.
+        install_local_bytes(b"MZ other bytes", &home, "1.6.0+abc").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"MZ other bytes");
+        assert!(!xshell_core::private_fs::security_sddl(&dest)
+            .unwrap()
+            .contains("WD"));
+    }
+
+    /// B1: the check every existing destination goes through refuses a file this user does
+    /// not own (a system file here: a test cannot give a file to another user) and a
+    /// directory where the executable should be.
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_destination_must_be_ours() {
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("notepad.exe");
+        assert!(xshell_core::private_fs::open_read(&system).is_err());
+        let t = tempfile::tempdir().unwrap();
+        let home = windows_home(&t);
+        let dest = local_server_bin(&home, "1.6.0+abc");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(install_local_bytes(b"MZ", &home, "1.6.0+abc").is_err());
     }
 
     #[cfg(unix)]

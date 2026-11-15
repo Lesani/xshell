@@ -401,10 +401,32 @@ fn session_ending() -> bool {
     }
 }
 
-/// This process started the Local Host's running window-bound Daemon (it is in our Job):
-/// closing this process ends it. A Desktop that only connected to it does not own it.
-fn owns_daemon(hosts: &Hosts) -> bool {
-    hosts.local_daemon_now().and_then(|d| d.gui_pid()).is_some()
+/// Whether this process started the Local Host's running window-bound Daemon (it is in
+/// our Job, so closing this process ends it), without waiting: `None` while a start holds
+/// the Daemon's child slot (validating or spawning can take seconds). A Desktop that only
+/// connected to the Daemon, or has none, does not own it. Never asked for an always-on
+/// Daemon, and never blocks the UI thread.
+fn owns_daemon_now(d: Option<&xshell_hostlink::LocalDaemon>) -> Option<bool> {
+    match d {
+        None => Some(false),
+        Some(d) => d.try_gui_pid().map(|pid| pid.is_some()),
+    }
+}
+
+/// [`owns_daemon_now`], waiting up to `wait` (off the UI thread) for a start to let go of
+/// the child slot. Still uncertain: owner, so closing asks rather than ends Terminals
+/// unasked.
+pub fn owns_daemon_within(d: Option<&xshell_hostlink::LocalDaemon>, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(owner) = owns_daemon_now(d) {
+            return owner;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The Local Host's running Terminals, when known.
@@ -451,24 +473,30 @@ fn evaluate(app: &AppHandle, label: &str, last_window: bool, exit: bool) -> Eval
     let lifetime = Lifetime::of_platform();
     let running = local_running(&hosts);
     let keep = read_keep_sessions(hosts.store.as_deref());
-    let owner = owns_daemon(&hosts);
+    // Ownership matters only window-bound, and is read without waiting here.
+    let owner = match lifetime {
+        Lifetime::AlwaysOn => Some(false),
+        Lifetime::WindowBound => owns_daemon_now(hosts.local_daemon_now().as_deref()),
+    };
     let mut inputs = q.inputs(
         lifetime,
         keep,
         last_window,
         running.as_ref().map(Vec::len),
-        owner,
+        owner.unwrap_or(true),
     );
     // Only elect when everything else would ask: a cheap close stays cheap.
     let pre = decide(&inputs);
-    if pre == CloseDecision::Confirm(None) {
-        // Unknown is not zero (A2): ask for the list off the UI thread, the window open.
+    if pre == CloseDecision::Confirm(None) || (owner.is_none() && pre != CloseDecision::Close) {
+        // Unknown is not zero (A2): ask for the list (and, while a start holds it, the
+        // ownership) off the UI thread, the window open.
         q.deciding.store(true, Ordering::SeqCst);
         let worker_app = app.clone();
         let worker_label = label.to_string();
+        let owner_known = owner.is_some();
         let spawned = std::thread::Builder::new()
             .name("quit-decide".into())
-            .spawn(move || decide_later(&worker_app, &worker_label, inputs, exit));
+            .spawn(move || decide_later(&worker_app, &worker_label, inputs, owner_known, exit));
         if spawned.is_err() {
             // No worker: ask without a number rather than close unasked.
             q.deciding.store(false, Ordering::SeqCst);
@@ -502,14 +530,27 @@ fn evaluate(app: &AppHandle, label: &str, last_window: bool, exit: bool) -> Eval
     }
 }
 
-/// The worker half of a window-bound close whose Terminal count was unknown: wait briefly
-/// for the list, decide again, then close or show the `close` prompt (with or without a
-/// number).
-fn decide_later(app: &AppHandle, label: &str, mut inputs: CloseInputs, exit: bool) {
+/// The worker half of a window-bound close whose Terminal count (or ownership) was not
+/// known: wait briefly for them, decide again, then close or show the `close` prompt (with
+/// or without a number).
+fn decide_later(
+    app: &AppHandle,
+    label: &str,
+    mut inputs: CloseInputs,
+    owner_known: bool,
+    exit: bool,
+) {
     let (Some(q), Some(hosts)) = (app.try_state::<QuitState>(), app.try_state::<Hosts>()) else {
         return;
     };
-    let running = local_running_within(&hosts, LIST_WAIT);
+    if !owner_known {
+        inputs.owner = owns_daemon_within(hosts.local_daemon_now().as_deref(), LIST_WAIT);
+    }
+    let running = if inputs.owner {
+        local_running_within(&hosts, LIST_WAIT)
+    } else {
+        None
+    };
     inputs.running = running.as_ref().map(Vec::len);
     inputs.bypass = q.bypassed();
     inputs.session_ending = session_ending();
@@ -627,7 +668,8 @@ pub fn check(app: &AppHandle) -> Option<QuitCheck> {
         keep,
         app.webview_windows().len() <= 1,
         running.as_ref().map(Vec::len),
-        owns_daemon(&hosts),
+        lifetime == Lifetime::WindowBound
+            && owns_daemon_now(hosts.local_daemon_now().as_deref()).unwrap_or(true),
     );
     // A check is informational: ask as if the frontend listened.
     i.attached = true;
@@ -887,6 +929,75 @@ mod tests {
                 assert_eq!(decide(&i), CloseDecision::Close, "{what}, count unknown");
             }
         }
+    }
+
+    /// B2: closing while the Daemon's start holds its child slot (a stalled `--version`
+    /// probe) never waits on the UI thread: ownership is "not known yet" at once, and the
+    /// deferred decision treats a still-uncertain owner as the owner (it asks).
+    #[test]
+    fn close_during_a_stalled_startup_probe_does_not_wait() {
+        let t = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let bin = {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = t.path().join("slow-xshelld");
+            std::fs::write(&bin, "#!/bin/sh\nsleep 3\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        #[cfg(windows)]
+        let bin = {
+            let bin = t.path().join("slow-xshelld.cmd");
+            std::fs::write(&bin, "@ping -n 4 127.0.0.1 >nul\r\n").unwrap();
+            bin
+        };
+        let d = std::sync::Arc::new(
+            xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+                bin,
+                env: vec![],
+                home: t.path().to_path_buf(),
+                socket: t.path().join("d.sock"),
+                version: "1.6.0".into(),
+                build: Some(xshell_protocol::build::BuildId {
+                    commit: "85ee920a1b2c".into(),
+                    dirty: None,
+                    time: 7,
+                }),
+            })
+            .unwrap(),
+        );
+        let starter = {
+            let d = d.clone();
+            std::thread::spawn(move || d.ensure_spawned())
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        while d.try_gui_pid().is_some() {
+            assert!(
+                Instant::now() < until,
+                "the start never held the child slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let t0 = Instant::now();
+        assert_eq!(owns_daemon_now(Some(&d)), None);
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t0.elapsed()
+        );
+        let t0 = Instant::now();
+        assert!(owns_daemon_within(Some(&d), Duration::from_millis(300)));
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        let inputs = CloseInputs {
+            owner: true,
+            running: None,
+            ..window_bound()
+        };
+        assert_eq!(decide(&inputs), CloseDecision::Confirm(None));
+        // The stalled binary is not this build: the start fails, and then nothing owns it.
+        assert!(starter.join().unwrap().is_err());
+        assert_eq!(owns_daemon_now(Some(&d)), Some(false));
+        assert!(!owns_daemon_within(None, Duration::ZERO));
     }
 
     /// A `close` prompt takes only Close and Cancel; a `keep` prompt never takes Close.

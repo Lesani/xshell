@@ -88,9 +88,9 @@ mod win {
         GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        CopySid, EqualSid, GetLengthSid, GetTokenInformation, TokenUser,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-        TOKEN_USER,
+        CopySid, EqualSid, GetLengthSid, GetTokenInformation, TokenOwner, TokenUser,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_OWNER,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
@@ -158,7 +158,7 @@ mod win {
         }
 
         /// Copy the SID at `p`.
-        fn copy(p: PSID) -> io::Result<Sid> {
+        pub(crate) fn copy(p: PSID) -> io::Result<Sid> {
             let len = unsafe { GetLengthSid(p) };
             let mut buf = vec![0u32; (len as usize).div_ceil(4)];
             if unsafe { CopySid(len, buf.as_mut_ptr() as PSID, p) } == 0 {
@@ -212,6 +212,37 @@ mod win {
         }
         let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
         Sid::copy(user.User.Sid)
+    }
+
+    /// The owner this process gives the objects it creates without an explicit owner
+    /// (`TokenOwner`): the user, or Administrators for an elevated administrator.
+    pub fn token_owner_sid() -> io::Result<Sid> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(last_error());
+        }
+        let token = owned(token)?;
+        let mut len = 0u32;
+        unsafe { GetTokenInformation(raw(&token), TokenOwner, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return Err(last_error());
+        }
+        // u64s: aligned for TOKEN_OWNER.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        if unsafe {
+            GetTokenInformation(
+                raw(&token),
+                TokenOwner,
+                buf.as_mut_ptr().cast(),
+                len,
+                &mut len,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let owner = unsafe { &*(buf.as_ptr() as *const TOKEN_OWNER) };
+        Sid::copy(owner.Owner)
     }
 
     /// This user's Daemon pipe.

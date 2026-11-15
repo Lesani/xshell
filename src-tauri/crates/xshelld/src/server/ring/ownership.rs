@@ -35,7 +35,9 @@ pub(crate) fn canonical_store(directory: &Path) -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        xshell_core::private_fs::check_owned_dir(&home)?;
+        // The home is not ours to create: a profile owned by SYSTEM or Administrators is
+        // normal. Everything from `.xshell` down is created private and checked strictly.
+        xshell_core::private_fs::check_anchor_dir(&home)?;
         let mut dir = home;
         for component in [".xshell", "daemon", "ring"] {
             dir.push(component);
@@ -301,6 +303,49 @@ impl Drop for StoreOperation {
                 slot.standalone_cancel = None;
             }
         }
+    }
+}
+
+/// The Daemon Store under the real OS profile (the VM's start failure: a profile owned by
+/// Administrators was refused as "owned by another user").
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_store_accepts_the_os_profile_as_home() {
+        let profile = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE"));
+        let store = profile.join(".xshell").join("daemon").join("ring");
+        let canonical = canonical_store(&store).unwrap();
+        assert!(
+            canonical.ends_with(".xshell\\daemon\\ring"),
+            "{}",
+            canonical.display()
+        );
+        // What it created below the profile is private and the user's.
+        xshell_core::private_fs::check_private_dir(&canonical).unwrap();
+        // A second start finds it as it left it.
+        assert_eq!(canonical_store(&store).unwrap(), canonical);
+    }
+
+    #[test]
+    fn canonical_store_uses_the_real_directory_behind_a_junction_home() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let home = t.path().join("home");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&home)
+            .arg(&real)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // canonicalize resolves the junction to `real`, a user-owned directory: accepted
+        // there, and the store lands in the real directory, never through the junction.
+        let canonical = canonical_store(&home.join(".xshell").join("daemon").join("ring")).unwrap();
+        assert!(canonical.starts_with(real.canonicalize().unwrap()));
     }
 }
 

@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GENERIC_EXECUTE,
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsValidAcl, IsValidSecurityDescriptor,
-    IsValidSid, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL,
-    DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY,
+    IsValidSid, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSID,
+    TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
@@ -78,12 +78,9 @@ fn real_directory(path: &Path) -> io::Result<OwnedHandle> {
     Ok(h)
 }
 
+/// SYSTEM, Administrators or TrustedInstaller (as `private_fs::check_anchor_dir`).
 fn privileged(sid: PSID) -> bool {
-    !sid.is_null()
-        && unsafe {
-            IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
-                || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-        }
+    super::win::system_sid(sid)
 }
 
 /// Conservative grant scan, not effective-access evaluation. A deny never excuses a
