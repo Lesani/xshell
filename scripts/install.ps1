@@ -81,8 +81,7 @@
       $p -and $p.StartsWith($full, [StringComparison]::OrdinalIgnoreCase)
     })
     if ($running.Count -gt 0) {
-      Write-Host "xshell is running from $dir. To update it, the installer closes it now."
-      Write-Host "Sessions running on this computer will end."
+      Write-Host "xshell is running from $dir. Updating it closes xshell, and the sessions running on this computer end."
       $interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
       if ($env:XSHELL_INSTALL_YES -ne '1' -and $interactive) {
         $answer = Read-Host "Close xshell and continue? [y/N]"
