@@ -144,7 +144,8 @@ impl Runner for SystemRunner {
 
     fn write(&self, path: &Path, text: &str) -> io::Result<()> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+            // Missing ancestors (`~/.config/systemd/user`) are private whatever the umask.
+            crate::paths::create_private_dirs(dir)?;
         }
         // Keep an existing file's mode (a profile may be 0644 or 0600); new files are 0644.
         let mode = fs::metadata(path)

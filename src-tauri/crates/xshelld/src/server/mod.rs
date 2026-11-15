@@ -54,6 +54,8 @@ pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
 mod staging;
+#[doc(hidden)]
+pub use staging::FAIL_WRITES as STAGE_FAIL_WRITES;
 mod terminal;
 pub use terminal::OPTIONAL_FIELDS_BYTES;
 pub mod transport;
@@ -208,6 +210,9 @@ pub struct Config {
     /// Test hook (S4 C1): restore fails the first Terminal record.
     #[doc(hidden)]
     pub test_fail_restore: bool,
+    /// An update trial runs (S4 P1-5): unreadable or corrupt Terminal records count as
+    /// restore failures instead of an empty list.
+    pub strict_restore: bool,
     /// Test hook: the range offered in `hello` and negotiated against, as an older or newer
     /// Daemon would.
     #[doc(hidden)]
@@ -257,6 +262,9 @@ pub enum TestPoint {
     /// A staged build is complete and about to be run for validation, before the requester
     /// is checked again (no lock held; a hook may block).
     StageBeforeVerify,
+    /// A staged build passed validation and is about to be published (no lock held; a hook
+    /// may block).
+    StageBeforePublish,
     /// A selected update is about to check its requester again and commit (no lock held;
     /// a hook may block).
     UpgradeBeforeCommit,
@@ -620,6 +628,7 @@ impl Config {
             hide_capabilities: Vec::new(),
             stage_idle: Duration::from_secs(120),
             test_fail_restore: false,
+            strict_restore: false,
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
             test_hook: None,
@@ -1091,6 +1100,18 @@ impl DaemonProbe {
     /// Terminal records restore could not start again.
     pub fn restore_failures(&self) -> usize {
         self.0.restore_failures.load(Ordering::SeqCst)
+    }
+
+    /// The Terminals listed now.
+    pub fn terminal_ids(&self) -> Vec<Uuid> {
+        self.0
+            .reg
+            .lock()
+            .unwrap()
+            .terminals
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Connected to (authenticated at) its Ring's Relay now.

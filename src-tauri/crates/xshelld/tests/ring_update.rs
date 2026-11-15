@@ -201,7 +201,7 @@ fn update_info_reports_target_and_limits() {
 fn stage_sequential_chunks_publish_verified_build() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let dir = stage(&mut c, &build, &bytes).unwrap();
     assert_eq!(dir, install_dir_name(VERSION, Some(&build)));
@@ -228,7 +228,7 @@ fn stage_sequential_chunks_publish_verified_build() {
 fn stage_identical_install_skips_upload() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     stage(&mut c, &build, &bytes).unwrap();
     let again = begin(&mut c, &build, &bytes).unwrap();
@@ -240,7 +240,7 @@ fn stage_identical_install_skips_upload() {
 fn stage_wrong_offset_keeps_progress() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
     chunk(&mut c, id, 0, &bytes[..1000]).unwrap();
@@ -262,7 +262,7 @@ fn stage_wrong_offset_keeps_progress() {
 fn stage_corrupted_chunk_fails_commit_and_removes_part() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let mut bad = bytes.clone();
     let mid = bad.len() / 2;
@@ -299,7 +299,7 @@ fn stage_corrupted_chunk_fails_commit_and_removes_part() {
 fn stage_wrong_sha_refused() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = stage_id(
         &c.request(&ClientMsg::DaemonStageBegin {
@@ -336,7 +336,7 @@ fn stage_wrong_sha_refused() {
 fn stage_limits() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     for length in [0, 64 * 1024 * 1024 + 1] {
         let e = c
@@ -378,7 +378,7 @@ fn stage_limits() {
 fn stage_stamp_or_dir_mismatch_refused() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, _) = patched_bytes("0123456789ab");
     let other = BuildId {
         commit: "aaaaaaaaaaaa".into(),
@@ -403,7 +403,7 @@ fn stage_stamp_or_dir_mismatch_refused() {
 fn stage_binary_that_does_not_run_refused() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let build = BuildId {
         commit: "0123456789ab".into(),
         ..own_build()
@@ -438,8 +438,8 @@ fn stage_binary_that_does_not_run_refused() {
 fn second_connection_stage_is_busy() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut a = Client::in_process(&srv, Role::Desktop);
-    let mut b = Client::in_process(&srv, Role::Desktop);
+    let mut a = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let mut b = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let first = stage_id(&begin(&mut a, &build, &bytes).unwrap());
     let e = begin(&mut b, &build, &bytes).unwrap_err();
@@ -457,7 +457,7 @@ fn second_connection_stage_is_busy() {
 fn idle_stage_expires() {
     let h = TestHome::new();
     let srv = start(&h, |c| c.stage_idle = Duration::from_millis(300));
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
     chunk(&mut c, id, 0, &bytes[..100]).unwrap();
@@ -472,7 +472,7 @@ fn idle_stage_expires() {
 fn interrupted_staging_removed_on_disconnect() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
     chunk(&mut c, id, 0, &bytes[..4096]).unwrap();
@@ -483,7 +483,7 @@ fn interrupted_staging_removed_on_disconnect() {
         !srv.stage_active() && part_files(&h).is_empty()
     });
     // Another Desktop may send now.
-    let mut d = Client::in_process(&srv, Role::Desktop);
+    let mut d = Client::in_process_within(&srv, Role::Desktop, WAIT);
     stage(&mut d, &build, &bytes).unwrap();
 }
 
@@ -508,7 +508,7 @@ fn stage_requester_gone_before_validation_publishes_nothing() {
             false
         })));
     });
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
     for (i, piece) in bytes.chunks(1024 * 1024).enumerate() {
@@ -538,7 +538,7 @@ fn stage_requester_gone_before_validation_publishes_nothing() {
 fn mobile_cannot_stage_or_select() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut m = Client::in_process(&srv, Role::Mobile);
+    let mut m = Client::in_process_within(&srv, Role::Mobile, WAIT);
     let (bytes, build) = patched_bytes("0123456789ab");
     let id = Uuid::new_v4();
     for msg in [
@@ -1070,7 +1070,7 @@ fn unowned_trial_rolls_back_at_next_start() {
 fn upgrade_selected_refusals_touch_nothing() {
     let h = TestHome::new();
     let srv = start(&h, |_| {});
-    let mut c = Client::in_process(&srv, Role::Desktop);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let (_, build) = patched_bytes("0123456789ab");
     let e = c
         .request(&ClientMsg::DaemonUpgradeSelected {
@@ -1132,4 +1132,458 @@ fn stop_during_trial_rolls_back_and_starts_nothing() {
     assert_eq!(selected(&m.h).as_deref(), Some(own_dir().as_str()));
     std::thread::sleep(Duration::from_millis(500));
     assert!(!xshell_hostlink::trial::daemon_alive(&m.h.home()));
+}
+
+// ---- review findings (S4 diff review P1-1 … P2-10) ----
+
+/// A hook that pauses at `at` until released; `paused()` waits until it got there.
+#[derive(Clone)]
+struct Pause {
+    at: xshelld::server::TestPoint,
+    state: Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+impl Pause {
+    fn new(at: xshelld::server::TestPoint) -> Pause {
+        Pause {
+            at,
+            state: Arc::new((Mutex::new((false, false)), std::sync::Condvar::new())),
+        }
+    }
+    fn hook(&self) -> xshelld::server::TestHook {
+        let me = self.clone();
+        xshelld::server::TestHook(Arc::new(move |_, point| {
+            if point == me.at {
+                let mut g = me.state.0.lock().unwrap();
+                g.0 = true;
+                me.state.1.notify_all();
+                while !g.1 {
+                    g = me.state.1.wait(g).unwrap();
+                }
+            }
+            false
+        }))
+    }
+    fn paused(&self) {
+        let mut g = self.state.0.lock().unwrap();
+        while !g.0 {
+            g = self.state.1.wait(g).unwrap();
+        }
+    }
+    fn release(&self) {
+        self.state.0.lock().unwrap().1 = true;
+        self.state.1.notify_all();
+    }
+}
+
+/// P1-6: the requester leaves while validation runs: nothing is published.
+#[test]
+fn stage_requester_gone_before_publication_publishes_nothing() {
+    let h = TestHome::new();
+    let pause = Pause::new(xshelld::server::TestPoint::StageBeforePublish);
+    let hook = pause.hook();
+    let srv = start(&h, move |cfg| cfg.test_hook = Some(hook));
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
+    for (i, piece) in bytes.chunks(1024 * 1024).enumerate() {
+        chunk(&mut c, id, (i * 1024 * 1024) as u64, piece).unwrap();
+    }
+    let rid = c.request_id();
+    c.send(&ClientMsg::DaemonStageCommit { stage: id }, Some(rid));
+    pause.paused();
+    c.shutdown();
+    drop(c);
+    wait_until("connection gone", || srv.connections() == 0);
+    pause.release();
+    wait_until("stage over", || !srv.stage_active());
+    assert!(part_files(&h).is_empty());
+    assert!(!root(&h)
+        .join(install_dir_name(VERSION, Some(&build)))
+        .join("xshelld")
+        .exists());
+}
+
+/// P1-6: the running build's and the selected build's directories are never staged into.
+#[test]
+fn stage_never_replaces_running_or_selected_build() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let other = b"not the running build".to_vec();
+    assert_eq!(
+        begin(&mut c, &own_build(), &other).unwrap(),
+        json!({"installed": true})
+    );
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let dir = install_dir_name(VERSION, Some(&build));
+    xshell_hostlink::install::install_local_bytes(&bytes, &h.home(), &dir).unwrap();
+    xshell_core::server::write_selected(&h.home(), &dir).unwrap();
+    assert_eq!(
+        begin(&mut c, &build, &other).unwrap(),
+        json!({"installed": true})
+    );
+    assert_eq!(
+        fs::read(root(&h).join(&dir).join("xshelld")).unwrap(),
+        bytes
+    );
+    assert!(!srv.stage_active());
+}
+
+/// P2-8 / C7: a write that fails as on a full disk stops the stage; the part file goes and
+/// the running build and `selected` are untouched.
+#[test]
+fn stage_write_failure_leaves_selection_and_running_build() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (old, old_build) = patched_bytes("aaaaaaaaaaaa");
+    let old_dir = install_dir_name(VERSION, Some(&old_build));
+    xshell_hostlink::install::install_local_bytes(&old, &h.home(), &old_dir).unwrap();
+    xshell_core::server::write_selected(&h.home(), &old_dir).unwrap();
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let id = stage_id(&begin(&mut c, &build, &bytes).unwrap());
+    chunk(&mut c, id, 0, &bytes[..1000]).unwrap();
+    xshelld_staging_fail_writes(&h, true);
+    let e = chunk(&mut c, id, 1000, &bytes[1000..2000]).unwrap_err();
+    xshelld_staging_fail_writes(&h, false);
+    assert!(e.contains("No space left"), "{e}");
+    wait_until("stage removed", || {
+        !srv.stage_active() && part_files(&h).is_empty()
+    });
+    assert_eq!(selected(&h).as_deref(), Some(old_dir.as_str()));
+    assert_eq!(
+        fs::read(root(&h).join(&old_dir).join("xshelld")).unwrap(),
+        old
+    );
+    assert!(!root(&h)
+        .join(install_dir_name(VERSION, Some(&build)))
+        .join("xshelld")
+        .exists());
+    assert!(
+        c.request(&ClientMsg::DaemonUpdateInfo).is_ok(),
+        "still serving"
+    );
+}
+
+fn xshelld_staging_fail_writes(h: &TestHome, on: bool) {
+    let mut f = xshelld::server::STAGE_FAIL_WRITES.lock().unwrap();
+    f.retain(|p| p != &h.home());
+    if on {
+        f.push(h.home());
+    }
+}
+
+/// P2-10: the single stage stays reserved until its commit has fully finished.
+#[test]
+fn stage_reservation_held_until_commit_finished() {
+    let h = TestHome::new();
+    let pause = Pause::new(xshelld::server::TestPoint::StageBeforeVerify);
+    let hook = pause.hook();
+    let srv = start(&h, move |cfg| cfg.test_hook = Some(hook));
+    let mut a = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let mut b = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let (other, other_build) = patched_bytes("aaaaaaaaaaaa");
+    let id = stage_id(&begin(&mut a, &build, &bytes).unwrap());
+    for (i, piece) in bytes.chunks(1024 * 1024).enumerate() {
+        chunk(&mut a, id, (i * 1024 * 1024) as u64, piece).unwrap();
+    }
+    let rid = a.request_id();
+    a.send(&ClientMsg::DaemonStageCommit { stage: id }, Some(rid));
+    pause.paused();
+    assert_eq!(
+        begin(&mut b, &other_build, &other).unwrap_err(),
+        xshell_protocol::msg::STAGE_BUSY
+    );
+    // Not even the committing connection starts another one meanwhile.
+    assert!(begin(&mut a, &other_build, &other).is_err());
+    pause.release();
+    assert_eq!(
+        a.wait_res(rid).unwrap()["dir"],
+        json!(install_dir_name(VERSION, Some(&build)))
+    );
+    wait_until("released", || !srv.stage_active());
+    assert!(begin(&mut b, &other_build, &other).is_ok());
+}
+
+/// P1-4: `selected` changed but its directory sync failed: the previous selection is put
+/// back durably and the trial record removed; the Daemon keeps serving.
+#[test]
+fn select_sync_failure_restores_previous_selection() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (bytes, build) = patched_bytes("0123456789ab");
+    stage(&mut c, &build, &bytes).unwrap();
+    xshell_hostlink::trial::FAIL_SELECT_SYNC
+        .lock()
+        .unwrap()
+        .push((h.home(), 1));
+    let e = c
+        .request(&ClientMsg::DaemonUpgradeSelected {
+            version: VERSION.into(),
+            build,
+        })
+        .unwrap_err();
+    assert!(e.contains("cannot prepare the update"), "{e}");
+    assert_eq!(selected(&h).as_deref(), Some(own_dir().as_str()));
+    assert!(!root(&h).join("trial").exists());
+    assert!(
+        c.request(&ClientMsg::DaemonUpdateInfo).is_ok(),
+        "still serving"
+    );
+}
+
+/// P1-4: when even the restore cannot be confirmed, the trial record stays, and the next
+/// start rolls back to the previous build.
+#[test]
+fn select_sync_failure_keeps_recovery_record() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let dir = stage(&mut c, &build, &bytes).unwrap();
+    xshell_hostlink::trial::FAIL_SELECT_SYNC
+        .lock()
+        .unwrap()
+        .push((h.home(), 2));
+    assert!(c
+        .request(&ClientMsg::DaemonUpgradeSelected {
+            version: VERSION.into(),
+            build,
+        })
+        .is_err());
+    // The restore was written but not confirmed durable either: the record stays.
+    assert!(root(&h).join("trial").exists(), "recovery record kept");
+    assert_ne!(selected(&h), None);
+    let _ = dir;
+    drop(c);
+    srv.shutdown();
+    assert_eq!(xshell_hostlink::trial::settle(&h.home()).unwrap(), None);
+    assert_eq!(selected(&h).as_deref(), Some(own_dir().as_str()));
+    assert!(!root(&h).join("trial").exists());
+}
+
+/// P2-9: a trial that cannot be prepared refuses `daemon.upgrade`; the Daemon keeps
+/// serving and nothing is frozen.
+#[test]
+fn plain_upgrade_refused_when_trial_cannot_be_prepared() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (t, _) = (Uuid::new_v4(), ());
+    c.open(t, sh_spec(&h.project("p")));
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let dir = install_dir_name(VERSION, Some(&build));
+    xshell_hostlink::install::install_local_bytes(&bytes, &h.home(), &dir).unwrap();
+    xshell_core::server::write_selected(&h.home(), &dir).unwrap();
+    let held = xshell_hostlink::trial::try_lock(&h.home())
+        .unwrap()
+        .unwrap();
+    let e = c.request(&ClientMsg::DaemonUpgrade).unwrap_err();
+    assert!(e.contains("already running"), "{e}");
+    drop(held);
+    assert!(c.request(&ClientMsg::DaemonUpdateInfo).is_ok());
+    assert!(
+        srv.wait_timeout(Duration::from_millis(300)).is_none(),
+        "still serving"
+    );
+}
+
+/// P2-9: a plain `daemon.upgrade` that selects no other build restarts this build in
+/// place: same process, Terminals restored.
+#[test]
+fn plain_upgrade_restarts_in_place() {
+    let mut m = Machine::new(&[]);
+    let pid = m.serve();
+    let (mut c, _, _) = m.client_of(&own_dir());
+    let (t, old) = open_shell(&mut c, &m);
+    assert_eq!(c.request(&ClientMsg::DaemonUpgrade), Ok(json!(null)));
+    let until = Instant::now() + WAIT;
+    loop {
+        let (_c, _, list) = m.client_of(&own_dir());
+        if list.iter().any(|i| i.terminal == t && i.pid != Some(old)) {
+            break;
+        }
+        assert!(Instant::now() < until, "not restarted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(m.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    assert_eq!(m.pidfile(), Some(pid));
+    assert!(!m.trial_open());
+}
+
+/// P1-1: a `serve` started directly while a trial runs waits; it neither starts beside the
+/// trial nor touches it, and gives up once the build on trial serves.
+#[test]
+fn direct_serve_waits_while_a_trial_runs() {
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let mut m = Machine::new(&[("XSHELLD_TEST_TRIAL_SETTLE_MS", "3000")]);
+    m.serve();
+    let (mut c, _, _) = m.client_of(&own_dir());
+    let dir = stage(&mut c, &build, &bytes).unwrap();
+    c.request(&ClientMsg::DaemonUpgradeSelected {
+        version: VERSION.into(),
+        build,
+    })
+    .unwrap();
+    drop(m.client_of(&dir));
+    assert!(m.trial_open());
+    let mut racer = m.command(&m.installed(&own_dir()));
+    racer.arg("serve").arg("--interactive-env");
+    let mut racer = racer.spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(m.trial_open(), "the trial must still run");
+    assert!(
+        racer.try_wait().unwrap().is_none(),
+        "a serve beside a running trial must wait"
+    );
+    m.wait_trial_closed();
+    let st = wait_child(&mut racer, WAIT).expect("the racer gives up");
+    assert_eq!(st.code(), Some(3));
+    assert!(m.failure().is_none(), "the trial was not disturbed");
+    assert_eq!(selected(&m.h).as_deref(), Some(dir.as_str()));
+}
+
+fn wait_child(c: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
+    let until = Instant::now() + within;
+    loop {
+        if let Some(s) = c.try_wait().unwrap() {
+            return Some(s);
+        }
+        if Instant::now() >= until {
+            let _ = c.kill();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// P1-1: the build on trial dies but something it started still holds the serve lock: the
+/// watchdog does not roll back (Terminal records untouched) until the lock is free.
+#[test]
+fn rollback_waits_until_a_dead_successors_lock_is_free() {
+    let mut m = Machine::new(&[("XSHELLD_TEST_TRIAL_READY_MS", "1500")]);
+    m.serve();
+    let (mut c, _, _) = m.client_of(&own_dir());
+    let (t, _) = open_shell(&mut c, &m);
+    let lock = m.h.paths().lock;
+    let build = BuildId {
+        commit: "0123456789ab".into(),
+        ..own_build()
+    };
+    // The successor forks a child that keeps the serve lock for 4 s after it is gone.
+    let body = format!(
+        "exec python3 -c 'import fcntl,os,time,signal; f=open(\"{}\",\"a\"); fcntl.flock(f, fcntl.LOCK_EX)\nif os.fork()==0:\n  os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(4); os._exit(0)\ntime.sleep(600)'",
+        lock.display()
+    );
+    stage(&mut c, &build, &stamped_script(&build, true, &body)).unwrap();
+    c.request(&ClientMsg::DaemonUpgradeSelected {
+        version: VERSION.into(),
+        build,
+    })
+    .unwrap();
+    // Ready never comes: after 1.5 s the watchdog stops the successor; its child keeps
+    // the lock for a while longer.
+    let st = wait_child(m.child.as_mut().unwrap(), WAIT).expect("successor stopped");
+    assert!(!st.success());
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        m.trial_open(),
+        "rolled back while the serve lock was still held"
+    );
+    assert!(m.failure().is_none());
+    m.wait_trial_closed();
+    assert!(m.failure().is_some());
+    let (_c, _, list) = m.client_of(&own_dir());
+    assert!(list.iter().any(|i| i.terminal == t));
+}
+
+/// P1-5: during a trial, unreadable or corrupt Terminal records fail the trial; the
+/// previous build comes back with every Terminal.
+#[test]
+fn unreadable_or_corrupt_state_during_trial_rolls_back() {
+    for how in ["unreadable", "corrupt"] {
+        let (bytes, build) = patched_bytes("0123456789ab");
+        let dir = install_dir_name(VERSION, Some(&build));
+        let hook = format!("{dir}:{how}");
+        let mut m = Machine::new(&[("XSHELLD_TEST_CORRUPT_STATE", &hook)]);
+        m.serve();
+        let (mut c, _, _) = m.client_of(&own_dir());
+        let (t1, _) = open_shell(&mut c, &m);
+        let (t2, _) = open_shell(&mut c, &m);
+        stage(&mut c, &build, &bytes).unwrap();
+        c.request(&ClientMsg::DaemonUpgradeSelected {
+            version: VERSION.into(),
+            build,
+        })
+        .unwrap();
+        m.wait_trial_closed();
+        let f = m
+            .failure()
+            .unwrap_or_else(|| panic!("{how}: not rolled back"));
+        assert!(
+            f.reason.contains("did not start again"),
+            "{how}: {}",
+            f.reason
+        );
+        let (_c, _, list) = m.client_of(&own_dir());
+        for t in [t1, t2] {
+            assert!(list.iter().any(|i| i.terminal == t), "{how}: {t} missing");
+        }
+    }
+}
+
+/// P1-2: installing over a running Daemon only installs; an installer stopped before the
+/// switch leaves `selected` alone, so the next start serves the old build. An installer
+/// run during a trial does not change `selected` either.
+#[test]
+fn self_install_never_selects_beside_a_running_daemon_or_trial() {
+    let mut m = Machine::new(&[("XSHELLD_TEST_TRIAL_SETTLE_MS", "3000")]);
+    xshell_hostlink::trial::select(&m.h.home(), &own_dir()).unwrap();
+    let pid = m.serve();
+    let _ = m.client_of(&own_dir());
+    let (bytes, build) = patched_bytes("0123456789ab");
+    let new = m.h.root().join("new-xshelld");
+    fs::write(&new, &bytes).unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = m
+        .command(&new)
+        .args(["self-install", "--select"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let dir = install_dir_name(VERSION, Some(&build));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), dir);
+    assert!(m.installed(&dir).is_file(), "the bytes are installed");
+    assert_eq!(selected(&m.h).as_deref(), Some(own_dir().as_str()));
+    // Interrupted here; the machine restarts.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = m.child.as_mut().unwrap().wait();
+    m.serve();
+    let _ = m.client_of(&own_dir());
+    // Now a trial runs; another installer leaves the selection to it.
+    let (mut c, _, _) = m.client_of(&own_dir());
+    c.request(&ClientMsg::DaemonUpgradeSelected {
+        version: VERSION.into(),
+        build,
+    })
+    .unwrap();
+    drop(m.client_of(&dir));
+    assert!(m.trial_open());
+    let (third, _) = patched_bytes("bbbbbbbbbbbb");
+    let third_path = m.h.root().join("third-xshelld");
+    fs::write(&third_path, &third).unwrap();
+    fs::set_permissions(&third_path, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(m
+        .command(&third_path)
+        .args(["self-install", "--select"])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(selected(&m.h).as_deref(), Some(dir.as_str()));
+    m.wait_trial_closed();
+    assert_eq!(selected(&m.h).as_deref(), Some(dir.as_str()));
 }

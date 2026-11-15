@@ -92,6 +92,17 @@ mod linux {
     }
 
     static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+    /// Homes whose Daemon was asked to restart in place (a plain `daemon.upgrade` that
+    /// selects no other build).
+    static RESTART: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// A plain `daemon.upgrade` without another build: the Daemon restarts in place.
+    pub fn restart(home: &Path) {
+        let mut r = RESTART.lock().unwrap();
+        if !r.iter().any(|h| h == home) {
+            r.push(home.to_path_buf());
+        }
+    }
 
     /// Open a trial for the installed build `target` (C4 order: staged directory complete →
     /// trial file → `selected`). The caller holds the registry lock and has just saved the
@@ -135,7 +146,21 @@ mod linux {
             trial::select(home, target)
         })();
         if let Err(e) = r {
-            let _ = trial::remove(home);
+            // `selected` may already name the target although its directory sync failed
+            // (P1-4): then put the previous selection back durably before the trial record
+            // goes, or keep the record, so the next start rolls back.
+            let changed = fs::read_to_string(root.join(xshell_core::server::SELECTED))
+                .is_ok_and(|s| s.lines().next() == Some(target));
+            if !changed {
+                let _ = trial::remove(home);
+            } else if let Err(e2) = trial::select(home, &own_dir()) {
+                crate::log!(
+                    "ERROR",
+                    "cannot restore the selection after a failed update ({e2}); the next start rolls back"
+                );
+            } else {
+                let _ = trial::remove(home);
+            }
             return Err(format!("cannot prepare the update: {e}"));
         }
         let mut p = PENDING.lock().unwrap();
@@ -168,9 +193,20 @@ mod linux {
     /// the selected build in this process. Returns the exit code when nothing was executed.
     pub fn reexec(home: &Path, paths: &crate::paths::Paths) -> i32 {
         let Some(p) = take(home) else {
-            // No trial: a plain `daemon.upgrade` that selects no other build is a restart
-            // request (a mode switch, say). Exit as before; whoever asked starts the Daemon.
-            return 0;
+            // No trial: a plain `daemon.upgrade` that selects no other build restarts this
+            // build in place (P2-9).
+            let asked = {
+                let mut r = RESTART.lock().unwrap();
+                let at = r.iter().position(|h| h == home);
+                at.map(|i| r.swap_remove(i)).is_some()
+            };
+            if !asked {
+                return 0;
+            }
+            crate::log!("INFO", "restarting in place (pid {})", std::process::id());
+            let e = exec(Path::new("/proc/self/exe"));
+            crate::log!("ERROR", "cannot restart in place: {e}");
+            return 1;
         };
         let root = trial::root(home);
         let Some(target) = xshell_core::server::valid_install(&root, &p.trial.target) else {
@@ -268,11 +304,35 @@ mod linux {
     pub enum Decision {
         /// No trial for this process.
         Normal,
+        /// Another process runs a trial of this home: this `serve` must not start (P1-1).
+        Busy,
         /// This process is the build on trial (its watchdog runs).
         Trial(Trial),
         /// A trial nobody owns was rolled back and this build was its target: execute the
         /// previous build instead.
         Exec(PathBuf),
+    }
+
+    /// Called by `serve` before it takes the start lock (P1-1): while another process owns a
+    /// trial of this home, wait until it is settled. The build on trial itself (this
+    /// process, re-executed) and a trial nobody owns (rolled back by [`on_start`]) do not
+    /// wait.
+    pub fn wait_for_foreign_trial(home: &Path) {
+        let mut said = None::<Instant>;
+        loop {
+            let t = match trial::read(home) {
+                Ok(Some(t)) => t,
+                _ => return,
+            };
+            if (t.pid == std::process::id() && t.target == own_dir()) || !trial::held(home) {
+                return;
+            }
+            if said.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                crate::log!("INFO", "waiting for the update of this machine to finish");
+                said = Some(Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Called by `serve` holding the start lock (no other Daemon of this home runs).
@@ -290,7 +350,7 @@ mod linux {
             return if mine && t.pid == std::process::id() {
                 Decision::Trial(t)
             } else {
-                Decision::Normal
+                Decision::Busy
             };
         }
         // Nobody owns it (power loss, a killed watchdog): go back (C4).
@@ -329,6 +389,15 @@ mod linux {
             if failed > 0 {
                 return Err(format!("{failed} terminals did not start again"));
             }
+            // Every record the old build had is running again (C1, P1-5).
+            let running = probe.terminal_ids();
+            let missing = snapshot_ids(&home)?
+                .into_iter()
+                .filter(|id| !running.contains(id))
+                .count();
+            if missing > 0 {
+                return Err(format!("{missing} terminals did not start again"));
+            }
             if t.ring {
                 while !probe.ring_connected() {
                     if started.elapsed() >= limits.ring || probe.exiting() {
@@ -346,6 +415,53 @@ mod linux {
             (Err(e), Ok(())) => crate::log!("WARN", "update trial failed: {e}"),
         }
         crash_after_ready_for_tests(outcome.is_ok());
+    }
+
+    /// The Terminal UUIDs in the trial's snapshot (none when there was no state file).
+    fn snapshot_ids(home: &Path) -> Result<Vec<uuid::Uuid>, String> {
+        let bytes = match fs::read(trial::root(home).join(trial::SNAPSHOT)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read the Terminal records: {e}")),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("cannot read the Terminal records: {e}"))?;
+        Ok(v["terminals"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["terminal"].as_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Test hook (debug builds): `XSHELLD_TEST_CORRUPT_STATE=<install dir>:unreadable|corrupt`:
+    /// that build, on an update trial, finds the Terminal records unreadable or corrupt.
+    pub fn corrupt_state_for_tests(home: &Path) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let Ok(v) = std::env::var("XSHELLD_TEST_CORRUPT_STATE") else {
+            return;
+        };
+        let Some((dir, how)) = v.rsplit_once(':') else {
+            return;
+        };
+        if dir != own_dir() {
+            return;
+        }
+        let state = trial::state_path(home);
+        use std::os::unix::fs::PermissionsExt;
+        match how {
+            "unreadable" => {
+                let _ = fs::set_permissions(&state, fs::Permissions::from_mode(0o000));
+            }
+            "corrupt" => {
+                let _ = fs::write(&state, b"{not json");
+            }
+            _ => {}
+        }
     }
 
     /// Test hook (debug builds): `XSHELLD_TEST_TRIAL_CRASH=<install dir>:<ms>`: that build
@@ -500,16 +616,27 @@ mod linux {
 
         /// Stop the build on trial (C3): SIGTERM through the pidfd, then SIGKILL, then wait
         /// until no Daemon of this home holds its locks.
+        /// Never on a timeout alone (P1-1): it returns only once the process is gone
+        /// (pidfd) and both home locks are free, escalating and reporting until then.
         fn stop(&self, limits: Limits) {
             if !self.ended(Duration::ZERO) {
                 self.signal(libc::SIGTERM);
                 if !self.ended(limits.term) {
                     crate::log!("WARN", "update trial: the new build ignored SIGTERM");
-                    self.signal(libc::SIGKILL);
-                    let _ = self.ended(Duration::from_secs(10));
+                    let mut said = Instant::now();
+                    loop {
+                        self.signal(libc::SIGKILL);
+                        if self.ended(Duration::from_secs(1)) {
+                            break;
+                        }
+                        if said.elapsed() >= Duration::from_secs(30) {
+                            crate::log!("ERROR", "update trial: pid {} does not end", self.pid);
+                            said = Instant::now();
+                        }
+                    }
                 }
             }
-            let until = Instant::now() + Duration::from_secs(10);
+            let mut said = Instant::now();
             loop {
                 let serve_free = match fs::OpenOptions::new().read(true).open(&self.serve_lock) {
                     Ok(f) => match f.try_lock() {
@@ -521,8 +648,15 @@ mod linux {
                     },
                     Err(_) => true,
                 };
-                if (serve_free && !trial::daemon_alive(&self.home)) || Instant::now() >= until {
+                if serve_free && !trial::daemon_alive(&self.home) {
                     return;
+                }
+                if said.elapsed() >= Duration::from_secs(5) {
+                    crate::log!(
+                        "WARN",
+                        "update trial: the new build ended but this home's locks are still held; waiting before rolling back"
+                    );
+                    said = Instant::now();
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -682,7 +816,8 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    begin, exec_previous, on_start, reexec, report, stopped_during_trial, watch_main, Decision,
+    begin, corrupt_state_for_tests, exec_previous, on_start, reexec, report, restart,
+    stopped_during_trial, wait_for_foreign_trial, watch_main, Decision,
 };
 
 /// Not Linux: no in-place update; the Daemon exits as before.
@@ -697,20 +832,27 @@ pub fn watch_main(_args: Vec<OsString>) -> i32 {
     1
 }
 
-/// `xshelld self-install [--select] [--switch] [--home DIR]` (Unix; what `install.sh` runs
-/// with the verified download): `--select` copies this binary into
-/// `~/.xshell/server/<version>+<build>/` and records it as `selected` (an explicit user
-/// action, ADR-0019); `--switch` then brings a running Daemon of another build onto it
-/// (`daemon.upgrade-selected` where it is offered, else `daemon.upgrade`).
+/// `xshelld self-install [--select] [--switch] [--in-ring] [--home DIR]` (Unix; what
+/// `install.sh` runs):
+/// - `--select` copies this binary into `~/.xshell/server/<version>+<build>/` and prints
+///   that directory. It records it as `selected` only on a fresh machine (no Daemon of this
+///   home alive, no update trial; under `trial.lock`, S4 P1-2); with a running Daemon the
+///   selection goes through that Daemon's transactional update (`--switch`).
+/// - `--switch` brings a running Daemon of another build onto this one:
+///   `daemon.upgrade-selected` where it is offered; an older Daemon gets `daemon.upgrade`,
+///   is waited for until it has gone, and then this build is selected (P1-3).
+/// - `--in-ring`: exit 0 when the running Daemon is in a Ring.
 pub fn self_install_main(args: Vec<OsString>) -> i32 {
     let mut select = false;
     let mut switch = false;
+    let mut in_ring = false;
     let mut home: Option<PathBuf> = None;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.to_str() {
             Some("--select") => select = true,
             Some("--switch") => switch = true,
+            Some("--in-ring") => in_ring = true,
             Some("--home") => match it.next() {
                 Some(v) => home = Some(v.into()),
                 None => {
@@ -736,31 +878,55 @@ pub fn self_install_main(args: Vec<OsString>) -> i32 {
     #[cfg(unix)]
     {
         if select {
-            if let Err(e) = select_self(&home) {
-                eprintln!("xshelld: {e}");
-                return 1;
+            match select_self(&home) {
+                Ok(dir) => println!("{dir}"),
+                Err(e) => {
+                    eprintln!("xshelld: {e}");
+                    return 1;
+                }
             }
         }
         if switch {
-            return switch_running(&home);
+            let code = switch_running(&home);
+            if code != 0 {
+                return code;
+            }
+        }
+        if in_ring {
+            return i32::from(!running_in_ring(&home));
         }
         0
     }
     #[cfg(not(unix))]
     {
-        let _ = (select, switch, home);
+        let _ = (select, switch, in_ring, home);
         eprintln!("xshelld: self-install is Linux and macOS only");
         1
     }
 }
 
 #[cfg(unix)]
-fn select_self(home: &Path) -> Result<(), String> {
+fn select_self(home: &Path) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = own_dir();
     xshell_hostlink::install::install_local(&exe, home, &dir)
         .map_err(|e| format!("cannot install: {e}"))?;
-    trial::select(home, &dir).map_err(|e| format!("cannot select {dir}: {e}"))
+    trial::select_if_fresh(home, &dir).map_err(|e| format!("cannot select {dir}: {e}"))?;
+    Ok(dir)
+}
+
+/// Whether the running Daemon of `home` is a member of a Ring (`ring.identity`).
+#[cfg(unix)]
+fn running_in_ring(home: &Path) -> bool {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let paths = crate::paths::resolve(home, xdg.as_deref(), None);
+    let socket = crate::paths::live_socket(home, &paths.socket);
+    Client::connect(&socket)
+        .and_then(|mut c| {
+            c.request(&xshell_protocol::msg::ClientMsg::RingIdentity)
+                .map_err(std::io::Error::other)
+        })
+        .is_ok_and(|v| !v["ring"].is_null())
 }
 
 /// The install directory of the Daemon of `home` that answers a hello now (within 2 s).
@@ -792,8 +958,9 @@ fn switch_running(home: &Path) -> i32 {
     let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let paths = crate::paths::resolve(home, xdg.as_deref(), None);
     let socket = crate::paths::live_socket(home, &paths.socket);
+    let dir = own_dir();
     if !crate::paths::daemon_alive(home, &paths.socket) {
-        return 0;
+        return select_fresh(home, &dir);
     }
     let mut c = match Client::connect(&socket) {
         Ok(c) => c,
@@ -802,25 +969,53 @@ fn switch_running(home: &Path) -> i32 {
             return 1;
         }
     };
-    let dir = own_dir();
     let theirs = xshell_protocol::build::install_dir_name(&c.hello.version, c.hello.build.as_ref());
     if theirs == dir {
         return 0;
     }
     let has = |cap: &str| c.hello.capabilities.iter().any(|x| x == cap);
-    let msg = match crate::build_id::BUILD.clone() {
-        Some(build) if has(xshell_protocol::cap::DAEMON_STAGE) => {
-            ClientMsg::DaemonUpgradeSelected {
-                version: env!("CARGO_PKG_VERSION").into(),
-                build,
+    if let (Some(build), true) = (
+        crate::build_id::BUILD.clone(),
+        has(xshell_protocol::cap::DAEMON_STAGE),
+    ) {
+        // The Daemon selects this build in its own update transaction.
+        let msg = ClientMsg::DaemonUpgradeSelected {
+            version: env!("CARGO_PKG_VERSION").into(),
+            build,
+        };
+        return match c.request(&msg) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("xshelld: the running xshelld refused the update: {e}");
+                1
             }
+        };
+    }
+    // An older Daemon: ask it to exit, wait until it has gone (its locks are free), then
+    // select this build on the now quiet machine (P1-3).
+    if let Err(e) = c.request(&ClientMsg::DaemonUpgrade) {
+        eprintln!("xshelld: the running xshelld refused the update: {e}");
+        return 1;
+    }
+    drop(c);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while crate::paths::daemon_alive(home, &paths.socket) {
+        if std::time::Instant::now() >= until {
+            eprintln!("xshelld: the running xshelld did not exit");
+            return 1;
         }
-        _ => ClientMsg::DaemonUpgrade,
-    };
-    match c.request(&msg) {
-        Ok(()) => 0,
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    select_fresh(home, &dir)
+}
+
+/// Select `dir` when nothing else decides the selection; 0 also when something does.
+#[cfg(unix)]
+fn select_fresh(home: &Path, dir: &str) -> i32 {
+    match trial::select_if_fresh(home, dir) {
+        Ok(_) => 0,
         Err(e) => {
-            eprintln!("xshelld: the running xshelld refused the update: {e}");
+            eprintln!("xshelld: cannot select {dir}: {e}");
             1
         }
     }
@@ -862,7 +1057,10 @@ impl Client {
         Ok(Client { s, r, hello })
     }
 
-    fn request(&mut self, msg: &xshell_protocol::msg::ClientMsg) -> Result<(), String> {
+    fn request(
+        &mut self,
+        msg: &xshell_protocol::msg::ClientMsg,
+    ) -> Result<serde_json::Value, String> {
         use std::io::Write;
         use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
         use xshell_protocol::msg::{decode_server, encode_msg, ServerMsg};
@@ -872,7 +1070,7 @@ impl Client {
             match read_frame(&mut self.r, MAX_FRAME_LEN).map_err(|e| e.to_string())? {
                 Some(Frame::Json(j)) => match decode_server(&j) {
                     Ok(ServerMsg::Res(res)) if res.id == 1 => {
-                        return res.outcome.into_result().map(|_| ());
+                        return res.outcome.into_result();
                     }
                     _ => continue,
                 },

@@ -972,7 +972,16 @@ fn local_switch_on_keeps_terminals() {
 fn local_switch_off_then_quit_ends_terminals() {
     let home = common::TestHome::new();
     let _guard = common::DaemonGuard::new(&home);
-    let a = LocalDesk::persistent(&home);
+    // The legacy GUI-bound switch needs the Persistent Daemon to exit on `daemon.upgrade`;
+    // since S4 one restarts in place, so this Daemon plays one from before that.
+    let a = LocalDesk::with(
+        &home,
+        LocalOpts {
+            persistent: true,
+            env: vec![("XSHELLD_TEST_NO_REEXEC".into(), "1".into())],
+            ..Default::default()
+        },
+    );
     a.wait_usable();
     let old = daemon_pid(&home);
     let t = Uuid::new_v4();

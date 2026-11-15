@@ -486,11 +486,17 @@ impl Daemon {
                     "cannot read {}: {e}",
                     self.cfg.paths.state.display()
                 );
+                if self.cfg.strict_restore {
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                }
                 state::Loaded::default()
             }
         };
         if let Some(p) = &loaded.moved_aside {
             crate::log!("WARN", "corrupt state file moved to {}", p.display());
+            if self.cfg.strict_restore {
+                self.restore_failures.fetch_add(1, Ordering::SeqCst);
+            }
         }
         let mut reg = self.reg.lock().unwrap();
         let had = loaded.terminals.len();

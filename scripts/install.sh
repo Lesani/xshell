@@ -16,6 +16,8 @@
 #
 # For tests: XSHELL_INSTALL_BASE (download base URL) and XSHELL_TAG override the release.
 set -eu
+# Everything this script and what it starts create is private, whatever umask it inherits.
+umask 077
 
 # Pinned by publish-release.sh: the release this script belongs to.
 TAG="v1.5.0"
@@ -49,8 +51,7 @@ case "$os/$arch" in
   Darwin/arm64|Darwin/aarch64) triple=aarch64-apple-darwin ;;
   Darwin/x86_64) triple=x86_64-apple-darwin ;;
   *)
-    # COPY-GAP: no approved text for an unsupported platform.
-    echo "Unsupported platform: $os $arch" >&2
+    echo "xshell isn't available for $os $arch. Installation stopped." >&2
     exit 1 ;;
 esac
 
@@ -59,8 +60,7 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -q -U xshell-install -O "$2" "$1"; }
 else
-  # COPY-GAP: no approved text for a missing downloader.
-  echo "curl or wget is required." >&2
+  echo "Install curl or wget, then run this command again." >&2
   exit 1
 fi
 
@@ -94,10 +94,10 @@ server="$HOME/.xshell/server"
 launcher="$HOME/.xshell/service/xshelld"
 before=$(head -n 1 "$server/selected" 2>/dev/null || true)
 
-# From here on only absolute paths: the verified download, then the installed build and the
-# launcher (S4 C6); never whatever `xshelld` PATH finds.
-"$tmp/xshelld" self-install --select
-dir=$(head -n 1 "$server/selected")
+# From here on only absolute paths: the verified download, then the installed build (S4 C6);
+# never whatever `xshelld` PATH finds. Installing only installs the bytes; on a machine whose
+# Daemon runs, the selection changes only through that Daemon's update (`--switch`).
+dir=$("$tmp/xshelld" self-install --select)
 bin="$server/$dir/xshelld"
 [ -x "$bin" ] || { echo "xshell: $bin is missing" >&2; exit 1; }
 
@@ -110,14 +110,16 @@ fi
 report=$("$bin" service install --json)
 mechanism=$(printf '%s\n' "$report" | sed -n 's/.*"mechanism":"\([a-z]*\)".*/\1/p')
 
-# A running xshelld of another build moves onto this one (in place where it can).
-"$launcher" self-install --switch
-"$launcher" service ensure
+# A running xshelld of another build moves onto this one: in place where it can; an older
+# one is asked to exit and waited for, then this build is selected (P1-3).
+"$bin" self-install --switch
 
-# Wait until this build serves.
+# Start it where nothing runs, again on every round until this build serves: an older
+# Daemon may still be on its way out.
 i=0
 while :; do
-  status=$("$launcher" service status --json 2>/dev/null || true)
+  "$bin" service ensure >/dev/null 2>&1 || true
+  status=$("$bin" service status --json 2>/dev/null || true)
   case "$status" in *"\"serving\":\"$dir\""*) break ;; esac
   i=$((i + 1))
   if [ $i -ge 120 ]; then
@@ -140,6 +142,10 @@ if [ -d "$HOME/.local/bin" ]; then
 fi
 
 [ "$pair" = 1 ] || exit 0
+# Already in a Ring: nothing to pair (re-running this script only updates).
+if "$bin" self-install --in-ring >/dev/null 2>&1; then
+  exit 0
+fi
 rm -rf "$tmp"
 trap - EXIT INT TERM
 if [ -n "$relay" ]; then

@@ -290,11 +290,39 @@ pub fn wait_free(home: &Path, max: Duration) -> bool {
     true
 }
 
-/// Record `dir` as the build to start next, durably.
+/// Test seam: per home, how many [`select`] calls fail their directory sync after the rename
+/// (the selection changed but is not confirmed durable).
+#[doc(hidden)]
+pub static FAIL_SELECT_SYNC: std::sync::Mutex<Vec<(PathBuf, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record `dir` as the build to start next, durably. An error after the rename means the
+/// selection may have changed without being durable: callers check `selected` again.
 #[cfg(unix)]
 pub fn select(home: &Path, dir: &str) -> io::Result<()> {
     xshell_core::server::write_selected(home, dir)?;
+    {
+        let mut f = FAIL_SELECT_SYNC.lock().unwrap();
+        if let Some(e) = f.iter_mut().find(|(h, n)| h == home && *n > 0) {
+            e.1 -= 1;
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+    }
     sync_dir(&root(home))
+}
+
+/// Select `dir` only on a machine where nothing else decides the selection (S4 P1-2): no
+/// trial, no Daemon of this home alive, holding `trial.lock`. Returns whether it selected.
+#[cfg(unix)]
+pub fn select_if_fresh(home: &Path, dir: &str) -> io::Result<bool> {
+    let Some(_lock) = try_lock(home)? else {
+        return Ok(false);
+    };
+    if read(home)?.is_some() || daemon_alive(home) {
+        return Ok(false);
+    }
+    select(home, dir)?;
+    Ok(true)
 }
 
 /// The rollback still reported (younger than [`FAILURE_TTL`]).

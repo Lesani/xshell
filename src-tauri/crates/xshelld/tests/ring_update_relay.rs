@@ -510,7 +510,13 @@ fn old_daemon_without_capability_shows_install_command() {
     );
     assert_eq!(s.update_action, None);
     let e = reply(|w| host.upgrade(w)).unwrap_err();
-    assert_eq!(e.message, xshell_hostlink::handle::RING_UPDATE_UNSUPPORTED);
+    assert_eq!(
+        e.message,
+        format!(
+            "{} is too old to update through your Ring. Update xshell directly on that machine.",
+            name_of(&desktop, host.id())
+        )
+    );
     assert_eq!(
         serde_json::to_value(RouteUpdateUnavailable::RingUpdateUnsupported).unwrap(),
         serde_json::json!("ring-update-unsupported")

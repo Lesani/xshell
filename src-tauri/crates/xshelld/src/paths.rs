@@ -286,12 +286,24 @@ pub fn private_file(o: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
 /// Create `dir` (and parents) as 0700. An existing dir must be owned by us; a mode broader
 /// than 0700 is tightened. Windows: created, and it must be a directory; the user profile's
 /// ACL is inherited.
+/// Create `dir` and every missing ancestor with mode 0700 whatever the umask (S4 P1-7);
+/// existing directories are left as they are.
+#[cfg(unix)]
+pub fn create_private_dirs(dir: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    for d in missing.into_iter().rev() {
+        match fs::DirBuilder::new().mode(0o700).create(d) {
+            Ok(()) => fs::set_permissions(d, fs::Permissions::from_mode(0o700))?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    create_private_dirs(dir)?;
     #[cfg(not(unix))]
     fs::create_dir_all(dir)?;
     let meta = fs::symlink_metadata(dir)?;

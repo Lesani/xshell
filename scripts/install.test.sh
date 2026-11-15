@@ -133,6 +133,68 @@ pid_after=$(cat "$work/fresh/run/xshell/daemon.pid")
 [ "$(readlink "/proc/$pid_after/exe")" = "$h/.xshell/server/$dir_b/xshelld" ] || fail "the Daemon does not run $dir_b"
 ok "re-run with a newer release updates the running Daemon in place"
 
+# ---- an older Daemon (no in-place update) that acknowledges and exits late (P1-3) ----
+for mech in none profile; do
+  machine "old-$mech"
+  mo="$work/old-$mech"
+  # Build a plays a Daemon from before in-place updates: no daemon.stage, exits on an
+  # upgrade, and only 1.5 s later (still holding its start lock).
+  out=$(env -i HOME="$mo/home" XDG_RUNTIME_DIR="$mo/run" PATH="$mo/bin:/usr/bin:/bin" \
+    XSHELL_SERVICE_MECHANISM="$mech" XSHELLD_LOGIN_ENV=0 \
+    XSHELLD_TEST_HIDE_CAPABILITIES=daemon.stage,daemon.upgrade-selected \
+    XSHELLD_TEST_NO_REEXEC=1 XSHELLD_TEST_EXIT_DELAY_MS=1500 \
+    XSHELL_INSTALL_BASE="$base" XSHELL_TAG=va sh "$here/install.sh" --no-pair 2>&1) \
+    || fail "old Daemon install ($mech) failed" "$out"
+  [ "$(serving "old-$mech")" = "$dir_a" ] || fail "old Daemon ($mech) not serving"
+  old_pid=$(cat "$mo/run/xshell/daemon.pid")
+  out=$(env -i HOME="$mo/home" XDG_RUNTIME_DIR="$mo/run" PATH="$mo/bin:/usr/bin:/bin" \
+    XSHELL_SERVICE_MECHANISM="$mech" XSHELLD_LOGIN_ENV=0 \
+    XSHELL_INSTALL_BASE="$base" XSHELL_TAG=vb sh "$here/install.sh" --no-pair 2>&1) \
+    || fail "update of an old Daemon ($mech) failed" "$out"
+  [ "$(serving "old-$mech")" = "$dir_b" ] || fail "update of an old Daemon ($mech): $dir_b not serving" "$out"
+  [ "$(cat "$mo/home/.xshell/server/selected")" = "$dir_b" ] || fail "old Daemon ($mech): $dir_b not selected"
+  new_pid=$(cat "$mo/run/xshell/daemon.pid")
+  [ "$new_pid" != "$old_pid" ] || fail "old Daemon ($mech): still the old process"
+  ! kill -0 "$old_pid" 2>/dev/null || fail "old Daemon ($mech) still runs"
+  ok "an older Daemon ($mech) that exits late is replaced by the new build"
+done
+
+# ---- whatever umask the installer inherits, everything it creates is private (P1-7) ----
+for um in 0000 0002 0277; do
+  machine "um$um"
+  mu="$work/um$um"
+  # A fake systemd user manager: nothing real is touched.
+  printf '#!/bin/sh\nexit 0\n' > "$mu/bin/systemctl"
+  printf '#!/bin/sh\nexit 0\n' > "$mu/bin/loginctl"
+  chmod 755 "$mu/bin/systemctl" "$mu/bin/loginctl"
+  out=$( (umask "$um"; env -i HOME="$mu/home" XDG_RUNTIME_DIR="$mu/run" PATH="$mu/bin:/usr/bin:/bin" \
+    XSHELL_SERVICE_MECHANISM=systemd XSHELLD_LOGIN_ENV=0 \
+    XSHELL_INSTALL_BASE="$base" XSHELL_TAG=va sh "$here/install.sh" --no-pair) 2>&1) \
+    || fail "install with umask $um failed" "$out"
+  hu="$mu/home"
+  for d in .xshell .xshell/server ".xshell/server/$dir_a" .xshell/service .xshell/log .config .config/systemd .config/systemd/user; do
+    m=$(stat -c %a "$hu/$d" 2>/dev/null || echo missing)
+    [ "$m" = 700 ] || fail "umask $um: $d is $m, not 700" "$out"
+  done
+  [ "$(stat -c %a "$hu/.xshell/server/$dir_a/xshelld")" = 700 ] || fail "umask $um: binary mode"
+  m=$(stat -c %a "$hu/.xshell/server/selected"); [ $(( 0$m & 077 )) -eq 0 ] || fail "umask $um: selected is $m"
+  [ "$(serving "um$um")" = "$dir_a" ] || fail "umask $um: not serving" "$out"
+  ok "umask $um: every directory 0700, files private, serving"
+done
+
+# `xshelld service install` run directly (not through install.sh) under a loose umask.
+machine direct
+md="$work/direct"
+printf '#!/bin/sh\nexit 0\n' > "$md/bin/systemctl"; cp "$md/bin/systemctl" "$md/bin/loginctl"
+chmod 755 "$md/bin/systemctl" "$md/bin/loginctl"
+( umask 0002; env -i HOME="$md/home" XDG_RUNTIME_DIR="$md/run" PATH="$md/bin:/usr/bin:/bin" \
+  "$work/xshelld-a" service install --mechanism systemd >/dev/null ) || fail "direct service install failed"
+for d in .config .config/systemd .config/systemd/user .xshell .xshell/service; do
+  m=$(stat -c %a "$md/home/$d" 2>/dev/null || echo missing)
+  [ "$m" = 700 ] || fail "direct service install, umask 0002: $d is $m"
+done
+ok "service install creates missing ancestors 0700 under umask 0002"
+
 # ---- a download that does not match its checksum ----
 machine bad
 if out=$(run_install bad vbad 2>&1); then fail "a bad checksum was accepted" "$out"; fi
@@ -145,7 +207,7 @@ machine odd
 printf '#!/bin/sh\ncase "$1" in -s) echo FreeBSD;; -m) echo x86_64;; esac\n' > "$work/odd/bin/uname"
 chmod 755 "$work/odd/bin/uname"
 if out=$(run_install odd va 2>&1); then fail "an unsupported platform was accepted" "$out"; fi
-case "$out" in *"Unsupported platform: FreeBSD x86_64"*) ;; *) fail "no platform message" "$out" ;; esac
+case "$out" in *"xshell isn't available for FreeBSD x86_64. Installation stopped."*) ;; *) fail "no platform message" "$out" ;; esac
 [ ! -e "$work/odd/home/.xshell" ] || fail "something was installed on an unsupported platform"
 ok "unsupported platform refused"
 

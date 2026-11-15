@@ -68,10 +68,17 @@ pub const RING_CAPABILITY: &str = "ring";
 /// the expected one.
 pub const RING_CJOIN_CAPABILITY: &str = "ring.cjoin";
 const RING_REFUSED: &str = "this Host's xshelld cannot join a ring; upgrade it first";
-/// A Ring Host whose xshell cannot take an update over the Ring. COPY-GAP: no approved text
-/// for this case; nearest approved string `update.noBuild`.
-pub const RING_UPDATE_UNSUPPORTED: &str =
-    "This xshell cannot update this type of machine. Update xshell directly on that machine.";
+/// A Ring Host whose xshell cannot take an update over the Ring (copy `update.tooOld`).
+pub fn ring_update_unsupported(name: &str) -> String {
+    format!(
+        "{name} is too old to update through your Ring. Update xshell directly on that machine."
+    )
+}
+
+/// A Ring Host that did not come back after an update (copy `update.notBack`).
+pub fn ring_not_back(name: &str) -> String {
+    format!("{name} hasn't reconnected after the update. Check that machine, then try connecting again.")
+}
 /// This Desktop has no build for the Ring Host's platform (copy `update.noBuild`).
 pub const RING_NO_BUILD: &str =
     "This xshell cannot update this type of machine. Update xshell directly on that machine.";
@@ -2328,7 +2335,7 @@ impl HostHandle {
                         .iter()
                         .any(|c| c == xshell_protocol::cap::DAEMON_STAGE))
             {
-                return Err(HostError::invalid(RING_UPDATE_UNSUPPORTED));
+                return Err(HostError::invalid(ring_update_unsupported(&name)));
             }
             if st.upgrading {
                 return Err(HostError::new(
@@ -2355,7 +2362,7 @@ impl HostHandle {
                 .iter()
                 .any(|c| c == xshell_protocol::cap::DAEMON_STAGE)
             {
-                return Err(HostError::invalid(RING_UPDATE_UNSUPPORTED));
+                return Err(HostError::invalid(ring_update_unsupported(&name)));
             }
             if !crate::version::update_eligible(
                 &self.sh.mc.desktop_version,
@@ -2581,9 +2588,7 @@ pub(crate) fn expire_upgrade(sh: &Shared, st: &mut State) {
         st.upgrade_complete_deadline = None;
         st.status.phase = None;
         st.status.last_error = Some(if matches!(st.cfg.route, HostRoute::Relay(_)) {
-            // COPY-GAP: no approved text for a Ring Host that did not come back in time;
-            // nearest approved string `update.offline`.
-            ring_offline(&st.cfg.name)
+            ring_not_back(&st.cfg.name)
         } else {
             "This Host did not reconnect with this Desktop’s build. Check that xshell is still open there, then reconnect.".into()
         });

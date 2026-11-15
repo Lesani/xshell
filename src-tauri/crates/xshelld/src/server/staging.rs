@@ -51,7 +51,17 @@ pub(crate) struct Requester {
 /// C8: the requester is still connected, and a Relay requester's key is still a Desktop in
 /// this Host's current Roster.
 pub(crate) fn authorized(d: &Daemon, who: Requester) -> Result<(), String> {
-    if !d.reg.lock().unwrap().conns.contains_key(&who.conn) {
+    let reg = d.reg.lock().unwrap();
+    authorized_locked(d, &reg, who)
+}
+
+/// [`authorized`] with the registry locked by the caller: a disconnect waits for it.
+fn authorized_locked(
+    d: &Daemon,
+    reg: &super::registry::Registry,
+    who: Requester,
+) -> Result<(), String> {
+    if !reg.conns.contains_key(&who.conn) {
         return Err("the requesting connection is gone".into());
     }
     let Some(key) = who.peer else {
@@ -81,7 +91,13 @@ struct Active {
     queued: u64,
     length: u64,
     tx: SyncSender<Job>,
+    /// Commit runs: the reservation stays until it has fully finished (P2-10).
+    committing: bool,
 }
+
+/// Test seam (C7): homes whose stage writes fail as on a full disk.
+#[doc(hidden)]
+pub static FAIL_WRITES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 #[derive(Default)]
 pub(crate) struct Staging {
@@ -122,9 +138,19 @@ impl Staging {
                 }));
             }
         }
+        // The running build and the selected build are never replaced (P1-6).
+        let selected = fs::read_to_string(root.join(xshell_core::server::SELECTED))
+            .ok()
+            .and_then(|t| t.lines().next().map(str::to_string));
+        if dir == crate::upgrade::own_dir() || selected.as_deref() == Some(dir.as_str()) {
+            return Ok(json!(StageBegun {
+                stage: None,
+                installed: true
+            }));
+        }
         let mut slot = self.slot.lock().unwrap();
         match slot.as_ref() {
-            Some(a) if a.conn != who.conn => return Err(STAGE_BUSY.into()),
+            Some(a) if a.conn != who.conn || a.committing => return Err(STAGE_BUSY.into()),
             // The same connection starts over: its earlier stage goes.
             _ => drop(slot.take()),
         }
@@ -142,6 +168,7 @@ impl Staging {
             who,
             dir,
             dir_path,
+            home: home.clone(),
             version: version.to_string(),
             build: build.clone(),
             part,
@@ -160,6 +187,7 @@ impl Staging {
             queued: 0,
             length,
             tx,
+            committing: false,
         });
         Ok(json!(StageBegun {
             stage: Some(id),
@@ -179,7 +207,7 @@ impl Staging {
         let mut slot = self.slot.lock().unwrap();
         let Some(a) = slot
             .as_mut()
-            .filter(|a| a.id == stage && a.conn == who.conn)
+            .filter(|a| a.id == stage && a.conn == who.conn && !a.committing)
         else {
             reply(Err("unknown update stage".into()));
             return None;
@@ -242,19 +270,22 @@ impl Staging {
 
     /// `daemon.stage-commit`: the worker answers once the queued chunks are written.
     pub fn commit(&self, who: Requester, stage: Uuid, reply: Reply) {
-        let active = {
+        let tx = {
             let mut slot = self.slot.lock().unwrap();
-            match slot.as_ref() {
-                Some(a) if a.id == stage && a.conn == who.conn => slot.take(),
+            match slot.as_mut() {
+                Some(a) if a.id == stage && a.conn == who.conn && !a.committing => {
+                    a.committing = true;
+                    Some(a.tx.clone())
+                }
                 _ => None,
             }
         };
-        let Some(a) = active else {
+        let Some(tx) = tx else {
             return reply(Err("unknown update stage".into()));
         };
-        if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r))) =
-            a.tx.send(Job::Commit(reply))
+        if let Err(mpsc::SendError(Job::Write(_, r) | Job::Commit(r))) = tx.send(Job::Commit(reply))
         {
+            self.forget(stage);
             r(Err("the update was stopped".into()));
         }
     }
@@ -264,7 +295,7 @@ impl Staging {
         let mut slot = self.slot.lock().unwrap();
         if slot
             .as_ref()
-            .is_some_and(|a| a.id == stage && a.conn == who.conn)
+            .is_some_and(|a| a.id == stage && a.conn == who.conn && !a.committing)
         {
             *slot = None;
         }
@@ -273,7 +304,11 @@ impl Staging {
     /// The connection closed: its stage goes.
     pub fn drop_conn(&self, conn: ConnId) {
         let mut slot = self.slot.lock().unwrap();
-        if slot.as_ref().is_some_and(|a| a.conn == conn) {
+        // A commit in progress finishes; its worker releases the reservation (P2-10).
+        if slot
+            .as_ref()
+            .is_some_and(|a| a.conn == conn && !a.committing)
+        {
             *slot = None;
         }
     }
@@ -366,6 +401,7 @@ struct Worker {
     who: Requester,
     dir: String,
     dir_path: PathBuf,
+    home: PathBuf,
     version: String,
     build: BuildId,
     part: PathBuf,
@@ -407,6 +443,9 @@ impl Worker {
     fn write(&mut self, bytes: &[u8]) -> io::Result<u64> {
         let v = self.verifier.as_mut().expect("open stage");
         v.check(bytes.len() as u64)?;
+        if FAIL_WRITES.lock().unwrap().contains(&self.home) {
+            return Err(io::Error::from_raw_os_error(28));
+        }
         self.file.as_mut().expect("open stage").write_all(bytes)?;
         v.update(bytes)?;
         Ok(v.received())
@@ -419,7 +458,8 @@ impl Worker {
             .finish()
             .map_err(|e| e.to_string())?;
         let file = self.file.take().expect("open stage");
-        file.sync_all().map_err(|e| e.to_string())?;
+        file.sync_all()
+            .map_err(|e| format!("cannot save the build: {e}"))?;
         drop(file);
         let mut bytes = Vec::new();
         fs::File::open(&self.part)
@@ -450,12 +490,43 @@ impl Worker {
                 return Err("the build reports another version or build".into());
             }
         }
+        let d = self.d.upgrade().ok_or("xshelld is exiting")?;
+        d.test_point(self.id, TestPoint::StageBeforePublish);
         let dest = self.dir_path.join("xshelld");
-        fs::rename(&self.part, &dest).map_err(|e| e.to_string())?;
-        self.published = true;
-        let _ = fs::File::open(&self.dir_path).and_then(|f| f.sync_all());
+        {
+            // Publication with the registry locked: a disconnect waits for it, or wins
+            // before it (P1-6).
+            let reg = d.reg.lock().unwrap();
+            authorized_locked(&d, &reg, self.who)?;
+            fs::rename(&self.part, &dest).map_err(|e| e.to_string())?;
+            self.published = true;
+            let synced =
+                sync(&self.dir_path).and_then(|()| self.dir_path.parent().map_or(Ok(()), sync));
+            if let Err(e) = synced {
+                // Not durable: nothing may be selectable (P2-8).
+                self.unpublish(&dest);
+                return Err(format!("cannot save the build: {e}"));
+            }
+        }
+        // A Roster revocation is not ordered by that lock: one that won meanwhile undoes it.
+        if let Err(e) = authorized(&d, self.who) {
+            self.unpublish(&dest);
+            return Err(e);
+        }
         crate::log!("INFO", "update stage {}: installed {}", self.id, self.dir);
         Ok(self.dir.clone())
+    }
+}
+
+fn sync(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+impl Worker {
+    fn unpublish(&mut self, dest: &Path) {
+        let _ = fs::remove_file(dest);
+        let _ = sync(&self.dir_path);
+        self.published = false;
     }
 }
 

@@ -148,6 +148,9 @@ pub fn main_entry() -> i32 {
     if !serve {
         return connect::run_connect(&opts, &paths);
     }
+    // S4 P1-1: never start beside an update trial another process owns; wait it out.
+    #[cfg(target_os = "linux")]
+    upgrade::wait_for_foreign_trial(&home);
     // Unix: one starter at a time per home, from before the (slow) login-environment
     // preparation to exit, so a second `serve` (an `ensure`, a Desktop, a `connect`) gives up
     // at once instead of preparing in parallel. Exit 3: another `serve` will listen.
@@ -176,6 +179,10 @@ pub fn main_entry() -> i32 {
     #[cfg(target_os = "linux")]
     let trial = match upgrade::on_start(&home) {
         upgrade::Decision::Normal => None,
+        upgrade::Decision::Busy => {
+            crate::log!("INFO", "an update of this machine is running; exiting");
+            return 3;
+        }
         upgrade::Decision::Trial(t) => Some(t),
         upgrade::Decision::Exec(bin) => return upgrade::exec_previous(&bin),
     };
@@ -235,6 +242,10 @@ pub fn main_entry() -> i32 {
     #[cfg(target_os = "linux")]
     {
         cfg.test_fail_restore = trial.is_some() && fail_restore_for_tests();
+        cfg.strict_restore = trial.is_some();
+        if trial.is_some() {
+            upgrade::corrupt_state_for_tests(&cfg.home);
+        }
     }
     let home = cfg.home.clone();
     let paths = cfg.paths.clone();
@@ -262,7 +273,23 @@ pub fn main_entry() -> i32 {
     {
         return upgrade::reexec(&home, &paths);
     }
+    exit_delay_for_tests();
     served.code
+}
+
+/// Test hook (debug builds): `XSHELLD_TEST_EXIT_DELAY_MS=<ms>`: after serving ends, wait
+/// that long before exiting, still holding the start lock (an older Daemon that is slow to
+/// go).
+fn exit_delay_for_tests() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Some(ms) = std::env::var("XSHELLD_TEST_EXIT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }
 
 /// A GUI-bound Daemon is replaced by the app that owns it, never in place.

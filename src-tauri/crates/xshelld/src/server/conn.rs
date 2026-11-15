@@ -906,24 +906,29 @@ impl Conn {
                 // again, C2).
                 #[cfg(target_os = "linux")]
                 let ring = super::ring_connected(&d);
-                {
+                let prepared = (|| -> Result<(), String> {
                     let mut reg = d.reg.lock().unwrap();
                     if !reg.frozen {
                         // The last word on disk before the Terminals are ended.
                         d.persist(&reg);
                         // In place on Linux (S4): a `selected` naming another build gets a
-                        // trial, so a broken one rolls back. Without, the re-exec starts
-                        // whatever is selected.
+                        // trial, so a broken one rolls back; a trial that cannot be prepared
+                        // refuses the request and this Daemon keeps serving (P2-9). Without
+                        // another build it restarts this build in place.
                         #[cfg(target_os = "linux")]
-                        if let Some(target) =
-                            selected_other_build(&d.cfg.home).filter(|_| crate::upgrade::in_place())
-                        {
-                            if let Err(e) = crate::upgrade::begin(&d.cfg.home, &target, ring) {
-                                crate::log!("WARN", "upgrading to {target} without a trial: {e}");
+                        if crate::upgrade::in_place() {
+                            match selected_other_build(&d.cfg.home) {
+                                Some(target) => crate::upgrade::begin(&d.cfg.home, &target, ring)?,
+                                None => crate::upgrade::restart(&d.cfg.home),
                             }
                         }
                         reg.frozen = true;
                     }
+                    Ok(())
+                })();
+                if let Err(e) = prepared {
+                    reply(&self.ob, id, Err(e));
+                    return;
                 }
                 reply(&self.ob, id, Ok(Value::Null));
                 let d2 = d.clone();
