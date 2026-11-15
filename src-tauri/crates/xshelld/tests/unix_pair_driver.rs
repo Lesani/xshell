@@ -1511,3 +1511,184 @@ fn offline_pair_final_receipt_failure_is_nonzero_and_exact_accepted_recovery_rem
     assert_no_words_on_disk(&b, &code);
     ar.quit();
 }
+
+/// Pauses a Join at [`AdoptionTestPoint::JoinBeforeConsent`] (the approver's proposal is
+/// verified, nothing is signed yet) until released.
+#[derive(Clone, Default)]
+struct ConsentGate(Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>);
+impl ConsentGate {
+    fn hook(&self) -> AdoptionTestHook {
+        let gate = self.clone();
+        AdoptionTestHook(Arc::new(move |point| {
+            if point == AdoptionTestPoint::JoinBeforeConsent {
+                let (lock, cv) = &*gate.0;
+                let mut st = lock.lock().unwrap();
+                st.0 = true;
+                cv.notify_all();
+                while !st.1 {
+                    st = cv.wait(st).unwrap();
+                }
+            }
+        }))
+    }
+    fn reached(&self) {
+        let (lock, cv) = &*self.0;
+        let mut st = lock.lock().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !st.0 {
+            assert!(Instant::now() < until, "the proposal never arrived");
+            st = cv.wait_timeout(st, Duration::from_millis(50)).unwrap().0;
+        }
+    }
+    fn release(&self) {
+        let (lock, cv) = &*self.0;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    }
+}
+
+/// What ends the code's display while the approver's proposal arrives (B7).
+#[derive(Clone, Copy, Debug)]
+enum CodeGone {
+    /// The code screen closes (`ring_join_cancel`).
+    Cancelled,
+    /// The `xshelld pair` command that shows the code exits.
+    PairExited,
+    /// Another xshell window takes the Ring over (this one closed).
+    OtherWindow,
+    /// The code expires.
+    Expired,
+}
+
+/// B7: the approver's proposal arrives just as the code stops being shown. The joining
+/// machine releases no proof (its journal never reaches "consent may have left", its
+/// Daemon holds none) and is not enrolled; the Ring is unchanged.
+fn no_proofs_after_the_code_is_gone(gone: CodeGone) {
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = a.ring(&relay.url());
+    create(&ar, &a.companion());
+    wait(|| ar.view().connection == "connected");
+    let b = Fixture::new();
+    let _bd = b.server();
+    let gate = ConsentGate::default();
+    let br = {
+        let mut cfg = DesktopRingConfig::new(b.desktop.clone(), "Computer".into());
+        cfg.default_relay_url = relay.url();
+        cfg.owner_retry = Duration::from_millis(20);
+        cfg.adoption_test_hook = Some(gate.hook());
+        if matches!(gone, CodeGone::Expired) {
+            cfg.pair_ttl = Duration::from_secs(3);
+        }
+        DesktopRing::open(cfg, Arc::new(Quiet))
+    };
+    br.register_companion(&b.companion()).unwrap();
+    let _manager = b.manager(&br);
+    let mut child = None;
+    let (offer, join, code) = if matches!(gone, CodeGone::PairExited) {
+        let mut c = b.pair(&relay.url(), 30_000);
+        let code = c.code();
+        child = Some(c);
+        (None, Some(controller(&br)), code)
+    } else {
+        let offer = br.begin_join(&b.companion()).unwrap();
+        let code = offer.code.clone();
+        (Some(offer), None, code)
+    };
+    let expires_at = offer
+        .as_ref()
+        .map_or_else(|| join.as_ref().unwrap().expires_at, |o| o.expires_at);
+    let mut other = None;
+    std::thread::scope(|scope| {
+        let approval = scope.spawn(|| ar.approve_device_code(&code));
+        gate.reached();
+        match gone {
+            CodeGone::Cancelled => offer.as_ref().unwrap().cancel_join(),
+            CodeGone::PairExited => {
+                let c = child.as_mut().unwrap();
+                c.cancel();
+                assert_ne!(c.finish(), 0);
+                // The Desktop dropped the command's operation.
+                wait(|| br.administration_joins().is_empty());
+            }
+            CodeGone::OtherWindow => {
+                br.quit();
+                let next = b.ring(&relay.url());
+                wait(|| next.pairing_ipc_owner());
+                other = Some(next);
+            }
+            CodeGone::Expired => {
+                let until = Instant::now() + Duration::from_secs(10);
+                while unix_now() < expires_at {
+                    assert!(Instant::now() < until);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        gate.release();
+        assert!(approval.join().unwrap().is_err(), "nothing to publish");
+        match offer {
+            Some(offer) => assert!(offer.wait().is_err()),
+            None => wait(|| {
+                matches!(
+                    join.as_ref().unwrap().join_status(),
+                    JoinStatus::Failed { .. } | JoinStatus::Finishing { .. }
+                )
+            }),
+        }
+    });
+    let stored = Store::new(b.desktop.clone())
+        .load_profile()
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(stored.membership.is_none(), "{gone:?}: not enrolled");
+    let journal = stored.journal.unwrap();
+    assert!(
+        matches!(
+            journal.phase,
+            AdoptionPhase::Cancelled | AdoptionPhase::ExpiredBeforeProof
+        ),
+        "{gone:?}: no proof may have left, got {:?}",
+        journal.phase
+    );
+    assert!(journal.signed_candidate.is_none() && journal.accepted.is_empty());
+    let counterpart: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(b.paths.ring_dir.join("companion.json")).unwrap())
+            .unwrap();
+    assert!(
+        counterpart["obligation"]["proofs"].is_null(),
+        "{gone:?}: the Daemon released no proof"
+    );
+    assert!(!b.paths.ring_dir.join("roster.json").exists());
+    let ring = ar.chain().unwrap();
+    assert_eq!(ring.head().version(), 1, "{gone:?}: the Ring is unchanged");
+    assert_eq!(
+        xshell_protocol::ring::relay::contract::relay_version(&relay.target(), ring.ring_id()),
+        1
+    );
+    assert_no_words_on_disk(&b, &code);
+    drop(join);
+    if let Some(other) = other {
+        other.quit();
+    }
+    br.quit();
+    ar.quit();
+}
+#[test]
+fn no_proofs_when_the_code_screen_closes_as_the_proposal_arrives() {
+    no_proofs_after_the_code_is_gone(CodeGone::Cancelled);
+}
+#[test]
+fn no_proofs_when_the_pair_command_exits_as_the_proposal_arrives() {
+    no_proofs_after_the_code_is_gone(CodeGone::PairExited);
+}
+#[test]
+fn no_proofs_when_another_window_takes_over_as_the_proposal_arrives() {
+    no_proofs_after_the_code_is_gone(CodeGone::OtherWindow);
+}
+#[test]
+fn no_proofs_when_the_code_expires_as_the_proposal_arrives() {
+    no_proofs_after_the_code_is_gone(CodeGone::Expired);
+}
