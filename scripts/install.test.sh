@@ -249,6 +249,7 @@ chmod 755 "$pub/bin/gh" "$pub/bin/file" "$pub/bin/stamp"
   short=$(git rev-parse --short=12 HEAD)
   printf '[package]\nname = "xshell"\nversion = "9.9.9-test.1"\n' > src-tauri/Cargo.toml
   sed 's/^TAG=".*"$/TAG="v9.9.9-test.1"/' "$here/install.sh" > scripts/install.sh
+  sed 's/^\( *\)\$TAG = ".*"$/\1$TAG = "v9.9.9-test.1"/' "$here/install.ps1" > scripts/install.ps1
   for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     mkdir -p "src-tauri/target/$t/release-daemon"
   done
@@ -291,6 +292,27 @@ out=$(publish env GH_TAG_SHA=0000000000000000000000000000000000000000 2>&1) && f
 created && fail "created a release over a foreign tag"
 out=$(publish env GH_TAG_SHA="$sha" 2>&1) || fail "a tag at the same commit was refused" "$out"
 ok "publish refuses a tag at another commit, accepts one at this commit"
+
+grep -q "/xshell-windows-x86_64.zip\( \|$\)" "$pub/gh.log" && fail "published a Windows zip that is not there"
+win="$pub/win"
+mkdir -p "$win"
+printf 'MZ fake' > "$win/xshell.exe"
+(cd "$win" && python3 -c 'import zipfile; zipfile.ZipFile("xshell-windows-x86_64.zip", "w").write("xshell.exe")' \
+  && sha256sum xshell-windows-x86_64.zip > xshell-windows-x86_64.zip.sha256)
+printf 'version=x\ncommit=%s\n' "$sha" > "$win/BUILD"
+out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) || fail "publish with a Windows build failed" "$out"
+for f in xshell-windows-x86_64.zip xshell-windows-x86_64.zip.sha256 install.ps1 install.sh; do
+  grep -q "/$f\( \|$\)" "$pub/gh.log" || fail "release lacks $f" "$(cat "$pub/gh.log")"
+done
+printf 'commit=0000000000000000000000000000000000000000\n' > "$win/BUILD.other"
+mv "$win/BUILD" "$win/BUILD.ok"; mv "$win/BUILD.other" "$win/BUILD"
+out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) && fail "published a Windows build of another commit" "$out"
+created && fail "created a release with a foreign Windows build"
+mv "$win/BUILD.ok" "$win/BUILD"
+echo tampered >> "$win/xshell-windows-x86_64.zip"
+out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) && fail "published a Windows zip that fails its .sha256" "$out"
+created && fail "created a release with a tampered Windows zip"
+ok "publish: an optional Windows zip, its .sha256 and install.ps1, only for this commit and intact"
 
 fake_daemon aarch64-unknown-linux-musl 0123456789ab
 out=$(publish env 2>&1) && fail "published a build of another commit" "$out"

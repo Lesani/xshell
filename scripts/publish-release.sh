@@ -19,6 +19,12 @@
 # Then the release is created as a pre-release whose tag targets that exact commit, with
 # xshelld-<triple>, xshelld-<triple>.sha256 and install.sh.
 #
+# Windows (optional): when $XSHELL_PUBLISH_WINDOWS_DIR (default src-tauri/target/windows-release)
+# holds the output of xshell-meta/bin/windows-build (xshell-windows-x86_64.zip, its .sha256 and
+# BUILD), the zip, the .sha256 and scripts/install.ps1 are published too. Checked first: the
+# BUILD receipt names exactly this commit, the zip matches its .sha256 and holds xshell.exe, and
+# install.ps1 is pinned to v<version>.
+#
 # Environment (tests): XSHELL_PUBLISH_REPO (default Lesani/xshell), XSHELL_PUBLISH_ROOT (the
 # checkout, default this script's parent), XSHELL_PUBLISH_STAMP (the build-stamp checker:
 # a command taking <binary> <expected display>; default the build_stamp example).
@@ -103,9 +109,39 @@ done
 cp scripts/install.sh "$out/install.sh"
 files="$files $out/install.sh"
 
+windir="${XSHELL_PUBLISH_WINDOWS_DIR:-src-tauri/target/windows-release}"
+winzip=xshell-windows-x86_64.zip
+windows=0
+if [ -f "$windir/$winzip" ]; then
+  [ -f "$windir/$winzip.sha256" ] || fail "$windir/$winzip has no .sha256"
+  grep -qx "commit=$sha" "$windir/BUILD" 2>/dev/null || fail "$windir/BUILD is not a build of $sha"
+  want=$(sed -n '1s/^\([0-9A-Fa-f]\{64\}\).*/\1/p' "$windir/$winzip.sha256")
+  got=$(sha256sum "$windir/$winzip" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$got" ] || fail "$windir/$winzip does not match its .sha256"
+  python3 -c 'import sys, zipfile; sys.exit("xshell.exe" not in zipfile.ZipFile(sys.argv[1]).namelist())' "$windir/$winzip" \
+    || fail "$windir/$winzip has no xshell.exe"
+  winpinned=$(sed -n 's/^ *\$TAG = "\(.*\)"$/\1/p' scripts/install.ps1 | head -n 1)
+  [ "$winpinned" = "$tag" ] || fail "scripts/install.ps1 is pinned to $winpinned, not $tag"
+  cp "$windir/$winzip" "$out/$winzip"
+  (cd "$out" && sha256sum "$winzip" > "$winzip.sha256")
+  cp scripts/install.ps1 "$out/install.ps1"
+  files="$files $out/$winzip $out/$winzip.sha256 $out/install.ps1"
+  windows=1
+else
+  echo "publish-release: no Windows build in $windir, not published" >&2
+fi
+
 notes="xshell $version (commit $short). Install or update a machine without a window:
 
     curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh"
+if [ "$windows" = 1 ]; then
+  notes="$notes
+
+Install or update the xshell Desktop on Windows (PowerShell, no administrator rights; the files
+are not code-signed yet, so Windows may warn):
+
+    irm https://github.com/$repo/releases/download/$tag/install.ps1 | iex"
+fi
 
 if [ "$dry" = 1 ]; then
   echo "would run: gh release create $tag --repo $repo --prerelease --target $sha --title \"xshell $version\"$files"
