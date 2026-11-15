@@ -36,7 +36,7 @@ export function formatError(raw: string, attempted: boolean): boolean {
 
 type AddState = { kind: "idle" } | { kind: "checking" } | { kind: "done"; names: string[] } | { kind: "failed"; key: CopyKey };
 
-export function AddMachinePanel({ approve, disabled = false }: { approve: (words: string) => Promise<ApprovedComputer>; disabled?: boolean }) {
+export function AddMachinePanel({ approve, disabled = false, note = null }: { approve: (words: string) => Promise<ApprovedComputer>; disabled?: boolean; note?: string | null }) {
   const [words, setWords] = useState("");
   const [attempted, setAttempted] = useState(false);
   const [st, setSt] = useState<AddState>({ kind: "idle" });
@@ -69,6 +69,7 @@ export function AddMachinePanel({ approve, disabled = false }: { approve: (words
   return (
     <div className="edit-field" data-add-machine>
       <label className="edit-label">{C["add.entry"]}</label>
+      {note && <div className="host-row-note host-row-warn" data-ring-connection-required>{note}</div>}
       <div className="edit-hint">{C["add.body"]}</div>
       <div className="edit-field">
         <label className="edit-label" htmlFor={inputId}>{C["add.label"]}</label>

@@ -91,10 +91,22 @@ export function reconcile(
     if (skip !== !!t.skipPermissions) next = { ...next, skipPermissions: skip };
     if (next !== t) update.push(next);
   }
-  const add = list
-    .filter(i => !have.has(i.terminal))
-    .sort((a, b) => a.createdAtMs - b.createdAtMs)
-    .map(i => tabFromTerminal(host, i));
+  // A machine that left the Ring and joined again has a new Host id; its Terminals keep their
+  // ids. Such a Terminal's Tab (still on the departed id) moves to this Host: one Tab, never two.
+  const elsewhere = new Map(tabs.filter(t => t.terminal && registry.dataHost(t.host) !== host).map(t => [t.terminal!, t]));
+  const add: Tab[] = [];
+  for (const i of [...list].sort((a, b) => a.createdAtMs - b.createdAtMs)) {
+    if (have.has(i.terminal)) continue;
+    const old = elsewhere.get(i.terminal);
+    if (old && registry.isDeparted(old.host)) {
+      const moved: Tab = { ...tabFromTerminal(host, i) };
+      if (old.customTitle && moved.customTitle === undefined) moved.customTitle = old.customTitle;
+      update.push(moved);
+      continue;
+    }
+    if (old) continue; // the same id on another current Host: the existing Tab stays
+    add.push(tabFromTerminal(host, i));
+  }
   const confirmed = list.filter(i => pending.has(i.terminal)).map(i => i.terminal);
   return { add, remove, update, confirmed };
 }

@@ -22,6 +22,9 @@ export interface HostCacheEntry {
 export interface CacheState {
   version: 1;
   hosts: Record<HostId, HostCacheEntry>;
+  // The last name seen for each Host id (and its aliases): a Host that left the Ring is still
+  // named by it, also after a restart. Never shown as a raw id.
+  names?: Record<HostId, string>;
 }
 
 export function emptyCache(): CacheState {
@@ -33,7 +36,8 @@ export function parseCache(raw: unknown): CacheState {
   if (!raw || typeof raw !== "object") return emptyCache();
   const r = raw as Partial<CacheState>;
   if (r.version !== CACHE_VERSION || !r.hosts || typeof r.hosts !== "object") return emptyCache();
-  return { version: CACHE_VERSION, hosts: r.hosts };
+  const names = r.names && typeof r.names === "object" ? Object.fromEntries(Object.entries(r.names).filter(([, v]) => typeof v === "string" && v)) : undefined;
+  return { version: CACHE_VERSION, hosts: r.hosts, ...(names ? { names } : {}) };
 }
 
 // Stable JSON: object keys sorted at every level, so `{a,b}` and `{b,a}` share a key.
@@ -174,7 +178,7 @@ export const cache = {
           fromDisk = parseCache(await store.get(CACHE_KEY));
         } catch (_) {}
         // Writes made before the load landed win over the disk copy.
-        state = { version: CACHE_VERSION, hosts: { ...fromDisk.hosts, ...state.hosts } };
+        state = { version: CACHE_VERSION, hosts: { ...fromDisk.hosts, ...state.hosts }, names: { ...fromDisk.names, ...state.names } };
         loaded = true;
         return state;
       })();
@@ -198,6 +202,30 @@ export const cache = {
   putTerminals(host: HostId, list: TerminalInfo[]) {
     state = putTerminals(state, binding(host).key, list, Date.now());
     stamp(host);
+    scheduleWrite();
+  },
+  // Remembers each row's name under its id and aliases (written only when it changes).
+  rememberNames(rows: { id: HostId; aliases?: HostId[]; name?: string | null }[]) {
+    const names = { ...state.names };
+    let changed = false;
+    for (const row of rows) {
+      if (!row.name) continue;
+      for (const id of [row.id, ...(row.aliases ?? [])]) if (names[id] !== row.name) { names[id] = row.name; changed = true; }
+    }
+    if (!changed) return;
+    state = { ...state, names };
+    scheduleWrite();
+  },
+  lastName(host: HostId): string | null {
+    return state.names?.[host] ?? null;
+  },
+  // A Terminal's Tab closed for a Host that left the Ring: it is not restored again.
+  forgetTerminal(host: HostId, terminal: string) {
+    for (const [key, entry] of Object.entries(state.hosts)) {
+      if ((key === host || entry.provenance?.host === host || binding(host).key === key) && entry.terminals.some(t => t.terminal === terminal)) {
+        state = { ...state, hosts: { ...state.hosts, [key]: { ...entry, terminals: entry.terminals.filter(t => t.terminal !== terminal) } } };
+      }
+    }
     scheduleWrite();
   },
   terminals(host: HostId): TerminalInfo[] | null {

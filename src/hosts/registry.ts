@@ -1,3 +1,4 @@
+import { C, fmtc } from "../ring/copy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AGENT_IDS, AGENTS, type AgentId } from "../agents";
@@ -123,6 +124,7 @@ export class HostRegistry {
         if (!next && !snapshot.hosts.some(h => h.aliases.includes(old.id))) this.withdrawn.add(old.id);
       }
     }
+    cache.rememberNames(snapshot.hosts);
     this.emit({ available: snapshot.hosts, status, live });
     for (const old of previous) if (!this.isAvailable(old.id)) this.rejectWaiters(old.id);
     for (const h of snapshot.hosts) {
@@ -337,7 +339,37 @@ export class HostRegistry {
     return !!this.availableHost(id) || (id === LOCAL_HOST ? this.local : this.isConfigured(id));
   }
   config(id: HostId): HostConfig | undefined { return this.snap.configs.find(c => c.id === id); }
-  hostName(id: HostId | undefined): string { return (id && (this.availableHost(id)?.name || this.config(id)?.name)) || id || ""; }
+  // A Host's label: its current name; for a Host that left the Ring its last known name marked
+  // "(not in Ring)". Never the raw id.
+  hostName(id: HostId | undefined): string {
+    if (!id) return "";
+    const current = this.availableHost(id)?.name || this.config(id)?.name;
+    if (current) return current;
+    const name = this.machineName(id);
+    return this.isDeparted(id) ? fmtc("tab.removed.machineLabel", { name }) : name;
+  }
+  // The plain name (current or last known), or the neutral wording when never seen.
+  machineName(id: HostId): string {
+    return this.availableHost(id)?.name || this.config(id)?.name || cache.lastName(id) || C["machine.unknown"];
+  }
+  // The Ring Hosts of the current Roster, while this machine is a member (null otherwise:
+  // nothing is known to have left). Set from `ring:status` by App.
+  private ringHosts: Set<HostId> | null = null;
+  setRingHosts(ids: HostId[] | null) {
+    const next = ids ? new Set(ids) : null;
+    const same = next === this.ringHosts || (!!next && !!this.ringHosts && next.size === this.ringHosts.size && [...next].every(id => this.ringHosts!.has(id)));
+    if (same) return;
+    this.ringHosts = next;
+    this.emit({});
+  }
+  // The machine left the Ring: a Ring Host id (or an alias of one) that the Roster no longer
+  // lists. A Host that is only unreachable or briefly withdrawn is not departed.
+  isDeparted(id: HostId | undefined): boolean {
+    if (!id || id === LOCAL_HOST || !this.ringHosts) return false;
+    const ids = [id, ...(this.availableHost(id)?.aliases ?? []), this.availableHost(id)?.id].filter((x): x is string => !!x);
+    const ring = ids.filter(x => /^r_[0-9a-f]{64}$/.test(x));
+    return ring.length > 0 && !ring.some(x => this.ringHosts!.has(x));
+  }
   getStatus(id: HostId): HostStatus | undefined { return this.snap.status[this.resolveAlias(id)]; }
   isUsable(id: HostId): boolean { return this.isAvailable(id) && isUsableStatus(this.getStatus(id)); }
 
@@ -398,6 +430,7 @@ export class HostRegistry {
 
   // Tests only.
   _dispose() {
+    this.ringHosts = null;
     for (const u of this.unlisten) u();
     this.unlisten = [];
     this.teardown?.();

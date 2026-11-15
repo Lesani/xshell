@@ -46,7 +46,17 @@ export function restorableTabs(r: RestoreInput): Tab[] {
       hosts.set(canonical, identity ?? host);
     }
   }
-  const remote = [...hosts].flatMap(([canonical, original]) => byCreated(r.cached(canonical!) ?? r.cached(original) ?? []).map(info => tabFromTerminal(original, info)));
+  // One Tab per Terminal id: a retained list of a machine that left the Ring and the list of
+  // its new identity may hold the same Terminal; the Host still in the Ring wins.
+  const byId = new Map<string, Tab>();
+  for (const [canonical, original] of hosts) {
+    for (const info of byCreated(r.cached(canonical!) ?? r.cached(original) ?? [])) {
+      const tab = tabFromTerminal(original, info);
+      const prev = byId.get(tab.id);
+      if (!prev || (registry.isDeparted(prev.host) && !registry.isDeparted(tab.host))) byId.set(tab.id, tab);
+    }
+  }
+  const remote = [...byId.values()];
   let local: Tab[] = [];
   if (r.localDaemon) {
     const merged = new Map((r.cached(LOCAL_HOST) ?? []).map(i => [i.terminal, i]));

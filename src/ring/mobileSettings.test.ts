@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { connectionLine, formatResetTime, localLine, pairingBlocked, pairingNote, problemLine, quotaLine, relayHost, relayUrlError, validRelayUrl } from "./mobileSettings";
+import { connectionLine, formatResetTime, localLine, pairingBlocked, pairingLine, problemLine, quotaLine, relayHost, relayUrlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
 import { C } from "./copy";
 import type { RingStatus } from "./types";
@@ -45,65 +45,59 @@ describe("quota notice (#42)", () => {
   });
 });
 
-describe("connection line", () => {
-  it("says how the Relay connection stands", () => {
-    expect(connectionLine(status())).toBe("Connected to relay.xshell.sh");
-    expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
-    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to relay.xshell.sh…");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach relay.xshell.sh. Retrying in 4s");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach relay.xshell.sh. Retrying in 1s");
+describe("connection line (copy-rjw-3)", () => {
+  it("the default service: no address, \"second\" when n is 1", () => {
+    expect(connectionLine(status())).toBe("Connected to the service.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach the service. Retrying in 4 seconds.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 1 }))).toBe("Can't reach the service. Retrying in 1 second.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach the service. Retrying in 1 second.");
+    expect(connectionLine(status({ connection: "connecting" }))).toBeNull();
+    // The build's default address (a test Relay) is the default service too.
+    expect(connectionLine(status({ relayUrl: "ws://127.0.0.1:48790", hostedRelayUrl: "ws://127.0.0.1:48790", relayHosted: true }))).toBe("Connected to the service.");
     expect(connectionLine(status({ connection: "stopped" }))).toBe(fmt("mobile.conn.stopped"));
     expect(connectionLine(status({ connection: "off", enabled: false, membership: "none" }))).toBeNull();
-    expect(connectionLine(status({ connection: "other-window" }))).toBe("Another xshell window manages the connection to your devices.");
+    expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
   });
 
-  it("names the host of the current relay, with the port, never the full URL", () => {
-    const s = status({ relayUrl: "wss://mine.example:8443/path?x=1" });
-    expect(relayHost(s.relayUrl)).toBe("mine.example:8443");
-    expect(connectionLine(s)).toBe("Connected to mine.example:8443");
-    expect(connectionLine(status({ ...s, connection: "connecting" }))).toBe("Connecting to mine.example:8443…");
-    expect(connectionLine(status({ ...s, connection: "waiting", retryIn: 3 }))).toBe("Can't reach mine.example:8443. Retrying in 3s");
-    expect(connectionLine(status({ ...s, limited: true }))).toBe(fmt("mobile.conn.limited"));
+  it("a self-chosen address names its host, never the full URL", () => {
+    const own = { relayUrl: "wss://mine.example:8443/path?x=1", relayHosted: false };
+    expect(relayHost(own.relayUrl)).toBe("mine.example:8443");
+    expect(connectionLine(status(own))).toBe("Connected to mine.example:8443.");
+    expect(connectionLine(status({ ...own, connection: "waiting", retryIn: 3 }))).toBe("Can't reach mine.example:8443. Retrying in 3 seconds.");
+    expect(connectionLine(status({ ...own, connection: "waiting", retryIn: 1 }))).toBe("Can't reach mine.example:8443. Retrying in 1 second.");
+  });
+
+  it("never says relay", () => {
+    for (const over of [{}, { connection: "waiting" as const, retryIn: 2 }, { connection: "connecting" as const }, { relayUrl: "wss://own.example", relayHosted: false, connection: "connecting" as const }]) {
+      expect((connectionLine(status(over)) ?? "").toLowerCase()).not.toContain("relay");
+    }
   });
 
   it("reports local limits and recovery", () => {
     expect(localLine(status())).toBeNull();
     expect(localLine(status({ local: "too-old" }))).toBe(C["mobile.local.tooOld"]);
-    // Create starts over after a recovery: no line; refused settings say so.
     expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toBeNull();
     expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).toBe(C["mobile.problem.unreadable"]);
-    expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).not.toContain("bad json");
     expect(problemLine(status())).toBeNull();
   });
 });
 
-describe("pairing and the connection", () => {
-  it("disables pairing only where it cannot succeed", () => {
-    expect(pairingBlocked(status({ connection: "connected" }))).toBeNull();
-    expect(pairingBlocked(status({ connection: "connecting" }))).toBeNull();
-    expect(pairingBlocked(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
-    expect(pairingBlocked(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
+describe("Pair a phone / Add a machine and the connection", () => {
+  it("blocks only where pairing cannot succeed", () => {
+    expect(pairingBlocked(status({ connection: "connected" }))).toBe(false);
+    expect(pairingBlocked(status({ connection: "connecting" }))).toBe(false);
+    expect(pairingBlocked(status({ connection: "waiting", retryIn: 4 }))).toBe(true);
+    expect(pairingBlocked(status({ connection: "stopped" }))).toBe(true);
   });
 
-  it("notes that pairing waits for the connection, or why it is disabled", () => {
-    expect(pairingNote(status({ connection: "connecting" }))).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connected" }))).toBeNull();
-    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
-    expect(pairingNote(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
-  });
-
-  it("keeps a shown offer waiting for the connection while it retries", () => {
-    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }), true)).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connecting" }), true)).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connected" }), true)).toBeNull();
-    // No longer a member: the offer cannot succeed.
-    expect(pairingNote(status({ connection: "stopped" }), true)).toBe("mobile.pair.needsMember");
-  });
-
-  it("has the notes' strings", () => {
-    for (const k of ["mobile.pair.connecting", "mobile.pair.needsRelay", "mobile.pair.needsMember"] as const) {
-      expect(S[k], k).toBeTruthy();
-    }
+  it("says why with the required line: default service, or the chosen address", () => {
+    expect(pairingLine(status({ connection: "connected" }))).toBeNull();
+    expect(pairingLine(status({ connection: "connecting" }))).toBeNull();
+    expect(pairingLine(status({ connection: "waiting", retryIn: 4 }))).toBe(C["ring.connection.default.required"]);
+    expect(pairingLine(status({ connection: "waiting", relayUrl: "wss://own.example", relayHosted: false }))).toBe("Can't reach own.example. Check your connection and try again.");
+    // A phone offer already shown stays valid while the connection retries.
+    expect(pairingLine(status({ connection: "waiting" }), true)).toBeNull();
+    expect(pairingLine(status({ connection: "stopped" }))).toBe(S["mobile.pair.needsMember"]);
   });
 });
 

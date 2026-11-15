@@ -1,7 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Smartphone } from "lucide-react";
 import { fmt } from "../ring/strings";
-import { pairingBlocked, pairingNote } from "../ring/mobileSettings";
+import { pairingBlocked, pairingLine } from "../ring/mobileSettings";
 import { errorText } from "../ring/members";
 import { expiresLine, failureLine, offersNewCode, PHONE_IDLE, pairedLine, phoneReducer, type PhoneAction, type PhoneState, qrRects } from "../ring/pairing";
 import type { PairingEvents } from "../ring/useRing";
@@ -29,9 +29,9 @@ function QrCode({ qr }: { qr: Qr }) {
 // Why pairing is disabled, or that it waits for the connection, under a panel's title.
 // `offerShown`: a phone offer is up, and stays valid while the connection retries.
 export function PairingNote({ s, offerShown = false }: { s: RingStatus; offerShown?: boolean }) {
-  const key = pairingNote(s, offerShown);
-  if (!key) return null;
-  return <div className={`host-row-note ${key === "mobile.pair.connecting" ? "" : "host-row-warn"}`}>{fmt(key)}</div>;
+  const line = pairingLine(s, offerShown);
+  if (!line) return null;
+  return <div className="host-row-note host-row-warn" data-ring-connection-required>{line}</div>;
 }
 
 // "Cancel pairing": ends the offer on the Desktop and returns the panel to "Pair a phone".
@@ -68,7 +68,7 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
   useEffect(() => () => { if (operation.current) cancel(operation.current).catch(() => {}); }, []);
 
   const start = async () => {
-    if (acquiring.current || st.state === "starting" || st.state === "waiting" || pairingBlocked(s) !== null) return;
+    if (acquiring.current || st.state === "starting" || st.state === "waiting" || pairingBlocked(s)) return;
     acquiring.current = true;
     const owned = crypto.randomUUID();
     operation.current = owned;
@@ -83,7 +83,7 @@ export function PhonePanel({ s, p, initial = PHONE_IDLE }: { s: RingStatus; p: P
     }
   };
   const busy = st.state === "starting" || waiting;
-  const blocked = pairingBlocked(s) !== null;
+  const blocked = pairingBlocked(s);
   return (
     <div className="edit-field">
       <label className="edit-label">{fmt("mobile.pair.phone")}</label>

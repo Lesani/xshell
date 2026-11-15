@@ -181,6 +181,16 @@ describe("member list", () => {
 });
 
 describe("Add a machine", () => {
+  it("while the service cannot be reached it says so (default service, no address) and is disabled", async () => {
+    setup(member({ connection: "waiting", retryIn: 1 }));
+    await mount();
+    expect(q("[data-ring-connection]")?.textContent).toBe("Can't reach the service. Retrying in 1 second.");
+    expect(q("[data-add-machine] [data-ring-connection-required]")?.textContent).toBe(C["ring.connection.default.required"]);
+    await type("[data-computer-words]", WORDS);
+    expect((q("[data-add-computer]") as HTMLButtonElement).disabled).toBe(true);
+    expect(text().toLowerCase()).not.toContain("relay");
+  });
+
   it("add.format for 9 words; sends normalized words; invalid_code → add.invalid; closed → add.closed; done → Added X", async () => {
     let reply: () => unknown = () => { throw "invalid_code: not a code"; };
     setup(member(), { ring_approve_device_code: () => reply() });

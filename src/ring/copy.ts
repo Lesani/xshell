@@ -1,5 +1,5 @@
 // Every user-facing string of the "Ring just works" Desktop UI: plans/copy-rjw-desktop.md §1–12
-// and Part A of plans/copy-rjw-gaps.md, plus §C of plans/review-rjw-s3-sol.md, keys and wording
+// and Part A of plans/copy-rjw-gaps.md, plus §C of plans/review-rjw-s3-sol.md and plans/copy-rjw-3.md, keys and wording
 // verbatim (generated from the tables).
 // `{param}` placeholders are filled by fmtc(); counted keys come in `.one`/`.other` pairs.
 
@@ -159,6 +159,20 @@ export const C = {
   "mobile.pair.failed": "Couldn't pair this phone. Check your device list, then try again.",
   "mobile.pair.err.role": "This pairing code can't add this type of device. Choose Pair a phone for a new code.",
   "update.notBack": "{name} hasn't reconnected after the update. Check that machine, then try connecting again.",
+  // plans/copy-rjw-3.md (binding).
+  "tab.removed.state": "{name} is no longer in your Ring.",
+  "tab.removed.body": "This tab stays open so you can read it. You can no longer use this terminal from here.",
+  "tab.removed.close": "Close tab",
+  "tab.removed.machineLabel": "{name} (not in Ring)",
+  "tab.offline.state": "{name} is offline. Reconnecting…",
+  "ring.connection.default.connected": "Connected to the service.",
+  "ring.connection.default.retry": "Can't reach the service. Retrying in {n} seconds.",
+  "ring.connection.custom.connected": "Connected to {address}.",
+  "ring.connection.custom.retry": "Can't reach {address}. Retrying in {n} seconds.",
+  "ring.connection.default.required": "Can't reach the service. Check your connection and try again.",
+  "ring.connection.custom.required": "Can't reach {address}. Check your connection and try again.",
+  // COPY-GAP: no approved wording for a machine whose name was never seen.
+  "machine.unknown": "a machine",
 } as const;
 
 export type CopyKey = keyof typeof C;

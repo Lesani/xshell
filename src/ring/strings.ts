@@ -3,14 +3,10 @@
 // placeholders are filled by fmt().
 
 export const S = {
-  "mobile.relay.title": "Relay",
-  "mobile.relay.hosted": "Hosted relay",
   "mobile.relay.url.placeholder": "wss://relay.example.com",
   "mobile.relay.save": "Use this relay",
   "mobile.relay.err.invalid": "Enter a wss:// URL. Use ws:// only for a loopback address, such as localhost.",
-  "mobile.conn.connected": "Connected to {relay}",
   "mobile.conn.connecting": "Connecting to {relay}…",
-  "mobile.conn.retrying": "Can't reach {relay}. Retrying in {s}s",
   "mobile.conn.limited": "Connected. To control agents through the hosted relay, purchase a Hosted subscription on one of your paired phones.",
   "mobile.conn.stopped": "This app is no longer one of your paired devices.",
   "mobile.conn.otherWindow": "Another xshell window manages the connection to your devices.",
@@ -27,8 +23,6 @@ export const S = {
   "mobile.pair.paired": "Added {name}",
   "mobile.pair.err.busy": "Another pairing is already in progress. Wait for it to finish.",
   "mobile.pair.err.full": "You've reached the limit of 64 devices. Remove a device, then try again.",
-  "mobile.pair.connecting": "Connecting to the relay. You can start pairing now. xshell will add the device once it connects.",
-  "mobile.pair.needsRelay": "Pairing needs a connection to the relay. xshell keeps trying.",
   "mobile.pair.needsMember": "This app is no longer one of your paired devices, so it can't add devices.",
   "mobile.pair.err.publishFailed": "xshell couldn't reach the relay in time to add the device. Try again.",
 } as const;

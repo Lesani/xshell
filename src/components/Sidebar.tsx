@@ -7,7 +7,7 @@ import { FolderEditorDialog } from "./FolderEditorDialog";
 import { RateLimitIndicator } from "./RateLimitIndicator";
 import { HostBadge } from "./HostBadge";
 import { useHostsSnapshot, statusLabel } from "../hosts/useHosts";
-import { isUsableStatus, resolveHostAlias } from "../hosts/registry";
+import { isUsableStatus, registry, resolveHostAlias } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SidebarItem, SidebarFolder } from "../types";
@@ -431,7 +431,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
     const activeCount = activeCountByProject.get(pl) ?? [...activeCountByProject].find(([key]) => sameKey(key, path))?.[1] ?? 0;
     // Remote Project: Host badge; dimmed with a status dot while its Host is not usable.
     const host = proj?.host ?? parseProjectKey(path).host;
-    const hostName = host ? (hostsSnap.available.find(h => h.id === host || h.aliases.includes(host))?.name || hostsSnap.configs.find(c => c.id === host)?.name || host) : "";
+    const hostName = host ? registry.hostName(host) : "";
     const hostStatus = host ? hostsSnap.status[resolveHostAlias(hostsSnap, host)] : undefined;
     const stale = !!host && !isUsableStatus(hostStatus);
     const tooltipText = !host ? displayName

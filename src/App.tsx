@@ -64,6 +64,7 @@ import { localView, type LocalStatus } from "./local/localInfo";
 import { awaitLocalReadiness, liveLocalInfo } from "./local/readiness";
 import { useRingStatus } from "./ring/useRingStatus";
 import { useNotAdded } from "./ring/notAdded";
+import { ringHostId } from "./hosts/ringIdentity";
 import { OLD_SEEN_SETTING, SETUP_SKIPPED_SETTING, startView } from "./ring/firstLaunch";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
@@ -1182,6 +1183,19 @@ export default function App() {
     }, 180);
   }, [activeTabId, forgetInProcessPanels]);
 
+  // "Close tab" on a Tab whose machine left the Ring: only this Tab goes (nothing is closed on
+  // that machine), and it is not restored from the retained list again.
+  const closeDepartedTab = useCallback((id: string) => {
+    const tab = tabsRef.current.find(t => t.id === id);
+    if (!tab) return;
+    if (tab.host && tab.terminal) cache.forgetTerminal(tab.host, tab.terminal);
+    const removed = [id];
+    if (activeTabIdRef.current === id || (tab.groupId && activeTabIdRef.current === tab.groupId && groupsRef.current.find(g => g.id === tab.groupId) && collectLeafIds(groupsRef.current.find(g => g.id === tab.groupId)!.layout).length <= 1)) setActiveTabId("home");
+    setTabs(prev => prev.filter(t => t.id !== id));
+    setGroups(prev => applyGroupRemovals(prev, removed));
+    setActiveLeafByGroup(prev => applyFocusRemovals(prev, applyGroupRemovals(groupsRef.current, removed), removed));
+  }, []);
+
   const handleReorderProjects = useCallback(async (newPaths: ProjectKey[]) => {
     await persistPaths(newPaths);
   }, [persistPaths]);
@@ -1211,6 +1225,13 @@ export default function App() {
   const ring = useRingStatus();
   // Remembers a Join/Create being finished even while no Ring screen is open (finishing → none).
   useNotAdded(ring.status);
+  // Which Ring Hosts are still in the Roster: Tabs of a machine that left say so (never "Waiting").
+  useEffect(() => {
+    const s = ring.status;
+    // Member names under their Host ids: a machine that leaves is still named.
+    if (s) cache.rememberNames(s.members.flatMap(m => [m.daemonKey, m.signKey].map(k => ({ id: ringHostId(k) ?? "", name: m.name }))).filter(r => r.id));
+    registry.setRingHosts(s?.membership === "member" ? s.members.flatMap(m => [m.daemonKey, m.signKey]).map(ringHostId).filter((x): x is string => !!x) : null);
+  }, [ring.status]);
   const local = useLocalInfo();
   const ringRef = useRef(ring.status);
   ringRef.current = ring.status;
@@ -1227,10 +1248,28 @@ export default function App() {
     if (s?.membership === "removed" && s.removed) setRemovedDismissedAt(s.removed.at);
     setActiveTabId("home");
   }, []);
+  // A notice about this machine's Ring membership belongs to that membership: the next change
+  // (removed, left, joined again) clears it, so two contradicting notices never show together.
+  const ringNoticeId = useRef<number | null>(null);
   const ringSetupDone = useCallback((text: string) => {
     setActiveTabId(id => (id === RING_SETUP_TAB ? "home" : id));
-    setNotice({ id: Date.now(), text, good: true });
+    const id = Date.now();
+    ringNoticeId.current = id;
+    setNotice({ id, text, good: true });
   }, []);
+  const membershipNow = ring.status?.membership;
+  const membershipSeen = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const before = membershipSeen.current;
+    membershipSeen.current = membershipNow;
+    if (before === undefined || before === membershipNow) return;
+    const id = ringNoticeId.current;
+    if (id === null) return;
+    // The notice of the change that just happened stays (created/joined arrives with "member").
+    if (membershipNow === "member") return;
+    ringNoticeId.current = null;
+    setNotice(n => (n && n.id === id ? null : n));
+  }, [membershipNow]);
   // At the end of startup: the setup screen when this machine is in no Ring (D9), after old Ring
   // data was set aside, or after a removal.
   const [setupPrefs, setSetupPrefs] = useState<{ skipped: boolean; oldSeenAt: number | null } | null>(null);
@@ -1877,7 +1916,7 @@ export default function App() {
           const wireHost = daemonHost(tab);
           const observedCompletionId = wireHost ? hostsSnap.live[registry.resolveAlias(wireHost)]?.find(i => i.terminal === tab.terminal)?.completionAttention?.completionId : undefined;
           return createPortal(
-            <TerminalTab tab={tab} observedCompletionId={observedCompletionId} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} rightPanel={rightPanels[rightPanelKey(tab)] ?? defaultRightPanel(tab, fileExplorerOnStart)} onRightPanelChange={panel => changeRightPanel(tab, panel)} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
+            <TerminalTab onCloseDeparted={closeDepartedTab} tab={tab} observedCompletionId={observedCompletionId} isActive={tab.id === activeTabId || (!!tab.groupId && tab.groupId === activeTabId && activeLeafByGroup[tab.groupId] === tab.id)} gitLazyPolling={gitLazyPolling} gitChangesTree={gitChangesTree} rightPanel={rightPanels[rightPanelKey(tab)] ?? defaultRightPanel(tab, fileExplorerOnStart)} onRightPanelChange={panel => changeRightPanel(tab, panel)} terminalBgColor={terminalBgColor} defaultFontSize={defaultTerminalFontSize} defaultShellId={defaultShell} fullscreenRendering={fullscreenRendering} forceSyncOutput={forceSyncOutput} webglRendering={webglRendering} terminalFontWeight={terminalFontWeight} eagerInit={eagerInitTabs} theme={theme} projectEncodedName={encodedName} showTerminalHeaderStats={showTerminalHeaderStats} onBranchSwitch={handleSwitchTabToBranch} onSkipPermissionsChange={handleSkipPermissionsChange} />,
             host,
             tab.id,
           );

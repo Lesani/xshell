@@ -121,8 +121,8 @@ describe("pairing strings", () => {
     "mobile.pair.phone", "mobile.pair.phone.desc", "mobile.pair.phone.expires", "mobile.pair.phone.copy",
     "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired",
     "mobile.pair.err.busy",
-    "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
-    "mobile.pair.needsRelay", "mobile.pair.needsMember",
+    "mobile.pair.err.full", "mobile.pair.err.publishFailed", 
+     "mobile.pair.needsMember",
   ];
 
   it("has every key", () => {

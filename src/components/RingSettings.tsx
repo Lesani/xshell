@@ -1,7 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import { C } from "../ring/copy";
 import { fmt } from "../ring/strings";
-import { connectionLine, localLine, problemLine, quotaLine, relayUrlError, validRelayUrl } from "../ring/mobileSettings";
+import { connectionLine, localLine, pairingBlocked, pairingLine, problemLine, quotaLine, relayUrlError, validRelayUrl } from "../ring/mobileSettings";
 import { useRing, type RingApi } from "../ring/useRing";
 import { useNotAdded } from "../ring/notAdded";
 import { AddMachinePanel } from "./AddMachinePanel";
@@ -24,16 +24,6 @@ export interface RingSettingsProps {
 export function RingSettings(props: RingSettingsProps) {
   const own = useRing();
   return <RingSettingsView {...props} ring={props.ring ?? own} />;
-}
-
-// A member's Relay is fixed: shown, not edited.
-function FixedRelay({ s }: { s: RingStatus }) {
-  return (
-    <div className="edit-field" data-ring-relay-fixed>
-      <label className="edit-label">{fmt("mobile.relay.title")}</label>
-      <div className="host-row-note">{s.relayHosted ? fmt("mobile.relay.hosted") : (s.relayUrl ?? "")}</div>
-    </div>
-  );
 }
 
 // The self-hosted Relay, chosen before the Ring is created (advanced). Empty: the hosted Relay.
@@ -93,13 +83,12 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
           </div>
         ) : s.membership === "member" ? (
           <>
-            <FixedRelay s={s} />
-            {conn && <div className="host-row-note">{conn}</div>}
+            {conn && <div className="host-row-note" data-ring-connection>{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
             <RingMembers s={s} readOnly={follower} remove={r.removeMember} refresh={r.refreshStatus} onSelfRemoved={() => setSelfRemoved(true)} />
             {follower ? <div className="host-row-note">{C["ring.follower"]}</div> : (
               <>
-                <AddMachinePanel approve={r.approveComputer} disabled={s.busy} />
+                <AddMachinePanel approve={r.approveComputer} disabled={s.busy || pairingBlocked(s)} note={pairingLine(s)} />
                 <PhonePanel s={s} p={p} key={visible ? "shown" : "hidden"} />
               </>
             )}

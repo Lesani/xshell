@@ -244,7 +244,8 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
   const nameTrigger = useRef<HTMLElement | null>(null);
   const closeNameMenu = useCallback(() => setNameMenu(null), []);
   const hostsSnap = useHostsSnapshot();
-  const hostNameOf = (h: string) => hostsSnap.available.find(row => row.id === h || row.aliases.includes(h))?.name || hostsSnap.configs.find(c => c.id === h)?.name || h;
+  // `hostsSnap` re-renders on changes; the name never falls back to the raw Host id.
+  const hostNameOf = (h: string) => registry.hostName(h);
   const localAgentStatuses = useLocalAgentStatuses();
   useEffect(() => { names.invalidate(); }, [names, tabs, hostsSnap, closingTabIds]);
   const menuTab = nameMenu ? tabs.find(t => t.id === nameMenu.tabId && (!nameMenu.target || customTitleTargetMatches(nameMenu.target, t, hostsSnap)) && !t.groupId && !closingTabIds.has(t.id)) : undefined;

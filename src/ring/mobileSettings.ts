@@ -1,6 +1,6 @@
-import { fmt, type StringKey } from "./strings";
+import { fmt } from "./strings";
 import type { RingStatus } from "./types";
-import { C } from "./copy";
+import { C, fmtc } from "./copy";
 
 // Settings → Ring, the pure part of the lines kept from the earlier Ring section: the Relay,
 // the connection, the daily quota, and why pairing a phone waits.
@@ -12,17 +12,42 @@ export function relayHost(url: string | null | undefined): string {
   return m ? m[1].replace(/^[^@]*@/, "") : url;
 }
 
-// The connection line under the Relay; null while there is no connection to report.
+// The Ring uses the default service (no address is shown) rather than a self-chosen address.
+export function usesDefaultService(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl" | "relayHosted">): boolean {
+  return !s.relayUrl || s.relayHosted || s.relayUrl === s.hostedRelayUrl;
+}
+
+// "{n} seconds", or "1 second" (copy-rjw-3: "second" when n is 1).
+function seconds(text: string, n: number): string {
+  return n === 1 ? text.replace(/\b1 seconds\b/, "1 second") : text;
+}
+
+// The connection line in Settings → Ring; null while there is nothing to report.
 export function connectionLine(s: RingStatus): string | null {
-  const relay = relayHost(s.relayUrl);
+  const address = relayHost(s.relayUrl);
+  const def = usesDefaultService(s);
   switch (s.connection) {
-    case "connected": return s.limited ? fmt("mobile.conn.limited") : fmt("mobile.conn.connected", { relay });
-    case "connecting": return fmt("mobile.conn.connecting", { relay });
-    case "waiting": return fmt("mobile.conn.retrying", { relay, s: Math.max(1, s.retryIn ?? 1) });
+    // COPY-GAP: `mobile.conn.limited` predates the new copy and still names the hosted relay.
+    case "connected": return s.limited ? fmt("mobile.conn.limited") : def ? C["ring.connection.default.connected"] : fmtc("ring.connection.custom.connected", { address });
+    // COPY-GAP: no text while connecting to the default service; a chosen address keeps the
+    // earlier line (it names only the address).
+    case "connecting": return def ? null : fmt("mobile.conn.connecting", { relay: address });
+    case "waiting": {
+      const n = Math.max(1, s.retryIn ?? 1);
+      return seconds(def ? fmtc("ring.connection.default.retry", { n }) : fmtc("ring.connection.custom.retry", { address, n }), n);
+    }
     case "stopped": return fmt("mobile.conn.stopped");
     case "other-window": return fmt("mobile.conn.otherWindow");
     default: return null;
   }
+}
+
+// Why Pair a phone / Add a machine cannot work now, or null: the service cannot be reached, or
+// this machine is no longer a member. While connecting they are offered.
+export function pairingLine(s: Pick<RingStatus, "connection" | "relayUrl" | "hostedRelayUrl" | "relayHosted">, offerShown = false): string | null {
+  if (s.connection === "stopped") return fmt("mobile.pair.needsMember");
+  if (s.connection !== "waiting" || offerShown) return null;
+  return usesDefaultService(s) ? C["ring.connection.default.required"] : fmtc("ring.connection.custom.required", { address: relayHost(s.relayUrl) });
 }
 
 // The reset time of the daily quota, in local time (HH:MM), as the phone app shows it.
@@ -54,22 +79,9 @@ export function problemLine(s: Pick<RingStatus, "problem">): string | null {
 
 // ── Pairing a phone and the connection (xshell#38) ──────────────────────────
 
-// Why pairing cannot succeed now, as the note shown with its buttons disabled; null when it
-// can. While connecting it is offered: the Desktop waits for the connection to add a device.
-export function pairingBlocked(s: Pick<RingStatus, "connection">): StringKey | null {
-  switch (s.connection) {
-    case "waiting": return "mobile.pair.needsRelay";
-    case "stopped": return "mobile.pair.needsMember";
-    default: return null;
-  }
-}
-
-// The note under a pairing panel's title: that pairing waits for the connection (while
-// connecting, or while an offer already shown stays valid during a retry), or why it is
-// disabled; null when connected.
-export function pairingNote(s: Pick<RingStatus, "connection">, offerShown = false): StringKey | null {
-  if (s.connection === "connecting" || (offerShown && s.connection === "waiting")) return "mobile.pair.connecting";
-  return pairingBlocked(s);
+// Whether pairing cannot succeed now (its buttons are disabled; `pairingLine` says why).
+export function pairingBlocked(s: Pick<RingStatus, "connection">): boolean {
+  return s.connection === "waiting" || s.connection === "stopped";
 }
 
 // ── The Relay chosen before the Ring exists ──────────────────────────────────

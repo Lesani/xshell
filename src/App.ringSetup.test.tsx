@@ -173,3 +173,22 @@ it("leaving the setup screen for Settings cancels the shown words", async () => 
   expect(q("[data-ring-words]")).toBeNull();
   expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === "ring_join_cancel").map(([, a]) => a)).toEqual([{ operation: op.operation }]);
 });
+
+it("a membership change clears the notice about the previous membership (no two contradicting notices)", async () => {
+  freshSettings();
+  ring = ringStatus();
+  await mountApp();
+  const base = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) => command === "ring_create_computer" ? member() : base(command, args));
+  await click(q("[data-ring-create]"));
+  await act(async () => {});
+  expect(q(".app-notice")?.textContent).toContain(C["create.done"]);
+  // The member status arriving after the success keeps it.
+  ring = member();
+  await emit("ring:status", ring);
+  expect(q(".app-notice")?.textContent).toContain(C["create.done"]);
+  // This machine removes itself: the "now in your Ring" notice goes.
+  ring = ringStatus({ membership: "none" });
+  await emit("ring:status", ring);
+  expect(q(".app-notice")?.textContent ?? "").not.toContain(C["create.done"]);
+});
