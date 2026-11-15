@@ -460,6 +460,9 @@ pub enum AdoptionTestPoint {
     JoinBeforeConsent,
     OriginControllerAttached,
     OriginDispatchEnded,
+    /// The approver's outgoing record is durably `Prepared`, before the proposal is
+    /// created on the Relay (nothing has left this machine yet).
+    ApprovalPreparedBeforeProposal,
     ApprovalProofsReceived,
     ApprovalBeforePublish,
     CompletionBeforeUncertainWrite,
