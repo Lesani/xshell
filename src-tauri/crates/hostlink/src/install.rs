@@ -310,14 +310,7 @@ pub fn parse_probe(stdout: &str) -> Result<Probe, String> {
 }
 
 pub fn target_triple(os: &str, arch: &str) -> Result<&'static str, String> {
-    match (os, arch) {
-        ("windows" | "Windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        ("Linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-musl"),
-        ("Linux", "aarch64" | "arm64") => Ok("aarch64-unknown-linux-musl"),
-        ("Darwin", "arm64" | "aarch64") => Ok("aarch64-apple-darwin"),
-        ("Darwin", "x86_64") => Ok("x86_64-apple-darwin"),
-        _ => Err(format!("unsupported host platform: {os} {arch}")),
-    }
+    xshell_protocol::build::host_triple(os, arch)
 }
 
 /// `linux` / `macos` for the status, from `uname -s`.
@@ -684,7 +677,7 @@ pub fn install_local_bytes(
     dir_name: &str,
 ) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind, Write};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     if !valid_version(dir_name) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -692,35 +685,8 @@ pub fn install_local_bytes(
         ));
     }
     let dest = local_server_bin(home, dir_name);
+    let dir = ensure_server_dir(home, dir_name)?;
     let uid = unsafe { libc::getuid() };
-    let mut dir = home.to_path_buf();
-    for part in [".xshell", "server", dir_name] {
-        dir.push(part);
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-        let m = std::fs::symlink_metadata(&dir)?;
-        if !m.file_type().is_dir() {
-            return Err(Error::other(format!(
-                "{} is not a directory",
-                dir.display()
-            )));
-        }
-        if m.uid() != uid {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
-            ));
-        }
-        if part == ".xshell" {
-            xshell_core::server::refuse_writable_shared_root(&dir, m.mode())?;
-        }
-        if m.mode() & 0o077 != 0 {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
     if let Ok(m) = std::fs::symlink_metadata(&dest) {
         let same = m.file_type().is_file()
             && m.uid() == uid
@@ -758,6 +724,51 @@ pub fn install_local_bytes(
         let _ = std::fs::remove_file(&tmp);
     }
     r.map(|_| dest)
+}
+
+/// `home/.xshell/server/<dir_name>`, created where missing: every directory on the way 0700
+/// and a real directory owned by this user (a wider one is narrowed; a shared, writable
+/// `~/.xshell` is refused).
+#[cfg(unix)]
+pub fn ensure_server_dir(home: &std::path::Path, dir_name: &str) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if !valid_version(dir_name) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid version string {dir_name:?}"),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    let mut dir = home.to_path_buf();
+    for part in [".xshell", "server", dir_name] {
+        dir.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let m = std::fs::symlink_metadata(&dir)?;
+        if !m.file_type().is_dir() {
+            return Err(Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        if m.uid() != uid {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
+            ));
+        }
+        if part == ".xshell" {
+            xshell_core::server::refuse_writable_shared_root(&dir, m.mode())?;
+        }
+        if m.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(dir)
 }
 
 #[cfg(test)]

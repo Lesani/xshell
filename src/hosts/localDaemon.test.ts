@@ -238,28 +238,18 @@ describe("localDaemon: the live list and confirm-again", () => {
 describe("LocalDaemonView", () => {
   it("renders under StrictMode", () => {
     const html = renderToStaticMarkup(createElement(StrictMode, null, createElement(LocalDaemonView, { persistent: on, status: status(), live: [], state: initialState, dispatch: () => {} })));
-    expect(html).toContain("Keep terminals running after quit");
+    expect(html).toContain("This computer");
   });
 
   const render = (state: State, persistent = off, st: HostStatus | undefined = status(), live: TerminalInfo[] | null = [term()]) =>
     renderToStaticMarkup(createElement(LocalDaemonView, { persistent, status: st, live, state, dispatch: () => {} }));
 
-  it("idle: the copy, an enabled toggle with the stored value, and the setup line", () => {
+  // The Persistent/GUI-bound toggle is gone (ADR-0017, UI slice): no switch control.
+  it("idle: this computer, no switch and no upgrade action", () => {
     const html = render(initialState, on);
     expect(html).toContain("This computer");
-    expect(html).toContain("Keep terminals running after quit");
-    expect(html).toMatch(/<input type="checkbox"[^>]*checked=""/);
-    expect(html).not.toMatch(/<input[^>]*disabled=""/);
-    expect(html).toContain("Terminal setup 1.5.0 · keeps running");
     expect(html).not.toContain("Upgrade now");
-  });
-
-  it("busy: disabled but still checked, with the switching hint", () => {
-    const html = render(run([{ type: "toggle", target: false, terminals: 0 }]), on);
-    const input = html.match(/<input[^>]*>/)![0];
-    expect(input).toContain('checked=""');
-    expect(input).toContain('disabled=""');
-    expect(html).toContain("Switching…");
+    expect(html).not.toContain("Replace with");
   });
 
   it("confirm: the dialog with the count", () => {
@@ -291,41 +281,27 @@ describe("LocalDaemonView", () => {
     expect(html).not.toContain("Replace with");
   });
 
-  it("C4: the command succeeded, then the status names why the replacement did not take", () => {
+  it("C4: after a replacement that did not take, Replace stays offered", () => {
     const c4 = "xshelld 1.5.0 (unknown build) is still running after replacement; expected 1.5.0 (85ee920a1b2c). Try Replace again. If this repeats, quit other xshell apps using this host.";
     const st = status({ status: "build-differs", daemonBuild: null, desktopBuild: ours, lastError: c4 });
     const html = render(run([{ type: "replace", terminals: 0, build: "85ee920a1b2c" }, { type: "confirm" }, { type: "upgraded" }]), on, st);
-    expect(html).toContain("Last error");
-    expect(html).toContain("still running after replacement");
     expect(html).toContain("Replace with Desktop’s build");
-    // Shown once when the section's own error already says it.
-    const both = render({ phase: { kind: "idle" }, error: `Couldn’t change terminal settings: ${c4}` }, on, st);
-    expect(both.split("still running after replacement").length - 1).toBe(1);
-    // Not for a plainly connected Host.
-    expect(render(initialState, on, status({ lastError: "old" }))).not.toContain("Last error");
+    expect(html).not.toContain("Replacing…");
   });
 
-  it("without persistence (Windows): build and the other-app note, no toggle or Replace", () => {
+  it("without persistence (Windows): no switch or Replace", () => {
     const section = (info: Parameters<typeof LocalDaemonSection>[0]["info"], st: HostStatus) =>
       renderToStaticMarkup(createElement(LocalDaemonSection, { info, status: st, live: [term()], state: initialState, dispatch: () => {} }));
     const unsupported = { mode: "daemon" as const, reason: null, persistent: { supported: false, enabled: false, running: null, log: null } };
     const html = section(unsupported, status({ status: "connected", daemonBuild: other, desktopBuild: ours }));
     expect(html).toContain("This computer");
-    expect(html).toContain("Terminal setup 1.5.0 (000000000000) · ends with xshell");
-    expect(html).toContain("Another xshell app using 000000000000 runs this computer’s terminals.");
-    expect(html).not.toContain("Keep terminals running after quit");
     expect(html).not.toContain("<input");
     expect(html).not.toContain("Replace with");
-    expect(html).not.toContain("Choose what happens");
-    // A backend without the persistence info at all, and the same build: just the line.
     const same = section({ mode: "daemon", reason: null }, status({ daemonBuild: ours, desktopBuild: ours }));
-    expect(same).toContain("Terminal setup 1.5.0 (85ee920a1b2c) · ends with xshell");
     expect(same).not.toContain("Another xshell app");
     // In-process local Tabs: nothing.
     expect(section({ mode: "in-process", reason: "r" }, status())).toBe("");
     expect(section(null, status())).toBe("");
-    // Supported: the toggle is there.
-    expect(section({ mode: "daemon", reason: null, persistent: on }, status())).toContain("Keep terminals running after quit");
   });
 
   it("upgrade pending: the chip and Upgrade now", () => {

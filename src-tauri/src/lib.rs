@@ -438,6 +438,7 @@ const HOST_LINK_COMMANDS: &[&str] = &[
     "host_term_update",
     "host_term_relaunch",
     "host_upgrade",
+    "host_install_command",
     "host_test",
     "local_host_info",
     "local_daemon_set_persistent",
@@ -877,6 +878,7 @@ pub fn run() {
             hosts::commands::host_term_update,
             hosts::commands::host_term_relaunch,
             hosts::commands::host_upgrade,
+            hosts::commands::host_install_command,
             hosts::commands::host_test,
             hosts::commands::local_host_info,
             hosts::commands::local_daemon_set_persistent,
@@ -991,7 +993,7 @@ mod tests {
     #[test]
     fn host_link_and_desktop_lists_registered() {
         let registered = registered_commands();
-        assert_eq!(registered.len(), 110);
+        assert_eq!(registered.len(), 111);
         for c in DESKTOP_ONLY_COMMANDS
             .iter()
             .chain(TERMINAL_COMMANDS)

@@ -153,7 +153,7 @@ impl HostSync {
     /// From the Observer, under the Host's lock: records the Host's connection and queues a
     /// job when a usable one is new or changed. Never blocks.
     pub fn observe(&self, s: &HostStatus) {
-        if s.route_update_unavailable.is_some() {
+        if s.route_update_unavailable.is_some() || s.host.starts_with("r_") {
             return;
         }
         let seen = Seen::of(s);

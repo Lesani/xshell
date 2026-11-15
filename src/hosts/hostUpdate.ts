@@ -1,4 +1,5 @@
 import { sameBuild } from "../buildId";
+import { fmt } from "./strings";
 import { invoke } from "@tauri-apps/api/core";
 import { registry } from "./registry";
 import { collectLeafIds } from "../layout";
@@ -38,15 +39,50 @@ export function exactUpdateConnected(status: HostStatus | undefined): boolean {
 
 type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
 type Invocation = { confirmation: Confirmation; succeeded: boolean };
-type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, boolean>; errors: Record<string, string> };
+
+export type UpdateHost = Pick<HostConfig, "id" | "name">;
+/// Why "Update all" leaves a machine out.
+export type SkipReason = "current" | "offline" | "unsupported" | "busy";
+export type AllResult =
+  | { host: UpdateHost; outcome: "ok"; version: string }
+  | { host: UpdateHost; outcome: "failed"; error: string }
+  | { host: UpdateHost; outcome: "skipped"; reason: SkipReason };
+/// "Update all": the machines it will update (each with the target it was confirmed for)
+/// and the ones it leaves out, then one result per machine as they finish.
+export type AllRun = {
+  queue: Confirmation[];
+  skipped: AllResult[];
+  confirmed: boolean;
+  current: UpdateHost | null;
+  results: AllResult[];
+  done: boolean;
+};
+type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, boolean>; errors: Record<string, string>; all: AllRun | null };
+
+/// Why `status` cannot be updated now; `null` when it can.
+export function skipReason(status: HostStatus | undefined): SkipReason | null {
+  if (!status) return "offline";
+  if (status.routeUpdateUnavailable === "ring-update-unsupported" || status.updateUnavailable) return "unsupported";
+  if (status.phase === "upgrading" || status.phase === "preparing" || status.phase === "installing") return "busy";
+  if (!["connected", "upgrade-pending", "build-differs", "incompatible"].includes(status.status)) return "offline";
+  return updateAction(status) ? null : "current";
+}
+
+/// How long "Update all" waits for one machine to come back with this Desktop's build.
+export const SETTLE_MS = 150_000;
 
 // Only confirmation/invocation state is shared here. Completion and progress remain the
 // existing Host Status authority. This store outlives navigation between its two surfaces.
 export class HostUpdates {
-  private state: Snapshot = { confirmation: null, invoking: {}, errors: {} };
+  private state: Snapshot = { confirmation: null, invoking: {}, errors: {}, all: null };
   private listeners = new Set<() => void>();
   private inFlight = new Map<string, Invocation>();
-  constructor(private call: typeof invoke = invoke) {}
+  constructor(
+    private call: typeof invoke = invoke,
+    private statusOf: (id: string) => HostStatus | undefined = id => registry.getSnapshot().status[id],
+    private watch: (listener: () => void) => () => void = l => registry.subscribe(l),
+    private settleMs: number = SETTLE_MS,
+  ) {}
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private set(patch: Partial<Snapshot>) { this.state = { ...this.state, ...patch }; for (const listener of this.listeners) listener(); }
@@ -69,6 +105,90 @@ export class HostUpdates {
     if (this.state.errors[status.host]) this.set({ errors: { ...this.state.errors, [status.host]: "" } });
   }
   cancel = () => this.set({ confirmation: null });
+
+  /// "Update all": the eligible machines among `hosts`, one after another, once confirmed.
+  askAll(hosts: { host: UpdateHost; status: HostStatus | undefined }[]) {
+    if (this.state.confirmation || (this.state.all && !this.state.all.done)) return;
+    const queue: Confirmation[] = [];
+    const skipped: AllResult[] = [];
+    for (const { host, status } of hosts) {
+      const reason = status?.host === host.id ? skipReason(status) : "offline";
+      const action = status && updateAction(status);
+      if (reason || !status || !action || this.state.invoking[host.id]) {
+        skipped.push({ host: { ...host }, outcome: "skipped", reason: reason ?? "busy" });
+        continue;
+      }
+      queue.push({ host: { ...host }, action, target: updateTarget(status), expectedVersion: status.desktopVersion, expectedBuild: status.desktopBuild ? { ...status.desktopBuild } : null });
+    }
+    if (!queue.length) return;
+    this.set({ all: { queue, skipped, confirmed: false, current: null, results: [], done: false } });
+  }
+
+  cancelAll = () => { if (this.state.all && !this.state.all.confirmed) this.set({ all: null }); };
+  dismissAll = () => { if (this.state.all?.done) this.set({ all: null }); };
+
+  confirmAll = async () => {
+    const run = this.state.all;
+    if (!run || run.confirmed) return;
+    this.set({ all: { ...run, confirmed: true } });
+    for (const c of run.queue) {
+      const all = this.state.all!;
+      this.set({ all: { ...all, current: c.host } });
+      const result = await this.updateOne(c);
+      const after = this.state.all!;
+      this.set({ all: { ...after, current: null, results: [...after.results, result] } });
+    }
+    const end = this.state.all!;
+    this.set({ all: { ...end, done: true } });
+  };
+
+  /// One machine of "Update all": the confirmed update, then wait until it is back with
+  /// this Desktop's build, its update failed, or `settleMs` passed.
+  private async updateOne(c: Confirmation): Promise<AllResult> {
+    const id = c.host.id;
+    const current = this.statusOf(id);
+    if (!current || skipReason(current) || (current.linkGeneration ?? 0) !== c.target.linkGeneration) {
+      return { host: c.host, outcome: "skipped", reason: skipReason(current) ?? "offline" };
+    }
+    const settled = this.waitSettled(c);
+    this.set({ invoking: { ...this.state.invoking, [id]: true } });
+    try {
+      await this.call("host_upgrade", { host: id, target: c.target });
+      settled.started();
+    } catch (e) {
+      settled.cancel();
+      const error = typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e);
+      return { host: c.host, outcome: "failed", error };
+    } finally {
+      this.set({ invoking: { ...this.state.invoking, [id]: false } });
+    }
+    const r = await settled.promise;
+    return r === true ? { host: c.host, outcome: "ok", version: c.expectedVersion } : { host: c.host, outcome: "failed", error: r };
+  }
+
+  private waitSettled(c: Confirmation): { promise: Promise<true | string>; cancel: () => void; started: () => void } {
+    let finish!: (r: true | string) => void;
+    const promise = new Promise<true | string>(resolve => { finish = resolve; });
+    let over = false;
+    // An update error counts only once this update began: an older one may still show.
+    let began = false;
+    const end = (r: true | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
+    const check = () => {
+      const s = this.statusOf(c.host.id);
+      if (!s) return;
+      if (s.phase !== null) began = true;
+      if (exactUpdateConnected(s) && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion && sameBuild(s.daemonBuild, c.expectedBuild)) end(true);
+      else if (began && s.errorHint === "update-failed" && s.phase === null && s.lastError) end(s.lastError);
+    };
+    const stop = this.watch(check);
+    // The backend's error (when it set one) wins.
+    const timer = setTimeout(() => end(this.statusOf(c.host.id)?.lastError ?? fmt("update.notBack", { name: c.host.name })), this.settleMs);
+    return {
+      promise,
+      cancel: () => { if (!over) { over = true; stop(); clearTimeout(timer); } },
+      started: () => { began = true; check(); },
+    };
+  }
   confirm = async () => {
     const pending = this.state.confirmation;
     if (!pending || this.state.invoking[pending.host.id]) return;

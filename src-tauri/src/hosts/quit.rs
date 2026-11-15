@@ -431,8 +431,7 @@ pub fn resolve(
                         )
                     });
                 if let Err(e) = saved {
-                    q.end(None);
-                    return Err(format!("failed:0 {e}"));
+                    return Err(keep_save_failed(&q, e));
                 }
             }
             q.end(None);
@@ -465,9 +464,36 @@ pub fn resolve(
     }
 }
 
+/// Saving "always keep" failed: the prompt stays pending under the same id (not in flight),
+/// so the open dialog can answer it again, as after a failed Stop.
+fn keep_save_failed(q: &QuitState, e: String) -> String {
+    q.release();
+    format!("failed:0 {e}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed save of "always keep" keeps the prompt resolvable under the same id.
+    #[test]
+    fn keep_save_failure_keeps_the_prompt_resolvable() {
+        let q = QuitState::new(None);
+        let ev = q.begin("main", vec![Uuid::new_v4()], false).unwrap();
+        q.start(&ev.id).unwrap();
+        assert_eq!(
+            keep_save_failed(&q, "disk full".into()),
+            "failed:0 disk full"
+        );
+        let again = q.pending().expect("still pending");
+        assert_eq!(again.id, ev.id);
+        assert!(!again.in_flight);
+        assert_eq!(
+            q.start(&ev.id).unwrap().id,
+            ev.id,
+            "Keep, Stop or Cancel again"
+        );
+    }
 
     fn base() -> CloseInputs {
         CloseInputs {

@@ -384,6 +384,13 @@ pub async fn host_test(
         .map_err(|e| e.to_string())
 }
 
+/// The command that installs or updates xshell on a machine whose xshell cannot be updated
+/// over the Ring (S4): the release `install.sh` of this Desktop's version.
+#[tauri::command]
+pub fn host_install_command() -> String {
+    super::binaries::install_command(env!("CARGO_PKG_VERSION"))
+}
+
 #[tauri::command]
 pub fn list_ssh_hosts() -> Vec<String> {
     match dirs::home_dir() {

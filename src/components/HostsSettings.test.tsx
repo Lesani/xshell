@@ -17,7 +17,7 @@ it("shows no Ring rows or Ring section for a Ring-only Host, and asks nothing of
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const id = `r_${"a".repeat(64)}`;
   const snapshot: AvailableSnapshot = { sequence: 1, hosts: [{ id, aliases: [id], name: "Ring-only Daemon", color: null, daemonKey: "key", routes: ["relay"], activeRoute: "relay", reachability: { kind: "online" } }] };
-  const status = { host: id, status: "build-differs", phase: null, updateAction: null, routeUpdateUnavailable: "relay-only", updateUnavailable: "desktop-owned", lastError: null } as HostStatus;
+  const status = { host: id, status: "build-differs", phase: null, updateAction: null, routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", lastError: null } as HostStatus;
   native.invoke.mockImplementation(async command => {
     if (command === "hosts_available") return snapshot;
     if (command === "hosts_status") return [{ status, terminals: null }];

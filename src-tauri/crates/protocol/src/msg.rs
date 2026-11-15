@@ -110,6 +110,38 @@ pub enum ClientMsg {
     /// Exact installed target; only owners advertising selected restart accept this.
     #[serde(rename = "daemon.upgrade-selected")]
     DaemonUpgradeSelected { version: String, build: BuildId },
+    /// What this Daemon needs to receive an update over its link (capability
+    /// `daemon.stage`): answered with [`UpdateInfo`]. Desktop only.
+    #[serde(rename = "daemon.update-info")]
+    DaemonUpdateInfo,
+    /// Start sending build `version`+`build` (`length` bytes, SHA-256 `sha256`, lowercase
+    /// hex) to this Daemon (capability `daemon.stage`): answered with [`StageBegun`]. At most
+    /// one stage per Daemon; one from another connection is refused with [`STAGE_BUSY`].
+    /// Never selects or starts anything. Desktop only.
+    #[serde(rename = "daemon.stage-begin")]
+    DaemonStageBegin {
+        version: String,
+        build: BuildId,
+        sha256: String,
+        length: u64,
+    },
+    /// The next piece of a stage: `data` is base64 of at most [`STAGE_MAX_CHUNK`] bytes and
+    /// `offset` must equal the bytes received so far. Answered with [`StageReceived`]. A
+    /// wrong offset is refused and the stage kept; anything else wrong aborts the stage.
+    #[serde(rename = "daemon.stage-chunk")]
+    DaemonStageChunk {
+        stage: Uuid,
+        offset: u64,
+        data: String,
+    },
+    /// Verify (length, SHA-256, build stamp, `--version`) and publish the staged build into
+    /// its install directory: answered with [`StageCommitted`]. Selects nothing; a
+    /// `daemon.upgrade-selected` follows.
+    #[serde(rename = "daemon.stage-commit")]
+    DaemonStageCommit { stage: Uuid },
+    /// Drop a stage and its partial file. Answers `null`, also for an unknown stage.
+    #[serde(rename = "daemon.stage-abort")]
+    DaemonStageAbort { stage: Uuid },
     /// An agent hook reporting the Agent Status of the Terminal it runs in. Sent by the hook
     /// client on the Host itself (`xshelld event`, or the Desktop executable for Local Host
     /// Terminals), never by a Desktop's UI. `run` names the Terminal's process (a Relaunch
@@ -240,6 +272,67 @@ pub enum ClientMsg {
         )]
         handled_completion_id: Option<Uuid>,
     },
+}
+
+/// The largest build a `daemon.stage-begin` may announce.
+pub const STAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The most bytes one `daemon.stage-chunk` carries (decoded).
+pub const STAGE_MAX_CHUNK: u64 = 1024 * 1024;
+/// The refusal of a `daemon.stage-begin` while another connection sends a build.
+pub const STAGE_BUSY: &str = "another update is being sent to this machine";
+
+/// The answer to `daemon.update-info`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    /// This Daemon's target triple ([`crate::build::host_triple`]), e.g.
+    /// `x86_64-unknown-linux-musl`.
+    pub target: String,
+    pub max_bytes: u64,
+    pub max_chunk: u64,
+    /// The last update that was rolled back, for 24 hours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<UpdateFailure>,
+}
+
+/// An update this Daemon tried and rolled back.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFailure {
+    /// The install directory of the build that did not start.
+    pub target: String,
+    /// The install directory it went back to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    pub reason: String,
+    /// ms since the epoch.
+    pub at_ms: u64,
+}
+
+/// The answer to `daemon.stage-begin`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StageBegun {
+    /// The stage to send chunks to; `None` when `installed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<Uuid>,
+    /// These exact bytes are installed already: nothing to send.
+    pub installed: bool,
+}
+
+/// The answer to `daemon.stage-chunk`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StageReceived {
+    pub received: u64,
+}
+
+/// The answer to `daemon.stage-commit`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StageCommitted {
+    /// The install directory the build is now in.
+    pub dir: String,
 }
 
 /// The most files one `term.submit` carries.
@@ -697,6 +790,11 @@ const CLIENT_TYPES: &[&str] = &[
     "term.relaunch",
     "daemon.upgrade",
     "daemon.upgrade-selected",
+    "daemon.update-info",
+    "daemon.stage-begin",
+    "daemon.stage-chunk",
+    "daemon.stage-commit",
+    "daemon.stage-abort",
     "term.event",
     "ring.identity",
     "ring.companion-pending",
@@ -1338,6 +1436,85 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn daemon_stage_messages_round_trip() {
+        let stage = Uuid::nil();
+        let build = BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let cases = [
+            (
+                ClientMsg::DaemonUpdateInfo,
+                json!({"t":"daemon.update-info"}),
+            ),
+            (
+                ClientMsg::DaemonStageBegin {
+                    version: "1.6.0".into(),
+                    build: build.clone(),
+                    sha256: "ab".repeat(32),
+                    length: 5,
+                },
+                json!({"t":"daemon.stage-begin","version":"1.6.0","build":build,"sha256":"ab".repeat(32),"length":5}),
+            ),
+            (
+                ClientMsg::DaemonStageChunk {
+                    stage,
+                    offset: 3,
+                    data: "AA==".into(),
+                },
+                json!({"t":"daemon.stage-chunk","stage":stage,"offset":3,"data":"AA=="}),
+            ),
+            (
+                ClientMsg::DaemonStageCommit { stage },
+                json!({"t":"daemon.stage-commit","stage":stage}),
+            ),
+            (
+                ClientMsg::DaemonStageAbort { stage },
+                json!({"t":"daemon.stage-abort","stage":stage}),
+            ),
+        ];
+        for (msg, wire) in cases {
+            assert_eq!(serde_json::to_value(&msg).unwrap(), wire);
+            let bytes = body(encode_msg(&msg, Some(4)).unwrap());
+            let inb = decode_inbound(&bytes).unwrap();
+            assert_eq!((inb.id, inb.msg), (Some(4), msg));
+        }
+        let info = UpdateInfo {
+            target: "x86_64-unknown-linux-musl".into(),
+            max_bytes: STAGE_MAX_BYTES,
+            max_chunk: STAGE_MAX_CHUNK,
+            last_failure: Some(UpdateFailure {
+                target: "1.6.0+85ee920a1b2c".into(),
+                previous: Some("1.5.0".into()),
+                reason: "did not start".into(),
+                at_ms: 9,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            json!({"target":"x86_64-unknown-linux-musl","maxBytes":STAGE_MAX_BYTES,"maxChunk":STAGE_MAX_CHUNK,
+                "lastFailure":{"target":"1.6.0+85ee920a1b2c","previous":"1.5.0","reason":"did not start","atMs":9}})
+        );
+        assert_eq!(
+            serde_json::to_value(StageBegun {
+                stage: None,
+                installed: true
+            })
+            .unwrap(),
+            json!({"installed":true})
+        );
+        assert_eq!(
+            serde_json::to_value(StageReceived { received: 2 }).unwrap(),
+            json!({"received":2})
+        );
+        assert_eq!(
+            serde_json::to_value(StageCommitted { dir: "d".into() }).unwrap(),
+            json!({"dir":"d"})
+        );
     }
 
     #[cfg(feature = "ring")]

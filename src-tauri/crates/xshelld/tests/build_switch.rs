@@ -93,6 +93,8 @@ impl Old {
             .env("XDG_RUNTIME_DIR", h.run())
             .env("XSHELLD_LOGIN_ENV", "0")
             .env("XSHELLD_IDLE_TIMEOUT_MS", "60000")
+            // It plays a Daemon from before in-place updates: it exits on an upgrade.
+            .env("XSHELLD_TEST_NO_REEXEC", "1")
             .env_remove("XSHELLD_HOME")
             .env_remove("XSHELLD_SOCKET")
             .stdin(Stdio::null())
@@ -251,6 +253,8 @@ impl Remote {
                 ("XDG_RUNTIME_DIR".into(), home.run().into()),
                 ("XSHELLD_LOGIN_ENV".into(), "0".into()),
                 ("XSHELLD_IDLE_TIMEOUT_MS".into(), "5000".into()),
+                // Daemons from before in-place updates exit on an upgrade (S4).
+                ("XSHELLD_TEST_NO_REEXEC".into(), "1".into()),
             ],
             events: events.clone(),
             legacy: legacy.clone(),

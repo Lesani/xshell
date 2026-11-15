@@ -229,6 +229,12 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::TermUpdate { .. } => Err(forbidden("term.update")),
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
         ClientMsg::DaemonUpgradeSelected { .. } => Err(forbidden("daemon.upgrade-selected")),
+        // Updates over the Ring are a Desktop's (C8); refused before any disk access.
+        ClientMsg::DaemonUpdateInfo => Err(forbidden("daemon.update-info")),
+        ClientMsg::DaemonStageBegin { .. } => Err(forbidden("daemon.stage-begin")),
+        ClientMsg::DaemonStageChunk { .. } => Err(forbidden("daemon.stage-chunk")),
+        ClientMsg::DaemonStageCommit { .. } => Err(forbidden("daemon.stage-commit")),
+        ClientMsg::DaemonStageAbort { .. } => Err(forbidden("daemon.stage-abort")),
         // Agent hooks report from the Host itself, over the local socket, never from a phone.
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
         // Ring membership is the Desktop's to manage.
@@ -934,6 +940,24 @@ pub(crate) mod tests {
                 request: xshell_protocol::ring::companion::CompanionAdminRequest::Pending,
             },
             &join,
+            &ClientMsg::DaemonUpdateInfo,
+            &ClientMsg::DaemonStageBegin {
+                version: "1.5.0".into(),
+                build: xshell_protocol::build::BuildId {
+                    commit: "85ee920a1b2c".into(),
+                    dirty: None,
+                    time: 7,
+                },
+                sha256: "00".repeat(32),
+                length: 1,
+            },
+            &ClientMsg::DaemonStageChunk {
+                stage: t,
+                offset: 0,
+                data: String::new(),
+            },
+            &ClientMsg::DaemonStageCommit { stage: t },
+            &ClientMsg::DaemonStageAbort { stage: t },
         ] {
             assert!(check(Role::Mobile, &ctx, m)
                 .unwrap_err()
@@ -1044,6 +1068,8 @@ pub(crate) mod tests {
                 16,
                 256,
             ),
+            staging: Default::default(),
+            restore_failures: Default::default(),
         })
     }
 

@@ -65,7 +65,10 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: Rin
   return (
     <div className="edit-field" data-ring-members>
       <label className="edit-label">{C["ring.members"]}</label>
-      <UpdateAllSlot />
+      <UpdateAllSlot hosts={s.members.flatMap(m => {
+        const id = isMachine(m) && !isThisMachine(m) ? hostOf(m, snap.available) : null;
+        return id ? [{ id, name: m.name }] : [];
+      })} />
       {s.members.map(m => {
         const self = isThisMachine(m);
         const hostId = self ? LOCAL_HOST : hostOf(m, snap.available);

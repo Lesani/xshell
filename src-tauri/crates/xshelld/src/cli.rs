@@ -37,6 +37,11 @@ pub enum Command {
         length: u64,
     },
     Maintenance(crate::maintenance::Cleanup),
+    /// Hidden `upgrade-watch …`: the watchdog of an update trial (`crate::upgrade`).
+    UpgradeWatch(Vec<OsString>),
+    /// `self-install [--select] [--switch] [--home DIR]`: what `install.sh` runs with the
+    /// verified download (`crate::upgrade::self_install_main`).
+    SelfInstall(Vec<OsString>),
     /// `service install|uninstall|status|run|ensure [--home DIR] [--json] [--mechanism M]`:
     /// keep this machine's Daemon running (ADR-0017; Linux and macOS).
     Service {
@@ -145,6 +150,9 @@ commands:
   pair        Unix: request Computer pairing in the registered xshell window,
               or pair an unregistered standalone Host with eight Device Code words
               (Settings → Hosts → Ring). Windows Pair is not supported.
+  self-install [--select] [--switch] [--home DIR]
+              Linux and macOS: install this binary as the selected build (--select) and
+              move a running Daemon onto it (--switch); what install.sh runs
   maintenance cleanup-installs --home ABS [--reference-home ABS]... [--keep DIR]...
               [--delete --confirm-quiescent]
               Linux only, dry-run by default; see docs/host-daemon-updates.md
@@ -186,7 +194,7 @@ pub fn version_json() -> String {
     )
 }
 
-fn uname_os() -> &'static str {
+pub(crate) fn uname_os() -> &'static str {
     match std::env::consts::OS {
         "linux" => "Linux",
         "macos" => "Darwin",
@@ -232,6 +240,8 @@ pub fn parse(
             });
         }
         "maintenance" => return crate::maintenance::parse(args).map(Command::Maintenance),
+        "upgrade-watch" => return Ok(Command::UpgradeWatch(args.collect())),
+        "self-install" => return Ok(Command::SelfInstall(args.collect())),
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
         "console-mode" => return parse_console_mode(args),

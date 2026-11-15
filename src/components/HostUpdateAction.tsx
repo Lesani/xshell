@@ -1,41 +1,119 @@
-import { useSyncExternalStore } from "react";
-import { exactUpdateConnected, hostUpdates, updateAction } from "../hosts/hostUpdate";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { exactUpdateConnected, hostUpdates, skipReason, updateAction, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import { buildText } from "../buildId";
-import type { HostConfig, HostStatus } from "../hosts/types";
+import type { HostStatus } from "../hosts/types";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { CodeCopy } from "./CodeCopy";
 
-export function HostUpdateAction({ host, status, description = false }: { host: Pick<HostConfig, "id" | "name">; status: HostStatus | undefined; description?: boolean }) {
+// The command that installs this Desktop's version on a machine without a window
+// (`host_install_command`), fetched once per window.
+let installCommand: Promise<string> | null = null;
+export function fetchInstallCommand(call: typeof invoke = invoke): Promise<string> {
+  installCommand ??= call<string>("host_install_command").catch(e => { installCommand = null; throw e; });
+  return installCommand;
+}
+
+function useInstallCommand(wanted: boolean): string | null {
+  const [command, setCommand] = useState<string | null>(null);
+  useEffect(() => {
+    if (!wanted || command) return;
+    let live = true;
+    fetchInstallCommand().then(c => { if (live) setCommand(c); }, () => {});
+    return () => { live = false; };
+  }, [wanted, command]);
+  return command;
+}
+
+/// A machine whose xshell cannot take an update over the Ring: how to update it there.
+export function RingUpdateUnsupported({ name }: { name: string }) {
+  const command = useInstallCommand(true);
+  return <span className="host-update-unsupported">
+    <span>{fmt("update.tooOld", { name })}</span>
+    {command && <CodeCopy text={command} />}
+  </span>;
+}
+
+export function HostUpdateAction({ host, status, description = false }: { host: UpdateHost; status: HostStatus | undefined; description?: boolean }) {
   const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
   const healthy = exactUpdateConnected(status);
   const action = status?.host === host.id ? updateAction(status) : null;
-  const busy = !healthy && (!!state.invoking[host.id] || status?.phase === "upgrading" || status?.phase === "preparing");
+  const busy = !healthy && (!!state.invoking[host.id] || status?.phase === "upgrading" || status?.phase === "preparing" || status?.phase === "installing");
   const replace = (action ?? status?.updateAction) === "replace";
   const error = healthy ? null : state.errors[host.id] || (status?.errorHint === "update-failed" ? status.lastError : null);
   const unavailable = status?.updateUnavailable && (!!status.updateAction || !!status.routeUpdateUnavailable) ? status.updateUnavailable : null;
-  const routeUnavailable = status?.routeUpdateUnavailable;
-  const visible = action || busy || unavailable || routeUnavailable || error;
+  const route = status?.routeUpdateUnavailable;
+  const visible = action || busy || unavailable || route || error;
   if (!visible) return null;
   return <div className="host-update-action">
-    {description && !busy && status && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
-    {routeUnavailable && <span>{routeUnavailable === "relay-only" ? "Relay access cannot install or update the Daemon. Manage its build on the Host." : "This identity-bound alias cannot update the Daemon. Use its configured SSH route."}</span>}
+    {description && !busy && status && (action || unavailable) && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
+    {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} />}
+    {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
-      {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? (replace ? "hosts.update.switching" : "hosts.update.waiting") : "hosts.update.preparing", { host: host.name })}</span> : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(replace ? "hosts.update.replace" : "hosts.update.action")}</button>}
+      {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? "update.restarting" : "update.sending")}</span>
+        : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!(state.all && !state.all.done)} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>}
     </>}
     {error && <span className="host-row-error" role="alert">{fmt(replace ? "hosts.update.replaceFailed" : "hosts.update.failed", { host: host.name, error })}</span>}
+  </div>;
+}
+
+/// One line of an "Update all" result.
+function resultText(r: AllResult): string {
+  switch (r.outcome) {
+    case "ok": return `${r.host.name}: ${fmt("update.done", { new: r.version })}`;
+    case "failed": return `${r.host.name}: ${r.error}`;
+    case "skipped":
+      switch (r.reason) {
+        case "current": return `${r.host.name}: ${fmt("update.current")}`;
+        case "offline": return fmt("update.offline", { name: r.host.name });
+        case "unsupported": return fmt("update.tooOld", { name: r.host.name });
+        case "busy": return fmt("update.busy", { name: r.host.name });
+      }
+  }
+}
+
+const count = (n: number) => n === 1 ? fmt("update.count.one") : fmt("update.count.other", { n });
+
+/// "Update all": updates every machine in `hosts` that needs this Desktop's build, one after
+/// another, after one confirmation. Self-contained: statuses come from the Host registry.
+export function HostUpdateAll({ hosts }: { hosts: UpdateHost[] }) {
+  const snap = useHostsSnapshot();
+  const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
+  const statusOf = (id: string) => snap.status[id];
+  const eligible = hosts.filter(h => statusOf(h.id)?.host === h.id && !skipReason(statusOf(h.id)));
+  const run = state.all;
+  if (run && run.confirmed) {
+    return <div className="host-update-all" role="status">
+      {run.current && <span>{run.current.name}: {fmt("update.sending")}</span>}
+      {[...run.results, ...(run.done ? run.skipped : [])].map(r => <span key={r.host.id} className={r.outcome === "failed" ? "host-row-error" : undefined}>{resultText(r)}</span>)}
+    </div>;
+  }
+  if (eligible.length < 1) return null;
+  return <div className="host-update-all">
+    <span>{count(eligible.length)}</span>
+    <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!run}
+      onClick={() => hostUpdates.askAll(hosts.map(h => ({ host: h, status: statusOf(h.id) })))}>{fmt("update.all", { n: eligible.length })}</button>
   </div>;
 }
 
 // Mounted once in App, not inside a Tab or settings row: an open confirmation never
 // changes its Host when focus/navigation changes, and cannot appear twice.
 export function HostUpdateConfirmation() {
-  const { confirmation } = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
+  const { confirmation, all } = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
   const snap = useHostsSnapshot();
+  if (all && !all.confirmed) {
+    // The list of machines stays visible beside the approved body.
+    const names = all.queue.map(c => c.host.name).join(", ");
+    return <ConfirmDialog title={fmt("update.all.title")}
+      body={`${fmt("update.all.body", { n: all.queue.length })} ${names}`}
+      confirm={fmt("update.all.confirm")} cancel={fmt("update.all.cancel")} onConfirm={hostUpdates.confirmAll} onCancel={hostUpdates.cancelAll} />;
+  }
   if (!confirmation) return null;
   const { host, action } = confirmation;
-  const count = snap.live[host.id]?.length;
+  const n = snap.live[host.id]?.length;
   return <ConfirmDialog title={fmt("hosts.update.confirmTitle", { host: host.name })}
-    body={fmt("hosts.update.confirmBody", { host: host.name }) + (count === undefined ? "" : ` ${fmt("hosts.row.terminals", { n: count })}`)}
-    confirm={fmt(action === "replace" ? "hosts.update.replace" : "hosts.update.action")} onConfirm={hostUpdates.confirm} onCancel={hostUpdates.cancel} />;
+    body={fmt("hosts.update.confirmBody", { host: host.name }) + (n === undefined ? "" : ` ${fmt("hosts.row.terminals", { n })}`)}
+    confirm={fmt(action === "replace" ? "hosts.update.replace" : "update.action")} onConfirm={hostUpdates.confirm} onCancel={hostUpdates.cancel} />;
 }
