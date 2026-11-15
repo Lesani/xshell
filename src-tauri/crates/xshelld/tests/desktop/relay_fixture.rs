@@ -219,6 +219,27 @@ impl Computer {
         assert!(pair.join().unwrap().is_ok());
         common::ring::identity(self.daemon.as_ref().unwrap()).0
     }
+    /// `xshelld pair` on this machine with no Desktop registered: its Daemon joins
+    /// `approver`'s format-2 Ring as a standalone member. Returns the Daemon's key.
+    pub(super) fn standalone_pair(&self, approver: &Self, relay: &Relay) -> SignKey {
+        let (tx, rx) = mpsc::channel();
+        let url = relay.url();
+        std::thread::scope(|scope| {
+            let guest = scope.spawn(|| {
+                self.daemon.as_ref().unwrap().adopt_standalone(
+                    &url,
+                    Duration::from_secs(30),
+                    &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    |code| tx.send(code.clone()).unwrap(),
+                    |p, lease| Ok(Some(lease.confirm(&p.proposal_hash)?)),
+                )
+            });
+            let code = rx.recv_timeout(WAIT).unwrap();
+            approver.ring.approve_device_code(&code).unwrap();
+            guest.join().unwrap().unwrap();
+        });
+        common::ring::identity(self.daemon.as_ref().unwrap()).0
+    }
     pub(super) fn relay_host(&self, key: SignKey) -> Arc<HostHandle> {
         let id = relay_host_id(&key);
         wait("Relay Host available and usable", || {

@@ -1138,7 +1138,6 @@ fn public_snapshot_and_observer_targets_work_for_owner_and_distinct_follower_dir
 
 #[test]
 #[cfg(feature = "legacy-pair-test-control")]
-#[ignore = "format 1, removed in S7"]
 fn retargeted_configured_representative_attaches_new_canonical_uuid_without_cached_success() {
     use xshell_hostlink::{HostConfig, HostStatus};
     let relay = Relay::start();
@@ -1147,11 +1146,11 @@ fn retargeted_configured_representative_attaches_new_canonical_uuid_without_cach
         |_| {},
         |home| Arc::new(OwnedSocketFactory(home.paths().socket)),
     );
-    owner.ring.enable(None, false).unwrap();
+    owner.create();
     let first = Computer::new(&relay);
-    let k1 = first.legacy_pair(&owner, &relay);
+    let k1 = first.standalone_pair(&owner, &relay);
     let second = Computer::new(&relay);
-    let k2 = second.legacy_pair(&owner, &relay);
+    let k2 = second.standalone_pair(&owner, &relay);
     let sync = Box::leak(Box::new(xshell_hostlink::ring::HostSync::new()));
     *owner.events.sync.lock().unwrap() = Some(sync);
     let worker = xshell_hostlink::ring::SyncWorker::new(
@@ -1343,7 +1342,6 @@ fn post_hello_partial_header_expires_and_reclaims_its_slot_while_healthy_client_
 
 #[test]
 #[cfg(feature = "legacy-pair-test-control")]
-#[ignore = "format 1, removed in S7"]
 fn owner_loss_mutable_alias_retarget_does_not_deliver_other_canonical_same_uuid() {
     use xshell_hostlink::HostConfig;
     let relay = Relay::start();
@@ -1352,11 +1350,11 @@ fn owner_loss_mutable_alias_retarget_does_not_deliver_other_canonical_same_uuid(
         |_| {},
         |home| Arc::new(OwnedSocketFactory(home.paths().socket)),
     );
-    owner.ring.enable(None, false).unwrap();
+    owner.create();
     let first = Computer::new(&relay);
-    let k1 = first.legacy_pair(&owner, &relay);
+    let k1 = first.standalone_pair(&owner, &relay);
     let second = Computer::new(&relay);
-    let k2 = second.legacy_pair(&owner, &relay);
+    let k2 = second.standalone_pair(&owner, &relay);
     let sync = Box::leak(Box::new(xshell_hostlink::ring::HostSync::new()));
     *owner.events.sync.lock().unwrap() = Some(sync);
     let worker = xshell_hostlink::ring::SyncWorker::new(
