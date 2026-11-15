@@ -58,6 +58,9 @@ pub enum RemoveError {
     NotAuthorized,
     /// The unit is not in the Ring (already removed): callers treat it as done.
     NotInRing,
+    /// After a conflict, the replacement record could not be stored by the caller, so it
+    /// was not sent. The stored original can never land (another version took its slot).
+    Journal(String),
 }
 
 impl std::fmt::Display for RemoveError {
@@ -69,6 +72,7 @@ impl std::fmt::Display for RemoveError {
             Self::Refused(e) => write!(f, "refused: {e}"),
             Self::NotAuthorized => f.write_str("not_authorized: this device can't remove it"),
             Self::NotInRing => f.write_str("not_in_ring: it is not in the Ring"),
+            Self::Journal(e) => write!(f, "journal: the retry was not recorded ({e})"),
         }
     }
 }
@@ -153,11 +157,17 @@ fn conflict(e: &RingError) -> bool {
 /// a second conflict is [`RemoveError::Conflict`]. A unit that is already gone is done.
 /// `Ok`: the Relay holds the removal; the chain returned is the Connector's chain with
 /// it. The caller persists that chain unless it removed itself.
+///
+/// `on_replacement` is called with the retry's new record before the retry is sent: the
+/// caller stores it in place of `op`, so that [`resume_removal`] after a lost answer
+/// judges the candidate that may still land. An `Err` from it sends nothing more
+/// ([`RemoveError::Journal`]; the stored original can never land).
 pub fn publish_removal(
     connector: &Connector,
     signer: &dyn Signer,
     op: &RemovalOp,
     deadline: Instant,
+    on_replacement: &mut dyn FnMut(&RemovalOp) -> Result<(), String>,
 ) -> Result<RosterChain, RemoveError> {
     let mut op = op.clone();
     let mut retried = false;
@@ -174,7 +184,10 @@ pub fn publish_removal(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 match removal_candidate(&connector.chain(), signer, &op.enrollment_id, now())? {
-                    Some(fresh) => op = fresh,
+                    Some(fresh) => {
+                        on_replacement(&fresh).map_err(RemoveError::Journal)?;
+                        op = fresh;
+                    }
                     None => return Ok(connector.chain()),
                 }
             }
@@ -214,8 +227,9 @@ fn publish_once(
     }
 }
 
-/// What became of a stored `op`, from the Relay's accepted chain on `connector`'s
-/// connection. The removal is in the chain (or the unit is retired anyway): `Done`. The
+/// What became of a stored `op` (the original record, or the replacement
+/// [`publish_removal`] handed to its `on_replacement`), from the Relay's accepted chain on
+/// `connector`'s connection. The removal is in the chain (or the unit is retired anyway): `Done`. The
 /// head moved past the record's predecessor without it: `NotDone` (the stored candidate
 /// can never be accepted). The head is still the predecessor: the identical stored signed
 /// candidate is sent again (idempotent; it completes the user's own action and is no new
@@ -278,8 +292,13 @@ pub fn remove_enrollment(
         Err(RemoveError::NotInRing) => return Ok(connector.chain()),
         r => r?,
     };
-    match publish_removal(connector, signer, &op, deadline) {
-        Err(RemoveError::Uncertain) => match resume_removal(connector, &op) {
+    let mut stored = op.clone();
+    let result = publish_removal(connector, signer, &op, deadline, &mut |fresh| {
+        stored = fresh.clone();
+        Ok(())
+    });
+    match result {
+        Err(RemoveError::Uncertain) => match resume_removal(connector, &stored) {
             Resume::Done(chain) => Ok(chain),
             _ => Err(RemoveError::Uncertain),
         },
