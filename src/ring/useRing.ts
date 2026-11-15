@@ -4,16 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import { load } from "@tauri-apps/plugin-store";
 import type { ApprovedComputer, JoinEvent, JoinOverview, JoinStarted, PairingEvent, PairingFlow, PhoneStart, RingStatus } from "./types";
 
-// The Relay chosen on the unpaired screen (settings.json), bound into Create and Join. Absent:
+// The Relay chosen before the Ring exists (settings.json), bound into Create and Join. Absent:
 // the hosted Relay.
 export const RING_RELAY_SETTING = "ring_relay_url";
 
 // The latest `ring:pairing` event of each flow (a new object per event).
 export type PairingEvents = Record<PairingFlow, PairingEvent | null>;
 
-// The Ring as Settings → Hosts → Ring shows it: `ring_status` once, then every `ring:status`;
-// phone pairing (#9): its commands and every `ring:pairing`; Computer adoption (#87): its
-// commands, `ring_join_overview` once and every `ring:join`.
+// The Ring as Settings → Ring and the setup screen show it: `ring_status` once, then every
+// `ring:status`; phone pairing (#9): its commands and every `ring:pairing`; Create, Join and
+// Add a machine: their commands, `ring_join_overview` and every `ring:join`.
 export function useRing() {
   const [status, setStatus] = useState<RingStatus | null>(null);
   const [pairing, setPairing] = useState<PairingEvents>({ phone: null, computer: null });
@@ -28,28 +28,30 @@ export function useRing() {
   const mounted = useRef(false);
   const operations = useRef<Partial<Record<PairingFlow, string>>>({});
 
+  const refreshOverview = useCallback(async (): Promise<JoinOverview | null> => {
+    try {
+      const o = await invoke<JoinOverview>("ring_join_overview");
+      if (!mounted.current || !o) return o ?? null;
+      setOverview(o);
+      // Events seen meanwhile are newer than the overview.
+      setJoinEvents(m => ({ ...Object.fromEntries((o.joins ?? []).map(j => [j.operation, j])), ...m }));
+      return o;
+    } catch {
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     mounted.current = true;
     const unlisten: (() => void)[] = [];
     let cancelled = false;
     const keep = (u: () => void) => { if (cancelled) u(); else unlisten.push(u); };
-    // Ownership can move between windows: every status change and focus request re-reads it.
-    const refreshOverview = () => {
-      invoke<JoinOverview>("ring_join_overview").then(o => {
-        if (!mounted.current || !o) return;
-        setOverview(o);
-        // Events seen meanwhile are newer than the overview.
-        setJoinEvents(m => ({ ...Object.fromEntries(o.joins.map(j => [j.operation, j])), ...m }));
-      }).catch(() => {});
-    };
-    listen<RingStatus>("ring:status", e => { if (mounted.current) { setStatus(e.payload); refreshOverview(); } })
-      .then(keep)
-      .catch(() => {});
-    listen("ring:focus", () => { if (mounted.current) refreshOverview(); })
+    // Ownership can move between windows: every status change re-reads it.
+    listen<RingStatus>("ring:status", e => { if (mounted.current) { setStatus(e.payload); void refreshOverview(); } })
       .then(keep)
       .catch(() => {});
     // An unpaired takeover need not change any status: re-read when the window gains focus.
-    const onFocus = () => { if (mounted.current) refreshOverview(); };
+    const onFocus = () => { if (mounted.current) void refreshOverview(); };
     window.addEventListener("focus", onFocus);
     unlisten.push(() => window.removeEventListener("focus", onFocus));
     load("settings.json", { defaults: {}, autoSave: true })
@@ -67,40 +69,18 @@ export function useRing() {
       .then(keep)
       .catch(() => {});
     invoke<RingStatus>("ring_status").then(s => { if (mounted.current && s) setStatus(s); }).catch(() => {});
-    refreshOverview();
+    void refreshOverview();
     return () => {
       mounted.current = false;
       cancelled = true;
       unlisten.forEach(u => u());
     };
-  }, []);
+  }, [refreshOverview]);
 
-  // Registration/startup of the local Host emits no event of its own: re-read until ready.
-  const notRegistered = overview?.unavailable === "not-registered";
-  useEffect(() => {
-    if (!notRegistered) return;
-    const t = setInterval(() => {
-      invoke<JoinOverview>("ring_join_overview").then(o => { if (mounted.current && o) setOverview(o); }).catch(() => {});
-    }, 2000);
-    return () => clearInterval(t);
-  }, [notRegistered]);
+  const apply = useCallback((s: RingStatus) => { if (mounted.current && s) setStatus(s); return s; }, []);
+  const refreshStatus = useCallback(async () => apply(await invoke<RingStatus>("ring_status")), [apply]);
 
-  const apply = useCallback((s: RingStatus) => { if (mounted.current) setStatus(s); return s; }, []);
-
-  // Only to start over after unreadable settings were set aside.
-  const enable = useCallback(async (startOver: boolean) => {
-    apply(await invoke<RingStatus>("ring_enable", { startOver }));
-  }, [apply]);
-
-  const setRelayUrl = useCallback(async (url: string) => {
-    apply(await invoke<RingStatus>("ring_set_relay_url", { url }));
-  }, [apply]);
-
-  const claimHost = useCallback(async (host: string) => {
-    apply(await invoke<RingStatus>("ring_claim_host", { host }));
-  }, [apply]);
-
-  // Removes a device (#22): a new Roster version without it.
+  // Removes a device, this machine included: a new Roster version without its unit.
   const removeMember = useCallback(async (signKey: string) => apply(await invoke<RingStatus>("ring_remove_member", { signKey })), [apply]);
 
   const startPhone = useCallback((operation: string) => {
@@ -111,10 +91,10 @@ export function useRing() {
     if (operations.current.phone === operation) delete operations.current.phone;
     return invoke<void>("ring_pair_phone_cancel", { operation });
   }, []);
-  // Add computer: the normalized eight words.
+  // Add a machine: the normalized eight words.
   const approveComputer = useCallback((words: string) => invoke<ApprovedComputer>("ring_approve_device_code", { code: words }), []);
 
-  // The unpaired screen's Relay: `null` is the hosted one.
+  // The Relay chosen before the Ring exists: `null` is the hosted one.
   const setUnpairedRelay = useCallback(async (url: string | null) => {
     setRelaySaving(true);
     try {
@@ -127,16 +107,14 @@ export function useRing() {
       if (mounted.current) setRelaySaving(false);
     }
   }, []);
-  const createComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })); }, [apply]);
-  const upgradeComputer = useCallback(async () => { apply(await invoke<RingStatus>("ring_upgrade_computer")); }, [apply]);
-  const leaveRemoved = useCallback(async () => { apply(await invoke<RingStatus>("ring_leave_removed")); }, [apply]);
+  const createComputer = useCallback(async () => apply(await invoke<RingStatus>("ring_create_computer", { relayUrl: relayRef.current })), [apply]);
   const joinStart = useCallback((operation: string) => invoke<JoinStarted>("ring_join_start", { operation, relayUrl: relayRef.current }), []);
-  const joinConfirm = useCallback((operation: string) => invoke<void>("ring_join_confirm", { operation }), []);
-  const joinDecline = useCallback((operation: string) => invoke<void>("ring_join_decline", { operation }), []);
   const joinCancel = useCallback((operation: string) => invoke<void>("ring_join_cancel", { operation }), []);
 
   return {
-    status, enable, setRelayUrl, claimHost, removeMember, pairing, startPhone, cancelPhone, approveComputer,
-    joinEvents, overview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, upgradeComputer, leaveRemoved, joinStart, joinConfirm, joinDecline, joinCancel,
+    status, refreshStatus, removeMember, pairing, startPhone, cancelPhone, approveComputer,
+    joinEvents, overview, refreshOverview, chosenRelay, relayReady: relayLoaded && !relaySaving, setUnpairedRelay, createComputer, joinStart, joinCancel,
   };
 }
+
+export type RingApi = ReturnType<typeof useRing>;

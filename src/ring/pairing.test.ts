@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canSubmit, COMPUTER_IDLE, computerLine, computerReducer, countdown, errorCode, expiresLine, failureKey, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validWords, wordsError, type ComputerState, type PhoneState } from "./pairing";
+import { countdown, errorCode, expiresLine, failureKey, failureLine, normalizeWords, offersNewCode, PHONE_IDLE, phoneReducer, qrRects, secondsLeft, validWords, type PhoneState } from "./pairing";
 import { fmt, S, type StringKey } from "./strings";
 import type { PhoneStart } from "./types";
 
@@ -37,14 +37,6 @@ describe("eight-word Device Code", () => {
     expect(validWords("acid baker cable dance eagle fable gamma h4bit")).toBe(false); // digits
     expect(validWords("")).toBe(false);
   });
-
-  it("shows the invalid line only once typing on cannot help", () => {
-    expect(wordsError("")).toBeNull();
-    expect(wordsError("acid baker")).toBeNull();
-    expect(wordsError(WORDS)).toBeNull();
-    expect(wordsError("acid b4ker")).toBe(S["mobile.pair.computer.invalid"]);
-    expect(wordsError(`${WORDS} ivory`)).toBe(S["mobile.pair.computer.invalid"]);
-  });
 });
 
 describe("failures", () => {
@@ -52,10 +44,10 @@ describe("failures", () => {
     const cases: [string, StringKey][] = [
       ["role", "mobile.pair.err.role"],
       ["full", "mobile.pair.err.full"],
-      ["invalid_code", "mobile.pair.computer.invalid"],
-      ["not_approver", "mobile.pair.err.notApprover"],
       ["busy", "mobile.pair.err.busy"],
-      ["reconciliation_required", "mobile.pair.err.reconcile"],
+      // No "upgrade this Ring" or reconcile wording any more.
+      ["not_approver", "mobile.pair.failed"],
+      ["reconciliation_required", "mobile.pair.failed"],
       ["not_found", "mobile.pair.failed"],
       ["expired", "mobile.pair.expired"],
       ["publish_failed", "mobile.pair.err.publishFailed"],
@@ -114,44 +106,6 @@ describe("phone panel", () => {
   });
 });
 
-describe("computer section", () => {
-  const run = (s: ComputerState, ...as: Parameters<typeof computerReducer>[1][]) => as.reduce(computerReducer, s);
-  const WORDS = "acid baker cable dance eagle fable gamma habit";
-
-  it("connects, then the approved reply adds the computer", () => {
-    expect(canSubmit("acid baker", COMPUTER_IDLE)).toBe(false);
-    expect(canSubmit(WORDS, COMPUTER_IDLE)).toBe(true);
-    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
-    expect(c).toEqual({ state: "connecting", operation: "test-op" });
-    expect(canSubmit(WORDS, c)).toBe(false);
-    expect(computerLine(c)).toBe(S["mobile.pair.computer.connecting"]);
-    const p = run(c, { type: "approved", operation: "test-op", names: ["tower", "tower host"] });
-    expect(p).toEqual({ state: "paired", names: ["tower", "tower host"] });
-    expect(computerLine(p)).toBe("Added to the Ring: tower, tower host.");
-    // A stale reply of another attempt changes nothing.
-    expect(run(c, { type: "approved", operation: "old", names: ["x"] })).toBe(c);
-  });
-
-  it("not_approver, busy, reconcile and invalid have their own copy", () => {
-    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
-    const fail = (error: string) => computerLine(run(c, { type: "submitFailed", operation: "test-op", error }));
-    expect(fail("not_approver: approval requires enrolled membership")).toBe(S["mobile.pair.err.notApprover"]);
-    expect(fail("busy: another adoption operation is active")).toBe(S["mobile.pair.err.busy"]);
-    expect(fail("reconciliation_required: x")).toBe(S["mobile.pair.err.reconcile"]);
-    expect(fail("invalid_code: invalid pairing code: unknown device word")).toBe(S["mobile.pair.computer.invalid"]);
-    expect(fail("other: nobody is waiting with this code")).toBe("Couldn't pair the device: nobody is waiting with this code");
-  });
-
-  it("clears a finished attempt on edit, not a running one", () => {
-    const c = run(COMPUTER_IDLE, { type: "submit", operation: "test-op" });
-    expect(run(c, { type: "edit" })).toBe(c);
-    const f = run(c, { type: "submitFailed", operation: "test-op", error: "relay: down" });
-    expect(computerLine(f)).toBe("Couldn't pair the device: down");
-    expect(run(f, { type: "edit" })).toEqual(COMPUTER_IDLE);
-    expect(computerLine(COMPUTER_IDLE)).toBeNull();
-  });
-});
-
 describe("QR rectangles", () => {
   it("merges horizontal runs of dark modules", () => {
     expect(qrRects({ size: 3, rows: ["110", "011", "101"] })).toEqual([
@@ -167,9 +121,7 @@ describe("pairing strings", () => {
   const KEYS: StringKey[] = [
     "mobile.pair.phone", "mobile.pair.phone.desc", "mobile.pair.phone.expires", "mobile.pair.phone.copy",
     "mobile.pair.phone.new", "mobile.pair.expired", "mobile.pair.waiting", "mobile.pair.paired", "mobile.pair.failed",
-    "mobile.pair.computer", "mobile.pair.computer.desc", "mobile.pair.computer.label", "mobile.pair.computer.placeholder",
-    "mobile.pair.computer.connecting", "mobile.pair.computer.invalid", "mobile.pair.computer.added",
-    "mobile.pair.err.notApprover", "mobile.pair.err.busy", "mobile.pair.err.reconcile",
+    "mobile.pair.err.busy",
     "mobile.pair.err.role", "mobile.pair.err.full", "mobile.pair.err.publishFailed", "mobile.pair.connecting",
     "mobile.pair.needsRelay", "mobile.pair.needsMember",
   ];
@@ -182,8 +134,6 @@ describe("pairing strings", () => {
     expect(fmt("mobile.pair.phone.expires", { m: 3, ss: "07" })).toBe("Code expires in 3:07");
     expect(fmt("mobile.pair.paired", { name: "Pixel 8" })).toBe("Added Pixel 8");
     expect(fmt("mobile.pair.failed", { error: "relay" })).toBe("Couldn't pair the device: relay");
-    expect(fmt("mobile.pair.computer.desc")).not.toContain("{");
-    expect(S["mobile.pair.computer"]).toBeTruthy();
     for (const k of KEYS) expect(fmt(k, { m: 1, ss: "00", name: "n", error: "e", names: "a, b" }), k).not.toMatch(/\{\w+\}/);
   });
 });

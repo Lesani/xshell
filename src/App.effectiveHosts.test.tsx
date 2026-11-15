@@ -45,6 +45,8 @@ it("actual App discovers/selects Ring history without saved SSH or Local Daemon;
     if (host && offline) throw { code: "unknown-host", message: "signed membership withdrawn" };
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      // The Ring start view and the quit prompt: no Ring status here (no setup screen).
+      case "ring_status": case "ring_join_overview": case "local_quit_prompt_ready": return null;
       case "hosts_configure": expect(a?.hosts).toEqual([]); return;
       // Settings → Hosts mounts the Ring section (#87).
       case "ring_status": case "ring_join_overview": return null;
@@ -89,8 +91,10 @@ it("actual App discovers/selects Ring history without saved SSH or Local Daemon;
     await click('[aria-label="Settings"]');
     const hostsNav = Array.from(container.querySelectorAll<HTMLElement>(".settings-nav-item")).find(e => e.textContent === "Hosts")!;
     await act(async () => { hostsNav.click(); });
-    expect(container.querySelector("[data-ring-host]")?.textContent).toContain("Actual Ring Host");
-    expect(Array.from(container.querySelectorAll("[data-ring-host] button")).map(b => b.textContent)).toEqual(["Reconnect"]);
+    // The Ring's machines live in Settings → Ring now: Hosts has no Ring rows and no Ring section.
+    expect(container.querySelector(".host-empty")).not.toBeNull();
+    expect(container.querySelector("[data-ring-host]")).toBeNull();
+    expect(container.querySelector("[data-ring-section]")).toBeNull();
     await click(".ds-add");
     expect(container.querySelector(".picker-group-name")?.textContent).toBe("This computer");
     expect(container.querySelector(".picker-group .picker-item")?.textContent).toContain("ring");

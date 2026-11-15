@@ -55,6 +55,14 @@ import { localMigrationDeps } from "./hosts/localMigrationDeps";
 import { applyFenced, singleFlight } from "./hosts/startup";
 import { restorePendingCopies } from "./files/syncBackDeps";
 import { fmt } from "./hosts/strings";
+import { RingSetup, type SetupVariant } from "./components/RingSetup";
+import { LocalFailedView } from "./components/LocalFailedView";
+import { QuitPrompt } from "./components/QuitPrompt";
+import { RingRemovedNotice } from "./components/RingRemovedNotice";
+import { useLocalInfo } from "./local/useLocalInfo";
+import { localView, type LocalStatus } from "./local/localInfo";
+import { useRingStatus } from "./ring/useRingStatus";
+import { OLD_SEEN_SETTING, SETUP_SKIPPED_SETTING, startView } from "./ring/firstLaunch";
 
 // Flatten sidebar items to an ordered list of project keys (folders expanded in place).
 // Used to derive `savedPaths` for downstream code that doesn't care about folders. A Local
@@ -106,6 +114,9 @@ function DropZoneOverlay({ targetTabId, zone }: { targetTabId: string; zone: "le
   return <div className="drop-zone-preview" style={box} />;
 }
 
+// The pseudo tab id of the Ring setup screen (like "settings").
+const RING_SETUP_TAB = "ring-setup";
+
 // ── Startup (once per window) ─────────────────────────────────────
 // Reads the settings, starts the Host registry and, in local Daemon mode, moves saved
 // in-process Tabs into the Daemon (issue #4), then computes the Tabs to restore. App applies
@@ -151,6 +162,12 @@ async function loadStartup() {
   // before restoring layouts; neither cache nor TS descriptors grant Host access.
   const hostConfigs: HostConfig[] = Array.isArray(storedHosts) ? storedHosts : [];
   const localInfo = await invoke<LocalHostInfo>("local_host_info").catch(() => null);
+  // Terminals cannot start on this machine: nothing is migrated, restored or saved; the
+  // blocking view offers Retry, and recovery reloads the window (U5).
+  if (localView(localInfo as LocalStatus | null) === "failed") {
+    startupSuppressed = true;
+    return null;
+  }
   const localDaemon = localInfo?.mode === "daemon";
   await cache.load();
   await registry.init(hostConfigs).catch(() => {});
@@ -180,6 +197,8 @@ async function loadStartup() {
   return { v, hostConfigs, localDaemon, migration, durableGroups, restored, data };
 }
 const startupOnce = singleFlight(loadStartup);
+// The startup returned early because local Terminals could not start.
+let startupSuppressed = false;
 
 interface HostData<T> { identity: string | null; value: T[] }
 
@@ -1170,17 +1189,64 @@ export default function App() {
   }
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const showSettings = activeTabId === "settings";
-  // `ring:focus` (`xshelld pair` on this computer asks for the pairing window, #87): open
-  // Settings → Hosts → Ring. Bumped per request so the same request scrolls again.
-  const [ringFocus, setRingFocus] = useState(0);
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    listen("ring:focus", () => { setActiveTabId("settings"); setRingFocus(n => n + 1); })
-      .then(u => { if (cancelled) u(); else unlisten = u; })
-      .catch(() => {});
-    return () => { cancelled = true; unlisten?.(); };
+  // The setup screen is a pseudo tab like Settings: leaving it unmounts it (cancelling shown words).
+  const showRingSetup = activeTabId === RING_SETUP_TAB;
+  const [ringSetup, setRingSetup] = useState<{ variant: SetupVariant; initial?: "join"; key: number }>({ variant: "first", key: 0 });
+  const ring = useRingStatus();
+  const local = useLocalInfo();
+  const ringRef = useRef(ring.status);
+  ringRef.current = ring.status;
+  const openRingSetup = useCallback((initial?: "join") => {
+    const s = ringRef.current;
+    const variant: SetupVariant = s?.membership === "removed" ? "removed" : s?.oldRing ? "old" : "first";
+    setRingSetup(prev => ({ variant, initial, key: prev.key + 1 }));
+    setActiveTabId(RING_SETUP_TAB);
   }, []);
+  // The removal notice (U3) stays dismissed for the removal it was dismissed for.
+  const [removedDismissedAt, setRemovedDismissedAt] = useState<number | null>(null);
+  const closeRingSetup = useCallback(() => {
+    const s = ringRef.current;
+    if (s?.membership === "removed" && s.removed) setRemovedDismissedAt(s.removed.at);
+    setActiveTabId("home");
+  }, []);
+  const ringSetupDone = useCallback((text: string) => {
+    setActiveTabId(id => (id === RING_SETUP_TAB ? "home" : id));
+    showNotice(text);
+  }, [showNotice]);
+  // At the end of startup: the setup screen when this machine is in no Ring (D9), after old Ring
+  // data was set aside, or after a removal.
+  const [setupPrefs, setSetupPrefs] = useState<{ skipped: boolean; oldSeenAt: number | null } | null>(null);
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      let skipped = false, oldSeenAt: number | null = null;
+      try {
+        const store = await load("settings.json", { defaults: {}, autoSave: true });
+        skipped = (await store.get<boolean>(SETUP_SKIPPED_SETTING)) === true;
+        const at = await store.get<number>(OLD_SEEN_SETTING);
+        oldSeenAt = typeof at === "number" ? at : null;
+      } catch { /* defaults */ }
+      if (live) setSetupPrefs({ skipped, oldSeenAt });
+    })();
+    return () => { live = false; };
+  }, []);
+  const startDecided = useRef(false);
+  const [startViewDecided, setStartViewDecided] = useState(false);
+  useEffect(() => {
+    if (startDecided.current || !tabsRestored || !setupPrefs || !ring.status || ring.overview === undefined) return;
+    startDecided.current = true;
+    setStartViewDecided(true);
+    const v = startView({ status: ring.status, local: localView(local.info), overview: ring.overview, ...setupPrefs });
+    if (v) {
+      setRingSetup(prev => ({ variant: v, key: prev.key + 1 }));
+      setActiveTabId(RING_SETUP_TAB);
+    }
+  }, [tabsRestored, setupPrefs, ring.status, ring.overview, local.info]);
+  // Recovery after a suppressed startup: run the startup again in Daemon mode.
+  const localState = localView(local.info);
+  useEffect(() => { if (startupSuppressed && localState === "ready") window.location.reload(); }, [localState]);
+  const removedAt = ring.status?.membership === "removed" ? (ring.status.removed?.at ?? 0) : null;
+  const showRemovedNotice = startViewDecided && removedAt !== null && removedAt !== removedDismissedAt && !showRingSetup;
   const activeTab = tabs.find(t => t.id === activeTabId);
   const activeTabProjectPath = activeTab?.projectPath || null;
   const activeTabProjectKey = activeTab ? keyOfTab(activeTab) : null;
@@ -1190,7 +1256,7 @@ export default function App() {
   // in a binary-tree split layout. A tab is either standalone OR inside one group.
   const MAX_GROUP_LEAVES = 8;
   const [groups, setGroups] = useState<Group[]>([]);
-  const showHome = !showSettings && !tabs.find(t => t.id === activeTabId) && !groups.find(g => g.id === activeTabId);
+  const showHome = !showSettings && !showRingSetup && !tabs.find(t => t.id === activeTabId) && !groups.find(g => g.id === activeTabId);
 
   // Viewing consumes only this Desktop's exact observation, never a Host message.
   const visibleIds = visibleTerminalIds(tabs, groups, activeTabId);
@@ -1697,7 +1763,11 @@ export default function App() {
         <HostUpdateBanner host={activeUpdateHost(activeTabId, tabs, groups, activeLeafByGroup, selectedProject)} />
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} focusRing={ringFocus} />
+          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} onOpenRingSetup={openRingSetup} />
+        </div>
+        {/* The Ring setup screen — mounted only while shown */}
+        <div style={{ display: showRingSetup ? "flex" : "none", flex: 1, overflow: "auto" }}>
+          {showRingSetup && <RingSetup key={ringSetup.key} variant={ringSetup.variant} initial={ringSetup.initial} onClose={closeRingSetup} onDone={ringSetupDone} />}
         </div>
         {/* Home view — hidden when a terminal tab is active */}
         <div style={{ display: showHome ? "flex" : "none", flex: 1, overflow: "hidden" }}>
@@ -1717,7 +1787,7 @@ export default function App() {
             Terminal DOM hosts (created imperatively below) are physically reparented into
             the relevant slots on each layout change; the TerminalTab React instance stays
             alive throughout, so its xterm + PTY are never re-spawned. */}
-        <div ref={workAreaRef} className="work-area" style={{ display: showSettings || showHome ? "none" : "flex", flex: 1, overflow: "hidden", position: "relative" }}>
+        <div ref={workAreaRef} className="work-area" style={{ display: showSettings || showHome || showRingSetup ? "none" : "flex", flex: 1, overflow: "hidden", position: "relative" }}>
           {/* Standalone tabs render a bare slot (no React-level TerminalTab here). */}
           {tabs.filter(t => !t.groupId).map(tab => (
             <div key={tab.id} data-group-leaf={tab.id} className="work-pane" style={{ display: tab.id === activeTabId ? "flex" : "none" }}>
@@ -1805,7 +1875,10 @@ export default function App() {
         return <ProjectEditorDialog project={proj} settings={settings} onSave={(s) => handleSaveProjectSettings(editingProjectKey, s)} onClose={() => setEditingProjectKey(null)} />;
       })()}
       {updateDialogOpen && <UpdateDialog info={updateInfo} onDismiss={dismissUpdateDialog} />}
+      {showRemovedNotice && <RingRemovedNotice onJoin={() => openRingSetup("join")} onDismiss={() => setRemovedDismissedAt(removedAt)} />}
       <AppNotice notice={notice} onDismiss={dismissNotice} />
+      <QuitPrompt />
+      <LocalFailedView info={local.info} retry={local.retry} />
     </div>
   );
 }

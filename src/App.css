@@ -1990,3 +1990,33 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .project-terminal-detail, .project-terminal-state, .project-terminals-empty { color: var(--text-secondary); font-size: 11px; }
 .project-terminal-state { flex-shrink: 0; }
 .project-terminals-empty { padding: 14px; }
+
+/* ── Ring setup screen (first launch, Join again, old Ring data) ───────── */
+.ring-setup { flex: 1; display: flex; justify-content: center; overflow: auto; padding: 48px 16px; }
+.ring-setup-inner { width: min(640px, 100%); display: flex; flex-direction: column; gap: 12px; }
+.ring-setup-title { margin: 0; font-family: var(--font-serif); font-size: 24px; font-weight: 500; color: var(--text-primary); }
+.ring-setup-body { margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.55; }
+.ring-setup-note { margin: 0; font-size: 12px; color: var(--text-tertiary); line-height: 1.5; }
+.ring-setup-error { margin: 0; font-size: 12px; color: var(--accent-coral); line-height: 1.5; }
+.ring-setup-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 8px; }
+.ring-setup-card { display: flex; flex-direction: column; gap: 8px; padding: 16px; border: 1px solid var(--border-default); border-radius: var(--radius-lg); background: var(--bg-surface); }
+.ring-setup-card .btn { align-self: flex-start; margin-top: auto; }
+.ring-setup-card-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.ring-setup-card-body { margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.ring-setup-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.ring-setup-words { font-size: 1.5em; line-height: 1.6; user-select: all; -webkit-user-select: all; padding: 12px 16px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-elevated); color: var(--text-primary); overflow-wrap: anywhere; }
+.ring-setup-countdown { margin: 0; font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ring-removed-notice { max-width: min(720px, calc(100vw - 32px)); }
+.ring-removed-notice-title { font-weight: 600; margin-bottom: 2px; }
+
+/* ── Terminals cannot start on this machine (blocking) ──────────────────── */
+.local-failed-overlay { position: fixed; inset: 0; z-index: 4000; display: flex; align-items: center; justify-content: center; background: var(--bg-deep); padding: 16px; }
+.local-failed-panel { width: min(520px, 100%); display: flex; flex-direction: column; gap: 12px; padding: 24px; border: 1px solid var(--border-default); border-radius: var(--radius-lg); background: var(--bg-surface); }
+.local-failed-title { margin: 0; font-size: 18px; font-weight: 600; color: var(--text-primary); }
+.local-failed-body { margin: 0; font-size: 13px; color: var(--text-secondary); line-height: 1.55; overflow-wrap: anywhere; }
+.local-failed-path { font-family: var(--font-mono); user-select: all; -webkit-user-select: all; color: var(--text-primary); }
+.local-failed-actions { display: flex; justify-content: flex-end; }
+
+/* ── Quit prompt ───────────────────────────────────────────────────────── */
+.quit-prompt-overlay { z-index: 3500; }
+.quit-prompt-remember { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }

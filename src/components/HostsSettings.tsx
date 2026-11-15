@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap } from "lucide-react";
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
@@ -7,7 +7,6 @@ import { HostBadge } from "./HostBadge";
 import { HostUpdateAction } from "./HostUpdateAction";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LocalDaemonSettings } from "./LocalDaemonSettings";
-import { MobileSettings } from "./MobileSettings";
 import { fmt } from "../hosts/strings";
 import { hintText, toHostConfig, validateHostForm, type HostFormErrors, type HostFormValues } from "../hosts/hostForm";
 import { isUsableStatus } from "../hosts/registry";
@@ -15,17 +14,13 @@ import { buildText } from "../buildId";
 import { phaseLabel, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostConfig, HostStatus, HostTestResult } from "../hosts/types";
 
-// Settings → Hosts: add, edit, test, reconnect, upgrade and remove Remote Hosts.
+// Settings → Hosts: this computer's Daemon, and SSH Hosts (add, edit, test, reconnect, upgrade,
+// remove). The Ring's machines are in Settings → Ring.
 // Saving persists the `hosts` key in settings.json and reconfigures the registry (App).
 
 interface Props {
   onSave: (hosts: HostConfig[]) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
-  // The Ring section (#87) is on screen: Settings shown on Hosts. Leaving it cancels a shown
-  // Device Code.
-  ringVisible?: boolean;
-  // Bumped to scroll the Ring section into view (`ring:focus`, old links to Mobile).
-  ringFocus?: number;
 }
 
 type TestState = { busy: boolean; text: string | null; ok: boolean };
@@ -225,7 +220,7 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
   );
 }
 
-export function HostsSettings({ onSave, onRemove, ringVisible = true, ringFocus = 0 }: Props) {
+export function HostsSettings({ onSave, onRemove }: Props) {
   const snap = useHostsSnapshot();
   const hosts = snap.configs;
   const [editing, setEditing] = useState<HostConfig | "new" | null>(null);
@@ -250,24 +245,13 @@ export function HostsSettings({ onSave, onRemove, ringVisible = true, ringFocus 
         <button className="btn btn-primary settings-action-btn" onClick={() => setEditing("new")}><Plus size={11} /> {fmt("hosts.add")}</button>
       </div>
       <div className="settings-section-body">
-        {hosts.length === 0 && !snap.available.some(h => h.activeRoute === "relay") ? (
+        {hosts.length === 0 ? (
           <div className="host-empty">
             <div className="host-empty-title">{fmt("hosts.empty.title")}</div>
             <div className="host-empty-body">{fmt("hosts.empty.body")}</div>
           </div>
         ) : hosts.map(h => (
           <HostRow key={h.id} host={h} now={now} onEdit={() => setEditing(h)} onRemove={() => setRemoving(h)} />
-        ))}
-        {snap.available.filter(h => h.activeRoute === "relay").map(h => (
-          <div key={h.id} className="host-row" data-ring-host={h.id}>
-            <div className="host-row-name">{h.name}</div>
-            <div className="host-row-target">Ring · Relay</div>
-            <div className="host-row-status">{statusLabel(snap.status[h.id])} · {h.reachability.kind === "closed" ? `Closed: ${h.reachability.reason}` : h.reachability.kind}</div>
-            {snap.status[h.id]?.lastError && <div className="host-row-error">{snap.status[h.id]?.lastError}</div>}
-            <div className="host-row-detail">Relay access does not install or update the Daemon. Manage its build on the Host.</div>
-            {snap.status[h.id]?.updateUnavailable && <div className="host-row-detail">{fmt(snap.status[h.id]?.updateUnavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: h.name })}</div>}
-            <button className="btn btn-ghost settings-action-btn" onClick={() => invoke("hosts_kick", { host: h.id }).catch(() => {})}>Reconnect</button>
-          </div>
         ))}
       </div>
       {editing && <HostForm initial={editing === "new" ? null : editing} onSave={save} onCancel={() => setEditing(null)} />}
@@ -276,14 +260,6 @@ export function HostsSettings({ onSave, onRemove, ringVisible = true, ringFocus 
           onConfirm={() => { const id = removing.id; setRemoving(null); onRemove(id); }} onCancel={() => setRemoving(null)} />
       )}
     </div>
-    <RingAnchor focus={ringFocus}><MobileSettings visible={ringVisible} /></RingAnchor>
     </>
   );
-}
-
-// Settings → Hosts → Ring, scrolled into view whenever `focus` changes (not on first render).
-function RingAnchor({ focus, children }: { focus: number; children: React.ReactNode }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => { if (focus) ref.current?.scrollIntoView?.({ block: "start" }); }, [focus]);
-  return <div ref={ref} data-ring-anchor>{children}</div>;
 }

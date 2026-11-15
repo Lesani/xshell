@@ -1,8 +1,8 @@
 import { fmt, type StringKey } from "./strings";
 import type { PairingEvent, PhoneStart, Qr, RingStatus } from "./types";
 
-// Settings → Hosts → Ring, pairing (#9, #87), the pure part: the countdown, the eight words as typed, the
-// two panels' state machines and the failure lines.
+// Settings → Ring, pairing, the pure part: the countdown, the eight words as typed (Add a
+// machine), the phone panel's state machine and its failure lines.
 
 // ── Countdown ─────────────────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ export function expiresLine(expiresAt: number, nowMs: number): string {
   return fmt("mobile.pair.phone.expires", countdown(expiresAt, nowMs));
 }
 
-// ── The eight-word Device Code (Add computer) ─────────────────────────────
+// ── The eight-word Device Code (Add a machine) ─────────────────────────────
 
 export const WORD_COUNT = 8;
 
@@ -40,21 +40,13 @@ export function validWords(raw: string): boolean {
   return w.length === WORD_COUNT && w.every(x => /^[a-z]+$/.test(x));
 }
 
-// The inline error under the field: only once the input cannot become valid by typing on.
-export function wordsError(raw: string): string | null {
-  const w = words(raw);
-  if (w.length === 0 || validWords(raw)) return null;
-  if (w.length > WORD_COUNT || w.some(x => !/^[a-z]+$/.test(x))) return fmt("mobile.pair.computer.invalid");
-  return null;
-}
-
 // ── Failures ──────────────────────────────────────────────────────────────
 
 // The codes the Desktop reports (`PairingEvent::Failed`, and the start of a command's error).
 const CODES = new Set([
   "expired", "used", "role", "duplicate", "full", "publish_failed", "not_found", "crypto", "pin",
   "relay", "timeout", "protocol", "cancelled", "busy", "other_window", "not_enabled", "invalid_code",
-  "not_approver", "reconciliation_required",
+  "not_approver",
 ]);
 
 // The failure code a command error starts with, or "other".
@@ -67,10 +59,7 @@ export function failureKey(code: string): StringKey {
   switch (code) {
     case "role": return "mobile.pair.err.role";
     case "full": return "mobile.pair.err.full";
-    case "invalid_code": return "mobile.pair.computer.invalid";
-    case "not_approver": return "mobile.pair.err.notApprover";
     case "busy": return "mobile.pair.err.busy";
-    case "reconciliation_required": return "mobile.pair.err.reconcile";
     case "expired": return "mobile.pair.expired";
     case "publish_failed": return "mobile.pair.err.publishFailed";
     default: return "mobile.pair.failed";
@@ -142,58 +131,6 @@ export function phoneReducer(s: PhoneState, a: PhoneAction): PhoneState {
 // Whether the panel offers "New code" (otherwise "Pair a phone", or nothing while it runs).
 export function offersNewCode(s: PhoneState): boolean {
   return s.state === "expired" || s.state === "failed";
-}
-
-// ── The "Add computer" section ────────────────────────────────────────────
-
-// One request (`ring_approve_device_code`) and its reply; nothing arrives by event.
-export type ComputerState =
-  | { state: "idle" }
-  | { state: "connecting"; operation: string }
-  | { state: "paired"; names: string[] }
-  | { state: "failed"; code: string; error?: string };
-
-export type ComputerAction =
-  | { type: "submit"; operation: string }
-  | { type: "approved"; operation: string; names: string[] }
-  | { type: "submitFailed"; operation: string; error: string }
-  // The words were edited: a finished attempt's line goes away.
-  | { type: "edit" };
-
-export const COMPUTER_IDLE: ComputerState = { state: "idle" };
-
-export function computerReducer(s: ComputerState, a: ComputerAction): ComputerState {
-  switch (a.type) {
-    case "submit":
-      return s.state === "connecting" ? s : { state: "connecting", operation: a.operation };
-    case "approved":
-      return s.state === "connecting" && s.operation === a.operation ? { state: "paired", names: a.names } : s;
-    case "submitFailed":
-      return s.state === "connecting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
-    case "edit":
-      return s.state === "connecting" ? s : COMPUTER_IDLE;
-  }
-}
-
-export function canSubmit(raw: string, s: ComputerState): boolean {
-  return s.state !== "connecting" && validWords(raw);
-}
-
-// The backend's text after its `code: ` prefix.
-function detail(error: string | undefined, code: string): string {
-  if (!error) return code;
-  const m = /^[a-z_]+: (.*)$/s.exec(error);
-  return m ? m[1] : error;
-}
-
-// The line under the words field, if any.
-export function computerLine(s: ComputerState): string | null {
-  switch (s.state) {
-    case "connecting": return fmt("mobile.pair.computer.connecting");
-    case "paired": return fmt("mobile.pair.computer.added", { names: s.names.join(", ") });
-    case "failed": return fmt(failureKey(s.code), { error: detail(s.error, s.code) });
-    default: return null;
-  }
 }
 
 // ── The QR code as SVG rectangles ─────────────────────────────────────────

@@ -113,6 +113,8 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      // The Ring start view and the quit prompt: no Ring status here (no setup screen).
+      case "ring_status": case "ring_join_overview": case "local_quit_prompt_ready": return null;
       // Settings → Hosts mounts the Ring section (#87).
       case "ring_status": case "ring_join_overview": return null;
       case "hosts_available": return { sequence: 0, hosts: [] };

@@ -178,6 +178,8 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return localInfo;
+      // The Ring start view and the quit prompt: no Ring status here (no setup screen).
+      case "ring_status": case "ring_join_overview": case "local_quit_prompt_ready": return null;
       // Daemon startup reads this even with no legacy Tabs. Keep migration real.
       case "local_migration_journal_read": return null;
       // Settings → Hosts mounts the Ring section (#87).
