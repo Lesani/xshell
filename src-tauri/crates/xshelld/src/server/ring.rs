@@ -2055,6 +2055,11 @@ pub(crate) fn start_membership_maintenance(
             let mut standalone_at = Instant::now();
             #[cfg(unix)]
             let mut standalone_delay = Duration::from_secs(1);
+            // The standalone journal as it was when the last step found nothing to do: a
+            // new or changed obligation (a pair command that ended unresolved) is looked at
+            // on the next tick instead of after the idle minute.
+            #[cfg(unix)]
+            let mut standalone_idle: Option<Option<std::time::SystemTime>> = None;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 let Some(d) = weak.upgrade() else { return };
@@ -2140,13 +2145,22 @@ pub(crate) fn start_membership_maintenance(
                     }
                 }
                 #[cfg(unix)]
-                if now >= standalone_at {
+                let journal = || {
+                    fs::metadata(d.cfg.paths.ring_dir.join("standalone-adoption.json"))
+                        .and_then(|m| m.modified())
+                        .ok()
+                };
+                #[cfg(unix)]
+                if now >= standalone_at || standalone_idle.is_some_and(|seen| seen != journal()) {
+                    let seen = journal();
+                    standalone_idle = None;
                     // Never a ServerHandle here: dropping one shuts the Daemon down.
                     let handle = super::adoption::Standalone { d: &d };
                     match maintain_standalone(&handle) {
                         Ok(true) => {
                             standalone_delay = Duration::from_secs(1);
                             standalone_at = now + Duration::from_secs(60);
+                            standalone_idle = Some(seen);
                         }
                         // A pair command is still running: look again soon, no backoff.
                         Err(e) if e == STANDALONE_PENDING => {
