@@ -1024,13 +1024,22 @@ mod tests {
     }
 
     fn set_mtime(p: &Path, t: SystemTime) {
-        fs::File::options()
+        // Windows: a directory opens only with backup semantics, and setting a time needs
+        // just FILE_WRITE_ATTRIBUTES (which a read-only file grants too).
+        #[cfg(windows)]
+        let f = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::File::options()
+                .access_mode(0x0100)
+                .custom_flags(0x0200_0000)
+                .open(p)
+        };
+        #[cfg(not(windows))]
+        let f = fs::File::options()
             .write(true)
             .open(p)
-            .or_else(|_| fs::File::open(p))
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
+            .or_else(|_| fs::File::open(p));
+        f.unwrap().set_modified(t).unwrap();
     }
 
     fn sha(s: &str) -> String {
