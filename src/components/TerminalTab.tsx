@@ -661,8 +661,14 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
         sawFirstOutputRef.current = true;
         setIsInitializing(false);
         if (remoteHost) {
+          // Never the backend's text or a Host id: a machine that left says so in its banner;
+          // otherwise the approved offline line. The detail goes to the debug console only.
           const message = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
-          term.write(`\x1b[31m${terminalOpenFailedText(isLocalHost(remoteHost), registry.hostName(remoteHost), message)}\x1b[0m\r\n`);
+          console.debug("terminal start failed:", (err as { code?: string })?.code ?? "error");
+          void message;
+          const host = daemonHost(tabRef.current) ?? remoteHost;
+          if (isLocalHost(host)) term.write(`\x1b[31m${C["local.failed.title"]}\x1b[0m\r\n`);
+          else if (!registry.isDeparted(host)) term.write(`\x1b[31m${fmtc("tab.offline.state", { name: registry.machineName(host) })}\x1b[0m\r\n`);
           return;
         }
         term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
@@ -1155,7 +1161,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
   const machine = tab.host ? registry.machineName(tab.host) : "";
   const ringRow = tab.host ? hostsSnap.available.find(h => h.id === tab.host || h.aliases.includes(tab.host!)) : undefined;
   const ringOffline = !!remoteState && !!ringRow && ringRow.routes.includes("relay") && ringRow.reachability.kind !== "online";
-  const remoteStateText = departed ? null : ringOffline ? fmtc("tab.offline.state", { name: machine }) : terminalHostStateText(remoteState, localDaemonTab, hostName, hostStatus?.lastError);
+  const remoteStateText = departed ? null : ringOffline ? fmtc("tab.offline.state", { name: machine }) : terminalHostStateText(remoteState, localDaemonTab, hostName, null); // never the backend error
   const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
   const agentLabel = AGENTS[tab.agent || "claude"].label;
   const skipState = skipPermsState(tab, { live: hostLive, status: hostStatus, hostName, localEnded: ended, busy: skipBusy });

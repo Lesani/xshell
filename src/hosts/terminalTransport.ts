@@ -227,6 +227,14 @@ export class RemoteTerminals {
   // Registers the xterm that receives this Terminal's output; returns the mount generation.
   mount(host: HostId, uuid: string, sinks: TerminalSinks): number {
     const e = this.entry(host, uuid);
+    // The Tab moved to another Host (its machine left the Ring and joined again under a new
+    // id): the entry follows. Nothing is attached on a Host that left, and an idle entry has
+    // nothing to keep.
+    if (e.host !== host && !e.closeIntent && (registry.isDeparted(e.host) || (!e.attached && !e.inflight))) {
+      e.host = host;
+      e.attached = false;
+      e.resyncPending = false;
+    }
     e.mountGen = ++this.gen;
     e.sinks = sinks;
     return e.mountGen;

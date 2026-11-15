@@ -11,7 +11,7 @@ import type { MemberView } from "./ring/types";
 // A machine leaves the Ring (removed, or removes itself) while this Desktop shows one of its
 // Terminals; later it joins again under a new identity. Real App and real TerminalTabs; only
 // xterm and the native boundary are mocked.
-const native = vi.hoisted(() => ({ handlers: new Map<string, Set<(event: { payload: unknown }) => void>>() }));
+const native = vi.hoisted(() => ({ handlers: new Map<string, Set<(event: { payload: unknown }) => void>>(), written: [] as string[] }));
 vi.mock("@tauri-apps/api/core", async original => ({ ...await original<typeof import("@tauri-apps/api/core")>(), invoke: vi.fn(), Channel: class { onmessage: unknown = null; } }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (name: string, handler: (event: { payload: unknown }) => void) => {
@@ -29,7 +29,7 @@ vi.mock("./lib/fonts", () => ({ detectMonoFontFamily: () => "monospace", ensureM
 vi.mock("@xterm/xterm", () => ({ Terminal: class {
   options = {}; unicode = { activeVersion: "" }; parser = { registerOscHandler: vi.fn() };
   cols = 80; rows = 24; dispose = vi.fn();
-  open() {} loadAddon() {} focus() {} write() {} attachCustomKeyEventHandler() {} onData() { return { dispose() {} }; } onResize() { return { dispose() {} }; }
+  open() {} loadAddon() {} focus() {} write(d: unknown) { native.written.push(typeof d === "string" ? d : ""); } attachCustomKeyEventHandler() {} onData() { return { dispose() {} }; } onResize() { return { dispose() {} }; }
 } }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
 vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
@@ -159,4 +159,137 @@ it("while this machine is not a member, no tab is marked as left (nothing is kno
   await available([]);
   expect(container.querySelector("[data-tab-removed]")).toBeNull();
   expect(container.innerHTML).not.toContain("r_d3");
+});
+
+it("removed → restart (the tab comes back from disk, removed) → the machine joins again: the tab moves to the new Host and attaches", async () => {
+  const OLD = idOf(0xd4), NEW = idOf(0xe4);
+  native.written = [];
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+  // What B kept on disk from before the restart: hotel's last list and its name.
+  const stores = new Map<string, Map<string, unknown>>([
+    ["settings.json", new Map<string, unknown>([["rate_limit_in_sidebar", false], ["rate_limit_in_sidebar_codex", false], ["context_tree_enabled", false]])],
+    ["hosts-cache.json", new Map<string, unknown>([["cache", { version: 1, hosts: { [OLD]: { provenance: { host: OLD, daemonKey: OLD }, terminals: [info], terminalsAt: 1, calls: {} } }, names: { [OLD]: "hotel" } }]])],
+  ]);
+  vi.mocked(load).mockImplementation(async (file: string) => {
+    const data = stores.get(file) ?? new Map<string, unknown>(); stores.set(file, data);
+    return { get: async (k: string) => data.get(k) ?? null, set: async (k: string, v: unknown) => { data.set(k, v); }, save: async () => {} } as unknown as Awaited<ReturnType<typeof load>>;
+  });
+  let roster = member({ members: [me] });
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    const a = args as Record<string, unknown> | undefined;
+    switch (command) {
+      case "local_host_info": return { mode: "in-process", reason: null };
+      case "ring_status": return roster;
+      case "ring_join_overview": return { owner: true, joins: [] };
+      case "hosts_available": return { sequence: 0, hosts: [] };
+      case "hosts_status": return [];
+      case "get_global_rate_limits": return { five_hour_pct: null, seven_day_pct: null, five_hour_resets_at: null, seven_day_resets_at: null };
+      case "get_codex_usage": return { present: false, primary: null, secondary: null, plan_type: null, rate_limits_updated_iso: null, daily_sessions: [] };
+      case "detect_agent_binary": return { installed: false };
+      case "probe_statusline_setup": return { stats_dir_present: false, stats_session_count: 0 };
+      case "host_call": return null;
+      case "host_term_attach": case "host_term_open":
+        if (a?.host !== NEW) { throw { code: "unknown-host", message: `unknown host ${String(a?.host)}` }; }
+        return new Promise(() => {});
+      default: return String(command).startsWith("local_") || String(command).startsWith("host_term") ? null : [];
+    }
+  });
+  vi.resetModules();
+  const { default: App } = await import("./App");
+  ({ registry } = await import("./hosts/registry"));
+  ({ cache } = await import("./hosts/cache"));
+  ({ hostUpdates } = await import("./hosts/hostUpdate"));
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => { root!.render(<App />); });
+  await act(async () => {});
+  await act(async () => {});
+  // Restored from disk, in the removed state.
+  expect(tabs()).toHaveLength(1);
+  expect(container.querySelector("[data-tab-removed]")?.textContent).toContain("hotel is no longer in your Ring.");
+  (container.querySelector('[data-drag-id="remote-hotel-uuid"]') as HTMLElement).click();
+  await act(async () => {});
+
+  // hotel joins again: a new identity, its Daemon and the Terminal kept running.
+  roster = member({ members: [me, hotel(0xe4)] });
+  await emit("ring:status", roster);
+  await available([row(NEW)]);
+  await emit("hosts:status", status(NEW));
+  await emit("hosts:terminals", { host: NEW, list: [info] });
+  for (let i = 0; i < 5; i++) await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+  expect(tabs()).toHaveLength(1);
+  expect(container.querySelector("[data-tab-removed]")).toBeNull();
+  const attaches = vi.mocked(invoke).mock.calls.filter(([c]) => c === "host_term_attach" || c === "host_term_open").map(([c, a]) => [c, (a as { host: string }).host]);
+  expect(attaches).toContainEqual(["host_term_attach", NEW]);
+  expect(attaches.filter(([, h]) => h === OLD)).toEqual([]);
+  expect(native.written.join("")).not.toContain("Couldn't start");
+  expect(container.innerHTML).not.toContain("r_d4");
+});
+
+it("removed → restart → rejoin without that Terminal: the tab keeps the removed state, no error text", async () => {
+  const OLD = idOf(0xd5), NEW = idOf(0xe5);
+  native.written = [];
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+  // What B kept on disk from before the restart: hotel's last list and its name.
+  const stores = new Map<string, Map<string, unknown>>([
+    ["settings.json", new Map<string, unknown>([["rate_limit_in_sidebar", false], ["rate_limit_in_sidebar_codex", false], ["context_tree_enabled", false]])],
+    ["hosts-cache.json", new Map<string, unknown>([["cache", { version: 1, hosts: { [OLD]: { provenance: { host: OLD, daemonKey: OLD }, terminals: [info], terminalsAt: 1, calls: {} } }, names: { [OLD]: "hotel" } }]])],
+  ]);
+  vi.mocked(load).mockImplementation(async (file: string) => {
+    const data = stores.get(file) ?? new Map<string, unknown>(); stores.set(file, data);
+    return { get: async (k: string) => data.get(k) ?? null, set: async (k: string, v: unknown) => { data.set(k, v); }, save: async () => {} } as unknown as Awaited<ReturnType<typeof load>>;
+  });
+  let roster = member({ members: [me] });
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    const a = args as Record<string, unknown> | undefined;
+    switch (command) {
+      case "local_host_info": return { mode: "in-process", reason: null };
+      case "ring_status": return roster;
+      case "ring_join_overview": return { owner: true, joins: [] };
+      case "hosts_available": return { sequence: 0, hosts: [] };
+      case "hosts_status": return [];
+      case "get_global_rate_limits": return { five_hour_pct: null, seven_day_pct: null, five_hour_resets_at: null, seven_day_resets_at: null };
+      case "get_codex_usage": return { present: false, primary: null, secondary: null, plan_type: null, rate_limits_updated_iso: null, daily_sessions: [] };
+      case "detect_agent_binary": return { installed: false };
+      case "probe_statusline_setup": return { stats_dir_present: false, stats_session_count: 0 };
+      case "host_call": return null;
+      case "host_term_attach": case "host_term_open":
+        if (a?.host !== NEW) { throw { code: "unknown-host", message: `unknown host ${String(a?.host)}` }; }
+        return new Promise(() => {});
+      default: return String(command).startsWith("local_") || String(command).startsWith("host_term") ? null : [];
+    }
+  });
+  vi.resetModules();
+  const { default: App } = await import("./App");
+  ({ registry } = await import("./hosts/registry"));
+  ({ cache } = await import("./hosts/cache"));
+  ({ hostUpdates } = await import("./hosts/hostUpdate"));
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => { root!.render(<App />); });
+  await act(async () => {});
+  await act(async () => {});
+  // Restored from disk, in the removed state.
+  expect(tabs()).toHaveLength(1);
+  expect(container.querySelector("[data-tab-removed]")?.textContent).toContain("hotel is no longer in your Ring.");
+  (container.querySelector('[data-drag-id="remote-hotel-uuid"]') as HTMLElement).click();
+  await act(async () => {});
+
+  // hotel joins again: a new identity, its Daemon and the Terminal kept running.
+  roster = member({ members: [me, hotel(0xe5)] });
+  await emit("ring:status", roster);
+  await available([row(NEW)]);
+  await emit("hosts:status", status(NEW));
+  await emit("hosts:terminals", { host: NEW, list: [] });
+  for (let i = 0; i < 5; i++) await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+  expect(tabs()).toHaveLength(1);
+  expect(container.querySelector("[data-tab-removed]")?.textContent).toContain("hotel is no longer in your Ring.");
+  expect(native.written.join("")).not.toContain("Couldn't");
+  expect(native.written.join("")).not.toContain("unknown host");
+  expect(container.innerHTML).not.toContain("r_d5");
+  expect(container.innerHTML).not.toContain("r_e5");
 });

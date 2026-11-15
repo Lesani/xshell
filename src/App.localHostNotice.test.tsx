@@ -117,17 +117,18 @@ const banner = () => container.querySelector(".main-content > .host-update-banne
 function expectNoControls() {
   expect(banner()?.querySelectorAll("button, a, input, [role='button']").length ?? 0).toBe(0);
 }
-function expectLocalNotice(context: string, description = differentBuildText) {
+// This computer switches its own background program: no notice with versions, build hashes or
+// "check Settings" guidance (only a progress line while it switches).
+function expectLocalNotice(context: string, _description?: string) {
   const text = banner()?.textContent ?? "";
-  // Only required Local presence is soft so all native/navigation controls run on RED.
-  expect.soft(text, `${context}: native Local description`).toContain(description);
-  expect.soft(text, `${context}: textual Settings guidance`).toContain(settingsHint);
-  expect(text).not.toContain(hostA.name);
-  expect(text).not.toContain(hostB.name);
+  expect(text, `${context}: no Local notice`).toBe("");
+  expect(text).not.toContain(settingsHint);
+  expect(text).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expectNoControls();
 }
 function expectRemoteNotice(host: HostConfig) {
-  expect(banner()?.textContent).toContain(`${host.name} is running a different build of xshell`);
+  expect(banner()?.textContent).toContain(`${host.name}: Update available`);
+  expect(banner()?.textContent).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expect(banner()?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
   expect(banner()?.textContent).not.toContain("This computer");
   expect(banner()?.textContent).not.toContain(settingsHint);
@@ -254,7 +255,8 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
   await clickText(".settings-nav-item", "Hosts");
   const localSection = [...container.querySelectorAll(".settings-section")].find(section => section.querySelector(".settings-section-title")?.textContent === "This computer");
   expect(localSection, "existing This computer Settings section").toBeDefined();
-  expect(localSection!.textContent).toContain("Terminal setup 1.5.0 (3b9c9a89c10e) · keeps running");
+  expect(localSection!.textContent).toContain("Terminal setup 1.5.0 · keeps running");
+  expect(localSection!.textContent).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expect(localSection!.textContent).toContain("Different build");
   const replace = [...localSection!.querySelectorAll("button")].find(button => button.textContent?.trim() === "Replace with Desktop’s build");
   expect(replace, "existing Settings replacement control").toBeDefined();
@@ -282,8 +284,6 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
     { label: "reconnecting despite stale fields", patch: { status: "reconnecting" } },
     { label: "missing Daemon version", patch: { daemonVersion: null } },
     { label: "empty Daemon version", patch: { daemonVersion: "" } },
-    { label: "preparing", patch: { phase: "preparing" } },
-    { label: "upgrading", patch: { phase: "upgrading" } },
     { label: "incompatible older Daemon", patch: { status: "incompatible", incompatibleReason: "daemon-older" } },
   ];
   for (const { label, patch } of excluded) {
@@ -291,6 +291,12 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
     expect(banner()?.textContent ?? "", `excluded Local status: ${label}`).toBe("");
     expectNoControls();
   }
+  // While this computer switches: the approved progress line only.
+  await localStatus({ phase: "preparing" });
+  expect(banner()?.textContent).toBe("Sending update…");
+  await localStatus({ phase: "upgrading" });
+  expect(banner()?.textContent).toBe("Restarting…");
+  expectNoControls();
   await localStatus({});
   expectLocalNotice("reactive different-build reappearance");
   expect(container.querySelector(`[data-drag-id="${tabId(localTerminal)}"].active`)).not.toBeNull();

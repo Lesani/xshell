@@ -12,16 +12,20 @@ const host = { id: "h_aaaaaaaa", name: "Windows fixture", sshTarget: "test" };
 const status: HostStatus = { host: host.id, status: "build-differs", phase: null, lastError: null, errorHint: null, daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1, os: "windows", arch: "x86_64", incompatibleReason: null, nextRetryAt: null, sinceMs: 1, updateAction: "replace" };
 const render = (patch: Partial<HostStatus> = {}) => renderToStaticMarkup(createElement(HostUpdateAction, { host, status: { ...status, ...patch }, description: true }));
 describe("shared Host update action", () => {
-  it("describes a build difference, not assumed age", () => {
-    expect(render()).toContain("different build");
+  it("describes a build difference without build hashes, not assumed age", () => {
+    expect(render()).toContain("Windows fixture: Update available");
+    expect(render({ daemonBuild: { commit: "42c9be9636a9", dirty: null, time: 1 }, desktopBuild: { commit: "81badb2ccf31", dirty: null, time: 2 } })).not.toMatch(/42c9be|81badb/);
     expect(render()).toContain("Use this Desktop’s build");
   });
   it("shows backend preparation, waiting and failure rather than treating an invocation as completion", () => {
     expect(render({ phase: "preparing" })).toContain("Sending update…");
     expect(render({ phase: "installing" })).toContain("Sending update…");
     expect(render({ phase: "upgrading" })).toContain("Restarting…");
-    expect(render({ lastError: "stage failed", errorHint: "update-failed" })).toContain("stage failed");
-    expect(render({ status: "offline", phase: null, lastError: "deadline reached", errorHint: "update-failed" })).toContain("deadline reached");
+    // A failure in approved words only, never the backend's text.
+    expect(render({ lastError: "stage failed", errorHint: "update-failed" })).toContain("reconnected after the update.");
+    expect(render({ lastError: "stage failed", errorHint: "update-failed" })).not.toContain("stage failed");
+    expect(render({ status: "offline", phase: null, lastError: "offline: deadline reached", errorHint: "update-failed" })).toContain("Windows fixture is offline.");
+    expect(render({ status: "offline", phase: null, lastError: "offline: deadline reached", errorHint: "update-failed" })).not.toContain("deadline reached");
   });
   it("has no operative update for an old Windows owner, even during reconnect", () => {
     for (const kind of ["build-differs", "reconnecting"] as const) {
@@ -35,7 +39,8 @@ describe("shared Host update action", () => {
     vi.mocked(invoke).mockRejectedValueOnce({ message: "acknowledgement lost" });
     hostUpdates.ask(host, status);
     await hostUpdates.confirm();
-    expect(render()).toContain("acknowledgement lost");
+    expect(render()).toContain("reconnected after the update");
+    expect(render()).not.toContain("acknowledgement lost");
     const build = { commit: "85ee920a1b2c", dirty: null, time: 7 };
     expect(render({ status: "connected", updateAction: null, daemonBuild: build, desktopBuild: build, lastError: null, errorHint: null, phase: null })).toBe("");
   });

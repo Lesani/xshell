@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { exactUpdateConnected, hostUpdates, skipReason, updateAction, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
-import { buildText } from "../buildId";
 import type { HostStatus } from "../hosts/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CodeCopy } from "./CodeCopy";
@@ -36,6 +35,20 @@ export function RingUpdateUnsupported({ name }: { name: string }) {
   </span>;
 }
 
+// A failed update in approved words only: never the backend's text, a Host id or a build.
+// COPY-GAP: no text for a generic update failure; "hasn't reconnected" is the nearest.
+// The backend may report an outcome already in approved words (update.rolledBack, …): kept.
+const APPROVED = (["update.rolledBack", "update.offline", "update.busy", "update.notBack", "update.tooOld", "update.noBuild"] as const)
+  .map(k => new RegExp(`^${fmt(k).replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\?\{\w+\\?\}/g, ".+")}$`));
+
+export function updateErrorText(name: string, error: string): string {
+  if (APPROVED.some(re => re.test(error.trim())) && !/r_[0-9a-f]{8}/.test(error)) return error.trim();
+  console.debug("update failed:", error.split(":")[0]);
+  if (/offline|unreachable|not connected/i.test(error)) return fmt("update.offline", { name });
+  if (/\bbusy\b/i.test(error)) return fmt("update.busy", { name });
+  return fmt("update.notBack", { name });
+}
+
 export function HostUpdateAction({ host, status, description = false }: { host: UpdateHost; status: HostStatus | undefined; description?: boolean }) {
   const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
   const healthy = exactUpdateConnected(status);
@@ -48,14 +61,15 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
   const visible = action || busy || unavailable || route || error;
   if (!visible) return null;
   return <div className="host-update-action">
-    {description && !busy && status && (action || unavailable) && <span>{fmt(replace ? "hosts.update.buildDiffers" : "hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion, version: status.desktopVersion, daemonBuild: buildText(status.daemonBuild), desktopBuild: buildText(status.desktopBuild) })}</span>}
+    {/* Never a build hash: a different build is just "Update available". */}
+    {description && !busy && status && (action || unavailable) && <span>{replace ? `${host.name}: ${fmt("update.available")}` : fmt("hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion })}</span>}
     {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} />}
     {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? "update.restarting" : "update.sending")}</span>
         : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!(state.all && !state.all.done)} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>}
     </>}
-    {error && <span className="host-row-error" role="alert">{fmt(replace ? "hosts.update.replaceFailed" : "hosts.update.failed", { host: host.name, error })}</span>}
+    {error && <span className="host-row-error" role="alert">{updateErrorText(host.name, error)}</span>}
   </div>;
 }
 
@@ -63,7 +77,7 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
 function resultText(r: AllResult): string {
   switch (r.outcome) {
     case "ok": return `${r.host.name}: ${fmt("update.done", { new: r.version })}`;
-    case "failed": return `${r.host.name}: ${r.error}`;
+    case "failed": return updateErrorText(r.host.name, r.error ?? "");
     case "skipped":
       switch (r.reason) {
         case "current": return `${r.host.name}: ${fmt("update.current")}`;

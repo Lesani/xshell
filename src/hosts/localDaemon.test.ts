@@ -265,10 +265,11 @@ describe("LocalDaemonView", () => {
     expect(html).not.toContain("Switching…");
   });
 
-  it("build differs: the chip, the build in the line, and Replace (#49)", () => {
+  it("build differs: the chip, the version (never a build hash) in the line, and Replace (#49)", () => {
     const html = render(initialState, on, status({ status: "build-differs", daemonBuild: null, desktopBuild: ours }));
     expect(html).toContain("Different build");
-    expect(html).toContain("Terminal setup 1.5.0 (unknown build) · keeps running");
+    expect(html).toContain("Terminal setup 1.5.0 · keeps running");
+    expect(html).not.toContain("unknown build");
     expect(html).toContain("Replace with Desktop’s build");
     expect(html).not.toContain("Upgrade now");
     const busy = render({ phase: { kind: "upgrading", replace: true }, error: null }, on, status({ status: "build-differs", daemonBuild: null, desktopBuild: ours }));
@@ -277,7 +278,8 @@ describe("LocalDaemonView", () => {
 
   it("another app on another build: the note, no action", () => {
     const html = render(initialState, { ...on, enabled: false, running: "gui-bound" }, status({ daemonBuild: other, desktopBuild: ours }));
-    expect(html).toContain("Another xshell app using 000000000000 runs this computer’s terminals.");
+    expect(html).toContain("Another xshell app using 1.5.0 runs this computer’s terminals.");
+    expect(html).not.toContain("000000000000");
     expect(html).not.toContain("Replace with");
   });
 

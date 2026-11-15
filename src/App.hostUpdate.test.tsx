@@ -73,7 +73,7 @@ function expectNotice(host: HostConfig, owned = false) {
   // Soft assertions let the rest of the navigation controls execute on the RED tree.
   expect.soft(banner()?.textContent ?? "", `${host.name} notice in production App banner`).toContain(host.name);
   if (owned) {
-    expect.soft(banner()?.textContent).toContain("different build of xshell");
+    expect.soft(banner()?.textContent).toContain(`${host.name}: Update available`);
     expect.soft(banner()?.textContent).toContain(`Update xshell on ${host.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
     expect.soft(banner()?.querySelector("button")).toBeNull();
     expect.soft(container.querySelector(".host-confirm-panel")).toBeNull();
@@ -201,7 +201,9 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
   // An old target's exact refusal stays visible, alongside ownership-specific guidance.
   const legacyRefusal = "xshell on this machine runs these terminals; update xshell there instead";
   await act(async () => { registry.applyStatus({ ...eligibleStatus(hostA.id), updateUnavailable: "desktop-owned", errorHint: "update-failed", lastError: legacyRefusal }); });
-  expect(banner()?.textContent).toContain(legacyRefusal);
+  // Never the backend's text: the approved line, beside the ownership guidance.
+  expect(banner()?.textContent).not.toContain(legacyRefusal);
+  expect(banner()?.textContent).toContain("reconnected after the update");
   await click('[aria-label="Settings"]');
   const hostsTab = [...container.querySelectorAll<HTMLElement>(".settings-nav-item")].find(b => b.textContent === "Hosts");
   expect(hostsTab).toBeDefined();

@@ -8,7 +8,6 @@ import { controls, errorCode, initialState, localDaemonLine, localDaemonVisible,
 import { C, fmtc } from "../ring/copy";
 import type { LocalStatus } from "../local/localInfo";
 import { updateTarget, type UpdateTarget } from "../hosts/hostUpdate";
-import { buildText } from "../buildId";
 import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
 
@@ -74,10 +73,11 @@ export interface ViewProps {
 
 export function LocalDaemonView({ persistent, keep = false, status, live, state, dispatch }: ViewProps) {
   const c = controls(state, persistent, status, live);
-  const line = localDaemonLine(status, persistent.running);
+  // This computer is never shown with build hashes: versions only.
+  const line = localDaemonLine(status ? { ...status, daemonBuild: undefined } : status, persistent.running);
   const n = live?.length ?? 0;
   const pending = status?.status === "upgrade-pending" || status?.status === "build-differs" || status?.status === "incompatible";
-  const other = otherBuildNote(status, persistent.running);
+  const other = otherBuildNote(status, persistent.running) ? fmt("local.daemon.otherBuild", { build: status?.daemonVersion ?? "" }) : null;
   // The backend's diagnostic is not shown (no raw backend text); it goes to the debug console.
   const backendError = statusErrorText(status, state.error);
   useEffect(() => { if (backendError) console.debug("local Daemon update:", backendError); }, [backendError]);
@@ -105,7 +105,7 @@ export function LocalDaemonView({ persistent, keep = false, status, live, state,
               </button>
             )}
             {c.showReplace && (
-              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "replace", terminals: n, build: buildText(status?.desktopBuild) })}>
+              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "replace", terminals: n, build: status?.desktopVersion ?? "" })}>
                 <RefreshCcw size={11} /> {c.replaceBusy ? fmt("hosts.row.replacing") : fmt("hosts.row.replaceBuild")}
               </button>
             )}
