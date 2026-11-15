@@ -4,6 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RingSettings } from "./RingSettings";
 import { C, fmtc } from "../ring/copy";
+import { setOutcomeMs } from "../ring/outcome";
+setOutcomeMs(25);
 import { FAR, WORDS, me, member, phone, ringStatus, tower } from "./ringTestKit";
 import type { RingStatus } from "../ring/types";
 import type { AvailableHost, HostStatus } from "../hosts/types";
@@ -115,6 +117,9 @@ describe("member list", () => {
     await act(async () => { dialogButton(C["remove.action"]).click(); });
     expect(text()).toContain(fmtc("remove.done", { name: "tower" }));
     expect(q('[data-ring-member="tw"]')).toBeNull();
+    // The outcome line describes the last action only: it clears by itself.
+    await act(async () => { await new Promise(r => setTimeout(r, 60)); });
+    expect(q("[data-remove-done]")).toBeNull();
   });
 
   it("the last machine gets remove.last", async () => {
@@ -211,6 +216,8 @@ describe("Add a machine", () => {
     await click("[data-add-computer]");
     expect(text()).toContain("Added laptop to your Ring.");
     expect((q("[data-computer-words]") as HTMLInputElement).value).toBe("");
+    await act(async () => { await new Promise(r => setTimeout(r, 60)); });
+    expect(q("[data-add-done]")).toBeNull();
   });
 
   it("maps every approve code to approved copy, never the raw error", async () => {

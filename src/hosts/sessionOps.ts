@@ -1,3 +1,4 @@
+import { fmtc } from "../ring/copy";
 import type { ProjectInfo, SessionInfo, Tab } from "../types";
 import type { AgentId } from "../agents";
 import { getShellById } from "../shells";
@@ -34,7 +35,11 @@ export type Plan =
 
 // The refusal notice for a Host that cannot start Terminals right now, or null when it can.
 export function refusal(host: HostId, ctx: OpenContext): string | null {
-  if (!ctx.isAvailable(host)) return fmt("notice.unknownHost");
+  if (!ctx.isAvailable(host)) {
+    // A Ring machine that is not listed right now is offline or has left the Ring; only an
+    // SSH Host can be "added again in Settings → Hosts".
+    return host.startsWith("r_") ? fmtc("tab.offline.state", { name: ctx.hostName(host) }) : fmt("notice.unknownHost");
+  }
   if (ctx.isUsable(host)) return null;
   const s = ctx.status(host);
   const name = ctx.hostName(host);

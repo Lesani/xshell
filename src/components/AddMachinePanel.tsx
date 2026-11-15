@@ -1,3 +1,4 @@
+import { outcomeMs } from "../ring/outcome";
 import { useEffect, useId, useRef, useState } from "react";
 import { Monitor } from "lucide-react";
 import { C, fmtc, type CopyKey } from "../ring/copy";
@@ -43,6 +44,12 @@ export function AddMachinePanel({ approve, disabled = false, note = null }: { ap
   const busy = useRef(false);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  // An outcome line describes the last action only: it goes away by itself.
+  useEffect(() => {
+    if (st.kind !== "done") return;
+    const t = window.setTimeout(() => setSt(v => (v.kind === "done" ? { kind: "idle" } : v)), outcomeMs());
+    return () => window.clearTimeout(t);
+  }, [st]);
   const inputId = useId();
   const noteId = useId();
 

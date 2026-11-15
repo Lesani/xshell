@@ -4,6 +4,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { C, fmtc, type CopyKey } from "../ring/copy";
 import { errorCode } from "../ring/setup";
 import { errorText, hostOf, isMachine, isThisMachine, kindKey, presenceChip, removeDialog, removeErrorKey, versionLine } from "../ring/members";
+import { outcomeMs } from "../ring/outcome";
 import { MachineUpdateSlot, UpdateAllSlot } from "../ring/updateSlots";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { LOCAL_HOST } from "../hosts/localHost";
@@ -37,6 +38,12 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: Rin
   const [removal, setRemoval] = useState<Removal>({ kind: "idle" });
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  // An outcome line describes the last action only: it goes away by itself.
+  useEffect(() => {
+    if (removal.kind !== "done") return;
+    const t = window.setTimeout(() => setRemoval(r => (r.kind === "done" ? { kind: "idle" } : r)), outcomeMs());
+    return () => window.clearTimeout(t);
+  }, [removal]);
 
   const run = async (m: MemberView) => {
     setRemoval({ kind: "removing", member: m });

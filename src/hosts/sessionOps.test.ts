@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 
-import { planNewChat, planNewShell, planOpenSession, type OpenContext } from "./sessionOps";
+import { planNewChat, planNewShell, planOpenSession, refusal, type OpenContext } from "./sessionOps";
 import type { ProjectInfo, SessionInfo, Tab } from "../types";
 import type { HostStatus } from "./types";
 
@@ -224,5 +224,16 @@ describe("Pi exact project session identity", () => {
     if (a.kind !== "create") throw new Error("expected create");
     expect(planOpenSession(session({ agent: "pi", project_path: "c:/work/proj/" }), undefined, [a.tab], ctx())).toEqual({ kind: "focus", tab: a.tab });
     expect(planOpenSession(session({ agent: "pi", project_path: "/Project" }), undefined, [{ ...a.tab, projectPath: "/project" }], ctx()).kind).toBe("create");
+  });
+});
+
+describe("refusal for a Host that is not listed", () => {
+  it("a Ring machine is offline, never 'add it again in Settings → Hosts'", () => {
+    const c = ctx({ isAvailable: () => false, hostName: () => "hotel" });
+    expect(refusal("r_00ff" as never, c)).toBe("hotel is offline. Reconnecting…");
+  });
+  it("an SSH Host keeps the Hosts wording", () => {
+    const c = ctx({ isAvailable: () => false });
+    expect(refusal(H as never, c)).toContain("Settings → Hosts");
   });
 });
