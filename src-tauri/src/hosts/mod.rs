@@ -105,9 +105,9 @@ fn setup_local(
     );
     let daemon = match &mode {
         local::LocalMode::Daemon { bin, source } => {
-            match local_daemon(bin.clone(), version, home) {
+            match local_daemon(bin.clone(), version, home.clone()) {
                 Ok(d) => {
-                    configure(&d, source, svc);
+                    configure(&d, source, svc, home.as_deref());
                     Some(d)
                 }
                 Err(reason) => {
@@ -144,11 +144,29 @@ fn configure(
     d: &Arc<xshell_hostlink::LocalDaemon>,
     source: &local::DaemonSource,
     svc: &Arc<service::ServiceState>,
+    home: Option<&std::path::Path>,
 ) {
     #[cfg(unix)]
     {
         d.set_persistent(true);
         d.set_serve_first(true);
+        // An older xshell window that still runs (whose GUI-bound Daemon may not have started
+        // yet) keeps this Desktop from starting the machine's Daemon (A10).
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        let socket_dirs: Vec<std::path::PathBuf> = [
+            xdg.as_deref()
+                .filter(|p| p.is_absolute())
+                .map(|x| x.join("xshell")),
+            home.map(|h| h.join(".xshell").join("run")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let presence_dir = presence::default_dir();
+        d.set_blocker(Arc::new(move || {
+            presence::older_desktop_running(&socket_dirs, &presence_dir, std::process::id())
+                .then(|| xshell_hostlink::local::OLDER_DESKTOP.to_string())
+        }));
         let svc = svc.clone();
         let hook: xshell_hostlink::local::PrepareHook = match source.clone() {
             local::DaemonSource::Missing(reason) => Arc::new(move || Err(reason.clone())),
@@ -484,6 +502,58 @@ pub fn emit_local_info(app: &AppHandle) {
     let _ = tx.lock().unwrap().send(());
 }
 
+/// Move this machine off an older or other build's Local Host Daemon by itself (Unix,
+/// ADR-0017): the same update as "Replace" (this Desktop's build is installed and selected,
+/// the old Daemon persists its Terminals and exits, the new one restores them: agents resume,
+/// shells start fresh in the same directory). Once per connection and build; on a worker,
+/// since observer callbacks may run under hostlink's locks.
+#[cfg(unix)]
+fn auto_replace_local(app: &AppHandle, s: &HostStatus) {
+    type Seen = (u64, u64, Option<xshell_protocol::build::BuildId>);
+    static WORKER: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<HostStatus>>> =
+        std::sync::OnceLock::new();
+    let version = app.package_info().version.to_string();
+    if !local::auto_replace_wanted(s, &version, crate::build_id::BUILD.as_ref()) {
+        return;
+    }
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<HostStatus>();
+        let app = app.clone();
+        let _ = std::thread::Builder::new()
+            .name("local-replace".into())
+            .spawn(move || {
+                let mut seen: Option<Seen> = None;
+                while let Ok(st) = rx.recv() {
+                    let key = (
+                        st.config_generation,
+                        st.link_generation,
+                        st.daemon_build.clone(),
+                    );
+                    if seen.as_ref() == Some(&key) {
+                        continue;
+                    }
+                    let Some(h) = app.try_state::<Hosts>() else {
+                        continue;
+                    };
+                    let Some(access) = h.manager.access(LOCAL_HOST_ID) else {
+                        continue;
+                    };
+                    seen = Some(key);
+                    eprintln!(
+                        "xshell: moving this machine's terminals to this version's background program"
+                    );
+                    access.upgrade(Box::new(|r| {
+                        if let Err(e) = r {
+                            eprintln!("xshell: the background program was not replaced: {e:?}");
+                        }
+                    }));
+                }
+            });
+        Mutex::new(tx)
+    });
+    let _ = tx.lock().unwrap().send(s.clone());
+}
+
 /// The Local Host's Daemon, reached on this user's Daemon socket (Windows: named pipe).
 fn local_daemon(
     bin: std::path::PathBuf,
@@ -531,6 +601,8 @@ impl Observer for TauriObserver {
         let _ = self.0.emit("hosts:status", s);
         if s.host == LOCAL_HOST_ID {
             emit_local_info(&self.0);
+            #[cfg(unix)]
+            auto_replace_local(&self.0, s);
         }
     }
     fn terminals(&self, host: &str, list: &[TerminalInfo]) {
@@ -880,6 +952,165 @@ mod local_readiness_tests {
         });
         std::fs::write(path, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A Daemon like 42c9be9 (the build before "Ring just works"): answers the old hello
+    /// with its own build, lists `terminals`, refuses requests it does not know, and on
+    /// `daemon.upgrade` answers and exits (its socket goes away). Returns what it was asked.
+    fn fake_old_daemon(sock: std::path::PathBuf) -> Arc<Mutex<Vec<String>>> {
+        use xshell_protocol::frame::{read_frame, write_frame, Frame, MAX_FRAME_LEN};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming().flatten() {
+                let mut r = c.try_clone().unwrap();
+                let mut w = c;
+                let send = |w: &mut std::os::unix::net::UnixStream, v: serde_json::Value| {
+                    let _ = write_frame(w, &Frame::Json(serde_json::to_vec(&v).unwrap()));
+                };
+                let mut exit = false;
+                while let Ok(Some(Frame::Json(body))) = read_frame(&mut r, MAX_FRAME_LEN) {
+                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let t = v["t"].as_str().unwrap_or("").to_string();
+                    log.lock().unwrap().push(t.clone());
+                    match t.as_str() {
+                        "hello" => {
+                            use std::io::Write as _;
+                            let hello = xshell_protocol::msg::ServerMsg::Hello(
+                                xshell_protocol::msg::Hello {
+                                    protocol: xshell_protocol::msg::ProtocolRange {
+                                        min: 1,
+                                        max: 1,
+                                    },
+                                    version: "1.5.0".into(),
+                                    capabilities: vec![
+                                        "call".into(),
+                                        "term".into(),
+                                        "daemon.upgrade".into(),
+                                    ],
+                                    build: Some(xshell_protocol::build::BuildId {
+                                        commit: "42c9be9636a9".into(),
+                                        dirty: None,
+                                        time: 1,
+                                    }),
+                                },
+                            );
+                            let _ = w.write_all(
+                                &xshell_protocol::msg::encode_msg(&hello, None).unwrap(),
+                            );
+                            send(&mut w, serde_json::json!({"t": "terminals", "list": []}));
+                        }
+                        "daemon.upgrade" => {
+                            send(
+                                &mut w,
+                                serde_json::json!({"t": "res", "id": v["id"], "ok": null}),
+                            );
+                            exit = true;
+                            break;
+                        }
+                        _ if v.get("id").is_some() => send(
+                            &mut w,
+                            serde_json::json!({"t": "res", "id": v["id"], "err": format!("unknown request {t}")}),
+                        ),
+                        _ => {}
+                    }
+                }
+                if exit {
+                    // The old Daemon exits: nothing listens any more.
+                    let _ = std::fs::remove_file(&sock);
+                    return;
+                }
+            }
+        });
+        seen
+    }
+
+    /// P2: a 42c9be9-like Daemon left running by the old Desktop is replaced by this
+    /// Desktop's build by itself: the status asks for it, the update installs and selects
+    /// this build and sends `daemon.upgrade`; no error is left for the UI.
+    #[test]
+    fn old_build_daemon_is_replaced_by_itself() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("h");
+        std::fs::create_dir_all(&home).unwrap();
+        let sock = t.path().join("d.sock");
+        let seen = fake_old_daemon(sock.clone());
+        // The app's xshelld: this Desktop's build (so the update may install it); never
+        // serves in this test.
+        let bin = t.path().join("xshelld");
+        version_script(&bin, &serde_json::json!(*crate::build_id::BUILD));
+        let d = Arc::new(
+            xshell_hostlink::LocalDaemon::new(xshell_hostlink::LocalDaemonConfig {
+                bin,
+                env: vec![],
+                home: home.clone(),
+                socket: sock,
+                version: env!("CARGO_PKG_VERSION").into(),
+                build: crate::build_id::BUILD.clone(),
+            })
+            .unwrap(),
+        );
+        d.set_persistent(true);
+        let slot: DaemonSlot = Arc::new(Mutex::new(Some(d.clone())));
+        let mut cfg = ManagerConfig::new(
+            env!("CARGO_PKG_VERSION"),
+            Arc::new(SshFactory { local: slot }),
+            Arc::new(NoBinaries),
+            Arc::new(Quiet),
+        );
+        cfg.desktop_build = crate::build_id::BUILD.clone();
+        let m = Manager::new(cfg);
+        m.set_local(local_host_config());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let st = loop {
+            let st = m.access(LOCAL_HOST_ID).unwrap().status();
+            if local::auto_replace_wanted(
+                &st,
+                env!("CARGO_PKG_VERSION"),
+                crate::build_id::BUILD.as_ref(),
+            ) || std::time::Instant::now() >= deadline
+            {
+                break st;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if crate::build_id::BUILD.is_none() {
+            return;
+        }
+        assert!(
+            local::auto_replace_wanted(
+                &st,
+                env!("CARGO_PKG_VERSION"),
+                crate::build_id::BUILD.as_ref()
+            ),
+            "{st:#?} seen {:?}",
+            seen.lock().unwrap()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.access(LOCAL_HOST_ID).unwrap().upgrade(Box::new(move |r| {
+            let _ = tx.send(r.map(|_| ()).map_err(|e| format!("{e:?}")));
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !seen.lock().unwrap().iter().any(|t| t == "daemon.upgrade") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no daemon.upgrade: {:?} / {:?}",
+                seen.lock().unwrap(),
+                rx.try_recv()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // This Desktop's build was installed and selected first.
+        let dir = d.install_dir();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".xshell/server/selected"))
+                .unwrap()
+                .trim(),
+            dir
+        );
+        d.hang_up();
+        m.shutdown();
     }
 
     /// Retry rebuilds the selection from scratch: after the stale sidecar is renamed away,
