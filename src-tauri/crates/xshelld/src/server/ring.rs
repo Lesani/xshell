@@ -2030,16 +2030,18 @@ pub(super) fn storage_test_directory() -> tempfile::TempDir {
         .unwrap()
 }
 
-/// How long the terminal-expiry refusals must span before the Daemon stops waiting.
-const EXPIRY_SPAN: Duration = Duration::from_secs(600);
-
 /// The Daemon's background membership upkeep: the removal check after the Connector
 /// reported a refusal or close as removed (retried with backoff from 5 s to 5 min, and
 /// deferred while a counterpart or standalone operation is open), and, on Unix, the
 /// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
 /// installed when enrolled, ended when not a member once its code expired.
 #[cfg(any(unix, windows))]
-pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
+/// `expiry_span`: how long the terminal-expiry refusals must span before the Daemon stops
+/// waiting (10 minutes in production).
+pub(crate) fn start_membership_maintenance(
+    d: &Arc<super::registry::Daemon>,
+    expiry_span: Duration,
+) {
     let weak = Arc::downgrade(d);
     let _ = std::thread::Builder::new()
         .name("ring-maintenance".into())
@@ -2090,7 +2092,7 @@ pub(crate) fn start_membership_maintenance(d: &Arc<super::registry::Daemon>) {
                                 expiries.push(now);
                                 if expiries.len() >= 3
                                     && now.duration_since(expiries[expiries.len() - 3])
-                                        >= EXPIRY_SPAN
+                                        >= expiry_span
                                 {
                                     let budget =
                                         xshell_core::local_ipc::RequestBudget::for_operation(

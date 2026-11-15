@@ -528,6 +528,10 @@ pub struct DesktopRingConfig {
     /// of the format-1 code that stays until the cleanup slice deletes it; never set in the
     /// app.
     pub keep_format1: bool,
+    /// How long the Relay's refusals naming terminal expiry must keep coming (three of them,
+    /// at an unchanged signed head) before this Desktop stops waiting and shows the removed
+    /// state (10 minutes; tests shorten it).
+    pub expiry_span: Duration,
 }
 
 impl DesktopRingConfig {
@@ -549,6 +553,7 @@ impl DesktopRingConfig {
             quota_probe: Duration::from_secs(10 * 60),
             quota_probe_limited: Duration::from_secs(60 * 60),
             keep_format1: false,
+            expiry_span: Duration::from_secs(600),
         }
     }
 }

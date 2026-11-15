@@ -1084,3 +1084,187 @@ fn delayed_publication_resumes_retry_then_done() {
     connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
     other.stop(xshell_protocol::ring::relay::ByeReason::quit());
 }
+
+/// The key as it appears on the wire (`signKey`).
+fn wire_key(key: &SignKey) -> String {
+    serde_json::to_value(key)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn wait_long(what: &str, limit: Duration, f: impl Fn() -> bool) {
+    let until = Instant::now() + limit;
+    while !f() {
+        assert!(Instant::now() < until, "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `c`'s Daemon has its Relay connection up.
+fn daemon_online(c: &Computer) -> bool {
+    let mut local = common::Client::connect(&c.daemon.as_ref().unwrap().socket);
+    local.hello(common::range(1, 1));
+    local
+        .request(&xshell_protocol::msg::ClientMsg::RingIdentity)
+        .is_ok_and(|r| r["ring"]["state"] == "connected")
+}
+
+/// Two Computers in one Ring whose Relay URL is `proxy`; `span` is the terminal-expiry
+/// span of the second one's Desktop and Daemon. Returns b's Desktop and Daemon wire keys.
+fn ring_behind(proxy: &FaultProxy, span: Duration) -> (Computer, Computer, String, String) {
+    let a = Computer::at_url(&proxy.url(), |_| {}, |_| Arc::new(NoSsh), |_| {});
+    a.create();
+    let b = Computer::at_url(
+        &proxy.url(),
+        |c| c.ring_expiry_span = span,
+        |_| Arc::new(NoSsh),
+        |c| c.expiry_span = span,
+    );
+    b.join(&a);
+    connected(&b);
+    wait("b's Daemon online", || daemon_online(&b));
+    let p = profile(&b);
+    let desk = wire_key(&p.keys.sign_key());
+    let daemon = wire_key(&p.companion.unwrap().daemon.sign_key);
+    (a, b, desk, daemon)
+}
+
+fn refusals(proxy: &FaultProxy, key: &str) -> Vec<Instant> {
+    proxy
+        .auths(key)
+        .into_iter()
+        .filter(|s| s.refused)
+        .map(|s| s.at)
+        .collect()
+}
+
+/// Both of b's sides are still members with their stores in place.
+fn still_member(b: &Computer, head: u64) {
+    assert_eq!(b.ring.membership_state().unwrap(), MembershipState::Member);
+    assert!(b.ring.notices().unwrap().0.is_none());
+    assert_eq!(b.ring.chain().unwrap().head().version(), head);
+    assert_eq!(daemon_chain(b).unwrap().head().version(), head);
+    assert_eq!(
+        files(&b.home.root().join("desktop"), "ring.json.removed-"),
+        0
+    );
+    assert_eq!(files(&b.home.paths().ring_dir, "roster.json.removed-"), 0);
+}
+
+/// B4 / P2-6: the Relay refuses a valid member (no signed removal exists). The Desktop
+/// and the Daemon each verify their signed history, stay members, and dial again with
+/// the normal backoff (never a tight loop); once the Relay lets them in, they are back.
+#[test]
+fn false_refusal_keeps_membership_and_reconnects_with_backoff() {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let (_a, b, desk, daemon) = ring_behind(&proxy, Duration::from_secs(600));
+    let head = b.ring.chain().unwrap().head().version();
+    proxy.set_fault(Some(Fault::RefuseAuth {
+        keys: vec![desk.clone(), daemon.clone()],
+        code: "not_member",
+        detail: None,
+    }));
+    let before = [proxy.auths(&desk).len(), proxy.auths(&daemon).len()];
+    proxy.cut();
+    wait_long(
+        "a second refusal of each side",
+        Duration::from_secs(30),
+        || refusals(&proxy, &desk).len() >= 2 && refusals(&proxy, &daemon).len() >= 2,
+    );
+    proxy.set_fault(None);
+    for key in [&desk, &daemon] {
+        let r = refusals(&proxy, key);
+        assert!(
+            r[1].duration_since(r[0]) >= Duration::from_secs(4),
+            "dialed again after {:?}: a tight loop",
+            r[1].duration_since(r[0])
+        );
+    }
+    wait_long("b back on the Relay", Duration::from_secs(40), || {
+        b.ring.view().connection == "connected" && daemon_online(&b)
+    });
+    still_member(&b, head);
+    // From the cut to the reconnection: two refusals and one admission per side, at most
+    // one more.
+    for (key, before) in [(&desk, before[0]), (&daemon, before[1])] {
+        let n = proxy.auths(key).len() - before;
+        assert!(n <= 4, "{n} attempts");
+    }
+}
+
+/// P2-6 / B5: three refusals naming terminal expiry over at least the configured span set
+/// the membership aside with the removed state, on both sides.
+#[test]
+fn expiry_refusals_over_the_span_set_the_membership_aside() {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let span = Duration::from_secs(8);
+    let (_a, b, desk, daemon) = ring_behind(&proxy, span);
+    proxy.set_fault(Some(Fault::RefuseAuth {
+        keys: vec![desk.clone(), daemon.clone()],
+        code: "not_member",
+        detail: Some("terminal_expired"),
+    }));
+    proxy.cut();
+    wait_long("b shows the removed state", Duration::from_secs(60), || {
+        b.ring.membership_state() == Ok(MembershipState::Removed) && b.ring.chain().is_none()
+    });
+    assert!(b.ring.notices().unwrap().0.is_some(), "the removal notice");
+    wait_long(
+        "b's Daemon set its membership aside",
+        Duration::from_secs(60),
+        || {
+            !b.home.paths().ring_dir.join("roster.json").exists()
+                && files(&b.home.paths().ring_dir, "roster.json.removed-") > 0
+        },
+    );
+    for key in [&desk, &daemon] {
+        let r = refusals(&proxy, key);
+        assert!(r.len() >= 3, "{} refusals", r.len());
+        assert!(r[2].duration_since(r[0]) >= span);
+    }
+}
+
+/// The opposite cases: one expiry refusal, three plain refusals, or three expiry refusals
+/// within less than the span keep the membership; the machine reconnects by itself.
+fn refusals_keep_membership(n: usize, detail: Option<&'static str>, span: Duration) {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let (_a, b, desk, daemon) = ring_behind(&proxy, span);
+    let head = b.ring.chain().unwrap().head().version();
+    proxy.set_fault(Some(Fault::RefuseAuth {
+        keys: vec![desk.clone(), daemon.clone()],
+        code: "not_member",
+        detail,
+    }));
+    proxy.cut();
+    wait_long("the refusals", Duration::from_secs(40), || {
+        refusals(&proxy, &desk).len() >= n && refusals(&proxy, &daemon).len() >= n
+    });
+    proxy.set_fault(None);
+    // The next dial is admitted; any set-aside would have happened before it.
+    wait_long("b back on the Relay", Duration::from_secs(60), || {
+        b.ring.view().connection == "connected" && daemon_online(&b)
+    });
+    still_member(&b, head);
+    assert_eq!(refusals(&proxy, &desk).len(), n);
+    assert_eq!(refusals(&proxy, &daemon).len(), n);
+}
+
+#[test]
+fn a_single_expiry_refusal_keeps_membership() {
+    refusals_keep_membership(1, Some("terminal_expired"), Duration::ZERO);
+}
+
+#[test]
+fn plain_refusals_keep_membership() {
+    refusals_keep_membership(3, None, Duration::from_secs(1));
+}
+
+#[test]
+fn expiry_refusals_within_less_than_the_span_keep_membership() {
+    refusals_keep_membership(3, Some("terminal_expired"), Duration::from_secs(120));
+}

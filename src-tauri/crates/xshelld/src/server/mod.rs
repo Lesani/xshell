@@ -124,6 +124,10 @@ pub struct Config {
     pub ring_backoff_unit: Duration,
     /// The Relay client's timeouts (tests shorten them).
     pub ring_timeouts: xshell_protocol::ring::relay::RingTimeouts,
+    /// How long the Relay's refusals naming terminal expiry must keep coming (three of them,
+    /// at an unchanged signed head) before the Daemon sets its membership aside (10 minutes;
+    /// tests shorten it).
+    pub ring_expiry_span: Duration,
     /// Pushes to one Mobile go out at most once per window (leading and trailing).
     pub push_window: Duration,
     /// How long a push waits for the Relay's answer; past it the outcome is unknown and the
@@ -578,6 +582,7 @@ impl Config {
             abort: None,
             ring_backoff_unit: Duration::from_secs(1),
             ring_timeouts: Default::default(),
+            ring_expiry_span: Duration::from_secs(600),
             push_window: Duration::from_secs(10),
             push_timeout: Duration::from_secs(20),
             push_retry: Duration::from_secs(2),
@@ -766,6 +771,8 @@ impl Server {
             cfg.max_session_queue,
         );
         let drops = drops::Drops::new(cfg.drop_grace);
+        #[cfg(any(unix, windows))]
+        let expiry_span = cfg.ring_expiry_span;
         let d = Arc::new(Daemon {
             cfg,
             drops,
@@ -826,7 +833,7 @@ impl Server {
         d.ring.resume();
         // Removal detection and unfinished standalone pairing are finished in the background.
         #[cfg(any(unix, windows))]
-        ring::start_membership_maintenance(&d);
+        ring::start_membership_maintenance(&d, expiry_span);
         let da = d.clone();
         let ds = d.clone();
         let threads = std::thread::Builder::new()

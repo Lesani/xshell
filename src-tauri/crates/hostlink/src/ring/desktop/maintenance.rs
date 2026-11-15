@@ -54,8 +54,6 @@ const REMOVAL_MIN: Duration = Duration::from_secs(5);
 const REMOVAL_MAX: Duration = Duration::from_secs(300);
 /// The first reconnect delay after a refusal at an unchanged head.
 const MEMBER_MIN: Duration = Duration::from_secs(5);
-/// How long the terminal-expiry refusals must span before the Desktop stops waiting.
-const EXPIRY_SPAN: Duration = Duration::from_secs(600);
 
 /// Format-1 state this build no longer supports (D2a): a format-1 head, a singleton Desktop
 /// of a format-2 Ring (it needed the old local completion), or format-1 work (Upgrade, local
@@ -377,7 +375,7 @@ impl DesktopRing {
                                     let n = st.expiries.len();
                                     let expired = n >= 3
                                         && st.expiries[n - 1].duration_since(st.expiries[n - 3])
-                                            >= EXPIRY_SPAN;
+                                            >= ring.cfg.expiry_span;
                                     (wait, expired)
                                 };
                                 if expired {
