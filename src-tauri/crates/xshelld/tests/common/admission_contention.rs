@@ -150,22 +150,18 @@ impl ObservedChild {
                     break;
                 };
                 let at = state.started.unwrap().elapsed();
-                if line.starts_with("Getting a Device Code from xshell on this computer") {
+                if line == "Waiting for another device to add this machine..." {
                     state.events.push((at, "pending"));
                     state.pending = true;
-                } else if let Some(words) = line.strip_prefix("Device code: ") {
+                } else if let Ok(code) = DeviceCode::parse(&line) {
                     state.events.push((at, "words"));
-                    if let Ok(code) = DeviceCode::parse(words) {
-                        state.words.push(code);
-                    } else {
-                        state.unknown += 1;
-                    }
-                } else if line.starts_with("Pairing request expired.") {
+                    state.words.push(code);
+                } else if line == "These words have expired. Run xshelld pair again for new words." {
                     state.events.push((at, "expired"));
                     state.expired = true;
                 } else if line
-                    != "In xshell, open Settings -> Hosts -> Ring and enter these eight words."
-                    && !line.starts_with("One use; ")
+                    != "Type these eight words on a machine or phone already in your Ring. On a machine, open Settings > Ring > Add a machine."
+                    && line != "These words work once, for 10 minutes, while this command is running."
                 {
                     state.unknown += 1;
                 }
@@ -183,7 +179,7 @@ impl ObservedChild {
                 state.stderr_lines.push(line.clone());
                 match line.as_str() {
                     "xshelld: Computer pairing ended without installation" => state.ended_without_installation = true,
-                    "xshelld: Pairing cancelled" => state.cancelled = true,
+                    "These words were cancelled. Run xshelld pair again for new words." => state.cancelled = true,
                     "xshelld: xshell on this computer stopped answering; the code is no longer valid. If pairing had begun, xshell finishes it automatically." => state.owner_disconnected = true,
                     _ => state.unknown += 1,
                 }

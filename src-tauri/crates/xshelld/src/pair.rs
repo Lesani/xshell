@@ -27,7 +27,89 @@ pub const EXPIRED_EXIT: i32 = 5;
 enum Failure {
     Expired,
     ComputerExpired,
+    /// The service could not be reached before anything was uncertain.
+    Offline,
+    /// The user stopped the command (Ctrl-C).
+    Cancelled,
+    /// Approved; the machine finishes the Join by itself.
+    Finishing,
     Other(String),
+}
+
+// What `xshelld pair` prints: the approved copy (plans/copy-rjw-desktop.md section 13,
+// keys `cli.pair.*`), verbatim.
+const INSTRUCTION: &str = "Type these eight words on a machine or phone already in your Ring. On a machine, open Settings > Ring > Add a machine.";
+const LIFETIME: &str = "These words work once, for 10 minutes, while this command is running.";
+const WAITING: &str = "Waiting for another device to add this machine...";
+const EXPIRED: &str = "These words have expired. Run xshelld pair again for new words.";
+const OFFLINE: &str =
+    "Can't reach the service. Check your connection, then run xshelld pair again.";
+// COPY-GAP: no approved line for a pair command stopped with Ctrl-C; modelled on
+// `cli.pair.expired`.
+const CANCELLED: &str = "These words were cancelled. Run xshelld pair again for new words.";
+// COPY-GAP: no approved headless line for an approved Join that finishes automatically;
+// `finish.body` (section 8).
+const FINISHING: &str =
+    "xshell is checking whether this machine joined your Ring. You do not need to do anything.";
+
+/// `cli.pair.done.one` / `cli.pair.done.other`.
+fn done_line(machines: usize) -> String {
+    if machines == 1 {
+        "Added this machine to your Ring. Your Ring has 1 machine.".into()
+    } else {
+        format!("Added this machine to your Ring. Your Ring has {machines} machines.")
+    }
+}
+
+/// COPY-GAP: no approved line for `pair` on a machine already in a Ring; modelled on
+/// `cli.pair.done.*`.
+fn already_line(machines: usize) -> String {
+    if machines == 1 {
+        "This machine is already in your Ring. Your Ring has 1 machine.".into()
+    } else {
+        format!("This machine is already in your Ring. Your Ring has {machines} machines.")
+    }
+}
+
+/// The machines in the Ring: its Computer, standalone Host and legacy Desktop units, not
+/// its phones.
+fn machines(chain: &xshell_protocol::ring::RosterChain) -> usize {
+    use xshell_protocol::ring::membership::EnrollmentKind;
+    chain
+        .head()
+        .roster()
+        .membership()
+        .map(|m| {
+            m.enrollments
+                .iter()
+                .filter(|u| u.kind != EnrollmentKind::Mobile)
+                .count()
+        })
+        .unwrap_or_else(|_| {
+            chain
+                .head()
+                .roster()
+                .members
+                .iter()
+                .filter(|m| m.role != xshell_protocol::ring::Role::Mobile)
+                .count()
+        })
+}
+
+/// The format-2 Ring this Host's Daemon is an authorized member of, from its own store
+/// (format-1 state is set aside by the Daemon, never reported as a membership).
+fn current_ring(store: &Store) -> Option<xshell_protocol::ring::RosterChain> {
+    let chain = store.read_chain().ok()??;
+    if chain.head().roster().v != 2
+        || xshell_protocol::ring::membership::unsupported_stored_membership(chain.head())
+    {
+        return None;
+    }
+    let keys = store.load_keys().ok()??;
+    chain
+        .authorized_member(&keys.sign_key())
+        .is_some()
+        .then_some(chain)
 }
 
 impl From<String> for Failure {
@@ -59,11 +141,20 @@ fn run_pair_cancel(
     match pair_cancel(opts, paths, out, cancel) {
         Ok(()) => 0,
         Err(Failure::Expired | Failure::ComputerExpired) => {
-            let _ = writeln!(
-                out,
-                "Pairing request expired. Reconcile any recorded outcome in xshell before explicitly requesting a new code."
-            );
+            let _ = writeln!(out, "{EXPIRED}");
             EXPIRED_EXIT
+        }
+        Err(Failure::Offline) => {
+            eprintln!("{OFFLINE}");
+            1
+        }
+        Err(Failure::Cancelled) => {
+            eprintln!("{CANCELLED}");
+            1
+        }
+        Err(Failure::Finishing) => {
+            eprintln!("{FINISHING}");
+            1
         }
         Err(Failure::Other(message)) => {
             eprintln!("xshelld: {message}");
@@ -104,50 +195,51 @@ fn pair_cancel(
         .clone()
         .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
     RelayUrl::parse(&relay).map_err(|_| "invalid Pair Relay".to_string())?;
+    if let Some(chain) = current_ring(&store) {
+        return writeln!(out, "{}", already_line(machines(&chain)))
+            .and_then(|()| out.flush())
+            .map_err(|e| Failure::Other(e.to_string()));
+    }
     if crate::server::ring::companion_registered(&paths.ring_dir) {
         return registered_computer_pair(&store, &relay, out, cancel);
     }
     let lifetime = ttl();
-    let until = Instant::now() + lifetime;
-    crate::server::adoption::adopt_standalone_command(
+    let chain = crate::server::adoption::adopt_standalone_command(
         paths,
         &relay,
         opts.name.as_deref(),
         lifetime,
         cancel,
-        |code| print_words(out, code, &relay, until),
+        |code| print_words(out, code, true),
     )
     .map_err(|error| {
         if error == "the code expired" {
             Failure::Expired
+        } else if cancel.load(Ordering::Acquire) {
+            Failure::Cancelled
+        } else if error.contains("cannot reach the relay") {
+            Failure::Offline
         } else {
             Failure::Other(error)
         }
     })?;
-    writeln!(out, "Paired this standalone Host.")
+    writeln!(out, "{}", done_line(machines(&chain)))
         .and_then(|()| out.flush())
         .map_err(|e| e.to_string())?;
     Ok(())
 }
-fn print_words(
-    out: &mut dyn Write,
-    code: &DeviceCode,
-    relay: &str,
-    until: Instant,
-) -> Result<(), String> {
-    writeln!(out, "Device code: {}", code.format().as_str())
+/// The words on a line of their own, where to type them, how long they work, and (unless
+/// it was printed already) that the command waits.
+fn print_words(out: &mut dyn Write, code: &DeviceCode, waiting: bool) -> Result<(), String> {
+    writeln!(out, "{}", code.format().as_str())
+        .and_then(|()| writeln!(out, "{INSTRUCTION}"))
+        .and_then(|()| writeln!(out, "{LIFETIME}"))
         .and_then(|()| {
-            writeln!(
-                out,
-                "In xshell, open Settings -> Hosts -> Ring and enter these eight words."
-            )
-        })
-        .and_then(|()| {
-            writeln!(
-                out,
-                "One use; {} seconds remaining in this command. Relay: {relay}",
-                until.saturating_duration_since(Instant::now()).as_secs()
-            )
+            if waiting {
+                writeln!(out, "{WAITING}")
+            } else {
+                Ok(())
+            }
         })
         .and_then(|()| out.flush())
         .map_err(|_| "Pair origin output closed".into())
@@ -188,7 +280,9 @@ fn registered_computer_pair(
         relay_url: relay.into(),
         expires_at,
     };
-    writeln!(out, "Getting a Device Code from xshell on this computer…")
+    // COPY-GAP: no approved line while xshell on this machine prepares the words;
+    // `cli.pair.waiting`.
+    writeln!(out, "{WAITING}")
         .and_then(|()| out.flush())
         .map_err(|_| "Pair origin output closed".to_string())?;
     let mut client = None;
@@ -237,7 +331,7 @@ fn registered_computer_pair(
             if cancel.load(Ordering::Acquire) || Instant::now() >= until {
                 break;
             }
-            if let Err(error) = print_words(out, &offer.code, relay, until) {
+            if let Err(error) = print_words(out, &offer.code, false) {
                 result = Err(Failure::Other(error));
                 break;
             }
@@ -245,20 +339,22 @@ fn registered_computer_pair(
         }
         match status {
             S::Installed => {
-                result = writeln!(
-                    out,
-                    "Paired this Computer; both local stores are installed."
-                )
-                .and_then(|()| out.flush())
-                .map_err(|_| Failure::Other("Pair origin output closed".into()));
+                let count = current_ring(store).map_or(1, |chain| machines(&chain));
+                result = writeln!(out, "{}", done_line(count))
+                    .and_then(|()| out.flush())
+                    .map_err(|_| Failure::Other("Pair origin output closed".into()));
                 break;
             }
             S::ComputerPending | S::SlotReady | S::AwaitingConfirmation | S::Completing => {}
             S::Expired => break,
             S::ReconciliationRequired => {
-                result = Err(Failure::Other(
-                    "Finishing on this computer; xshell completes it automatically".into(),
-                ));
+                result = Err(Failure::Finishing);
+                break;
+            }
+            // Ended before any words were shown: the service could not be reached (an
+            // existing membership was answered before the command started).
+            S::Failed if !printed => {
+                result = Err(Failure::Offline);
                 break;
             }
             _ => {
@@ -273,7 +369,7 @@ fn registered_computer_pair(
         );
     }
     if cancel.load(Ordering::Acquire) {
-        result = Err(Failure::Other("Pairing cancelled".into()));
+        result = Err(Failure::Cancelled);
     }
     if let Some(mut connected) = client {
         // Cleanup only: never a fresh Start, owner, offer or lifetime.

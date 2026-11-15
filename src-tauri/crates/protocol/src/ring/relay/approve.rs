@@ -317,9 +317,19 @@ pub fn prepare_approval(
 /// and the answer to the joining machine. [`ApproveError::Uncertain`]: the Enroll may have
 /// been published; [`resume_approval`] decides. [`ApproveError::Conflict`]: the head moved
 /// after consent; nothing was enrolled.
-pub fn publish_approval(prepared: PreparedApproval) -> Result<ApprovedDevice, ApproveError> {
+///
+/// `on_record` is called with the updated operation before anything it describes newly is
+/// sent: when the standalone removal is retried after a conflict, with `replaced` set to
+/// the fresh removal. The caller stores it in place of [`PreparedApproval::op`] so that
+/// [`resume_approval`] judges what may still land; an `Err` sends nothing more. The
+/// Enroll's own conflict retry re-sends the identical signed bytes (the joining keys'
+/// consent binds them), so it needs no new record.
+pub fn publish_approval(
+    prepared: PreparedApproval,
+    on_record: &mut dyn FnMut(&ApprovalOp) -> Result<(), String>,
+) -> Result<ApprovedDevice, ApproveError> {
     let PreparedApproval {
-        op,
+        mut op,
         read,
         connector,
         keys,
@@ -329,12 +339,19 @@ pub fn publish_approval(prepared: PreparedApproval) -> Result<ApprovedDevice, Ap
     let stopped = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Acquire));
     let deadline = Instant::now() + HEAD_WAIT;
     let mut after = 0;
-    if let Some(removal) = &op.replaced {
+    if let Some(removal) = op.replaced.clone() {
         if stopped() {
             read.refuse(&PairError::Cancelled);
             return Err(ApproveError::Cancelled);
         }
-        match publish_removal(&connector, &*keys, removal, deadline) {
+        let result = publish_removal(&connector, &*keys, &removal, deadline, &mut |fresh| {
+            let mut next = op.clone();
+            next.replaced = Some(fresh.clone());
+            on_record(&next)?;
+            op = next;
+            Ok(())
+        });
+        match result {
             Ok(chain) => after = chain.head().version(),
             Err(e) => {
                 let e = match e {
@@ -466,8 +483,12 @@ pub fn approve_device_code(
     cancel: Option<&Cancel>,
 ) -> Result<ApprovedDevice, ApproveError> {
     let prepared = prepare_approval(connector.clone(), keys, code, opts, cancel)?;
-    let op = prepared.op().clone();
-    match publish_approval(prepared) {
+    let mut op = prepared.op().clone();
+    let result = publish_approval(prepared, &mut |next| {
+        op = next.clone();
+        Ok(())
+    });
+    match result {
         Err(ApproveError::Uncertain) => match resume_approval(connector, &op) {
             Resume::Done(device) => Ok(device),
             _ => Err(ApproveError::Uncertain),

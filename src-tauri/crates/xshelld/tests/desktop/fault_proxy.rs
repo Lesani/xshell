@@ -7,6 +7,9 @@
 //!   connection is dropped (a lost acknowledgment after the Relay stored a publication);
 //! - [`Fault::HoldFrom`]: the frame and everything after it on that connection are held
 //!   until [`FaultProxy::release`] (a publication that has not landed yet);
+//! - [`Fault::LostFrom`]: both at once from the `n`th such frame (counted from 1, on Ring
+//!   connections, since the fault was set): held, and nothing the Relay says reaches the
+//!   client;
 //! - [`Fault::RefuseAuth`]: an `auth` from one of the listed keys never reaches the Relay;
 //!   the proxy answers it as a Relay refusal (`error` frame, close 4003).
 //!
@@ -23,6 +26,7 @@ use std::time::Instant;
 pub enum Fault {
     DeafAfter(&'static str),
     HoldFrom(&'static str),
+    LostFrom(&'static str, usize),
     RefuseAuth {
         keys: Vec<String>,
         code: &'static str,
@@ -48,6 +52,8 @@ struct Shared {
     seen: Mutex<Vec<Seen>>,
     /// Bytes held by [`Fault::HoldFrom`], per connection, in order.
     held: Mutex<Vec<(Arc<Conn>, Vec<u8>)>>,
+    /// Frames of the [`Fault::LostFrom`] type seen since the fault was set.
+    counted: std::sync::atomic::AtomicUsize,
 }
 
 struct Conn {
@@ -126,6 +132,7 @@ impl FaultProxy {
 
     pub fn set_fault(&self, fault: Option<Fault>) {
         *self.shared.fault.lock().unwrap() = fault;
+        self.shared.counted.store(0, Ordering::Release);
     }
 
     pub fn set_down(&self, down: bool) {
@@ -276,10 +283,17 @@ fn upward(conn: Arc<Conn>, shared: Arc<Shared>) {
                 conn.close();
                 return;
             }
-            if let Some(Fault::HoldFrom(at)) = &fault {
-                if t == *at {
+            match &fault {
+                Some(Fault::HoldFrom(at)) if t == *at => {
                     conn.holding.store(true, Ordering::Release);
                 }
+                Some(Fault::LostFrom(at, n))
+                    if t == *at && shared.counted.fetch_add(1, Ordering::AcqRel) + 1 >= *n =>
+                {
+                    conn.holding.store(true, Ordering::Release);
+                    conn.deaf.store(true, Ordering::Release);
+                }
+                _ => {}
             }
             if !forward(&conn, &shared, &raw) {
                 conn.close();

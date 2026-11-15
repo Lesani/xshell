@@ -165,7 +165,7 @@ fn expired_pending(f: &Fixture) {
     let (mut child, rx) = f.pair_on_relay(450, Some(&relay));
     let line = rx.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(
-        line.starts_with("Getting a Device Code from xshell on this computer"),
+        line == "Waiting for another device to add this machine...",
         "{line}"
     );
     assert!(
@@ -180,10 +180,11 @@ fn expired_pending(f: &Fixture) {
     );
     let rest: Vec<_> = rx.iter().collect();
     assert!(!rest.iter().any(|line| line.starts_with("Pairing code:")
-        || line.starts_with("Device code:")
-        || line.starts_with("Paired as")));
-    assert!(rest.iter().any(|line| line
-        == "Pairing request expired. Reconcile any recorded outcome in xshell before explicitly requesting a new code."));
+        || xshell_protocol::ring::device_code::DeviceCode::parse(line).is_ok()
+        || line.starts_with("Added this machine")));
+    assert!(rest
+        .iter()
+        .any(|line| line == "These words have expired. Run xshelld pair again for new words."));
     assert_no_membership(f);
 }
 #[test]
@@ -215,10 +216,10 @@ fn fresh_unpaired_startup_registers_then_gui_close_actual_cli_stays_computer_pen
     drop(ring);
     expired_pending(&f);
     let (mut cancel, rx) = f.pair(5_000);
-    assert!(rx
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap()
-        .starts_with("Getting a Device Code from xshell on this computer"));
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).unwrap()
+            == "Waiting for another device to add this machine..."
+    );
     unsafe {
         libc::kill(cancel.0.id() as i32, libc::SIGINT);
     }
@@ -798,7 +799,9 @@ fn stalled_administration_cli(stall_hello: bool) {
         elapsed < Duration::from_millis(600),
         "original 200ms CLI TTL extended by fresh IO budgets: {elapsed:?}"
     );
-    assert!(!rx.iter().any(|line| line.starts_with("Device code:")));
+    assert!(!rx
+        .iter()
+        .any(|line| xshell_protocol::ring::device_code::DeviceCode::parse(&line).is_ok()));
     assert!(!f.daemon_dir().join("keys.json").exists());
 }
 #[test]
@@ -1003,7 +1006,9 @@ fn actual_cli_cancel_cleanup_is_limited_to_explicit_100ms_allowance() {
         elapsed < Duration::from_millis(600),
         "200ms TTL plus explicit 100ms cleanup exceeded margin: {elapsed:?}"
     );
-    assert!(!rx.iter().any(|line| line.starts_with("Device code:")));
+    assert!(!rx
+        .iter()
+        .any(|line| xshell_protocol::ring::device_code::DeviceCode::parse(&line).is_ok()));
 }
 
 #[test]
@@ -1048,7 +1053,7 @@ fn actual_registered_cli_expires_while_classification_lock_is_still_held() {
     assert!(!f.daemon_dir().join("roster.json").exists());
     assert!(f.daemon_dir().join("companion-pending.json").exists());
     assert!(!lines.iter().any(|line| line.starts_with("Pairing code:")
-        || line.starts_with("Device code:")
+        || xshell_protocol::ring::device_code::DeviceCode::parse(line).is_ok()
         || line.starts_with("Paired as")));
     drop(lock);
     assert!(
@@ -1056,8 +1061,9 @@ fn actual_registered_cli_expires_while_classification_lock_is_still_held() {
         "original 200ms deadline must expire before classification lock release"
     );
     assert_eq!(status.code(), Some(5));
-    assert!(lines.iter().any(|line| line
-        == "Pairing request expired. Reconcile any recorded outcome in xshell before explicitly requesting a new code."));
+    assert!(lines
+        .iter()
+        .any(|line| line == "These words have expired. Run xshelld pair again for new words."));
 }
 
 fn test_offer(expires_at: u64) -> xshell_hostlink::ring::adoption::JoinOfferInput {

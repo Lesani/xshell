@@ -431,7 +431,7 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
             head,
             "prepare publishes nothing"
         );
-        let device = publish_approval(prepared).unwrap();
+        let device = publish_approval(prepared, &mut |_| Ok(())).unwrap();
         assert!(matches!(resume_approval(&connector, &op), Resume::Done(_)));
         assert_eq!(device.kind, EnrollmentKind::Computer);
         assert_eq!(device.names.len(), 2);
@@ -482,7 +482,14 @@ fn mobile_identity_approves_computer_code_and_removes_it() {
     // A lost answer after it landed: resume reads the chain and finds it done; a second
     // publication of the same bytes is harmless.
     assert!(matches!(resume_removal(&connector, &op), Resume::Done(_)));
-    publish_removal(&connector, &*phone_keys, &op, Instant::now() + WAIT).unwrap();
+    publish_removal(
+        &connector,
+        &*phone_keys,
+        &op,
+        Instant::now() + WAIT,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
     // Already gone: done, not an error.
     assert_eq!(
         prepare_removal(&connector, &*phone_keys, &unit.id).unwrap_err(),
@@ -605,6 +612,7 @@ fn mobile_approval_dies_after_standalone_removal_resume_says_not_done() {
             &*phone_keys,
             op.replaced.as_ref().unwrap(),
             Instant::now() + WAIT,
+            &mut |_| Ok(()),
         )
         .unwrap();
         drop(prepared);
@@ -897,7 +905,7 @@ fn lost_acknowledgement_of_approval_and_removal_resumes_done_without_duplicates(
         let op = prepared.op().clone();
         // The Enroll reaches the Relay; nothing the Relay says after it reaches the phone.
         proxy.set_fault(Some(Fault::DeafAfter("roster.put")));
-        let publishing = scope.spawn(move || publish_approval(prepared));
+        let publishing = scope.spawn(move || publish_approval(prepared, &mut |_| Ok(())));
         wait_head(&a, start + 1);
         // Stored. The phone's connection then drops and stays down for a while.
         proxy.set_down(true);
@@ -970,6 +978,7 @@ fn lost_acknowledgement_of_approval_and_removal_resumes_done_without_duplicates(
                 &*phone_keys,
                 &removal,
                 Instant::now() + Duration::from_secs(3),
+                &mut |_| Ok(()),
             )
         });
         wait_head(&a, candidate.version());
@@ -1033,7 +1042,7 @@ fn delayed_publication_resumes_retry_then_done() {
         .unwrap();
         let op = prepared.op().clone();
         proxy.set_fault(Some(Fault::HoldFrom("roster.put")));
-        let publishing = scope.spawn(move || publish_approval(prepared));
+        let publishing = scope.spawn(move || publish_approval(prepared, &mut |_| Ok(())));
         wait("the Enroll is on its way", || proxy.holding());
         // The chain is readable and lacks the unit; the code is still shown.
         let pin = xshell_protocol::ring::relay::ChainPin {
@@ -1550,4 +1559,161 @@ fn daemon_membership_survives_restart_and_catches_up() {
     assert_eq!(daemon_chain(&b).unwrap().head(), &head);
     wait("b's Daemon online after the restart", || daemon_online(&b));
     assert_eq!(b.ring.membership_state().unwrap(), MembershipState::Member);
+}
+
+/// A removal whose first candidate loses its slot is retried with a fresh signature; the
+/// caller journals that replacement before it is sent. Its answer is lost (held, then the
+/// connection drops): a resume with the journaled replacement is never `NotDone` while it
+/// can still land, and ends `Done` with exactly one removal.
+#[test]
+fn removal_conflict_retry_is_journaled_and_resumes_done_after_a_lost_answer() {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let a = Computer::new(&relay);
+    a.create();
+    let (phone_keys, connector) = phone_dialing(&a, 36, Some(proxy.url()));
+    let (_other_keys, other) = phone(&a, 37);
+    let b = Computer::new(&relay);
+    b.join(&a);
+    let c = Computer::new(&relay);
+    let joined = c.join(&a);
+    let v = joined.head().version();
+    wait("phone at the head", || {
+        connector.chain().head().version() == v
+    });
+    let b_unit = joined
+        .head()
+        .roster()
+        .membership()
+        .unwrap()
+        .unit_for(&profile(&b).keys.sign_key())
+        .unwrap()
+        .id
+        .clone();
+    // The phone stores its removal of b on head v; meanwhile another device takes v+1.
+    let original = prepare_removal(&connector, &*phone_keys, &b_unit).unwrap();
+    connected(&a);
+    a.ring.remove_member(&profile(&c).keys.sign_key()).unwrap();
+    wait("phone saw the winning head", || {
+        connector.chain().head().version() == v + 1
+    });
+    // The first candidate is refused locally (its slot is taken); the retry is the first
+    // upload: it stays on its way, and the phone hears nothing more.
+    proxy.set_fault(Some(Fault::LostFrom("roster.put", 1)));
+    let journal = std::sync::Mutex::new(original.clone());
+    let publishing = std::thread::scope(|scope| {
+        let publishing = scope.spawn(|| {
+            publish_removal(
+                &connector,
+                &*phone_keys,
+                &original,
+                Instant::now() + Duration::from_secs(4),
+                &mut |fresh| {
+                    *journal.lock().unwrap() = fresh.clone();
+                    Ok(())
+                },
+            )
+        });
+        wait("the retry is on its way", || proxy.holding());
+        let stored = journal.lock().unwrap().clone();
+        assert_eq!(a.ring.chain().unwrap().head().version(), v + 1);
+        // Resumed from the journal on another device while the retry has not landed: never
+        // NotDone (it re-sends the identical replacement, which lands).
+        match resume_removal(&other, &stored) {
+            Resume::Done(chain) => assert_eq!(chain.get(v + 2), stored.candidate().ok().as_ref()),
+            r => panic!("the replacement can still land: {r:?}"),
+        }
+        // The phone's answer is lost: its connection drops with the retry still held.
+        proxy.set_down(true);
+        proxy.cut();
+        publishing.join().unwrap()
+    });
+    assert_eq!(publishing.unwrap_err(), RemoveError::Uncertain);
+    proxy.set_fault(None);
+    proxy.set_down(false);
+    phone_connected(&connector);
+    let stored = journal.lock().unwrap().clone();
+    let removed = match resume_removal(&connector, &stored) {
+        Resume::Done(chain) => chain,
+        r => panic!("{r:?}"),
+    };
+    let replacement = stored.candidate().unwrap();
+    assert_eq!(removed.get(v + 2), Some(&replacement));
+    assert_eq!(removed.head().version(), v + 2, "exactly one removal");
+    assert_eq!(
+        xshell_protocol::ring::relay::contract::relay_version(&relay.target(), removed.ring_id()),
+        v + 2
+    );
+    wait_removed(&b);
+    connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
+    other.stop(xshell_protocol::ring::relay::ByeReason::quit());
+}
+
+/// The same for an approval's standalone-removal stage: its conflict retry is handed to
+/// the caller as an updated operation before it is sent, and the approval completes.
+#[test]
+fn approval_standalone_removal_retry_is_journaled_before_it_is_sent() {
+    let relay = Relay::start();
+    let a = Computer::new(&relay);
+    a.create();
+    let (phone_keys, connector) = phone(&a, 38);
+    let c = Computer::new(&relay);
+    c.join(&a);
+    let b = Computer::new(&relay);
+    standalone(b.daemon.as_ref().unwrap(), &a, &relay.url());
+    let head = a.ring.chain().unwrap().head().version();
+    wait("phone has the standalone head", || {
+        connector.chain().head().version() == head
+    });
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b.ring.begin_join(&b.companion()).unwrap();
+    let code = offer.code.clone();
+    std::thread::scope(|scope| {
+        let joining = scope.spawn(|| offer.wait());
+        let prepared = prepare_approval(
+            connector.clone(),
+            phone_keys.clone(),
+            &code,
+            &PairOptions::default(),
+            None,
+        )
+        .unwrap();
+        let original = prepared.op().clone();
+        assert!(original.replaced.is_some());
+        // Another device takes the slot the stored standalone removal was signed for.
+        connected(&a);
+        a.ring.remove_member(&profile(&c).keys.sign_key()).unwrap();
+        wait("phone saw the winning head", || {
+            connector.chain().head().version() == head + 1
+        });
+        let mut records = Vec::new();
+        let device = publish_approval(prepared, &mut |next| {
+            // Nothing of the retry has reached the Relay yet.
+            assert_eq!(
+                xshell_protocol::ring::relay::contract::relay_version(
+                    &relay.target(),
+                    &next.ring_id
+                ),
+                head + 1
+            );
+            records.push(next.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(records.len(), 1, "one replacement record");
+        let record = &records[0];
+        assert_ne!(record.replaced, original.replaced);
+        assert_eq!(record.operation, original.operation);
+        let fresh = record.replaced.as_ref().unwrap().candidate().unwrap();
+        assert_eq!(device.chain.get(head + 2), Some(&fresh));
+        match resume_approval(&connector, record) {
+            Resume::Done(d) => assert_eq!(d.chain.head().version(), head + 3),
+            r => panic!("{r:?}"),
+        }
+        assert!(matches!(
+            joining.join().unwrap().unwrap(),
+            AdoptionOutcome::Installed { .. }
+        ));
+    });
+    connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
 }
