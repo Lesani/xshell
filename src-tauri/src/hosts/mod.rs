@@ -172,6 +172,11 @@ fn configure(
             local::DaemonSource::Missing(reason) => Arc::new(move || Err(reason.clone())),
             local::DaemonSource::Embedded => {
                 let bin = d.bin().to_path_buf();
+                // Installed now, not only when nothing listens: replacing a Daemon that runs
+                // (an older build's) installs and selects this file first.
+                if let Err(e) = install_embedded(&bin) {
+                    eprintln!("xshell: {e}");
+                }
                 Arc::new(move || {
                     install_embedded(&bin)?;
                     svc.wait_first(service::FIRST_WAIT);
