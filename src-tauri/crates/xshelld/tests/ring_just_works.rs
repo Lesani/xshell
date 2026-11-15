@@ -5,11 +5,14 @@
 //! set aside, a standalone Daemon that joins as a Computer in one approval, and the
 //! Mobile's approve/remove library (`relay::approve`, `relay::remove`) with its resume.
 mod common;
+#[path = "desktop/fault_proxy.rs"]
+mod fault_proxy;
 #[path = "desktop/relay_fixture.rs"]
 mod fixture;
 #[allow(dead_code)]
 #[path = "desktop/workerd.rs"]
 mod workerd;
+use fault_proxy::{Fault, FaultProxy};
 use fixture::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -74,6 +77,12 @@ fn daemon_chain(c: &Computer) -> Option<RosterChain> {
 
 /// A phone in `c`'s Ring (through its v2 QR offer), with its own running Connector.
 fn phone(c: &Computer, n: u8) -> (Arc<DeviceKeys>, Arc<Connector>) {
+    phone_dialing(c, n, None)
+}
+
+/// [`phone`] whose Connector dials `dial` (a fault proxy in front of the Relay) instead of
+/// the Relay its head names.
+fn phone_dialing(c: &Computer, n: u8, dial: Option<String>) -> (Arc<DeviceKeys>, Arc<Connector>) {
     connected(c);
     let keys = Arc::new(DeviceKeys::from_seeds(&[n; 32], &[n.wrapping_add(100); 32]));
     let shown = c.ring.pair_phone(Arc::new(Quiet)).unwrap();
@@ -92,12 +101,14 @@ fn phone(c: &Computer, n: u8) -> (Arc<DeviceKeys>, Arc<Connector>) {
     )
     .unwrap();
     let mut client = RingClientConfig::new(enrolled.chain, keys.clone());
+    client.dial = dial;
     client.timeouts = RingTimeouts {
         connect: Duration::from_secs(5),
         ..RingTimeouts::default()
     };
-    let connector =
-        Arc::new(Connector::start(ConnectorConfig::new(client), Arc::new(NoEvents)).unwrap());
+    let mut config = ConnectorConfig::new(client);
+    config.backoff_unit = Duration::from_millis(50);
+    let connector = Arc::new(Connector::start(config, Arc::new(NoEvents)).unwrap());
     wait("phone connected", || {
         matches!(connector.state(), LinkState::Connected { .. })
     });
@@ -834,4 +845,242 @@ fn approver_removed_between_consent_and_publication_cannot_publish() {
     assert!(head
         .authorized_member(&profile(&c).keys.sign_key())
         .is_none());
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// `c` holds a head at `version` or later (the Relay stored what led there).
+fn wait_head(c: &Computer, version: u64) {
+    wait("the Relay stored the new head", || {
+        c.ring
+            .chain()
+            .is_some_and(|chain| chain.head().version() >= version)
+    });
+}
+
+fn phone_connected(connector: &Connector) {
+    wait("phone connected again", || {
+        matches!(connector.state(), LinkState::Connected { .. })
+    });
+}
+
+/// B6: the Relay stores the phone's Enroll, then its answer is lost (and the connection
+/// with it): the approval is `Uncertain`, and once the phone is back `resume_approval`
+/// finds it `Done`. The same for a removal. Exactly one unit, one publication each.
+#[test]
+fn lost_acknowledgement_of_approval_and_removal_resumes_done_without_duplicates() {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let a = Computer::new(&relay);
+    a.create();
+    let (phone_keys, connector) = phone_dialing(&a, 33, Some(proxy.url()));
+    let b = Computer::new(&relay);
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b.ring.begin_join(&b.companion()).unwrap();
+    let code = offer.code.clone();
+    let start = connector.chain().head().version();
+    let op = std::thread::scope(|scope| {
+        let joining = scope.spawn(|| offer.wait());
+        let prepared = prepare_approval(
+            connector.clone(),
+            phone_keys.clone(),
+            &code,
+            &PairOptions::default(),
+            None,
+        )
+        .unwrap();
+        let op = prepared.op().clone();
+        // The Enroll reaches the Relay; nothing the Relay says after it reaches the phone.
+        proxy.set_fault(Some(Fault::DeafAfter("roster.put")));
+        let publishing = scope.spawn(move || publish_approval(prepared));
+        wait_head(&a, start + 1);
+        // Stored. The phone's connection then drops and stays down for a while.
+        proxy.set_down(true);
+        proxy.cut();
+        assert_eq!(
+            publishing.join().unwrap().unwrap_err(),
+            ApproveError::Uncertain
+        );
+        // The joining machine never got the approver's answer either.
+        let joined = joining.join().unwrap();
+        assert!(
+            joined.as_ref().is_err_and(|e| e.starts_with("finishing:")),
+            "{:?}",
+            joined.map(|_| ())
+        );
+        op
+    });
+    proxy.set_fault(None);
+    proxy.set_down(false);
+    phone_connected(&connector);
+    let device = match resume_approval(&connector, &op) {
+        Resume::Done(device) => device,
+        other => panic!("{other:?}"),
+    };
+    let chain = device.chain;
+    let m = chain.head().roster().membership().unwrap();
+    assert_eq!(
+        m.enrollments
+            .iter()
+            .filter(|u| u.id == op.operation)
+            .count(),
+        1,
+        "one unit"
+    );
+    assert_eq!(
+        chain.head().version(),
+        start + 1,
+        "one publication, never a second"
+    );
+    assert_eq!(
+        xshell_protocol::ring::relay::contract::relay_version(&relay.target(), chain.ring_id()),
+        start + 1
+    );
+    assert_eq!(
+        a.ring.chain().unwrap().get(start + 1),
+        chain.get(start + 1),
+        "the same bytes everywhere"
+    );
+    // A second resume is still Done and changes nothing.
+    assert!(matches!(resume_approval(&connector, &op), Resume::Done(_)));
+    // The joining machine finishes by itself.
+    b.ring.start_reconciler();
+    wait("the joining machine installed the Join", || {
+        b.ring.membership_state() == Ok(MembershipState::Member)
+    });
+
+    // The removal of the joined machine: stored by the Relay, answer lost.
+    let b_key = profile(&b).keys.sign_key();
+    let unit = m.unit_for(&b_key).unwrap().id.clone();
+    wait("phone has the new head", || {
+        connector.chain().head().version() == start + 1
+    });
+    let removal = prepare_removal(&connector, &*phone_keys, &unit).unwrap();
+    let candidate = removal.candidate().unwrap();
+    proxy.set_fault(Some(Fault::DeafAfter("roster.put")));
+    std::thread::scope(|scope| {
+        let publishing = scope.spawn(|| {
+            publish_removal(
+                &connector,
+                &*phone_keys,
+                &removal,
+                Instant::now() + Duration::from_secs(3),
+            )
+        });
+        wait_head(&a, candidate.version());
+        proxy.set_down(true);
+        proxy.cut();
+        assert_eq!(
+            publishing.join().unwrap().unwrap_err(),
+            RemoveError::Uncertain
+        );
+    });
+    proxy.set_fault(None);
+    proxy.set_down(false);
+    phone_connected(&connector);
+    let removed = match resume_removal(&connector, &removal) {
+        Resume::Done(chain) => chain,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(removed.get(candidate.version()), Some(&candidate));
+    assert_eq!(
+        removed.head().version(),
+        candidate.version(),
+        "never a second publication"
+    );
+    assert_eq!(
+        xshell_protocol::ring::relay::contract::relay_version(&relay.target(), removed.ring_id()),
+        candidate.version()
+    );
+    assert!(matches!(
+        resume_removal(&connector, &removal),
+        Resume::Done(_)
+    ));
+    wait_removed(&b);
+    connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
+}
+
+/// A resume before the code's expiry while the Enroll has not landed is `Retry`, never
+/// `NotDone` (the publication may still land); once it lands, `Done`.
+#[test]
+fn delayed_publication_resumes_retry_then_done() {
+    let relay = Relay::start();
+    let proxy = FaultProxy::start(&relay.url());
+    let a = Computer::new(&relay);
+    a.create();
+    let (phone_keys, connector) = phone_dialing(&a, 34, Some(proxy.url()));
+    // Another device of the same Ring reads the chain meanwhile.
+    let (_other_keys, other) = phone(&a, 35);
+    let b = Computer::new(&relay);
+    b.ring.register_companion(&b.companion()).unwrap();
+    let offer = b.ring.begin_join(&b.companion()).unwrap();
+    let code = offer.code.clone();
+    let start = connector.chain().head().version();
+    std::thread::scope(|scope| {
+        let joining = scope.spawn(|| offer.wait());
+        let prepared = prepare_approval(
+            connector.clone(),
+            phone_keys.clone(),
+            &code,
+            &PairOptions::default(),
+            None,
+        )
+        .unwrap();
+        let op = prepared.op().clone();
+        proxy.set_fault(Some(Fault::HoldFrom("roster.put")));
+        let publishing = scope.spawn(move || publish_approval(prepared));
+        wait("the Enroll is on its way", || proxy.holding());
+        // The chain is readable and lacks the unit; the code is still shown.
+        let pin = xshell_protocol::ring::relay::ChainPin {
+            version: op.predecessor_version,
+            hash: op.predecessor_hash.clone(),
+        };
+        let read = other.read_accepted_chain(&pin).unwrap();
+        assert!(read
+            .head()
+            .roster()
+            .membership()
+            .unwrap()
+            .unit(&op.operation)
+            .is_none());
+        assert!(unix_now() < op.expires_at);
+        match resume_approval(&other, &op) {
+            Resume::Retry => {}
+            r => panic!("not landed yet, before expiry: {r:?}"),
+        }
+        assert_eq!(
+            xshell_protocol::ring::relay::contract::relay_version(&relay.target(), read.ring_id()),
+            start,
+            "nothing landed while the resume ran"
+        );
+        proxy.release();
+        wait_head(&a, start + 1);
+        match resume_approval(&other, &op) {
+            Resume::Done(device) => {
+                assert_eq!(device.chain.head().version(), start + 1);
+                assert!(device
+                    .chain
+                    .head()
+                    .roster()
+                    .membership()
+                    .unwrap()
+                    .unit(&op.operation)
+                    .is_some());
+            }
+            r => panic!("{r:?}"),
+        }
+        let published = publishing.join().unwrap().unwrap();
+        assert_eq!(published.chain.head().version(), start + 1);
+        assert!(matches!(
+            joining.join().unwrap().unwrap(),
+            AdoptionOutcome::Installed { .. }
+        ));
+    });
+    connector.stop(xshell_protocol::ring::relay::ByeReason::quit());
+    other.stop(xshell_protocol::ring::relay::ByeReason::quit());
 }

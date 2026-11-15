@@ -102,13 +102,22 @@ impl Computer {
         factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
         ring_config: impl FnOnce(&mut DesktopRingConfig),
     ) -> Self {
+        Self::at_url(&relay.url(), tweak, factory, ring_config)
+    }
+    /// A Computer whose new Rings start on `url` (a fault proxy in front of the Relay, say).
+    pub(super) fn at_url(
+        url: &str,
+        tweak: impl FnOnce(&mut Config),
+        factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
+        ring_config: impl FnOnce(&mut DesktopRingConfig),
+    ) -> Self {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
         cfg.ring_backoff_unit = Duration::from_millis(10);
         tweak(&mut cfg);
         let daemon = Server::start(cfg).unwrap();
         let mut cfg = DesktopRingConfig::new(home.root().join("desktop"), "same name".into());
-        cfg.default_relay_url = relay.url();
+        cfg.default_relay_url = url.to_string();
         cfg.owner_retry = Duration::from_millis(20);
         cfg.backoff_unit = Duration::from_millis(10);
         ring_config(&mut cfg);
