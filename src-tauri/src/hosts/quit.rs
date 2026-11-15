@@ -208,6 +208,14 @@ impl QuitState {
         }
     }
 
+    /// A resolution failed (Terminals did not stop): the same prompt stays pending, no longer
+    /// in flight, so its id can be resolved again (Stop again, Keep, Cancel).
+    pub fn release(&self) {
+        if let Some(p) = self.pending.lock().unwrap().as_mut() {
+            p.in_flight = false;
+        }
+    }
+
     /// End a resolution: no prompt, or a new one (Terminals added meanwhile).
     pub fn end(&self, next: Option<(String, Vec<Uuid>, bool)>) -> Option<PromptEvent> {
         let mut g = self.pending.lock().unwrap();
@@ -435,7 +443,9 @@ pub fn resolve(
             stop_terminals(&hosts, ids)
         }) {
             StopOutcome::Failed(left) => {
-                q.end(None);
+                // The dialog stays open: the same id may be answered again. Terminals that
+                // did stop are simply gone from the next attempt's running set.
+                q.release();
                 Err(format!("failed:{left} sessions did not stop"))
             }
             StopOutcome::Added(added) => {
@@ -547,6 +557,48 @@ mod tests {
         assert!(q.start(&ev.id).unwrap_err().starts_with("busy"));
         q.end(None);
         assert!(q.pending().is_none());
+    }
+
+    /// After `failed:<n>` the prompt stays pending under the same id, not in flight, so the
+    /// open dialog can retry Stop (only what still runs), Keep or Cancel.
+    #[test]
+    fn stop_failure_keeps_the_prompt_resolvable() {
+        use std::cell::RefCell;
+        let q = QuitState::new(None);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let ev = q.begin("main", vec![a, b], false).unwrap();
+        let p = q.start(&ev.id).unwrap();
+        // a stops, b does not.
+        let running = RefCell::new(vec![a, b]);
+        let out = run_stop(&p.terminals, &|| Some(running.borrow().clone()), &|_| {
+            *running.borrow_mut() = vec![b];
+            1
+        });
+        assert_eq!(out, StopOutcome::Failed(1));
+        q.release();
+        let again = q.pending().expect("still pending");
+        assert_eq!(again.id, ev.id);
+        assert!(!again.in_flight);
+        assert!(
+            q.begin("main", vec![b], false).is_none(),
+            "a close began a prompt"
+        );
+        // Retry Stop under the same id: only b is stopped this time.
+        let p = q.start(&ev.id).unwrap();
+        let stopped = RefCell::new(Vec::new());
+        let out = run_stop(&p.terminals, &|| Some(running.borrow().clone()), &|ids| {
+            stopped.borrow_mut().extend_from_slice(ids);
+            running.borrow_mut().clear();
+            0
+        });
+        assert_eq!(out, StopOutcome::Done);
+        assert_eq!(*stopped.borrow(), vec![b]);
+        q.end(None);
+        // Keep or Cancel after a failure find the same id too.
+        let ev = q.begin("main", vec![a], false).unwrap();
+        q.start(&ev.id).unwrap();
+        q.release();
+        assert_eq!(q.start(&ev.id).unwrap().id, ev.id);
     }
 
     /// P1-a: a Terminal opened during the stop wait is reported as added (the window stays);
