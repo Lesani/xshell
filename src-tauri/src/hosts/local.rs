@@ -113,11 +113,12 @@ impl LocalMode {
                 daemon: None,
                 service: None,
             },
+            // The Daemon object is kept (Unix): the error view needs the log path.
             LocalMode::Failed { reason } => LocalHostInfo {
                 mode: "failed",
                 reason: Some(reason.clone()),
                 persistent: PersistentInfo::default(),
-                daemon: None,
+                daemon,
                 service: None,
             },
         }

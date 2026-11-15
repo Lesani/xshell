@@ -316,6 +316,7 @@ impl Hosts {
             self.local_daemon_now().as_deref(),
             &self.manager,
             &self.service,
+            (self.home_of)().as_deref(),
         )
     }
 
@@ -359,8 +360,23 @@ fn info_of(
     d: Option<&xshell_hostlink::LocalDaemon>,
     manager: &Manager,
     svc: &service::ServiceState,
+    home: Option<&std::path::Path>,
 ) -> local::LocalHostInfo {
     let daemon = match (mode, d) {
+        // No LocalDaemon could be built: still the error with this home's real log path.
+        (local::LocalMode::Failed { reason }, _) if cfg!(unix) => {
+            let error = Some(reason.clone());
+            Some(local::DaemonInfo {
+                state: "failed",
+                error_kind: local::error_kind(error.as_deref()),
+                error,
+                log: home.map(|h| {
+                    xshell_hostlink::local::local_log_path(h)
+                        .display()
+                        .to_string()
+                }),
+            })
+        }
         (local::LocalMode::Daemon { .. }, Some(d)) => {
             let snap = manager.access(LOCAL_HOST_ID).map(|h| h.snapshot());
             let (state, error) = local::daemon_state(
@@ -737,8 +753,25 @@ mod local_readiness_tests {
             Arc::new(NoBinaries),
             Arc::new(Quiet),
         ));
-        let info = info_of(&current.lock().unwrap(), None, &m, &svc);
+        let info = info_of(&current.lock().unwrap(), None, &m, &svc, None);
         assert_eq!(info.mode, "failed");
+        // The Daemon object is there for the error view, with the log path when the home
+        // is known.
+        let d0 = info.daemon.expect("daemon info in mode failed");
+        assert_eq!(d0.state, "failed");
+        assert!(d0.error.unwrap().contains("home directory is unknown"));
+        assert_eq!(d0.log, None);
+        let info = info_of(&current.lock().unwrap(), None, &m, &svc, Some(t.path()));
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["daemon"]["state"], "failed");
+        assert_eq!(json["daemon"]["errorKind"], serde_json::Value::Null);
+        assert_eq!(
+            json["daemon"]["log"],
+            t.path()
+                .join(".xshell/log/xshelld.log")
+                .display()
+                .to_string()
+        );
         // Still unknown: stays failed, no Local Host.
         assert!(!retry_setup(&current, &slot, &m, "1.5.0", &svc, None));
         assert!(m.access(LOCAL_HOST_ID).is_none());
@@ -755,7 +788,7 @@ mod local_readiness_tests {
         ));
         let d = slot.lock().unwrap().clone().expect("a Daemon");
         assert!(m.access(LOCAL_HOST_ID).is_some());
-        let info = info_of(&current.lock().unwrap(), Some(&d), &m, &svc);
+        let info = info_of(&current.lock().unwrap(), Some(&d), &m, &svc, Some(&home));
         assert_eq!(info.mode, "daemon", "{info:?}");
         assert!(info
             .daemon
