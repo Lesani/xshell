@@ -6243,7 +6243,7 @@ dependencies = [
 
 [[package]]
 name = "xshell"
-version = "1.5.0"
+version = "1.6.0-rjw.1"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -6368,7 +6368,7 @@ dependencies = [
 
 [[package]]
 name = "xshelld"
-version = "1.5.0"
+version = "1.6.0-rjw.1"
 dependencies = [
  "base64 0.22.1",
  "dirs",

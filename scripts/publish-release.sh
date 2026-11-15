@@ -5,8 +5,8 @@
 #   scripts/publish-release.sh [--dry-run]
 #
 # Inputs: the version in src-tauri/Cargo.toml and `--profile release-daemon` builds in
-# src-tauri/target/<triple>/release-daemon/xshelld for x86_64- and aarch64-unknown-linux-musl
-# (Darwin triples too, when built). Every version is published once: give each pre-release
+# src-tauri/target/<triple>/release-daemon/xshelld. The build for this machine's own triple is
+# required; other triples (aarch64-unknown-linux-musl, Darwin) are published when built. Every version is published once: give each pre-release
 # its own semver version (for example 1.6.0-rjw.3).
 #
 # Checks before anything is published (S4 C9):
@@ -83,8 +83,8 @@ files=""
 for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
   bin="src-tauri/target/$triple/release-daemon/xshelld"
   case "$triple" in
-    *-linux-musl) [ -f "$bin" ] || fail "missing $bin: cargo build -p xshelld --profile release-daemon --target $triple" ;;
-    *) [ -f "$bin" ] || continue ;;
+    "$native") [ -f "$bin" ] || fail "missing $bin: cargo build -p xshelld --profile release-daemon --target $triple" ;;
+    *) [ -f "$bin" ] || { echo "publish-release: no build for $triple, not published" >&2; continue; } ;;
   esac
   case "$triple" in
     *-linux-musl)
