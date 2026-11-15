@@ -876,7 +876,7 @@ impl Conn {
                 let answer: super::staging::Reply = Box::new(move |r| reply(&ob, id, r));
                 match self.refuse_frozen() {
                     Err(e) => {
-                        d.staging.abort(self.requester(), stage);
+                        d.staging.abort(self.requester(), stage, Box::new(|_| {}));
                         answer(Err(e))
                     }
                     Ok(()) => {
@@ -891,15 +891,19 @@ impl Conn {
                 let answer: super::staging::Reply = Box::new(move |r| reply(&ob, id, r));
                 match self.refuse_frozen() {
                     Err(e) => {
-                        d.staging.abort(self.requester(), stage);
+                        d.staging.abort(self.requester(), stage, Box::new(|_| {}));
                         answer(Err(e))
                     }
                     Ok(()) => d.staging.commit(self.requester(), stage, answer),
                 }
             }
             ClientMsg::DaemonStageAbort { stage } => {
-                d.staging.abort(self.requester(), stage);
-                reply(&self.ob, id, Ok(Value::Null))
+                let ob = self.ob.clone();
+                d.staging.abort(
+                    self.requester(),
+                    stage,
+                    Box::new(move |r| reply(&ob, id, r)),
+                );
             }
             ClientMsg::DaemonUpgrade => {
                 // Before the lock: whether the Ring is connected (a trial build must be

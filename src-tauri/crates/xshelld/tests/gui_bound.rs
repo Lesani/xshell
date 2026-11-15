@@ -605,10 +605,12 @@ fn handover_gui_bound_to_persistent_restores_terminals() {
     assert!(alive(pids[1]));
 }
 
-/// Switching off: `daemon.upgrade` makes the Persistent Daemon persist and exit, and the
-/// app's GUI-bound Daemon restores the same Terminals.
+/// An older Desktop "switching off" sends a plain `daemon.upgrade` and then starts its own
+/// GUI-bound Daemon. A current Linux Daemon is always on (ADR-0017): it restarts in place
+/// (S4 P2-9), the same process restores the Terminals, and the older Desktop's GUI-bound
+/// Daemon finds it serving and gives up, so the Terminals do not end with that app.
 #[test]
-fn handover_persistent_to_gui_bound_via_upgrade() {
+fn handover_request_from_older_desktop_restarts_always_on_in_place() {
     let h = TestHome::new();
     let fake = soft_agent(&h);
     let _reap = FakeReaper(fake.pids_log.clone());
@@ -622,28 +624,39 @@ fn handover_persistent_to_gui_bound_via_upgrade() {
     let first = *fake.wait_pids(1).last().unwrap();
     make_jsonl(&h, &cwd, SID);
     c.request(&ClientMsg::DaemonUpgrade).unwrap();
-    assert!(serve.wait_exit(T).is_some());
+    // The same process comes back and resumes the agent in a new Terminal process.
+    assert_eq!(fake.wait_launches(2)[1], vec!["--resume", SID]);
     assert!(!alive(first));
-
-    let parent = GuiParent::start(&h, &[("PATH", path.as_str())]);
+    assert!(
+        serve.wait_exit(Duration::from_millis(200)).is_none(),
+        "restarted in place"
+    );
     let mut c = Client::connect(&h.paths().socket);
     let (_, list) = c.hello(range(1, 1));
     assert_eq!(
         list.iter().map(|t| t.terminal).collect::<Vec<_>>(),
         vec![id]
     );
-    assert_eq!(fake.wait_launches(2)[1], vec!["--resume", SID]);
+    assert_eq!(
+        fs::read_to_string(h.paths().pid).unwrap().trim(),
+        serve.pid().to_string()
+    );
     assert_eq!(
         fs::read_to_string(h.paths().mode).unwrap().trim(),
-        "gui-bound"
+        "persistent"
     );
-    // From now on the Terminals end with the app.
-    let daemon = parent.daemon_pid();
+    // The older Desktop's GUI-bound Daemon gives up beside the always-on one.
+    let parent = GuiParent::start(&h, &[("PATH", path.as_str())]);
+    let gui = parent.daemon_pid();
+    assert!(
+        wait_dead(gui, Duration::from_secs(10)),
+        "a second Daemon kept running"
+    );
     let second = fake.wait_pids(2)[1];
-    drop(c);
     drop(parent);
-    assert!(wait_dead(daemon, Duration::from_secs(10)));
-    assert!(wait_dead(second, Duration::from_secs(2)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(alive(second), "the Terminal ended with the older app");
+    assert!(serve.wait_exit(Duration::from_millis(10)).is_none());
 }
 
 /// A Persistent Daemon has no parent watch: the process that started it (the app) dying,
