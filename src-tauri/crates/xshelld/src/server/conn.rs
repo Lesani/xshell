@@ -851,10 +851,10 @@ impl Conn {
                 let peer = self.peer.as_ref().filter(|_| self.role == Role::Mobile);
                 reply(&self.ob, id, d.push.unregister(peer))
             }
-            ClientMsg::DaemonUpdateInfo => {
-                let r = self.refuse_frozen().and_then(|()| update_info(&d));
-                reply(&self.ob, id, r)
-            }
+            // Every Daemon says which target it is (a Desktop learns a Ring Host's OS from it,
+            // round 6 D1), also one that cannot be updated over its link; staging itself
+            // stays refused there (`refuse_frozen`).
+            ClientMsg::DaemonUpdateInfo => reply(&self.ob, id, update_info(&d)),
             ClientMsg::DaemonStageBegin {
                 version,
                 build,

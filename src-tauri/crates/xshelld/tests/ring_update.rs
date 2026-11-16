@@ -197,6 +197,40 @@ fn update_info_reports_target_and_limits() {
     assert!(info.get("lastFailure").is_none());
 }
 
+/// Round 6 (D1): a Daemon that cannot be updated over its link (GUI-bound, as every
+/// Windows Daemon) still says which target it is, so a Desktop learns the Ring Host's OS;
+/// staging stays refused.
+#[test]
+fn gui_bound_daemon_reports_its_target_but_refuses_staging() {
+    let h = TestHome::new();
+    let srv = start(&h, |cfg| {
+        cfg.gui_bound = Some(xshelld::server::GuiBound {
+            parent_pid: std::process::id(),
+        });
+    });
+    let mut c = Client::connect(&srv.socket);
+    let (hello, _) = c.hello(range(1, 1));
+    assert!(!hello.capabilities.iter().any(|c| c == "daemon.stage"));
+    let info = c.request(&ClientMsg::DaemonUpdateInfo).unwrap();
+    assert_eq!(
+        info["target"],
+        json!(xshell_protocol::build::host_triple("Linux", std::env::consts::ARCH).unwrap())
+    );
+    let (_, build) = patched_bytes("0123456789ab");
+    let refused = c
+        .request(&ClientMsg::DaemonStageBegin {
+            version: VERSION.into(),
+            build,
+            sha256: "0".repeat(64),
+            length: 1,
+        })
+        .unwrap_err();
+    assert!(
+        refused.contains("cannot be updated over its link"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn stage_sequential_chunks_publish_verified_build() {
     let h = TestHome::new();
