@@ -684,7 +684,7 @@ impl Sup {
                     return;
                 }
                 st.status.os = Some(os.into());
-                st.status.arch = Some(arch.into());
+                st.status.arch = Some(arch);
                 sh.publish(&mut st);
             }),
         );
