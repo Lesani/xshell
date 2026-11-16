@@ -1649,8 +1649,6 @@ impl Ring {
         self.join_inner(tokens, expect, JoinOrigin::Host, Some(&budget))
     }
     #[cfg(test)]
-    // Used only by the Unix-only adoption reconciliation tests.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn test_host_join_until(
         &self,
         tokens: &[String],
@@ -2558,7 +2556,20 @@ mod tests {
             .unwrap();
         let chain = RosterChain::from_chain(vec![genesis, joined]).unwrap();
         let tokens: Vec<String> = chain.versions().iter().map(|r| r.token().into()).collect();
-        ring.join(&tokens, None).unwrap();
+        // Setup only: the first install creates the store's files (on Windows each one gets
+        // its private DACL and a write-through rename, and a scanner may look at it). Its
+        // time is not what this test bounds, so it gets its own generous budget; the short
+        // `timeout` applies to the join under test below.
+        let started = Instant::now();
+        ring.test_host_join_until(
+            &tokens,
+            &xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        eprintln!("setup join took {:?}", started.elapsed());
         let successor = chain.head().next(&desktop, 1002, |_| {}).unwrap();
         let next = chain.extended(&[successor]).unwrap().0;
         let next_tokens: Vec<String> = next.versions().iter().map(|r| r.token().into()).collect();
