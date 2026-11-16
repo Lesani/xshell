@@ -301,7 +301,12 @@ fn create_ring_from_windows_desktop() {
     let b = Computer::new(&relay);
     join_computer(&b, &w.ring);
     let daemon_key = w.register().daemon.sign_key;
-    assert!(b.relay_host(daemon_key).status().usable());
+    let host = b.relay_host(daemon_key);
+    assert!(host.status().usable());
+    // The other machine learns this Host is Windows (round 6, D1: it started Bash here).
+    fixture::wait("the Windows Host's OS is known", || {
+        host.status().os.as_deref() == Some("windows")
+    });
 }
 
 #[test]

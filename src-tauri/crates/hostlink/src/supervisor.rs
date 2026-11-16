@@ -646,6 +646,8 @@ impl Sup {
         };
         if ring_stage {
             self.check_rolled_back(&link, gen, &hello);
+        }
+        if self.relay {
             self.learn_platform(&link, gen);
         }
         Attempt::Connected(Connected {
@@ -658,8 +660,10 @@ impl Sup {
     }
 
     /// A Ring Host is never probed over SSH, so its OS is unknown until its Daemon says which
-    /// target it is (`daemon.update-info`, which every Daemon that stages updates answers):
-    /// the Desktop then offers that OS's shells (a Windows Host gets PowerShell, not Bash).
+    /// target it is (`daemon.update-info`, answered by every Ring-era Daemon whether or not
+    /// it stages updates; an older Daemon answers an unknown request with an error, which
+    /// leaves the OS unknown): the Desktop then offers that OS's shells (a Windows Host gets
+    /// PowerShell, not Bash).
     fn learn_platform(&self, link: &Arc<Link>, gen: u64) {
         if self.sh.lock().status.os.is_some() {
             return;
