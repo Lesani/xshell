@@ -605,7 +605,7 @@ fn mobile_cannot_stage_or_select() {
 }
 
 /// A Daemon told not to offer `daemon.stage` (an older build, as far as a Desktop can
-/// tell) refuses the messages.
+/// tell) refuses the staging messages; it still says which target it is (round 6, D1).
 #[test]
 fn daemon_without_capability_refuses_staging() {
     let h = TestHome::new();
@@ -615,7 +615,8 @@ fn daemon_without_capability_refuses_staging() {
     assert!(!hello.capabilities.iter().any(|c| c == "daemon.stage"));
     let (bytes, build) = patched_bytes("0123456789ab");
     assert!(begin(&mut c, &build, &bytes).is_err());
-    assert!(c.request(&ClientMsg::DaemonUpdateInfo).is_err());
+    let info = c.request(&ClientMsg::DaemonUpdateInfo).unwrap();
+    assert!(info["target"].as_str().is_some_and(|t| !t.is_empty()));
 }
 
 fn wait_until(what: &str, f: impl Fn() -> bool) {
