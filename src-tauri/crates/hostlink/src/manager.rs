@@ -354,20 +354,75 @@ impl Manager {
         self.host(id).map(crate::HostAccess::Direct)
     }
 
-    /// The access an update of Host `id` goes through. A Ring Host is reached through the
-    /// broker everywhere else ([`Manager::access`]), and the broker cannot update a Daemon;
-    /// but the elected owner (not a follower window) holds the Host's own link, and a Ring
-    /// update is staged over exactly that link (S4). A follower keeps the broker's refusal.
-    pub fn update_access(&self, id: &str) -> Option<crate::HostAccess> {
-        let access = self.access(id)?;
-        if matches!(access, crate::HostAccess::Broker(_))
-            && !self.broker_follower.load(Ordering::Acquire)
-        {
-            if let Some(h) = self.host(id) {
-                return Some(crate::HostAccess::Direct(h));
+    /// Update Host `id` to this Desktop's build, for a target the UI read (`hosts_status`).
+    /// A Ring Host is reached through the elected broker everywhere else
+    /// ([`Manager::access`]), and the broker cannot update a Daemon. The elected owner (not a
+    /// follower window) holds the Host's own link, and a Ring update is staged over exactly
+    /// that link (S4): the public target is checked against the broker publication it was
+    /// read from, then the update runs on that link with the generations it names. A
+    /// follower keeps the broker's refusal; a configured route updates as before.
+    pub fn upgrade_target(&self, id: &str, target: crate::handle::UpdateTarget, w: crate::Waiter) {
+        let Some(access) = self.access(id) else {
+            return w(Err(crate::HostError::unknown_host(id)));
+        };
+        let proxy = match &access {
+            crate::HostAccess::Broker(proxy) if !self.broker_follower.load(Ordering::Acquire) => {
+                proxy.clone()
             }
+            _ => return access.upgrade_target(Some(target), w),
+        };
+        let owned = (|| {
+            let changed =
+                || crate::HostError::invalid("the Host update target changed; review it again");
+            let client = self
+                .broker
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| crate::HostError::offline("Host broker reconnecting"))?;
+            let publication = client.publication();
+            let epoch = publication
+                .epoch
+                .ok_or_else(|| crate::HostError::offline("Host broker reconnecting"))?;
+            let row = publication
+                .hosts
+                .iter()
+                .find(|row| {
+                    row.daemon_key == Some(proxy.canonical()) && row.aliases.iter().any(|a| a == id)
+                })
+                .ok_or_else(changed)?;
+            let snapshot = publication
+                .snapshots
+                .iter()
+                .find(|s| s.status.host == row.id)
+                .ok_or_else(changed)?;
+            let raw = self.action_targets().remote(
+                id,
+                proxy.canonical(),
+                crate::handle::InputTarget {
+                    config_generation: target.config_generation,
+                    link_generation: target.link_generation,
+                },
+                epoch,
+                crate::handle::InputTarget {
+                    config_generation: snapshot.status.config_generation,
+                    link_generation: snapshot.status.link_generation,
+                },
+            )?;
+            let handle = self.host(&row.id).ok_or_else(changed)?;
+            Ok::<_, crate::HostError>((
+                handle,
+                crate::handle::UpdateTarget {
+                    config_generation: raw.config_generation,
+                    link_generation: raw.link_generation,
+                    ..target
+                },
+            ))
+        })();
+        match owned {
+            Ok((handle, raw)) => handle.upgrade_target(Some(raw), w),
+            Err(e) => w(Err(e)),
         }
-        Some(access)
     }
 
     /// Enrollment lookup must never enroll a Relay discovery or an identity-bound alias.

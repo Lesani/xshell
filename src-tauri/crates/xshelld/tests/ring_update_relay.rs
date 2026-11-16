@@ -439,12 +439,51 @@ fn update_through_the_desktop_route_reaches_the_ring_host() {
     let host = desktop.host(key);
     let id = host.id().to_string();
     let before = host.status().link_generation;
+    // What the UI holds: the broker's view and the target it reads from it.
     let ui = desktop.manager.access(&id).unwrap();
     assert!(matches!(ui, xshell_hostlink::HostAccess::Broker(_)));
-    let refused = reply(|w| ui.upgrade_target(None, w)).unwrap_err();
+    // The UI reads the broker's publication of the connected Host (it follows the link
+    // shortly after the Host is usable).
+    let read = || {
+        let seen = ui.snapshot().status;
+        xshell_hostlink::handle::UpdateTarget {
+            config_generation: seen.config_generation,
+            link_generation: seen.link_generation,
+            daemon_version: seen.daemon_version.clone(),
+            daemon_build: seen.daemon_build.clone(),
+        }
+    };
+    let mut target = read();
+    let until = Instant::now() + Duration::from_secs(15);
+    while ui.snapshot().status.link_generation == 0 || !ui.snapshot().status.usable() {
+        assert!(
+            Instant::now() < until,
+            "the broker never published the connected Host"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        target = read();
+    }
+    let refused = reply(|w| ui.upgrade_target(Some(target.clone()), w)).unwrap_err();
     assert!(refused.message.contains("broker"), "{refused:?}");
-    let route = desktop.manager.update_access(&id).unwrap();
-    reply(|w| route.upgrade_target(None, w)).unwrap_or_else(|e| panic!("{e:?}\n{}", m.log()));
+    // A stale target is refused before anything is sent.
+    let stale = xshell_hostlink::handle::UpdateTarget {
+        link_generation: target.link_generation + 1,
+        ..target.clone()
+    };
+    assert!(reply(|w| desktop.manager.upgrade_target(&id, stale, w)).is_err());
+    // What the update command does: the owner's own link, with the UI's target (read again
+    // if the publication followed a newer link meanwhile, as a user would see it).
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        match reply(|w| desktop.manager.upgrade_target(&id, target.clone(), w)) {
+            Ok(_) => break,
+            Err(e) if e.message.contains("target changed") && Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(100));
+                target = read();
+            }
+            Err(e) => panic!("{e:?}\n{}", m.log()),
+        }
+    }
     wait("updated and connected again", || {
         let s = host.status();
         s.usable()
