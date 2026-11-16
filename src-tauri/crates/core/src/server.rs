@@ -12,6 +12,24 @@ use std::path::{Path, PathBuf};
 /// The record's file name, in [`server_root`].
 pub const SELECTED: &str = "selected";
 
+/// Whether a `selected` record's build is honoured over this Desktop's own (A5), given how
+/// the selected version compares with ours. A newer version is an update made on this
+/// machine. For the same version, only exactly our build or a build with a strictly newer
+/// commit time (an update to it, #77) is honoured: the time is the commit's, so two builds
+/// of one commit (dirty digests) or of one second cannot be ordered, and the record left by
+/// a replaced Desktop must not keep its build running. An older version never is.
+pub fn selected_build_honoured(
+    version: std::cmp::Ordering,
+    selected: &xshell_protocol::build::BuildId,
+    own: &xshell_protocol::build::BuildId,
+) -> bool {
+    match version {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => selected.same(own) || selected.time > own.time,
+        std::cmp::Ordering::Less => false,
+    }
+}
+
 /// The longest directory name accepted.
 const MAX_DIR_NAME: usize = 128;
 
@@ -247,6 +265,63 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A5 (Round 3): the same version is honoured only for our exact build or a strictly
+    /// newer commit time; equal times with another commit or another dirty digest, or an
+    /// older time, are not.
+    #[test]
+    fn selected_build_honoured_orders_only_what_it_can() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        use xshell_protocol::build::BuildId;
+        let id = |commit: &str, dirty: Option<&str>, time: u64| BuildId {
+            commit: commit.into(),
+            dirty: dirty.map(Into::into),
+            time,
+        };
+        let own = id("85ee920a1b2c", None, 100);
+        assert!(selected_build_honoured(Equal, &own, &own));
+        assert!(selected_build_honoured(
+            Equal,
+            &id("85ee920a1b2c", None, 7),
+            &own
+        ));
+        assert!(selected_build_honoured(
+            Equal,
+            &id("000000000000", None, 101),
+            &own
+        ));
+        assert!(!selected_build_honoured(
+            Equal,
+            &id("000000000000", None, 100),
+            &own
+        ));
+        assert!(!selected_build_honoured(
+            Equal,
+            &id("85ee920a1b2c", Some("aaaaaaaaaaaa"), 100),
+            &own
+        ));
+        let own_dirty = id("85ee920a1b2c", Some("aaaaaaaaaaaa"), 100);
+        assert!(!selected_build_honoured(
+            Equal,
+            &id("85ee920a1b2c", Some("bbbbbbbbbbbb"), 100),
+            &own_dirty
+        ));
+        assert!(!selected_build_honoured(
+            Equal,
+            &id("000000000000", None, 99),
+            &own
+        ));
+        assert!(selected_build_honoured(
+            Greater,
+            &id("000000000000", None, 1),
+            &own
+        ));
+        assert!(!selected_build_honoured(
+            Less,
+            &id("000000000000", None, 999),
+            &own
+        ));
+    }
 
     #[test]
     fn dir_names() {

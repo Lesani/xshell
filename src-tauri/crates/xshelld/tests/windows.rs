@@ -1067,7 +1067,9 @@ fn bundled_spawn_without_selection_does_not_require_private_update_home() {
     );
 }
 
-fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
+/// This test binary as another build of the same version: another commit id and `time`
+/// moved by `delta` seconds (equal-length stamp edits only).
+fn restamped_fixture_bytes(delta: i64) -> (Vec<u8>, xshell_protocol::build::BuildId) {
     let mut bytes = fs::read(bin()).unwrap();
     let original = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
     let stamp = format!(
@@ -1075,35 +1077,12 @@ fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
         original.display(),
         original.time
     );
-    let mut count = 0;
-    for i in 0..=bytes.len() - stamp.len() {
-        if bytes[i..].starts_with(stamp.as_bytes()) {
-            let j = i + "@@XSHELL-BUILD-V1:".len();
-            bytes[j] = if bytes[j] == b'0' { b'1' } else { b'0' };
-            count += 1;
-        }
-    }
-    assert!(count > 0);
-    let build = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
-    (bytes, build)
-}
-
-/// [`update_fixture_bytes`] of an older commit: another commit id and an earlier commit
-/// time (equal-length stamp edits only).
-fn older_build_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
-    let mut bytes = fs::read(bin()).unwrap();
-    let original = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
-    let stamp = format!(
-        "@@XSHELL-BUILD-V1:{}:{}@@",
-        original.display(),
-        original.time
-    );
-    let older_time = (original.time - 1).to_string();
-    assert_eq!(older_time.len(), original.time.to_string().len());
+    let time = (original.time as i64 + delta).to_string();
+    assert_eq!(time.len(), original.time.to_string().len());
     let mut commit = original.display().into_bytes();
     commit[0] = if commit[0] == b'0' { b'1' } else { b'0' };
     let replacement = format!(
-        "@@XSHELL-BUILD-V1:{}:{older_time}@@",
+        "@@XSHELL-BUILD-V1:{}:{time}@@",
         String::from_utf8(commit).unwrap()
     );
     let mut count = 0;
@@ -1115,8 +1094,20 @@ fn older_build_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
     }
     assert!(count > 0);
     let build = xshell_protocol::build::scan_stamp(&bytes).unwrap().unwrap();
-    assert!(build.time < original.time && !build.same(&original));
+    assert!(!build.same(&original));
+    assert_eq!(build.time as i64, original.time as i64 + delta);
     (bytes, build)
+}
+
+/// An update to another build of this version: a strictly newer commit time, which A5
+/// honours as `selected` (#77).
+fn update_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
+    restamped_fixture_bytes(1)
+}
+
+/// Another build of this version with an older commit time (a replaced Desktop's).
+fn older_build_fixture_bytes() -> (Vec<u8>, xshell_protocol::build::BuildId) {
+    restamped_fixture_bytes(-1)
 }
 
 fn stage_fixture(h: &TestHome, bytes: &[u8], build: &xshell_protocol::build::BuildId) -> String {
@@ -1328,9 +1319,19 @@ fn native_selected_record_validation_and_valid_older_bundle_fallback() {
 /// `selected_update_owner_restart_restores_uuid_and_preserves_quit`.)
 #[test]
 fn same_version_older_build_selected_record_yields_to_the_embedded_build() {
+    a5_selected_record_yields(older_build_fixture_bytes());
+}
+
+/// A5 (Round 3): the same commit time with another commit cannot be ordered, so it is not
+/// honoured either (the dirty-digest case is covered by `selected_build_honoured`).
+#[test]
+fn same_version_equal_time_other_commit_selected_record_yields_to_the_embedded_build() {
+    a5_selected_record_yields(restamped_fixture_bytes(0));
+}
+
+fn a5_selected_record_yields((bytes, build): (Vec<u8>, xshell_protocol::build::BuildId)) {
     use sha2::{Digest, Sha256};
     let h = TestHome::new_private_home();
-    let (bytes, build) = older_build_fixture_bytes();
     let other = xshell_protocol::build::install_dir_name(env!("CARGO_PKG_VERSION"), Some(&build));
     xshelld::stage::stage(
         &h.home(),

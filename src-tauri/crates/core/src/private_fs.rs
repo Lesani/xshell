@@ -101,41 +101,8 @@ mod win {
     const TRUSTED_INSTALLER: &str =
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
-    /// The owner of `h`.
-    fn owner_of(h: &OwnedHandle) -> io::Result<Sid> {
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        let r = unsafe {
-            GetSecurityInfo(
-                raw(h),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut sd,
-            )
-        };
-        if r != 0 {
-            return Err(os_error(r));
-        }
-        let copied = if owner.is_null() {
-            Err(io::Error::other("no owner"))
-        } else {
-            Sid::copy(owner)
-        };
-        unsafe { LocalFree(sd as _) };
-        copied
-    }
-
-    /// Whether `sid` is an owner Windows itself gives directories it creates: SYSTEM,
-    /// Administrators or TrustedInstaller.
-    fn system_owner(sid: &Sid) -> bool {
-        system_sid(sid.as_psid())
-    }
-
-    /// [`system_owner`] for a SID in a descriptor (`null`: no).
+    /// SYSTEM, Administrators or TrustedInstaller: owners Windows itself gives the
+    /// directories it creates (`null`: no).
     pub(super) fn system_sid(sid: PSID) -> bool {
         !sid.is_null()
             && (unsafe {
@@ -147,8 +114,9 @@ mod win {
     }
 
     /// A directory xshell does not create and never changes (the home or profile, anything
-    /// above `.xshell`): a real directory (not a reparse point) owned by this user, SYSTEM,
-    /// Administrators or TrustedInstaller. Nothing is repaired.
+    /// above `.xshell`): a real directory (not a reparse point) owned by this user, or owned
+    /// by SYSTEM, Administrators or TrustedInstaller with no mutation grant to anyone else
+    /// (the update home's read-only DACL scan). Nothing is repaired.
     pub fn check_anchor_dir(path: &Path) -> io::Result<()> {
         let me = me()?;
         let h = open(path, READ_CONTROL, OPEN_EXISTING, None)?
@@ -157,10 +125,16 @@ mod win {
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(refuse(path, "is not a real directory"));
         }
-        if owned_by_me(&h, &me)? || system_owner(&owner_of(&h)?) {
+        if owned_by_me(&h, &me)? {
             return Ok(());
         }
-        Err(refuse(path, "is owned by another user"))
+        if super::update_home::privileged_anchor_allowed(&h, &me.sid)? {
+            return Ok(());
+        }
+        Err(refuse(
+            path,
+            "is owned by another user, or others may change it",
+        ))
     }
 
     pub(super) fn refuse(path: &Path, why: &str) -> io::Error {
@@ -539,15 +513,16 @@ mod win_tests {
     }
 
     /// A home anchor xshell does not create is accepted when Windows owns it the usual way
-    /// (the profile, `C:\Windows` owned by TrustedInstaller) or this user owns it; the strict
-    /// check stays strict for those system-owned directories.
+    /// (the profile) or this user owns it; the strict check stays strict for system-owned
+    /// directories.
     #[test]
     fn anchor_accepts_user_and_system_owned_directories() {
         check_anchor_dir(&profile()).unwrap();
         let canonical = profile().canonicalize().unwrap();
         check_anchor_dir(&canonical).unwrap();
+        // `C:\Windows` is TrustedInstaller's: never "ours" (TrustedInstaller as an anchor
+        // owner is covered by the descriptor tests in `update_home`).
         let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-        check_anchor_dir(&windows).unwrap();
         assert!(
             check_owned_dir(&windows).is_err(),
             "{}",

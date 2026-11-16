@@ -413,20 +413,41 @@ fn owns_daemon_now(d: Option<&xshell_hostlink::LocalDaemon>) -> Option<bool> {
     }
 }
 
-/// [`owns_daemon_now`], waiting up to `wait` (off the UI thread) for a start to let go of
-/// the child slot. Still uncertain: owner, so closing asks rather than ends Terminals
-/// unasked.
-pub fn owns_daemon_within(d: Option<&xshell_hostlink::LocalDaemon>, wait: Duration) -> bool {
-    let deadline = Instant::now() + wait;
+/// [`owns_daemon_now`], waiting until `deadline` (off the UI thread) for a start to let go
+/// of the child slot. `None`: still uncertain at the deadline.
+fn owns_daemon_until(d: Option<&xshell_hostlink::LocalDaemon>, deadline: Instant) -> Option<bool> {
     loop {
         if let Some(owner) = owns_daemon_now(d) {
-            return owner;
+            return Some(owner);
         }
         if Instant::now() >= deadline {
-            return true;
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// The deferred half of a window-bound close, within one `deadline` (A2, Round 3): the
+/// ownership when it was not known, then the Terminal list, both bounded by the same
+/// deadline. Ownership still uncertain at the deadline counts as owner and the count as
+/// unknown, so the prompt without a number shows at once. Returns (owner, running).
+fn resolve_deferred(
+    d: Option<&xshell_hostlink::LocalDaemon>,
+    owner: Option<bool>,
+    deadline: Instant,
+    running_until: impl FnOnce(Instant) -> Option<Vec<Uuid>>,
+) -> (bool, Option<Vec<Uuid>>) {
+    let owner = match owner {
+        Some(owner) => owner,
+        None => match owns_daemon_until(d, deadline) {
+            Some(owner) => owner,
+            None => return (true, None),
+        },
+    };
+    if !owner {
+        return (false, None);
+    }
+    (true, running_until(deadline))
 }
 
 /// The Local Host's running Terminals, when known.
@@ -437,8 +458,7 @@ fn local_running(hosts: &Hosts) -> Option<Vec<Uuid>> {
 
 /// The Local Host's running Terminals, waiting up to `wait` for a list that is not known
 /// yet (the Local Host may still be connecting).
-fn local_running_within(hosts: &Hosts, wait: Duration) -> Option<Vec<Uuid>> {
-    let deadline = Instant::now() + wait;
+fn local_running_until(hosts: &Hosts, deadline: Instant) -> Option<Vec<Uuid>> {
     if let Some(h) = hosts.manager.access(LOCAL_HOST_ID) {
         h.kick();
     }
@@ -543,14 +563,14 @@ fn decide_later(
     let (Some(q), Some(hosts)) = (app.try_state::<QuitState>(), app.try_state::<Hosts>()) else {
         return;
     };
-    if !owner_known {
-        inputs.owner = owns_daemon_within(hosts.local_daemon_now().as_deref(), LIST_WAIT);
-    }
-    let running = if inputs.owner {
-        local_running_within(&hosts, LIST_WAIT)
-    } else {
-        None
-    };
+    let deadline = Instant::now() + LIST_WAIT;
+    let (owner, running) = resolve_deferred(
+        hosts.local_daemon_now().as_deref(),
+        owner_known.then_some(inputs.owner),
+        deadline,
+        |deadline| local_running_until(&hosts, deadline),
+    );
+    inputs.owner = owner;
     inputs.running = running.as_ref().map(Vec::len);
     inputs.bypass = q.bypassed();
     inputs.session_ending = session_ending();
@@ -985,19 +1005,42 @@ mod tests {
             "{:?}",
             t0.elapsed()
         );
+        // One deadline for the whole deferred decision: ownership exhausts it, so the
+        // Terminal list is not even waited for and the prompt without a number shows.
+        let wait = Duration::from_millis(300);
         let t0 = Instant::now();
-        assert!(owns_daemon_within(Some(&d), Duration::from_millis(300)));
-        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        let mut listed = false;
+        let (owner, running) = resolve_deferred(Some(&d), None, t0 + wait, |_| {
+            listed = true;
+            None
+        });
+        let took = t0.elapsed();
+        assert!(owner && running.is_none() && !listed);
+        assert!(
+            took >= wait && took < wait + Duration::from_millis(250),
+            "{took:?}"
+        );
         let inputs = CloseInputs {
-            owner: true,
-            running: None,
+            owner,
+            running: running.as_ref().map(Vec::len),
             ..window_bound()
         };
         assert_eq!(decide(&inputs), CloseDecision::Confirm(None));
+        // Known ownership: the list gets the same deadline, not a fresh one.
+        let t0 = Instant::now();
+        let mut given = None;
+        let _ = resolve_deferred(Some(&d), Some(true), t0 + wait, |deadline| {
+            given = Some(deadline);
+            None
+        });
+        assert_eq!(given, Some(t0 + wait));
         // The stalled binary is not this build: the start fails, and then nothing owns it.
         assert!(starter.join().unwrap().is_err());
         assert_eq!(owns_daemon_now(Some(&d)), Some(false));
-        assert!(!owns_daemon_within(None, Duration::ZERO));
+        assert_eq!(
+            resolve_deferred(None, None, Instant::now(), |_| Some(vec![])),
+            (false, None)
+        );
     }
 
     /// A `close` prompt takes only Close and Cancel; a `keep` prompt never takes Close.

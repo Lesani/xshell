@@ -144,6 +144,47 @@ fn isolated_profile_dacl(sd: &SecDesc, me: &Sid) -> bool {
     true
 }
 
+/// A privileged-owned directory xshell does not create (a home anchor): owned by SYSTEM,
+/// Administrators or TrustedInstaller, and no observable mutation grant to anyone else than
+/// the user and those (the same conservative scan as the update home; a profile's
+/// capability ACE is read/traverse only).
+fn privileged_anchor_policy(sd: &SecDesc, me: &Sid) -> bool {
+    if unsafe { IsValidSecurityDescriptor(sd.0) } == 0 {
+        return false;
+    }
+    let (mut owner, mut defaulted) = (std::ptr::null_mut(), 0);
+    (unsafe { GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) } != 0)
+        && privileged(owner)
+        && isolated_profile_dacl(sd, me)
+}
+
+/// The owner and DACL of the object behind `h` (read only).
+fn descriptor(h: &OwnedHandle) -> io::Result<SecDesc> {
+    let mut descriptor = std::ptr::null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            raw(h),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(os_error(result));
+    }
+    Ok(SecDesc(descriptor))
+}
+
+/// For `private_fs::check_anchor_dir`: whether the privileged-owned anchor behind `h` has no
+/// foreign mutation grant. Never changes it.
+pub(super) fn privileged_anchor_allowed(h: &OwnedHandle, me: &Sid) -> io::Result<bool> {
+    Ok(privileged_anchor_policy(&descriptor(h)?, me))
+}
+
 fn privileged_profile_policy(
     sd: &SecDesc,
     me: &Sid,
@@ -169,23 +210,7 @@ pub fn check_update_home_anchor(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let profile = real_directory(&process_profile()?)?;
-    let mut descriptor = std::ptr::null_mut();
-    let result = unsafe {
-        GetSecurityInfo(
-            raw(&candidate),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if result != 0 {
-        return Err(os_error(result));
-    }
-    let sd = SecDesc(descriptor);
+    let sd = descriptor(&candidate)?;
     if !privileged_profile_policy(&sd, &me, identity(&candidate)?, identity(&profile)?) {
         return Err(refuse(
             path,
@@ -328,6 +353,42 @@ mod tests {
             identity(&ha).unwrap(),
             identity(&hb).unwrap()
         ));
+    }
+
+    /// Round 3 (Sol): a privileged-owned home anchor passes only without foreign mutation
+    /// grants; the real profile's shape (SYSTEM, Administrators, the user, a read/traverse
+    /// capability ACE) passes; TrustedInstaller counts as privileged.
+    #[test]
+    fn privileged_anchor_refuses_foreign_mutation_grants() {
+        let sid = user_sid_string().unwrap();
+        let me = current_user_sid().unwrap();
+        let anchor = |sddl: &str| privileged_anchor_policy(&SecDesc::from_sddl(sddl).unwrap(), &me);
+        let profile =
+            format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})(A;;0x00100020;;;{CAPABILITY})");
+        assert!(anchor(&profile));
+        assert!(anchor(&profile.replacen("O:BA", "O:SY", 1)));
+        assert!(anchor(
+            "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:P(A;;FA;;;SY)"
+        ));
+        for trustee in ["WD", "BU", "AU", FOREIGN, CAPABILITY] {
+            for mask in ["FA", "FW", "0x2", "0x40", "SD", "WD"] {
+                let sddl = format!("{profile}(A;;{mask};;;{trustee})");
+                assert!(!anchor(&sddl), "{sddl}");
+            }
+            // Read and traverse only stay fine.
+            assert!(anchor(&format!("{profile}(A;;FR;;;{trustee})")));
+        }
+        // A home owned by another user (or a standard group) is never privileged.
+        assert!(!anchor(&format!("O:{FOREIGN}D:P(A;;FA;;;SY)")));
+        assert!(!anchor("O:BUD:P(A;;FA;;;SY)"));
+        // The real profile, read only.
+        let real = process_profile().unwrap();
+        let before = security_sddl(&real).unwrap();
+        let h = real_directory(&real).unwrap();
+        if !owner_is(&h, &me).unwrap() {
+            assert!(privileged_anchor_allowed(&h, &me).unwrap(), "{before}");
+        }
+        assert_eq!(security_sddl(&real).unwrap(), before);
     }
 
     #[test]
