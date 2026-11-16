@@ -245,6 +245,47 @@ fn registers_over_pipe_without_reservation() {
     assert_eq!(w.register().daemon.sign_key, profile.daemon.sign_key);
 }
 
+/// Round 4: on Windows too, a Join whose Relay cannot be reached reports that error, not
+/// "cancelled" (the GUI showed "cancelled when you switched away" within 2 s).
+#[test]
+fn join_start_with_an_unreachable_relay_reports_its_error_not_a_cancel() {
+    let relay = Relay::start();
+    let w = WinMachine::new(&relay);
+    w.register();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let error = w
+        .ring
+        .begin_join_cancellable(
+            &w.client(),
+            cancel.clone(),
+            Some(&format!("ws://127.0.0.1:{port}")),
+        )
+        .err()
+        .expect("an unreachable Relay never shows words");
+    assert!(!error.starts_with("cancelled:"), "{error}");
+    assert!(!cancel.load(Ordering::Acquire));
+    // A start that is not cancelled shows its words and keeps them.
+    let offer = w
+        .ring
+        .begin_join_cancellable(&w.client(), Arc::new(AtomicBool::new(false)), None)
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !matches!(
+            offer.join_status(),
+            xshell_hostlink::ring::adoption::JoinStatus::Failed { .. }
+        ),
+        "{:?}",
+        offer.join_status()
+    );
+    offer.cancel_join();
+}
+
 #[test]
 fn create_ring_from_windows_desktop() {
     let relay = Relay::start();

@@ -127,7 +127,9 @@ impl DesktopRing {
 
     /// [`DesktopRing::begin_join`] with an external cancel flag that also ends the wait for
     /// the Relay slot. A cancelled start never returns an offer: its driver is cancelled and
-    /// joined, so no words can be shown for it.
+    /// joined, so no words can be shown for it. Only `cancel` (the caller's) means
+    /// "cancelled": the driver gets its own flag, which it also raises when it ends, so a
+    /// driver that failed (an unreachable Relay) reports its error, never a cancellation.
     /// `relay_url`: the user's own Relay chosen before Join, else the hosted default.
     pub fn begin_join_cancellable(
         self: &Arc<Self>,
@@ -148,7 +150,7 @@ impl DesktopRing {
                 expires_at: now() + ttl.as_secs(),
             },
             until,
-            cancel.clone(),
+            Arc::new(AtomicBool::new(false)),
         )?;
         loop {
             if cancel.load(Ordering::Acquire) {

@@ -200,6 +200,43 @@ fn gui_join_installs_without_confirmation_and_two_approvers_get_one_winner() {
     assert!(a.ring.approve_device_code(&code).is_err());
 }
 
+/// A Join whose Relay cannot be reached ends with that error, not as a cancellation: the
+/// driver raises its own flag when it ends, which the start once read as the caller's
+/// cancel ("These words were cancelled when you switched away" within 2 s on a machine
+/// that could not reach the Relay).
+#[test]
+fn join_start_with_an_unreachable_relay_reports_its_error_not_a_cancel() {
+    let relay = Relay::start();
+    let c = Computer::new(&relay);
+    c.ring.register_companion(&c.companion()).unwrap();
+    // A loopback port nothing listens on.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let error = c
+        .ring
+        .begin_join_cancellable(
+            &c.companion(),
+            cancel.clone(),
+            Some(&format!("ws://127.0.0.1:{port}")),
+        )
+        .err()
+        .expect("an unreachable Relay never shows words");
+    assert!(!error.starts_with("cancelled:"), "{error}");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
+    // The caller's own cancel still reads as one.
+    let cancel = Arc::new(AtomicBool::new(true));
+    let error = c
+        .ring
+        .begin_join_cancellable(&c.companion(), cancel, None)
+        .err()
+        .expect("a cancelled start never shows words");
+    assert!(error.starts_with("cancelled:"), "{error}");
+}
+
 #[test]
 fn remove_self_cleans_both_stores_terminals_survive() {
     let relay = Relay::start();
