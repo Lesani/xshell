@@ -646,6 +646,7 @@ impl Sup {
         };
         if ring_stage {
             self.check_rolled_back(&link, gen, &hello);
+            self.learn_platform(&link, gen);
         }
         Attempt::Connected(Connected {
             link,
@@ -654,6 +655,39 @@ impl Sup {
             at: Instant::now(),
             left,
         })
+    }
+
+    /// A Ring Host is never probed over SSH, so its OS is unknown until its Daemon says which
+    /// target it is (`daemon.update-info`, which every Daemon that stages updates answers):
+    /// the Desktop then offers that OS's shells (a Windows Host gets PowerShell, not Bash).
+    fn learn_platform(&self, link: &Arc<Link>, gen: u64) {
+        if self.sh.lock().status.os.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.sh);
+        let _ = link.request(
+            xshell_protocol::msg::ClientMsg::DaemonUpdateInfo,
+            self.sh.mc.term_timeout,
+            Box::new(move |r| {
+                let Some(sh) = weak.upgrade() else { return };
+                let Ok(info) = r.and_then(|v| {
+                    serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(v)
+                        .map_err(|e| crate::errors::HostError::offline(e.to_string()))
+                }) else {
+                    return;
+                };
+                let Some((os, arch)) = platform_of_target(&info.target) else {
+                    return;
+                };
+                let mut st = sh.lock();
+                if st.gen != gen || st.status.os.is_some() {
+                    return;
+                }
+                st.status.os = Some(os.into());
+                st.status.arch = Some(arch.into());
+                sh.publish(&mut st);
+            }),
+        );
     }
 
     /// After this Desktop updated a Ring Host and another build came back: ask the Daemon
@@ -750,8 +784,48 @@ fn reason_json(r: version::IncompatibleReason) -> IncompatibleReason {
     }
 }
 
+/// The OS (as `HostStatus::os` names it) and arch of a Daemon target triple
+/// (`xshell_protocol::build::host_triple`).
+pub(crate) fn platform_of_target(target: &str) -> Option<(&'static str, String)> {
+    let arch = target
+        .split('-')
+        .next()
+        .filter(|a| !a.is_empty())?
+        .to_string();
+    let os = if target.contains("-windows") {
+        "windows"
+    } else if target.contains("-linux") {
+        "linux"
+    } else if target.contains("-apple-darwin") {
+        "macos"
+    } else {
+        return None;
+    };
+    Some((os, arch))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn platform_of_every_daemon_target() {
+        use super::platform_of_target as p;
+        for (os, arch) in [
+            ("windows", "x86_64"),
+            ("Linux", "x86_64"),
+            ("Linux", "aarch64"),
+            ("Darwin", "arm64"),
+            ("Darwin", "x86_64"),
+        ] {
+            let triple = xshell_protocol::build::host_triple(os, arch).unwrap();
+            let (got, got_arch) = p(triple).unwrap();
+            assert_eq!(Some(got), crate::install::os_name(os), "{triple}");
+            assert_eq!(got_arch, triple.split('-').next().unwrap());
+        }
+        assert_eq!(p("x86_64-pc-windows-msvc").unwrap().0, "windows");
+        assert!(p("riscv64-unknown-freebsd").is_none());
+        assert!(p("").is_none());
+    }
+
     use super::*;
     use crate::config::test_host;
     use crate::manager::tests::{script_factory, test_config, Recorder};
