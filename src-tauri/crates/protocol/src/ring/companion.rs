@@ -627,7 +627,7 @@ impl CompanionPolicy {
         }
         let r = &proposal.proposal;
         r.validate().map_err(|e| e.to_string())?;
-        if r.issued_at > now || o.intent.expires_at.saturating_sub(r.issued_at) > 600 {
+        if !proposal_within_operation(r.issued_at, o.intent.expires_at, now) {
             return Err("proposal outside the original operation deadline".into());
         }
         let m = r.membership().map_err(|e| e.to_string())?;
@@ -892,4 +892,55 @@ pub enum CompanionAdminRequest {
         operation: String,
         rosters: Vec<String>,
     },
+}
+
+/// How far apart two machines' clocks may be: the approver stamps a proposal with its own
+/// time, which the joining machine's Daemon checks with its own (as push freshness allows
+/// `push::MAX_SKEW_MS`). Without it a proposal from an approver whose clock runs a few
+/// seconds ahead was refused as "outside the original operation deadline".
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+/// A proposal issued (approver's clock) within the operation's 600 s window that ends at
+/// `expires_at` (this machine's clock), allowing [`MAX_CLOCK_SKEW_SECS`] either way.
+pub fn proposal_within_operation(issued_at: u64, expires_at: u64, now: u64) -> bool {
+    issued_at <= now.saturating_add(MAX_CLOCK_SKEW_SECS)
+        && expires_at.saturating_sub(issued_at) <= 600 + MAX_CLOCK_SKEW_SECS
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    /// Round 4: an approver whose clock runs ahead (the Windows VM was 29 s behind the Linux
+    /// approver) is accepted within the bound; far-off or stale proposals still are not.
+    #[test]
+    fn proposal_issuance_tolerates_bounded_clock_skew() {
+        let now = 1_000_000;
+        let expires = now + 570; // the Join started 30 s ago with a 600 s window
+        assert!(proposal_within_operation(now, expires, now));
+        assert!(
+            proposal_within_operation(now + 29, expires, now),
+            "approver 29 s ahead"
+        );
+        assert!(proposal_within_operation(
+            now + MAX_CLOCK_SKEW_SECS,
+            expires,
+            now
+        ));
+        assert!(!proposal_within_operation(
+            now + MAX_CLOCK_SKEW_SECS + 1,
+            expires,
+            now
+        ));
+        assert!(
+            proposal_within_operation(now - 29, expires, now),
+            "approver 29 s behind"
+        );
+        // Issued long before this operation's window: never.
+        assert!(!proposal_within_operation(
+            expires - 600 - MAX_CLOCK_SKEW_SECS - 1,
+            expires,
+            now
+        ));
+    }
 }
