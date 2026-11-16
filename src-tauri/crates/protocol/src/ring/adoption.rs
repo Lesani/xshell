@@ -115,6 +115,9 @@ pub fn enroll_proposal(
     at: u64,
 ) -> Result<Roster, PairError> {
     use crate::ring::membership::{verify_enroll_proposal, Enrollment};
+    // Never before the head: another machine (whose clock may run ahead of ours) issued it,
+    // and a successor issued earlier reads as a clock rollback (as Remove does).
+    let at = at.max(head.roster().issued_at);
     let mut proposal = head.roster().clone();
     proposal.version += 1;
     proposal.prev = Some(head.hash());
@@ -423,4 +426,106 @@ pub enum AdoptionDecision {
         operation: String,
         proposal_hash: String,
     },
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+    use crate::ring::membership::{
+        consent_message, local_consent_context, Enrollment, Membership, RingPolicy,
+    };
+    use crate::ring::{b64, DeviceKeys, RingId, Role, Signature, Signer};
+
+    /// A v2 genesis issued at `at` by `keys` (a Desktop and its Daemon).
+    fn genesis(keys: &DeviceKeys, daemon: &DeviceKeys, at: u64) -> crate::ring::SignedRoster {
+        let mut g = Roster {
+            v: 2,
+            ring_id: RingId::derive(&keys.sign_key()),
+            version: 1,
+            prev: None,
+            relay_url: "ws://127.0.0.1:9".into(),
+            signed_by: keys.sign_key(),
+            issued_at: at,
+            members: vec![
+                Member::new("desk", Role::Desktop, keys.sign_key(), keys.noise_key(), at),
+                Member::new(
+                    "desk",
+                    Role::Daemon,
+                    daemon.sign_key(),
+                    daemon.noise_key(),
+                    at,
+                ),
+            ],
+            extra: Default::default(),
+        };
+        g.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: b64::encode(&[1; 32]),
+                kind: EnrollmentKind::Computer,
+                members: vec![keys.sign_key(), daemon.sign_key()],
+                enrolled_at: at,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: None,
+                activity_key: keys.sign_key(),
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        });
+        let context = local_consent_context(&g).unwrap();
+        let proofs = [keys, daemon]
+            .iter()
+            .map(|k| ConsentProof {
+                key: k.sign_key(),
+                expires_at: at + 600,
+                context: context.clone(),
+                signature: Signature::from_bytes(
+                    k.sign(&consent_message(&g, at + 600, &context).unwrap())
+                        .unwrap(),
+                ),
+            })
+            .collect();
+        let mut m = g.membership().unwrap();
+        m.change = RosterChange::Genesis { proofs };
+        g.set_membership(&m);
+        g.sign(keys).unwrap()
+    }
+
+    /// Round 5: an approver whose clock runs behind the machine that issued the head
+    /// proposes at the head's time (never a "clock rollback"); one running ahead keeps its
+    /// own time. Members and the enrollment carry the proposal's time either way.
+    #[test]
+    fn enroll_proposal_never_precedes_the_head() {
+        let (keys, daemon, phone) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let head = genesis(&keys, &daemon, 10_000);
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[7; 32]),
+            expires_at: 10_600,
+            target: JoinTarget::Mobile {
+                phone: PublicIdentity {
+                    sign_key: phone.sign_key(),
+                    noise_key: phone.noise_key(),
+                    name: "phone".into(),
+                },
+            },
+        };
+        for (at, want) in [
+            (10_000 - 30, 10_000),
+            (10_000, 10_000),
+            (10_000 + 30, 10_030),
+        ] {
+            let p = enroll_proposal(&head, keys.sign_key(), &intent, at).unwrap();
+            assert_eq!(p.issued_at, want, "approver at {at}");
+            assert!(p
+                .members
+                .iter()
+                .all(|m| m.added_at == want || m.added_at == 10_000));
+            let m = p.membership().unwrap();
+            assert!(m.enrollments.last().is_some_and(|e| e.enrolled_at == want));
+        }
+    }
 }

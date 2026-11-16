@@ -363,6 +363,13 @@ fn valid_context(r: &Roster, context: &ConsentContext) -> bool {
         local_consent_context(r).as_ref() == Ok(context)
     }
 }
+/// A consent expiry (stamped by the consenting machine) within the 600 s operation window
+/// that starts at the proposal's issue time (stamped by the approver), allowing
+/// [`super::MAX_CLOCK_SKEW_SECS`] between the two clocks either way.
+fn consent_window(issued_at: u64, expires_at: u64) -> bool {
+    expires_at.saturating_add(super::MAX_CLOCK_SKEW_SECS) >= issued_at
+        && expires_at.saturating_sub(issued_at) <= 600 + super::MAX_CLOCK_SKEW_SECS
+}
 fn proofs(r: &Roster, required: &[SignKey], proofs: &[ConsentProof]) -> Result<(), RosterError> {
     if proofs.len() != required.len() {
         return Err(invalid("missing consent/possession"));
@@ -371,8 +378,8 @@ fn proofs(r: &Roster, required: &[SignKey], proofs: &[ConsentProof]) -> Result<(
     for p in proofs {
         if !required.contains(&p.key)
             || !seen.insert(p.key)
-            || p.expires_at < r.issued_at
-            || p.expires_at.saturating_sub(r.issued_at) > 600
+            // `expires_at` is the consenting machine's stamp, `issued_at` the approver's.
+            || !consent_window(r.issued_at, p.expires_at)
             || !valid_context(r, &p.context)
             || proofs
                 .first()
@@ -777,5 +784,30 @@ pub fn verify_local_proposal(prev: Option<&SignedRoster>, n: &Roster) -> Result<
             }
             verify_transition_roster(prev, n, true)
         }
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    /// Round 5: a consent expiry (the joining machine's clock) and the proposal's issue time
+    /// (the approver's clock) may be up to `MAX_CLOCK_SKEW_SECS` apart either way.
+    #[test]
+    fn consent_window_tolerates_bounded_clock_skew() {
+        let skew = crate::ring::MAX_CLOCK_SKEW_SECS;
+        let issued = 10_000;
+        // Same clock: the intent expires within 600 s of the proposal.
+        assert!(consent_window(issued, issued + 600));
+        assert!(consent_window(issued, issued + 1));
+        // Joiner 30 s ahead, approved at once: expiry 630 s after the proposal.
+        assert!(consent_window(issued, issued + 630));
+        // Approver ahead near the code's expiry: the expiry reads as passed.
+        assert!(consent_window(issued, issued - 30));
+        // The bound holds both ways.
+        assert!(consent_window(issued, issued + 600 + skew));
+        assert!(!consent_window(issued, issued + 600 + skew + 1));
+        assert!(consent_window(issued, issued - skew));
+        assert!(!consent_window(issued, issued - skew - 1));
     }
 }

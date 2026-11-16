@@ -894,11 +894,9 @@ pub enum CompanionAdminRequest {
     },
 }
 
-/// How far apart two machines' clocks may be: the approver stamps a proposal with its own
-/// time, which the joining machine's Daemon checks with its own (as push freshness allows
-/// `push::MAX_SKEW_MS`). Without it a proposal from an approver whose clock runs a few
-/// seconds ahead was refused as "outside the original operation deadline".
-pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+/// The approver stamps a proposal with its own clock, which the joining machine's Daemon
+/// checks with its own: see [`super::MAX_CLOCK_SKEW_SECS`].
+pub use super::MAX_CLOCK_SKEW_SECS;
 
 /// A proposal issued (approver's clock) within the operation's 600 s window that ends at
 /// `expires_at` (this machine's clock), allowing [`MAX_CLOCK_SKEW_SECS`] either way.

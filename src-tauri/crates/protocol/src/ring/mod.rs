@@ -58,3 +58,9 @@ pub const ENTITLEMENT_PREFIX: &str = "xet1.";
 
 /// The largest integer every JSON implementation reads exactly (`Number.MAX_SAFE_INTEGER`).
 pub const MAX_SAFE_INT: u64 = (1 << 53) - 1;
+
+/// How far apart two machines' clocks may be, in seconds. Every comparison of a time one
+/// machine stamped with another machine's clock (or stamp) allows this much either way;
+/// signed expiries, local monotonic caps and a live operation's own expiry stay exact.
+/// (Push freshness allows the same five minutes, `push::MAX_SKEW_MS`.)
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300;

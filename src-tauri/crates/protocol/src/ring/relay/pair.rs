@@ -480,11 +480,25 @@ fn offer_deadline(expires_at: u64, until: Instant) -> Result<Instant, PairError>
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| PairError::Expired)?;
+    offer_deadline_at(expires_at, now, until, Instant::now())
+}
+/// [`offer_deadline`] with the clocks given: the joining machine stamped `expires_at` with
+/// its clock, at most 600 s ahead of its own now; this machine's clock may run up to
+/// [`crate::ring::MAX_CLOCK_SKEW_SECS`] behind it. Already past here: expired. The local
+/// `until` (monotonic) still caps the result.
+fn offer_deadline_at(
+    expires_at: u64,
+    now: Duration,
+    until: Instant,
+    mono_now: Instant,
+) -> Result<Instant, PairError> {
     let remaining = Duration::from_secs(expires_at)
         .checked_sub(now)
-        .filter(|d| !d.is_zero() && *d <= Duration::from_secs(600))
+        .filter(|d| {
+            !d.is_zero() && *d <= Duration::from_secs(600 + crate::ring::MAX_CLOCK_SKEW_SECS)
+        })
         .ok_or(PairError::Expired)?;
-    Ok(until.min(Instant::now() + remaining))
+    Ok(until.min(mono_now + remaining))
 }
 /// Points in a guest's adoption exchange where a test can stop it (`test-relay` only).
 #[cfg(feature = "test-relay")]
@@ -1443,5 +1457,39 @@ impl AdoptionRead {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+
+    /// Round 5: the joining machine stamps its intent's expiry with its own clock. A joiner
+    /// up to `MAX_CLOCK_SKEW_SECS` ahead, approved at once, is not refused as expired; an
+    /// expiry already past here still is; the local monotonic `until` still caps it.
+    #[test]
+    fn offer_deadline_tolerates_a_joiner_ahead_and_keeps_the_local_cap() {
+        let skew = crate::ring::MAX_CLOCK_SKEW_SECS;
+        let now = Duration::from_secs(1_000_000);
+        let mono = Instant::now();
+        let far = mono + Duration::from_secs(3600);
+        // Same clock, fresh intent.
+        let d = offer_deadline_at(1_000_600, now, far, mono).unwrap();
+        assert_eq!(d, mono + Duration::from_secs(600));
+        // Joiner 30 s ahead, approved at once.
+        assert!(offer_deadline_at(1_000_630, now, far, mono).is_ok());
+        assert!(offer_deadline_at(1_000_600 + skew, now, far, mono).is_ok());
+        assert!(matches!(
+            offer_deadline_at(1_000_601 + skew, now, far, mono),
+            Err(PairError::Expired)
+        ));
+        // Joiner behind, past its expiry in this clock: expired (exact).
+        assert!(matches!(
+            offer_deadline_at(1_000_000, now, far, mono),
+            Err(PairError::Expired)
+        ));
+        // The local monotonic cap still wins.
+        let near = mono + Duration::from_secs(10);
+        assert_eq!(offer_deadline_at(1_000_630, now, near, mono).unwrap(), near);
     }
 }
