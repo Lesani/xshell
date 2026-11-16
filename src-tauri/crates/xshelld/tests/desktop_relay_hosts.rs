@@ -96,15 +96,15 @@ fn v2_public_join_discovers_existing_hosts_bidirectionally_and_same_names_stay_d
     assert_ne!(a_to_b.id(), b_to_a.id());
     // A Ring Host is never probed over SSH: its OS comes from its Daemon's update info, so
     // a new Shell there matches it (round 6, D1: a Linux Desktop started Bash on Windows).
+    // `relay_host` returns as soon as the Host is usable.
     let os = if cfg!(target_os = "macos") {
         "macos"
     } else {
         "linux"
     };
+    // Known the moment the Host is usable (published after the answer), never later.
     for host in [&a_to_b, &b_to_a] {
-        wait("the Ring Host's OS is known", || {
-            host.status().os.as_deref() == Some(os)
-        });
+        assert_eq!(host.status().os.as_deref(), Some(os));
         assert_eq!(host.status().arch.as_deref(), Some(std::env::consts::ARCH));
     }
     for c in [&a, &b] {

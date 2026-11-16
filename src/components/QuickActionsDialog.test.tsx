@@ -6,6 +6,11 @@ import { QuickActionsDialog } from "./QuickActionsDialog";
 import { AGENT_IDS, type AgentId } from "../agents";
 import type { Tab } from "../types";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
+const hostOs = vi.hoisted(() => ({ value: null as "linux" | "macos" | "windows" | null }));
+vi.mock("../hosts/useHosts", async importOriginal => ({
+  ...(await importOriginal<typeof import("../hosts/useHosts")>()),
+  useHostsSnapshot: () => ({ status: { r_windows: { os: hostOs.value } }, live: {} }),
+}));
 let root: Root, container: HTMLDivElement;
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); Element.prototype.scrollIntoView = vi.fn(); container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
 afterEach(() => { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
@@ -24,5 +29,25 @@ describe("QuickActionsDialog effective live names", () => {
     search("missing"); expect(container.querySelector(".ts-row-title")).toBeNull();
     search(""); render([{ ...tabs[0], title: "Latest automatic", customTitle: undefined }, { ...tabs[1], customTitle: undefined }]);
     expect(Array.from(container.querySelectorAll(".ts-row-title")).map(el => el.textContent)).toEqual(["Latest automatic", "Other Project"]);
+  });
+});
+
+describe("QuickActionsDialog shells follow the Host's OS", () => {
+  // Round 7: a Ring Host's OS arrives from its Daemon after the dialog may already be open;
+  // the shell list must follow it, not keep the Linux fallback.
+  it("re-lists the shells when the context Host's OS becomes known", () => {
+    const project = { name: "tester", path: "C:\\Users\\tester", encoded_name: "x", session_count: 0, last_active: "", host: "r_windows" };
+    const show = () => act(() => root.render(<QuickActionsDialog tabs={[]} activeTabId="" projectIcons={{}} pinnedProjects={[]} contextProject={project} hoveredProjectKey={null} linkedProjectKey={null} selectedProjectKey={null} hasActiveTab={false} installedAgents={Object.fromEntries(AGENT_IDS.map(a => [a, true])) as Record<AgentId, boolean>} onSelectTab={vi.fn()} onCloseTab={vi.fn()} onNewChat={vi.fn()} onNewShell={vi.fn()} onGoHome={vi.fn()} onOpenSettings={vi.fn()} onToggleSidebar={vi.fn()} onClose={vi.fn()} />));
+    hostOs.value = null;
+    show();
+    const row = Array.from(container.querySelectorAll<HTMLElement>(".ts-row")).find(el => el.textContent?.includes("New shell in"))!;
+    act(() => row.click());
+    const names = () => Array.from(container.querySelectorAll(".ts-row-title")).map(el => el.textContent);
+    expect(names()).toContain("Bash");
+    expect(names()).not.toContain("Windows PowerShell");
+    hostOs.value = "windows";
+    show();
+    expect(names()).toContain("Windows PowerShell");
+    expect(names()).not.toContain("Bash");
   });
 });

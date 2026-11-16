@@ -1051,7 +1051,10 @@ impl DesktopRing {
                     .filter(|journal| journal.intent.operation == op)
                     .ok_or(PairError::Cancelled)?
                     .intent
-                    .expires_at;
+                    .expires_at
+                    // The joining machine's stamp, read with this clock (round 7): live
+                    // until the skew past it; its own expiry and the Relay stay exact.
+                    .saturating_add(xshell_protocol::ring::MAX_CLOCK_SKEW_SECS);
                 if cancel.load(Ordering::Acquire)
                     || Instant::now() >= until
                     || now() >= original_expiry

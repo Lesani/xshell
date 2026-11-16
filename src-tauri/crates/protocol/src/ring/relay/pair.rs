@@ -483,20 +483,25 @@ fn offer_deadline(expires_at: u64, until: Instant) -> Result<Instant, PairError>
     offer_deadline_at(expires_at, now, until, Instant::now())
 }
 /// [`offer_deadline`] with the clocks given: the joining machine stamped `expires_at` with
-/// its clock, at most 600 s ahead of its own now; this machine's clock may run up to
-/// [`crate::ring::MAX_CLOCK_SKEW_SECS`] behind it. Already past here: expired. The local
-/// `until` (monotonic) still caps the result.
+/// its clock, at most 600 s ahead of its own now, and this machine's clock may be up to
+/// [`crate::ring::MAX_CLOCK_SKEW_SECS`] off either way. So an expiry up to 600 s + skew
+/// ahead is accepted, and one up to the skew behind is still live (the joining machine
+/// enforces its own exact expiry and the Relay its own clock); the wait ends at the expiry
+/// plus the skew, and the local `until` (monotonic) still caps it.
 fn offer_deadline_at(
     expires_at: u64,
     now: Duration,
     until: Instant,
     mono_now: Instant,
 ) -> Result<Instant, PairError> {
-    let remaining = Duration::from_secs(expires_at)
+    let skew = Duration::from_secs(crate::ring::MAX_CLOCK_SKEW_SECS);
+    let expires = Duration::from_secs(expires_at);
+    if expires.saturating_sub(now) > Duration::from_secs(600) + skew {
+        return Err(PairError::Expired);
+    }
+    let remaining = (expires + skew)
         .checked_sub(now)
-        .filter(|d| {
-            !d.is_zero() && *d <= Duration::from_secs(600 + crate::ring::MAX_CLOCK_SKEW_SECS)
-        })
+        .filter(|d| !d.is_zero())
         .ok_or(PairError::Expired)?;
     Ok(until.min(mono_now + remaining))
 }
@@ -1468,24 +1473,32 @@ mod skew_tests {
     /// up to `MAX_CLOCK_SKEW_SECS` ahead, approved at once, is not refused as expired; an
     /// expiry already past here still is; the local monotonic `until` still caps it.
     #[test]
-    fn offer_deadline_tolerates_a_joiner_ahead_and_keeps_the_local_cap() {
+    fn offer_deadline_tolerates_skew_both_ways_and_keeps_the_local_cap() {
         let skew = crate::ring::MAX_CLOCK_SKEW_SECS;
         let now = Duration::from_secs(1_000_000);
         let mono = Instant::now();
         let far = mono + Duration::from_secs(3600);
-        // Same clock, fresh intent.
+        // Same clock, fresh intent: the wait ends at the expiry plus the skew.
         let d = offer_deadline_at(1_000_600, now, far, mono).unwrap();
-        assert_eq!(d, mono + Duration::from_secs(600));
-        // Joiner 30 s ahead, approved at once.
+        assert_eq!(d, mono + Duration::from_secs(600 + skew));
+        // Joining machine 30 s ahead, approved at once.
         assert!(offer_deadline_at(1_000_630, now, far, mono).is_ok());
         assert!(offer_deadline_at(1_000_600 + skew, now, far, mono).is_ok());
         assert!(matches!(
             offer_deadline_at(1_000_601 + skew, now, far, mono),
             Err(PairError::Expired)
         ));
-        // Joiner behind, past its expiry in this clock: expired (exact).
+        // This machine 30 s ahead and the code 20 s from its end there: the expiry reads 10 s
+        // past here, and the operation is still live.
+        let d = offer_deadline_at(1_000_000 - 10, now, far, mono).unwrap();
+        assert_eq!(d, mono + Duration::from_secs(skew - 10));
+        // Past by the whole skew or more: expired.
         assert!(matches!(
-            offer_deadline_at(1_000_000, now, far, mono),
+            offer_deadline_at(1_000_000 - skew, now, far, mono),
+            Err(PairError::Expired)
+        ));
+        assert!(matches!(
+            offer_deadline_at(1_000_000 - skew - 1, now, far, mono),
             Err(PairError::Expired)
         ));
         // The local monotonic cap still wins.

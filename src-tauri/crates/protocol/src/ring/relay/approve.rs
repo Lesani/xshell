@@ -421,7 +421,12 @@ pub fn publish_approval(
     let maybe_sent = RefCell::new(false);
     let conflict = RefCell::new(false);
     let result = signed.publish(cancel.as_ref(), |candidate| {
-        if stopped() || now() >= op.expires_at {
+        if stopped()
+            || now()
+                >= op
+                    .expires_at
+                    .saturating_add(crate::ring::MAX_CLOCK_SKEW_SECS)
+        {
             return Err(PairError::Expired);
         }
         *maybe_sent.borrow_mut() = true;

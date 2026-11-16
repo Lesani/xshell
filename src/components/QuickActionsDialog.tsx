@@ -5,6 +5,7 @@ import { useProjectImage } from "../hooks/useProjectImage";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AgentIcon, type AgentId } from "../agents";
 import { getAvailableShells, shellsForPlatform } from "../shells";
+import { useHostsSnapshot } from "../hosts/useHosts";
 import { registry } from "../hosts/registry";
 import { keyOf, keyOfTab, lookupKey, type ProjectKey } from "../hosts/projectKey";
 import logo from "../assets/logo.png";
@@ -132,8 +133,11 @@ export function QuickActionsDialog({ tabs, activeTabId, projectIcons, pinnedProj
 
   // Available shells for the drill-down view.
   // Shells for the context project's Host (a Remote Host offers its own OS's shells).
+  // Follows the Host's OS as it becomes known (a Ring Host learns it from its Daemon).
   const contextHost = contextProject?.host;
-  const shells = useMemo(() => contextHost ? shellsForPlatform(registry.getStatus(contextHost)?.os ?? "linux") : getAvailableShells(), [contextHost]);
+  const hostsSnap = useHostsSnapshot();
+  const contextOs = contextHost ? hostsSnap.status[registry.resolveAlias(contextHost)]?.os : undefined;
+  const shells = useMemo(() => contextHost ? shellsForPlatform(contextOs ?? "linux") : getAvailableShells(), [contextHost, contextOs]);
 
   const filteredShells = useMemo(() => {
     const q = query.trim().toLowerCase();

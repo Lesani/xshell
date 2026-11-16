@@ -126,7 +126,9 @@ export function RecentSessionsDropdown({ project, displayName, openSessionIds, a
     ...(canOpenRight ? { left: Math.max(4, anchorRect.left) } : { left: Math.min(maxLeft, Math.max(4, anchorRect.right - dropdownWidth)) }),
   };
 
-  // A Remote Host offers its own OS's shells, never the Desktop's.
+  // A Remote Host offers its own OS's shells, never the Desktop's. Read on every render: the
+  // TabBar that renders this dropdown re-renders on each Host snapshot (`useHostsSnapshot`),
+  // so the list follows the OS as it becomes known.
   const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();
   // If there's no project, collapsing the shells makes no sense — there's nothing else in the dropdown.
   const [shellsOpen, setShellsOpen] = useState(!project);

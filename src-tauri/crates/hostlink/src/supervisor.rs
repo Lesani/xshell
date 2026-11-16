@@ -574,7 +574,18 @@ impl Sup {
             });
         }
         let relay = self.relay;
+        // A Ring Host is published with its OS already known (or known to be unknown), so an
+        // OS-dependent launch right after it connects never falls back to Linux.
+        let platform = if relay {
+            self.platform_now(&link, PLATFORM_WAIT)
+        } else {
+            None
+        };
         let adopted = self.sh.adopt(gen, &link, |st| {
+            if let Some((os, arch)) = &platform {
+                st.status.os = Some((*os).into());
+                st.status.arch = Some(arch.clone());
+            }
             // After an upgrade or a replacement (R7, C4): the Daemon must be this Desktop's
             // version and build. Another Desktop's connector may have won the restart.
             // Authorization/classification belongs to the current mode; completion belongs
@@ -647,9 +658,6 @@ impl Sup {
         if ring_stage {
             self.check_rolled_back(&link, gen, &hello);
         }
-        if self.relay {
-            self.learn_platform(&link, gen);
-        }
         Attempt::Connected(Connected {
             link,
             conn,
@@ -661,37 +669,22 @@ impl Sup {
 
     /// A Ring Host is never probed over SSH, so its OS is unknown until its Daemon says which
     /// target it is (`daemon.update-info`, answered by every Ring-era Daemon whether or not
-    /// it stages updates; an older Daemon answers an unknown request with an error, which
-    /// leaves the OS unknown): the Desktop then offers that OS's shells (a Windows Host gets
-    /// PowerShell, not Bash).
-    fn learn_platform(&self, link: &Arc<Link>, gen: u64) {
-        if self.sh.lock().status.os.is_some() {
-            return;
-        }
-        let weak = Arc::downgrade(&self.sh);
-        let _ = link.request(
+    /// it stages updates). Asked once on link-up, before the Host is published as usable,
+    /// waiting at most `wait`. `None`: unknown (an older Daemon answers the request with an
+    /// error, or it did not answer in time); the Desktop's fallback then applies.
+    fn platform_now(&self, link: &Arc<Link>, wait: Duration) -> Option<(&'static str, String)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        link.request(
             xshell_protocol::msg::ClientMsg::DaemonUpdateInfo,
-            self.sh.mc.term_timeout,
+            wait,
             Box::new(move |r| {
-                let Some(sh) = weak.upgrade() else { return };
-                let Ok(info) = r.and_then(|v| {
-                    serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(v)
-                        .map_err(|e| crate::errors::HostError::offline(e.to_string()))
-                }) else {
-                    return;
-                };
-                let Some((os, arch)) = platform_of_target(&info.target) else {
-                    return;
-                };
-                let mut st = sh.lock();
-                if st.gen != gen || st.status.os.is_some() {
-                    return;
-                }
-                st.status.os = Some(os.into());
-                st.status.arch = Some(arch);
-                sh.publish(&mut st);
+                let _ = tx.send(r);
             }),
-        );
+        )
+        .ok()?;
+        let info = rx.recv_timeout(wait).ok()?.ok()?;
+        let info = serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(info).ok()?;
+        platform_of_target(&info.target)
     }
 
     /// After this Desktop updated a Ring Host and another build came back: ask the Daemon
@@ -787,6 +780,9 @@ fn reason_json(r: version::IncompatibleReason) -> IncompatibleReason {
         version::IncompatibleReason::Newer => IncompatibleReason::DaemonNewer,
     }
 }
+
+/// How long link-up waits for a Ring Host's platform before publishing it as unknown.
+const PLATFORM_WAIT: Duration = Duration::from_secs(3);
 
 /// The OS (as `HostStatus::os` names it) and arch of a Daemon target triple
 /// (`xshell_protocol::build::host_triple`).
