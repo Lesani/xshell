@@ -354,6 +354,22 @@ impl Manager {
         self.host(id).map(crate::HostAccess::Direct)
     }
 
+    /// The access an update of Host `id` goes through. A Ring Host is reached through the
+    /// broker everywhere else ([`Manager::access`]), and the broker cannot update a Daemon;
+    /// but the elected owner (not a follower window) holds the Host's own link, and a Ring
+    /// update is staged over exactly that link (S4). A follower keeps the broker's refusal.
+    pub fn update_access(&self, id: &str) -> Option<crate::HostAccess> {
+        let access = self.access(id)?;
+        if matches!(access, crate::HostAccess::Broker(_))
+            && !self.broker_follower.load(Ordering::Acquire)
+        {
+            if let Some(h) = self.host(id) {
+                return Some(crate::HostAccess::Direct(h));
+            }
+        }
+        Some(access)
+    }
+
     /// Enrollment lookup must never enroll a Relay discovery or an identity-bound alias.
     pub fn sync_host(&self, id: &str) -> Option<Arc<HostHandle>> {
         let h = self.host(id)?;

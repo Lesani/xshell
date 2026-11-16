@@ -2428,6 +2428,17 @@ impl HostHandle {
                             eprintln!("xshell: host {name}: no build for {target}: {detail}");
                             HostError::offline(RING_NO_BUILD)
                         }
+                        // The transfer itself was lost (the link or the Relay dropped it, or
+                        // it timed out): say so in approved words, never "hasn't reconnected".
+                        crate::stage::StageError::Failed(e)
+                            if matches!(
+                                e.code,
+                                crate::HostErrorCode::Offline | crate::HostErrorCode::Timeout
+                            ) =>
+                        {
+                            eprintln!("xshell: host {name}: update transfer failed: {}", e.message);
+                            HostError::offline(ring_offline(&name))
+                        }
                         crate::stage::StageError::Failed(e) => e,
                     })?;
                     check_upgrade(&sh, op, gen, &cancel)?;

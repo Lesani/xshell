@@ -426,6 +426,35 @@ fn relay_desktop_updates_other_build_reexec_same_pid_terminal_resumes() {
     );
 }
 
+/// Round 9 (D1): the Desktop's update command reaches a Ring Host the way the window does.
+/// Every UI lookup of a Ring Host goes through the elected broker, which cannot update a
+/// Daemon ("Update all" then failed at once, shown as "hasn't reconnected"); the update
+/// route of the owning window uses its own link.
+#[test]
+fn update_through_the_desktop_route_reaches_the_ring_host() {
+    let relay = Relay::start();
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build.clone(), bytes);
+    let (m, key) = Machine::start(&relay, &desktop, &[]);
+    let host = desktop.host(key);
+    let id = host.id().to_string();
+    let before = host.status().link_generation;
+    let ui = desktop.manager.access(&id).unwrap();
+    assert!(matches!(ui, xshell_hostlink::HostAccess::Broker(_)));
+    let refused = reply(|w| ui.upgrade_target(None, w)).unwrap_err();
+    assert!(refused.message.contains("broker"), "{refused:?}");
+    let route = desktop.manager.update_access(&id).unwrap();
+    reply(|w| route.upgrade_target(None, w)).unwrap_or_else(|e| panic!("{e:?}\n{}", m.log()));
+    wait("updated and connected again", || {
+        let s = host.status();
+        s.usable()
+            && s.phase.is_none()
+            && s.link_generation > before
+            && s.daemon_build.as_ref() == Some(&build)
+    });
+    assert_eq!(host.status().last_error, None);
+}
+
 /// The new build does not come up: the Host goes back to its build, and the Desktop says
 /// the update was rolled back (copy `update.rolledBack`).
 #[test]

@@ -6,7 +6,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 import { invoke } from "@tauri-apps/api/core";
 import { registry } from "../hosts/registry";
 import { hostUpdates } from "../hosts/hostUpdate";
-import { HostUpdateAction } from "./HostUpdateAction";
+import { HostUpdateAction, updateAllBody } from "./HostUpdateAction";
 import type { HostStatus } from "../hosts/types";
 const host = { id: "h_aaaaaaaa", name: "Windows fixture", sshTarget: "test" };
 const status: HostStatus = { host: host.id, status: "build-differs", phase: null, lastError: null, errorHint: null, daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1, os: "windows", arch: "x86_64", incompatibleReason: null, nextRetryAt: null, sinceMs: 1, updateAction: "replace" };
@@ -97,4 +97,12 @@ it("offers Retry after a failed update and shows the backend's rollback text", (
   const html = render({ status: "upgrade-pending", updateAction: "update", daemonVersion: "1.4.0", lastError: "The update failed. Windows fixture is back on version 1.4.0. Try again.", errorHint: "update-failed" });
   expect(html).toContain("Retry");
   expect(html).toContain("back on version 1.4.0");
+});
+
+describe("Update all confirmation count", () => {
+  it("is singular for one machine", () => {
+    expect(updateAllBody(1)).toMatch(/^This updates 1 machine and restarts its terminals/);
+    expect(updateAllBody(1)).not.toContain("machines");
+    expect(updateAllBody(2)).toMatch(/^This updates 2 machines and restarts their terminals/);
+  });
 });

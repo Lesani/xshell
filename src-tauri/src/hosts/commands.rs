@@ -367,7 +367,12 @@ pub async fn host_upgrade(
     host: String,
     target: xshell_hostlink::handle::UpdateTarget,
 ) -> Result<(), HostError> {
-    let h = handle(&state, &host)?;
+    // The update route, not the UI access: a Ring Host's update is staged over the owning
+    // window's own link (the broker cannot update a Daemon).
+    let h = state
+        .manager
+        .update_access(&host)
+        .ok_or_else(|| HostError::unknown_host(&host))?;
     reply(|w| h.upgrade_target(Some(target), w))
         .await
         .map(|_| ())

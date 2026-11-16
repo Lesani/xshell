@@ -41,6 +41,11 @@ export function RingUpdateUnsupported({ name }: { name: string }) {
 const APPROVED = (["update.rolledBack", "update.offline", "update.busy", "update.notBack", "update.tooOld", "update.noBuild"] as const)
   .map(k => new RegExp(`^${fmt(k).replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\?\{\w+\\?\}/g, ".+")}$`));
 
+// "This updates 1 machine…" / "This updates {n} machines…".
+export function updateAllBody(n: number): string {
+  return n === 1 ? fmt("update.all.body.one") : fmt("update.all.body", { n });
+}
+
 export function updateErrorText(name: string, error: string): string {
   if (APPROVED.some(re => re.test(error.trim())) && !/r_[0-9a-f]{8}/.test(error)) return error.trim();
   console.debug("update failed:", error.split(":")[0]);
@@ -121,7 +126,7 @@ export function HostUpdateConfirmation() {
     // The list of machines stays visible beside the approved body.
     const names = all.queue.map(c => c.host.name).join(", ");
     return <ConfirmDialog title={fmt("update.all.title")}
-      body={`${fmt("update.all.body", { n: all.queue.length })} ${names}`}
+      body={`${updateAllBody(all.queue.length)} ${names}`}
       confirm={fmt("update.all.confirm")} cancel={fmt("update.all.cancel")} onConfirm={hostUpdates.confirmAll} onCancel={hostUpdates.cancelAll} />;
   }
   if (!confirmation) return null;

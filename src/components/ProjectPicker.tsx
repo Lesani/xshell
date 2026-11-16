@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { buildProjectRows, loadPickerProjects, type AgentProjectLists, type PickerRow } from "../hosts/hostProjects";
 import { isPinned, toProjectKey, type ProjectKey } from "../hosts/projectKey";
 import { isUsableStatus } from "../hosts/registry";
-import { remoteHosts, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
+import { remoteHosts, statusLabel, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import type { HostId } from "../hosts/types";
 import { cache } from "../hosts/cache";
@@ -167,11 +167,17 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
   );
 }
 
+// The path example follows the Host's OS: a Windows Host gets a Windows path.
+export function addPathPlaceholder(os: string | null | undefined): string {
+  return fmt(os === "windows" ? "picker.addPath.placeholderWindows" : "picker.addPath.placeholder");
+}
+
 // Per-Host "add a folder by path" — the Browse dialog only sees this computer.
 function AddRemotePath({ host, usable, onAdd }: { host: HostId; usable: boolean; onAdd: (host: HostId, path: string) => Promise<"ok" | "notFound" | "offline"> }) {
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const os = useHostStatus(host)?.os;
   const submit = async () => {
     const p = path.trim();
     if (!p || busy) return;
@@ -184,7 +190,7 @@ function AddRemotePath({ host, usable, onAdd }: { host: HostId; usable: boolean;
   };
   return (
     <div className="picker-addpath">
-      <input value={path} onChange={(e) => { setPath(e.target.value); setError(null); }} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder={fmt("picker.addPath.placeholder")} spellCheck={false} />
+      <input value={path} onChange={(e) => { setPath(e.target.value); setError(null); }} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder={addPathPlaceholder(os)} spellCheck={false} />
       <button className="btn" disabled={!path.trim() || busy} onClick={submit}><FolderPlus size={12} /> {fmt("picker.addPath.button")}</button>
       {error && <div className="picker-addpath-error">{error}</div>}
     </div>
