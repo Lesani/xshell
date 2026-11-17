@@ -154,6 +154,19 @@ pub fn pair_error(e: PairError, local_cancel: bool) -> ApproveError {
     }
 }
 
+/// A refused proposal create, as this approver reports it. The joining machine stamped its
+/// code's expiry with its own clock and this machine accepts it up to
+/// [`crate::ring::MAX_CLOCK_SKEW_SECS`] past (the clocks may differ), but the Relay keeps
+/// that expiry exact by its clock. So a Relay refusal of a code whose expiry has passed
+/// here is the code having expired, not an unknown failure.
+fn proposal_refusal(e: RingError, expires_at: u64, now: u64) -> PairError {
+    if matches!(e, RingError::Relay { .. }) && now >= expires_at {
+        PairError::Expired
+    } else {
+        PairError::Relay(e.to_string())
+    }
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -400,7 +413,7 @@ pub fn publish_approval(
                 let proposal = enroll_proposal(chain.head(), me, intent, now())?;
                 let handle = captured
                     .create(intent, hash, &proposal)
-                    .map_err(|e| PairError::Relay(e.to_string()))?;
+                    .map_err(|e| proposal_refusal(e, intent.expires_at, now()))?;
                 *lane.borrow_mut() = Some(captured);
                 Ok(VerifiedProposal {
                     chain,
@@ -571,5 +584,39 @@ pub fn check_join(
             ..
         }) => JoinCheck::NotEnrolled,
         Err(_) => JoinCheck::Retry,
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::ring::relay::wire::ErrorCode;
+
+    /// Sol run 3, late approval: the joining machine's clock ran 29 s behind, its code had
+    /// 20 s left there, so the stamp was 9 s past here and at the Relay. The Relay refused
+    /// the proposal and both sides showed an unknown failure. The approver now says the
+    /// code expired; a refusal of a live code and a transport failure stay what they are.
+    #[test]
+    fn a_relay_refusal_of_a_code_past_its_expiry_here_is_expired() {
+        let refused = || RingError::Relay {
+            code: ErrorCode::RosterInvalid,
+            detail: Some("bounds".into()),
+        };
+        assert_eq!(
+            proposal_refusal(refused(), 1_000, 1_009),
+            PairError::Expired
+        );
+        assert_eq!(
+            proposal_refusal(refused(), 1_000, 1_000),
+            PairError::Expired
+        );
+        assert!(matches!(
+            proposal_refusal(refused(), 1_000, 999),
+            PairError::Relay(_)
+        ));
+        assert!(matches!(
+            proposal_refusal(RingError::Timeout, 1_000, 1_009),
+            PairError::Relay(_)
+        ));
     }
 }
