@@ -1020,9 +1020,14 @@ impl DesktopRing {
                 );
                 let captured = Arc::new(captured);
                 *lane.lock().unwrap_or_else(|e| e.into_inner()) = Some(captured.clone());
-                let handle = captured
-                    .create(intent, hash, &proposal)
-                    .map_err(|e| PairError::Relay(e.to_string()))?;
+                // A code approved in its last seconds from a machine whose clock runs
+                // behind: the Relay keeps the expiry exact, so its refusal reads as expired.
+                let handle = captured.create(intent, hash, &proposal).map_err(|e| {
+                    xshell_protocol::ring::relay::approve::proposal_refusal_now(
+                        e,
+                        intent.expires_at,
+                    )
+                })?;
                 Ok(VerifiedProposal {
                     chain,
                     proposal,

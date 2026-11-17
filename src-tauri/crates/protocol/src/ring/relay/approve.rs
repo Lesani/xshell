@@ -159,12 +159,25 @@ pub fn pair_error(e: PairError, local_cancel: bool) -> ApproveError {
 /// [`crate::ring::MAX_CLOCK_SKEW_SECS`] past (the clocks may differ), but the Relay keeps
 /// that expiry exact by its clock. So a Relay refusal of a code whose expiry has passed
 /// here is the code having expired, not an unknown failure.
-fn proposal_refusal(e: RingError, expires_at: u64, now: u64) -> PairError {
-    if matches!(e, RingError::Relay { .. }) && now >= expires_at {
+///
+/// Only the Relay's `roster_invalid`/`bounds` answer counts (the one its expiry check
+/// gives); it also covers a moved head and a full chain, which is why the expiry must have
+/// passed here too. An authority or quota refusal stays what it is.
+pub fn proposal_refusal(e: RingError, expires_at: u64, now: u64) -> PairError {
+    let bounds = matches!(
+        &e,
+        RingError::Relay { code: super::wire::ErrorCode::RosterInvalid, detail: Some(d) } if d == "bounds"
+    );
+    if bounds && now >= expires_at {
         PairError::Expired
     } else {
         PairError::Relay(e.to_string())
     }
+}
+
+/// [`proposal_refusal`] with this machine's clock, for the Desktop's own approval path.
+pub fn proposal_refusal_now(e: RingError, expires_at: u64) -> PairError {
+    proposal_refusal(e, expires_at, now())
 }
 
 fn now() -> u64 {
@@ -618,5 +631,20 @@ mod refusal_tests {
             proposal_refusal(RingError::Timeout, 1_000, 1_009),
             PairError::Relay(_)
         ));
+        // Other refusals stay what they are, even past the expiry here.
+        for (code, detail) in [
+            (ErrorCode::RosterInvalid, Some("authority")),
+            (ErrorCode::RosterInvalid, None),
+            (ErrorCode::Quota, Some("bounds")),
+        ] {
+            let e = RingError::Relay {
+                code,
+                detail: detail.map(Into::into),
+            };
+            assert!(
+                matches!(proposal_refusal(e, 1_000, 1_009), PairError::Relay(_)),
+                "{detail:?}"
+            );
+        }
     }
 }

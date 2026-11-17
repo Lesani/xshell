@@ -833,8 +833,10 @@ fn adopt_guest(
                 guest.encrypt(&serde_json::to_vec(&decision).expect("cancel serializes"))?;
             let _ = pipe.send_within(&message, DECLINE_SEND);
         }
+        // Judged before the closing handshake, which may take up to `CLOSE_LINGER`.
+        let alive = live(until, None);
         pipe.close();
-        live(until, None)?;
+        alive?;
         return Err(PairError::Cancelled);
     }
     live(until, cancel)?;
@@ -1508,7 +1510,9 @@ mod close_tests {
             let (tcp, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(tcp).unwrap();
             ws.send(Message::text(r#"{"t":"pair.peer"}"#)).unwrap();
-            // Frames the client never reads before it closes.
+            // Frames the client never reads before it closes: sent after its `open` has
+            // returned (it sleeps longer than this), so they wait in the kernel buffer.
+            std::thread::sleep(Duration::from_millis(50));
             for _ in 0..3 {
                 ws.send(Message::text(r#"{"t":"pong"}"#)).unwrap();
             }
@@ -1534,7 +1538,7 @@ mod close_tests {
         )
         .unwrap();
         // Let the unread frames arrive first.
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(200));
         pipe.send(b"last").unwrap();
         pipe.close();
         let (texts, close_frame) = server.join().unwrap().expect("a clean close");
