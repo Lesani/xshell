@@ -57,6 +57,9 @@ const DECLINE_SEND: Duration = Duration::from_secs(2);
 /// failed (a revoked proposal read, a closed pipe): a refusal already sent wins.
 const REFUSAL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long [`PairPipe::close`] waits for the Relay's side of the closing handshake.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
+
 /// How often a blocked read looks at the cancel flag.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -175,9 +178,31 @@ impl PairPipe {
         }
     }
 
+    /// Ends this socket with the closing handshake: the Close frame is written, then what
+    /// the Relay still sends is read until its Close (or [`CLOSE_LINGER`] at most). Dropping
+    /// the stream right after a write, with unread frames (a `pong`, the other side's
+    /// frames) in the receive buffer, resets the connection, and the Relay can then lose the
+    /// message written just before: the other side sees "the pipe closed" instead of it.
     pub fn close(mut self) {
+        let until = Instant::now() + CLOSE_LINGER;
+        let _ = self.ws.get_mut().set_deadline(until);
         let _ = self.ws.close(None);
-        let _ = self.ws.flush();
+        loop {
+            // `read` also writes what is still queued (the Close frame).
+            match self.ws.read() {
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e)) if transport::is_would_block(&e) => {
+                    if Instant::now() >= until {
+                        break;
+                    }
+                }
+                // ConnectionClosed: the handshake is complete. Anything else: nothing more to do.
+                Err(_) => break,
+            }
+            if Instant::now() >= until {
+                break;
+            }
+        }
     }
 
     fn write(&mut self, text: String) -> Result<(), PairError> {
@@ -1462,6 +1487,59 @@ impl AdoptionRead {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// The last message of an exchange is followed at once by `close`. With unread frames
+    /// still in this socket's receive buffer, dropping the stream after writing resets the
+    /// connection, and the Relay can lose that last message (seen on the hosted Relay as a
+    /// 1006 close and "the pipe closed" on the other side). `close` does the closing
+    /// handshake: the other end reads the message, then a clean Close.
+    #[test]
+    fn close_delivers_the_last_message_and_closes_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(tcp).unwrap();
+            ws.send(Message::text(r#"{"t":"pair.peer"}"#)).unwrap();
+            // Frames the client never reads before it closes.
+            for _ in 0..3 {
+                ws.send(Message::text(r#"{"t":"pong"}"#)).unwrap();
+            }
+            let mut texts = Vec::new();
+            let mut close_frame = false;
+            loop {
+                match ws.read() {
+                    Ok(Message::Text(t)) => texts.push(t.to_string()),
+                    Ok(Message::Close(_)) => close_frame = true,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::ConnectionClosed) => break Ok((texts, close_frame)),
+                    Err(e) => {
+                        break Err(format!("{e} after {texts:?}, close frame: {close_frame}"))
+                    }
+                }
+            }
+        });
+        let slot = "a".repeat(43);
+        let mut pipe = PairPipe::open(
+            &format!("ws://127.0.0.1:{port}"),
+            &slot,
+            &PairOptions::default(),
+        )
+        .unwrap();
+        // Let the unread frames arrive first.
+        std::thread::sleep(Duration::from_millis(100));
+        pipe.send(b"last").unwrap();
+        pipe.close();
+        let (texts, close_frame) = server.join().unwrap().expect("a clean close");
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(close_frame);
     }
 }
 

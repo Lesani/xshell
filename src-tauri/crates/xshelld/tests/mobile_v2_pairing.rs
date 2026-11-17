@@ -308,9 +308,13 @@ fn an_expired_offer_is_refused_without_membership() {
     let (o, obs) = offer(&a);
     std::thread::sleep(Duration::from_millis(2500));
     let phone = phone_keys(33);
-    assert_eq!(
-        scan_with(&o, &phone, |_| panic!("consent after expiry")).unwrap_err(),
-        PairError::Expired
+    // The phone tolerates clock skew (`MAX_CLOCK_SKEW_SECS`), so an offer half a second past
+    // its expiry is not refused by the phone's own clock any more: it looks for the Desktop,
+    // which has left the slot at its exact expiry. Either way nothing is consented or added.
+    let refused = scan_with(&o, &phone, |_| panic!("consent after expiry")).unwrap_err();
+    assert!(
+        matches!(refused, PairError::Expired | PairError::NotFound),
+        "{refused:?}"
     );
     assert_eq!(obs.outcome(), PairingEvent::Expired);
     assert_eq!(relay_head(&relay, &created), created.head().version());
