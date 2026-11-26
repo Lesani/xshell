@@ -945,6 +945,26 @@ impl HostHandle {
         self.sh.ep.lock().unwrap().input_target
     }
 
+    /// Whether a Kick through this view may reach its Host. A Kick names no connection, so
+    /// a newer link attempt is fine, but an identity-bound view (a configured
+    /// representative of a Ring alias) refuses while its endpoint currently proves another
+    /// Daemon or its configuration changed. An unproven link (`identity` unknown) is
+    /// allowed: retrying is how it gets proven.
+    pub(crate) fn kick_admitted(&self) -> Result<(), HostError> {
+        let Some(target) = self.identity_target() else {
+            return Ok(());
+        };
+        let ep = self.sh.ep.lock().unwrap();
+        if ep.input_target.config_generation != target.config_generation
+            || ep.identity.is_some_and(|key| key != target.daemon_key)
+        {
+            return Err(HostError::offline(
+                "this Ring alias is not verified on the current Host connection",
+            ));
+        }
+        Ok(())
+    }
+
     /// A dispatch view checks the expected connection under the actual admission lock.
     pub(crate) fn for_generation(
         owner: Arc<Self>,
@@ -2897,6 +2917,55 @@ pub(crate) mod tests {
             h.allows_ring_identity(&original),
             "pre-retarget proof changed the new target's association"
         );
+    }
+
+    /// Sol's review of #110: a broker Kick takes the endpoint's newest link generation, but
+    /// a configured representative's identity-bound view must not kick a different Daemon
+    /// now proven behind the same endpoint (same configuration, newer link).
+    #[test]
+    fn kick_through_identity_view_refuses_a_proven_foreign_daemon() {
+        let sh = shared();
+        let a = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let b = xshell_protocol::ring::DeviceKeys::generate()
+            .unwrap()
+            .sign_key();
+        let (_pa, _la, gen_a) = connect(&sh, vec![]);
+        assert!(sh.observe_identity(gen_a, a));
+        let owner = Arc::new(handle(&sh));
+        let alias_a = HostHandle::for_identity(owner.clone(), a);
+        let stale = owner.input_target();
+        assert!(alias_a.kick_admitted().is_ok(), "A proven: Kick allowed");
+        // The same endpoint now reaches B: config unchanged, link generation advanced.
+        let (_pb, _lb, gen_b) = connect(&sh, vec![]);
+        assert_eq!(
+            owner.input_target().config_generation,
+            stale.config_generation
+        );
+        assert_ne!(owner.input_target().link_generation, stale.link_generation);
+        // Unproven newer link: retrying is allowed (that is how it gets proven).
+        assert!(alias_a.kick_admitted().is_ok());
+        assert!(sh.observe_identity(gen_b, b));
+        assert_eq!(
+            alias_a.kick_admitted().unwrap_err().code,
+            HostErrorCode::Offline,
+            "a stale Kick for A reached B"
+        );
+        // The broker's Kick generation (configuration only) would pass; identity refuses.
+        assert!(HostHandle::for_generation(
+            alias_a.clone(),
+            InputTarget {
+                config_generation: stale.config_generation,
+                link_generation: owner.input_target().link_generation,
+            }
+        )
+        .is_ok());
+        // A view for B, and the unbound owner handle, may kick.
+        assert!(HostHandle::for_identity(owner.clone(), b)
+            .kick_admitted()
+            .is_ok());
+        assert!(owner.kick_admitted().is_ok());
     }
 
     fn res_slot<T: Send + 'static>() -> (Box<dyn FnOnce(T) + Send>, mpsc::Receiver<T>) {

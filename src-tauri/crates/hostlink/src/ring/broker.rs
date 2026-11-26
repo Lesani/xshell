@@ -885,6 +885,8 @@ impl Session {
             // the Host after the follower's snapshot (the owner's presence kick, #110) must
             // not refuse it: only the configuration generation fences it.
             let expected = if matches!(request.operation, BrokerOperation::Kick) {
+                // ...but never a currently proven foreign Daemon behind the same endpoint.
+                raw.kick_admitted()?;
                 InputTarget {
                     config_generation: request.expected.config_generation,
                     link_generation: raw.input_target().link_generation,
@@ -1094,10 +1096,13 @@ impl Session {
                     }),
                 );
             }
-            BrokerOperation::Kick => {
-                raw.kick();
-                done(Ok(Value::Null));
-            }
+            BrokerOperation::Kick => match raw.kick_admitted() {
+                Ok(()) => {
+                    raw.kick();
+                    done(Ok(Value::Null));
+                }
+                Err(error) => done(Err(error)),
+            },
         }
         Ok(())
     }
