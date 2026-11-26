@@ -3198,3 +3198,52 @@ fn actual_cli_pair_with_invalid_installed_receipt_never_reports_membership() {
     assert_eq!(again.words, 0);
     ar.quit();
 }
+
+/// #110: when the Daemon refuses a Desktop Join's start (here another operation still holds
+/// it), no words were shown and nothing is reserved: the Desktop keeps no reservation, so
+/// the next Join is not refused as "an earlier Join is being finished" and the screen does
+/// not sit in "Finishing…".
+#[test]
+fn desktop_join_refused_by_the_daemon_keeps_no_reservation() {
+    let relay = workerd::Relay::start();
+    let b = Fixture::new();
+    let _bd = b.server();
+    let br = b.ring(&relay.url());
+    let profile = br.register_companion(&b.companion()).unwrap();
+    let held = xshell_protocol::ring::pairing::adoption::AdoptionIntent {
+        operation: xshell_protocol::ring::relay::wire::new_nonce().unwrap(),
+        expires_at: unix_now() + 300,
+        target: profile.target(),
+    };
+    b.companion()
+        .request(CompanionRequest::Start {
+            intent: held.clone(),
+        })
+        .unwrap();
+    let error = match br.begin_join(&b.companion()) {
+        Err(error) => error,
+        Ok(_) => panic!("the Daemon admitted a second operation"),
+    };
+    assert!(!error.starts_with("finishing:"), "{error}");
+    let stored = Store::new(b.desktop.clone())
+        .load_profile()
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(
+        stored.pending_join.is_none(),
+        "a refused start kept its reservation"
+    );
+    assert!(stored.journal.is_none());
+    b.companion()
+        .request(CompanionRequest::Cancel {
+            operation: held.operation.clone(),
+        })
+        .unwrap();
+    let offer = br
+        .begin_join(&b.companion())
+        .unwrap_or_else(|e| panic!("the next Join was refused: {e}"));
+    assert!(offer.code.format().split('-').count() == 8);
+    offer.cancel_join();
+    br.quit();
+}

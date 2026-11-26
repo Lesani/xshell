@@ -498,7 +498,16 @@ impl CompanionPolicy {
         {
             return Err("companion operation already reserved".into());
         }
-        if let Some(old) = &self.obligation {
+        // An operation cancelled before it produced anything (no possession, proposal or
+        // proofs: its slot never met a peer) is not retired: restarting its id could release
+        // nothing that was not fresh. Retiring those let 64 quick retries during an outage
+        // refuse every Join for up to 10 minutes (#110).
+        if let Some(old) = self.obligation.as_ref().filter(|o| {
+            o.phase != CompanionPhase::Cancelled
+                || o.possession.is_some()
+                || o.proposal.is_some()
+                || o.proofs.is_some()
+        }) {
             if self.retired.len() >= 64 {
                 return Err("companion operation capacity".into());
             }

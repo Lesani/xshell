@@ -540,9 +540,31 @@ impl DesktopRing {
         self.adoption_test_point(
             super::super::desktop::AdoptionTestPoint::JoinBeforeCounterpartStart,
         );
-        client.request(CompanionRequest::Start {
+        if let Err(error) = client.request(CompanionRequest::Start {
             intent: intent.clone(),
-        })?;
+        }) {
+            // The Daemon answered with a refusal: its handler persists a reservation only
+            // on success, so nothing is reserved for this operation and no words were shown.
+            // Only a lost answer ("protected counterpart unavailable") is uncertain and keeps
+            // the reservation for the reconciler. Keeping it after a refusal showed
+            // "Finishing…" for a Join that never began (#110).
+            if !error.starts_with("protected counterpart") {
+                self.store.transact_profile(|stored, _| {
+                    let Some(mut stored) = stored else {
+                        return Ok((None, ()));
+                    };
+                    if stored
+                        .pending_join
+                        .as_ref()
+                        .is_some_and(|pending| pending.intent.operation == intent.operation)
+                    {
+                        stored.pending_join = None;
+                    }
+                    Ok((Some(stored), ()))
+                })?;
+            }
+            return Err(error);
+        }
         self.record_driver_cancel(&cancel)?;
         let shared = Arc::new(JoinShared {
             state: Mutex::new(JoinState {

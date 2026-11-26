@@ -751,3 +751,93 @@ mod rjw {
         policy.start(next, 1601).unwrap();
     }
 }
+
+/// #110: a Join retried many times while its slot never met a peer (each attempt started,
+/// then cancelled before any possession) never exhausts the operation capacity. An
+/// operation that produced a possession is still retired and cannot be restarted.
+#[test]
+fn unused_cancelled_operations_do_not_exhaust_capacity() {
+    let desktop = DeviceKeys::generate().unwrap();
+    let daemon = DeviceKeys::generate().unwrap();
+    let profile = fixture_profile(&desktop, &daemon);
+    let target = JoinTarget::Computer {
+        desktop: profile.desktop.clone(),
+        daemon: profile.daemon.clone(),
+    };
+    let intent = |n: u32| AdoptionIntent {
+        operation: b64::encode(&[
+            (n % 251) as u8,
+            (n / 251) as u8,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+        ]),
+        expires_at: 1600,
+        target: target.clone(),
+    };
+    let mut policy = CompanionPolicy::new(profile).unwrap();
+    for n in 0..200 {
+        let i = intent(n);
+        policy
+            .start(i.clone(), 1000)
+            .unwrap_or_else(|e| panic!("attempt {n}: {e}"));
+        policy.cancel(&i.operation).unwrap();
+    }
+    // A used (possession) operation is retired: never restarted.
+    let used = intent(500);
+    policy.start(used.clone(), 1000).unwrap();
+    policy
+        .possession(&daemon, &used.operation, [4; 32], 1000)
+        .unwrap();
+    policy.cancel(&used.operation).unwrap();
+    policy.start(intent(501), 1000).unwrap();
+    policy.cancel(&intent(501).operation).unwrap();
+    assert!(
+        policy.start(used, 1000).is_err(),
+        "a used, cancelled operation cannot be restarted"
+    );
+    // Used operations still count toward the capacity.
+    for n in 600..700 {
+        let i = intent(n);
+        if policy.start(i.clone(), 1000).is_err() {
+            assert!(
+                n > 600 + 60,
+                "capacity reached after only {} used operations",
+                n - 600
+            );
+            return;
+        }
+        policy
+            .possession(&daemon, &i.operation, [4; 32], 1000)
+            .unwrap();
+        policy.cancel(&i.operation).unwrap();
+    }
+    panic!("used operations never reached the capacity");
+}
