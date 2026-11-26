@@ -30,6 +30,7 @@ export const C = {
   "join.cancelled": "These words were cancelled when you switched away. Choose New words to try again.",
   "join.new": "New words",
   "join.offline": "Can't reach the service to add this machine. Check your connection and try again.",
+  "join.rateLimited": "Too many pairing attempts from this network in the last minute. Wait about a minute, then choose Retry.",
   "join.retry": "Retry",
   "join.cancel": "Cancel",
   "add.entry": "Add a machine",

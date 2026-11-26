@@ -73,6 +73,9 @@ pub enum PairError {
     Cancelled,
     /// The Relay (or the network) failed, or broke the pipe's protocol.
     Relay(String),
+    /// The Relay refused to open a pairing slot: too many pairing attempts from this
+    /// address in its sliding minute (HTTP 429). Not a connection problem (#112).
+    RateLimited,
 }
 
 impl PairError {
@@ -88,6 +91,7 @@ impl PairError {
             PairError::Timeout => "timeout",
             PairError::Cancelled => "cancelled",
             PairError::Relay(_) => "relay",
+            PairError::RateLimited => "rate_limited",
         }
     }
 }
@@ -105,6 +109,9 @@ impl fmt::Display for PairError {
             PairError::Timeout => f.write_str("timed out"),
             PairError::Cancelled => f.write_str("cancelled"),
             PairError::Relay(m) => write!(f, "relay: {m}"),
+            PairError::RateLimited => f.write_str(
+                "too many pairing attempts from this network (the relay answered HTTP 429)",
+            ),
         }
     }
 }

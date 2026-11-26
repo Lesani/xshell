@@ -85,7 +85,7 @@ impl PairPipe {
         }
         let url = RelayUrl::parse(relay_url).map_err(|e| PairError::Invalid(e.to_string()))?;
         let deadline = Instant::now() + opts.step;
-        let ws = transport::dial(
+        let ws = transport::dial_pair(
             &url,
             &url.pair_endpoint(slot),
             opts.tls.clone(),
@@ -93,8 +93,9 @@ impl PairPipe {
             MAX_PAIR_FRAME * 4,
         )
         .map_err(|e| match e {
-            RingError::Timeout => PairError::Timeout,
-            e => relay_err(e),
+            transport::DialFailure::RateLimited => PairError::RateLimited,
+            transport::DialFailure::Ring(RingError::Timeout) => PairError::Timeout,
+            transport::DialFailure::Ring(e) => relay_err(e),
         })?;
         let mut p = PairPipe {
             ws,

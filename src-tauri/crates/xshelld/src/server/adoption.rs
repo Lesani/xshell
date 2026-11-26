@@ -536,6 +536,9 @@ pub(crate) enum StandaloneCommandError {
     /// Consent may have left this machine and the obligation is retained: the Daemon
     /// (running now, or when it next runs) finishes it. Never a new offer.
     Unfinished { daemon_running: bool, cause: String },
+    /// The Relay refused to open the pairing slot: too many attempts from this network in
+    /// the last minute (#112). Nothing is pending.
+    RateLimited,
     /// Nothing is pending on this command's behalf (or it ended as the approver declined).
     Failed(String),
 }
@@ -543,6 +546,7 @@ impl StandaloneCommandError {
     pub(crate) fn into_message(self) -> String {
         match self {
             Self::Unfinished { cause, .. } | Self::Failed(cause) => cause,
+            Self::RateLimited => xshell_protocol::ring::pairing::PairError::RateLimited.to_string(),
         }
     }
 }
@@ -1049,6 +1053,13 @@ impl StandaloneDriver<'_> {
                     return Err(StandaloneCommandError::Failed(format!(
                         "reconciliation_required: {error}"
                     )))
+                }
+                None if matches!(
+                    error,
+                    xshell_protocol::ring::pairing::PairError::RateLimited
+                ) =>
+                {
+                    return Err(StandaloneCommandError::RateLimited)
                 }
                 None => return Err(StandaloneCommandError::Failed(error.to_string())),
             },

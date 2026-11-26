@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { setupReducer, setupView, SETUP_CHOICES, wordGroups, type SetupAction, type SetupState } from "./setup";
+import { joinErrorKey, setupReducer, setupView, SETUP_CHOICES, wordGroups, type SetupAction, type SetupState } from "./setup";
+import { fmtc } from "./copy";
 import type { JoinEvent } from "./types";
 
 const FAR = 2_000_000_000;
@@ -49,6 +50,15 @@ describe("setup reducer", () => {
     const s = code();
     expect(setupReducer(s, ev("B", "installed"))).toBe(s);
     expect(setupReducer(s, ev("A", "installed", { origin: "cli" }))).toBe(s);
+  });
+
+  it("rate_limited (#112) has its own retryable text, as a start error and as an event", () => {
+    expect(joinErrorKey("rate_limited")).toBe("join.rateLimited");
+    const started = run([{ type: "start", operation: "A" }, { type: "startFailed", operation: "A", error: "rate_limited: too many pairing attempts from this network (the relay answered HTTP 429)" }]);
+    expect(setupView(started, none)).toEqual({ kind: "ended", text: "join.rateLimited", action: "retry" });
+    const failed = setupReducer(code(), ev("A", "failed", { error: "rate_limited: too many pairing attempts" }));
+    expect(setupView(failed, none)).toEqual({ kind: "ended", text: "join.rateLimited", action: "retry" });
+    expect(fmtc("join.rateLimited")).toBe("Too many pairing attempts from this network in the last minute. Wait about a minute, then choose Retry.");
   });
 
   it("start error offline: → join.offline; finishing: → finishing; create offline: → create.offline", () => {

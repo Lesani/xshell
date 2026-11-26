@@ -822,7 +822,11 @@ impl DesktopRing {
                     }
                     Ok((Some(stored), ()))
                 })?;
-                Err(error.to_string())
+                // A rate limit is its own outcome (#112), never a connection problem.
+                Err(match error {
+                    PairError::RateLimited => format!("rate_limited: {error}"),
+                    error => error.to_string(),
+                })
             }
         }
     }
@@ -910,7 +914,10 @@ impl DesktopRing {
             format!("{}: {e}", e.as_code())
         };
         let pipe = PairPipe::open(&relay, &secret.slot(), &options).map_err(|e| match e {
-            PairError::Relay(_) | PairError::Timeout => format!("offline: {e}"),
+            // An approver reports a rate limit as before: it could not reach the slot.
+            PairError::Relay(_) | PairError::Timeout | PairError::RateLimited => {
+                format!("offline: {e}")
+            }
             e => code_of(e),
         })?;
         // Readiness-gated origins already occupy their slot. An absent peer is an

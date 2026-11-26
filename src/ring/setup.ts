@@ -155,6 +155,7 @@ const CREATE_ERRORS: Record<string, CopyKey> = {
 
 const JOIN_ERRORS: Record<string, CopyKey> = {
   offline: "join.offline",
+  rate_limited: "join.rateLimited",
   busy: "join.busy",
   already_member: "join.alreadyMember",
   other_window: "join.otherWindow",
@@ -163,7 +164,7 @@ const JOIN_ERRORS: Record<string, CopyKey> = {
 };
 
 // Errors a Retry can fix (the others need something else first).
-const RETRYABLE = new Set(["offline", "busy", "not_registered", "other", "cancelled", "unavailable"]);
+const RETRYABLE = new Set(["offline", "rate_limited", "busy", "not_registered", "other", "cancelled", "unavailable"]);
 
 export function createErrorKey(code: string): CopyKey {
   return CREATE_ERRORS[code] ?? "create.failed";

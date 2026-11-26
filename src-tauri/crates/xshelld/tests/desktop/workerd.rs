@@ -32,9 +32,16 @@ pub struct Relay {
     #[cfg(unix)]
     listener: TcpListener,
     child: Option<Child>,
+    /// Relay configuration for this instance (names from `CONFIG_VARS`).
+    env: Vec<(&'static str, String)>,
 }
 impl Relay {
     pub fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+    /// A Relay with configuration `env` (for example `PAIR_OPENS_PER_MINUTE`).
+    pub fn start_with_env(env: &[(&'static str, &str)]) -> Self {
+        assert!(env.iter().all(|(name, _)| CONFIG_VARS.contains(name)));
         let root = PathBuf::from(
             std::env::var_os("XSHELL_ADOPTION_RELAY_DIR")
                 .expect("XSHELL_ADOPTION_RELAY_DIR required"),
@@ -63,6 +70,7 @@ impl Relay {
             #[cfg(unix)]
             listener,
             child: None,
+            env: env.iter().map(|(k, v)| (*k, v.to_string())).collect(),
         };
         relay.spawn();
         relay
@@ -88,6 +96,9 @@ impl Relay {
             .stderr(log);
         for name in CONFIG_VARS {
             command.env_remove(name);
+        }
+        for (name, value) in &self.env {
+            command.env(name, value);
         }
         #[cfg(unix)]
         let fd = self.listener.as_raw_fd();

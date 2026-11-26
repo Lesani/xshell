@@ -205,7 +205,7 @@ pub fn approve_error(error: &str) -> String {
 }
 
 /// The error codes Create and Join report, first in `code: detail`.
-pub const START_CODES: [&str; 9] = [
+pub const START_CODES: [&str; 10] = [
     "not_registered",
     "busy",
     "other_window",
@@ -215,6 +215,7 @@ pub const START_CODES: [&str; 9] = [
     "unavailable",
     "cancelled",
     "offline",
+    "rate_limited",
 ];
 
 /// A Create/Join start error in `code: detail` form: a local Host that is registered but
@@ -932,6 +933,8 @@ mod tests {
             "already_member: this computer is already in a Ring",
             "offline: relay unreachable",
             "other_window: another window owns Create",
+            // #112: a rate limit is kept, never turned into `offline:` by its "relay" text.
+            "rate_limited: too many pairing attempts from this network (the relay answered HTTP 429)",
         ] {
             assert_eq!(start_error(kept.to_string()), kept);
         }

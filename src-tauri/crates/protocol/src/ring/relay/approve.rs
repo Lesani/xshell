@@ -146,6 +146,8 @@ pub fn pair_error(e: PairError, local_cancel: bool) -> ApproveError {
         PairError::Expired | PairError::Timeout => ApproveError::Expired,
         PairError::Invalid(_) => ApproveError::InvalidCode,
         PairError::Refused(PairRefusal::Used) => ApproveError::AlreadyUsed,
+        // An approver reports a rate limit as before: it could not reach the joiner's slot.
+        PairError::RateLimited => ApproveError::Offline,
         PairError::Relay(m) if m.starts_with("not_approver") => ApproveError::NotApprover,
         PairError::Relay(m) if m.starts_with("offline") => ApproveError::Offline,
         PairError::Relay(m) if m.contains("pipe closed") => ApproveError::Closed,
@@ -283,7 +285,7 @@ pub fn prepare_approval(
     // The exchange is bounded further by the joining machine's own expiry.
     let until = Instant::now() + Duration::from_secs(600);
     let pipe = PairPipe::open(&relay, &secret.slot(), opts).map_err(|e| match e {
-        PairError::Relay(_) | PairError::Timeout => ApproveError::Offline,
+        PairError::Relay(_) | PairError::Timeout | PairError::RateLimited => ApproveError::Offline,
         e => pair_error(e, stopped()),
     })?;
     // The joining machine holds its slot while its code is shown. Nobody there: an

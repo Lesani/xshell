@@ -653,3 +653,33 @@ mod offer_anchor {
         assert!(matches!(r, Err(PairError::Invalid(_))));
     }
 }
+
+/// #112: the Relay's HTTP 429 on a pairing open is its own outcome, not a relay failure, so
+/// the joining apps can say "too many attempts" instead of "can't reach the service".
+#[test]
+fn pair_open_over_limit_is_rate_limited() {
+    let r = TestRelay::start_with(TestRelayOptions {
+        pair_opens_per_minute: Some(1),
+        ..TestRelayOptions::default()
+    });
+    let first = xshell_protocol::ring::device_code::DeviceCode::generate()
+        .unwrap()
+        .secret();
+    let _held = PairPipe::open(&r.url(), &first.slot(), &opts()).unwrap();
+    let second = xshell_protocol::ring::device_code::DeviceCode::generate()
+        .unwrap()
+        .secret();
+    match PairPipe::open(&r.url(), &second.slot(), &opts()) {
+        Err(e @ PairError::RateLimited) => {
+            assert_eq!(e.as_code(), "rate_limited");
+            assert!(e.to_string().contains("too many pairing attempts"), "{e}");
+        }
+        Err(e) => panic!("expected RateLimited, got {e:?}"),
+        Ok(_) => panic!("an open over the limit was upgraded"),
+    }
+    // An approver still reports it as offline (it could not reach the joiner's slot).
+    assert!(matches!(
+        xshell_protocol::ring::relay::approve::pair_error(PairError::RateLimited, false),
+        xshell_protocol::ring::relay::approve::ApproveError::Offline
+    ));
+}

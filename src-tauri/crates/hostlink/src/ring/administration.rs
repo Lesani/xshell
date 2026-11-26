@@ -41,6 +41,9 @@ pub enum AdministrationStatus {
     Expired,
     Unknown,
     OwnerFocusRequested,
+    /// The Relay refused to open the pairing slot: too many attempts from this network in
+    /// the last minute (#112). Ended, like `Failed`.
+    RateLimited,
     OriginInvalidated,
 }
 struct Operation {
@@ -494,6 +497,9 @@ pub(super) fn dispatch_pending(
                         ),
                         J::Completing => (AdministrationStatus::Completing, false),
                         J::Installed { .. } => (AdministrationStatus::Installed, true),
+                        J::Failed { error } if error.starts_with("rate_limited:") => {
+                            (AdministrationStatus::RateLimited, true)
+                        }
                         J::Failed { .. } => (AdministrationStatus::Failed, true),
                         // The wire keeps its name; the pair command says "Finishing".
                         J::Finishing { .. } => (AdministrationStatus::ReconciliationRequired, true),

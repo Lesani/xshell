@@ -23,6 +23,9 @@ use xshell_protocol::ring::RosterChain;
 
 /// The exit code when nobody entered the code in time.
 pub const EXPIRED_EXIT: i32 = 5;
+/// The exit code when the Relay refused new pairing attempts from this network for now
+/// (HTTP 429, #112): not a connection problem.
+pub const RATE_LIMITED_EXIT: i32 = 7;
 /// The exit code when another device approved this machine but the command ended before the
 /// Join was confirmed: xshell on this machine finishes it by itself (never a new offer).
 pub const UNFINISHED_EXIT: i32 = 6;
@@ -55,6 +58,8 @@ enum Failure {
     AlreadyRunning,
     /// The Store is owned but nothing answers: a Daemon is starting or stopping.
     Busy,
+    /// Too many pairing attempts from this network in the Relay's last minute.
+    RateLimited,
     Other(String),
 }
 
@@ -88,6 +93,8 @@ const EARLIER_STOPPED: &str = "Pairing needs xshell running in the background he
 const ALREADY_RUNNING: &str = "Another xshelld pair command is showing words on this machine. Use those words, or stop that command first.";
 const BUSY: &str =
     "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
+// `cli.pair.rateLimited` (plans/plan-pairing-bc.md, COPY).
+const RATE_LIMITED: &str = "Too many pairing attempts from this network in the last minute. Wait about a minute, then run xshelld pair again.";
 
 /// `cli.pair.earlier.running`; `minutes` is 1 to 10.
 fn earlier_running(minutes: u64) -> String {
@@ -231,6 +238,7 @@ fn failure_report(failure: Failure) -> (i32, Vec<String>) {
         Failure::EarlierStopped => (UNFINISHED_EXIT, vec![EARLIER_STOPPED.into()]),
         Failure::AlreadyRunning => (1, vec![ALREADY_RUNNING.into()]),
         Failure::Busy => (1, vec![BUSY.into()]),
+        Failure::RateLimited => (RATE_LIMITED_EXIT, vec![RATE_LIMITED.into()]),
         Failure::Other(message) => (1, vec![format!("xshelld: {message}")]),
     }
 }
@@ -251,6 +259,7 @@ fn standalone_failure(
             cancelled,
             cause,
         },
+        E::RateLimited => Failure::RateLimited,
         E::Failed(error) if error == "the code expired" => Failure::Expired,
         E::Failed(_) if cancelled => Failure::Cancelled,
         E::Failed(error) if error.contains("cannot reach the relay") => Failure::Offline,
@@ -631,6 +640,11 @@ fn registered_computer_pair(
             }
             S::ComputerPending | S::SlotReady | S::AwaitingConfirmation | S::Completing => {}
             S::Expired => break,
+            // Kept through the Administration status (#112): not "can't reach the service".
+            S::RateLimited => {
+                result = Err(Failure::RateLimited);
+                break;
+            }
             S::ReconciliationRequired => {
                 result = Err(Failure::Finishing);
                 break;
@@ -1010,6 +1024,18 @@ mod tests {
         assert!(!String::from_utf8(registered)
             .unwrap()
             .contains("on this machine"));
+    }
+    #[test]
+    fn rate_limited_maps_to_copy_and_exit_7() {
+        use crate::server::adoption::StandaloneCommandError as E;
+        let (code, lines) = failure_report(standalone_failure(E::RateLimited, false));
+        assert_eq!(
+            (code, lines),
+            (RATE_LIMITED_EXIT, vec![RATE_LIMITED.to_string()])
+        );
+        assert!(!RATE_LIMITED.contains("reach"));
+        assert!(crate::cli::USAGE.contains(&format!("  {RATE_LIMITED_EXIT}  ")));
+        assert_ne!(RATE_LIMITED_EXIT, UNFINISHED_EXIT);
     }
     #[test]
     fn earlier_pairing_maps_to_copy_and_exit_6() {

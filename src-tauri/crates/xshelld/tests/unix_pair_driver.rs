@@ -3024,3 +3024,55 @@ fn actual_cli_second_pair_needs_the_installation_receipt() {
     });
     ar.quit();
 }
+
+// ---------- #112: a rate limit is its own outcome ----------
+
+const RATE_LIMITED_LINE: &str = "Too many pairing attempts from this network in the last minute. Wait about a minute, then run xshelld pair again.";
+
+/// A Relay that allows one pairing open a minute, with that one used up from this address.
+fn rate_limited_relay() -> (workerd::Relay, xshell_protocol::ring::relay::pair::PairPipe) {
+    let relay = workerd::Relay::start_with_env(&[("PAIR_OPENS_PER_MINUTE", "1")]);
+    let secret = DeviceCode::generate().unwrap().secret();
+    let held = xshell_protocol::ring::relay::pair::PairPipe::open(
+        &relay.url(),
+        &secret.slot(),
+        &Default::default(),
+    )
+    .unwrap();
+    (relay, held)
+}
+
+#[test]
+fn actual_cli_standalone_rate_limited_exits_7_with_its_copy() {
+    let (relay, _held) = rate_limited_relay();
+    let b = Fixture::new();
+    let _bd = b.server();
+    let mut child = b.pair(&relay.url(), 30_000);
+    assert_eq!(child.finish(), xshelld::pair::RATE_LIMITED_EXIT);
+    assert_eq!(child.words, 0);
+    let stderr = child.stderr();
+    assert_eq!(stderr.trim_end(), RATE_LIMITED_LINE, "{stderr}");
+    assert!(!b.paths.ring_dir.join("standalone-adoption.json").exists());
+}
+
+/// S3: `xshelld pair` forwarding to its registered Desktop keeps the classification through
+/// the Administration status; the Desktop's own Join reports `rate_limited:` too.
+#[test]
+fn actual_cli_registered_computer_rate_limited_exits_7_with_its_copy() {
+    let (relay, _held) = rate_limited_relay();
+    let b = Fixture::new();
+    let _bd = b.server();
+    let br = b.ring(&relay.url());
+    br.register_companion(&b.companion()).unwrap();
+    let _manager = b.manager(&br);
+    let mut child = b.pair(&relay.url(), 30_000);
+    assert_eq!(child.finish(), xshelld::pair::RATE_LIMITED_EXIT);
+    assert_eq!(child.words, 0);
+    let stderr = child.stderr();
+    assert_eq!(stderr.trim_end(), RATE_LIMITED_LINE, "{stderr}");
+    match br.begin_join(&b.companion()) {
+        Err(error) => assert!(error.starts_with("rate_limited: "), "{error}"),
+        Ok(_) => panic!("a Join opened a slot over the limit"),
+    }
+    br.quit();
+}
