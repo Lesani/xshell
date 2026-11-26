@@ -881,7 +881,18 @@ impl Session {
             } else {
                 HostHandle::for_identity(raw, request.canonical)
             };
-            let h = HostHandle::for_generation(raw.clone(), request.expected)?;
+            // A Kick carries no input and names no connection, so an attempt that reached
+            // the Host after the follower's snapshot (the owner's presence kick, #110) must
+            // not refuse it: only the configuration generation fences it.
+            let expected = if matches!(request.operation, BrokerOperation::Kick) {
+                InputTarget {
+                    config_generation: request.expected.config_generation,
+                    link_generation: raw.input_target().link_generation,
+                }
+            } else {
+                request.expected
+            };
+            let h = HostHandle::for_generation(raw.clone(), expected)?;
             (row, raw, h)
         };
         // Only immutable, currently observed target views escape the admission guard.

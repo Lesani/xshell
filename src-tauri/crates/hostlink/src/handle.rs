@@ -939,6 +939,12 @@ impl HostHandle {
         })
     }
 
+    /// The connection an input sent now would be bound to (its configuration and the
+    /// newest link attempt).
+    pub(crate) fn input_target(&self) -> InputTarget {
+        self.sh.ep.lock().unwrap().input_target
+    }
+
     /// A dispatch view checks the expected connection under the actual admission lock.
     pub(crate) fn for_generation(
         owner: Arc<Self>,
