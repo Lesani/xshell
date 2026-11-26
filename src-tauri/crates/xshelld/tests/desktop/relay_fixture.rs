@@ -111,6 +111,19 @@ impl Computer {
         factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
         ring_config: impl FnOnce(&mut DesktopRingConfig),
     ) -> Self {
+        Self::at_url_managed(url, tweak, factory, ring_config, |_| {})
+    }
+    /// A Computer whose Manager configuration is adjusted by `manager` (its Host backoff, say).
+    pub(super) fn with_manager(relay: &Relay, manager: impl FnOnce(&mut ManagerConfig)) -> Self {
+        Self::at_url_managed(&relay.url(), |_| {}, |_| Arc::new(NoSsh), |_| {}, manager)
+    }
+    fn at_url_managed(
+        url: &str,
+        tweak: impl FnOnce(&mut Config),
+        factory: impl FnOnce(&TestHome) -> Arc<dyn TransportFactory>,
+        ring_config: impl FnOnce(&mut DesktopRingConfig),
+        manager: impl FnOnce(&mut ManagerConfig),
+    ) -> Self {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
         cfg.ring_backoff_unit = Duration::from_millis(10);
@@ -125,6 +138,7 @@ impl Computer {
         let events = Arc::new(Events::default());
         let mut cfg = ManagerConfig::new("1.5.0", factory(&home), Arc::new(NoSsh), events.clone());
         cfg.backoff_unit = Duration::from_millis(20);
+        manager(&mut cfg);
         let manager = Arc::new(Manager::new(cfg));
         ring.attach_manager(&manager).unwrap();
         Self {
@@ -239,6 +253,18 @@ impl Computer {
             guest.join().unwrap().unwrap();
         });
         common::ring::identity(self.daemon.as_ref().unwrap()).0
+    }
+    /// Stops this machine's Daemon (as a crash or a stopped service would).
+    pub(super) fn stop_daemon(&mut self) {
+        self.daemon.take().expect("Daemon running").shutdown();
+    }
+    /// Starts this machine's Daemon again on the same home (the fixture's configuration).
+    pub(super) fn restart_daemon(&mut self, tweak: impl FnOnce(&mut Config)) {
+        assert!(self.daemon.is_none(), "Daemon still running");
+        let mut cfg = Config::new(self.home.home(), self.home.paths());
+        cfg.ring_backoff_unit = Duration::from_millis(10);
+        tweak(&mut cfg);
+        self.daemon = Some(Server::start(cfg).unwrap());
     }
     pub(super) fn relay_host(&self, key: SignKey) -> Arc<HostHandle> {
         let id = relay_host_id(&key);

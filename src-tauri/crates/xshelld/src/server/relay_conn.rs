@@ -103,7 +103,11 @@ fn bridge(d: Arc<Daemon>, inc: Incoming) -> io::Result<()> {
         .spawn({
             let d = d.clone();
             move || {
-                d.test_point(uuid::Uuid::nil(), super::TestPoint::RelayHostAccepted);
+                if d.test_point(uuid::Uuid::nil(), super::TestPoint::RelayHostAccepted) {
+                    // Test only: refuse this session before Host hello (an Online Host that
+                    // refuses connections). Dropping our end closes it.
+                    return;
+                }
                 conn::handle(d, theirs, id, role, Some(peer), conn::Ingress::Relay)
             }
         })

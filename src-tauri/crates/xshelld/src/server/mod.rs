@@ -236,6 +236,7 @@ pub struct Config {
 pub enum TestPoint {
     /// A real Relay Noise session reached the Host worker, before Host hello. No locks
     /// held; tests may pause this worker to exercise cancellation and late Link fencing.
+    /// Returning `true` refuses the session (it closes before Host hello).
     RelayHostAccepted,
     /// Ordinary Host RingJoin before store admission (Ring lifecycle/state locked).
     /// May coordinate registration, but must not re-enter Ring methods.

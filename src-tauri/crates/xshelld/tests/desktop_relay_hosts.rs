@@ -769,3 +769,152 @@ fn same_configured_endpoint_with_foreign_live_key_cannot_keep_the_old_ring_alias
     );
     sync.shutdown();
 }
+
+/// Waits up to `limit` for `f`; returns when it first held.
+fn wait_up_to(what: &str, limit: Duration, f: impl Fn() -> bool) -> Instant {
+    let until = Instant::now() + limit;
+    while !f() {
+        assert!(Instant::now() < until, "timed out after {limit:?}: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Instant::now()
+}
+
+/// The owner's row for the Ring Host with Daemon key `key`.
+fn host_row(
+    c: &Computer,
+    key: xshell_protocol::ring::SignKey,
+) -> Option<xshell_hostlink::ring::hosts::AvailableHost> {
+    c.manager
+        .available_hosts()
+        .into_iter()
+        .find(|h| h.daemon_key == Some(key))
+}
+
+fn online(c: &Computer, key: xshell_protocol::ring::SignKey) -> bool {
+    host_row(c, key).is_some_and(|h| h.reachability == Reachability::Online)
+}
+
+/// Milliseconds until a handle's next timed retry (0 when none is scheduled).
+fn retry_in_ms(host: &xshell_hostlink::HostHandle) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    host.status()
+        .next_retry_at
+        .map_or(0, |at| at.saturating_sub(now))
+}
+
+/// B2 (#110): a Computer Device's Daemon that was offline long enough for the owner's Relay
+/// HostHandle to back off far shows its version within seconds of its Daemon key turning
+/// Online again: presence Online kicks the handle instead of waiting out the backoff. The
+/// version must come from a fresh Hello (a new usable link generation), not one left over.
+#[test]
+fn relay_host_version_known_within_seconds_of_coming_online() {
+    let relay = Relay::start();
+    // Owner retries after 1, 2, 4, 8, 16 ... s, so a timed retry cannot pass the deadline.
+    let a = Computer::with_manager(&relay, |m| m.backoff_unit = Duration::from_secs(1));
+    a.create();
+    let mut b = Computer::new(&relay);
+    b.join(&a);
+    let key = common::ring::identity(b.daemon.as_ref().unwrap()).0;
+    let host = a.relay_host(key);
+    let before = host.status().link_generation;
+    assert!(host.status().daemon_version.is_some());
+    b.stop_daemon();
+    wait("the Daemon key is no longer Online", || !online(&a, key));
+    // Several failed dials: the next timed retry is at least 7 s away.
+    wait_up_to("the owner's backoff grows", Duration::from_secs(40), || {
+        !host.status().usable() && retry_in_ms(&host) >= 7_000
+    });
+    b.restart_daemon(|_| {});
+    let came_online = wait_up_to(
+        "the Daemon key Online again",
+        Duration::from_secs(20),
+        || online(&a, key),
+    );
+    wait_up_to(
+        "a fresh Hello within 3 s of Online",
+        Duration::from_secs(20),
+        || {
+            let s = host.status();
+            s.usable() && s.link_generation > before
+        },
+    );
+    assert!(
+        came_online.elapsed() < Duration::from_secs(3),
+        "the version took {:?} after the Host came Online",
+        came_online.elapsed()
+    );
+    // What Settings > Ring shows for the Computer Device: the row its Daemon key stands for
+    // is Online and that Host's status names the version of the new connection.
+    let row = host_row(&a, key).unwrap();
+    assert_eq!(row.reachability, Reachability::Online);
+    let status = a
+        .events
+        .statuses
+        .lock()
+        .unwrap()
+        .get(&row.id)
+        .cloned()
+        .unwrap();
+    assert!(status.link_generation > before);
+    assert!(status.daemon_version.is_some());
+}
+
+/// B2/S5: only a Host's own transition to Online kicks its handle. An Online Host that
+/// refuses connections keeps its backoff while another Host's presence goes and comes back.
+#[test]
+fn another_hosts_presence_churn_does_not_bypass_an_online_hosts_backoff() {
+    let relay = Relay::start();
+    let a = Computer::with_manager(&relay, |m| m.backoff_unit = Duration::from_secs(1));
+    a.create();
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let x = {
+        let refuse = refuse.clone();
+        Computer::with_config(&relay, move |cfg| {
+            cfg.test_hook = Some(xshelld::server::TestHook(Arc::new(move |_, point| {
+                point == xshelld::server::TestPoint::RelayHostAccepted
+                    && refuse.load(std::sync::atomic::Ordering::SeqCst)
+            })))
+        })
+    };
+    x.join(&a);
+    let x_key = common::ring::identity(x.daemon.as_ref().unwrap()).0;
+    let mut y = Computer::new(&relay);
+    y.join(&a);
+    let y_key = common::ring::identity(y.daemon.as_ref().unwrap()).0;
+    a.relay_host(y_key);
+    let id = relay_host_id(&x_key);
+    wait("X has a handle", || a.manager.host(&id).is_some());
+    let hx = a.manager.host(&id).unwrap();
+    // X stays Online but refuses: its retries back off to at least 8 s.
+    wait_up_to("X's backoff grows", Duration::from_secs(40), || {
+        online(&a, x_key) && !hx.status().usable() && retry_in_ms(&hx) >= 8_000
+    });
+    let attempts = hx.link_generation();
+    let window = Instant::now() + Duration::from_millis(retry_in_ms(&hx).saturating_sub(500));
+    y.stop_daemon();
+    wait("Y offline", || !online(&a, y_key));
+    y.restart_daemon(|_| {});
+    wait("Y Online again", || online(&a, y_key));
+    a.relay_host(y_key);
+    assert!(
+        Instant::now() < window,
+        "Y's presence churn outlasted X's backoff window: inconclusive"
+    );
+    assert!(online(&a, x_key));
+    assert_eq!(
+        hx.link_generation(),
+        attempts,
+        "another Host's presence kicked X's handle"
+    );
+    // X's own handle still connects once it stops refusing (at its next timed retry).
+    refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_up_to(
+        "X usable after its timed retry",
+        Duration::from_secs(40),
+        || hx.status().usable(),
+    );
+}

@@ -10,7 +10,7 @@ use crate::ring::dial::RelayDialer;
 use crate::ring::hosts::{AvailableHost, Reachability, RingHosts, RouteKind, VerifiedRingHost};
 use crate::status::{HostSnapshot, HostStatus, HostTestResult};
 use crate::transport::TransportFactory;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -125,6 +125,9 @@ pub struct Manager {
     ring: Mutex<Option<RingHosts>>,
     ring_generation: AtomicU64,
     relay: Mutex<Vec<Arc<HostHandle>>>,
+    /// The Relay Hosts whose presence was Online in the last committed projection: a
+    /// retained Relay HostHandle is kicked only on its own Host's transition to Online.
+    relay_online: Mutex<HashSet<xshell_protocol::ring::SignKey>>,
     available: Mutex<Vec<AvailableHost>>,
     aliases: Mutex<HashMap<String, HostAlias>>,
     configure_lock: Mutex<()>,
@@ -174,6 +177,7 @@ impl Manager {
             ring: Mutex::new(None),
             ring_generation: AtomicU64::new(0),
             relay: Mutex::new(Vec::new()),
+            relay_online: Mutex::new(HashSet::new()),
             available: Mutex::new(Vec::new()),
             aliases: Mutex::new(HashMap::new()),
             configure_lock: Mutex::new(()),
@@ -710,6 +714,7 @@ impl Manager {
             })
             .collect();
         let mut desired = Vec::new();
+        let mut online = HashSet::new();
         if let Some(ring) = ring {
             for descriptor in VerifiedRingHost::project(&ring.state.chain) {
                 if ring
@@ -750,6 +755,7 @@ impl Manager {
                     .map(|o| o.reachability(&descriptor))
                     .unwrap_or(Reachability::Unknown);
                 if equivalent.is_empty() {
+                    let is_online = presence == Reachability::Online;
                     rows.push(AvailableHost {
                         id: relay_id.clone(),
                         aliases: vec![relay_id.clone()],
@@ -762,6 +768,9 @@ impl Manager {
                     });
                     if let Some(owner) = &ring.owner {
                         if owner.authorized(&descriptor) {
+                            if is_online {
+                                online.insert(descriptor.sign_key);
+                            }
                             desired.push(RelayDialer {
                                 host: descriptor,
                                 owner: owner.clone(),
@@ -797,6 +806,7 @@ impl Manager {
             .collect();
         let current = std::mem::take(&mut *self.relay.lock().unwrap());
         let mut next = Vec::new();
+        let mut retained = Vec::new();
         let mut joins = Vec::new();
         for dialer in desired {
             if let Some(h) = current
@@ -804,6 +814,7 @@ impl Manager {
                 .find(|h| h.relay_route().is_some_and(|old| old.same_route(&dialer)))
             {
                 next.push(h.clone());
+                retained.push((dialer.host.sign_key, h.clone()));
             } else {
                 let mut mc = (*self.mc).clone();
                 mc.observer = Arc::new(OwnerRelayObserver);
@@ -850,6 +861,18 @@ impl Manager {
             .collect::<Vec<_>>();
         for h in &next {
             h.start();
+        }
+        // A retained handle whose Host just came Online retries now instead of waiting out
+        // its backoff (its dials failed locally while the Host was offline). Only its own
+        // transition counts: another Host's presence churn never bypasses its backoff.
+        {
+            let mut was_online = self.relay_online.lock().unwrap();
+            for (key, h) in &retained {
+                if online.contains(key) && !was_online.contains(key) && !h.status().usable() {
+                    h.kick();
+                }
+            }
+            *was_online = online;
         }
         *relay = next;
         *self.aliases.lock().unwrap() = aliases;
