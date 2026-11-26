@@ -1225,9 +1225,14 @@ fn lost_preparation_reply_preserves_uncertainty_without_consent_restart_or_new_o
             .state,
         xshelld::server::adoption::StandaloneRecoveryState::ReconciliationRequired
     );
-    let mut later = b.pair(&relay.url(), 2_000);
-    assert_eq!(later.finish(), 1);
+    // #110: a later pair waits briefly for the running Daemon (deferred here), then says
+    // the earlier attempt is still unresolved (its code has expired): exit 6, no offer.
+    let wait_1s = ms("1000");
+    let mut later = b.pair_with_env(&relay.url(), 2_000, &earlier_wait(&wait_1s));
+    assert_eq!(later.finish(), xshelld::pair::UNFINISHED_EXIT);
     assert_eq!(later.words, 0);
+    let stderr = later.stderr();
+    assert_eq!(stderr.trim_end(), UNFINISHED_RUNNING_LINE, "{stderr}");
     assert_eq!(std::fs::read(journal_path).unwrap(), retained);
     assert_eq!(proofs.load(Ordering::Acquire), 0);
     assert_no_words_on_disk(&b, &code);
