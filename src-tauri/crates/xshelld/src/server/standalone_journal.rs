@@ -163,6 +163,12 @@ pub(crate) fn earlier_pairing(store: &Store) -> EarlierPairing {
     }
 }
 
+/// The fence's refusal text, if it refuses (`xshelld pair` reports it as is).
+#[cfg(unix)]
+pub(crate) fn standalone_refusal(store: &Store) -> Option<String> {
+    refuse_unresolved_standalone(store).err()
+}
+
 /// Shared admission/commit fence. Expiry and process death cannot turn possible consent
 /// into permission to establish another membership. Only a verified durable installation
 /// permits the later registered-counterpart completion path.

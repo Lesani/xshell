@@ -303,22 +303,48 @@ fn pair_cancel(
         .clone()
         .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
     RelayUrl::parse(&relay).map_err(|_| "invalid Pair Relay".to_string())?;
-    // An earlier attempt whose consent may have left comes first: a Roster installed
-    // without its receipt is not yet "in your Ring". Wait (briefly) for the Daemon to
-    // finish or abandon it instead of refusing with a raw code. Once only.
+    // "Already in your Ring" needs the durable receipt too: a Roster installed without it
+    // (an earlier attempt whose consent may have left) is not yet a membership. The Roster
+    // is read first and the journal after it: a standalone attempt writes its journal
+    // before it installs any Roster and sets aside only an uninstalled journal, so a
+    // Roster seen first is never paired with a journal state older than it. An unresolved
+    // attempt is waited for (briefly, once) instead of refused with a raw code.
     let mut waited = false;
-    if let EarlierPairing::Unresolved { expires_at } = earlier_pairing(&store) {
-        waited = true;
-        if let Earlier::Added(chain) = wait_for_earlier(&store, out, cancel, expires_at)? {
-            return writeln!(out, "{}", done_line(machines(&chain)))
-                .and_then(|()| out.flush())
-                .map_err(|e| Failure::Other(e.to_string()));
+    loop {
+        let chain = current_ring(&store);
+        #[cfg(debug_assertions)]
+        test_cut("XSHELLD_TEST_PAIR_BEFORE_JOURNAL_READ");
+        match (earlier_pairing(&store), chain) {
+            (EarlierPairing::Unresolved { expires_at }, _) => {
+                if waited {
+                    return Err(Failure::EarlierRunning {
+                        minutes: minutes_left(expires_at),
+                    });
+                }
+                waited = true;
+                if let Earlier::Added(chain) = wait_for_earlier(&store, out, cancel, expires_at)? {
+                    return writeln!(out, "{}", done_line(machines(&chain)))
+                        .and_then(|()| out.flush())
+                        .map_err(|e| Failure::Other(e.to_string()));
+                }
+                // Set aside: look again from the start.
+            }
+            // An installed journal whose durable validation fails (or an unreadable one)
+            // never reads as a membership: the existing refusal.
+            (EarlierPairing::Other, Some(_)) => {
+                return Err(Failure::Other(
+                    crate::server::standalone_journal::standalone_refusal(&store).unwrap_or_else(
+                        || "reconciliation_required: standalone obligation changed".into(),
+                    ),
+                ));
+            }
+            (EarlierPairing::Absent | EarlierPairing::Installed, Some(chain)) => {
+                return writeln!(out, "{}", already_line(machines(&chain)))
+                    .and_then(|()| out.flush())
+                    .map_err(|e| Failure::Other(e.to_string()));
+            }
+            (_, None) => break,
         }
-    }
-    if let Some(chain) = current_ring(&store) {
-        return writeln!(out, "{}", already_line(machines(&chain)))
-            .and_then(|()| out.flush())
-            .map_err(|e| Failure::Other(e.to_string()));
     }
     if crate::server::ring::companion_registered(&paths.ring_dir) {
         return registered_computer_pair(&store, &relay, out, cancel);
@@ -420,6 +446,21 @@ fn local_owner(store: &Store) -> LocalOwner {
             LocalOwner::Stopped
         }
         Err(_) => LocalOwner::Busy,
+    }
+}
+
+/// Test cut: the command waits here while the named file exists (at most 60 s), so a test
+/// can order another process's work between two of its reads.
+#[cfg(debug_assertions)]
+fn test_cut(name: &str) {
+    if let Some(path) = std::env::var_os(name) {
+        let path = std::path::PathBuf::from(path);
+        if crate::server::ring::write_private(&path, b"reached").is_ok() {
+            let until = Instant::now() + Duration::from_secs(60);
+            while path.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }
 

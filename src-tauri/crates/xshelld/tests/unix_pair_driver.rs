@@ -3076,3 +3076,109 @@ fn actual_cli_registered_computer_rate_limited_exits_7_with_its_copy() {
     }
     br.quit();
 }
+
+// ---------- #110 review: the first "already in your Ring" needs the receipt too ----------
+
+/// The second command pauses between its first observation (the Roster: none yet) and the
+/// journal read. Meanwhile the first attempt's consent leaves, the Daemon installs the
+/// Roster and holds before its receipt, and the receipt then cannot be written. The
+/// second command must not report a membership (exit 0).
+#[test]
+fn actual_cli_pair_paused_between_reads_never_succeeds_without_the_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &relay.url(), &pid, || {}, || {});
+    let b = Fixture::new();
+    let (reached_tx, reached) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let reached_tx = std::sync::Mutex::new(reached_tx);
+    let _bd = b.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
+        if point == xshelld::server::TestPoint::StandaloneInstalledBeforeJournal
+            && first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        }
+        false
+    })));
+    let cut = b.home.path().join("before-journal-read");
+    let wait_3s = ms("3000");
+    let mut second = b.pair_with_env(
+        &relay.url(),
+        300_000,
+        &[
+            ("XSHELLD_TEST_PAIR_BEFORE_JOURNAL_READ", cut.as_path()),
+            ("XSHELLD_PAIR_EARLIER_WAIT_MS", wait_3s.as_path()),
+        ],
+    );
+    wait_for(
+        "the second command's pause",
+        Duration::from_secs(10),
+        || cut.exists(),
+    );
+    assert!(
+        !b.paths.ring_dir.join("roster.json").exists(),
+        "no Roster yet"
+    );
+    let approval = first_pair_killed(&b, &ar, &relay.url(), 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(b.paths.ring_dir.join("roster.json").is_file(), "installed");
+    assert_eq!(b.journal()["installed"], false, "no receipt");
+    let dir = b.paths.ring_dir.clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    release.send(()).unwrap();
+    std::fs::remove_file(&cut).unwrap();
+    let code = second.finish();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = second.stderr();
+    assert_eq!(code, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
+    assert!(
+        !second
+            .seen
+            .iter()
+            .any(|l| l.starts_with("Added") || l.starts_with("This machine is already")),
+        "{:?}",
+        second.seen
+    );
+    assert_eq!(second.words, 0);
+    ar.quit();
+}
+
+/// An installed journal that fails its durable validation is never read as a membership.
+#[test]
+fn actual_cli_pair_with_invalid_installed_receipt_never_reports_membership() {
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = approver(&a, &relay.url(), |_| {});
+    let b = Fixture::new();
+    let mut child = b.pair(&relay.url(), 30_000);
+    let code = child.code();
+    assert!(ar.approve_device_code(&code).is_ok());
+    assert_eq!(child.finish(), 0, "stderr:\n{}", child.stderr());
+    assert!(standalone_installed(&b));
+    // The receipt no longer matches: its accepted chain lost the Enroll transition.
+    let path = b.paths.ring_dir.join("standalone-adoption.json");
+    let mut journal = b.journal();
+    journal["accepted"].as_array_mut().unwrap().pop();
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let mut again = b.pair(&relay.url(), 30_000);
+    assert_eq!(again.finish(), 1);
+    let stderr = again.stderr();
+    assert!(
+        stderr.starts_with("xshelld: reconciliation_required: "),
+        "{stderr}"
+    );
+    assert!(again.seen.is_empty(), "{:?}", again.seen);
+    assert_eq!(again.words, 0);
+    ar.quit();
+}
