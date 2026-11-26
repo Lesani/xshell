@@ -795,6 +795,13 @@ fn online(c: &Computer, key: xshell_protocol::ring::SignKey) -> bool {
     host_row(c, key).is_some_and(|h| h.reachability == Reachability::Online)
 }
 
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 /// Milliseconds until a handle's next timed retry (0 when none is scheduled).
 fn retry_in_ms(host: &xshell_hostlink::HostHandle) -> u64 {
     let now = std::time::SystemTime::now()
@@ -824,28 +831,32 @@ fn relay_host_version_known_within_seconds_of_coming_online() {
     assert!(host.status().daemon_version.is_some());
     b.stop_daemon();
     wait("the Daemon key is no longer Online", || !online(&a, key));
-    // Several failed dials: the next timed retry is at least 7 s away.
-    wait_up_to("the owner's backoff grows", Duration::from_secs(40), || {
-        !host.status().usable() && retry_in_ms(&host) >= 7_000
+    // Several failed dials: the next timed retry is at least 12 s away. Only a kick can
+    // bring an attempt before that scheduled time.
+    wait_up_to("the owner's backoff grows", Duration::from_secs(60), || {
+        !host.status().usable() && retry_in_ms(&host) >= 12_000
     });
+    let scheduled = host.status().next_retry_at.expect("a scheduled retry");
     b.restart_daemon(|_| {});
-    let came_online = wait_up_to(
+    wait_up_to(
         "the Daemon key Online again",
         Duration::from_secs(20),
         || online(&a, key),
     );
-    wait_up_to(
-        "a fresh Hello within 3 s of Online",
-        Duration::from_secs(20),
-        || {
-            let s = host.status();
-            s.usable() && s.link_generation > before
-        },
-    );
+    // When Online is observed, the timed retry still lies beyond the 3 s deadline, so only
+    // the presence-triggered attempt can satisfy what follows.
+    let deadline = Duration::from_secs(3);
     assert!(
-        came_online.elapsed() < Duration::from_secs(3),
-        "the version took {:?} after the Host came Online",
-        came_online.elapsed()
+        scheduled > epoch_ms() + deadline.as_millis() as u64 + 500,
+        "inconclusive: the timed retry is due within the deadline (restart too slow)"
+    );
+    wait_up_to("a fresh Hello within 3 s of Online", deadline, || {
+        let s = host.status();
+        s.usable() && s.link_generation > before
+    });
+    assert!(
+        epoch_ms() < scheduled,
+        "the fresh Hello came no sooner than the timed retry"
     );
     // What Settings > Ring shows for the Computer Device: the row its Daemon key stands for
     // is Online and that Host's status names the version of the new connection.
