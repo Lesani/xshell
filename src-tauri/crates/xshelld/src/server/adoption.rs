@@ -783,6 +783,7 @@ impl StandaloneDriver<'_> {
     /// Each wait (the Store lock for the pin, one observation) is bounded by
     /// [`OBSERVE_ATTEMPT`] and honours cancellation. The caller's acceptance gate decides
     /// whether a returned chain may still be installed.
+    #[allow(clippy::too_many_arguments)]
     fn observe_after_consent(
         &self,
         record: &StandaloneJournal,
