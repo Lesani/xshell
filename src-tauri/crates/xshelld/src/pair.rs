@@ -500,8 +500,22 @@ fn offer_held_by_another(store: &Store) -> bool {
 }
 /// The words on a line of their own, where to type them, how long they work, and (unless
 /// it was printed already) that the command waits.
+/// `cli.pair.version`: this build's version, beside the words on the standalone route only
+/// (on a registered Computer the Desktop joins, so this CLI's version would mislead). It
+/// lets the user compare it with the approving Desktop's before entering the words (#111).
+fn version_line() -> String {
+    format!("xshell {} on this machine", env!("CARGO_PKG_VERSION"))
+}
+
 fn print_words(out: &mut dyn Write, code: &DeviceCode, waiting: bool) -> Result<(), String> {
     writeln!(out, "{}", code.format().as_str())
+        .and_then(|()| {
+            if waiting {
+                writeln!(out, "{}", version_line())
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| writeln!(out, "{INSTRUCTION}"))
         .and_then(|()| writeln!(out, "{LIFETIME}"))
         .and_then(|()| {
@@ -971,6 +985,31 @@ mod tests {
         assert!(crate::cli::USAGE.contains("pair exit codes:"));
         assert!(crate::cli::USAGE.contains(&format!("  {UNFINISHED_EXIT}  ")));
         assert!(crate::cli::USAGE.contains(&format!("  {EXPIRED_EXIT}  ")));
+    }
+    #[test]
+    fn words_block_names_this_build_version() {
+        let code = DeviceCode::generate().unwrap();
+        let mut standalone = Vec::new();
+        print_words(&mut standalone, &code, true).unwrap();
+        let lines: Vec<String> = String::from_utf8(standalone)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(lines[0], code.format().as_str());
+        assert_eq!(
+            lines[1],
+            format!("xshell {} on this machine", env!("CARGO_PKG_VERSION"))
+        );
+        // Never mistaken for the words.
+        assert!(DeviceCode::parse(&lines[1]).is_err());
+        assert_eq!(lines[2..], [INSTRUCTION, LIFETIME, WAITING]);
+        // The registered-Computer route: the Desktop joins, no CLI version.
+        let mut registered = Vec::new();
+        print_words(&mut registered, &code, false).unwrap();
+        assert!(!String::from_utf8(registered)
+            .unwrap()
+            .contains("on this machine"));
     }
     #[test]
     fn earlier_pairing_maps_to_copy_and_exit_6() {

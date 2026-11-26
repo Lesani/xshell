@@ -479,6 +479,7 @@ fn standalone_install(running: bool, different_socket: bool, existing: bool) {
             child.seen,
             [
                 code.format().as_str(),
+                format!("xshell {} on this machine", env!("CARGO_PKG_VERSION")).as_str(),
                 "Type these eight words on a machine or phone already in your Ring. On a machine, open Settings > Ring > Add a machine.",
                 "These words work once, for 10 minutes, while this command is running.",
                 "Waiting for another device to add this machine...",

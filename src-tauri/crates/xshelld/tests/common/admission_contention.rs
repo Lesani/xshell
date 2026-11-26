@@ -162,6 +162,7 @@ impl ObservedChild {
                 } else if line
                     != "Type these eight words on a machine or phone already in your Ring. On a machine, open Settings > Ring > Add a machine."
                     && line != "These words work once, for 10 minutes, while this command is running."
+                    && line != format!("xshell {} on this machine", env!("CARGO_PKG_VERSION"))
                 {
                     state.unknown += 1;
                 }

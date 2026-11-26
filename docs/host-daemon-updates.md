@@ -21,6 +21,32 @@ Host's selected directory before normal upgrade teardown. Its owning Desktop sta
 selection on reconnect, unless its newly installed bundle is newer. An invalid/unsafe
 selection is a visible failure, not a silent fallback.
 
+## Updating a Host that is in no Ring
+
+A Host joins a Ring only when its xshell can pair with the Desktops already in it. The
+Desktop's update action needs a Ring (or an SSH Host entry), so a headless Host that is in
+no Ring yet is updated by hand (#111):
+
+1. Compare versions. `xshelld pair` prints `xshell <version> on this machine` next to the
+   eight words; the Desktop shows its own version in Settings → About. When they differ,
+   update the Host first.
+2. On the Host, run the installer of the release the approving Desktop runs, with that
+   Desktop's version:
+
+   ```sh
+   curl -fsSL https://github.com/Lesani/xshell/releases/download/v<version>/install.sh | sh
+   ```
+
+   This is the same command the Desktop gives for a new Host. Builds are published as
+   pre-releases, so `releases/latest` does not find them: always name the version.
+3. On a Host where xshell is already installed, the installer only updates it and moves the
+   running `xshelld` onto the new build. Without `--no-pair` it then shows new words; enter
+   them on the Desktop (Settings → Ring → Add a machine). With `--no-pair`, run
+   `xshelld pair` afterwards.
+
+The `xshell.sh/install.sh` command in the README installs the Desktop, not this Host
+installer.
+
 ## Coordinated private-dogfood Store ownership upgrade
 
 Before using the canonical Store ownership lease on an existing deployment, stop and drain
