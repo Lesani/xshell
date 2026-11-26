@@ -526,20 +526,37 @@ fn dispatch(
         if daemon.cfg.gui_bound.is_some() {
             return Err("GUI-bound owner excludes standalone installation".into());
         }
-        daemon
-            .ring
-            .join_accepted_standalone(&rosters, &operation, budget)?;
+        let handoff = || -> Result<CompanionResponse, String> {
+            daemon
+                .ring
+                .join_accepted_standalone(&rosters, &operation, budget)?;
+            if let Some(hook) = &daemon.cfg.test_hook {
+                (hook.0)(
+                    uuid::Uuid::nil(),
+                    super::TestPoint::StandaloneHandoffInstalled,
+                );
+            }
+            let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;
+            super::adoption::finalize_standalone_install(
+                &daemon.ring,
+                &operation,
+                &accepted,
+                budget,
+            )?;
+            Ok(CompanionResponse::Installed {
+                hash: accepted.head().hash(),
+            })
+        };
+        let result = handoff();
         if let Some(hook) = &daemon.cfg.test_hook {
             (hook.0)(
                 uuid::Uuid::nil(),
-                super::TestPoint::StandaloneHandoffInstalled,
+                super::TestPoint::StandaloneHandoffEnded {
+                    installed: result.is_ok(),
+                },
             );
         }
-        let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;
-        super::adoption::finalize_standalone_install(&daemon.ring, &operation, &accepted, budget)?;
-        return Ok(CompanionResponse::Installed {
-            hash: accepted.head().hash(),
-        });
+        return result;
     }
     if let CompanionRequest::InstallAccepted { operation, rosters } = request {
         let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;

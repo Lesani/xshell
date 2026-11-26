@@ -269,6 +269,9 @@ pub enum TestPoint {
     /// before its final receipt. No locks held; a test may pause it to overlap with
     /// maintenance after the command exited.
     StandaloneHandoffInstalled,
+    /// That handler has ended; `installed`: it replied with an installation receipt. No
+    /// locks held.
+    StandaloneHandoffEnded { installed: bool },
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
     /// A staged build is complete and about to be run for validation, before the requester

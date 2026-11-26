@@ -560,8 +560,31 @@ impl From<&str> for StandaloneCommandError {
 /// The command's observation backoff after consent: 250 ms, doubling, at most 2 s.
 const OBSERVE_FIRST: Duration = Duration::from_millis(250);
 const OBSERVE_MAX: Duration = Duration::from_secs(2);
-/// After the approver's typed refusal, how long the command still looks for a publication.
+/// After the approver's typed refusal, how long the command still looks for a publication
+/// (`XSHELLD_PAIR_REFUSAL_OBSERVE_MS`, test only, shortens it).
 const OBSERVE_AFTER_REFUSAL: Duration = Duration::from_secs(30);
+fn observe_after_refusal() -> Duration {
+    std::env::var("XSHELLD_PAIR_REFUSAL_OBSERVE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(OBSERVE_AFTER_REFUSAL)
+        .min(OBSERVE_AFTER_REFUSAL)
+}
+/// Test cut: a successful observation is held here until the named file is removed, so a
+/// test can deliver it after the deadline or a cancellation.
+#[cfg(debug_assertions)]
+fn test_cut_after_observation() {
+    if let Some(path) = std::env::var_os("XSHELLD_TEST_AFTER_OBSERVATION") {
+        let path = std::path::PathBuf::from(path);
+        if write_private(&path, b"observed").is_ok() {
+            let until = Instant::now() + Duration::from_secs(60);
+            while path.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
 /// One observation's connection budget: Ctrl-C is honoured at the latest after this.
 const OBSERVE_ATTEMPT: Duration = Duration::from_secs(5);
 
@@ -755,39 +778,33 @@ impl StandaloneDriver<'_> {
     /// never extends `until`. Every Relay refusal before the deadline is retried; only a
     /// verified chain whose accepted Enroll no longer authorizes this Daemon, cancellation
     /// and the deadline end it. After the approver's typed refusal it looks for at most
-    /// [`OBSERVE_AFTER_REFUSAL`], then ends as declined.
+    /// `refusal_window` ([`observe_after_refusal`]; or until the deadline, if sooner), then
+    /// ends as declined.
+    /// Each wait (the Store lock for the pin, one observation) is bounded by
+    /// [`OBSERVE_ATTEMPT`] and honours cancellation. The caller's acceptance gate decides
+    /// whether a returned chain may still be installed.
     fn observe_after_consent(
         &self,
         record: &StandaloneJournal,
         keys: &Arc<DeviceKeys>,
         until: Instant,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         error: &PairError,
+        refusal_window: Duration,
         mut reconnecting: impl FnMut(),
     ) -> Result<RosterChain, StandaloneCommandError> {
         let unfinished =
             |e: &dyn std::fmt::Display| self.unfinished(format!("reconciliation_required: {e}"));
-        if matches!(error, PairError::Cancelled) || self.stopping(cancel) || Instant::now() >= until
-        {
+        let refused = matches!(error, PairError::Refused(_));
+        // The approver's typed refusal keeps its own outcome when its window ends without
+        // an accepted chain, also when the original deadline is what ends that window.
+        let declined =
+            || StandaloneCommandError::Failed(format!("reconciliation_required: {error}"));
+        if matches!(error, PairError::Cancelled) || self.stopping(cancel) {
             return Err(unfinished(error));
         }
-        let budget = xshell_core::local_ipc::RequestBudget::for_operation(
-            until,
-            Arc::new(AtomicBool::new(false)),
-        );
-        let pin = {
-            let _lock = self
-                .store
-                .lock_until(&budget)
-                .map_err(|_| unfinished(error))?;
-            if load_journal(&self.store).ok().flatten().as_ref() != Some(record) {
-                return Err(unfinished(error));
-            }
-            standalone_pin(&self.store, record).map_err(|_| unfinished(error))?
-        };
-        let refused = matches!(error, PairError::Refused(_));
         let stop = if refused {
-            until.min(Instant::now() + OBSERVE_AFTER_REFUSAL)
+            until.min(Instant::now() + refusal_window)
         } else {
             until
         };
@@ -796,6 +813,7 @@ impl StandaloneDriver<'_> {
             _ => None,
         };
         reconnecting();
+        let mut pin = None;
         let mut delay = OBSERVE_FIRST;
         let mut last = error.to_string();
         loop {
@@ -803,30 +821,44 @@ impl StandaloneDriver<'_> {
                 return Err(unfinished(&last));
             }
             if Instant::now() >= stop {
-                return Err(if refused && Instant::now() < until {
-                    StandaloneCommandError::Failed(format!("reconciliation_required: {error}"))
+                return Err(if refused {
+                    declined()
                 } else {
                     unfinished(&last)
                 });
             }
-            let observed = observe_standalone_accepted(
-                link.clone(),
-                record,
-                keys.clone(),
-                &pin,
-                stop.min(Instant::now() + OBSERVE_ATTEMPT),
-            );
-            // An answer that arrives after the deadline or a cancellation is not used.
-            if self.stopping(cancel) || Instant::now() >= until {
-                return Err(unfinished(&last));
+            let attempt = stop.min(Instant::now() + OBSERVE_ATTEMPT);
+            if pin.is_none() {
+                let budget =
+                    xshell_core::local_ipc::RequestBudget::for_operation(attempt, cancel.clone());
+                match self.store.lock_until(&budget) {
+                    Ok(_lock) => {
+                        if load_journal(&self.store).ok().flatten().as_ref() != Some(record) {
+                            return Err(unfinished(error));
+                        }
+                        pin = Some(
+                            standalone_pin(&self.store, record).map_err(|_| unfinished(error))?,
+                        );
+                    }
+                    // Busy (or cancelled): look again, within the loop's own checks.
+                    Err(e) => {
+                        last = e;
+                        self.back_off(&mut delay, stop, cancel);
+                        continue;
+                    }
+                }
             }
-            match observed {
+            let pin_now = pin.as_ref().expect("pin");
+            match observe_standalone_accepted(link.clone(), record, keys.clone(), pin_now, attempt)
+            {
                 Ok(chain) => {
                     let mut candidate = record.clone();
                     candidate.accepted =
                         chain.versions().iter().map(|r| r.token().into()).collect();
                     if accepted_record(&self.store, &candidate).is_ok() {
                         if chain.authorized_member(&keys.sign_key()).is_some() {
+                            #[cfg(debug_assertions)]
+                            test_cut_after_observation();
                             return Ok(chain);
                         }
                         // Signed evidence: the accepted Enroll is followed by this Daemon's
@@ -840,14 +872,18 @@ impl StandaloneDriver<'_> {
                 }
                 Err(e) => last = e.to_string(),
             }
-            let wake = Instant::now() + delay;
-            while Instant::now() < wake.min(stop) && !self.stopping(cancel) {
-                std::thread::sleep(
-                    Duration::from_millis(50).min(wake.saturating_duration_since(Instant::now())),
-                );
-            }
-            delay = (delay * 2).min(OBSERVE_MAX);
+            self.back_off(&mut delay, stop, cancel);
         }
+    }
+    /// Sleeps `delay` (never past `stop`, woken by cancellation), then doubles it.
+    fn back_off(&self, delay: &mut Duration, stop: Instant, cancel: &AtomicBool) {
+        let wake = Instant::now() + *delay;
+        while Instant::now() < wake.min(stop) && !self.stopping(cancel) {
+            std::thread::sleep(
+                Duration::from_millis(50).min(wake.saturating_duration_since(Instant::now())),
+            );
+        }
+        *delay = (*delay * 2).min(OBSERVE_MAX);
     }
 
     fn run(
@@ -997,11 +1033,17 @@ impl StandaloneDriver<'_> {
         let chain = match result {
             Ok((chain, _)) => chain,
             Err(error) => match journal.as_ref() {
-                Some(record) if prepared => {
-                    self.observe_after_consent(record, &keys, until, cancel, &error, || {
+                Some(record) if prepared => self.observe_after_consent(
+                    record,
+                    &keys,
+                    until,
+                    cancel,
+                    &error,
+                    observe_after_refusal(),
+                    || {
                         let _ = events(StandaloneEvent::Reconnecting);
-                    })?
-                }
+                    },
+                )?,
                 Some(_) => {
                     return Err(StandaloneCommandError::Failed(format!(
                         "reconciliation_required: {error}"
@@ -1011,6 +1053,15 @@ impl StandaloneDriver<'_> {
             },
         };
         let record = journal.ok_or("standalone consent receipt missing")?;
+        // The one acceptance gate for a chain from either path: only a chain accepted while
+        // the command is live gets the local completion tail. After consent anything else
+        // is unfinished (the Daemon finishes it), never success.
+        if Instant::now() >= until || self.stopping(cancel) {
+            return Err(self.unfinished(
+                "reconciliation_required: the accepted chain arrived after the command ended"
+                    .into(),
+            ));
+        }
         self.install_accepted(record, chain, cancel)
             .map_err(|cause| self.unfinished(cause))
     }

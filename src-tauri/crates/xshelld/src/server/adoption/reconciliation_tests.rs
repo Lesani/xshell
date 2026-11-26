@@ -1609,3 +1609,117 @@ fn reconcile_uses_shared_observation_pin() {
         Some((expected.version, expected.hash))
     );
 }
+
+/// The command's post-consent observation on this Fixture's (unpaired, in-process) Daemon.
+/// Its Relay (`ws://127.0.0.1:9`) refuses every connection, so nothing is ever accepted.
+fn observe_after(
+    f: &Fixture,
+    until: Instant,
+    cancel: &Arc<AtomicBool>,
+    error: PairError,
+    refusal_window: Duration,
+) -> (Result<RosterChain, StandaloneCommandError>, Duration) {
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let record = load_journal(&store).unwrap().unwrap();
+    let keys = Arc::new(store.load_keys().unwrap().unwrap());
+    let driver = StandaloneDriver {
+        store,
+        owner: StandaloneOwner::Runtime(&f.handle.d.ring),
+        exiting: None,
+    };
+    let started = Instant::now();
+    let result =
+        driver.observe_after_consent(&record, &keys, until, cancel, &error, refusal_window, || {});
+    (result, started.elapsed())
+}
+fn refused() -> PairError {
+    PairError::Refused(xshell_protocol::ring::pairing::PairRefusal::PublishFailed)
+}
+
+#[test]
+fn typed_refusal_with_lifetime_left_ends_declined_after_its_window() {
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (result, elapsed) = observe_after(
+        &f,
+        Instant::now() + Duration::from_secs(60),
+        &cancel,
+        refused(),
+        Duration::from_millis(800),
+    );
+    assert!(
+        matches!(&result, Err(StandaloneCommandError::Failed(m)) if m.contains("refused")),
+        "declined: {result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(5),
+        "bounded by the refusal window: {elapsed:?}"
+    );
+}
+
+#[test]
+fn typed_refusal_near_expiry_ends_declined_at_the_deadline() {
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (result, elapsed) = observe_after(
+        &f,
+        Instant::now() + Duration::from_millis(800),
+        &cancel,
+        refused(),
+        OBSERVE_AFTER_REFUSAL,
+    );
+    assert!(
+        matches!(&result, Err(StandaloneCommandError::Failed(m)) if m.contains("refused")),
+        "declined, not unfinished, when the deadline ends the window: {result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    // Already past the deadline when the refusal arrives: still declined.
+    let (result, _) = observe_after(
+        &f,
+        Instant::now(),
+        &cancel,
+        refused(),
+        OBSERVE_AFTER_REFUSAL,
+    );
+    assert!(
+        matches!(result, Err(StandaloneCommandError::Failed(_))),
+        "{result:?}"
+    );
+    // Not a refusal: the deadline leaves it unfinished.
+    let (result, _) = observe_after(
+        &f,
+        Instant::now() + Duration::from_millis(300),
+        &cancel,
+        PairError::Relay("connection closed".into()),
+        OBSERVE_AFTER_REFUSAL,
+    );
+    assert!(
+        matches!(result, Err(StandaloneCommandError::Unfinished { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn ctrl_c_during_a_refusal_window_stays_cancelled() {
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (result, elapsed) = std::thread::scope(|scope| {
+        let setter = cancel.clone();
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, Ordering::Release);
+        });
+        observe_after(
+            &f,
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+            refused(),
+            OBSERVE_AFTER_REFUSAL,
+        )
+    });
+    assert!(
+        matches!(result, Err(StandaloneCommandError::Unfinished { .. })),
+        "{result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}

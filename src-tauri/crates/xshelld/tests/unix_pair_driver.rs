@@ -2182,9 +2182,10 @@ fn actual_cli_relay_refusals_after_consent_are_retried_until_listed() {
     ar.quit();
 }
 
-/// S3: an observation answered after Ctrl-C (or after the deadline) is not used; the
-/// command ends unfinished and the Daemon finishes the Join later.
-fn observation_outlived(cancel: bool) {
+/// S3: an observation answered after Ctrl-C is not used: the held authentication is let
+/// through only after the command was cancelled, and the answer would list this machine.
+#[test]
+fn actual_cli_ctrl_c_during_observation_never_uses_its_late_answer() {
     let relay = workerd::Relay::start();
     let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
     let a = Fixture::new();
@@ -2200,42 +2201,27 @@ fn observation_outlived(cancel: bool) {
         })
     };
     let b = Fixture::new();
-    let ttl = if cancel { 60_000 } else { 6_000 };
-    let mut child = b.pair(&proxy.url(), ttl);
+    let mut child = b.pair(&proxy.url(), 60_000);
     let code = child.code();
-    let started = Instant::now();
     assert!(ar.approve_device_code(&code).is_ok(), "published");
     child.wait_line(RECONNECTING_LINE, Duration::from_secs(5));
     wait_for("an observation in flight", Duration::from_secs(5), || {
         proxy.holding()
     });
-    if cancel {
-        child.cancel();
-        std::thread::sleep(Duration::from_millis(300));
-        // The held observation now completes and would list this machine.
-        proxy.release();
-    }
+    child.cancel();
+    std::thread::sleep(Duration::from_millis(300));
+    // The held observation now completes and would list this machine.
+    proxy.release();
     let exit = child.finish();
     let stderr = child.stderr();
     assert_eq!(exit, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
-    let copy = if cancel {
-        UNFINISHED_CANCELLED_LINE
-    } else {
-        UNFINISHED_STOPPED_LINE
-    };
-    assert!(stderr.lines().any(|l| l == copy), "{stderr}");
-    if !cancel {
-        assert!(
-            started.elapsed() < Duration::from_millis(ttl + 3_000),
-            "the observation outlived the deadline: {:?}",
-            started.elapsed()
-        );
-    }
+    assert!(
+        stderr.lines().any(|l| l == UNFINISHED_CANCELLED_LINE),
+        "{stderr}"
+    );
     // The Offline command used nothing it observed late.
-    assert!(!standalone_installed(&b));
     assert!(!b.paths.ring_dir.join("roster.json").exists());
     assert_eq!(b.journal()["installed"], false);
-    proxy.release();
     let daemon = b.server();
     wait_for(
         "the Daemon finishes the approved Join",
@@ -2244,20 +2230,178 @@ fn observation_outlived(cancel: bool) {
     );
     ar.quit();
 }
-#[test]
-fn actual_cli_ctrl_c_during_observation_never_uses_its_late_answer() {
-    observation_outlived(true);
-}
+
+/// S3: a successful observation that returns after the command's deadline is not used.
+/// The observation succeeds (the approver published) and is held at a test cut until the
+/// code has expired, then returned.
 #[test]
 fn actual_cli_deadline_during_observation_never_uses_its_late_answer() {
-    observation_outlived(false);
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = {
+        let proxy = proxy.clone();
+        approver(&a, &proxy.url(), move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived {
+                proxy.cut_non_ring();
+            }
+        })
+    };
+    let b = Fixture::new();
+    let cut = b.home.path().join("after-observation");
+    let ttl = 6_000;
+    let mut child = b.pair_with_env(
+        &proxy.url(),
+        ttl,
+        &[("XSHELLD_TEST_AFTER_OBSERVATION", &cut)],
+    );
+    let code = child.code();
+    let started = Instant::now();
+    assert!(ar.approve_device_code(&code).is_ok(), "published");
+    wait_for(
+        "a successful observation",
+        Duration::from_millis(ttl),
+        || cut.exists(),
+    );
+    let expires_at = b.journal()["intent"]["expiresAt"].as_u64().unwrap();
+    while unix_now() <= expires_at || started.elapsed() < Duration::from_millis(ttl + 500) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.child.try_wait().unwrap().is_none());
+    std::fs::remove_file(&cut).unwrap();
+    let exit = child.finish();
+    let stderr = child.stderr();
+    assert_eq!(exit, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
+    assert!(
+        stderr.lines().any(|l| l == UNFINISHED_STOPPED_LINE),
+        "{stderr}"
+    );
+    assert!(!child
+        .seen
+        .iter()
+        .any(|l| l.starts_with("Added this machine")));
+    assert!(!b.paths.ring_dir.join("roster.json").exists());
+    assert_eq!(b.journal()["installed"], false);
+    let daemon = b.server();
+    wait_for(
+        "the Daemon finishes the approved Join",
+        Duration::from_secs(15),
+        || status_installed(&daemon) && standalone_installed(&b),
+    );
+    ar.quit();
+}
+
+/// Ctrl-C while the Store lock for the observation pin is busy ends the command within one
+/// attempt's bound, with the cancelled copy.
+#[test]
+fn actual_cli_ctrl_c_while_store_lock_busy_after_consent_ends_promptly() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let b = Fixture::new();
+    let held = Arc::new(std::sync::Mutex::new(None::<std::fs::File>));
+    let ar = {
+        let (proxy, held, ring_lock) = (
+            proxy.clone(),
+            held.clone(),
+            b.paths.ring_dir.join("ring.lock"),
+        );
+        approver(&a, &proxy.url(), move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&ring_lock)
+                    .unwrap();
+                file.try_lock().unwrap();
+                *held.lock().unwrap() = Some(file);
+                proxy.cut_non_ring();
+            }
+        })
+    };
+    let mut child = b.pair(&proxy.url(), 120_000);
+    let code = child.code();
+    assert!(ar.approve_device_code(&code).is_ok());
+    child.wait_line(RECONNECTING_LINE, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(held.lock().unwrap().is_some());
+    let cancelled = Instant::now();
+    child.cancel();
+    let exit = child.finish();
+    let stderr = child.stderr();
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        cancelled.elapsed()
+    );
+    assert_eq!(exit, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
+    assert!(
+        stderr.lines().any(|l| l == UNFINISHED_CANCELLED_LINE),
+        "{stderr}"
+    );
+    drop(held.lock().unwrap().take());
+    ar.quit();
+}
+
+/// Every journal state from the start until `watching` is cleared: (accepted length,
+/// installed).
+fn watch_journal(
+    b: &Fixture,
+    watching: &Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Vec<(usize, bool)>> {
+    use std::sync::atomic::Ordering;
+    let (watching, path) = (
+        watching.clone(),
+        b.paths.ring_dir.join("standalone-adoption.json"),
+    );
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while watching.load(Ordering::SeqCst) {
+            if let Some(j) = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            {
+                seen.push((
+                    j["accepted"].as_array().map_or(0, |a| a.len()),
+                    j["installed"] == true,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen
+    })
+}
+fn assert_never_regressed(seen: &[(usize, bool)]) {
+    assert!(
+        seen.windows(2)
+            .all(|w| w[1].0 >= w[0].0 && (w[1].1 || !w[0].1)),
+        "the journal regressed: {seen:?}"
+    );
+}
+/// The receipt names exactly the durable installation.
+fn assert_receipt_is_installation(b: &Fixture) -> serde_json::Value {
+    let end = b.journal();
+    assert_eq!(end["installed"], true);
+    let chain = b.chain();
+    assert_eq!(
+        end["accepted"],
+        serde_json::json!(chain
+            .versions()
+            .iter()
+            .map(|v| v.token())
+            .collect::<Vec<_>>())
+    );
+    end
 }
 
 /// S1: "offer lock free" proves only that the command is gone. A running owner's admitted
 /// `InstallStandaloneAccepted` handler may still overlap with maintenance; the journal and
-/// runtime fences keep the result exact.
-#[test]
-fn running_owner_handoff_overlapping_maintenance_ends_installed_without_regression() {
+/// runtime fences keep the result exact. `newer`: while the handler is paused another
+/// machine joins, so maintenance observes a strictly newer accepted prefix than the one
+/// the paused handler carries.
+fn handoff_overlapping_maintenance(newer: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let relay = workerd::Relay::start();
     let a = Fixture::new();
@@ -2268,19 +2412,24 @@ fn running_owner_handoff_overlapping_maintenance_ends_installed_without_regressi
     let (reached, at_handler) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let released = std::sync::Mutex::new(released);
-    let handler_done = Arc::new(AtomicBool::new(false));
+    let (ended_tx, ended) = mpsc::channel::<bool>();
+    let ended_tx = std::sync::Mutex::new(ended_tx);
     let first = AtomicBool::new(true);
-    let done = handler_done.clone();
     let bd = b.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
-        if point == xshelld::server::TestPoint::StandaloneHandoffInstalled
-            && first.swap(false, Ordering::SeqCst)
-        {
-            reached.send(()).unwrap();
-            let _ = released
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30));
-            done.store(true, Ordering::SeqCst);
+        match point {
+            xshelld::server::TestPoint::StandaloneHandoffInstalled
+                if first.swap(false, Ordering::SeqCst) =>
+            {
+                reached.send(()).unwrap();
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30));
+            }
+            xshelld::server::TestPoint::StandaloneHandoffEnded { installed } => {
+                let _ = ended_tx.lock().unwrap().send(installed);
+            }
+            _ => {}
         }
         false
     })));
@@ -2290,70 +2439,114 @@ fn running_owner_handoff_overlapping_maintenance_ends_installed_without_regressi
     at_handler.recv_timeout(Duration::from_secs(10)).unwrap();
     let handed = b.journal();
     assert_eq!(handed["installed"], false);
-    let accepted_len = handed["accepted"].as_array().unwrap().len();
-    assert!(accepted_len > 0);
-    // Watch every journal state from here on: the accepted prefix never shrinks.
+    let handed_len = handed["accepted"].as_array().unwrap().len();
+    assert!(handed_len > 0);
     let watching = Arc::new(AtomicBool::new(true));
-    let watcher = {
-        let (watching, path) = (
-            watching.clone(),
-            b.paths.ring_dir.join("standalone-adoption.json"),
-        );
-        std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            while watching.load(Ordering::SeqCst) {
-                if let Some(j) = std::fs::read(&path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                {
-                    seen.push((
-                        j["accepted"].as_array().map_or(0, |a| a.len()),
-                        j["installed"] == true,
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            seen
-        })
-    };
+    let watcher = watch_journal(&b, &watching);
+    if newer {
+        let c = Fixture::new();
+        let mut joiner = c.pair(&relay.url(), 30_000);
+        let words = joiner.code();
+        assert!(ar.approve_device_code(&words).is_ok());
+        assert_eq!(joiner.finish(), 0);
+    }
     // The command dies while its handoff is paused inside the Daemon.
     child.child.kill().unwrap();
     assert!(!child.child.wait().unwrap().success());
     wait_for(
         "maintenance installs while the handoff is paused",
-        Duration::from_secs(10),
-        || standalone_installed(&b),
+        Duration::from_secs(15),
+        || {
+            standalone_installed(&b)
+                && (!newer || b.journal()["accepted"].as_array().unwrap().len() > handed_len)
+        },
     );
-    assert!(!handler_done.load(Ordering::SeqCst));
+    assert!(ended.try_recv().is_err(), "the handoff is still paused");
     release.send(()).unwrap();
-    wait_for("the paused handoff ends", Duration::from_secs(10), || {
-        handler_done.load(Ordering::SeqCst)
-    });
-    std::thread::sleep(Duration::from_millis(300));
+    // Synchronised on the handler's actual end, not a sleep.
+    let handler_installed = ended.recv_timeout(Duration::from_secs(10)).unwrap();
     watching.store(false, Ordering::SeqCst);
-    let seen = watcher.join().unwrap();
-    assert!(
-        seen.windows(2)
-            .all(|w| w[1].0 >= w[0].0 && (w[1].1 || !w[0].1)),
-        "the journal regressed: {seen:?}"
-    );
-    let end = b.journal();
-    assert_eq!(end["installed"], true);
+    assert_never_regressed(&watcher.join().unwrap());
+    let end = assert_receipt_is_installation(&b);
     assert_eq!(end["intent"], handed["intent"]);
-    let chain = b.chain();
-    assert_eq!(
-        end["accepted"],
-        serde_json::json!(chain
-            .versions()
-            .iter()
-            .map(|v| v.token())
-            .collect::<Vec<_>>()),
-        "the receipt names exactly the durable installation"
-    );
-    assert!(end["accepted"].as_array().unwrap().len() >= accepted_len);
+    let len = end["accepted"].as_array().unwrap().len();
+    if newer {
+        assert!(len > handed_len, "the newer prefix is kept");
+    } else {
+        assert!(
+            handler_installed,
+            "same prefix: the handoff receipt is consistent"
+        );
+        assert_eq!(len, handed_len);
+    }
     assert!(status_installed(&bd));
     let (_, _, identity) = common::ring::identity(&bd);
-    assert_eq!(identity["ring"]["version"], chain.head().version());
+    assert_eq!(identity["ring"]["version"], b.chain().head().version());
+    assert_no_words_on_disk(&b, &code);
+    ar.quit();
+}
+#[test]
+fn running_owner_handoff_overlapping_maintenance_ends_installed_without_regression() {
+    handoff_overlapping_maintenance(false);
+}
+#[test]
+fn running_owner_handoff_overlapping_maintenance_keeps_a_newer_accepted_prefix() {
+    handoff_overlapping_maintenance(true);
+}
+
+/// A running owner's handoff whose install fails gives no success receipt: the command
+/// exits unfinished, and maintenance ends the obligation installed.
+#[test]
+fn running_owner_failed_handoff_gives_no_receipt_and_maintenance_installs() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = a.ring(&relay.url());
+    create(&ar, &a.companion());
+    let b = Fixture::new();
+    let armed = Arc::new(AtomicBool::new(true));
+    let (ended_tx, ended) = mpsc::channel::<bool>();
+    let ended_tx = std::sync::Mutex::new(ended_tx);
+    let hook_armed = armed.clone();
+    let bd = b.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
+        match point {
+            // The handoff's roster write fails; maintenance's own (on its thread) does not.
+            xshelld::server::TestPoint::BeforeRingRosterWrite => {
+                hook_armed.load(Ordering::SeqCst)
+                    && std::thread::current().name() != Some("ring-maintenance")
+            }
+            xshelld::server::TestPoint::StandaloneHandoffEnded { installed } => {
+                hook_armed.store(false, Ordering::SeqCst);
+                let _ = ended_tx.lock().unwrap().send(installed);
+                false
+            }
+            _ => false,
+        }
+    })));
+    let watching = Arc::new(AtomicBool::new(true));
+    let watcher = watch_journal(&b, &watching);
+    let mut child = b.pair(&relay.url(), 120_000);
+    let code = child.code();
+    assert!(ar.approve_device_code(&code).is_ok());
+    assert!(
+        !ended.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "the failed handoff replied without a receipt"
+    );
+    assert_eq!(child.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(child.stderr().lines().any(|l| l == UNFINISHED_RUNNING_LINE));
+    assert!(!child
+        .seen
+        .iter()
+        .any(|l| l.starts_with("Added this machine")));
+    wait_for(
+        "maintenance installs the retained obligation",
+        Duration::from_secs(15),
+        || status_installed(&bd) && standalone_installed(&b),
+    );
+    watching.store(false, Ordering::SeqCst);
+    assert_never_regressed(&watcher.join().unwrap());
+    assert_receipt_is_installation(&b);
     assert_no_words_on_disk(&b, &code);
     ar.quit();
 }
