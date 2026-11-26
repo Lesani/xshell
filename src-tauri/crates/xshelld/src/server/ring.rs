@@ -476,6 +476,23 @@ impl Store {
         self.refuse_registered_join()?;
         Ok(offer)
     }
+    /// The offer lock if nobody holds it, `None` while another holder (a running `xshelld
+    /// pair` command, or another open file in this process) does. flock semantics: a second
+    /// open of the same file conflicts even inside one process.
+    #[cfg(unix)]
+    pub(super) fn try_offer_lock(&self) -> Result<Option<StoreLock>, String> {
+        let file = self.open_lock("ring-legacy-offer.lock")?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StoreLock(file))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error.to_string()),
+        }
+    }
+    /// The raw offer lease a pair command holds, without its admission checks.
+    #[cfg(all(test, unix))]
+    pub(crate) fn offer_lock_for_test(&self) -> Result<StoreLock, String> {
+        self.offer_lock()
+    }
     /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
     #[cfg(any(unix, windows))]
     pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
@@ -2171,6 +2188,11 @@ pub(crate) fn start_membership_maintenance(
                         Err(e) if e == STANDALONE_PENDING => {
                             standalone_at = now + Duration::from_secs(1);
                         }
+                        // Not enrolled (yet) while the code is valid: the approver may
+                        // still publish. Look again soon, without growing the backoff.
+                        Err(e) if e == STANDALONE_NOT_YET => {
+                            standalone_at = now + standalone_delay.min(Duration::from_secs(5));
+                        }
                         Ok(false) | Err(_) => {
                             standalone_at = now + standalone_delay;
                             standalone_delay = (standalone_delay * 2).min(Duration::from_secs(60));
@@ -2182,27 +2204,68 @@ pub(crate) fn start_membership_maintenance(
 }
 
 #[cfg(unix)]
-const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
+pub(super) const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
+#[cfg(unix)]
+pub(super) const STANDALONE_NOT_YET: &str =
+    "waiting: the standalone obligation is not enrolled yet and its code is still valid";
 
 /// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
 #[cfg(unix)]
 fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool, String> {
+    maintain_standalone_with(handle, || handle.reconcile_standalone_adoption())
+}
+
+/// [`maintain_standalone`] with the reconcile step given (tests observe without a Relay).
+///
+/// The obligation belongs to the `xshelld pair` command while it holds the offer lock;
+/// a free lock means that command has exited, and the step runs at once instead of
+/// waiting for the code to expire (expiry stays the upper bound). The step itself holds
+/// the lock, so no new command can start in the middle of it. A Daemon handler the exited
+/// command had already started (its accepted install) may still overlap: both are fenced by
+/// journal equality and the runtime chain, never by this lock alone.
+#[cfg(unix)]
+pub(super) fn maintain_standalone_with(
+    handle: &super::adoption::Standalone<'_>,
+    reconcile: impl FnOnce() -> Result<super::adoption::StandaloneRecoveryStatus, String>,
+) -> Result<bool, String> {
     use super::adoption::StandaloneRecoveryState as S;
     let Some(status) = handle.standalone_adoption_status()? else {
         return Ok(true);
     };
-    let expired = || {
+    // Idle ticks never probe the lock, so they never collide with a new pair command.
+    if status.state == S::Installed {
+        return Ok(true);
+    }
+    let expired = |expires_at: u64| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-            >= status.expires_at
+            >= expires_at
     };
-    // A pair command still running owns its obligation until its code expires: never
-    // compete with it (its own journal writes would see a changed record).
-    if status.state != S::Installed && !expired() {
-        return Err(STANDALONE_PENDING.into());
+    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
+    let _offer = match store.try_offer_lock()? {
+        Some(guard) => Some(guard),
+        // A pair command still running owns its obligation: never compete with it (its
+        // own journal writes would see a changed record).
+        None if !expired(status.expires_at) => return Err(STANDALONE_PENDING.into()),
+        None => None,
+    };
+    let Some(status) = handle.standalone_adoption_status()? else {
+        return Ok(true);
+    };
+    if status.state == S::Installed {
+        return Ok(true);
     }
+    if let Some(hook) = &handle.d.cfg.test_hook {
+        if (hook.0)(
+            uuid::Uuid::nil(),
+            super::TestPoint::StandaloneMaintenanceActs,
+        ) {
+            return Err(STANDALONE_PENDING.into());
+        }
+    }
+    let expired = || expired(status.expires_at);
     match status.state {
         S::Installed => Ok(true),
         S::Terminal => {
@@ -2210,7 +2273,7 @@ fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool,
             Ok(true)
         }
         S::ReconciliationRequired | S::AcceptedInstalling => {
-            match handle.reconcile_standalone_adoption() {
+            match reconcile() {
                 Ok(s) if s.state == S::Installed => Ok(true),
                 Ok(s) if s.state == S::Terminal => {
                     abandon_standalone(handle, &s.operation)?;
@@ -2225,6 +2288,13 @@ fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool,
                 {
                     abandon_standalone(handle, &status.operation)?;
                     Ok(true)
+                }
+                // Before expiry "not a member" means not approved yet (or the answer was
+                // lost): never abandon, and do not back off as for a failure.
+                Err(e)
+                    if !expired() && ["not_member", "no_roster"].iter().any(|c| e.contains(c)) =>
+                {
+                    Err(STANDALONE_NOT_YET.into())
                 }
                 Err(e) => Err(e),
             }

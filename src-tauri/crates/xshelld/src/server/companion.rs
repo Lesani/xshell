@@ -529,6 +529,12 @@ fn dispatch(
         daemon
             .ring
             .join_accepted_standalone(&rosters, &operation, budget)?;
+        if let Some(hook) = &daemon.cfg.test_hook {
+            (hook.0)(
+                uuid::Uuid::nil(),
+                super::TestPoint::StandaloneHandoffInstalled,
+            );
+        }
         let accepted = RosterChain::from_tokens(&rosters).map_err(|e| e.to_string())?;
         super::adoption::finalize_standalone_install(&daemon.ring, &operation, &accepted, budget)?;
         return Ok(CompanionResponse::Installed {

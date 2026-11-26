@@ -15,17 +15,58 @@ use xshell_protocol::ring::membership::consent_proposal_hash;
 use xshell_protocol::ring::pairing::adoption::{
     AdoptionIntent, AdoptionSigners, JoinTarget, PublicIdentity,
 };
+use xshell_protocol::ring::pairing::PairError;
 use xshell_protocol::ring::relay::pair::{
     adopt_as_guest_with_ready, AdoptionGuestRequest, PairOptions,
 };
-use xshell_protocol::ring::relay::{ChainPin, RingClient, RingTimeouts};
-use xshell_protocol::ring::RosterChain;
+use xshell_protocol::ring::relay::{ChainPin, Connector, RingClient, RingTimeouts};
+use xshell_protocol::ring::{DeviceKeys, RingError, RosterChain};
 
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// The accepted chain is observed from the journaled predecessor's head.
+fn standalone_pin(store: &Store, record: &StandaloneJournal) -> Result<ChainPin, String> {
+    let predecessor = recorded_predecessor(store, record)?;
+    Ok(ChainPin {
+        version: predecessor.head().version(),
+        hash: predecessor.head().hash(),
+    })
+}
+
+/// Observe only: the accepted chain from the Relay (through the owner's push link when one
+/// exists), authenticated with this Daemon's retained keys. Never signs, publishes or opens
+/// a pairing slot. The connection attempt never outlives `until`.
+fn observe_standalone_accepted(
+    link: Option<Arc<Connector>>,
+    record: &StandaloneJournal,
+    keys: Arc<DeviceKeys>,
+    pin: &ChainPin,
+    until: Instant,
+) -> Result<RosterChain, RingError> {
+    if let Some(owner) = link {
+        return owner.read_accepted_chain(pin);
+    }
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(RingError::Timeout);
+    }
+    let defaults = RingTimeouts::default();
+    RingClient::fetch_chain(
+        &record.proposal.proposal.relay_url,
+        &record.proposal.proposal.ring_id,
+        keys,
+        pin,
+        None,
+        RingTimeouts {
+            connect: defaults.connect.min(left),
+            ..defaults
+        },
+    )
 }
 
 /// Denial-only durable preparation under the actual runtime -> ring.lock fence.
@@ -295,18 +336,13 @@ impl Standalone<'_> {
 
     pub(crate) fn reconcile_standalone_adoption(&self) -> Result<StandaloneRecoveryStatus, String> {
         self.reconcile_standalone_adoption_with(|original, keys, pin| {
-            if let Some((owner, _, _)) = self.d.ring.push_link() {
-                owner.read_accepted_chain(pin)
-            } else {
-                RingClient::fetch_chain(
-                    &original.proposal.proposal.relay_url,
-                    &original.proposal.proposal.ring_id,
-                    keys,
-                    pin,
-                    None,
-                    RingTimeouts::default(),
-                )
-            }
+            observe_standalone_accepted(
+                self.d.ring.push_link().map(|(owner, _, _)| owner),
+                original,
+                keys,
+                pin,
+                Instant::now() + RingTimeouts::default().connect,
+            )
             .map_err(|e| format!("reconciliation_required: {e}"))
         })
     }
@@ -367,11 +403,7 @@ impl Standalone<'_> {
                 });
             }
         }
-        let predecessor = recorded_predecessor(&store, &original)?;
-        let pin = ChainPin {
-            version: predecessor.head().version(),
-            hash: predecessor.head().hash(),
-        };
+        let pin = standalone_pin(&store, &original)?;
         let observed = observe(&original, keys, &pin)?;
         let accepted = match known {
             Some(known) => {
@@ -473,14 +505,65 @@ impl ServerHandle {
             &super::ring::host_name(),
             deadline,
             cancel,
-            |code| {
-                words(code);
-                Ok(())
+            {
+                let mut words = Some(words);
+                move |event| {
+                    if let StandaloneEvent::Words(code) = event {
+                        if let Some(words) = words.take() {
+                            words(code);
+                        }
+                    }
+                    Ok(())
+                }
             },
             confirm,
         )
+        .map_err(StandaloneCommandError::into_message)
     }
 }
+
+/// What the standalone command reports while it runs.
+pub(crate) enum StandaloneEvent<'a> {
+    /// The Device code words, once, when the Relay holds the slot.
+    Words(&'a DeviceCode),
+    /// The connection was lost after consent; the command keeps observing (once).
+    Reconnecting,
+}
+
+/// How a standalone command ended without a membership.
+#[derive(Debug)]
+pub(crate) enum StandaloneCommandError {
+    /// Consent may have left this machine and the obligation is retained: the Daemon
+    /// (running now, or when it next runs) finishes it. Never a new offer.
+    Unfinished { daemon_running: bool, cause: String },
+    /// Nothing is pending on this command's behalf (or it ended as the approver declined).
+    Failed(String),
+}
+impl StandaloneCommandError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Unfinished { cause, .. } | Self::Failed(cause) => cause,
+        }
+    }
+}
+impl From<String> for StandaloneCommandError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+impl From<&str> for StandaloneCommandError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+/// The command's observation backoff after consent: 250 ms, doubling, at most 2 s.
+const OBSERVE_FIRST: Duration = Duration::from_millis(250);
+const OBSERVE_MAX: Duration = Duration::from_secs(2);
+/// After the approver's typed refusal, how long the command still looks for a publication.
+const OBSERVE_AFTER_REFUSAL: Duration = Duration::from_secs(30);
+/// One observation's connection budget: Ctrl-C is honoured at the latest after this.
+const OBSERVE_ATTEMPT: Duration = Duration::from_secs(5);
 
 #[cfg(debug_assertions)]
 fn offline_ownership_cut(
@@ -650,18 +733,135 @@ impl StandaloneDriver<'_> {
             _ => Err("running owner accepted handoff receipt missing".into()),
         }
     }
+    fn daemon_running(&self) -> bool {
+        !matches!(self.owner, StandaloneOwner::Offline(_))
+    }
+    fn stopping(&self, cancel: &AtomicBool) -> bool {
+        cancel.load(Ordering::Acquire)
+            || self
+                .exiting
+                .is_some_and(|exiting| exiting.load(Ordering::Acquire))
+    }
+    fn unfinished(&self, cause: String) -> StandaloneCommandError {
+        StandaloneCommandError::Unfinished {
+            daemon_running: self.daemon_running(),
+            cause,
+        }
+    }
+
+    /// After consent may have left, a lost connection is not final: observe the accepted
+    /// chain (the same observation as reconciliation) with backoff until it lists this
+    /// Daemon, within the original lifetime. Never signs again, never opens a new slot,
+    /// never extends `until`. Every Relay refusal before the deadline is retried; only a
+    /// verified chain whose accepted Enroll no longer authorizes this Daemon, cancellation
+    /// and the deadline end it. After the approver's typed refusal it looks for at most
+    /// [`OBSERVE_AFTER_REFUSAL`], then ends as declined.
+    fn observe_after_consent(
+        &self,
+        record: &StandaloneJournal,
+        keys: &Arc<DeviceKeys>,
+        until: Instant,
+        cancel: &AtomicBool,
+        error: &PairError,
+        mut reconnecting: impl FnMut(),
+    ) -> Result<RosterChain, StandaloneCommandError> {
+        let unfinished =
+            |e: &dyn std::fmt::Display| self.unfinished(format!("reconciliation_required: {e}"));
+        if matches!(error, PairError::Cancelled) || self.stopping(cancel) || Instant::now() >= until
+        {
+            return Err(unfinished(error));
+        }
+        let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+            until,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pin = {
+            let _lock = self
+                .store
+                .lock_until(&budget)
+                .map_err(|_| unfinished(error))?;
+            if load_journal(&self.store).ok().flatten().as_ref() != Some(record) {
+                return Err(unfinished(error));
+            }
+            standalone_pin(&self.store, record).map_err(|_| unfinished(error))?
+        };
+        let refused = matches!(error, PairError::Refused(_));
+        let stop = if refused {
+            until.min(Instant::now() + OBSERVE_AFTER_REFUSAL)
+        } else {
+            until
+        };
+        let link = match &self.owner {
+            StandaloneOwner::Runtime(runtime) => runtime.push_link().map(|(owner, _, _)| owner),
+            _ => None,
+        };
+        reconnecting();
+        let mut delay = OBSERVE_FIRST;
+        let mut last = error.to_string();
+        loop {
+            if self.stopping(cancel) {
+                return Err(unfinished(&last));
+            }
+            if Instant::now() >= stop {
+                return Err(if refused && Instant::now() < until {
+                    StandaloneCommandError::Failed(format!("reconciliation_required: {error}"))
+                } else {
+                    unfinished(&last)
+                });
+            }
+            let observed = observe_standalone_accepted(
+                link.clone(),
+                record,
+                keys.clone(),
+                &pin,
+                stop.min(Instant::now() + OBSERVE_ATTEMPT),
+            );
+            // An answer that arrives after the deadline or a cancellation is not used.
+            if self.stopping(cancel) || Instant::now() >= until {
+                return Err(unfinished(&last));
+            }
+            match observed {
+                Ok(chain) => {
+                    let mut candidate = record.clone();
+                    candidate.accepted =
+                        chain.versions().iter().map(|r| r.token().into()).collect();
+                    if accepted_record(&self.store, &candidate).is_ok() {
+                        if chain.authorized_member(&keys.sign_key()).is_some() {
+                            return Ok(chain);
+                        }
+                        // Signed evidence: the accepted Enroll is followed by this Daemon's
+                        // removal. Terminal; the Daemon abandons the obligation.
+                        return Err(StandaloneCommandError::Failed(
+                            "reconciliation_required: the accepted Ring no longer lists this machine"
+                                .into(),
+                        ));
+                    }
+                    last = "the accepted Ring does not list this machine yet".into();
+                }
+                Err(e) => last = e.to_string(),
+            }
+            let wake = Instant::now() + delay;
+            while Instant::now() < wake.min(stop) && !self.stopping(cancel) {
+                std::thread::sleep(
+                    Duration::from_millis(50).min(wake.saturating_duration_since(Instant::now())),
+                );
+            }
+            delay = (delay * 2).min(OBSERVE_MAX);
+        }
+    }
+
     fn run(
         &self,
         relay: &str,
         name: &str,
         deadline: StandaloneDeadline,
         cancel: &Arc<AtomicBool>,
-        words: impl FnOnce(&DeviceCode) -> Result<(), String>,
+        mut events: impl FnMut(StandaloneEvent<'_>) -> Result<(), String>,
         confirm: impl FnOnce(
             &StandalonePreview,
             &StandaloneLease,
         ) -> Result<Option<StandaloneConfirmation>, String>,
-    ) -> Result<RosterChain, String> {
+    ) -> Result<RosterChain, StandaloneCommandError> {
         let StandaloneDeadline { until, expires_at } = deadline;
         let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel.clone());
         let store = &self.store;
@@ -715,6 +915,8 @@ impl StandaloneDriver<'_> {
         let code = DeviceCode::generate().map_err(|e| e.to_string())?;
         let secret = code.secret();
         let mut journal = None;
+        // Set once this command's preparation is durable: only then can a proof leave.
+        let mut prepared = false;
         let result = adopt_as_guest_with_ready(
             &AdoptionGuestRequest {
                 keys: keys.clone(),
@@ -730,7 +932,7 @@ impl StandaloneDriver<'_> {
             },
             &PairOptions::default(),
             Some(cancel),
-            || words(&code).map_err(xshell_protocol::ring::pairing::PairError::Relay),
+            || events(StandaloneEvent::Words(&code)).map_err(PairError::Relay),
             |request| {
                 let proposal = CompanionProposal {
                     operation: intent.operation.clone(),
@@ -788,17 +990,41 @@ impl StandaloneDriver<'_> {
                 journal = Some(record.clone());
                 self.prepare(&record, &budget)
                     .map_err(xshell_protocol::ring::pairing::PairError::Relay)?;
+                prepared = true;
                 Ok(true)
             },
         );
-        let (chain, _) = result.map_err(|e| {
-            if journal.is_some() {
-                format!("reconciliation_required: {e}")
-            } else {
-                e.to_string()
-            }
-        })?;
-        let mut record = journal.ok_or("standalone consent receipt missing")?;
+        let chain = match result {
+            Ok((chain, _)) => chain,
+            Err(error) => match journal.as_ref() {
+                Some(record) if prepared => {
+                    self.observe_after_consent(record, &keys, until, cancel, &error, || {
+                        let _ = events(StandaloneEvent::Reconnecting);
+                    })?
+                }
+                Some(_) => {
+                    return Err(StandaloneCommandError::Failed(format!(
+                        "reconciliation_required: {error}"
+                    )))
+                }
+                None => return Err(StandaloneCommandError::Failed(error.to_string())),
+            },
+        };
+        let record = journal.ok_or("standalone consent receipt missing")?;
+        self.install_accepted(record, chain, cancel)
+            .map_err(|cause| self.unfinished(cause))
+    }
+
+    /// The local tail after an accepted chain: journal it, install it through this route
+    /// and write the final receipt. Its own 5 s budget is local completion only (no network
+    /// use) and is the only work allowed past the command's deadline.
+    fn install_accepted(
+        &self,
+        mut record: StandaloneJournal,
+        chain: RosterChain,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<RosterChain, String> {
+        let store = &self.store;
         record.accepted = chain.versions().iter().map(|r| r.token().into()).collect();
         let install_budget = xshell_core::local_ipc::RequestBudget::for_operation(
             Instant::now() + Duration::from_secs(5),
@@ -850,8 +1076,8 @@ pub(crate) fn adopt_standalone_command(
     name: Option<&str>,
     ttl: Duration,
     cancel: &Arc<AtomicBool>,
-    words: impl FnOnce(&DeviceCode) -> Result<(), String>,
-) -> Result<RosterChain, String> {
+    events: impl FnMut(StandaloneEvent<'_>) -> Result<(), String>,
+) -> Result<RosterChain, StandaloneCommandError> {
     let deadline = StandaloneDeadline::new(ttl)?;
     let directory =
         super::ring::ownership::canonical_store(&paths.ring_dir).map_err(|e| e.to_string())?;
@@ -877,7 +1103,7 @@ pub(crate) fn adopt_standalone_command(
             .unwrap_or_else(super::ring::host_name),
         deadline,
         cancel,
-        words,
+        events,
         |preview, lease| {
             // Only this explicit standalone command grants consent, after the protocol
             // independently verifies this exact Daemon target and approving proposal.

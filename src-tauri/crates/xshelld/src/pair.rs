@@ -23,6 +23,9 @@ use xshell_protocol::ring::RosterChain;
 
 /// The exit code when nobody entered the code in time.
 pub const EXPIRED_EXIT: i32 = 5;
+/// The exit code when another device approved this machine but the command ended before the
+/// Join was confirmed: xshell on this machine finishes it by itself (never a new offer).
+pub const UNFINISHED_EXIT: i32 = 6;
 
 enum Failure {
     Expired,
@@ -33,6 +36,13 @@ enum Failure {
     Cancelled,
     /// Approved; the machine finishes the Join by itself.
     Finishing,
+    /// Standalone: consent may have left and the obligation is retained; the Daemon
+    /// finishes it (running now, or when it next runs). `cancelled`: ended by Ctrl-C.
+    Unfinished {
+        daemon_running: bool,
+        cancelled: bool,
+        cause: String,
+    },
     Other(String),
 }
 
@@ -51,6 +61,12 @@ const CANCELLED: &str = "These words were cancelled. Run xshelld pair again for 
 // `finish.body` (section 8).
 const FINISHING: &str =
     "xshell is checking whether this machine joined your Ring. You do not need to do anything.";
+
+// `cli.pair.reconnecting` and `cli.pair.unfinished.*` (plans/plan-pairing-a.md, COPY).
+const RECONNECTING: &str = "Connection to the service was lost; this command is still trying. Do not enter the words again or start over.";
+const UNFINISHED_RUNNING: &str = "Pairing isn't confirmed; this machine keeps checking and joins when it reaches the service. No action needed; watch for it in Settings > Ring on another device.";
+const UNFINISHED_STOPPED: &str = "Pairing isn't confirmed; xshell finishes it when it next runs in the background here (xshelld serve or a terminal connects). Do not run xshelld pair again first.";
+const UNFINISHED_CANCELLED: &str = "Stopping does not undo approval; this machine may still join your Ring. If you don't want it to, remove it in Settings > Ring on another device.";
 
 /// `cli.pair.done.one` / `cli.pair.done.other`.
 fn done_line(machines: usize) -> String {
@@ -144,22 +160,65 @@ fn run_pair_cancel(
             let _ = writeln!(out, "{EXPIRED}");
             EXPIRED_EXIT
         }
-        Err(Failure::Offline) => {
-            eprintln!("{OFFLINE}");
-            1
+        Err(failure) => {
+            let (code, lines) = failure_report(failure);
+            for line in lines {
+                eprintln!("{line}");
+            }
+            code
         }
-        Err(Failure::Cancelled) => {
-            eprintln!("{CANCELLED}");
-            1
+    }
+}
+
+/// The exit code and the stderr lines of a failed `pair` (other than expiry).
+fn failure_report(failure: Failure) -> (i32, Vec<String>) {
+    match failure {
+        Failure::Expired | Failure::ComputerExpired => (EXPIRED_EXIT, vec![EXPIRED.into()]),
+        Failure::Offline => (1, vec![OFFLINE.into()]),
+        Failure::Cancelled => (1, vec![CANCELLED.into()]),
+        Failure::Finishing => (1, vec![FINISHING.into()]),
+        // The copy says what happens next; the detail line stays for logs and tests.
+        Failure::Unfinished {
+            daemon_running,
+            cancelled,
+            cause,
+        } => {
+            let copy = if cancelled {
+                UNFINISHED_CANCELLED
+            } else if daemon_running {
+                UNFINISHED_RUNNING
+            } else {
+                UNFINISHED_STOPPED
+            };
+            (
+                UNFINISHED_EXIT,
+                vec![copy.into(), format!("xshelld: {cause}")],
+            )
         }
-        Err(Failure::Finishing) => {
-            eprintln!("{FINISHING}");
-            1
-        }
-        Err(Failure::Other(message)) => {
-            eprintln!("xshelld: {message}");
-            1
-        }
+        Failure::Other(message) => (1, vec![format!("xshelld: {message}")]),
+    }
+}
+
+/// A standalone command's end as a [`Failure`]. Retained post-consent work is checked
+/// before cancellation, so Ctrl-C after approval never reads as "the words were cancelled".
+fn standalone_failure(
+    error: crate::server::adoption::StandaloneCommandError,
+    cancelled: bool,
+) -> Failure {
+    use crate::server::adoption::StandaloneCommandError as E;
+    match error {
+        E::Unfinished {
+            daemon_running,
+            cause,
+        } => Failure::Unfinished {
+            daemon_running,
+            cancelled,
+            cause,
+        },
+        E::Failed(error) if error == "the code expired" => Failure::Expired,
+        E::Failed(_) if cancelled => Failure::Cancelled,
+        E::Failed(error) if error.contains("cannot reach the relay") => Failure::Offline,
+        E::Failed(error) => Failure::Other(error),
     }
 }
 
@@ -210,19 +269,16 @@ fn pair_cancel(
         opts.name.as_deref(),
         lifetime,
         cancel,
-        |code| print_words(out, code, true),
+        |event| match event {
+            crate::server::adoption::StandaloneEvent::Words(code) => print_words(out, code, true),
+            crate::server::adoption::StandaloneEvent::Reconnecting => {
+                writeln!(out, "{RECONNECTING}")
+                    .and_then(|()| out.flush())
+                    .map_err(|_| "Pair origin output closed".into())
+            }
+        },
     )
-    .map_err(|error| {
-        if error == "the code expired" {
-            Failure::Expired
-        } else if cancel.load(Ordering::Acquire) {
-            Failure::Cancelled
-        } else if error.contains("cannot reach the relay") {
-            Failure::Offline
-        } else {
-            Failure::Other(error)
-        }
-    })?;
+    .map_err(|error| standalone_failure(error, cancel.load(Ordering::Acquire)))?;
     writeln!(out, "{}", done_line(machines(&chain)))
         .and_then(|()| out.flush())
         .map_err(|e| e.to_string())?;
@@ -657,6 +713,50 @@ mod tests {
                 "refusal must not create replacement identities"
             );
         }
+    }
+    #[test]
+    fn unfinished_after_cancel_maps_to_unfinished_copy() {
+        use crate::server::adoption::StandaloneCommandError as E;
+        let unfinished = |daemon_running| E::Unfinished {
+            daemon_running,
+            cause: "reconciliation_required: connection closed".into(),
+        };
+        // Ctrl-C after approval: the cancelled copy, never "the words were cancelled".
+        for daemon_running in [true, false] {
+            let (code, lines) =
+                failure_report(standalone_failure(unfinished(daemon_running), true));
+            assert_eq!(code, UNFINISHED_EXIT);
+            assert_eq!(lines[0], UNFINISHED_CANCELLED);
+            assert!(!lines.iter().any(|l| l == CANCELLED));
+            assert_eq!(
+                lines[1],
+                "xshelld: reconciliation_required: connection closed"
+            );
+        }
+        let (code, lines) = failure_report(standalone_failure(unfinished(true), false));
+        assert_eq!(
+            (code, lines[0].as_str()),
+            (UNFINISHED_EXIT, UNFINISHED_RUNNING)
+        );
+        let (code, lines) = failure_report(standalone_failure(unfinished(false), false));
+        assert_eq!(
+            (code, lines[0].as_str()),
+            (UNFINISHED_EXIT, UNFINISHED_STOPPED)
+        );
+        // Before consent nothing is retained: Ctrl-C keeps its own copy and exit code 1.
+        let (code, lines) = failure_report(standalone_failure(
+            E::Failed("connection closed".into()),
+            true,
+        ));
+        assert_eq!((code, lines), (1, vec![CANCELLED.to_string()]));
+        assert!(matches!(
+            standalone_failure(E::Failed("the code expired".into()), true),
+            Failure::Expired
+        ));
+        assert_ne!(UNFINISHED_EXIT, EXPIRED_EXIT);
+        assert!(crate::cli::USAGE.contains("pair exit codes:"));
+        assert!(crate::cli::USAGE.contains(&format!("  {UNFINISHED_EXIT}  ")));
+        assert!(crate::cli::USAGE.contains(&format!("  {EXPIRED_EXIT}  ")));
     }
     #[test]
     fn legacy_adopt_rechecks_effective_binding_under_ring_lock() {

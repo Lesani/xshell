@@ -54,6 +54,18 @@ impl Fixture {
         Self::with_hook(standalone, None)
     }
     fn with_hook(standalone: bool, hook: Option<crate::server::TestHook>) -> Self {
+        Self::build(standalone, hook, None)
+    }
+    /// An unpaired Daemon with an unfinished standalone obligation (no accepted chain, not
+    /// installed) whose code expires at `expires_at`.
+    fn pending(expires_at: u64, hook: Option<crate::server::TestHook>) -> Self {
+        Self::build(true, hook, Some(expires_at))
+    }
+    fn build(
+        standalone: bool,
+        hook: Option<crate::server::TestHook>,
+        pending: Option<u64>,
+    ) -> Self {
         let home = tempfile::Builder::new()
             .prefix("r5-evidence-")
             .tempdir()
@@ -131,7 +143,7 @@ impl Fixture {
         };
         let intent = AdoptionIntent {
             operation: b64::encode(&[2; 32]),
-            expires_at: 1600,
+            expires_at: pending.unwrap_or(1600),
             target,
         };
         let mut proposal = predecessor.head().roster().clone();
@@ -174,7 +186,9 @@ impl Fixture {
             .unwrap();
         let chain = predecessor.extended(&[signed]).unwrap().0;
         let tokens: Vec<String> = chain.versions().iter().map(|r| r.token().into()).collect();
-        handle.d.ring.join(&tokens, None).unwrap();
+        if pending.is_none() {
+            handle.d.ring.join(&tokens, None).unwrap();
+        }
         let client =
             CompanionClient::for_store(handle.companion_endpoint().unwrap().parent().unwrap())
                 .unwrap();
@@ -194,10 +208,12 @@ impl Fixture {
                     },
                 },
                 consent_may_have_left: true,
-                accepted: tokens,
-                installed: true,
+                accepted: if pending.is_some() { vec![] } else { tokens },
+                installed: pending.is_none(),
             };
-            accepted_record(&store, &journal).unwrap();
+            if pending.is_none() {
+                accepted_record(&store, &journal).unwrap();
+            }
             write_private(
                 &store.dir.join("standalone-adoption.json"),
                 &serde_json::to_vec(&journal).unwrap(),
@@ -1427,4 +1443,169 @@ fn admitted_ring_companion_mutation_retains_store_through_shutdown_and_late_requ
         StoreOwnershipLease::acquire(&store.dir).unwrap(),
         StoreOwnership::Acquired(_)
     ));
+}
+
+fn unix_now() -> u64 {
+    super::now()
+}
+/// Defers the Fixture Daemon's own maintenance thread, so only the test's calls act.
+fn defer_background_maintenance() -> Option<crate::server::TestHook> {
+    Some(crate::server::TestHook(Arc::new(|_, point| {
+        point == crate::server::TestPoint::StandaloneMaintenanceActs
+            && std::thread::current().name() == Some("ring-maintenance")
+    })))
+}
+fn journal_bytes(f: &Fixture) -> Vec<u8> {
+    std::fs::read(
+        f.handle
+            .d
+            .cfg
+            .paths
+            .ring_dir
+            .join("standalone-adoption.json"),
+    )
+    .unwrap()
+}
+/// One maintenance step whose reconcile observes through `observe` (no Relay). A brief
+/// probe of the deferred background thread can collide with the test's own; such a
+/// `PENDING` is retried a few times, never counted as a result.
+fn maintain(
+    f: &Fixture,
+    observe: impl Fn(&StandaloneJournal) -> Result<RosterChain, String>,
+) -> Result<bool, String> {
+    let handle = Standalone { d: &f.handle.d };
+    for _ in 0..20 {
+        let result = crate::server::ring::maintain_standalone_with(&handle, || {
+            handle.reconcile_standalone_adoption_with(|record, _, _| observe(record))
+        });
+        match result {
+            Err(e) if e == crate::server::ring::STANDALONE_PENDING => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            other => return other,
+        }
+    }
+    Err(crate::server::ring::STANDALONE_PENDING.into())
+}
+
+#[test]
+fn offer_probe_sees_holder_in_same_process_and_other_fd() {
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    // The command's reservation (it refuses while the journal is unresolved, so take the
+    // raw lease the same way: another open file description in this process).
+    let held = store.offer_lock_for_test().unwrap();
+    assert!(
+        store.try_offer_lock().unwrap().is_none(),
+        "flock: a second open in the same process must conflict (the Runtime route)"
+    );
+    drop(held);
+    let until = Instant::now() + Duration::from_secs(5);
+    let free = loop {
+        if let Some(guard) = store.try_offer_lock().unwrap() {
+            break guard;
+        }
+        assert!(Instant::now() < until, "the released lock stays held");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(store.try_offer_lock().unwrap().is_none());
+    drop(free);
+}
+
+#[test]
+fn maintain_pending_while_offer_held_then_acts_at_once() {
+    use std::sync::atomic::AtomicUsize;
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let calls = AtomicUsize::new(0);
+    let before = journal_bytes(&f);
+    let held = store.offer_lock_for_test().unwrap();
+    let handle = Standalone { d: &f.handle.d };
+    let result = crate::server::ring::maintain_standalone_with(&handle, || {
+        handle.reconcile_standalone_adoption_with(|_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("reconciliation_required: connection closed".into())
+        })
+    });
+    assert_eq!(
+        result.unwrap_err(),
+        crate::server::ring::STANDALONE_PENDING,
+        "a live command owns its unexpired obligation"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(journal_bytes(&f), before);
+    drop(held);
+    // The command exited: the very next step acts, long before the code expires.
+    let result = maintain(&f, |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err("reconciliation_required: connection closed".into())
+    });
+    assert!(result.is_err());
+    assert_ne!(result.unwrap_err(), crate::server::ring::STANDALONE_PENDING);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(journal_bytes(&f), before);
+}
+
+#[test]
+fn not_member_before_expiry_never_abandons() {
+    let ring_dir = |f: &Fixture| f.handle.d.cfg.paths.ring_dir.clone();
+    let abandoned = |f: &Fixture| {
+        std::fs::read_dir(ring_dir(f))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("standalone-adoption.json.abandoned-")
+            })
+    };
+    for refusal in ["not_member", "no_roster"] {
+        let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+        let before = journal_bytes(&f);
+        let result = maintain(&f, |_| {
+            Err(format!("reconciliation_required: relay refused: {refusal}"))
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            crate::server::ring::STANDALONE_NOT_YET,
+            "{refusal}"
+        );
+        assert_eq!(journal_bytes(&f), before, "{refusal}");
+        assert!(!abandoned(&f), "{refusal}");
+    }
+    // The existing rule after expiry: not a member once the code expired ends it.
+    let f = Fixture::pending(unix_now() - 1, defer_background_maintenance());
+    let result = maintain(&f, |_| {
+        Err("reconciliation_required: relay refused: not_member".into())
+    });
+    assert_eq!(result, Ok(true));
+    assert!(!ring_dir(&f).join("standalone-adoption.json").exists());
+    assert!(abandoned(&f));
+}
+
+#[test]
+fn reconcile_uses_shared_observation_pin() {
+    let f = Fixture::pending(unix_now() + 300, defer_background_maintenance());
+    let store = Store::new(f.handle.d.cfg.paths.ring_dir.clone());
+    let record = load_journal(&store).unwrap().unwrap();
+    let predecessor = recorded_predecessor(&store, &record).unwrap();
+    let expected = ChainPin {
+        version: predecessor.head().version(),
+        hash: predecessor.head().hash(),
+    };
+    let pin = standalone_pin(&store, &record).unwrap();
+    assert_eq!(
+        (pin.version, pin.hash.clone()),
+        (expected.version, expected.hash.clone())
+    );
+    let seen = std::sync::Mutex::new(None);
+    let _ = f.handle.reconcile_standalone_adoption_with(|_, keys, pin| {
+        assert_eq!(keys.sign_key(), f.daemon.sign_key());
+        *seen.lock().unwrap() = Some((pin.version, pin.hash.clone()));
+        Err("reconciliation_required: observed".into())
+    });
+    assert_eq!(
+        seen.into_inner().unwrap(),
+        Some((expected.version, expected.hash))
+    );
 }

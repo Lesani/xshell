@@ -489,16 +489,22 @@ fn approver_process_death_after_acceptance_recovers_standalone_lost_controller_a
         )
         .unwrap();
         kill_at_cut(&mut controller, &a);
-        let error = guest.join().unwrap().unwrap_err();
-        assert!(error.starts_with("reconciliation_required:"), "{error}");
+        // The approver published and died before its answer reached the command: the
+        // command observes the accepted chain itself (#109) and installs it, without a new
+        // offer and without waiting for the code to expire.
+        let chain = guest.join().unwrap().unwrap();
+        assert!(
+            d.home.paths().ring_dir.join("roster.json").exists(),
+            "installed by the command"
+        );
+        assert_eq!(chain.head().version(), 2);
     });
     let before: serde_json::Value = serde_json::from_slice(
         &std::fs::read(d.home.paths().ring_dir.join("standalone-adoption.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(before["accepted"], serde_json::json!([]));
-    assert_eq!(before["installed"], false);
-    assert!(!d.home.paths().ring_dir.join("roster.json").exists());
+    assert_eq!(before["accepted"].as_array().unwrap().len(), 2);
+    assert_eq!(before["installed"], true);
     let outgoing = stored(&a).outgoing.unwrap();
     assert!(outgoing.accepted.is_empty());
     restart_controller(&mut a, &relay);
@@ -526,7 +532,7 @@ fn approver_process_death_after_acceptance_recovers_standalone_lost_controller_a
             .unwrap()
             .unwrap()
             .state,
-        StandaloneRecoveryState::ReconciliationRequired
+        StandaloneRecoveryState::Installed
     );
     let recovered = d
         .daemon
@@ -686,6 +692,11 @@ fn standalone_actual_store_write_failure_retries_same_accepted_bytes_and_receipt
         let fail = fail.clone();
         let hit = hit.clone();
         cfg.test_hook = Some(TestHook(Arc::new(move |_, p| {
+            // Explicit recovery of the retained obligation is the subject; the Daemon's
+            // automatic step after the command exits (#109) is deferred so it cannot race.
+            if p == TestPoint::StandaloneMaintenanceActs {
+                return true;
+            }
             if p == TestPoint::BeforeRingRosterWrite && fail.load(Ordering::Acquire) {
                 hit.store(true, Ordering::Release);
                 true
@@ -988,6 +999,10 @@ fn concurrent_standalone_recoveries_never_overwrite_a_newer_accepted_journal_pre
         let pause = pause.clone();
         let installs = installs.clone();
         cfg.test_hook = Some(TestHook(Arc::new(move |_, p| {
+            // Two explicit recoveries are the subject; the automatic step (#109) is deferred.
+            if p == TestPoint::StandaloneMaintenanceActs {
+                return true;
+            }
             if p == TestPoint::BeforeRingRosterWrite && fail.load(Ordering::Acquire) {
                 return true;
             }

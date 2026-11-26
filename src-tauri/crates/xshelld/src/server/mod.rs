@@ -261,6 +261,14 @@ pub enum TestPoint {
     /// Conservative preparation is durable, before its reply; no locks held. A test
     /// may delay delivery to exercise loss of the acknowledgment under the original budget.
     StandaloneCommandPreparedBeforeReply,
+    /// The maintenance loop is about to reconcile or abandon an unfinished standalone
+    /// obligation: the pair command has exited (or its code expired), the offer lock is
+    /// held by this step. Returning `true` defers the step (as if the command still ran).
+    StandaloneMaintenanceActs,
+    /// A running owner's `InstallStandaloneAccepted` handler installed the accepted chain,
+    /// before its final receipt. No locks held; a test may pause it to overlap with
+    /// maintenance after the command exited.
+    StandaloneHandoffInstalled,
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
     /// A staged build is complete and about to be run for validation, before the requester

@@ -66,6 +66,21 @@ impl Fixture {
     fn server(&self) -> ServerHandle {
         Server::start(Config::new(self.home.path().into(), self.paths.clone())).unwrap()
     }
+    fn server_with_hook(&self, hook: xshelld::server::TestHook) -> ServerHandle {
+        let mut config = Config::new(self.home.path().into(), self.paths.clone());
+        config.test_hook = Some(hook);
+        Server::start(config).unwrap()
+    }
+    /// A Daemon whose automatic standalone step is deferred while `defer` is set (as if a
+    /// pair command still owned the obligation), so a test can look at the obligation as
+    /// the command left it before the Daemon finishes it.
+    fn server_deferring(&self, defer: &Arc<std::sync::atomic::AtomicBool>) -> ServerHandle {
+        let defer = defer.clone();
+        self.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
+            point == xshelld::server::TestPoint::StandaloneMaintenanceActs
+                && defer.load(std::sync::atomic::Ordering::Acquire)
+        })))
+    }
     fn ring(&self, relay: &str) -> Arc<DesktopRing> {
         self.ring_with_hook(relay, None)
     }
@@ -728,6 +743,9 @@ fn standalone_install_failure(owner_loss: bool, replace: bool) {
         let a = Fixture::new();
         let _ad = a.server();
         let b = Fixture::new();
+        // The Daemon now finishes the obligation as soon as the command exits: defer that
+        // until the test has looked at what the command left and run explicit recovery.
+        let defer = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut daemon = owner_loss.then(|| b.server());
         let (reached, receive) = mpsc::channel();
         let (release, proceed) = mpsc::channel();
@@ -754,7 +772,7 @@ fn standalone_install_failure(owner_loss: bool, replace: bool) {
             if owner_loss {
                 daemon.take().unwrap().shutdown();
                 if replace {
-                    daemon = Some(b.server());
+                    daemon = Some(b.server_deferring(&defer));
                 } // not this driver's pinned route
             } else {
                 std::fs::create_dir(b.paths.ring_dir.join("roster.json")).unwrap();
@@ -762,7 +780,7 @@ fn standalone_install_failure(owner_loss: bool, replace: bool) {
             release.send(()).unwrap();
             assert!(approval.join().unwrap().is_ok());
         });
-        assert_ne!(child.finish(), 0);
+        assert_eq!(child.finish(), xshelld::pair::UNFINISHED_EXIT);
         assert_eq!(child.words, 1);
         let journal: serde_json::Value = serde_json::from_slice(
             &std::fs::read(b.paths.ring_dir.join("standalone-adoption.json")).unwrap(),
@@ -772,7 +790,7 @@ fn standalone_install_failure(owner_loss: bool, replace: bool) {
         assert!(!journal["accepted"].as_array().unwrap().is_empty());
         if owner_loss {
             if !replace {
-                daemon = Some(b.server());
+                daemon = Some(b.server_deferring(&defer));
             }
             let status = daemon
                 .as_ref()
@@ -1126,6 +1144,11 @@ fn lost_preparation_reply_preserves_uncertainty_without_consent_restart_or_new_o
     let first = AtomicBool::new(true);
     let mut config = Config::new(b.home.path().into(), b.paths.clone());
     config.test_hook = Some(xshelld::server::TestHook(Arc::new(move |_, point| {
+        // The obligation as the command left it is the subject: the automatic step (which
+        // may abandon it once its 4 s code expired) is deferred on both Daemons.
+        if point == xshelld::server::TestPoint::StandaloneMaintenanceActs {
+            return true;
+        }
         if point == xshelld::server::TestPoint::StandaloneCommandPreparedBeforeReply
             && first.swap(false, Ordering::AcqRel)
         {
@@ -1171,7 +1194,7 @@ fn lost_preparation_reply_preserves_uncertainty_without_consent_restart_or_new_o
         .request(CompanionRequest::StandaloneCommandReady)
         .is_err());
     bd.shutdown();
-    let restarted = b.server();
+    let restarted = b.server_deferring(&Arc::new(AtomicBool::new(true)));
     assert_eq!(
         restarted
             .standalone_adoption_status()
@@ -1283,7 +1306,10 @@ fn offline_pair_process_death_after_acceptance_keeps_exact_obligation_for_explic
     assert!(!before["accepted"].as_array().unwrap().is_empty());
     child.child.kill().unwrap();
     assert!(!child.child.wait().unwrap().success());
-    let successor = b.server();
+    // Explicit recovery is the subject; the automatic step (covered by
+    // actual_cli_killed_after_consent_offline_then_daemon_start_installs_within_seconds) is
+    // deferred so it cannot race it.
+    let successor = b.server_deferring(&Arc::new(std::sync::atomic::AtomicBool::new(true)));
     assert_eq!(
         successor
             .standalone_adoption_status()
@@ -1408,12 +1434,13 @@ fn offline_pair_final_receipt_failure_is_nonzero_and_exact_accepted_recovery_rem
     std::fs::rename(&journal, &retained).unwrap();
     std::fs::create_dir(&journal).unwrap();
     std::fs::remove_file(cut).unwrap();
-    assert_ne!(child.finish(), 0);
+    assert_eq!(child.finish(), xshelld::pair::UNFINISHED_EXIT);
     assert_eq!(child.words, 1);
     assert_eq!(b.chain(), accepted);
     std::fs::remove_dir(&journal).unwrap();
     std::fs::rename(&retained, &journal).unwrap();
-    let successor = b.server();
+    // Explicit recovery is the subject: defer the automatic step so it cannot race it.
+    let successor = b.server_deferring(&Arc::new(std::sync::atomic::AtomicBool::new(true)));
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use xshell_protocol::frame::{read_frame, Frame, FrameError, MAX_FRAME_LEN};

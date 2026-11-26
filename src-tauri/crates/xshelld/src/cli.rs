@@ -175,6 +175,11 @@ pair options:
   --relay URL   the relay your xshell uses (default: the hosted relay)
   --name NAME   standalone Host name (default: hostname); registered names are retained
   --force       legacy option; cannot replace a retained Ring (Leave required)
+
+pair exit codes:
+  5             the words expired before another device used them
+  6             approved, but not confirmed when the command ended: xshell on this
+                machine finishes pairing by itself; do not run pair again first
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
