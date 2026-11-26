@@ -864,11 +864,18 @@ impl Manager {
         }
         // A retained handle whose Host just came Online retries now instead of waiting out
         // its backoff (its dials failed locally while the Host was offline). Only its own
-        // transition counts: another Host's presence churn never bypasses its backoff.
+        // transition counts: another Host's presence churn never bypasses its backoff. A
+        // Host in the middle of an update keeps that flow's own reconnect timing (its
+        // "restarting" phase stays visible).
         {
             let mut was_online = self.relay_online.lock().unwrap();
             for (key, h) in &retained {
-                if online.contains(key) && !was_online.contains(key) && !h.status().usable() {
+                let status = h.status();
+                if online.contains(key)
+                    && !was_online.contains(key)
+                    && !status.usable()
+                    && status.phase.is_none()
+                {
                     h.kick();
                 }
             }
