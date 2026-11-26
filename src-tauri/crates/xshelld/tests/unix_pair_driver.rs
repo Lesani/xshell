@@ -2805,20 +2805,36 @@ fn actual_cli_second_pair_offline_reports_stopped_at_once() {
     assert_eq!(stderr.trim_end(), EARLIER_STOPPED_LINE, "{stderr}");
     assert!(second.seen.is_empty(), "{:?}", second.seen);
     assert_eq!(second.words, 0);
-    // A serve started while a second command runs is never turned away by it.
+    // S1: a serve started while a second command is at its owner probe is never turned
+    // away by it. The command pauses at the probe boundary (after its read-only request,
+    // before using the answer: anything the probe took would still be held there).
+    let cut = b.home.path().join("at-owner-probe");
     let wait_300ms = ms("300");
-    for _ in 0..5 {
-        let mut again = b.pair_with_env(&url, 300_000, &earlier_wait(&wait_300ms));
-        let daemon = b.server();
-        let code = again.finish();
-        assert!(
-            [xshelld::pair::UNFINISHED_EXIT, 1].contains(&code),
-            "{code}: {}",
-            again.stderr()
-        );
-        assert_eq!(again.words, 0);
-        daemon.shutdown();
-    }
+    let mut again = b.pair_with_env(
+        &url,
+        300_000,
+        &[
+            ("XSHELLD_TEST_PAIR_AT_OWNER_PROBE", cut.as_path()),
+            ("XSHELLD_PAIR_EARLIER_WAIT_MS", wait_300ms.as_path()),
+        ],
+    );
+    wait_for(
+        "the second command at its probe",
+        Duration::from_secs(10),
+        || cut.exists(),
+    );
+    let daemon = Server::start(Config::new(b.home.path().into(), b.paths.clone()))
+        .expect("serve starts while the second command probes");
+    std::fs::remove_file(&cut).unwrap();
+    // It found nothing listening (the probe ran before serve), so it says "stopped".
+    assert_eq!(again.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert_eq!(again.stderr().trim_end(), EARLIER_STOPPED_LINE);
+    assert_eq!(again.words, 0);
+    // The next probe finds the running Daemon.
+    let mut running = b.pair_with_env(&url, 300_000, &earlier_wait(&wait_300ms));
+    assert_eq!(running.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(running.seen.iter().any(|l| l == EARLIER_CHECKING_LINE));
+    daemon.shutdown();
     // Something listens on the endpoint but never answers.
     let endpoint = b.paths.ring_dir.join("companion.sock");
     let _ = std::fs::remove_file(&endpoint);

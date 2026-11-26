@@ -431,11 +431,14 @@ fn local_owner(store: &Store) -> LocalOwner {
         Instant::now() + Duration::from_secs(2),
         Arc::new(AtomicBool::new(false)),
     );
-    match xshell_core::local_ipc::exchange_until::<_, CompanionResponse>(
+    let answer = xshell_core::local_ipc::exchange_until::<_, CompanionResponse>(
         &store.dir.join("companion.sock"),
         &CompanionRequest::StandaloneCommandReady,
         &budget,
-    ) {
+    );
+    #[cfg(debug_assertions)]
+    test_cut("XSHELLD_TEST_PAIR_AT_OWNER_PROBE");
+    match answer {
         Ok(_) => LocalOwner::Running,
         Err(error)
             if matches!(
