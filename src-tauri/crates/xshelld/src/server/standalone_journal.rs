@@ -131,6 +131,38 @@ pub(super) fn accepted_record(
         .map_err(|e| e.to_string())?;
     Ok(chain)
 }
+/// The refusal while an earlier standalone attempt may still have this machine's consent
+/// in flight (not installed): `xshelld pair` recognises it exactly.
+pub(crate) const CONSENT_PENDING: &str = "standalone consent may have left";
+
+/// What a new `xshelld pair` finds of an earlier standalone attempt (#110).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlierPairing {
+    /// No journal: nothing earlier is pending.
+    Absent,
+    /// Consent may have left and the attempt is not installed: the Daemon finishes or
+    /// abandons it. `expires_at`: when its code expires (Unix seconds).
+    Unresolved { expires_at: u64 },
+    /// Installed with the durable-membership validation of [`refuse_unresolved_standalone`].
+    Installed,
+    /// Unreadable, or installed but not (yet) durable: left to the ordinary path.
+    Other,
+}
+
+/// Reads the journal only (no lock: it is replaced atomically); never elects or writes.
+#[cfg(unix)]
+pub(crate) fn earlier_pairing(store: &Store) -> EarlierPairing {
+    match load_journal(store) {
+        Ok(None) => EarlierPairing::Absent,
+        Ok(Some(record)) if !record.installed => EarlierPairing::Unresolved {
+            expires_at: record.intent.expires_at,
+        },
+        Ok(Some(_)) if refuse_unresolved_standalone(store).is_ok() => EarlierPairing::Installed,
+        _ => EarlierPairing::Other,
+    }
+}
+
 /// Shared admission/commit fence. Expiry and process death cannot turn possible consent
 /// into permission to establish another membership. Only a verified durable installation
 /// permits the later registered-counterpart completion path.
@@ -140,7 +172,7 @@ pub(super) fn refuse_unresolved_standalone(store: &Store) -> Result<(), String> 
     };
     let check = || -> Result<(), String> {
         if !record.installed {
-            return Err("standalone consent may have left".into());
+            return Err(CONSENT_PENDING.into());
         }
         let accepted = accepted_record(store, &record)?;
         let durable =

@@ -480,7 +480,7 @@ impl Store {
     /// pair` command, or another open file in this process) does. flock semantics: a second
     /// open of the same file conflicts even inside one process.
     #[cfg(unix)]
-    pub(super) fn try_offer_lock(&self) -> Result<Option<StoreLock>, String> {
+    pub(crate) fn try_offer_lock(&self) -> Result<Option<StoreLock>, String> {
         let file = self.open_lock("ring-legacy-offer.lock")?;
         match file.try_lock() {
             Ok(()) => Ok(Some(StoreLock(file))),

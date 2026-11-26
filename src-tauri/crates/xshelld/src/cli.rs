@@ -178,8 +178,9 @@ pair options:
 
 pair exit codes:
   5             the words expired before another device used them
-  6             approved, but not confirmed when the command ended: xshell on this
-                machine finishes pairing by itself; do not run pair again first
+  6             approved, but not confirmed when the command ended, or an earlier
+                pairing of this machine is still being finished: xshell on this
+                machine finishes it by itself; do not run pair again first
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`

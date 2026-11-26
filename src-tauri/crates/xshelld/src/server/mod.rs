@@ -34,7 +34,7 @@ mod drops;
 mod last_line;
 mod orphans;
 #[cfg(any(unix, windows))]
-mod standalone_journal;
+pub(crate) mod standalone_journal;
 pub use orphans::Cleanup;
 mod outbox;
 pub mod parent;

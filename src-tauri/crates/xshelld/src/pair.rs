@@ -43,6 +43,18 @@ enum Failure {
         cancelled: bool,
         cause: String,
     },
+    /// An earlier attempt of this machine is still unresolved while a Daemon runs: it
+    /// finishes it. `minutes`: whole minutes (1 to 10) until its code expires; `None` once
+    /// it has expired (the service stayed unreachable).
+    EarlierRunning {
+        minutes: Option<u64>,
+    },
+    /// An earlier attempt is unresolved and no Daemon runs here to finish it.
+    EarlierStopped,
+    /// Another `xshelld pair` is showing words on this machine.
+    AlreadyRunning,
+    /// The Store is owned but nothing answers: a Daemon is starting or stopping.
+    Busy,
     Other(String),
 }
 
@@ -67,6 +79,20 @@ const RECONNECTING: &str = "Connection to the service was lost; this command is 
 const UNFINISHED_RUNNING: &str = "Pairing isn't confirmed; this machine keeps checking and joins when it reaches the service. No action needed; watch for it in Settings > Ring on another device.";
 const UNFINISHED_STOPPED: &str = "Pairing isn't confirmed; xshell finishes it when it next runs in the background here (xshelld serve or a terminal connects). Do not run xshelld pair again first.";
 const UNFINISHED_CANCELLED: &str = "Stopping does not undo approval; this machine may still join your Ring. If you don't want it to, remove it in Settings > Ring on another device.";
+
+// `cli.pair.earlier.*`, `cli.pair.alreadyRunning`, `cli.pair.busy` (plans/plan-pairing-bc.md,
+// COPY).
+const EARLIER_CHECKING: &str =
+    "An earlier pairing of this machine is still being finished. Checking now; no new words yet.";
+const EARLIER_STOPPED: &str = "Pairing needs xshell running in the background here: start xshelld serve. Then check Settings > Ring on another device; no new words needed yet.";
+const ALREADY_RUNNING: &str = "Another xshelld pair command is showing words on this machine. Use those words, or stop that command first.";
+const BUSY: &str =
+    "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
+
+/// `cli.pair.earlier.running`; `minutes` is 1 to 10.
+fn earlier_running(minutes: u64) -> String {
+    format!("Pairing isn't confirmed; the machine keeps checking and joins when it reaches the service. If not joined in about {minutes} min, run xshelld pair for new words.")
+}
 
 /// `cli.pair.done.one` / `cli.pair.done.other`.
 fn done_line(machines: usize) -> String {
@@ -195,6 +221,16 @@ fn failure_report(failure: Failure) -> (i32, Vec<String>) {
                 vec![copy.into(), format!("xshelld: {cause}")],
             )
         }
+        Failure::EarlierRunning {
+            minutes: Some(minutes),
+        } => (UNFINISHED_EXIT, vec![earlier_running(minutes)]),
+        // Its code has expired and it is still unresolved: no promise about when it ends.
+        Failure::EarlierRunning { minutes: None } => {
+            (UNFINISHED_EXIT, vec![UNFINISHED_RUNNING.into()])
+        }
+        Failure::EarlierStopped => (UNFINISHED_EXIT, vec![EARLIER_STOPPED.into()]),
+        Failure::AlreadyRunning => (1, vec![ALREADY_RUNNING.into()]),
+        Failure::Busy => (1, vec![BUSY.into()]),
         Failure::Other(message) => (1, vec![format!("xshelld: {message}")]),
     }
 }
@@ -218,6 +254,10 @@ fn standalone_failure(
         E::Failed(error) if error == "the code expired" => Failure::Expired,
         E::Failed(_) if cancelled => Failure::Cancelled,
         E::Failed(error) if error.contains("cannot reach the relay") => Failure::Offline,
+        // Races with the checks before the offer: another command took the offer lock, or
+        // the Store's owner has no endpoint yet (starting) or any more (stopping).
+        E::Failed(error) if error.starts_with("legacy_offer_active") => Failure::AlreadyRunning,
+        E::Failed(error) if error.starts_with("running owner unavailable") => Failure::Busy,
         E::Failed(error) => Failure::Other(error),
     }
 }
@@ -254,6 +294,18 @@ fn pair_cancel(
         .clone()
         .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
     RelayUrl::parse(&relay).map_err(|_| "invalid Pair Relay".to_string())?;
+    // An earlier attempt whose consent may have left comes first: a Roster installed
+    // without its receipt is not yet "in your Ring". Wait (briefly) for the Daemon to
+    // finish or abandon it instead of refusing with a raw code. Once only.
+    let mut waited = false;
+    if let EarlierPairing::Unresolved { expires_at } = earlier_pairing(&store) {
+        waited = true;
+        if let Earlier::Added(chain) = wait_for_earlier(&store, out, cancel, expires_at)? {
+            return writeln!(out, "{}", done_line(machines(&chain)))
+                .and_then(|()| out.flush())
+                .map_err(|e| Failure::Other(e.to_string()));
+        }
+    }
     if let Some(chain) = current_ring(&store) {
         return writeln!(out, "{}", already_line(machines(&chain)))
             .and_then(|()| out.flush())
@@ -263,26 +315,188 @@ fn pair_cancel(
         return registered_computer_pair(&store, &relay, out, cancel);
     }
     let lifetime = ttl();
-    let chain = crate::server::adoption::adopt_standalone_command(
-        paths,
-        &relay,
-        opts.name.as_deref(),
-        lifetime,
-        cancel,
-        |event| match event {
-            crate::server::adoption::StandaloneEvent::Words(code) => print_words(out, code, true),
-            crate::server::adoption::StandaloneEvent::Reconnecting => {
-                writeln!(out, "{RECONNECTING}")
-                    .and_then(|()| out.flush())
-                    .map_err(|_| "Pair origin output closed".into())
+    let pending = format!(
+        "reconciliation_required: {}",
+        crate::server::standalone_journal::CONSENT_PENDING
+    );
+    let chain = loop {
+        // An attempt that became unresolved since the check above (a race): same path.
+        if let EarlierPairing::Unresolved { expires_at } = earlier_pairing(&store) {
+            if waited {
+                return Err(Failure::EarlierRunning {
+                    minutes: minutes_left(expires_at),
+                });
             }
-        },
-    )
-    .map_err(|error| standalone_failure(error, cancel.load(Ordering::Acquire)))?;
+            waited = true;
+            if let Earlier::Added(chain) = wait_for_earlier(&store, out, cancel, expires_at)? {
+                break chain;
+            }
+        }
+        if offer_held_by_another(&store) {
+            return Err(Failure::AlreadyRunning);
+        }
+        match crate::server::adoption::adopt_standalone_command(
+            paths,
+            &relay,
+            opts.name.as_deref(),
+            lifetime,
+            cancel,
+            |event| match event {
+                crate::server::adoption::StandaloneEvent::Words(code) => {
+                    print_words(out, code, true)
+                }
+                crate::server::adoption::StandaloneEvent::Reconnecting => {
+                    writeln!(out, "{RECONNECTING}")
+                        .and_then(|()| out.flush())
+                        .map_err(|_| "Pair origin output closed".into())
+                }
+            },
+        ) {
+            Ok(chain) => break chain,
+            // An attempt became unresolved after the check above (a race): same path.
+            Err(crate::server::adoption::StandaloneCommandError::Failed(error))
+                if error == pending && !cancel.load(Ordering::Acquire) =>
+            {
+                continue
+            }
+            Err(error) => return Err(standalone_failure(error, cancel.load(Ordering::Acquire))),
+        }
+    };
     writeln!(out, "{}", done_line(machines(&chain)))
         .and_then(|()| out.flush())
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+use crate::server::standalone_journal::{earlier_pairing, EarlierPairing};
+
+/// How a wait for an earlier attempt ended without a failure.
+enum Earlier {
+    /// The Daemon installed it (with its durable receipt): this machine is in the Ring.
+    Added(xshell_protocol::ring::RosterChain),
+    /// It was abandoned (its journal set aside): a fresh attempt may start.
+    Fresh,
+}
+
+/// Whether a Daemon runs for this Store, found without electing an owner: a read-only
+/// request to its protected companion endpoint with a short budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalOwner {
+    /// It answered (with anything, a refusal included).
+    Running,
+    /// No endpoint, or nothing listens on it.
+    Stopped,
+    /// Something listens but does not answer in time.
+    Busy,
+}
+
+fn local_owner(store: &Store) -> LocalOwner {
+    use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+        Instant::now() + Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    );
+    match xshell_core::local_ipc::exchange_until::<_, CompanionResponse>(
+        &store.dir.join("companion.sock"),
+        &CompanionRequest::StandaloneCommandReady,
+        &budget,
+    ) {
+        Ok(_) => LocalOwner::Running,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            LocalOwner::Stopped
+        }
+        Err(_) => LocalOwner::Busy,
+    }
+}
+
+/// How long the second command waits for an earlier attempt: 15 s
+/// (`XSHELLD_PAIR_EARLIER_WAIT_MS`, test only, shortens it).
+fn earlier_wait() -> Duration {
+    const EARLIER_WAIT: Duration = Duration::from_secs(15);
+    std::env::var("XSHELLD_PAIR_EARLIER_WAIT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(EARLIER_WAIT)
+        .min(EARLIER_WAIT)
+}
+
+/// Whole minutes (rounded up, 1 to 10) until `expires_at`; `None` once it has passed.
+fn minutes_left(expires_at: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let left = expires_at.checked_sub(now).filter(|left| *left > 0)?;
+    Some(left.div_ceil(60).clamp(1, 10))
+}
+
+/// Waits while the Daemon finishes an earlier unresolved attempt. Only reads local files
+/// and asks the Daemon whether it runs: never takes the offer lock or the Store ownership
+/// lease, never opens a pairing slot. Success needs the installed journal with its durable
+/// membership validation, not merely a readable Roster.
+fn wait_for_earlier(
+    store: &Store,
+    out: &mut dyn Write,
+    cancel: &Arc<AtomicBool>,
+    mut expires_at: u64,
+) -> Result<Earlier, Failure> {
+    match local_owner(store) {
+        LocalOwner::Running => {}
+        LocalOwner::Stopped => return Err(Failure::EarlierStopped),
+        LocalOwner::Busy => return Err(Failure::Busy),
+    }
+    writeln!(out, "{EARLIER_CHECKING}")
+        .and_then(|()| out.flush())
+        .map_err(|_| Failure::Other("Pair origin output closed".into()))?;
+    let until = Instant::now() + earlier_wait();
+    let mut probe_at = Instant::now() + Duration::from_secs(1);
+    loop {
+        match earlier_pairing(store) {
+            EarlierPairing::Absent => return Ok(Earlier::Fresh),
+            EarlierPairing::Installed => {
+                if let Some(chain) = current_ring(store) {
+                    return Ok(Earlier::Added(chain));
+                }
+            }
+            EarlierPairing::Unresolved { expires_at: at } => expires_at = at,
+            EarlierPairing::Other => {}
+        }
+        let now = Instant::now();
+        if cancel.load(Ordering::Acquire) || now >= until {
+            break;
+        }
+        // The Daemon that would finish it has exited: say so instead of waiting it out.
+        if now >= probe_at {
+            if local_owner(store) == LocalOwner::Stopped {
+                return Err(Failure::EarlierStopped);
+            }
+            probe_at = Instant::now() + Duration::from_secs(1);
+        }
+        std::thread::sleep(Duration::from_millis(250).min(until.saturating_duration_since(now)));
+    }
+    Err(Failure::EarlierRunning {
+        minutes: minutes_left(expires_at),
+    })
+}
+
+/// Another `xshelld pair` holds the offer lock. The Daemon also takes it briefly while it
+/// finishes or sets aside an earlier attempt, so a held lock is rechecked for up to 1 s.
+fn offer_held_by_another(store: &Store) -> bool {
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        match store.try_offer_lock() {
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => return true,
+            // Free (the guard is dropped at once) or unreadable: the ordinary path decides.
+            Ok(Some(_)) | Err(_) => return false,
+        }
+    }
 }
 /// The words on a line of their own, where to type them, how long they work, and (unless
 /// it was printed already) that the command waits.
@@ -757,6 +971,57 @@ mod tests {
         assert!(crate::cli::USAGE.contains("pair exit codes:"));
         assert!(crate::cli::USAGE.contains(&format!("  {UNFINISHED_EXIT}  ")));
         assert!(crate::cli::USAGE.contains(&format!("  {EXPIRED_EXIT}  ")));
+    }
+    #[test]
+    fn earlier_pairing_maps_to_copy_and_exit_6() {
+        use crate::server::adoption::StandaloneCommandError as E;
+        let cases = [
+            (
+                Failure::EarlierRunning { minutes: Some(7) },
+                UNFINISHED_EXIT,
+                earlier_running(7),
+            ),
+            (
+                Failure::EarlierRunning { minutes: None },
+                UNFINISHED_EXIT,
+                UNFINISHED_RUNNING.to_string(),
+            ),
+            (
+                Failure::EarlierStopped,
+                UNFINISHED_EXIT,
+                EARLIER_STOPPED.to_string(),
+            ),
+            (Failure::AlreadyRunning, 1, ALREADY_RUNNING.to_string()),
+            (Failure::Busy, 1, BUSY.to_string()),
+        ];
+        for (failure, code, line) in cases {
+            let (got, lines) = failure_report(failure);
+            assert_eq!((got, lines), (code, vec![line]));
+        }
+        // Races after the checks map to the same copy, never a raw code.
+        for (raw, code) in [
+            (
+                "legacy_offer_active: a legacy pairing offer is still open",
+                1,
+            ),
+            ("running owner unavailable: No such file or directory", 1),
+        ] {
+            let (got, lines) = failure_report(standalone_failure(E::Failed(raw.into()), false));
+            assert_eq!(got, code);
+            assert!(
+                lines.iter().all(|l| !l.starts_with("xshelld:")),
+                "{lines:?}"
+            );
+        }
+        assert_eq!(minutes_left(0), None);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(minutes_left(now + 30), Some(1));
+        assert_eq!(minutes_left(now + 61), Some(2));
+        assert_eq!(minutes_left(now + 3_600), Some(10));
+        assert!(crate::cli::USAGE.contains("earlier"));
     }
     #[test]
     fn legacy_adopt_rechecks_effective_binding_under_ring_lock() {

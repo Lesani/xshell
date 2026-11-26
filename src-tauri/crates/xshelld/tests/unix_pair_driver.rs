@@ -1261,6 +1261,8 @@ fn offline_pair_lease_before_keys_excludes_start_and_second_pair_then_crash_rele
     let mut second = b.pair(&relay.url(), 2_000);
     assert_eq!(second.finish(), 1);
     assert_eq!(second.words, 0);
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), BUSY_LINE, "{stderr}");
     assert!(!b.paths.ring_dir.join("keys.json").exists());
     child.child.kill().unwrap();
     assert!(!child.child.wait().unwrap().success()); // exact owned process natively reaped
@@ -1291,9 +1293,14 @@ fn offline_pair_before_accepted_commit_excludes_start_and_second_pair_then_relea
         Err(xshelld::server::StartError::AlreadyRunning)
     ));
     assert!(!b.paths.ring_dir.join("roster.json").exists());
-    let mut second = b.pair(&relay.url(), 2_000);
-    assert_eq!(second.finish(), 1);
+    // #110: the earlier attempt is unresolved and no Daemon runs to finish it (the first
+    // command still owns it): exit 6 with that copy, not a raw refusal.
+    let wait_1s = ms("1000");
+    let mut second = b.pair_with_env(&relay.url(), 2_000, &earlier_wait(&wait_1s));
+    assert_eq!(second.finish(), xshelld::pair::UNFINISHED_EXIT);
     assert_eq!(second.words, 0);
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), EARLIER_STOPPED_LINE, "{stderr}");
     std::fs::remove_file(cut).unwrap();
     assert_eq!(child.finish(), 0);
     assert_eq!(child.words, 1);
@@ -2548,5 +2555,466 @@ fn running_owner_failed_handoff_gives_no_receipt_and_maintenance_installs() {
     assert_never_regressed(&watcher.join().unwrap());
     assert_receipt_is_installation(&b);
     assert_no_words_on_disk(&b, &code);
+    ar.quit();
+}
+
+// ---------- #110 B1: a second `xshelld pair` while an earlier attempt is unresolved ----------
+
+const EARLIER_CHECKING_LINE: &str =
+    "An earlier pairing of this machine is still being finished. Checking now; no new words yet.";
+const EARLIER_STOPPED_LINE: &str = "Pairing needs xshell running in the background here: start xshelld serve. Then check Settings > Ring on another device; no new words needed yet.";
+const ALREADY_RUNNING_LINE: &str = "Another xshelld pair command is showing words on this machine. Use those words, or stop that command first.";
+const BUSY_LINE: &str =
+    "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
+const DONE_TWO: &str = "Added this machine to your Ring. Your Ring has 2 machines.";
+
+/// The `cli.pair.earlier.running` line with `minutes`.
+fn earlier_running_line(minutes: u64) -> String {
+    format!("Pairing isn't confirmed; the machine keeps checking and joins when it reaches the service. If not joined in about {minutes} min, run xshelld pair for new words.")
+}
+fn assert_no_raw_code(stderr: &str) {
+    for code in [
+        "reconciliation_required",
+        "legacy_offer_active",
+        "running owner unavailable",
+        "xshelld:",
+    ] {
+        assert!(!stderr.contains(code), "raw {code:?} in:\n{stderr}");
+    }
+}
+/// An approver that SIGKILLs the pair command `pid` the first time it receives proofs,
+/// right after `at_proofs` (proxy faults, say); `before_publish` runs at the first
+/// `ApprovalBeforePublish`.
+fn killing_approver(
+    a: &Fixture,
+    url: &str,
+    pid: &Arc<std::sync::atomic::AtomicI32>,
+    at_proofs: impl Fn() + Send + Sync + 'static,
+    before_publish: impl Fn() + Send + Sync + 'static,
+) -> Arc<DesktopRing> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pid = pid.clone();
+    let (killed, held) = (AtomicBool::new(false), AtomicBool::new(false));
+    approver(a, url, move |point| match point {
+        AdoptionTestPoint::ApprovalProofsReceived if !killed.swap(true, Ordering::SeqCst) => {
+            assert_eq!(
+                unsafe { libc::kill(pid.load(Ordering::SeqCst), libc::SIGKILL) },
+                0
+            );
+            at_proofs();
+        }
+        AdoptionTestPoint::ApprovalBeforePublish if !held.swap(true, Ordering::SeqCst) => {
+            before_publish()
+        }
+        _ => {}
+    })
+}
+/// The first `xshelld pair` on `b`, SIGKILLed after this machine's consent left (by a
+/// [`killing_approver`] sharing `pid`). The approval runs on its own thread (returned).
+fn first_pair_killed(
+    b: &Fixture,
+    ar: &Arc<DesktopRing>,
+    url: &str,
+    ttl_ms: u64,
+    pid: &Arc<std::sync::atomic::AtomicI32>,
+) -> std::thread::JoinHandle<Result<(), String>> {
+    let mut child = b.pair(url, ttl_ms);
+    pid.store(child.child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    let code = child.code();
+    let ar = ar.clone();
+    let approval = std::thread::spawn(move || {
+        ar.approve_device_code(&code)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+    assert!(!child.child.wait().unwrap().success());
+    approval
+}
+impl PairChild {
+    /// The next Device code within `within` (stdout lines are kept in `seen`).
+    fn code_within(&mut self, within: Duration) -> DeviceCode {
+        let until = Instant::now() + within;
+        loop {
+            let line = match self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => line,
+                Err(e) => self.no_code(e),
+            };
+            self.seen.push(line.clone());
+            if let Ok(code) = DeviceCode::parse(&line) {
+                self.words += 1;
+                return code;
+            }
+        }
+    }
+}
+fn ms(value: &str) -> PathBuf {
+    PathBuf::from(value)
+}
+/// The pair env (`XSHELLD_PAIR_EARLIER_WAIT_MS`) as the fixture takes it.
+fn earlier_wait(ms_value: &PathBuf) -> [(&'static str, &std::path::Path); 1] {
+    [("XSHELLD_PAIR_EARLIER_WAIT_MS", ms_value.as_path())]
+}
+/// Members of `chain` whose key is `key`.
+fn entries(chain: &RosterChain, key: &xshell_protocol::ring::SignKey) -> usize {
+    chain
+        .head()
+        .roster()
+        .members
+        .iter()
+        .filter(|m| m.sign_key == *key)
+        .count()
+}
+
+/// Fault: the joiner's Relay is unreachable from the approver's proofs on (the approver
+/// still publishes on its open Ring connection).
+fn outage_at_proofs(proxy: &Arc<fault_proxy::FaultProxy>) -> impl Fn() + Send + Sync + 'static {
+    let proxy = proxy.clone();
+    move || {
+        proxy.set_down(true);
+        proxy.cut_non_ring();
+    }
+}
+
+#[test]
+fn actual_cli_second_pair_while_daemon_finishes_reports_added() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &url, &pid, outage_at_proofs(&proxy), || {});
+    let b = Fixture::new();
+    let bd = b.server();
+    let approval = first_pair_killed(&b, &ar, &url, 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    assert_eq!(b.journal()["installed"], false);
+    let mut second = b.pair(&url, 300_000);
+    second.wait_line(EARLIER_CHECKING_LINE, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(1));
+    proxy.set_down(false);
+    assert_eq!(second.finish(), 0, "stderr:\n{}", second.stderr());
+    assert_eq!(second.words, 0, "no new offer");
+    assert_eq!(second.seen.last().unwrap(), DONE_TWO);
+    assert!(standalone_installed(&b));
+    let key = common::ring::identity(&bd).0;
+    assert_eq!(entries(&b.chain(), &key), 1, "one Roster entry");
+    assert_no_raw_code(&second.stderr());
+    ar.quit();
+}
+
+#[test]
+fn actual_cli_second_pair_unresolved_times_out_with_earlier_copy() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &url, &pid, outage_at_proofs(&proxy), || {});
+    let b = Fixture::new();
+    let _bd = b.server();
+    let approval = first_pair_killed(&b, &ar, &url, 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    let wait_2s = ms("2000");
+    let started = Instant::now();
+    let mut second = b.pair_with_env(&url, 300_000, &earlier_wait(&wait_2s));
+    assert_eq!(second.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(started.elapsed() < Duration::from_secs(6));
+    let stderr = second.stderr();
+    assert_eq!(second.words, 0);
+    assert!(second.seen.iter().any(|l| l == EARLIER_CHECKING_LINE));
+    // About 5 minutes of the 300 s code are left.
+    assert_eq!(stderr.trim_end(), earlier_running_line(5), "{stderr}");
+    assert_no_raw_code(&stderr);
+    assert_eq!(
+        b.journal()["installed"],
+        false,
+        "nothing installed or set aside"
+    );
+    ar.quit();
+}
+
+/// S7: once the earlier attempt's code has expired and the service is still unreachable,
+/// the command promises no time: slice A's `cli.pair.unfinished.running` text.
+#[test]
+fn actual_cli_second_pair_outage_past_expiry_makes_no_promise() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &url, &pid, outage_at_proofs(&proxy), || {});
+    let b = Fixture::new();
+    let _bd = b.server();
+    let approval = first_pair_killed(&b, &ar, &url, 4_000, &pid);
+    let _ = approval.join().unwrap();
+    let expires_at = b.journal()["intent"]["expiresAt"].as_u64().unwrap();
+    wait_for("the code expires", Duration::from_secs(10), || {
+        unix_now() > expires_at
+    });
+    let wait_1s = ms("1000");
+    let mut second = b.pair_with_env(&url, 300_000, &earlier_wait(&wait_1s));
+    assert_eq!(second.finish(), xshelld::pair::UNFINISHED_EXIT);
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), UNFINISHED_RUNNING_LINE, "{stderr}");
+    assert_eq!(second.words, 0);
+    assert_no_raw_code(&stderr);
+    assert!(
+        b.paths.ring_dir.join("standalone-adoption.json").exists(),
+        "kept past expiry while the service is unreachable"
+    );
+    ar.quit();
+}
+
+/// No Daemon runs: the second command says so at once. It never takes the Store ownership
+/// lease to find that out, so a `serve` starting meanwhile still starts (S1). A listener
+/// that does not answer is "starting or stopping".
+#[test]
+fn actual_cli_second_pair_offline_reports_stopped_at_once() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &url, &pid, outage_at_proofs(&proxy), || {});
+    let b = Fixture::new();
+    let approval = first_pair_killed(&b, &ar, &url, 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    assert_eq!(b.journal()["installed"], false);
+    let started = Instant::now();
+    let mut second = b.pair(&url, 300_000);
+    assert_eq!(second.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), EARLIER_STOPPED_LINE, "{stderr}");
+    assert!(second.seen.is_empty(), "{:?}", second.seen);
+    assert_eq!(second.words, 0);
+    // A serve started while a second command runs is never turned away by it.
+    let wait_300ms = ms("300");
+    for _ in 0..5 {
+        let mut again = b.pair_with_env(&url, 300_000, &earlier_wait(&wait_300ms));
+        let daemon = b.server();
+        let code = again.finish();
+        assert!(
+            [xshelld::pair::UNFINISHED_EXIT, 1].contains(&code),
+            "{code}: {}",
+            again.stderr()
+        );
+        assert_eq!(again.words, 0);
+        daemon.shutdown();
+    }
+    // Something listens on the endpoint but never answers.
+    let endpoint = b.paths.ring_dir.join("companion.sock");
+    let _ = std::fs::remove_file(&endpoint);
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    listener.set_nonblocking(true).unwrap();
+    // Accepts and holds connections for 4 s without ever answering.
+    let held = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(4);
+        let mut conns = Vec::new();
+        while Instant::now() < until {
+            if let Ok((conn, _)) = listener.accept() {
+                conns.push(conn);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        conns.len()
+    });
+    let mut busy = b.pair(&url, 300_000);
+    assert_eq!(busy.finish(), 1);
+    let stderr = busy.stderr();
+    assert_eq!(stderr.trim_end(), BUSY_LINE, "{stderr}");
+    assert_eq!(busy.words, 0);
+    assert!(held.join().unwrap() >= 1, "the command asked the endpoint");
+    std::fs::remove_file(&endpoint).unwrap();
+    ar.quit();
+}
+
+/// S8: the second command starts while the unresolved journal exists, shows that it is
+/// checking, and gets fresh words once the Daemon sets the never-published attempt aside.
+#[test]
+fn actual_cli_second_pair_after_abandon_starts_fresh_offer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    // The first approval never publishes: it holds at the proofs until its window closes
+    // (as if the approving Desktop quit there), before any publication was uncertain.
+    let release = Arc::new(AtomicBool::new(false));
+    let ar = {
+        let release = release.clone();
+        killing_approver(
+            &a,
+            &relay.url(),
+            &pid,
+            move || {
+                let until = Instant::now() + Duration::from_secs(30);
+                while !release.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+            || {},
+        )
+    };
+    let b = Fixture::new();
+    let bd = b.server();
+    let approval = first_pair_killed(&b, &ar, &relay.url(), 3_000, &pid);
+    assert_eq!(b.journal()["installed"], false);
+    let mut second = b.pair(&relay.url(), 300_000);
+    second.wait_line(EARLIER_CHECKING_LINE, Duration::from_secs(2));
+    let quit = {
+        let ar = ar.clone();
+        std::thread::spawn(move || ar.quit())
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    release.store(true, Ordering::SeqCst);
+    quit.join().unwrap();
+    assert!(approval.join().unwrap().is_err(), "never published");
+    let next = a.ring(&relay.url());
+    wait_for("the approver window again", Duration::from_secs(10), || {
+        next.pairing_ipc_owner()
+    });
+    let code = second.code_within(Duration::from_secs(14));
+    let approved = next.approve_device_code(&code);
+    assert!(approved.is_ok(), "{approved:?}");
+    assert_eq!(second.finish(), 0, "stderr:\n{}", second.stderr());
+    assert_eq!(second.words, 1);
+    assert_eq!(second.seen.last().unwrap(), DONE_TWO);
+    let key = common::ring::identity(&bd).0;
+    assert_eq!(entries(&b.chain(), &key), 1);
+    assert!(std::fs::read_dir(&b.paths.ring_dir).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("standalone-adoption.json.abandoned-")));
+    next.quit();
+}
+
+#[test]
+fn actual_cli_second_pair_while_first_running_says_already_running() {
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = approver(&a, &relay.url(), |_| {});
+    let b = Fixture::new();
+    let _bd = b.server();
+    let mut first = b.pair(&relay.url(), 60_000);
+    let code = first.code();
+    let mut second = b.pair(&relay.url(), 60_000);
+    assert_eq!(second.finish(), 1);
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), ALREADY_RUNNING_LINE, "{stderr}");
+    assert_eq!(second.words, 0);
+    assert!(ar.approve_device_code(&code).is_ok());
+    assert_eq!(first.finish(), 0, "stderr:\n{}", first.stderr());
+    assert_eq!(first.seen.last().unwrap(), DONE_TWO);
+    ar.quit();
+}
+
+/// S8: Ctrl-C during the wait ends it with the earlier-running copy; the owning Daemon
+/// exiting during the wait is reported as stopped.
+#[test]
+fn actual_cli_second_pair_ctrl_c_and_owner_exit_during_wait() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &url, &pid, outage_at_proofs(&proxy), || {});
+    let b = Fixture::new();
+    let bd = b.server();
+    let approval = first_pair_killed(&b, &ar, &url, 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    let mut second = b.pair(&url, 300_000);
+    second.wait_line(EARLIER_CHECKING_LINE, Duration::from_secs(5));
+    let at = Instant::now();
+    second.cancel();
+    assert_eq!(second.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+    let stderr = second.stderr();
+    assert_eq!(stderr.trim_end(), earlier_running_line(5), "{stderr}");
+    let mut third = b.pair(&url, 300_000);
+    third.wait_line(EARLIER_CHECKING_LINE, Duration::from_secs(5));
+    let at = Instant::now();
+    bd.shutdown();
+    assert_eq!(third.finish(), xshelld::pair::UNFINISHED_EXIT);
+    assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+    let stderr = third.stderr();
+    assert_eq!(stderr.trim_end(), EARLIER_STOPPED_LINE, "{stderr}");
+    assert_eq!(third.words, 0);
+    ar.quit();
+}
+
+/// S2: the Daemon has installed the chain but not yet written its receipt, and then fails
+/// to: the waiting command never reports "Added" without the receipt.
+#[test]
+fn actual_cli_second_pair_needs_the_installation_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let ar = killing_approver(&a, &relay.url(), &pid, || {}, || {});
+    let b = Fixture::new();
+    let (reached_tx, reached) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let reached_tx = std::sync::Mutex::new(reached_tx);
+    let _bd = b.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
+        if point == xshelld::server::TestPoint::StandaloneInstalledBeforeJournal
+            && first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = reached_tx.lock().unwrap().send(());
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        }
+        false
+    })));
+    let approval = first_pair_killed(&b, &ar, &relay.url(), 300_000, &pid);
+    assert!(approval.join().unwrap().is_ok());
+    reached.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(b.paths.ring_dir.join("roster.json").is_file(), "installed");
+    assert_eq!(b.journal()["installed"], false, "no receipt yet");
+    let wait_5s = ms("5000");
+    let mut second = b.pair_with_env(&relay.url(), 300_000, &earlier_wait(&wait_5s));
+    second.wait_line(EARLIER_CHECKING_LINE, Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(1));
+    // The receipt cannot be written: finalization fails.
+    let dir = b.paths.ring_dir.clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    release.send(()).unwrap();
+    let code = second.finish();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = second.stderr();
+    assert_eq!(code, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
+    assert!(
+        !second.seen.iter().any(|l| l.starts_with("Added")),
+        "{:?}",
+        second.seen
+    );
+    assert_eq!(stderr.trim_end(), earlier_running_line(5), "{stderr}");
+    // The Daemon writes the receipt on a later step.
+    wait_for("the receipt", Duration::from_secs(40), || {
+        standalone_installed(&b)
+    });
     ar.quit();
 }
