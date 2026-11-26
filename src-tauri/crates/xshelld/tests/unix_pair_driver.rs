@@ -2660,8 +2660,8 @@ fn ms(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 /// The pair env (`XSHELLD_PAIR_EARLIER_WAIT_MS`) as the fixture takes it.
-fn earlier_wait(ms_value: &PathBuf) -> [(&'static str, &std::path::Path); 1] {
-    [("XSHELLD_PAIR_EARLIER_WAIT_MS", ms_value.as_path())]
+fn earlier_wait(ms_value: &std::path::Path) -> [(&'static str, &std::path::Path); 1] {
+    [("XSHELLD_PAIR_EARLIER_WAIT_MS", ms_value)]
 }
 /// Members of `chain` whose key is `key`.
 fn entries(chain: &RosterChain, key: &xshell_protocol::ring::SignKey) -> usize {
