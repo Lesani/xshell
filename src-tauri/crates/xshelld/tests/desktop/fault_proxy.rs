@@ -13,8 +13,9 @@
 //! - [`Fault::RefuseAuth`]: an `auth` from one of the listed keys never reaches the Relay;
 //!   the proxy answers it as a Relay refusal (`error` frame, close 4003).
 //!
-//! [`FaultProxy::set_down`] closes every new connection at once (Relay unreachable) and
-//! [`FaultProxy::cut`] closes every open one.
+//! [`FaultProxy::set_down`] closes every new connection at once (Relay unreachable),
+//! [`FaultProxy::cut`] closes every open one and [`FaultProxy::cut_non_ring`] only those
+//! that are not Ring connections (the pairing pipe and the proposal reader).
 #![allow(dead_code)]
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -54,6 +55,8 @@ struct Shared {
     held: Mutex<Vec<(Arc<Conn>, Vec<u8>)>>,
     /// Frames of the [`Fault::LostFrom`] type seen since the fault was set.
     counted: std::sync::atomic::AtomicUsize,
+    /// Every request path seen, in order.
+    paths: Mutex<Vec<String>>,
 }
 
 struct Conn {
@@ -65,6 +68,8 @@ struct Conn {
     holding: AtomicBool,
     closed: AtomicBool,
     write: Mutex<()>,
+    /// The request path from the upgrade request, once it was parsed.
+    path: Mutex<Option<String>>,
 }
 
 impl Conn {
@@ -116,6 +121,7 @@ impl FaultProxy {
                     holding: AtomicBool::new(false),
                     closed: AtomicBool::new(false),
                     write: Mutex::new(()),
+                    path: Mutex::new(None),
                 });
                 s.conns.lock().unwrap().push(conn.clone());
                 let (c1, s1) = (conn.clone(), s.clone());
@@ -144,6 +150,28 @@ impl FaultProxy {
         for c in self.shared.conns.lock().unwrap().drain(..) {
             c.close();
         }
+    }
+
+    /// Closes every open connection whose request path is known and is not a Ring
+    /// connection (`/v1/ring/…`); Ring connections stay up.
+    pub fn cut_non_ring(&self) {
+        self.shared.conns.lock().unwrap().retain(|c| {
+            let ring = c
+                .path
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_none_or(|p| p.contains("/v1/ring/"));
+            if !ring {
+                c.close();
+            }
+            ring
+        });
+    }
+
+    /// The request paths of the connections opened so far (still open or not).
+    pub fn paths(&self) -> Vec<String> {
+        self.shared.paths.lock().unwrap().clone()
     }
 
     /// Sends what [`Fault::HoldFrom`] held, in order, and stops holding.
@@ -223,7 +251,15 @@ fn upward(conn: Arc<Conn>, shared: Arc<Shared>) {
             };
             let head: Vec<u8> = pending.drain(..end + 4).collect();
             let line = String::from_utf8_lossy(&head);
-            ring = Some(line.lines().next().is_some_and(|l| l.contains("/v1/ring/")));
+            let path = line
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            ring = Some(path.contains("/v1/ring/"));
+            shared.paths.lock().unwrap().push(path.clone());
+            *conn.path.lock().unwrap() = Some(path);
             if !forward(&conn, &shared, &head) {
                 break;
             }

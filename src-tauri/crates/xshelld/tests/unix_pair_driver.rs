@@ -4,6 +4,8 @@
 //! Run with TMPDIR on SSD or RAM, not an HDD: under default test parallelism the fsync-heavy
 //! stores on an HDD push Device-code readiness past the short test TTLs (2-4 s).
 mod common;
+#[path = "desktop/fault_proxy.rs"]
+mod fault_proxy;
 #[path = "desktop/workerd.rs"]
 #[allow(dead_code)]
 mod workerd;
@@ -80,6 +82,12 @@ impl Fixture {
             point == xshelld::server::TestPoint::StandaloneMaintenanceActs
                 && defer.load(std::sync::atomic::Ordering::Acquire)
         })))
+    }
+    fn journal(&self) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(self.paths.ring_dir.join("standalone-adoption.json")).unwrap(),
+        )
+        .unwrap()
     }
     fn ring(&self, relay: &str) -> Arc<DesktopRing> {
         self.ring_with_hook(relay, None)
@@ -244,6 +252,20 @@ impl PairChild {
             unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) },
             0
         );
+    }
+    /// Reads stdout until `line` arrives (kept in `seen`), at most `within`.
+    fn wait_line(&mut self, line: &str, within: Duration) {
+        let until = Instant::now() + within;
+        while !self.seen.iter().any(|l| l == line) {
+            let next = self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|e| panic!("no {line:?} ({e:?}); seen {:?}", self.seen));
+            if DeviceCode::parse(&next).is_ok() {
+                self.words += 1;
+            }
+            self.seen.push(next);
+        }
     }
 }
 impl Drop for PairChild {
@@ -1741,4 +1763,597 @@ fn no_proofs_when_another_window_takes_over_as_the_proposal_arrives() {
 #[test]
 fn no_proofs_when_the_code_expires_as_the_proposal_arrives() {
     no_proofs_after_the_code_is_gone(CodeGone::Expired);
+}
+
+// #109: an interrupted standalone join finishes at once. Every Relay, Ring and `--relay` URL
+// below is the fault proxy's (or the local workerd's); never a hosted Relay.
+
+const RECONNECTING_LINE: &str = "Connection to the service was lost; this command is still trying. Do not enter the words again or start over.";
+const UNFINISHED_RUNNING_LINE: &str = "Pairing isn't confirmed; this machine keeps checking and joins when it reaches the service. No action needed; watch for it in Settings > Ring on another device.";
+const UNFINISHED_STOPPED_LINE: &str = "Pairing isn't confirmed; xshell finishes it when it next runs in the background here (xshelld serve or a terminal connects). Do not run xshelld pair again first.";
+const UNFINISHED_CANCELLED_LINE: &str = "Stopping does not undo approval; this machine may still join your Ring. If you don't want it to, remove it in Settings > Ring on another device.";
+
+fn wait_for(what: &str, within: Duration, mut test: impl FnMut() -> bool) {
+    let until = Instant::now() + within;
+    while !test() {
+        assert!(Instant::now() < until, "{what} within {within:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+/// The obligation is installed: receipt written and `roster.json` lists this Daemon.
+fn standalone_installed(b: &Fixture) -> bool {
+    b.paths.ring_dir.join("roster.json").is_file()
+        && std::fs::read(b.paths.ring_dir.join("standalone-adoption.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|j| j["installed"] == true)
+}
+/// A Daemon fixture's standalone status, through its handle.
+fn status_installed(daemon: &ServerHandle) -> bool {
+    daemon
+        .standalone_adoption_status()
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.state == xshelld::server::adoption::StandaloneRecoveryState::Installed)
+}
+/// An approver (a created Ring) whose test points run `on_point`.
+fn approver(
+    a: &Fixture,
+    relay: &str,
+    on_point: impl Fn(AdoptionTestPoint) + Send + Sync + 'static,
+) -> Arc<DesktopRing> {
+    let ring = a.ring_with_hook(relay, Some(AdoptionTestHook(Arc::new(on_point))));
+    create(&ring, &a.companion());
+    ring
+}
+
+fn relay_drop_after_consent(running: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let url = proxy.url();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let b = Fixture::new();
+    let journal_path = b.paths.ring_dir.join("standalone-adoption.json");
+    let proofs = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+    let ar = {
+        let (proxy, proofs, captured, path) = (
+            proxy.clone(),
+            proofs.clone(),
+            captured.clone(),
+            journal_path.clone(),
+        );
+        approver(&a, &url, move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived
+                && proofs.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                *captured.lock().unwrap() =
+                    Some(serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap());
+                // The pairing pipe and proposal reader die; the approver's Ring
+                // connection (its publication) stays.
+                proxy.cut_non_ring();
+            }
+        })
+    };
+    let _bd = running.then(|| b.server());
+    let mut child = b.pair(&url, 120_000);
+    let code = child.code();
+    let started = Instant::now();
+    let approved = ar.approve_device_code(&code);
+    let exit = child.finish();
+    let elapsed = started.elapsed();
+    assert_eq!(exit, 0, "running {running}; stderr:\n{}", child.stderr());
+    assert!(approved.is_ok(), "{approved:?}");
+    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+    assert_eq!(child.words, 1);
+    assert_eq!(
+        child
+            .seen
+            .iter()
+            .filter(|l| *l == RECONNECTING_LINE)
+            .count(),
+        1,
+        "{:?}",
+        child.seen
+    );
+    assert_eq!(
+        child.seen.last().unwrap(),
+        "Added this machine to your Ring. Your Ring has 2 machines."
+    );
+    assert_eq!(proofs.load(Ordering::SeqCst), 1, "signed and sent once");
+    let before = captured.lock().unwrap().clone().unwrap();
+    let after = b.journal();
+    assert_eq!(after["installed"], true);
+    assert_eq!(
+        after["intent"], before["intent"],
+        "no new offer or lifetime"
+    );
+    assert_eq!(after["intent"]["expiresAt"], before["intent"]["expiresAt"]);
+    assert_eq!(after["proposal"], before["proposal"], "no new proposal");
+    let chain = b.chain();
+    assert_eq!(
+        after["accepted"],
+        serde_json::json!(chain
+            .versions()
+            .iter()
+            .map(|v| v.token())
+            .collect::<Vec<_>>())
+    );
+    assert_no_words_on_disk(&b, &code);
+    ar.quit();
+}
+#[test]
+fn actual_cli_relay_drop_after_consent_installs_without_waiting_for_expiry() {
+    relay_drop_after_consent(true);
+}
+#[test]
+fn actual_cli_relay_drop_after_consent_offline_installs_without_waiting_for_expiry() {
+    relay_drop_after_consent(false);
+}
+
+fn killed_after_consent(running: bool) {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let b = Fixture::new();
+    let pid = Arc::new(AtomicI32::new(0));
+    let killed = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let ar = {
+        let (pid, killed) = (pid.clone(), killed.clone());
+        approver(&a, &relay.url(), move |point| {
+            let mut killed = killed.lock().unwrap();
+            if point == AdoptionTestPoint::ApprovalProofsReceived && killed.is_none() {
+                assert_eq!(
+                    unsafe { libc::kill(pid.load(Ordering::SeqCst), libc::SIGKILL) },
+                    0
+                );
+                *killed = Some(Instant::now());
+            }
+        })
+    };
+    let mut daemon = running.then(|| b.server());
+    let mut child = b.pair(&relay.url(), 300_000);
+    pid.store(child.child.id() as i32, Ordering::SeqCst);
+    let code = child.code();
+    let _ = ar.approve_device_code(&code);
+    assert!(!child.child.wait().unwrap().success());
+    let killed = killed.lock().unwrap().unwrap();
+    let expires_at = b.journal()["intent"]["expiresAt"].as_u64().unwrap();
+    let from = if running {
+        killed
+    } else {
+        // The Offline route: the obligation waits for the Daemon's next start.
+        assert!(!standalone_installed(&b));
+        daemon = Some(b.server());
+        Instant::now()
+    };
+    let daemon = daemon.unwrap();
+    wait_for(
+        "the Daemon installs the obligation",
+        Duration::from_secs(10),
+        || status_installed(&daemon) && standalone_installed(&b),
+    );
+    assert!(from.elapsed() < Duration::from_secs(10));
+    assert!(
+        unix_now() + 200 < expires_at,
+        "well before the code expires"
+    );
+    let (_, _, identity) = common::ring::identity(&daemon);
+    assert_eq!(identity["ring"]["version"], b.chain().head().version());
+    assert_no_words_on_disk(&b, &code);
+    ar.quit();
+}
+#[test]
+fn actual_cli_killed_after_consent_running_daemon_reconciles_within_seconds() {
+    killed_after_consent(true);
+}
+#[test]
+fn actual_cli_killed_after_consent_offline_then_daemon_start_installs_within_seconds() {
+    killed_after_consent(false);
+}
+
+/// The approver loses the pipe at the proofs and waits 3 s before it publishes, so the
+/// command spends about 3 s in its retry (answered `not_member`).
+fn slow_publication_after_cut(
+    a: &Fixture,
+    proxy: &Arc<fault_proxy::FaultProxy>,
+) -> Arc<DesktopRing> {
+    let proxy = proxy.clone();
+    approver(a, &proxy.url(), move |point| match point {
+        AdoptionTestPoint::ApprovalProofsReceived => proxy.cut_non_ring(),
+        AdoptionTestPoint::ApprovalBeforePublish => std::thread::sleep(Duration::from_secs(3)),
+        _ => {}
+    })
+}
+fn counting_maintenance(acts: &Arc<std::sync::atomic::AtomicUsize>) -> xshelld::server::TestHook {
+    let acts = acts.clone();
+    xshelld::server::TestHook(Arc::new(move |_, point| {
+        if point == xshelld::server::TestPoint::StandaloneMaintenanceActs {
+            acts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }))
+}
+
+#[test]
+fn live_pair_command_is_never_raced_by_daemon() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = slow_publication_after_cut(&a, &proxy);
+    let b = Fixture::new();
+    let acts = Arc::new(AtomicUsize::new(0));
+    let _bd = b.server_with_hook(counting_maintenance(&acts));
+    let mut child = b.pair(&proxy.url(), 120_000);
+    let code = child.code();
+    std::thread::scope(|scope| {
+        let approval = scope.spawn(|| ar.approve_device_code(&code));
+        while child.child.try_wait().unwrap().is_none() {
+            assert_eq!(
+                acts.load(Ordering::SeqCst),
+                0,
+                "the Daemon acted while the command lived"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(approval.join().unwrap().is_ok());
+    });
+    assert_eq!(child.finish(), 0, "stderr:\n{}", child.stderr());
+    assert!(child.seen.iter().any(|l| l == RECONNECTING_LINE));
+    assert!(standalone_installed(&b));
+    // Installed: idle maintenance returns before it probes, so it never acts later either.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(acts.load(Ordering::SeqCst), 0);
+    ar.quit();
+}
+#[test]
+fn live_in_process_adoption_is_never_raced_by_daemon() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = slow_publication_after_cut(&a, &proxy);
+    let b = Fixture::new();
+    let acts = Arc::new(AtomicUsize::new(0));
+    let bd = b.server_with_hook(counting_maintenance(&acts));
+    let (tx, rx) = mpsc::channel();
+    let url = proxy.url();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let guest = scope.spawn(|| {
+            let result = bd.adopt_standalone(
+                &url,
+                Duration::from_secs(120),
+                &Arc::new(AtomicBool::new(false)),
+                |code| tx.send(code.clone()).unwrap(),
+                |p, lease| Ok(Some(lease.confirm(&p.proposal_hash)?)),
+            );
+            done.store(true, Ordering::SeqCst);
+            result
+        });
+        let code = rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        let ar = &ar;
+        let approval = scope.spawn(move || ar.approve_device_code(&code));
+        while !done.load(Ordering::SeqCst) {
+            assert_eq!(
+                acts.load(Ordering::SeqCst),
+                0,
+                "raced the in-process command"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(guest.join().unwrap().is_ok());
+        assert!(approval.join().unwrap().is_ok());
+    });
+    assert!(standalone_installed(&b));
+    assert!(status_installed(&bd));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(acts.load(Ordering::SeqCst), 0);
+    ar.quit();
+}
+
+fn unfinished_and_ctrl_c(running: bool) {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    // At the proofs: the pipe dies and the service becomes unreachable for new
+    // connections; the approver still publishes on its open Ring connection.
+    let ar = {
+        let proxy = proxy.clone();
+        approver(&a, &proxy.url(), move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived {
+                proxy.set_down(true);
+                proxy.cut_non_ring();
+            }
+        })
+    };
+    for cancel in [false, true] {
+        let b = Fixture::new();
+        let mut daemon = running.then(|| b.server());
+        let ttl = if cancel { 60_000 } else { 6_000 };
+        let mut child = b.pair(&proxy.url(), ttl);
+        let code = child.code();
+        assert!(ar.approve_device_code(&code).is_ok());
+        child.wait_line(RECONNECTING_LINE, Duration::from_secs(5));
+        if cancel {
+            child.cancel();
+        }
+        assert_eq!(child.finish(), xshelld::pair::UNFINISHED_EXIT);
+        let stderr = child.stderr();
+        let copy = if cancel {
+            UNFINISHED_CANCELLED_LINE
+        } else if running {
+            UNFINISHED_RUNNING_LINE
+        } else {
+            UNFINISHED_STOPPED_LINE
+        };
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert!(lines.contains(&copy), "cancel {cancel}: {stderr}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("xshelld: reconciliation_required:")),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("These words were cancelled"),
+            "after consent: {stderr}"
+        );
+        assert!(!standalone_installed(&b));
+        proxy.set_down(false);
+        if !running {
+            daemon = Some(b.server());
+        }
+        let daemon = daemon.unwrap();
+        wait_for(
+            "the Daemon finishes the approved Join",
+            Duration::from_secs(30),
+            || status_installed(&daemon) && standalone_installed(&b),
+        );
+        assert_no_words_on_disk(&b, &code);
+    }
+    ar.quit();
+}
+#[test]
+fn actual_cli_unfinished_prints_daemon_finishes_and_ctrl_c_after_consent() {
+    unfinished_and_ctrl_c(true);
+}
+#[test]
+fn actual_cli_unfinished_offline_prints_next_start_and_ctrl_c_after_consent() {
+    unfinished_and_ctrl_c(false);
+}
+
+/// S2: every Relay refusal before expiry is retried, including `removed` and
+/// `bad_signature`; the command finishes once the accepted chain lists it.
+#[test]
+fn actual_cli_relay_refusals_after_consent_are_retried_until_listed() {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let armed = Arc::new(std::sync::Mutex::new(None::<fault_proxy::Fault>));
+    let ar = {
+        let (proxy, armed) = (proxy.clone(), armed.clone());
+        approver(&a, &proxy.url(), move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived {
+                if let Some(fault) = armed.lock().unwrap().take() {
+                    proxy.set_fault(Some(fault));
+                    proxy.cut_non_ring();
+                }
+            }
+        })
+    };
+    for code in ["removed", "bad_signature", "not_member"] {
+        let b = Fixture::new();
+        let bd = b.server();
+        let (key, _, _) = common::ring::identity(&bd);
+        let key = key.to_string();
+        *armed.lock().unwrap() = Some(fault_proxy::Fault::RefuseAuth {
+            keys: vec![key.clone()],
+            code,
+            detail: None,
+        });
+        let mut child = b.pair(&proxy.url(), 120_000);
+        let words = child.code();
+        std::thread::scope(|scope| {
+            let approval = scope.spawn(|| ar.approve_device_code(&words));
+            wait_for("two refused observations", Duration::from_secs(20), || {
+                proxy.auths(&key).iter().filter(|s| s.refused).count() >= 2
+            });
+            assert!(
+                child.child.try_wait().unwrap().is_none(),
+                "{code} ended the command"
+            );
+            proxy.set_fault(None);
+            assert!(approval.join().unwrap().is_ok());
+        });
+        assert_eq!(child.finish(), 0, "{code}: {}", child.stderr());
+        assert!(child.seen.iter().any(|l| l == RECONNECTING_LINE));
+        assert!(standalone_installed(&b), "{code}");
+        drop(bd);
+    }
+    ar.quit();
+}
+
+/// S3: an observation answered after Ctrl-C (or after the deadline) is not used; the
+/// command ends unfinished and the Daemon finishes the Join later.
+fn observation_outlived(cancel: bool) {
+    let relay = workerd::Relay::start();
+    let proxy = Arc::new(fault_proxy::FaultProxy::start(&relay.url()));
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = {
+        let proxy = proxy.clone();
+        approver(&a, &proxy.url(), move |point| {
+            if point == AdoptionTestPoint::ApprovalProofsReceived {
+                // Every new authentication (the command's observation) is held.
+                proxy.set_fault(Some(fault_proxy::Fault::HoldFrom("auth")));
+                proxy.cut_non_ring();
+            }
+        })
+    };
+    let b = Fixture::new();
+    let ttl = if cancel { 60_000 } else { 6_000 };
+    let mut child = b.pair(&proxy.url(), ttl);
+    let code = child.code();
+    let started = Instant::now();
+    assert!(ar.approve_device_code(&code).is_ok(), "published");
+    child.wait_line(RECONNECTING_LINE, Duration::from_secs(5));
+    wait_for("an observation in flight", Duration::from_secs(5), || {
+        proxy.holding()
+    });
+    if cancel {
+        child.cancel();
+        std::thread::sleep(Duration::from_millis(300));
+        // The held observation now completes and would list this machine.
+        proxy.release();
+    }
+    let exit = child.finish();
+    let stderr = child.stderr();
+    assert_eq!(exit, xshelld::pair::UNFINISHED_EXIT, "{stderr}");
+    let copy = if cancel {
+        UNFINISHED_CANCELLED_LINE
+    } else {
+        UNFINISHED_STOPPED_LINE
+    };
+    assert!(stderr.lines().any(|l| l == copy), "{stderr}");
+    if !cancel {
+        assert!(
+            started.elapsed() < Duration::from_millis(ttl + 3_000),
+            "the observation outlived the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+    // The Offline command used nothing it observed late.
+    assert!(!standalone_installed(&b));
+    assert!(!b.paths.ring_dir.join("roster.json").exists());
+    assert_eq!(b.journal()["installed"], false);
+    proxy.release();
+    let daemon = b.server();
+    wait_for(
+        "the Daemon finishes the approved Join",
+        Duration::from_secs(15),
+        || status_installed(&daemon) && standalone_installed(&b),
+    );
+    ar.quit();
+}
+#[test]
+fn actual_cli_ctrl_c_during_observation_never_uses_its_late_answer() {
+    observation_outlived(true);
+}
+#[test]
+fn actual_cli_deadline_during_observation_never_uses_its_late_answer() {
+    observation_outlived(false);
+}
+
+/// S1: "offer lock free" proves only that the command is gone. A running owner's admitted
+/// `InstallStandaloneAccepted` handler may still overlap with maintenance; the journal and
+/// runtime fences keep the result exact.
+#[test]
+fn running_owner_handoff_overlapping_maintenance_ends_installed_without_regression() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let relay = workerd::Relay::start();
+    let a = Fixture::new();
+    let _ad = a.server();
+    let ar = a.ring(&relay.url());
+    create(&ar, &a.companion());
+    let b = Fixture::new();
+    let (reached, at_handler) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let handler_done = Arc::new(AtomicBool::new(false));
+    let first = AtomicBool::new(true);
+    let done = handler_done.clone();
+    let bd = b.server_with_hook(xshelld::server::TestHook(Arc::new(move |_, point| {
+        if point == xshelld::server::TestPoint::StandaloneHandoffInstalled
+            && first.swap(false, Ordering::SeqCst)
+        {
+            reached.send(()).unwrap();
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+            done.store(true, Ordering::SeqCst);
+        }
+        false
+    })));
+    let mut child = b.pair(&relay.url(), 120_000);
+    let code = child.code();
+    assert!(ar.approve_device_code(&code).is_ok());
+    at_handler.recv_timeout(Duration::from_secs(10)).unwrap();
+    let handed = b.journal();
+    assert_eq!(handed["installed"], false);
+    let accepted_len = handed["accepted"].as_array().unwrap().len();
+    assert!(accepted_len > 0);
+    // Watch every journal state from here on: the accepted prefix never shrinks.
+    let watching = Arc::new(AtomicBool::new(true));
+    let watcher = {
+        let (watching, path) = (
+            watching.clone(),
+            b.paths.ring_dir.join("standalone-adoption.json"),
+        );
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while watching.load(Ordering::SeqCst) {
+                if let Some(j) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                {
+                    seen.push((
+                        j["accepted"].as_array().map_or(0, |a| a.len()),
+                        j["installed"] == true,
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            seen
+        })
+    };
+    // The command dies while its handoff is paused inside the Daemon.
+    child.child.kill().unwrap();
+    assert!(!child.child.wait().unwrap().success());
+    wait_for(
+        "maintenance installs while the handoff is paused",
+        Duration::from_secs(10),
+        || standalone_installed(&b),
+    );
+    assert!(!handler_done.load(Ordering::SeqCst));
+    release.send(()).unwrap();
+    wait_for("the paused handoff ends", Duration::from_secs(10), || {
+        handler_done.load(Ordering::SeqCst)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    watching.store(false, Ordering::SeqCst);
+    let seen = watcher.join().unwrap();
+    assert!(
+        seen.windows(2)
+            .all(|w| w[1].0 >= w[0].0 && (w[1].1 || !w[0].1)),
+        "the journal regressed: {seen:?}"
+    );
+    let end = b.journal();
+    assert_eq!(end["installed"], true);
+    assert_eq!(end["intent"], handed["intent"]);
+    let chain = b.chain();
+    assert_eq!(
+        end["accepted"],
+        serde_json::json!(chain
+            .versions()
+            .iter()
+            .map(|v| v.token())
+            .collect::<Vec<_>>()),
+        "the receipt names exactly the durable installation"
+    );
+    assert!(end["accepted"].as_array().unwrap().len() >= accepted_len);
+    assert!(status_installed(&bd));
+    let (_, _, identity) = common::ring::identity(&bd);
+    assert_eq!(identity["ring"]["version"], chain.head().version());
+    assert_no_words_on_disk(&b, &code);
+    ar.quit();
 }
