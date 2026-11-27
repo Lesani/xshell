@@ -30,6 +30,21 @@ export function resolveHostAlias(snap: RegistrySnapshot, id: HostId): HostId {
 export const isUsableStatus = (s: HostStatus | undefined): boolean =>
   !!s && (s.status === "connected" || s.status === "upgrade-pending" || s.status === "build-differs");
 
+// A Ring machine reached through the Relay that the Relay reports as not there: its link is
+// retried, but nothing is expected to answer. It is offline, not connecting.
+export function isRelayAway(snap: RegistrySnapshot, id: HostId | undefined): boolean {
+  const row = id ? snap.available.find(h => h.id === id || h.aliases.includes(id)) : undefined;
+  const r = row?.reachability.kind;
+  return row?.activeRoute === "relay" && (r === "closed" || r === "unreachable" || r === "never-connected");
+}
+
+// A Host whose link is being made (no status yet counts): the UI shows a turning ring.
+export function isConnecting(snap: RegistrySnapshot, id: HostId | undefined): boolean {
+  if (!id) return false;
+  if ((snap.status[resolveHostAlias(snap, id)]?.status ?? "reconnecting") !== "reconnecting") return false;
+  return !isRelayAway(snap, id);
+}
+
 export class HostUnknownError extends Error {
   readonly code = "unknown-host";
   constructor(host: HostId) { super(`unknown host ${host}`); this.name = "HostUnknownError"; }

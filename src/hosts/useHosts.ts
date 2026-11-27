@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { AGENT_IDS, type AgentId } from "../agents";
 import { registry, isUsableStatus, type RegistrySnapshot } from "./registry";
+export { isConnecting, isRelayAway } from "./registry";
 import { fmt } from "./strings";
 import { LOCAL_HOST } from "./localHost";
 import type { AvailableHost, HostConfig, HostId, HostStatus, TerminalInfo } from "./types";
@@ -38,17 +39,6 @@ export function useHostAgents(id: HostId | undefined): Record<AgentId, boolean> 
 
 export function usableHosts(snap: RegistrySnapshot = registry.getSnapshot()): HostId[] {
   return remoteHosts(snap).filter(c => isUsableStatus(snap.status[c.id])).map(c => c.id);
-}
-
-// A Host whose link is being made (no status yet counts): the UI shows a turning ring. A Ring
-// machine reached through the Relay that the Relay reports as not there is offline instead:
-// its link is retried, but nothing is expected to answer.
-export function isConnecting(snap: RegistrySnapshot, id: HostId | undefined): boolean {
-  if (!id) return false;
-  const row = snap.available.find(h => h.id === id || h.aliases.includes(id));
-  if ((snap.status[row?.id ?? id]?.status ?? "reconnecting") !== "reconnecting") return false;
-  const r = row?.reachability.kind;
-  return !(row?.activeRoute === "relay" && (r === "closed" || r === "unreachable" || r === "never-connected"));
 }
 
 // "Connected", "Reconnecting · Checking…" … — the chip text used everywhere.
