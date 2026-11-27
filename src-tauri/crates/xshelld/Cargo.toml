@@ -1,6 +1,6 @@
 [package]
 name = "xshelld"
-version = "1.6.0-rjw.3"
+version = "1.6.0-rjw.4"
 edition = "2021"
 license = "MIT"
 publish = false

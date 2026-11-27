@@ -19,7 +19,7 @@ semver = "1"
 
 [package]
 name = "xshell"
-version = "1.6.0-rjw.3"
+version = "1.6.0-rjw.4"
 edition = "2021"
 
 [lib]
