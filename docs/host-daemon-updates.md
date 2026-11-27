@@ -23,6 +23,11 @@ depends on the Host's xshell:
   When the latest version is unknown (offline), nothing is offered for these Hosts. Such a
   Host follows releases, not the build the Desktop runs: a Desktop build that differs is no
   reason to offer anything.
+  When the Host cannot get the release itself (it does not reach `get.xshell.sh`, or the
+  release has no build for its machine type), the Desktop sends its own build instead, as
+  for older Hosts, but only when the Desktop's version is newer than the Host's. The Host
+  then runs the Desktop's version and is still offered the release when that is newer. A
+  download that fails its checks is never replaced this way.
 - **Up to 1.6.0-rjw.3**: the Desktop sends its own `xshelld` build over the link
   (`daemon.stage-*`) when the Host runs an older version or another build of the same one.
 - A Host that can take neither shows `curl -fsSL https://get.xshell.sh | sh`, to run on

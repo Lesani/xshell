@@ -78,7 +78,7 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
     {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {/* With a description (the bar, Hosts settings) the progress line names its machine: the bar may list several. */}
-      {busy ? <span role="status">{description && `${host.name}: `}{fmt(status?.phase === "upgrading" ? "update.restarting" : source === "release" ? "update.downloading" : "update.sending")}</span>
+      {busy ? <span role="status">{description && `${host.name}: `}{fmt(status?.phase === "upgrading" ? "update.restarting" : source === "release" && status?.phase !== "installing" ? "update.downloading" : "update.sending")}</span>
         : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!(state.all && !state.all.done)} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>}
     </>}
     {error && <span className="host-row-error" role="alert">{updateErrorText(host.name, error)}</span>}

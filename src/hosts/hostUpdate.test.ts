@@ -264,6 +264,32 @@ describe("Updates from the latest release", () => {
     expect((await run(f))[0]).toMatchObject({ host: a, outcome: "failed" });
   });
 
+  it("a Host that was sent this Desktop's build instead of the release succeeds on this Desktop's version", async () => {
+    // The Host could not get 1.6.0 itself; the Desktop (1.5.0) sent its own build. 1.6.0 stays offered.
+    const sent = status({ host: "r_a", status: "upgrade-pending", updateAction: "update", updateSource: "release", updateVersion: "1.6.0", daemonVersion: "1.5.0", daemonBuild: build, desktopBuild: build, linkGeneration: 4 });
+    expect(sent.desktopVersion).toBe("1.5.0");
+    const f = fixture({ r_a: { ...release("r_a"), daemonVersion: "1.4.0" } }, 60_000);
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(sent), 5); return null; });
+    expect(await run(f)).toEqual([{ host: a, outcome: "ok", version: "1.5.0" }]);
+    // Sol: the result names the version it arrived on, whatever the status says later.
+    const g = fixture({ r_a: { ...release("r_a"), daemonVersion: "1.4.0" } }, 60_000);
+    g.replies.set("r_a", async () => { g.push(sent); g.push({ ...sent, daemonVersion: "1.7.0", linkGeneration: 5 }); return null; });
+    expect(await run(g)).toEqual([{ host: a, outcome: "ok", version: "1.5.0" }]);
+  });
+
+  it("a Host already on this Desktop's version that only reconnects has not been updated", async () => {
+    // Sol: Host and Desktop both run 1.5.0, release 1.6.0 offered; the Host reconnects and
+    // the backend refuses the obsolete target. No build was sent: not a success.
+    const back = status({ host: "r_a", status: "upgrade-pending", updateAction: "update", updateSource: "release", updateVersion: "1.6.0", daemonVersion: "1.5.0", daemonBuild: build, desktopBuild: build, linkGeneration: 4 });
+    const f = fixture({ r_a: { ...release("r_a"), daemonVersion: "1.5.0" } }, 50);
+    f.replies.set("r_a", async () => { f.push(back); throw new Error("the Host's connection changed"); });
+    expect((await run(f))[0]).toMatchObject({ host: a, outcome: "failed", error: "the Host's connection changed" });
+    // Another build of this Desktop's version is not the build it sent either.
+    const h = fixture({ r_a: { ...release("r_a"), daemonVersion: "1.4.0" } }, 50);
+    h.replies.set("r_a", async () => { setTimeout(() => h.push({ ...back, daemonBuild: other }), 5); return null; });
+    expect((await run(h))[0]).toMatchObject({ host: a, outcome: "failed" });
+  });
+
   it("this Desktop's build still has to come back with the same build", async () => {
     const f = fixture({ r_a: status({ host: "r_a", desktopBuild: build }) }, 50);
     f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4, { daemonVersion: "1.5.0", daemonBuild: other })), 5); return null; });
