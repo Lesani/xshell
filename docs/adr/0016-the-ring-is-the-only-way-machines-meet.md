@@ -13,3 +13,7 @@ Because the Ring is now the product, joining it has to be trivially easy and imp
 
 - Keeping the consent card: it defends against someone who reads the code off the screen and adopts the machine into their own Ring, but it only shows names the attacker chooses, and it carried most of the adoption state machine. The headless path already accepted the same risk.
 - Restricting removal to computers: a stolen laptop with only a phone at hand needs removal from the Mobile. An unlocked stolen phone can then remove machines, which costs re-pairing and grants no access.
+
+## Amendment (2026-11-27, #115)
+
+A saved SSH Host can be paired into the Ring from its row in Settings → Remote hosts (**Add to Ring**): the Desktop runs `xshelld pair` on the Host over its SSH route and approves the Device Code itself, bound to the key the Host's own `ring.identity` reported. This is Pairing, not a new way to meet: no new protocol message and no Daemon change.

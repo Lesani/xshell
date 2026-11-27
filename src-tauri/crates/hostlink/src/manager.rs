@@ -123,6 +123,14 @@ impl Observer for OwnerRelayObserver {
     fn terminals(&self, _: &str, _: &[TerminalInfo]) {}
 }
 
+/// [`Manager::ssh_route`].
+pub struct SshRoute {
+    pub handle: Arc<HostHandle>,
+    pub config: HostConfig,
+    pub transport: Box<dyn crate::transport::Transport>,
+    pub install_dir: String,
+}
+
 pub struct Manager {
     mc: Arc<ManagerConfig>,
     broker: Mutex<Option<Arc<crate::ring::broker::BrokerClient>>>,
@@ -465,6 +473,29 @@ impl Manager {
             Ok((handle, raw)) => handle.upgrade_target(Some(raw), w),
             Err(e) => w(Err(e)),
         }
+    }
+
+    /// A saved Host reached over SSH (Add to Ring, #115): its handle, its configuration,
+    /// the transport its connect command runs through and this Desktop's install directory.
+    /// `None` for the Local Host, a Ring Host, an identity alias and a direct route.
+    pub fn ssh_route(&self, id: &str) -> Option<SshRoute> {
+        let handle = self
+            .hosts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|h| h.id() == id)?
+            .clone();
+        let config = handle.saved_config().filter(|cfg| cfg.id == id)?;
+        if self.mc.transports.direct(&config).is_some() {
+            return None;
+        }
+        Some(SshRoute {
+            transport: self.mc.transports.for_host(&config),
+            install_dir: self.mc.install_dir(),
+            config,
+            handle,
+        })
     }
 
     /// Enrollment lookup must never enroll a Relay discovery or an identity-bound alias.

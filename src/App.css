@@ -1910,6 +1910,8 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .host-row-agent { display: inline-flex; align-items: center; gap: 4px; }
 .host-row-muted { color: var(--text-muted); }
 .host-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.host-row-ring { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.host-row-ring-member { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-secondary); }
 .host-row-remove:hover { color: #d97757; }
 .host-test-result { font-size: 11px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-deep); }
 .host-test-result.ok { color: var(--success); }

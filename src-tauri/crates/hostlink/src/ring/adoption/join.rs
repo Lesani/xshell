@@ -878,6 +878,31 @@ impl DesktopRing {
     /// `offline`, `not_found`, `already_used`, `closed`, `expired`, `cancelled`, `refused`,
     /// `uncertain`.
     pub fn approve_device_code(&self, code: &DeviceCode) -> Result<ApprovalOutcome, String> {
+        self.approve_device_code_bound(code, None)
+    }
+
+    /// [`DesktopRing::approve_device_code`] for words this Desktop read itself from a Host it
+    /// already reaches (Add to Ring, #115): only a standalone Daemon enrollment whose key is
+    /// `expected` (the key that Host's `ring.identity` reported) is approved. Checked as soon
+    /// as the joining intent is known, before any proposal is prepared or signed:
+    /// - a Computer enrollment (the Host runs its own Desktop) is refused with
+    ///   [`APPROVE_COMPUTER_INTENT`];
+    /// - any other key (the words belong to another machine) with [`APPROVE_SUBSTITUTED`].
+    ///
+    /// Otherwise the same errors as `approve_device_code`.
+    pub fn approve_device_code_for(
+        &self,
+        code: &DeviceCode,
+        expected: &xshell_protocol::ring::SignKey,
+    ) -> Result<ApprovalOutcome, String> {
+        self.approve_device_code_bound(code, Some(expected))
+    }
+
+    fn approve_device_code_bound(
+        &self,
+        code: &DeviceCode,
+        expected: Option<&xshell_protocol::ring::SignKey>,
+    ) -> Result<ApprovalOutcome, String> {
         let _admission = self.reserve_adoption().map_err(|e| format!("busy: {e}"))?;
         if !self.pairing_ipc_owner() {
             return Err("other_window: another window owns approval".into());
@@ -953,6 +978,7 @@ impl DesktopRing {
             Mutex::new(None::<Arc<xshell_protocol::ring::relay::connector::ProposalConnection>>);
         let operation = Mutex::new(None::<String>);
         let published = Mutex::new(None::<RosterChain>);
+        let refused = Mutex::new(None::<String>);
         let result = approve_adoption(
             pipe,
             &AdoptionHostRequest {
@@ -963,6 +989,11 @@ impl DesktopRing {
             },
             Some(&cancel),
             |intent, hash| {
+                // Bound to one Host (#115): first, before anything is prepared or signed.
+                if let Some(refusal) = expected.and_then(|key| bound_refusal(intent, key)) {
+                    *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(refusal);
+                    return Err(PairError::Payload("not the expected machine".into()));
+                }
                 // A machine whose headless Daemon is a standalone member joins as a Computer
                 // in this one approval: its standalone unit is removed first, only now that
                 // possession of the Daemon key was proven in this pairing.
@@ -1176,6 +1207,9 @@ impl DesktopRing {
                 }
             },
         );
+        if let Some(refusal) = refused.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(refusal);
+        }
         let op = operation.into_inner().unwrap_or_else(|e| e.into_inner());
         if let Some(chain) = published.into_inner().unwrap_or_else(|e| e.into_inner()) {
             // Even a lost guest ACK after this point does not undo known Relay publication.
@@ -1208,6 +1242,29 @@ impl DesktopRing {
             || "uncertain: approval ended without publication".into(),
             code_of,
         ))
+    }
+}
+
+/// [`DesktopRing::approve_device_code_for`]'s refusal of a Computer enrollment.
+pub const APPROVE_COMPUTER_INTENT: &str = "computer_intent";
+/// [`DesktopRing::approve_device_code_for`]'s refusal of another machine's words.
+pub const APPROVE_SUBSTITUTED: &str = "substituted";
+
+/// Why a joining intent is not the standalone enrollment of the Daemon whose key is
+/// `expected`, in `code: detail` form; `None` when it is.
+pub fn bound_refusal(
+    intent: &xshell_protocol::ring::pairing::adoption::AdoptionIntent,
+    expected: &xshell_protocol::ring::SignKey,
+) -> Option<String> {
+    use xshell_protocol::ring::pairing::adoption::JoinTarget;
+    match &intent.target {
+        JoinTarget::StandaloneDaemon { daemon } if daemon.sign_key == *expected => None,
+        JoinTarget::Computer { .. } => Some(format!(
+            "{APPROVE_COMPUTER_INTENT}: the machine joins with its own Desktop"
+        )),
+        _ => Some(format!(
+            "{APPROVE_SUBSTITUTED}: the words belong to another machine"
+        )),
     }
 }
 
