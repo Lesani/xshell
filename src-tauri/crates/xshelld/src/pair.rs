@@ -21,14 +21,10 @@ use xshell_protocol::ring::url::{RelayUrl, HOSTED_RELAY_URL};
 #[cfg(test)]
 use xshell_protocol::ring::RosterChain;
 
-/// The exit code when nobody entered the code in time.
-pub const EXPIRED_EXIT: i32 = 5;
-/// The exit code when the Relay refused new pairing attempts from this network for now
-/// (HTTP 429, #112): not a connection problem.
-pub const RATE_LIMITED_EXIT: i32 = 7;
-/// The exit code when another device approved this machine but the command ended before the
-/// Join was confirmed: xshell on this machine finishes it by itself (never a new offer).
-pub const UNFINISHED_EXIT: i32 = 6;
+/// The exit codes, shared with the Desktop that runs `pair` on a saved SSH Host (#115).
+pub use xshell_hostlink::ring::pair_cli::{EXPIRED_EXIT, RATE_LIMITED_EXIT, UNFINISHED_EXIT};
+// The stderr lines that Desktop tells apart: defined once, in `xshell_hostlink`.
+use xshell_hostlink::ring::pair_cli::{ALREADY_RUNNING, OFFLINE};
 
 enum Failure {
     Expired,
@@ -69,8 +65,6 @@ const INSTRUCTION: &str = "Type these eight words on a machine or phone already 
 const LIFETIME: &str = "These words work once, for 10 minutes, while this command is running.";
 const WAITING: &str = "Waiting for another device to add this machine...";
 const EXPIRED: &str = "These words have expired. Run xshelld pair again for new words.";
-const OFFLINE: &str =
-    "Can't reach the service. Check your connection, then run xshelld pair again.";
 // COPY-GAP: no approved line for a pair command stopped with Ctrl-C; modelled on
 // `cli.pair.expired`.
 const CANCELLED: &str = "These words were cancelled. Run xshelld pair again for new words.";
@@ -90,7 +84,6 @@ const UNFINISHED_CANCELLED: &str = "Stopping does not undo approval; this machin
 const EARLIER_CHECKING: &str =
     "An earlier pairing of this machine is still being finished. Checking now; no new words yet.";
 const EARLIER_STOPPED: &str = "Pairing needs xshell running in the background here: start xshelld serve. Then check Settings > Ring on another device; no new words needed yet.";
-const ALREADY_RUNNING: &str = "Another xshelld pair command is showing words on this machine. Use those words, or stop that command first.";
 const BUSY: &str =
     "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
 // `cli.pair.rateLimited` (plans/plan-pairing-bc.md, COPY).

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap } from "lucide-react";
+import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap, CircleDot } from "lucide-react";
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
 import { ColorPicker } from "./ColorPicker";
 import { HostBadge } from "./HostBadge";
@@ -13,9 +13,12 @@ import { isUsableStatus } from "../hosts/registry";
 import { buildText } from "../buildId";
 import { phaseLabel, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostConfig, HostStatus, HostTestResult } from "../hosts/types";
+import { useRingStatus } from "../ring/useRingStatus";
+import type { ApprovedComputer, RingStatus } from "../ring/types";
+import { addToRingErrorCode, addToRingErrorKey, sshRingView } from "../hosts/sshRing";
 
 // Settings → Hosts: this computer's Daemon, and SSH Hosts (add, edit, test, reconnect, upgrade,
-// remove). The Ring's machines are in Settings → Ring.
+// remove, Add to Ring). The Ring's machines are in Settings → Ring.
 // Saving persists the `hosts` key in settings.json and reconfigures the registry (App).
 
 interface Props {
@@ -148,7 +151,48 @@ function HostForm({ initial, onSave, onCancel }: { initial: HostConfig | null; o
   );
 }
 
-function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: () => void; onRemove: () => void; now: number }) {
+type RingAddState = { adding: boolean; added: boolean; error: string | null };
+
+// Add to Ring (#115): the button, its progress, the success line, the member label and the
+// error sentence. Not shown while this Desktop is in no Ring, or for a Windows Host. Keyed by
+// the Host's connection (ssh target, daemon command): an edit starts it afresh, and a result
+// that arrives for an earlier configuration, or after unmount, is ignored.
+function RingAction({ host, status, ring }: { host: HostConfig; status: HostStatus | undefined; ring: RingStatus | null }) {
+  const snap = useHostsSnapshot();
+  const view = sshRingView(host, status, snap.available, ring);
+  const [state, setState] = useState<RingAddState>({ adding: false, added: false, error: null });
+  // The current invocation; bumped on unmount so a late result is dropped.
+  const operation = useRef(0);
+  useEffect(() => () => { operation.current++; }, []);
+  if (view === "hidden") return null;
+  const add = async () => {
+    const mine = ++operation.current;
+    setState({ adding: true, added: false, error: null });
+    try {
+      await invoke<ApprovedComputer>("ring_add_ssh_host", { host: host.id });
+      if (operation.current === mine) setState({ adding: false, added: true, error: null });
+    } catch (e) {
+      if (operation.current === mine) setState({ adding: false, added: false, error: addToRingErrorCode(e) });
+    }
+  };
+  return (
+    <div className="host-row-ring" data-ring-action={view}>
+      {view === "member" ? (
+        <span className="host-row-ring-member" data-ring-host-member><CircleDot size={11} /> {fmt("hosts.ring.member")}</span>
+      ) : (
+        <button className="btn btn-ghost settings-action-btn" data-ring-add disabled={state.adding || view === "offline"} aria-busy={state.adding || undefined}
+          title={view === "offline" ? fmt("hosts.ring.offlineHint", { name: host.name }) : undefined} onClick={add}>
+          <CircleDot size={11} /> {state.adding ? fmt("hosts.ring.adding") : fmt("hosts.ring.add")}
+        </button>
+      )}
+      {view === "offline" && !state.adding && <span className="host-row-note" data-ring-offline-hint>{fmt("hosts.ring.offlineHint", { name: host.name })}</span>}
+      {state.added && view !== "member" && <span className="host-row-note host-row-ring-added" data-ring-added>{fmt("hosts.ring.added", { name: host.name })}</span>}
+      {state.error && !state.adding && view !== "member" && <span className="host-row-note host-row-warn" data-ring-error={state.error}>{fmt(addToRingErrorKey(state.error), { name: host.name })}</span>}
+    </div>
+  );
+}
+
+function HostRow({ host, onEdit, onRemove, now, ring }: { host: HostConfig; onEdit: () => void; onRemove: () => void; now: number; ring: RingStatus | null }) {
   const snap = useHostsSnapshot();
   const status = snap.status[host.id];
   const live = snap.live[host.id];
@@ -207,6 +251,8 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
 
       {test.text && <div className={`host-test-result ${test.ok ? "ok" : "failed"}`}>{test.text}</div>}
 
+      <RingAction key={`${host.sshTarget}\n${host.daemonCommand ?? ""}`} host={host} status={status} ring={ring} />
+
       <div className="host-row-actions">
         <button className="btn btn-ghost settings-action-btn" disabled={test.busy} onClick={testNow}><PlugZap size={11} /> {test.busy ? fmt("hosts.row.testing") : fmt("hosts.row.test")}</button>
         <button className="btn btn-ghost settings-action-btn" onClick={() => invoke("hosts_kick", { host: host.id }).catch(() => {})}><RefreshCw size={11} /> {fmt("hosts.row.reconnect")}</button>
@@ -218,6 +264,13 @@ function HostRow({ host, onEdit, onRemove, now }: { host: HostConfig; onEdit: ()
 
     </div>
   );
+}
+
+// The saved Hosts' rows. Only rendered when there is at least one: the Ring is asked whether
+// this Desktop is in one (for Add to Ring) only then.
+function HostRows({ hosts, now, onEdit, onRemove }: { hosts: HostConfig[]; now: number; onEdit: (h: HostConfig) => void; onRemove: (h: HostConfig) => void }) {
+  const { status: ring } = useRingStatus();
+  return <>{hosts.map(h => <HostRow key={h.id} host={h} now={now} ring={ring} onEdit={() => onEdit(h)} onRemove={() => onRemove(h)} />)}</>;
 }
 
 export function HostsSettings({ onSave, onRemove }: Props) {
@@ -250,9 +303,9 @@ export function HostsSettings({ onSave, onRemove }: Props) {
             <div className="host-empty-title">{fmt("hosts.empty.title")}</div>
             <div className="host-empty-body">{fmt("hosts.empty.body")}</div>
           </div>
-        ) : hosts.map(h => (
-          <HostRow key={h.id} host={h} now={now} onEdit={() => setEditing(h)} onRemove={() => setRemoving(h)} />
-        ))}
+        ) : (
+          <HostRows hosts={hosts} now={now} onEdit={setEditing} onRemove={setRemoving} />
+        )}
       </div>
       {editing && <HostForm initial={editing === "new" ? null : editing} onSave={save} onCancel={() => setEditing(null)} />}
       {removing && (

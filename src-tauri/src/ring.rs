@@ -1,7 +1,8 @@
 //! Settings → Ring: Tauri glue over `xshell_hostlink::ring`. Commands `ring_status` and
 //! `ring_remove_member` (any member, this computer included); the event `ring:status`.
 //! Phone pairing (#9): `ring_pair_phone_start`, `ring_pair_phone_cancel`; the event
-//! `ring:pairing`. Create, Join and Add a machine: [`join`].
+//! `ring:pairing`. Create, Join and Add a machine: [`join`]. Add to Ring for a saved SSH
+//! Host: [`ssh_host`].
 //!
 //! Every Host's Daemon (the Local Host's and each Remote Host's) joins the Ring whenever
 //! its Host connects: the Host Observer records the connection in [`HOST_SYNC`], and
@@ -17,6 +18,7 @@ use xshell_hostlink::{HostStatus, LOCAL_HOST_ID};
 use xshell_protocol::ring::SignKey;
 
 pub mod join;
+pub mod ssh_host;
 
 /// The one the app's Host Observer feeds.
 pub static HOST_SYNC: HostSync = HostSync::new();

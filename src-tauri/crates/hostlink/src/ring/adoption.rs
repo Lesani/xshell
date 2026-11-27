@@ -28,7 +28,10 @@ pub use reconcile::{
     PublicationRecoveryStatus,
 };
 mod join;
-pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
+pub use join::{
+    bound_refusal, ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus, APPROVE_COMPUTER_INTENT,
+    APPROVE_SUBSTITUTED,
+};
 mod ui;
 pub use ui::MembershipState;
 
