@@ -52,7 +52,7 @@ afterAll(() => { registry._dispose(); });
 async function render(opts: { member?: boolean; status?: Partial<HostStatus>; ring?: RingStatus | null; add?: () => Promise<unknown> } = {}) {
   mocks = { ring: opts.ring, add: opts.add };
   registry.applyAvailable({ sequence: ++sequence, hosts: [row(!!opts.member)] });
-  registry.applyStatus(hostStatus(opts.status));
+  registry.applyStatus(hostStatus({ configGeneration: 1_000_000 + sequence, ...opts.status }));
   await act(async () => { root.render(<HostsSettings onSave={vi.fn()} onRemove={vi.fn()} />); });
 }
 
@@ -155,4 +155,54 @@ it("reads an unknown error as failed", () => {
   expect(addToRingErrorCode("other: something")).toBe("failed");
   expect(addToRingErrorCode(new Error("boom"))).toBe("failed");
   expect(addToRingErrorCode("service: x")).toBe("service");
+});
+
+// Sol's diff review 5: an edit of the Host's connection starts the action afresh, and a result
+// for an earlier configuration, or after unmount, is ignored.
+async function edit(patch: Partial<HostConfig>) {
+  await act(async () => {
+    await registry.configure([{ ...HOST, ...patch }]);
+    registry.applyAvailable({ sequence: ++sequence, hosts: [row(false)] });
+    registry.applyStatus(hostStatus({ configGeneration: 1_000_000 + sequence }));
+  });
+}
+
+it("ignores the late result of an attempt started before an edit", async () => {
+  let finish: (v: unknown) => void = () => {};
+  await render({ add: () => new Promise(resolve => { finish = resolve; }) });
+  try {
+    await act(async () => { addButton()!.click(); });
+    expect(addButton()?.textContent).toContain("Adding…");
+    await edit({ sshTarget: "dev2" });
+    expect(addButton()?.textContent).toContain("Add to Ring");
+    await act(async () => { finish({ names: ["dev box"], version: 4 }); });
+    expect(q("[data-ring-added]")).toBeNull();
+    expect(addButton()?.disabled).toBe(false);
+  } finally { await edit({}); }
+});
+
+it("clears an error when the Host's connection is edited", async () => {
+  await render({ add: async () => { throw "service: detail"; } });
+  try {
+    await act(async () => { addButton()!.click(); });
+    expect(q("[data-ring-error]")).not.toBeNull();
+    await edit({ daemonCommand: "~/bin/xd" });
+    expect(q("[data-ring-error]")).toBeNull();
+    expect(addButton()).not.toBeNull();
+  } finally { await edit({}); }
+});
+
+it("drops a result that arrives after unmount", async () => {
+  const errors = vi.spyOn(console, "error");
+  let finish: (v: unknown) => void = () => {};
+  await render({ add: () => new Promise(resolve => { finish = resolve; }) });
+  await act(async () => { addButton()!.click(); });
+  await act(async () => { root.unmount(); });
+  await act(async () => { finish({ names: ["dev box"], version: 4 }); });
+  expect(errors).not.toHaveBeenCalled();
+  errors.mockRestore();
+  root = createRoot(container);
+  await render();
+  expect(q("[data-ring-added]")).toBeNull();
+  expect(addButton()?.textContent).toContain("Add to Ring");
 });

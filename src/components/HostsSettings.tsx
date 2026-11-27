@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Plus, RefreshCw, Pencil, Trash2, X, ChevronRight, PlugZap, CircleDot } from "lucide-react";
 import { AGENT_IDS, AGENTS, AgentIcon } from "../agents";
@@ -154,19 +154,25 @@ function HostForm({ initial, onSave, onCancel }: { initial: HostConfig | null; o
 type RingAddState = { adding: boolean; added: boolean; error: string | null };
 
 // Add to Ring (#115): the button, its progress, the success line, the member label and the
-// error sentence. Not shown while this Desktop is in no Ring, or for a Windows Host.
+// error sentence. Not shown while this Desktop is in no Ring, or for a Windows Host. Keyed by
+// the Host's connection (ssh target, daemon command): an edit starts it afresh, and a result
+// that arrives for an earlier configuration, or after unmount, is ignored.
 function RingAction({ host, status, ring }: { host: HostConfig; status: HostStatus | undefined; ring: RingStatus | null }) {
   const snap = useHostsSnapshot();
   const view = sshRingView(host, status, snap.available, ring);
   const [state, setState] = useState<RingAddState>({ adding: false, added: false, error: null });
+  // The current invocation; bumped on unmount so a late result is dropped.
+  const operation = useRef(0);
+  useEffect(() => () => { operation.current++; }, []);
   if (view === "hidden") return null;
   const add = async () => {
+    const mine = ++operation.current;
     setState({ adding: true, added: false, error: null });
     try {
       await invoke<ApprovedComputer>("ring_add_ssh_host", { host: host.id });
-      setState({ adding: false, added: true, error: null });
+      if (operation.current === mine) setState({ adding: false, added: true, error: null });
     } catch (e) {
-      setState({ adding: false, added: false, error: addToRingErrorCode(e) });
+      if (operation.current === mine) setState({ adding: false, added: false, error: addToRingErrorCode(e) });
     }
   };
   return (
@@ -245,7 +251,7 @@ function HostRow({ host, onEdit, onRemove, now, ring }: { host: HostConfig; onEd
 
       {test.text && <div className={`host-test-result ${test.ok ? "ok" : "failed"}`}>{test.text}</div>}
 
-      <RingAction host={host} status={status} ring={ring} />
+      <RingAction key={`${host.sshTarget}\n${host.daemonCommand ?? ""}`} host={host} status={status} ring={ring} />
 
       <div className="host-row-actions">
         <button className="btn btn-ghost settings-action-btn" disabled={test.busy} onClick={testNow}><PlugZap size={11} /> {test.busy ? fmt("hosts.row.testing") : fmt("hosts.row.test")}</button>

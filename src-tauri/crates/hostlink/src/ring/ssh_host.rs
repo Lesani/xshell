@@ -162,15 +162,29 @@ pub fn pair_invocation(binary: &PairBinary, relay: &str, name: &str) -> String {
     }
 }
 
-/// `cmd` wrapped so it ends when the session's input closes (AM2): the SSH input is kept on
-/// fd 3 for a watcher that kills `cmd` at its EOF, `cmd` itself reads `/dev/null`, the
-/// watcher is reaped when `cmd` ends first, and the wrapper exits with `cmd`'s code. Run
+/// `cmd` wrapped so it ends, with every process it started, when the session's input closes
+/// (AM2, and Sol's diff review 1): the SSH input is kept on fd 3 for a watcher that ends `cmd`
+/// at its EOF; `cmd` itself reads `/dev/null`. With job control (`set -m`; a shell without a
+/// terminal may refuse it, as dash does) `cmd` is its own process group and the group is
+/// signalled; otherwise its process tree (`d`, from `ps`) is. A "Daemon command" may be a
+/// script that runs `xshelld` without `exec`. When `cmd` ends first the watcher's tree is
+/// ended, and the wrapper exits with `cmd`'s code. The shell prints nothing on stdout. Run
 /// under `sh` whatever the login shell is.
 pub fn cancellable(cmd: &str) -> String {
-    sh_wrap(&format!(
-        "exec 3<&0; {cmd} </dev/null & p=$!; (cat <&3 >/dev/null 2>&1; kill $p 2>/dev/null) >/dev/null 2>&1 & w=$!; wait $p; s=$?; kill $w 2>/dev/null; exit $s"
-    ))
+    sh_wrap(&cancellable_script(cmd))
 }
+
+/// The script [`cancellable`] runs under `sh`.
+pub fn cancellable_script(cmd: &str) -> String {
+    format!(
+        "set -m 2>/dev/null; exec 3<&0; d(){{ echo \"$1\"; for c in $(ps -A -o pid= -o ppid= | awk -v p=\"$1\" '$2==p{{print $1}}'); do d \"$c\"; done; }}; {cmd} </dev/null & p=$!; (cat <&3 >/dev/null 2>&1; kill -s TERM -- -$p 2>/dev/null || kill -s TERM $(d $p) 2>/dev/null) >/dev/null 2>&1 & w=$!; wait $p; s=$?; kill $(d $w) 2>/dev/null; exit $s"
+    )
+}
+
+/// The longest stdout line read; longer lines are discarded (the words are one short line).
+pub const MAX_LINE: usize = 4096;
+/// The lines queued between the reader and [`drive`]; more are dropped, never waited for.
+const LINE_QUEUE: usize = 64;
 
 /// The remote command line Add to Ring runs on the Host.
 pub fn remote_pair_command(binary: &PairBinary, relay: &str, name: &str) -> String {
@@ -308,14 +322,56 @@ fn end(proc: &mut Proc) {
     }
 }
 
-/// The stderr tail on one line, for the log.
-fn stderr_detail(proc: &Proc) -> String {
+/// The remote command's stderr is classified, never repeated (Sol's diff review 3): only how
+/// many lines it had goes into a detail.
+fn stderr_text(proc: &Proc) -> Zeroizing<String> {
     proc.wait_stderr(Duration::from_secs(1));
-    proc.stderr_text()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ")
+    Zeroizing::new(proc.stderr_text())
+}
+
+fn stderr_lines(stderr: &str) -> usize {
+    stderr.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Reads `out` line by line into `tx`: a line longer than [`MAX_LINE`] is discarded, a line
+/// that finds the queue full or closed is dropped, and reading goes on to EOF either way, so
+/// the command never stalls on a full pipe.
+fn read_lines(out: impl std::io::Read, tx: mpsc::SyncSender<Zeroizing<String>>) {
+    let mut out = BufReader::new(out);
+    let mut line = Zeroizing::new(Vec::with_capacity(256));
+    let mut oversized = false;
+    loop {
+        let (consumed, newline) = match out.fill_buf() {
+            Ok([]) | Err(_) => return,
+            Ok(buf) => match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => {
+                    if !oversized && line.len() + i <= MAX_LINE {
+                        line.extend_from_slice(&buf[..i]);
+                    } else {
+                        oversized = true;
+                    }
+                    (i + 1, true)
+                }
+                None => {
+                    if !oversized && line.len() + buf.len() <= MAX_LINE {
+                        line.extend_from_slice(buf);
+                    } else {
+                        oversized = true;
+                    }
+                    (buf.len(), false)
+                }
+            },
+        };
+        out.consume(consumed);
+        if newline {
+            if !oversized {
+                let text = Zeroizing::new(String::from_utf8_lossy(&line).into_owned());
+                let _ = tx.try_send(text);
+            }
+            line.clear();
+            oversized = false;
+        }
+    }
 }
 
 /// Reads the command's stdout line by line, approves the first line that parses as a Device
@@ -331,23 +387,10 @@ pub fn drive<A>(
         end(&mut proc);
         return Err(AddError::new(AddCode::Failed, "the command has no output"));
     };
-    let (tx, rx) = mpsc::channel::<Zeroizing<String>>();
+    let (tx, rx) = mpsc::sync_channel::<Zeroizing<String>>(LINE_QUEUE);
     let reader = std::thread::Builder::new()
         .name("ring-ssh-pair-out".into())
-        .spawn(move || {
-            let mut out = BufReader::new(stdout);
-            loop {
-                let mut raw = Zeroizing::new(Vec::new());
-                match out.read_until(b'\n', &mut raw) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) => {
-                        let line = Zeroizing::new(String::from_utf8_lossy(&raw).into_owned());
-                        // Keep reading after the receiver is gone: the pipe must not fill.
-                        let _ = tx.send(line);
-                    }
-                }
-            }
-        });
+        .spawn(move || read_lines(stdout, tx));
     if let Err(e) = reader {
         end(&mut proc);
         return Err(AddError::new(
@@ -356,8 +399,20 @@ pub fn drive<A>(
         ));
     }
     let deadline = Instant::now() + timeouts.words;
+    let no_words = || {
+        AddError::new(
+            AddCode::Failed,
+            format!("no Device Code within {} s", timeouts.words.as_secs()),
+        )
+    };
     let code = loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        // Absolute: also while non-code lines keep arriving.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            end(&mut proc);
+            return Err(no_words());
+        }
+        match rx.recv_timeout(left) {
             Ok(line) => {
                 if let Ok(code) = DeviceCode::parse(line.trim()) {
                     break code;
@@ -365,24 +420,26 @@ pub fn drive<A>(
             }
             Err(RecvTimeoutError::Timeout) => {
                 end(&mut proc);
-                return Err(AddError::new(
-                    AddCode::Failed,
-                    format!("no Device Code within {} s", timeouts.words.as_secs()),
-                ));
+                return Err(no_words());
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // Its output closed without words: how it ended says why.
                 let status = proc.child.wait_timeout(Duration::from_secs(5));
                 let exit = status.and_then(|s| s.code());
-                let detail = format!("exit {exit:?} without words: {}", stderr_detail(&proc));
                 end(&mut proc);
+                let stderr = stderr_text(&proc);
                 return Err(AddError::new(
-                    exit_code_class(exit, &proc.stderr_text()),
-                    detail,
+                    exit_code_class(exit, &stderr),
+                    format!(
+                        "exit {exit:?} without words ({} stderr lines)",
+                        stderr_lines(&stderr)
+                    ),
                 ));
             }
         }
     };
+    // The reader only drains from here on.
+    drop(rx);
     let approved = match approve(&code) {
         Ok(a) => Some(a),
         Err(e) if approval_code(&e) == AddCode::Unfinished => None,
@@ -406,8 +463,11 @@ pub fn drive<A>(
             timeouts.exit.as_secs()
         ),
     };
-    let detail = scrub(&format!("{detail}: {}", stderr_detail(&proc)), &code);
     end(&mut proc);
+    let detail = format!(
+        "{detail} ({} stderr lines)",
+        stderr_lines(&stderr_text(&proc))
+    );
     Err(AddError::new(AddCode::Unfinished, detail))
 }
 
@@ -462,12 +522,23 @@ pub fn check_ready(ring: &DesktopRing) -> Result<(), AddError> {
     Ok(())
 }
 
+/// The error when the saved Host changed during the action.
+pub fn host_changed() -> AddError {
+    AddError::new(AddCode::Failed, "the Host changed")
+}
+
 /// Adds the Host to this Desktop's Ring: `identity` asks the Host for `ring.identity` over
 /// its usable link; then (AM3) this Ring is success, another Ring `other-ring`, none runs
 /// `pair` on the Host and approves its words, bound to the identity's key (AM1).
+///
+/// `unchanged` says whether the saved Host still exists with the configuration and link
+/// generation captured at the start. It is asked before the identity is used, right before
+/// `pair` starts and right before the words are approved; a change ends the command and is
+/// [`host_changed`], with nothing approved.
 pub fn add_ssh_host(
     req: &AddRequest<'_>,
     identity: impl FnOnce() -> Result<Value, String>,
+    unchanged: impl Fn() -> bool,
 ) -> Result<Added, AddError> {
     check_ready(req.ring)?;
     let chain = req
@@ -476,6 +547,9 @@ pub fn add_ssh_host(
         .ok_or_else(|| AddError::new(AddCode::NotReady, "this computer is in no Ring"))?;
     let reply =
         identity().map_err(|e| AddError::new(AddCode::Failed, format!("ring.identity: {e}")))?;
+    if !unchanged() {
+        return Err(host_changed());
+    }
     let host = LocalIdentity::from_json(&reply)
         .map_err(|e| AddError::new(AddCode::Failed, format!("ring.identity: {e}")))?;
     match host_membership(&reply, chain.ring_id()) {
@@ -501,11 +575,20 @@ pub fn add_ssh_host(
     let before = chain.head().roster().clone();
     let relay = before.relay_url.clone();
     let remote = remote_pair_command(req.binary, &relay, req.name);
+    if !unchanged() {
+        return Err(host_changed());
+    }
     let proc = process::spawn(&req.transport.command(&remote), req.cancel)
         .map_err(|e| AddError::new(AddCode::Failed, format!("cannot start the command: {e}")))?;
+    let changed = std::cell::Cell::new(false);
     let driven = drive(proc, req.timeouts, |code| {
+        if !unchanged() {
+            changed.set(true);
+            return Err("host_changed: the Host changed".to_string());
+        }
         req.ring.approve_device_code_for(code, &host.sign_key)
-    })?;
+    })
+    .map_err(|e| if changed.get() { host_changed() } else { e })?;
     let after = match driven {
         Driven::Approved(ApprovalOutcome { chain, .. }) => chain,
         Driven::Finished => req.ring.chain().ok_or_else(|| {
@@ -737,23 +820,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancelling_closes_stdin_and_the_wrapped_pair_ends() {
-        // A refused approval cancels: the wrapper sees its input close and ends `pair`.
+    /// A "Daemon command" script that does not `exec`: `outer` is the script, `inner` the
+    /// `pair`-like descendant it waits for. Prints `first_line` (if any) on stdout.
+    fn non_exec_script(dir: &std::path::Path, first_line: Option<&str>) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("pid");
-        let fake = dir.path().join("pair");
+        let fake = dir.join("pair");
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\necho $$ > {}\necho '{}'\nexec sleep 30\n",
-                pidfile.display(),
-                fixed_code().format().as_str()
+                "#!/bin/sh\necho $$ > {d}/outer\n{echo}sh -c 'echo $$ > {d}/inner; sleep 30'\necho after\n",
+                d = dir.display(),
+                echo = first_line.map_or(String::new(), |l| format!("echo '{l}'\n")),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    fn pid_in(path: &std::path::Path) -> i32 {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(Instant::now() < until, "{} never written", path.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn gone_within(pid: i32, d: Duration) -> bool {
+        let until = Instant::now() + d;
+        while alive(pid) {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn cancelling_closes_stdin_and_the_whole_pair_tree_ends() {
+        // A refused approval cancels: the wrapper sees its input close and ends `pair` and
+        // what it started, also through a script that does not `exec`.
+        let dir = tempfile::tempdir().unwrap();
+        let words = fixed_code().format().as_str().to_string();
+        let fake = non_exec_script(dir.path(), Some(&words));
         let script = cancellable(&sh_quote(&fake.display().to_string()));
         let started = Instant::now();
         let e = drive(spawn(&script), quick(), |_| {
@@ -761,12 +880,12 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(e.code, AddCode::Failed);
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pair still runs");
+        for name in ["outer", "inner"] {
+            assert!(
+                gone_within(pid_in(&dir.path().join(name)), Duration::from_secs(1)),
+                "{name} still runs"
+            );
+        }
         // Ended by its closed input, not by the kill after the grace period.
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -775,75 +894,201 @@ mod tests {
         );
     }
 
-    /// AM2, with a real `sh` child and no process-group kill: `pair` runs while stdin is
-    /// open, ends within a second of stdin closing, and the wrapper exits with `pair`'s code
-    /// when `pair` ends first.
-    #[test]
-    fn wrapper_follows_stdin_and_exits_with_the_commands_code() {
-        use std::process::{Command, Stdio};
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("pid");
-        let inner = format!("sh -c 'echo $$ > {}; exec sleep 30'", pidfile.display());
-        let wrapped = cancellable(&inner);
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(&wrapped)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let until = Instant::now() + Duration::from_secs(5);
-        while !pidfile.exists() || std::fs::read_to_string(&pidfile).unwrap().trim().is_empty() {
-            assert!(Instant::now() < until, "pair never started");
-            std::thread::sleep(Duration::from_millis(10));
+    /// The shells the wrapper is checked under: `sh`, and dash and bash in POSIX mode when
+    /// they are installed.
+    fn shells() -> Vec<Vec<&'static str>> {
+        let mut out = vec![vec!["sh"]];
+        for (bin, args) in [
+            ("/bin/dash", vec!["dash"]),
+            ("/bin/bash", vec!["bash", "--posix"]),
+        ] {
+            if std::path::Path::new(bin).exists() {
+                out.push(args);
+            }
         }
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(1000));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "ended while stdin is open"
-        );
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            0,
-            "pair ended while stdin is open"
-        );
-        drop(child.stdin.take());
-        let closed = Instant::now();
-        while unsafe { libc::kill(pid, 0) } == 0 {
-            assert!(
-                closed.elapsed() < Duration::from_secs(1),
-                "pair survived stdin closing"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let status = child.wait().unwrap();
-        assert!(!status.success());
+        out
+    }
 
-        // `pair` ends first: the wrapper exits with its code, promptly, stdin still open.
-        for code in [0, 3, 7] {
-            let mut child = Command::new("sh")
+    /// AM2 and Sol's diff review 1, with a real child of each shell and no process-group kill
+    /// from here: `pair` (a script that does not `exec`) runs while stdin is open; it and its
+    /// descendant end within a second of stdin closing; the shell prints nothing on stdout;
+    /// the wrapper exits with `pair`'s code when `pair` ends first.
+    #[test]
+    fn wrapper_ends_the_tree_at_eof_and_exits_with_the_commands_code() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        for shell in shells() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = non_exec_script(dir.path(), None);
+            let mut child = Command::new(shell[0])
+                .args(&shell[1..])
                 .arg("-c")
-                .arg(cancellable(&format!("sleep 0.2; exit {code}")))
+                .arg(cancellable_script(&sh_quote(&fake.display().to_string())))
                 .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            let started = Instant::now();
-            let status = loop {
-                if let Some(s) = child.try_wait().unwrap() {
-                    break s;
-                }
-                assert!(started.elapsed() < Duration::from_secs(3), "wrapper hung");
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            assert_eq!(status.code(), Some(code));
+            let outer = pid_in(&dir.path().join("outer"));
+            let inner = pid_in(&dir.path().join("inner"));
+            std::thread::sleep(Duration::from_millis(1000));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{shell:?}: ended with stdin open"
+            );
+            assert!(
+                alive(outer) && alive(inner),
+                "{shell:?}: pair ended with stdin open"
+            );
             drop(child.stdin.take());
+            assert!(
+                gone_within(inner, Duration::from_secs(1)),
+                "{shell:?}: descendant survived"
+            );
+            assert!(
+                gone_within(outer, Duration::from_secs(1)),
+                "{shell:?}: pair survived"
+            );
+            let status = child.wait().unwrap();
+            assert!(!status.success(), "{shell:?}");
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .unwrap();
+            assert_eq!(out, "", "{shell:?}: the shell printed on stdout");
+
+            // `pair` ends first: the wrapper exits with its code, promptly, stdin still open.
+            for code in [0, 3, 7] {
+                let mut child = Command::new(shell[0])
+                    .args(&shell[1..])
+                    .arg("-c")
+                    .arg(cancellable_script(&format!(
+                        "sh -c 'sleep 0.2; exit {code}'"
+                    )))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let started = Instant::now();
+                let status = loop {
+                    if let Some(s) = child.try_wait().unwrap() {
+                        break s;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(3),
+                        "{shell:?}: hung"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(code), "{shell:?}");
+                drop(child.stdin.take());
+                let mut out = String::new();
+                child
+                    .stdout
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut out)
+                    .unwrap();
+                assert_eq!(out, "", "{shell:?}");
+            }
         }
+    }
+
+    #[test]
+    fn continuous_output_does_not_extend_the_deadline() {
+        let started = Instant::now();
+        let e = drive(
+            spawn("while :; do echo 'Waiting for another device...'; done"),
+            Timeouts {
+                words: Duration::from_millis(300),
+                exit: Duration::from_secs(5),
+            },
+            |_| -> Result<(), String> { panic!("no words") },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, AddCode::Failed);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_oversized_line_is_discarded_and_reading_goes_on() {
+        let words = fixed_code().format().as_str().to_string();
+        // Words hidden at the end of a 5000-byte line are not words; the next line is.
+        let long = "x ".repeat(2500);
+        let seen = AtomicBool::new(false);
+        let r = drive(
+            spawn(&format!(
+                "printf '%s%s\\n' '{long}' '{words}'; echo '{words}'; exit 0"
+            )),
+            quick(),
+            |code| {
+                seen.store(approved_with(code), Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(matches!(r, Ok(Driven::Approved(()))), "{r:?}");
+        assert!(seen.load(Ordering::SeqCst));
+        // Only an oversized line: no words.
+        let e = drive(
+            spawn(&format!("printf '%s%s\\n' '{long}' '{words}'; exit 1")),
+            quick(),
+            |_| -> Result<(), String> { panic!("an oversized line is no code") },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, AddCode::Failed);
+        assert!(!words_in(&e.to_string(), &fixed_code()));
+    }
+
+    #[test]
+    fn stderr_never_crosses_into_the_error() {
+        let code = fixed_code();
+        let e = drive(
+            spawn(&format!(
+                "echo '{}' >&2; echo 'xshelld: secret detail' >&2; exit 1",
+                code.format().as_str()
+            )),
+            quick(),
+            |_| -> Result<(), String> { panic!("stderr words are not approved") },
+        )
+        .unwrap_err();
+        assert_eq!(e.code, AddCode::Failed);
+        let text = e.to_string();
+        assert!(!words_in(&text, &code), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert_eq!(text, "failed: exit Some(1) without words (2 stderr lines)");
+        // After an approval too.
+        let e = drive(
+            spawn(&fake_pair(&format!(
+                "echo '{}' >&2; exit 1",
+                code.format().as_str()
+            ))),
+            quick(),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, AddCode::Unfinished);
+        assert!(!words_in(&e.to_string(), &code), "{e}");
+    }
+
+    #[test]
+    fn a_full_queue_never_blocks_the_reader() {
+        // The consumer reads nothing: the reader keeps draining to EOF.
+        let (tx, rx) = mpsc::sync_channel(1);
+        let data = "line\n".repeat(10_000);
+        let reader = std::thread::spawn(move || read_lines(std::io::Cursor::new(data), tx));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !reader.is_finished() {
+            assert!(Instant::now() < until, "the reader blocked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]

@@ -234,7 +234,7 @@ fn ssh_host_ends_up_a_member_and_the_result_names_it() {
         cancel: &cancel,
         timeouts: Timeouts::default(),
     };
-    let added = add_ssh_host(&request, || Ok(b_identity.clone())).unwrap();
+    let added = add_ssh_host(&request, || Ok(b_identity.clone()), || true).unwrap();
     assert!(added.paired);
     assert_eq!(added.names, vec!["dev box".to_string()]);
     assert!(added.version > before);
@@ -256,7 +256,7 @@ fn ssh_host_ends_up_a_member_and_the_result_names_it() {
         binary: &PairBinary::Command("false".into()),
         ..request
     };
-    let added = add_ssh_host(&request, || Ok(again)).unwrap();
+    let added = add_ssh_host(&request, || Ok(again), || true).unwrap();
     assert!(!added.paired);
     assert_eq!(added.names, vec!["dev box".to_string()]);
     assert_eq!(added.version, head.head().version());
@@ -279,7 +279,7 @@ fn host_in_another_ring_is_refused_without_running_pair() {
         cancel: &CancelToken::new(),
         timeouts: Timeouts::default(),
     };
-    let e = add_ssh_host(&request, || Ok(other)).unwrap_err();
+    let e = add_ssh_host(&request, || Ok(other), || true).unwrap_err();
     assert_eq!(e.code, AddCode::OtherRing, "{e}");
     assert_eq!(ar.chain().unwrap().head().version(), version);
     cr.quit();
@@ -342,7 +342,7 @@ fn computer_intent_is_refused_and_nothing_is_signed() {
     let until = Instant::now() + Duration::from_secs(10);
     let e = loop {
         // The earlier offer may still be closing on the Computer's Desktop.
-        let e = add_ssh_host(&request, || Ok(b_identity.clone())).unwrap_err();
+        let e = add_ssh_host(&request, || Ok(b_identity.clone()), || true).unwrap_err();
         if e.code != AddCode::Unfinished || Instant::now() >= until {
             break e;
         }
@@ -352,5 +352,57 @@ fn computer_intent_is_refused_and_nothing_is_signed() {
     assert_nothing_signed(&a, &ar, version);
     assert!(br.chain().is_none());
     br.quit();
+    ar.quit();
+}
+
+/// Sol's diff review 4: the saved Host changes (edited, or a new link) while Add to Ring
+/// runs. Before the identity is used: `pair` never starts. After it, before the approval:
+/// the words are read but nothing is approved. Both are `failed: the Host changed`.
+#[test]
+fn a_host_that_changes_during_the_action_is_not_approved() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let relay = workerd::Relay::start();
+    let (a, _ad, ar) = approver(&relay.url());
+    let b = Fixture::new();
+    let bd = b.server();
+    let (b_key, b_identity) = identity(&bd);
+    let version = ar.chain().unwrap().head().version();
+    let transport = b.transport();
+    let cancel = CancelToken::new();
+
+    // Changed before the identity reply is used: the command never runs.
+    let marker = b.home.path().join("pair-ran");
+    let never = PairBinary::Command(format!("touch '{}'; :", marker.display()));
+    let request = AddRequest {
+        ring: &ar,
+        name: "dev box",
+        transport: &transport,
+        binary: &never,
+        cancel: &cancel,
+        timeouts: Timeouts::default(),
+    };
+    let e = add_ssh_host(&request, || Ok(b_identity.clone()), || false).unwrap_err();
+    assert_eq!(e.to_string(), "failed: the Host changed");
+    assert!(!marker.exists(), "pair ran for a changed Host");
+    assert_nothing_signed(&a, &ar, version);
+
+    // Unchanged until `pair` runs, changed before the approval: nothing is approved.
+    let binary = PairBinary::Command(b.daemon_command());
+    let request = AddRequest {
+        binary: &binary,
+        ..request
+    };
+    let asked = AtomicUsize::new(0);
+    let e = add_ssh_host(
+        &request,
+        || Ok(b_identity.clone()),
+        || asked.fetch_add(1, Ordering::SeqCst) < 2,
+    )
+    .unwrap_err();
+    assert_eq!(e.to_string(), "failed: the Host changed");
+    assert_eq!(asked.load(Ordering::SeqCst), 3, "asked before the approval");
+    assert_nothing_signed(&a, &ar, version);
+    assert!(ar.chain().unwrap().authorized_member(&b_key).is_none());
+    assert!(!b.paths.ring_dir.join("roster.json").exists());
     ar.quit();
 }

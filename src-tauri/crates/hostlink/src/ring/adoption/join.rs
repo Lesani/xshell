@@ -990,6 +990,8 @@ impl DesktopRing {
             Some(&cancel),
             |intent, hash| {
                 // Bound to one Host (#115): first, before anything is prepared or signed.
+                // A refused (substituted or Computer) code has already used its pairing slot on
+                // the Relay; accepted (Sol's diff review).
                 if let Some(refusal) = expected.and_then(|key| bound_refusal(intent, key)) {
                     *refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(refusal);
                     return Err(PairError::Payload("not the expected machine".into()));

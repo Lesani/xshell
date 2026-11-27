@@ -80,6 +80,21 @@ fn add(app: &AppHandle, host: &str) -> Result<ApprovedComputer, AddError> {
         &cancel,
     );
     let handle = route.handle.clone();
+    // Captured once; an edit of the Host or a new link during the action fails it.
+    let captured = (
+        route.config.ssh_target.clone(),
+        route.config.daemon_override().map(String::from),
+    );
+    let unchanged = || {
+        manager.ssh_route(host).is_some_and(|now| {
+            (
+                now.config.ssh_target.clone(),
+                now.config.daemon_override().map(String::from),
+            ) == captured
+        }) && HOST_SYNC
+            .seen(host)
+            .is_some_and(|(seen, _)| seen.usable && seen.link_gen == link_gen)
+    };
     let added = add_ssh_host(
         &AddRequest {
             ring: &w.ring,
@@ -103,6 +118,7 @@ fn add(app: &AppHandle, host: &str) -> Result<ApprovedComputer, AddError> {
                 Err(_) => Err("no answer".into()),
             }
         },
+        unchanged,
     )?;
     Ok(ApprovedComputer {
         names: added.names,
