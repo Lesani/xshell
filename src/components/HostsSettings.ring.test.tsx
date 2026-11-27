@@ -81,12 +81,12 @@ it("offers Add to Ring on a connected Host that is not a member", async () => {
   await render();
   expect(addButton()?.textContent).toContain("Add to Ring");
   expect(addButton()?.disabled).toBe(false);
-  expect(q("[data-ring-member]")).toBeNull();
+  expect(q("[data-ring-host-member]")).toBeNull();
 });
 
 it("shows the member label instead of the button for a Ring member", async () => {
   await render({ member: true });
-  expect(q("[data-ring-member]")?.textContent).toContain("In your Ring");
+  expect(q("[data-ring-host-member]")?.textContent).toContain("In your Ring");
   expect(addButton()).toBeNull();
 });
 
@@ -120,7 +120,7 @@ it("reads Adding… while it runs, then the success line until the row is a memb
   expect(addButton()?.textContent).toContain("Add to Ring");
   // The Host's row becomes a member: the label replaces the button and the line.
   await act(async () => { registry.applyAvailable({ sequence: ++sequence, hosts: [row(true)] }); });
-  expect(q("[data-ring-member]")).not.toBeNull();
+  expect(q("[data-ring-host-member]")).not.toBeNull();
   expect(q("[data-ring-added]")).toBeNull();
   expect(addButton()).toBeNull();
 });

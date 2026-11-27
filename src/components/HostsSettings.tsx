@@ -172,7 +172,7 @@ function RingAction({ host, status, ring }: { host: HostConfig; status: HostStat
   return (
     <div className="host-row-ring" data-ring-action={view}>
       {view === "member" ? (
-        <span className="host-row-ring-member" data-ring-member><CircleDot size={11} /> {fmt("hosts.ring.member")}</span>
+        <span className="host-row-ring-member" data-ring-host-member><CircleDot size={11} /> {fmt("hosts.ring.member")}</span>
       ) : (
         <button className="btn btn-ghost settings-action-btn" data-ring-add disabled={state.adding || view === "offline"} aria-busy={state.adding || undefined}
           title={view === "offline" ? fmt("hosts.ring.offlineHint", { name: host.name }) : undefined} onClick={add}>
