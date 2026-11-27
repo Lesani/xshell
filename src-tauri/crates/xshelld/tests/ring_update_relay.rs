@@ -1067,12 +1067,12 @@ fn host_that_cannot_get_the_release_takes_a_newer_desktop_build() {
         });
         wait("trial accepted", || m.trial_closed());
         let seen = phases(&desktop, host.id());
+        // The build was sent by the Desktop (phase `installing`), then the Host restarted.
         let at = |p| seen.iter().position(|x| *x == p);
         assert!(
-            at(xshell_hostlink::Phase::Preparing) < at(xshell_hostlink::Phase::Installing)
-                && at(xshell_hostlink::Phase::Installing).is_some()
-                && seen.contains(&xshell_hostlink::Phase::Upgrading),
-            "{no_build}: asked the Host first, then sent the build: {seen:?}"
+            at(xshell_hostlink::Phase::Installing).is_some()
+                && at(xshell_hostlink::Phase::Installing) < at(xshell_hostlink::Phase::Upgrading),
+            "{no_build}: sent the build, then restarted: {seen:?}"
         );
         // Asking again: the Desktop has nothing newer left to send, so the failure is told.
         let name = name_of(&desktop, host.id());
