@@ -875,6 +875,23 @@ fn capable_host_current_answer_finishes_quietly() {
         "{:?}",
         stub.hits()
     );
+    // The answer withdraws the offer while this Desktop's latest value stays: nothing to
+    // wait for, nothing on the bar.
+    let s = host.status();
+    assert_eq!(s.status, xshell_hostlink::StatusKind::Connected, "{s:?}");
+    assert_eq!(offer(&s), (None, None, None));
+    let e = reply(|w| host.upgrade(w)).unwrap_err();
+    assert!(e.message.contains("does not need an update"), "{e:?}");
+    // The same value again changes nothing; a newer one is offered again.
+    desktop.manager.set_latest_release(ver(&next));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(offer(&host.status()), (None, None, None));
+    desktop.manager.set_latest_release(ver("99.0.0"));
+    wait("offered again", || {
+        let s = host.status();
+        s.status == xshell_hostlink::StatusKind::UpgradePending
+            && offer(&s) == release_offer("99.0.0")
+    });
 }
 
 /// Every failure of the download leaves the Host running its build, reachable, with nothing

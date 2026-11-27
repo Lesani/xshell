@@ -265,6 +265,10 @@ pub(crate) struct State {
     /// The version and build the running update must come back with when it is not this
     /// Desktop's (a release the Host installed, D5).
     pub upgrade_identity: Option<(String, xshell_protocol::build::BuildId)>,
+    /// The Host answered `daemon.update-latest` with "current" while this Desktop's latest
+    /// value was `.0` and the Host ran `.1`: while both hold, nothing is offered for it.
+    /// Another latest value or another Host version clears it.
+    pub release_current: Option<(semver::Version, String)>,
 }
 
 impl State {
@@ -426,6 +430,7 @@ impl Shared {
                 ring_update: None,
                 release_updates: false,
                 upgrade_identity: None,
+                release_current: None,
             }),
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
@@ -483,16 +488,34 @@ impl Shared {
         } else {
             None
         };
-        let offered = st.status.daemon_version.as_deref().and_then(|v| {
-            crate::version::offered_update(
-                &self.mc.desktop_version,
-                self.mc.desktop_build.as_ref(),
+        if let Some(c) = &st.release_current {
+            let still = latest.as_ref() == Some(&c.0)
+                && st.status.daemon_version.as_deref() == Some(c.1.as_str());
+            if !still {
+                st.release_current = None;
+            }
+        }
+        let withdrawn = release_capable
+            && crate::version::release_withdrawn(
+                st.release_current.as_ref(),
                 latest.as_ref(),
-                release_capable,
-                v,
-                st.status.daemon_build.as_ref(),
-            )
-        });
+                st.status.daemon_version.as_deref().unwrap_or(""),
+            );
+        let offered = st
+            .status
+            .daemon_version
+            .as_deref()
+            .filter(|_| !withdrawn)
+            .and_then(|v| {
+                crate::version::offered_update(
+                    &self.mc.desktop_version,
+                    self.mc.desktop_build.as_ref(),
+                    latest.as_ref(),
+                    release_capable,
+                    v,
+                    st.status.daemon_build.as_ref(),
+                )
+            });
         if release_capable && st.status.usable() {
             st.status.set_kind(if offered.is_some() {
                 StatusKind::UpgradePending
@@ -1166,6 +1189,7 @@ impl HostHandle {
             st.upgrade_expect = false;
             st.upgrade_identity = None;
             st.release_updates = false;
+            st.release_current = None;
             st.upgrade_operation = None;
             st.upgrade_complete_deadline = None;
             self.sh.kick.store(false, Ordering::SeqCst);
@@ -2473,33 +2497,39 @@ impl HostHandle {
                 return Err(HostError::invalid(ring_update_unsupported(&name)));
             }
             let daemon_version = st.status.daemon_version.clone().unwrap_or_default();
-            let build = if st.release_updates {
-                if !crate::version::release_outdated(self.sh.mc.latest().as_ref(), &daemon_version)
-                {
-                    return Err(HostError::new(
-                        crate::HostErrorCode::Invalid,
-                        "this Host does not need an update",
-                    ));
-                }
-                None
-            } else {
-                if !crate::version::update_eligible(
-                    &self.sh.mc.desktop_version,
-                    self.sh.mc.desktop_build.as_ref(),
-                    &daemon_version,
-                    st.status.daemon_build.as_ref(),
-                ) {
-                    return Err(HostError::new(
-                        crate::HostErrorCode::Invalid,
-                        "this Host does not need this Desktop's build",
-                    ));
-                }
-                Some(
-                    self.sh.mc.desktop_build.clone().ok_or_else(|| {
+            let build =
+                if st.release_updates {
+                    let latest = self.sh.mc.latest();
+                    // Not newer, or the Host already answered "current" for this latest value.
+                    if !crate::version::release_outdated(latest.as_ref(), &daemon_version)
+                        || crate::version::release_withdrawn(
+                            st.release_current.as_ref(),
+                            latest.as_ref(),
+                            &daemon_version,
+                        )
+                    {
+                        return Err(HostError::new(
+                            crate::HostErrorCode::Invalid,
+                            "this Host does not need an update",
+                        ));
+                    }
+                    None
+                } else {
+                    if !crate::version::update_eligible(
+                        &self.sh.mc.desktop_version,
+                        self.sh.mc.desktop_build.as_ref(),
+                        &daemon_version,
+                        st.status.daemon_build.as_ref(),
+                    ) {
+                        return Err(HostError::new(
+                            crate::HostErrorCode::Invalid,
+                            "this Host does not need this Desktop's build",
+                        ));
+                    }
+                    Some(self.sh.mc.desktop_build.clone().ok_or_else(|| {
                         HostError::offline("this Desktop's exact build is unknown")
-                    })?,
-                )
-            };
+                    })?)
+                };
             let gen = st.gen;
             let op = st.next_epoch();
             st.upgrade_operation = Some(op);
@@ -2725,7 +2755,14 @@ fn upgrade_from_release(
     let answer = serde_json::from_value::<xshell_protocol::msg::UpdateLatest>(answer)
         .map_err(|e| release_failure(name, HostError::new(HostErrorCode::Remote, e.to_string())))?;
     if answer.current {
-        // Nothing newer for this Host after all (this Desktop's latest value is stale).
+        // Nothing newer for this Host after all (this Desktop's latest value is ahead of
+        // what the release server gave it): withdraw the offer while that value holds.
+        {
+            let mut st = sh.lock();
+            if st.upgrade_operation == Some(op) {
+                st.release_current = sh.mc.latest().zip(st.status.daemon_version.clone());
+            }
+        }
         finish_upgrade(sh, op, None);
         once.call(Ok(Value::Null));
         return Ok(false);

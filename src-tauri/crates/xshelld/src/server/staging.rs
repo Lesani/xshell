@@ -383,17 +383,30 @@ impl Staging {
         if fs::symlink_metadata(root.join(&dir).join("xshelld")).is_ok() {
             return Err(bad(&format!("{dir} holds another file")));
         }
-        let mut worker = self.open_worker(&d, id, who, &version, &stamp, dir, verifier)?;
-        drop(d);
-        worker.write(&bytes).map_err(|e| e.to_string())?;
-        drop(bytes);
-        let r = worker.commit();
-        worker.finish();
-        match r {
-            Ok(_) => Ok(installed),
-            Err(CommitError::Bad(e)) => Err(bad(&e)),
-            Err(CommitError::Other(e)) => Err(e),
+        // A directory this fetch creates goes again when nothing was published into it;
+        // one that existed before is never removed.
+        let dir_path = root.join(&dir);
+        let existed = fs::symlink_metadata(&dir_path).is_ok();
+        let r = (|| {
+            let mut worker = self.open_worker(&d, id, who, &version, &stamp, dir, verifier)?;
+            drop(d);
+            worker.write(&bytes).map_err(|e| e.to_string())?;
+            drop(bytes);
+            let r = worker.commit();
+            worker.finish();
+            match r {
+                Ok(_) => Ok(installed),
+                Err(CommitError::Bad(e)) => Err(bad(&e)),
+                Err(CommitError::Other(e)) => Err(e),
+            }
+        })();
+        if r.is_err() && !existed {
+            // `remove_dir` removes only an empty directory.
+            if fs::remove_dir(&dir_path).is_ok() {
+                let _ = sync(&root);
+            }
         }
+        r
     }
 
     /// `daemon.stage-chunk`. `Some(result)`: answered now; `None`: the worker answers.

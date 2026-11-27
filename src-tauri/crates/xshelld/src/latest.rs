@@ -5,7 +5,8 @@
 //! Three requests, all under one deadline ([`WHOLE`]): `<base>/latest` (a version line),
 //! then, when that version is newer than this Daemon's, `<base>/release/v<v>/xshelld-<triple>.sha256`
 //! and the build itself. The default base is followed over https only; an override (tests,
-//! end to end) may be plain http and never goes through a proxy. Redirects are bounded.
+//! end to end) may be plain http and never goes through a proxy. Redirects are bounded, and
+//! no connection is reused between requests.
 //! Every failure is a message that starts with one of the protocol's
 //! `UPDATE_LATEST_*` prefixes, so a Desktop can tell them apart without reading the detail.
 //! The checksum itself is checked by the staging worker that installs the bytes.
@@ -42,7 +43,12 @@ pub(crate) fn agent(https_only: bool, overridden: bool) -> ureq::Agent {
         .https_only(https_only)
         .max_redirects(MAX_REDIRECTS)
         .timeout_connect(Some(CONNECT))
-        .timeout_global(Some(WHOLE));
+        .timeout_global(Some(WHOLE))
+        // No idle connection is kept: each request opens a fresh one. A server that closes
+        // after every answer (HTTP/1.0 style, without `connection: close`) otherwise races
+        // the next request into a connection it is closing.
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0);
     if overridden {
         b = b.proxy(None);
     }
@@ -184,6 +190,92 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "only the http-allowed request"
+        );
+    }
+
+    /// A release server that answers HTTP/1.0-style: no keep-alive and no `connection:
+    /// close` header; it closes each connection a little after the body (as a server
+    /// whose close races the client's next request). A client that pools the connection
+    /// sends its next request into one about to close.
+    fn http10_stub(routes: Vec<(String, Vec<u8>)>) -> (String, Arc<AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let conns = Arc::new(AtomicUsize::new(0));
+        let n = conns.clone();
+        let routes = Arc::new(routes);
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { return };
+                n.fetch_add(1, Ordering::SeqCst);
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match c.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(k) => req.extend_from_slice(&buf[..k]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = routes
+                        .iter()
+                        .find(|(p, _)| *p == path)
+                        .map(|(_, b)| b.clone());
+                    let head = match &body {
+                        Some(b) => {
+                            format!("HTTP/1.0 200 OK\r\ncontent-length: {}\r\n\r\n", b.len())
+                        }
+                        None => "HTTP/1.0 404 Not Found\r\ncontent-length: 0\r\n\r\n".into(),
+                    };
+                    let _ = c.write_all(head.as_bytes());
+                    if let Some(b) = body {
+                        let _ = c.write_all(&b);
+                    }
+                    let _ = c.flush();
+                    std::thread::sleep(Duration::from_millis(100));
+                });
+            }
+        });
+        (base, conns)
+    }
+
+    /// Each of the three requests uses a fresh connection: a server that closes after every
+    /// answer never breaks a download.
+    #[test]
+    fn fetch_survives_a_server_that_closes_each_connection() {
+        let triple = "x86_64-unknown-linux-musl";
+        let build = vec![7u8; 100_000];
+        let asset = format!("/release/v9.0.0/xshelld-{triple}");
+        let (base, conns) = http10_stub(vec![
+            ("/latest".into(), b"9.0.0\n".to_vec()),
+            (
+                format!("{asset}.sha256"),
+                format!("{}  xshelld-{triple}\n", "ab".repeat(32)).into_bytes(),
+            ),
+            (asset, build.clone()),
+        ]);
+        let own = semver::Version::parse("1.0.0").unwrap();
+        for i in 0..20 {
+            match fetch(&base, &own, triple) {
+                Ok(Latest::Download {
+                    version,
+                    sha256,
+                    bytes,
+                }) => {
+                    assert_eq!(version.to_string(), "9.0.0");
+                    assert_eq!(sha256, "ab".repeat(32));
+                    assert_eq!(bytes, build);
+                }
+                Ok(Latest::Current) => panic!("round {i}: current"),
+                Err(e) => panic!("round {i}: {e}"),
+            }
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            60,
+            "one connection per request"
         );
     }
 }

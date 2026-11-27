@@ -69,6 +69,17 @@ pub fn release_outdated(latest: Option<&semver::Version>, daemon: &str) -> bool 
     }
 }
 
+/// A release-capable Host answered "current" while this Desktop's latest value was
+/// `current.0` and the Host ran `current.1`: while both are still so, the offer is
+/// withdrawn (the Desktop's value is ahead of what the release server gave the Host).
+pub fn release_withdrawn(
+    current: Option<&(semver::Version, String)>,
+    latest: Option<&semver::Version>,
+    daemon: &str,
+) -> bool {
+    current.is_some_and(|(l, v)| latest == Some(l) && v == daemon)
+}
+
 /// The update this Desktop offers for a Daemon of `daemon` (`build`): what it does, the
 /// version it leads to, and who supplies it.
 ///
@@ -477,5 +488,21 @@ mod tests {
             offered_update("1.5.0", None, None, false, "1.5.0", None),
             None
         );
+    }
+
+    #[test]
+    fn release_withdrawn_only_for_the_same_latest_and_host_version() {
+        let l = v("1.6.0-rjw.5");
+        let current = (l.clone(), "1.6.0-rjw.4".to_string());
+        assert!(release_withdrawn(Some(&current), Some(&l), "1.6.0-rjw.4"));
+        // Another latest value, or another Host version: offered again.
+        assert!(!release_withdrawn(
+            Some(&current),
+            Some(&v("1.6.0-rjw.6")),
+            "1.6.0-rjw.4"
+        ));
+        assert!(!release_withdrawn(Some(&current), Some(&l), "1.6.0-rjw.3"));
+        assert!(!release_withdrawn(Some(&current), None, "1.6.0-rjw.4"));
+        assert!(!release_withdrawn(None, Some(&l), "1.6.0-rjw.4"));
     }
 }

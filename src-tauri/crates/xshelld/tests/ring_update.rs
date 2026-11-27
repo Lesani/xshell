@@ -750,13 +750,7 @@ fn update_latest_current_when_not_newer() {
     let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
     let own_plus = format!("{VERSION}+0123456789ab");
     for latest in [VERSION, "0.0.1", own_plus.as_str()] {
-        stub.body(
-            "/latest",
-            format!(
-                "{latest}
-"
-            ),
-        );
+        stub.body("/latest", format!("{latest}\n"));
         let r = update_latest(&mut c).unwrap();
         assert_eq!(r, json!({"current": true, "version": VERSION}), "{latest}");
     }
@@ -781,11 +775,21 @@ fn update_latest_wrong_checksum_installs_nothing() {
     assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
     nothing_installed(&h, &build);
     assert!(!srv.stage_active(), "the slot is free again");
+    // The install directory the fetch created is gone again.
+    let dir = root(&h).join(install_dir_name(NEXT, Some(&build)));
+    assert!(!dir.exists(), "{} left behind", dir.display());
+    // One that existed before stays, empty as it was.
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert!(dir.is_dir());
+    assert!(fs::read_dir(&dir).unwrap().next().is_none());
+    fs::remove_dir(&dir).unwrap();
     // A checksum file without a digest is the same failure.
     stub.body(
         &format!("{}.sha256", GetStub::asset(NEXT, triple())),
-        "not a digest
-",
+        "not a digest\n",
     );
     let e = update_latest(&mut c).unwrap_err();
     assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
@@ -937,13 +941,7 @@ fn update_latest_redirects_bounded() {
     let h = TestHome::new();
     let srv = start_with_stub(&h, &stub);
     let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
-    stub.body(
-        "/v",
-        format!(
-            "{VERSION}
-"
-        ),
-    );
+    stub.body("/v", format!("{VERSION}\n"));
     // `/latest` → /r1 → … → /r<n-1> → /v: n redirects.
     let chain = |n: usize| {
         for i in 0..n {
@@ -1127,19 +1125,14 @@ fn update_latest_existing_other_bytes_refused() {
     stub.release(NEXT, triple(), &served, None);
     let e = update_latest(&mut c).unwrap_err();
     assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    // The directory that was there stays, with its build.
+    assert!(root(&h).join(&dir).is_dir());
     assert_eq!(
         fs::read(root(&h).join(&dir).join("xshelld")).unwrap(),
         there
     );
     // Also when it is the selected build.
-    fs::write(
-        root(&h).join("selected"),
-        format!(
-            "{dir}
-"
-        ),
-    )
-    .unwrap();
+    fs::write(root(&h).join("selected"), format!("{dir}\n")).unwrap();
     fs::set_permissions(root(&h).join("selected"), fs::Permissions::from_mode(0o600)).unwrap();
     let e = update_latest(&mut c).unwrap_err();
     assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
@@ -1188,6 +1181,17 @@ fn update_latest_existing_same_bytes_reused() {
     assert!(e.contains("another version or build"), "{e}");
     assert_eq!(fs::read(root(&h).join(dir).join("xshelld")).unwrap(), lying);
     assert!(!srv.stage_active());
+}
+
+/// `status()` through [`spawn_retrying`].
+trait StatusRetrying {
+    fn spawn_retrying_status(&mut self) -> std::process::ExitStatus;
+}
+
+impl StatusRetrying for Command {
+    fn spawn_retrying_status(&mut self) -> std::process::ExitStatus {
+        spawn_retrying(self).unwrap().wait().unwrap()
+    }
 }
 
 fn wait_until(what: &str, f: impl Fn() -> bool) {
@@ -1601,8 +1605,7 @@ fn reexec_failure_under_restart_loop_rolls_back() {
     let out = m
         .command(&m.installed(&own_dir()))
         .args(["service", "install", "--mechanism", "none"])
-        .status()
-        .unwrap();
+        .spawn_retrying_status();
     assert!(out.success());
     let launcher = m.h.home().join(".xshell/service/xshelld");
     // `while :` stands in for systemd's Restart=always.
@@ -1611,7 +1614,7 @@ fn reexec_failure_under_restart_loop_rolls_back() {
         "while :; do sh '{}' service run; sleep 0.2; done",
         launcher.display()
     ));
-    let mut supervisor = looped.spawn().unwrap();
+    let mut supervisor = spawn_retrying(&mut looped).unwrap();
     struct Kill(i32);
     impl Drop for Kill {
         fn drop(&mut self) {
@@ -1665,7 +1668,7 @@ fn unowned_trial_rolls_back_at_next_start() {
     xshell_hostlink::trial::select(&m.h.home(), &dir).unwrap();
     let mut cmd = m.command(&m.installed(&dir));
     cmd.arg("serve").arg("--interactive-env");
-    let child = cmd.spawn().unwrap();
+    let child = spawn_retrying(&mut cmd).unwrap();
     let pid = child.id() as i32;
     m.child = Some(child);
     let _ = m.client_of(&own_dir());
@@ -2043,7 +2046,7 @@ fn direct_serve_waits_while_a_trial_runs() {
     assert!(m.trial_open());
     let mut racer = m.command(&m.installed(&own_dir()));
     racer.arg("serve").arg("--interactive-env");
-    let mut racer = racer.spawn().unwrap();
+    let mut racer = spawn_retrying(&mut racer).unwrap();
     std::thread::sleep(Duration::from_millis(1000));
     assert!(m.trial_open(), "the trial must still run");
     assert!(
