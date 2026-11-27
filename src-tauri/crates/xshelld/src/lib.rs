@@ -9,6 +9,8 @@ pub mod connect;
 pub mod console_mode;
 pub mod env;
 pub mod job_exec;
+#[cfg(unix)]
+mod latest;
 pub mod log;
 pub mod maintenance;
 #[cfg(unix)]
@@ -22,6 +24,12 @@ pub mod upgrade;
 
 use cli::Command;
 use std::path::PathBuf;
+
+/// Where `daemon.update-latest` asks for the latest release (overridden by `XSHELL_GET_URL`).
+pub const GET_BASE_DEFAULT: &str = "https://get.xshell.sh";
+/// The environment variable that overrides [`GET_BASE_DEFAULT`]: tests and end-to-end runs
+/// point it at a local stub. Read in release builds too, since end-to-end runs use them.
+pub const GET_URL_ENV: &str = "XSHELL_GET_URL";
 
 /// The `xshelld` binary: returns the process exit code.
 pub fn main_entry() -> i32 {
@@ -231,6 +239,9 @@ pub fn main_entry() -> i32 {
     cfg.gui_bound = gui_bound;
     cfg.supports_selected_restart = cfg!(windows) && opts.supports_selected_restart;
     cfg.test_hook = test_hook();
+    if let Some(v) = std::env::var(GET_URL_ENV).ok().filter(|v| !v.is_empty()) {
+        cfg.get_base = v;
+    }
     // Test hook (Windows): `XSHELLD_TEST_JOB_LAUNCHER=<path>` starts Terminals through that
     // launcher instead of this executable (a missing one makes every start fail).
     if cfg!(windows) {

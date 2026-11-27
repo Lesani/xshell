@@ -31,7 +31,8 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use xshell_protocol::build::{install_dir_name, scan_stamp, BuildId};
 use xshell_protocol::msg::{
-    StageBegun, StageCommitted, StageReceived, STAGE_BUSY, STAGE_MAX_BYTES, STAGE_MAX_CHUNK,
+    StageBegun, StageCommitted, StageReceived, UpdateLatest, STAGE_BUSY, STAGE_MAX_BYTES,
+    STAGE_MAX_CHUNK, UPDATE_LATEST_BAD_BUILD,
 };
 use xshell_protocol::ring::SignKey;
 
@@ -180,29 +181,9 @@ impl Staging {
             // The same connection starts over: its earlier stage goes.
             _ => drop(slot.take()),
         }
-        sweep_parts(&root);
-        let dir_path =
-            xshell_hostlink::install::ensure_server_dir(home, &dir).map_err(|e| e.to_string())?;
         let id = Uuid::new_v4();
-        let part = dir_path.join(format!(".xshelld.stage-{}.part", id.simple()));
-        let file = create_part(&part).map_err(|e| e.to_string())?;
+        let worker = self.open_worker(d, id, who, version, build, dir, verifier)?;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let worker = Worker {
-            d: Arc::downgrade(d),
-            slot: Arc::downgrade(&self.slot),
-            id,
-            who,
-            dir,
-            dir_path,
-            home: home.clone(),
-            version: version.to_string(),
-            build: build.clone(),
-            part,
-            file: Some(file),
-            verifier: Some(verifier),
-            published: false,
-            finished: false,
-        };
         let idle = d.cfg.stage_idle;
         std::thread::Builder::new()
             .name("daemon-stage".into())
@@ -220,6 +201,199 @@ impl Staging {
             stage: Some(id),
             installed: false
         }))
+    }
+
+    /// The part file and the worker that receives build `version`+`build` into install
+    /// directory `dir` as stage `id`.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn open_worker(
+        &self,
+        d: &Arc<Daemon>,
+        id: Uuid,
+        who: Requester,
+        version: &str,
+        build: &BuildId,
+        dir: String,
+        verifier: crate::stage::Verifier,
+    ) -> Result<Worker, String> {
+        let home = &d.cfg.home;
+        sweep_parts(&xshell_core::server::server_root(home));
+        let dir_path =
+            xshell_hostlink::install::ensure_server_dir(home, &dir).map_err(|e| e.to_string())?;
+        let part = dir_path.join(format!(".xshelld.stage-{}.part", id.simple()));
+        let file = create_part(&part).map_err(|e| e.to_string())?;
+        Ok(Worker {
+            d: Arc::downgrade(d),
+            slot: Arc::downgrade(&self.slot),
+            id,
+            who,
+            dir,
+            dir_path,
+            home: home.clone(),
+            version: version.to_string(),
+            build: build.clone(),
+            part,
+            file: Some(file),
+            verifier: Some(verifier),
+            published: false,
+            finished: false,
+        })
+    }
+
+    /// `daemon.update-latest` (capability `daemon.update-latest`): ask the release server for
+    /// the latest release and, when it is newer than this Daemon, download its build for this
+    /// machine and install it as a `daemon.stage-commit` would. Answered with
+    /// [`UpdateLatest`] from a worker thread, so the connection's reader never waits on the
+    /// network. Shares the one slot with staging: a stage or another fetch in progress is
+    /// [`STAGE_BUSY`], and while this runs a stage begin is too. Selects nothing.
+    ///
+    /// Failures of the checksum, length, build stamp and reported identity answer with the
+    /// [`UPDATE_LATEST_BAD_BUILD`] prefix; saving and authorization failures pass through.
+    pub fn update_latest(&self, d: &Arc<Daemon>, who: Requester, reply: Reply) {
+        #[cfg(unix)]
+        {
+            self.update_latest_unix(d, who, reply)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (d, who);
+            reply(Err("this xshelld cannot be updated over its link".into()))
+        }
+    }
+
+    #[cfg(unix)]
+    fn update_latest_unix(&self, d: &Arc<Daemon>, who: Requester, reply: Reply) {
+        if let Err(e) = authorized(d, who) {
+            return reply(Err(e));
+        }
+        let id = Uuid::new_v4();
+        {
+            let mut slot = self.slot.lock().unwrap();
+            if slot.is_some() {
+                drop(slot);
+                return reply(Err(STAGE_BUSY.into()));
+            }
+            // A sender nobody receives from: `committing` keeps chunks, commits and a
+            // disconnect away from the reservation (P2-10); only the fetch frees it.
+            let (tx, _) = mpsc::sync_channel(1);
+            *slot = Some(Active {
+                id,
+                conn: who.conn,
+                queued: 0,
+                length: 0,
+                tx,
+                committing: true,
+            });
+        }
+        let guard = Reservation {
+            slot: Arc::downgrade(&self.slot),
+            id,
+        };
+        let reply = Arc::new(Mutex::new(Some(reply)));
+        let r2 = reply.clone();
+        let (staging, d2) = (
+            Staging {
+                slot: self.slot.clone(),
+            },
+            Arc::downgrade(d),
+        );
+        let base = d.cfg.get_base.clone();
+        let spawned = std::thread::Builder::new()
+            .name("daemon-update-latest".into())
+            .spawn(move || {
+                let r = staging.fetch_and_install(&d2, id, who, &base);
+                if let Err(e) = &r {
+                    crate::log!("WARN", "update from the release server: {e}");
+                }
+                // The slot is free before the requester hears back.
+                drop(guard);
+                if let Some(reply) = r2.lock().unwrap().take() {
+                    reply(r.map(|u| json!(u)));
+                }
+            });
+        if let Err(e) = spawned {
+            // The closure (and with it the reservation) is gone already.
+            if let Some(reply) = reply.lock().unwrap().take() {
+                reply(Err(e.to_string()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn fetch_and_install(
+        &self,
+        d: &Weak<Daemon>,
+        id: Uuid,
+        who: Requester,
+        base: &str,
+    ) -> Result<UpdateLatest, String> {
+        let own_text = env!("CARGO_PKG_VERSION");
+        let own = semver::Version::parse(own_text).map_err(|e| e.to_string())?;
+        let triple =
+            xshell_protocol::build::host_triple(crate::cli::uname_os(), std::env::consts::ARCH)?;
+        let (version, sha256, bytes) = match crate::latest::fetch(base, &own, triple)? {
+            crate::latest::Latest::Current => {
+                return Ok(UpdateLatest {
+                    current: true,
+                    version: own_text.into(),
+                    build: None,
+                    dir: None,
+                })
+            }
+            crate::latest::Latest::Download {
+                version,
+                sha256,
+                bytes,
+            } => (version.to_string(), sha256, bytes),
+        };
+        let bad = |e: &str| format!("{UPDATE_LATEST_BAD_BUILD}: {e}");
+        let stamp = scan_stamp(&bytes)
+            .map_err(|e| bad(&format!("not an xshell build: {e}")))?
+            .ok_or_else(|| bad("the build has no build stamp"))?;
+        let dir = install_dir_name(&version, Some(&stamp));
+        if !xshell_core::server::valid_dir_name(&dir) {
+            return Err(bad("invalid install directory"));
+        }
+        let length = bytes.len() as u64;
+        let verifier =
+            crate::stage::Verifier::new(&sha256, length).map_err(|e| bad(&e.to_string()))?;
+        let installed = UpdateLatest {
+            current: false,
+            version: version.clone(),
+            build: Some(stamp.clone()),
+            dir: Some(dir.clone()),
+        };
+        let d = d.upgrade().ok_or("xshelld is exiting")?;
+        let root = xshell_core::server::server_root(&d.cfg.home);
+        // An install directory of this release that exists already is reused only when it
+        // holds exactly these bytes and they report the release's identity; anything else
+        // there is never overwritten (amendment 6).
+        if let Some(file) = xshell_core::server::valid_install(&root, &dir) {
+            if !same_bytes(&file, &sha256, length) {
+                return Err(bad(&format!("{dir} holds another build")));
+            }
+            let (v, b) = crate::stage::native_identity(&file).map_err(|e| bad(&e.to_string()))?;
+            if v != version || !b.is_some_and(|b| b.same(&stamp)) {
+                return Err(bad("the build reports another version or build"));
+            }
+            authorized(&d, who)?;
+            return Ok(installed);
+        }
+        if fs::symlink_metadata(root.join(&dir).join("xshelld")).is_ok() {
+            return Err(bad(&format!("{dir} holds another file")));
+        }
+        let mut worker = self.open_worker(&d, id, who, &version, &stamp, dir, verifier)?;
+        drop(d);
+        worker.write(&bytes).map_err(|e| e.to_string())?;
+        drop(bytes);
+        let r = worker.commit();
+        worker.finish();
+        match r {
+            Ok(_) => Ok(installed),
+            Err(CommitError::Bad(e)) => Err(bad(&e)),
+            Err(CommitError::Other(e)) => Err(e),
+        }
     }
 
     /// `daemon.stage-chunk`. `Some(result)`: answered now; `None`: the worker answers.
@@ -468,7 +642,7 @@ impl Worker {
                     }
                 },
                 Ok(Job::Commit(reply)) => {
-                    let r = self.commit();
+                    let r = self.commit().map_err(CommitError::into_message);
                     if let Err(e) = &r {
                         crate::log!("WARN", "update stage {}: {e}", self.id);
                     }
@@ -519,70 +693,111 @@ impl Worker {
         Ok(v.received())
     }
 
-    fn commit(&mut self) -> Result<String, String> {
+    fn commit(&mut self) -> Result<String, CommitError> {
+        use CommitError::{Bad, Other};
         self.verifier
             .take()
             .expect("open stage")
             .finish()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Bad(e.to_string()))?;
         let file = self.file.take().expect("open stage");
         file.sync_all()
-            .map_err(|e| format!("cannot save the build: {e}"))?;
+            .map_err(|e| Other(format!("cannot save the build: {e}")))?;
         drop(file);
         let mut bytes = Vec::new();
         fs::File::open(&self.part)
             .and_then(|f| f.take(STAGE_MAX_BYTES + 1).read_to_end(&mut bytes))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Other(e.to_string()))?;
         let stamp = scan_stamp(&bytes)
-            .map_err(|e| format!("not an xshell build: {e}"))?
-            .ok_or("the build has no build stamp")?;
+            .map_err(|e| Bad(format!("not an xshell build: {e}")))?
+            .ok_or_else(|| Bad("the build has no build stamp".into()))?;
         drop(bytes);
         if !stamp.same(&self.build) || install_dir_name(&self.version, Some(&stamp)) != self.dir {
-            return Err("the build does not match its announced version and build".into());
+            return Err(Bad(
+                "the build does not match its announced version and build".into(),
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&self.part, fs::Permissions::from_mode(0o700))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| Other(e.to_string()))?;
         }
-        let d = self.d.upgrade().ok_or("xshelld is exiting")?;
+        let d = self
+            .d
+            .upgrade()
+            .ok_or_else(|| Other("xshelld is exiting".into()))?;
         d.test_point(self.id, TestPoint::StageBeforeVerify);
-        authorized(&d, self.who)?;
+        authorized(&d, self.who).map_err(Other)?;
         drop(d);
         #[cfg(unix)]
         {
             let (version, build) =
-                crate::stage::native_identity(&self.part).map_err(|e| e.to_string())?;
+                crate::stage::native_identity(&self.part).map_err(|e| Bad(e.to_string()))?;
             if version != self.version || !build.is_some_and(|b| b.same(&self.build)) {
-                return Err("the build reports another version or build".into());
+                return Err(Bad("the build reports another version or build".into()));
             }
         }
-        let d = self.d.upgrade().ok_or("xshelld is exiting")?;
+        let d = self
+            .d
+            .upgrade()
+            .ok_or_else(|| Other("xshelld is exiting".into()))?;
         d.test_point(self.id, TestPoint::StageBeforePublish);
         let dest = self.dir_path.join("xshelld");
         {
             // Publication with the registry locked: a disconnect waits for it, or wins
             // before it (P1-6).
             let reg = d.reg.lock().unwrap();
-            authorized_locked(&d, &reg, self.who)?;
-            fs::rename(&self.part, &dest).map_err(|e| e.to_string())?;
+            authorized_locked(&d, &reg, self.who).map_err(Other)?;
+            fs::rename(&self.part, &dest).map_err(|e| Other(e.to_string()))?;
             self.published = true;
             let synced =
                 sync(&self.dir_path).and_then(|()| self.dir_path.parent().map_or(Ok(()), sync));
             if let Err(e) = synced {
                 // Not durable: nothing may be selectable (P2-8).
                 self.unpublish(&dest);
-                return Err(format!("cannot save the build: {e}"));
+                return Err(Other(format!("cannot save the build: {e}")));
             }
         }
         // A Roster revocation is not ordered by that lock: one that won meanwhile undoes it.
         if let Err(e) = authorized(&d, self.who) {
             self.unpublish(&dest);
-            return Err(e);
+            return Err(Other(e));
         }
         crate::log!("INFO", "update stage {}: installed {}", self.id, self.dir);
         Ok(self.dir.clone())
+    }
+}
+
+/// Why a commit failed: the bytes failed a check (length and SHA-256, build stamp, reported
+/// identity), or anything else (saving, authorization, exiting).
+enum CommitError {
+    Bad(String),
+    Other(String),
+}
+
+impl CommitError {
+    fn into_message(self) -> String {
+        match self {
+            CommitError::Bad(e) | CommitError::Other(e) => e,
+        }
+    }
+}
+
+/// Holds the staging slot for a `daemon.update-latest` fetch; frees it when dropped.
+struct Reservation {
+    slot: Weak<Mutex<Option<Active>>>,
+    id: Uuid,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.upgrade() {
+            let mut slot = slot.lock().unwrap();
+            if slot.as_ref().is_some_and(|a| a.id == self.id) {
+                *slot = None;
+            }
+        }
     }
 }
 

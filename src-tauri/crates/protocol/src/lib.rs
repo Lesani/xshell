@@ -43,6 +43,7 @@ pub const CAPABILITIES: &[&str] = &[
     cap::DAEMON_UPGRADE_SELECTED,
     cap::DAEMON_DESKTOP_OWNED,
     cap::DAEMON_STAGE,
+    cap::DAEMON_UPDATE_LATEST,
     cap::TERM_RELAUNCH,
     cap::LAUNCH_PREFIX,
     cap::AGENT_STATUS,
@@ -93,6 +94,11 @@ pub mod cap {
     /// build in place (same process), with a trial that rolls back to the previous build when
     /// the new one does not come up. Offered by an always-on Linux Daemon only.
     pub const DAEMON_STAGE: &str = "daemon.stage";
+    /// `daemon.update-latest` (Desktop only): the Daemon downloads the latest xshell release
+    /// for its own machine type from the release server, verifies it and installs it like a
+    /// `daemon.stage-commit`; a `daemon.upgrade-selected` follows. Offered exactly where
+    /// [`DAEMON_STAGE`] is.
+    pub const DAEMON_UPDATE_LATEST: &str = "daemon.update-latest";
     /// `term.relaunch`.
     pub const TERM_RELAUNCH: &str = "term.relaunch";
     /// Launch prefixes in `term.open`.
@@ -193,6 +199,12 @@ mod tests {
     fn capabilities_include_daemon_stage() {
         assert!(CAPABILITIES.contains(&cap::DAEMON_STAGE));
         assert_eq!(cap::DAEMON_STAGE, "daemon.stage");
+    }
+
+    #[test]
+    fn capabilities_include_daemon_update_latest() {
+        assert!(CAPABILITIES.contains(&cap::DAEMON_UPDATE_LATEST));
+        assert_eq!(cap::DAEMON_UPDATE_LATEST, "daemon.update-latest");
     }
 
     #[test]

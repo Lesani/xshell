@@ -142,6 +142,12 @@ pub enum ClientMsg {
     /// Drop a stage and its partial file. Answers `null`, also for an unknown stage.
     #[serde(rename = "daemon.stage-abort")]
     DaemonStageAbort { stage: Uuid },
+    /// Download the latest xshell release for this machine type from the release server,
+    /// verify it and install it (capability `daemon.update-latest`): answered with
+    /// [`UpdateLatest`]. Shares the one-at-a-time slot with `daemon.stage-*` ([`STAGE_BUSY`]).
+    /// Never selects or starts anything; a `daemon.upgrade-selected` follows. Desktop only.
+    #[serde(rename = "daemon.update-latest")]
+    DaemonUpdateLatest,
     /// An agent hook reporting the Agent Status of the Terminal it runs in. Sent by the hook
     /// client on the Host itself (`xshelld event`, or the Desktop executable for Local Host
     /// Terminals), never by a Desktop's UI. `run` names the Terminal's process (a Relaunch
@@ -280,6 +286,15 @@ pub const STAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const STAGE_MAX_CHUNK: u64 = 1024 * 1024;
 /// The refusal of a `daemon.stage-begin` while another connection sends a build.
 pub const STAGE_BUSY: &str = "another update is being sent to this machine";
+/// Prefix of a `daemon.update-latest` refusal: the release server could not be reached or
+/// answered something unusable (an error status, no version).
+pub const UPDATE_LATEST_UNREACHABLE: &str = "the xshell release server cannot be reached";
+/// Prefix of a `daemon.update-latest` refusal: the latest release has no build for this
+/// machine type.
+pub const UPDATE_LATEST_NO_BUILD: &str = "the latest xshell release has no build for this machine";
+/// Prefix of a `daemon.update-latest` refusal: the downloaded build failed a check (checksum,
+/// size, build stamp or reported version). Nothing was installed.
+pub const UPDATE_LATEST_BAD_BUILD: &str = "the downloaded xshell build failed verification";
 
 /// The answer to `daemon.update-info`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -333,6 +348,22 @@ pub struct StageReceived {
 pub struct StageCommitted {
     /// The install directory the build is now in.
     pub dir: String,
+}
+
+/// The answer to `daemon.update-latest`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateLatest {
+    /// The latest release is not newer than this Daemon: nothing was downloaded.
+    pub current: bool,
+    /// This Daemon's version when `current`, else the installed release's.
+    pub version: String,
+    /// The installed release's build (absent when `current`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildId>,
+    /// The install directory the release is now in (absent when `current`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// The most files one `term.submit` carries.
@@ -795,6 +826,7 @@ const CLIENT_TYPES: &[&str] = &[
     "daemon.stage-chunk",
     "daemon.stage-commit",
     "daemon.stage-abort",
+    "daemon.update-latest",
     "term.event",
     "ring.identity",
     "ring.companion-pending",
@@ -1476,6 +1508,10 @@ mod tests {
                 ClientMsg::DaemonStageAbort { stage },
                 json!({"t":"daemon.stage-abort","stage":stage}),
             ),
+            (
+                ClientMsg::DaemonUpdateLatest,
+                json!({"t":"daemon.update-latest"}),
+            ),
         ];
         for (msg, wire) in cases {
             assert_eq!(serde_json::to_value(&msg).unwrap(), wire);
@@ -1514,6 +1550,31 @@ mod tests {
         assert_eq!(
             serde_json::to_value(StageCommitted { dir: "d".into() }).unwrap(),
             json!({"dir":"d"})
+        );
+        let current = UpdateLatest {
+            current: true,
+            version: "1.6.0-rjw.4".into(),
+            build: None,
+            dir: None,
+        };
+        let current_wire = json!({"current":true,"version":"1.6.0-rjw.4"});
+        assert_eq!(serde_json::to_value(&current).unwrap(), current_wire);
+        assert_eq!(
+            serde_json::from_value::<UpdateLatest>(current_wire).unwrap(),
+            current
+        );
+        let installed = UpdateLatest {
+            current: false,
+            version: "1.6.0-rjw.5".into(),
+            build: Some(build.clone()),
+            dir: Some("1.6.0-rjw.5+85ee920a1b2c".into()),
+        };
+        let installed_wire = json!({"current":false,"version":"1.6.0-rjw.5","build":build,
+            "dir":"1.6.0-rjw.5+85ee920a1b2c"});
+        assert_eq!(serde_json::to_value(&installed).unwrap(), installed_wire);
+        assert_eq!(
+            serde_json::from_value::<UpdateLatest>(installed_wire).unwrap(),
+            installed
         );
     }
 

@@ -211,6 +211,9 @@ pub struct Config {
     pub hide_capabilities: Vec<String>,
     /// A stage (`daemon.stage-*`) that gets nothing for this long is removed.
     pub stage_idle: Duration,
+    /// The release server `daemon.update-latest` asks ([`crate::GET_BASE_DEFAULT`], or
+    /// `XSHELL_GET_URL`).
+    pub get_base: String,
     /// Test hook (S4 C1): restore fails the first Terminal record.
     #[doc(hidden)]
     pub test_fail_restore: bool,
@@ -644,6 +647,7 @@ impl Config {
             submit_attach_timeout: Duration::from_secs(10),
             hide_capabilities: Vec::new(),
             stage_idle: Duration::from_secs(120),
+            get_base: crate::GET_BASE_DEFAULT.to_string(),
             test_fail_restore: false,
             strict_restore: false,
             protocol: xshell_protocol::PROTOCOL,

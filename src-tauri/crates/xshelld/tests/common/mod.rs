@@ -2,9 +2,11 @@
 //! binary, and a protocol client built only from xshell-protocol's codec.
 #![allow(dead_code)]
 
+pub mod get_stub;
 #[cfg(feature = "legacy-pair-test-control")]
 pub mod legacy_pair;
 pub mod ring;
+pub use get_stub::closed_get_url;
 
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -173,6 +175,8 @@ pub fn config(h: &TestHome) -> Config {
     c.kill_grace = Duration::from_millis(300);
     c.write_stall_timeout = Duration::from_secs(1);
     c.resize_persist_delay = Duration::from_millis(200);
+    // Never the real release server (`daemon.update-latest`).
+    c.get_base = closed_get_url();
     c
 }
 
@@ -525,6 +529,7 @@ pub fn bin_cmd(h: &TestHome) -> Command {
         .env("XDG_RUNTIME_DIR", h.run())
         .env("XSHELLD_LOGIN_ENV", "0")
         .env("XSHELLD_IDLE_TIMEOUT_MS", "3000")
+        .env("XSHELL_GET_URL", closed_get_url())
         .env_remove("XSHELLD_HOME")
         .env_remove("XSHELLD_SOCKET");
     c

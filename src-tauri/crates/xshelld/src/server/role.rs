@@ -235,6 +235,7 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::DaemonStageChunk { .. } => Err(forbidden("daemon.stage-chunk")),
         ClientMsg::DaemonStageCommit { .. } => Err(forbidden("daemon.stage-commit")),
         ClientMsg::DaemonStageAbort { .. } => Err(forbidden("daemon.stage-abort")),
+        ClientMsg::DaemonUpdateLatest => Err(forbidden("daemon.update-latest")),
         // Agent hooks report from the Host itself, over the local socket, never from a phone.
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
         // Ring membership is the Desktop's to manage.
@@ -958,6 +959,7 @@ pub(crate) mod tests {
             },
             &ClientMsg::DaemonStageCommit { stage: t },
             &ClientMsg::DaemonStageAbort { stage: t },
+            &ClientMsg::DaemonUpdateLatest,
         ] {
             assert!(check(Role::Mobile, &ctx, m)
                 .unwrap_err()

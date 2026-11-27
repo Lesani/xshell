@@ -6,6 +6,7 @@
 //! runs.
 mod common;
 use base64::Engine;
+use common::get_stub::{GetStub, Route};
 use common::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use xshell_protocol::build::{install_dir_name, BuildId};
 use xshell_protocol::msg::ClientMsg;
-use xshelld::server::Role;
+use xshelld::server::{Role, ServerHandle};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WAIT: Duration = Duration::from_secs(30);
@@ -211,6 +212,15 @@ fn gui_bound_daemon_reports_its_target_but_refuses_staging() {
     let mut c = Client::connect(&srv.socket);
     let (hello, _) = c.hello(range(1, 1));
     assert!(!hello.capabilities.iter().any(|c| c == "daemon.stage"));
+    assert!(!hello
+        .capabilities
+        .iter()
+        .any(|c| c == "daemon.update-latest"));
+    let refused = c.request(&ClientMsg::DaemonUpdateLatest).unwrap_err();
+    assert!(
+        refused.contains("cannot be updated over its link"),
+        "{refused}"
+    );
     let info = c.request(&ClientMsg::DaemonUpdateInfo).unwrap();
     assert_eq!(
         info["target"],
@@ -595,6 +605,7 @@ fn mobile_cannot_stage_or_select() {
             build: build.clone(),
         },
         ClientMsg::DaemonUpgrade,
+        ClientMsg::DaemonUpdateLatest,
     ] {
         let e = m.request(&msg).unwrap_err();
         assert!(e.starts_with("forbidden for mobile"), "{msg:?}: {e}");
@@ -613,10 +624,570 @@ fn daemon_without_capability_refuses_staging() {
     let mut c = Client::connect(&srv.socket);
     let (hello, _) = c.hello(range(1, 1));
     assert!(!hello.capabilities.iter().any(|c| c == "daemon.stage"));
+    assert!(!hello
+        .capabilities
+        .iter()
+        .any(|c| c == "daemon.update-latest"));
     let (bytes, build) = patched_bytes("0123456789ab");
     assert!(begin(&mut c, &build, &bytes).is_err());
+    assert!(c.request(&ClientMsg::DaemonUpdateLatest).is_err());
     let info = c.request(&ClientMsg::DaemonUpdateInfo).unwrap();
     assert!(info["target"].as_str().is_some_and(|t| !t.is_empty()));
+    // Hiding only `daemon.update-latest` refuses it and leaves staging offered. The stub
+    // shows the refusal comes before any request to the release server.
+    let stub = GetStub::start();
+    stub.release(NEXT, triple(), b"x", None);
+    let base = stub.url();
+    let h = TestHome::new();
+    let srv = start(&h, move |c| {
+        c.hide_capabilities = vec!["daemon.update-latest".into()];
+        c.get_base = base;
+    });
+    let mut c = Client::connect(&srv.socket);
+    let (hello, _) = c.hello(range(1, 1));
+    assert!(hello.capabilities.iter().any(|c| c == "daemon.stage"));
+    assert!(!hello
+        .capabilities
+        .iter()
+        .any(|c| c == "daemon.update-latest"));
+    let e = c.request(&ClientMsg::DaemonUpdateLatest).unwrap_err();
+    assert!(e.contains("cannot update itself"), "{e}");
+    assert!(stub.hits().is_empty(), "{:?}", stub.hits());
+}
+
+// ---- updating from the release server (`daemon.update-latest`, in-process Daemon) ----
+
+/// A version newer than this build, for scripts (their length does not matter).
+const NEXT: &str = "99.0.0";
+
+fn triple() -> &'static str {
+    xshell_protocol::build::host_triple("Linux", std::env::consts::ARCH).unwrap()
+}
+
+/// [`stamped_script`] that answers `--version` as `version` (with `build`).
+fn stamped_script_v(build: &BuildId, version: &str, body: &str) -> Vec<u8> {
+    let v = json!({"name":"xshelld","version":version,"protocol":{"min":1,"max":1},"os":"Linux","arch":"x86_64","build":build});
+    format!(
+        "#!/bin/sh\n# @@XSHELL-BUILD-V1:{}:{}@@\ncase \"$1\" in --version) echo '{v}'; exit 0;; esac\n{body}\n",
+        build.display(),
+        build.time
+    )
+    .into_bytes()
+}
+
+fn release_build() -> BuildId {
+    BuildId {
+        commit: "0123456789ab".into(),
+        ..own_build()
+    }
+}
+
+/// An in-process Daemon that asks `stub`.
+fn start_with_stub(h: &TestHome, stub: &GetStub) -> ServerHandle {
+    let base = stub.url();
+    start(h, move |c| c.get_base = base)
+}
+
+fn update_latest(c: &mut Client) -> Result<Value, String> {
+    c.request(&ClientMsg::DaemonUpdateLatest)
+}
+
+fn assert_prefix(e: &str, prefix: &str) {
+    assert!(
+        e.starts_with(prefix),
+        "{e:?} does not start with {prefix:?}"
+    );
+}
+
+fn nothing_installed(h: &TestHome, build: &BuildId) {
+    let dir = install_dir_name(NEXT, Some(build));
+    assert!(!root(h).join(dir).join("xshelld").exists());
+    wait_until("part files removed", || part_files(h).is_empty());
+    assert_eq!(selected(h), None);
+}
+
+#[test]
+fn update_latest_installs_newer_release() {
+    let stub = GetStub::start();
+    let build = release_build();
+    let script = stamped_script_v(&build, NEXT, "exit 3");
+    stub.release(NEXT, triple(), &script, None);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (hello, _) = Client::connect(&srv.socket).hello(range(1, 1));
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|c| c == "daemon.update-latest"));
+    let r = update_latest(&mut c).unwrap();
+    let dir = install_dir_name(NEXT, Some(&build));
+    assert_eq!(
+        r,
+        json!({"current": false, "version": NEXT, "build": build, "dir": dir})
+    );
+    let file = root(&h).join(&dir).join("xshelld");
+    assert_eq!(fs::read(&file).unwrap(), script);
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(part_files(&h).is_empty());
+    assert_eq!(selected(&h), None, "nothing is selected");
+    assert!(!srv.stage_active(), "the slot is free");
+    let asset = GetStub::asset(NEXT, triple());
+    assert_eq!(
+        stub.hits(),
+        vec!["/latest".to_string(), format!("{asset}.sha256"), asset]
+    );
+}
+
+#[test]
+fn update_latest_current_when_not_newer() {
+    let stub = GetStub::start();
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let own_plus = format!("{VERSION}+0123456789ab");
+    for latest in [VERSION, "0.0.1", own_plus.as_str()] {
+        stub.body(
+            "/latest",
+            format!(
+                "{latest}
+"
+            ),
+        );
+        let r = update_latest(&mut c).unwrap();
+        assert_eq!(r, json!({"current": true, "version": VERSION}), "{latest}");
+    }
+    assert!(
+        stub.hits().iter().all(|h| h == "/latest"),
+        "nothing is downloaded: {:?}",
+        stub.hits()
+    );
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_wrong_checksum_installs_nothing() {
+    let stub = GetStub::start();
+    let build = release_build();
+    let script = stamped_script_v(&build, NEXT, "exit 3");
+    stub.release(NEXT, triple(), &script, Some(&"00".repeat(32)));
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    nothing_installed(&h, &build);
+    assert!(!srv.stage_active(), "the slot is free again");
+    // A checksum file without a digest is the same failure.
+    stub.body(
+        &format!("{}.sha256", GetStub::asset(NEXT, triple())),
+        "not a digest
+",
+    );
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    // The right one then installs.
+    stub.release(NEXT, triple(), &script, None);
+    update_latest(&mut c).unwrap();
+}
+
+#[test]
+fn update_latest_version_mismatch_refused() {
+    let stub = GetStub::start();
+    let build = release_build();
+    // Stamped and announced as NEXT, but it reports this build's version.
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&build, VERSION, "exit 3"),
+        None,
+    );
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert!(e.contains("another version or build"), "{e}");
+    nothing_installed(&h, &build);
+    // One that does not run at all is the same failure.
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script(&build, false, "exit 1"),
+        None,
+    );
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    nothing_installed(&h, &build);
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_unstamped_refused() {
+    let stub = GetStub::start();
+    stub.release(NEXT, triple(), b"#!/bin/sh\necho no stamp\n", None);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert!(e.contains("stamp"), "{e}");
+    assert!(part_files(&h).is_empty());
+    assert!(!root(&h).exists() || fs::read_dir(root(&h)).unwrap().next().is_none());
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_unreachable_and_server_error() {
+    use xshell_protocol::msg::UPDATE_LATEST_UNREACHABLE;
+    // Nothing listens.
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, UPDATE_LATEST_UNREACHABLE);
+    assert!(!srv.stage_active());
+    // A server error, no version, or garbage.
+    let stub = GetStub::start();
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    stub.set("/latest", Route::Status(500));
+    assert_prefix(
+        &update_latest(&mut c).unwrap_err(),
+        UPDATE_LATEST_UNREACHABLE,
+    );
+    stub.remove("/latest");
+    assert_prefix(
+        &update_latest(&mut c).unwrap_err(),
+        UPDATE_LATEST_UNREACHABLE,
+    );
+    stub.body("/latest", "<html>hello</html>");
+    assert_prefix(
+        &update_latest(&mut c).unwrap_err(),
+        UPDATE_LATEST_UNREACHABLE,
+    );
+    stub.body("/latest", "1".repeat(65));
+    assert_prefix(
+        &update_latest(&mut c).unwrap_err(),
+        UPDATE_LATEST_UNREACHABLE,
+    );
+    // A server error on the build itself.
+    let build = release_build();
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&build, NEXT, "exit 3"),
+        None,
+    );
+    stub.set(&GetStub::asset(NEXT, triple()), Route::Status(503));
+    assert_prefix(
+        &update_latest(&mut c).unwrap_err(),
+        UPDATE_LATEST_UNREACHABLE,
+    );
+    nothing_installed(&h, &build);
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_missing_asset_is_no_build() {
+    use xshell_protocol::msg::UPDATE_LATEST_NO_BUILD;
+    let stub = GetStub::start();
+    let build = release_build();
+    let script = stamped_script_v(&build, NEXT, "exit 3");
+    stub.release(NEXT, triple(), &script, None);
+    let asset = GetStub::asset(NEXT, triple());
+    stub.remove(&asset);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    assert_prefix(&update_latest(&mut c).unwrap_err(), UPDATE_LATEST_NO_BUILD);
+    // Without a checksum file too.
+    stub.body(&asset, script);
+    stub.remove(&format!("{asset}.sha256"));
+    assert_prefix(&update_latest(&mut c).unwrap_err(), UPDATE_LATEST_NO_BUILD);
+    nothing_installed(&h, &build);
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_oversize_refused() {
+    let stub = GetStub::start();
+    let build = release_build();
+    let mut big = stamped_script_v(&build, NEXT, "exit 3");
+    big.resize(64 * 1024 * 1024 + 1, b'#');
+    stub.release(NEXT, triple(), &big, None);
+    drop(big);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert!(e.contains("64 MiB"), "{e}");
+    nothing_installed(&h, &build);
+    assert!(!srv.stage_active());
+}
+
+#[test]
+fn update_latest_redirects_bounded() {
+    let stub = GetStub::start();
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    stub.body(
+        "/v",
+        format!(
+            "{VERSION}
+"
+        ),
+    );
+    // `/latest` → /r1 → … → /r<n-1> → /v: n redirects.
+    let chain = |n: usize| {
+        for i in 0..n {
+            let from = if i == 0 {
+                "/latest".to_string()
+            } else {
+                format!("/r{i}")
+            };
+            let to = if i + 1 == n {
+                "/v".to_string()
+            } else {
+                format!("/r{}", i + 1)
+            };
+            stub.set(&from, Route::Redirect(to));
+        }
+    };
+    chain(5);
+    assert_eq!(
+        update_latest(&mut c).unwrap(),
+        json!({"current": true, "version": VERSION})
+    );
+    chain(6);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_UNREACHABLE);
+    assert!(e.contains("redirect"), "{e}");
+}
+
+/// One update at a time: a fetch holds the staging slot, so a stage begin or a second fetch
+/// (from another Desktop) is busy while it runs, and a fetch is busy while a stage is open
+/// (an update over the link in progress).
+#[test]
+fn update_latest_and_stage_are_exclusive() {
+    use xshell_protocol::msg::STAGE_BUSY;
+    let stub = GetStub::start();
+    let build = release_build();
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&build, NEXT, "exit 3"),
+        None,
+    );
+    let asset = GetStub::asset(NEXT, triple());
+    stub.gate(&asset);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut a = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let mut b = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let rid = a.request_id();
+    a.send(&ClientMsg::DaemonUpdateLatest, Some(rid));
+    stub.wait_hits(&asset, 1, WAIT);
+    let (bytes, other) = patched_bytes("aaaaaaaaaaaa");
+    assert_eq!(begin(&mut b, &other, &bytes).unwrap_err(), STAGE_BUSY);
+    assert_eq!(update_latest(&mut b).unwrap_err(), STAGE_BUSY);
+    // The requester's own second ask too.
+    assert_eq!(update_latest(&mut a).unwrap_err(), STAGE_BUSY);
+    assert!(srv.stage_active());
+    stub.open(&asset);
+    let r = a.wait_res(rid).unwrap();
+    assert_eq!(r["current"], json!(false));
+    assert!(!srv.stage_active());
+    // A stage that is open makes a fetch busy, from any connection.
+    let id = stage_id(&begin(&mut b, &other, &bytes).unwrap());
+    assert_eq!(update_latest(&mut a).unwrap_err(), STAGE_BUSY);
+    assert_eq!(update_latest(&mut b).unwrap_err(), STAGE_BUSY);
+    assert_eq!(stub.count(&asset), 1, "no second download");
+    c_abort(&mut b, id);
+    update_latest(&mut a).unwrap();
+}
+
+fn c_abort(c: &mut Client, stage: Uuid) {
+    c.request(&ClientMsg::DaemonStageAbort { stage }).unwrap();
+}
+
+#[test]
+fn update_latest_does_not_block_reader() {
+    let stub = GetStub::start();
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&release_build(), NEXT, "exit 3"),
+        None,
+    );
+    stub.gate("/latest");
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let rid = c.request_id();
+    c.send(&ClientMsg::DaemonUpdateLatest, Some(rid));
+    stub.wait_hits("/latest", 1, WAIT);
+    let t = Instant::now();
+    let info = c.request(&ClientMsg::DaemonUpdateInfo).unwrap();
+    assert!(info["target"].is_string());
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "answered in {:?}",
+        t.elapsed()
+    );
+    stub.open("/latest");
+    assert_eq!(c.wait_res(rid).unwrap()["current"], json!(false));
+}
+
+/// C8 for a fetch: a requester that left before the build is checked publishes nothing.
+#[test]
+fn update_latest_requester_gone_publishes_nothing() {
+    let stub = GetStub::start();
+    let build = release_build();
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&build, NEXT, "exit 3"),
+        None,
+    );
+    let h = TestHome::new();
+    let paused = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (p2, g2) = (paused.clone(), go.clone());
+    let base = stub.url();
+    let srv = start(&h, move |cfg| {
+        cfg.get_base = base;
+        cfg.test_hook = Some(xshelld::server::TestHook(Arc::new(move |_, point| {
+            if point == xshelld::server::TestPoint::StageBeforeVerify {
+                *p2.0.lock().unwrap() = true;
+                p2.1.notify_all();
+                let mut g = g2.0.lock().unwrap();
+                while !*g {
+                    g = g2.1.wait(g).unwrap();
+                }
+            }
+            false
+        })));
+    });
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let rid = c.request_id();
+    c.send(&ClientMsg::DaemonUpdateLatest, Some(rid));
+    {
+        let mut p = paused.0.lock().unwrap();
+        while !*p {
+            p = paused.1.wait(p).unwrap();
+        }
+    }
+    c.shutdown();
+    drop(c);
+    wait_until("connection gone", || srv.connections() == 0);
+    // The disconnect kept the reservation: nobody else may start meanwhile.
+    assert!(srv.stage_active());
+    *go.0.lock().unwrap() = true;
+    go.1.notify_all();
+    wait_until("slot freed", || !srv.stage_active());
+    nothing_installed(&h, &build);
+}
+
+/// Amendment 6: an install directory of the release that holds other bytes is never
+/// overwritten and never reported as installed.
+#[test]
+fn update_latest_existing_other_bytes_refused() {
+    let stub = GetStub::start();
+    let build = release_build();
+    let there = stamped_script_v(&build, NEXT, "exit 1");
+    let served = stamped_script_v(&build, NEXT, "exit 2");
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    // Put `there` in place over the link (a build of version NEXT).
+    let b = c
+        .request(&ClientMsg::DaemonStageBegin {
+            version: NEXT.into(),
+            build: build.clone(),
+            sha256: sha(&there),
+            length: there.len() as u64,
+        })
+        .unwrap();
+    let id = stage_id(&b);
+    chunk(&mut c, id, 0, &there).unwrap();
+    let dir = c
+        .request(&ClientMsg::DaemonStageCommit { stage: id })
+        .unwrap()["dir"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(dir, install_dir_name(NEXT, Some(&build)));
+    stub.release(NEXT, triple(), &served, None);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert_eq!(
+        fs::read(root(&h).join(&dir).join("xshelld")).unwrap(),
+        there
+    );
+    // Also when it is the selected build.
+    fs::write(
+        root(&h).join("selected"),
+        format!(
+            "{dir}
+"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(root(&h).join("selected"), fs::Permissions::from_mode(0o600)).unwrap();
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert_eq!(
+        fs::read(root(&h).join(&dir).join("xshelld")).unwrap(),
+        there
+    );
+    assert!(part_files(&h).is_empty());
+    assert!(!srv.stage_active());
+}
+
+/// Amendment 6: the same bytes in place are reused without a second write, and only after
+/// they still report the release's identity.
+#[test]
+fn update_latest_existing_same_bytes_reused() {
+    use std::os::unix::fs::MetadataExt;
+    let stub = GetStub::start();
+    let build = release_build();
+    let script = stamped_script_v(&build, NEXT, "exit 3");
+    stub.release(NEXT, triple(), &script, None);
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let first = update_latest(&mut c).unwrap();
+    let file = root(&h)
+        .join(install_dir_name(NEXT, Some(&build)))
+        .join("xshelld");
+    let before = fs::metadata(&file).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(update_latest(&mut c).unwrap(), first);
+    let after = fs::metadata(&file).unwrap();
+    assert_eq!(
+        (before.ino(), before.mtime_nsec(), before.mtime()),
+        (after.ino(), after.mtime_nsec(), after.mtime()),
+        "no second write"
+    );
+    // Bytes in place that match the checksum but do not report the release are refused:
+    // the reuse is verified, not assumed.
+    let lying = stamped_script_v(&build, VERSION, "exit 3");
+    let dir = install_dir_name(NEXT, Some(&build));
+    fs::write(&file, &lying).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o700)).unwrap();
+    stub.release(NEXT, triple(), &lying, None);
+    let e = update_latest(&mut c).unwrap_err();
+    assert_prefix(&e, xshell_protocol::msg::UPDATE_LATEST_BAD_BUILD);
+    assert!(e.contains("another version or build"), "{e}");
+    assert_eq!(fs::read(root(&h).join(dir).join("xshelld")).unwrap(), lying);
+    assert!(!srv.stage_active());
 }
 
 fn wait_until(what: &str, f: impl Fn() -> bool) {
@@ -671,6 +1242,7 @@ impl Machine {
         c.env("HOME", self.h.home())
             .env("XDG_RUNTIME_DIR", self.h.run())
             .env("XSHELLD_LOGIN_ENV", "0")
+            .env("XSHELL_GET_URL", closed_get_url())
             .env_remove("XSHELLD_IDLE_TIMEOUT_MS")
             .env_remove("XSHELLD_HOME")
             .env_remove("XSHELLD_SOCKET")

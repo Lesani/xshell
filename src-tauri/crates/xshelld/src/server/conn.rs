@@ -48,6 +48,10 @@ pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
         // An always-on Linux Daemon updates itself in place (S4).
         xshell_protocol::cap::DAEMON_STAGE => !cfg!(target_os = "linux") || cfg.gui_bound.is_some(),
         xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
+        // Offered exactly where staging is: hiding `daemon.stage` hides both.
+        xshell_protocol::cap::DAEMON_UPDATE_LATEST => {
+            !offered(cfg, xshell_protocol::cap::DAEMON_STAGE)
+        }
         "term.submit" => !cfg.submit,
         "term.submit-files" => !cfg.submit || !cfg.submit_files,
         // A Mobile rename is a custom-name update: never without the base capability.
@@ -895,6 +899,22 @@ impl Conn {
                         answer(Err(e))
                     }
                     Ok(()) => d.staging.commit(self.requester(), stage, answer),
+                }
+            }
+            // Answered by a worker thread: the download never holds up this reader.
+            ClientMsg::DaemonUpdateLatest => {
+                let ob = self.ob.clone();
+                let answer: super::staging::Reply = Box::new(move |r| reply(&ob, id, r));
+                let allowed = self.refuse_frozen().and_then(|()| {
+                    if offered(&d.cfg, xshell_protocol::cap::DAEMON_UPDATE_LATEST) {
+                        Ok(())
+                    } else {
+                        Err("this xshelld cannot update itself from the release server".into())
+                    }
+                });
+                match allowed {
+                    Err(e) => answer(Err(e)),
+                    Ok(()) => d.staging.update_latest(&d, self.requester(), answer),
                 }
             }
             ClientMsg::DaemonStageAbort { stage } => {

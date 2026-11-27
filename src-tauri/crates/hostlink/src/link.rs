@@ -138,6 +138,7 @@ fn what(msg: &ClientMsg) -> &'static str {
         ClientMsg::DaemonStageChunk { .. } => "daemon.stage-chunk",
         ClientMsg::DaemonStageCommit { .. } => "daemon.stage-commit",
         ClientMsg::DaemonStageAbort { .. } => "daemon.stage-abort",
+        ClientMsg::DaemonUpdateLatest => "daemon.update-latest",
         ClientMsg::TermEvent { .. } => "term.event",
         ClientMsg::RingIdentity => "ring.identity",
         ClientMsg::RingCompanion { .. } => "ring.companion-pending",
