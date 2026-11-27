@@ -40,6 +40,17 @@ export function usableHosts(snap: RegistrySnapshot = registry.getSnapshot()): Ho
   return remoteHosts(snap).filter(c => isUsableStatus(snap.status[c.id])).map(c => c.id);
 }
 
+// A Host whose link is being made (no status yet counts): the UI shows a turning ring. A Ring
+// machine reached through the Relay that the Relay reports as not there is offline instead:
+// its link is retried, but nothing is expected to answer.
+export function isConnecting(snap: RegistrySnapshot, id: HostId | undefined): boolean {
+  if (!id) return false;
+  const row = snap.available.find(h => h.id === id || h.aliases.includes(id));
+  if ((snap.status[row?.id ?? id]?.status ?? "reconnecting") !== "reconnecting") return false;
+  const r = row?.reachability.kind;
+  return !(row?.activeRoute === "relay" && (r === "closed" || r === "unreachable" || r === "never-connected"));
+}
+
 // "Connected", "Reconnecting · Checking…" … — the chip text used everywhere.
 export function statusLabel(s: HostStatus | undefined): string {
   if (!s) return fmt("hosts.status.reconnecting");

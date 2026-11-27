@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { buildProjectRows, loadPickerProjects, type AgentProjectLists, type PickerRow } from "../hosts/hostProjects";
 import { isPinned, toProjectKey, type ProjectKey } from "../hosts/projectKey";
 import { isUsableStatus } from "../hosts/registry";
-import { remoteHosts, statusLabel, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
+import { isConnecting, remoteHosts, statusLabel, useHostStatus, useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import type { HostId } from "../hosts/types";
 import { cache } from "../hosts/cache";
@@ -144,6 +144,7 @@ export function ProjectPicker({ savedPaths, onToggle, onBrowse, onClose, onRefre
                   <div className="picker-group-head">
                     <HostBadge host={h.id} size="md" />
                     <span className="picker-group-name">{h.name}</span>
+                    {isConnecting(hostsSnap, h.id) && <span className="host-spin" data-host-connecting aria-hidden="true" />}
                     <span className={`picker-group-status ${isUsableStatus(st) ? "ok" : "down"}`}>{fmt("picker.group.hostStatus", { status: statusLabel(st) })}</span>
                     {l?.stale && <span className="picker-group-stale">{fmt("picker.group.stale")}</span>}
                   </div>

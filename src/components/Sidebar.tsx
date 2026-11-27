@@ -6,7 +6,7 @@ import { useProjectImage } from "../hooks/useProjectImage";
 import { FolderEditorDialog } from "./FolderEditorDialog";
 import { RateLimitIndicator } from "./RateLimitIndicator";
 import { HostBadge } from "./HostBadge";
-import { useHostsSnapshot, statusLabel } from "../hosts/useHosts";
+import { isConnecting, useHostsSnapshot, statusLabel } from "../hosts/useHosts";
 import { isUsableStatus, registry, resolveHostAlias } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
 import logo from "../assets/logo.png";
@@ -434,6 +434,9 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
     const hostName = host ? registry.hostName(host) : "";
     const hostStatus = host ? hostsSnap.status[resolveHostAlias(hostsSnap, host)] : undefined;
     const stale = !!host && !isUsableStatus(hostStatus);
+    // The corner mark of a Project whose Host is not usable: a turning ring while it connects.
+    const connecting = stale && isConnecting(hostsSnap, host);
+    const staleKind = hostStatus?.status ?? "reconnecting";
     const tooltipText = !host ? displayName
       : stale ? `${fmt("sidebar.project.hostTooltip", { project: displayName, host: hostName })} · ${fmt("sidebar.project.staleTooltip", { host: hostName, status: statusLabel(hostStatus) })}`
       : fmt("sidebar.project.hostTooltip", { project: displayName, host: hostName });
@@ -465,7 +468,7 @@ export function Sidebar({ projects, projectIcons, selectedProject, activeCountBy
         {indicatorBefore && <div className="ds-drop-line ds-drop-line-before" />}
         <ProjectSidebarIcon iconValue={customIcon} color={settings?.color} name={displayName} highlighted={highlighted} />
         {host && <HostBadge host={host} size="md" className="ds-host-badge" />}
-        {stale && <div className={`ds-host-status ds-host-status-${hostStatus?.status ?? "reconnecting"}`} />}
+        {stale && <div className={`ds-host-status ds-host-status-${connecting ? "reconnecting" : staleKind === "reconnecting" ? "offline" : staleKind}`} {...(connecting ? { "data-host-connecting": "" } : {})} />}
         {activeCount > 0 && <div className="ds-active-badge" title={`${activeCount} active session${activeCount > 1 ? "s" : ""}`}>{activeCount}</div>}
         <div className="ds-indicator" />
         {indicatorAfter && <div className="ds-drop-line ds-drop-line-after" />}

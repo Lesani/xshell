@@ -1161,6 +1161,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
   const machine = tab.host ? registry.machineName(tab.host) : "";
   const ringRow = tab.host ? hostsSnap.available.find(h => h.id === tab.host || h.aliases.includes(tab.host!)) : undefined;
   const ringOffline = !!remoteState && !!ringRow && ringRow.routes.includes("relay") && ringRow.reachability.kind !== "online";
+  // Still being connected (not a Ring machine known to be offline): a turning ring, not a warning.
+  const connecting = !ringOffline && (remoteState === "waiting" || remoteState === "reconnecting");
   const remoteStateText = departed ? null : ringOffline ? fmtc("tab.offline.state", { name: machine }) : terminalHostStateText(remoteState, localDaemonTab, hostName, null); // never the backend error
   const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
   const agentLabel = AGENTS[tab.agent || "claude"].label;
@@ -1290,7 +1292,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
             </div>
           )}
           {!isInitializing && remoteStateText && (
-            <div className="terminal-remote-banner"><AlertTriangle size={12} /><span>{remoteStateText}</span></div>
+            <div className="terminal-remote-banner">{connecting ? <span className="host-spin" data-host-connecting aria-hidden="true" /> : <AlertTriangle size={12} />}<span>{remoteStateText}</span></div>
           )}
           {inputPaused && remoteState && !localDaemonTab && !departed && (
             <div className="terminal-remote-hint">{fmt("terminal.remote.inputPaused")}</div>
