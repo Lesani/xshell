@@ -107,6 +107,12 @@ export function skipReason(status: HostStatus | undefined): SkipReason | null {
   return updateAction(status) ? null : "current";
 }
 
+/// An update of this machine runs: this Desktop is asking for it, or the backend reports a
+/// phase of it.
+export function updateRunning(status: HostStatus | undefined, invoking: boolean | undefined): boolean {
+  return !exactUpdateConnected(status) && (!!invoking || status?.phase === "upgrading" || status?.phase === "preparing" || status?.phase === "installing");
+}
+
 /// How long "Update all" waits, after the request answered, for one machine to come back
 /// with the expected version.
 export const SETTLE_MS = 150_000;

@@ -1,6 +1,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { exactUpdateConnected, hostUpdates, skipReason, updateAction, updateSource, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
+import { exactUpdateConnected, hostUpdates, skipReason, updateAction, updateRunning, updateSource, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
+import { skippedVersions } from "../hosts/skippedVersions";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import type { HostStatus } from "../hosts/types";
@@ -57,18 +58,30 @@ export function updateErrorText(name: string, error: string): string {
   return fmt("update.notBack", { name });
 }
 
-export function HostUpdateAction({ host, status, description = false }: { host: UpdateHost; status: HostStatus | undefined; description?: boolean }) {
-  const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
+// What a machine's update row is made of; `visible`: it has anything to show.
+function updateRow(id: string, status: HostStatus | undefined, state: ReturnType<typeof hostUpdates.getSnapshot>) {
   const healthy = exactUpdateConnected(status);
-  const action = status?.host === host.id ? updateAction(status) : null;
-  const busy = !healthy && (!!state.invoking[host.id] || status?.phase === "upgrading" || status?.phase === "preparing" || status?.phase === "installing");
+  const action = status?.host === id ? updateAction(status) : null;
+  const busy = updateRunning(status, state.invoking[id]);
   const replace = (action ?? status?.updateAction) === "replace";
-  const error = healthy ? null : state.errors[host.id] || (status?.errorHint === "update-failed" ? status.lastError : null);
+  const error = healthy ? null : state.errors[id] || (status?.errorHint === "update-failed" ? status.lastError : null);
   const unavailable = status?.updateUnavailable && (!!status.updateAction || !!status.routeUpdateUnavailable) ? status.updateUnavailable : null;
   const route = status?.routeUpdateUnavailable;
+  return { action, busy, replace, error, unavailable, route, visible: !!(action || busy || unavailable || route || error) };
+}
+
+/// `HostUpdateAction` renders something for this machine.
+export function hasUpdateRow(id: string, status: HostStatus | undefined, state: ReturnType<typeof hostUpdates.getSnapshot>): boolean {
+  return updateRow(id, status, state).visible;
+}
+
+// `skippable` (the bar only): "Skip this version" beside the action button.
+export function HostUpdateAction({ host, status, description = false, skippable = false }: { host: UpdateHost; status: HostStatus | undefined; description?: boolean; skippable?: boolean }) {
+  const state = useSyncExternalStore(hostUpdates.subscribe, hostUpdates.getSnapshot, hostUpdates.getSnapshot);
+  const { action, busy, replace, error, unavailable, route, visible } = updateRow(host.id, status, state);
+  const blocked = !!state.confirmation || !!(state.all && !state.all.done);
   // A running update may no longer offer itself; then its source is the one confirmed.
   const source = updateSource(status) ?? (busy ? state.sources[host.id] : null);
-  const visible = action || busy || unavailable || route || error;
   if (!visible) return null;
   return <div className="host-update-action">
     {/* Never a build hash: a different build is just "Update available". */}
@@ -79,7 +92,10 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
       {/* With a description (the bar, Hosts settings) the progress line names its machine: the bar may list several. */}
       {busy ? <span role="status">{description && `${host.name}: `}{fmt(status?.phase === "upgrading" ? "update.restarting" : source === "release" && status?.phase !== "installing" ? "update.downloading" : "update.sending")}</span>
-        : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!(state.all && !state.all.done)} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>}
+        : action && <>
+          <button className="btn btn-ghost settings-action-btn" disabled={blocked} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>
+          {skippable && <button className="btn btn-ghost settings-action-btn" data-update-skip disabled={blocked} onClick={() => skippedVersions.skip(host.id, status)}>{fmt("update.skip")}</button>}
+        </>}
     </>}
     {error && <span className="host-row-error" role="alert">{updateErrorText(host.name, error)}</span>}
   </div>;
