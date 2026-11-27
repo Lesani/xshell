@@ -55,8 +55,11 @@ function expectation(status: HostStatus): Expectation {
 
 type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget } & Expectation;
 
+// This operation succeeded: usable, settled, on the expected version over a new link. A
+// further update may already be offered (a newer release learned meanwhile): still success.
 function arrived(s: HostStatus, c: Confirmation): boolean {
-  return exactUpdateConnected(s) && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion
+  return ["connected", "upgrade-pending", "build-differs"].includes(s.status) && s.phase === null && !s.lastError && s.errorHint !== "update-failed"
+    && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion
     && (c.source !== "desktop" || sameBuild(s.daemonBuild, c.expectedBuild));
 }
 
@@ -97,7 +100,8 @@ export function skipReason(status: HostStatus | undefined): SkipReason | null {
   return updateAction(status) ? null : "current";
 }
 
-/// How long "Update all" waits for one machine to come back with the expected version.
+/// How long "Update all" waits, after the request answered, for one machine to come back
+/// with the expected version.
 export const SETTLE_MS = 150_000;
 
 // Only confirmation/invocation state is shared here. Completion and progress remain the
@@ -121,14 +125,13 @@ export class HostUpdates {
     this.set({ confirmation: { host: { ...host }, action, target: updateTarget(status), ...expectation(status) } });
   }
   reconcile(status: HostStatus | undefined) {
-    if (!status || !exactUpdateConnected(status)) return;
+    if (!status) return;
     const invocation = this.inFlight.get(status.host);
-    if (invocation) {
-      if ((status.configGeneration ?? 0) === invocation.confirmation.target.configGeneration && arrived(status, invocation.confirmation)) {
-        // Keep this evidence until the invocation settles, even across offline/navigation.
-        invocation.succeeded = true;
-      }
+    if (invocation && (status.configGeneration ?? 0) === invocation.confirmation.target.configGeneration && arrived(status, invocation.confirmation)) {
+      // Keep this evidence until the invocation settles, even across offline/navigation.
+      invocation.succeeded = true;
     }
+    if (!exactUpdateConnected(status)) return;
     if (this.state.errors[status.host]) this.set({ errors: { ...this.state.errors, [status.host]: "" } });
     if (this.state.sources[status.host] && !this.state.invoking[status.host]) {
       const sources = { ...this.state.sources };
@@ -210,6 +213,7 @@ export class HostUpdates {
     // Already current is believed only after `host_upgrade` resolved: before, the Host may
     // not have looked yet.
     let answered = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const end = (r: boolean | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
     const check = () => {
       const s = this.statusOf(c.host.id);
@@ -220,12 +224,16 @@ export class HostUpdates {
       else if (began && s.errorHint === "update-failed" && s.phase === null && s.lastError) end(s.lastError);
     };
     const stop = this.watch(check);
-    // The backend's error (when it set one) wins.
-    const timer = setTimeout(() => end(this.statusOf(c.host.id)?.lastError ?? fmt("update.notBack", { name: c.host.name })), this.settleMs);
     return {
       promise,
       cancel: () => { if (!over) { over = true; stop(); clearTimeout(timer); } },
-      started: () => { began = true; answered = true; check(); },
+      // The deadline runs from the answer: until then the request itself is bounded by the
+      // backend (a Host fetching a release may take most of it before it restarts).
+      started: () => {
+        began = true; answered = true; check();
+        // The backend's error (when it set one) wins.
+        if (!over) timer = setTimeout(() => end(this.statusOf(c.host.id)?.lastError ?? fmt("update.notBack", { name: c.host.name })), this.settleMs);
+      },
     };
   }
   confirm = async () => {

@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { activeUpdateHost, exactUpdateConnected, HostUpdates, skipReason, updateAction, updateSource } from "./hostUpdate";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { activeUpdateHost, exactUpdateConnected, HostUpdates, SETTLE_MS, skipReason, updateAction, updateSource } from "./hostUpdate";
 import type { HostStatus, HostConfig } from "./types";
 import type { LayoutNode } from "../types";
 
@@ -274,14 +274,55 @@ describe("Updates from the latest release", () => {
   });
 
   it("settles as already current when the Host answers it is current, without waiting for the time limit", async () => {
+    // What the backend publishes after the answer "already current": connected, nothing
+    // offered, the same version and link generation as before.
     const f = fixture({ r_a: release("r_a") }, 60_000);
-    // The Host looked, found nothing newer and stayed on its link: nothing offered any more.
-    f.replies.set("r_a", async () => { f.push(healthy("r_a", 3, { daemonVersion: "1.5.0" })); return null; });
+    f.replies.set("r_a", async () => {
+      setTimeout(() => f.push(status({ host: "r_a", status: "connected", updateAction: null, updateSource: null, updateVersion: null, daemonVersion: "1.5.0", desktopBuild: build, linkGeneration: 3 })), 5);
+      return null;
+    });
     expect(await run(f)).toEqual([{ host: a, outcome: "skipped", reason: "current" }]);
-    // The same status reported after the answer settles it too.
-    const g = fixture({ r_a: release("r_a") }, 60_000);
-    g.replies.set("r_a", async () => { setTimeout(() => g.push(healthy("r_a", 3, { daemonVersion: "1.5.0" })), 5); return null; });
-    expect(await run(g)).toEqual([{ host: a, outcome: "skipped", reason: "current" }]);
+  });
+
+  it("an update that worked is a success even when a newer release is offered right after", async () => {
+    // Brought to 1.6.0; meanwhile the Desktop learned 1.7.0, so the Host is back offering it.
+    const further = (gen: number) => status({ host: "r_a", status: "upgrade-pending", updateAction: "update", updateSource: "release", updateVersion: "1.7.0", daemonVersion: "1.6.0", daemonBuild: other, desktopBuild: build, linkGeneration: gen });
+    const f = fixture({ r_a: release("r_a") }, 60_000);
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(further(4)), 5); return null; });
+    expect(await run(f)).toEqual([{ host: a, outcome: "ok", version: "1.6.0" }]);
+    // A single Update keeps that evidence over a lost acknowledgement.
+    let reject!: (e: Error) => void;
+    const updates = new HostUpdates(vi.fn(() => new Promise<never>((_, fail) => { reject = fail; })) as never);
+    updates.ask(host, release(host.id));
+    const pending = updates.confirm();
+    updates.reconcile({ ...further(4), host: host.id });
+    reject(new Error("acknowledgement lost"));
+    await pending;
+    expect(updates.getSnapshot().errors[host.id]).toBe("");
+  });
+
+  describe("the time limit", () => {
+    afterEach(() => { vi.useRealTimers(); });
+    it("starts when the request answers: a long download is not a failure", async () => {
+      vi.useFakeTimers();
+      const f = fixture({ r_a: release("r_a") }, SETTLE_MS);
+      f.replies.set("r_a", () => new Promise(done => setTimeout(() => done(null), 140_000)));
+      const results = run(f);
+      await vi.advanceTimersByTimeAsync(140_000);
+      await vi.advanceTimersByTimeAsync(60_000);
+      f.push(healthy("r_a", 4));
+      expect(await results).toEqual([{ host: a, outcome: "ok", version: "1.6.0" }]);
+    });
+    it("fails with the approved sentence when nothing comes back within it after the answer", async () => {
+      vi.useFakeTimers();
+      const f = fixture({ r_a: release("r_a") }, SETTLE_MS);
+      let settled = false;
+      const results = run(f).then(r => { settled = true; return r; });
+      await vi.advanceTimersByTimeAsync(SETTLE_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await results).toEqual([{ host: a, outcome: "failed", error: "box-a hasn't reconnected after the update. Check that machine, then try connecting again." }]);
+    });
   });
 
   it("remembers the confirmed source while the update runs, and forgets it once the Host is healthy", async () => {

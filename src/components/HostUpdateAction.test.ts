@@ -148,3 +148,16 @@ describe("an update from the latest release", () => {
     expect(render({ ...release, lastError: "update-verify-failed: stamp names 1.5.9", errorHint: "update-failed" })).not.toContain("stamp");
   });
 });
+
+describe("progress rows", () => {
+  const ringRow = (patch: Partial<HostStatus>) => renderToStaticMarkup(createElement(HostUpdateAction, { host, status: { ...status, ...patch } }));
+  it("name the machine where a description is shown, with the approved sentence unchanged", () => {
+    expect(render({ phase: "upgrading" })).toContain("Windows fixture: Restarting…");
+    expect(render({ phase: "preparing", updateSource: "release", updateVersion: "1.6.0" })).toContain("Windows fixture: Downloading update…");
+    expect(render({ phase: "installing" })).toContain("Windows fixture: Sending update…");
+  });
+  it("stay as they are in Ring member rows", () => {
+    expect(ringRow({ phase: "upgrading" })).toContain('<span role="status">Restarting…</span>');
+    expect(ringRow({ phase: "upgrading" })).not.toContain("Windows fixture");
+  });
+});
