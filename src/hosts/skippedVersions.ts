@@ -46,6 +46,9 @@ export class SkippedVersions {
   private state: Snapshot = { loaded: false, skipped: {} };
   private listeners = new Set<() => void>();
   private loading: Promise<void> | null = null;
+  // Writes go one after another, each with the map as it is then: a later skip is never
+  // overwritten by an earlier, slower write.
+  private writing: Promise<void> = Promise.resolve();
   constructor(private open: () => Promise<SettingsStore> = () => load("settings.json", { defaults: {}, autoSave: true })) {}
   getSnapshot = () => this.state;
   // Subscribing (the mounted bar) starts the one load.
@@ -64,7 +67,7 @@ export class SkippedVersions {
     const target = updateTargetKey(status);
     if (!target || this.state.skipped[host] === target) return;
     this.set({ ...this.state, skipped: { ...this.state.skipped, [host]: target } });
-    void this.load().then(async () => { await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped); }).catch(() => {});
+    this.writing = this.writing.then(() => this.load()).then(async () => { await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped); }).catch(() => {});
   }
 }
 
