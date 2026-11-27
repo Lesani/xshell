@@ -202,19 +202,21 @@ impl Manager {
     /// Record the latest xshell release (D3). Only a change republishes the status of every
     /// Host; a Host offers the release only when it can update itself from it (a Relay Host
     /// with `daemon.update-latest`), so configured and Local Hosts publish nothing new.
+    ///
+    /// Every refresh, also with an unchanged value, ends the withdrawal a "current" answer
+    /// made (so it lasts at most one refresh period): the Host is asked again next time.
     pub fn set_latest_release(&self, v: semver::Version) {
-        {
+        let changed = {
             let mut cur = self.mc.latest_release.lock().unwrap();
-            if cur.as_ref() == Some(&v) {
-                return;
-            }
+            let changed = cur.as_ref() != Some(&v);
             *cur = Some(v);
-        }
+            changed
+        };
         let mut handles: Vec<Arc<HostHandle>> = self.hosts.lock().unwrap().clone();
         handles.extend(self.local.lock().unwrap().clone());
         handles.extend(self.relay.lock().unwrap().iter().cloned());
         for h in handles {
-            h.republish();
+            h.latest_refreshed(changed);
         }
     }
 

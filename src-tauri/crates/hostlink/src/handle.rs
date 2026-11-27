@@ -276,6 +276,9 @@ pub(crate) struct State {
     /// value was `.0` and the Host ran `.1`: while both hold, nothing is offered for it.
     /// Another latest value or another Host version clears it.
     pub release_current: Option<(semver::Version, String)>,
+    /// The latest value and Host version a running release update was asked with; a
+    /// "current" answer withdraws exactly that release.
+    pub release_asked: Option<(semver::Version, String)>,
 }
 
 impl State {
@@ -438,6 +441,7 @@ impl Shared {
                 release_updates: false,
                 upgrade_identity: None,
                 release_current: None,
+                release_asked: None,
             }),
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
@@ -552,12 +556,6 @@ impl Shared {
 
     pub(crate) fn snapshot(&self) -> HostSnapshot {
         self.snap.lock().unwrap().clone()
-    }
-
-    /// Derive and emit the status again (the latest release changed).
-    pub(crate) fn republish(&self) {
-        let mut st = self.lock();
-        self.publish(&mut st);
     }
 
     /// Start a new link generation: everything from older links is ignored from now on.
@@ -1197,6 +1195,7 @@ impl HostHandle {
             st.upgrade_identity = None;
             st.release_updates = false;
             st.release_current = None;
+            st.release_asked = None;
             st.upgrade_operation = None;
             st.upgrade_complete_deadline = None;
             self.sh.kick.store(false, Ordering::SeqCst);
@@ -1267,9 +1266,15 @@ impl HostHandle {
         }
     }
 
-    /// Derive and emit this Host's status again (the latest release changed).
-    pub(crate) fn republish(&self) {
-        self.sh.republish();
+    /// The Desktop refreshed the latest release (`changed`: to another value). A withdrawal
+    /// after a "current" answer lasts until such a refresh: it is cleared, and the status
+    /// emitted again when it changed or a withdrawal was cleared.
+    pub(crate) fn latest_refreshed(&self, changed: bool) {
+        let mut st = self.sh.lock();
+        let had = st.release_current.take().is_some();
+        if changed || had {
+            self.sh.publish(&mut st);
+        }
     }
 
     pub(crate) fn set_display(&self, cfg: HostConfig) {
@@ -2520,6 +2525,7 @@ impl HostHandle {
                             "this Host does not need an update",
                         ));
                     }
+                    st.release_asked = latest.zip(Some(daemon_version.clone()));
                     None
                 } else {
                     if !crate::version::update_eligible(
@@ -2763,11 +2769,15 @@ fn upgrade_from_release(
         .map_err(|e| release_failure(name, HostError::new(HostErrorCode::Remote, e.to_string())))?;
     if answer.current {
         // Nothing newer for this Host after all (this Desktop's latest value is ahead of
-        // what the release server gave it): withdraw the offer while that value holds.
+        // what the release server gave it): withdraw the release this update was asked
+        // with, only while the Host still runs the version it ran then, and only until the
+        // Desktop's next refresh of the latest value. A value learnt meanwhile stays offered.
         {
             let mut st = sh.lock();
             if st.upgrade_operation == Some(op) {
-                st.release_current = sh.mc.latest().zip(st.status.daemon_version.clone());
+                let asked = st.release_asked.take();
+                st.release_current =
+                    asked.filter(|(_, v)| st.status.daemon_version.as_deref() == Some(v.as_str()));
             }
         }
         finish_upgrade(sh, op, None);

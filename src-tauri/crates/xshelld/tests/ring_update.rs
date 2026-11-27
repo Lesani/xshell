@@ -1093,6 +1093,66 @@ fn update_latest_requester_gone_publishes_nothing() {
     nothing_installed(&h, &build);
 }
 
+/// Sol: a refused fetch removes the directory it created while it still holds the update
+/// slot, so no stage can begin into that directory before it is gone.
+#[test]
+fn update_latest_dir_cleanup_stays_inside_the_slot() {
+    use xshell_protocol::msg::{STAGE_BUSY, UPDATE_LATEST_BAD_BUILD};
+    let stub = GetStub::start();
+    let build = release_build();
+    let script = stamped_script_v(&build, NEXT, "exit 3");
+    stub.release(NEXT, triple(), &script, Some(&"00".repeat(32)));
+    let h = TestHome::new();
+    let paused = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (p2, g2) = (paused.clone(), go.clone());
+    let base = stub.url();
+    let srv = start(&h, move |cfg| {
+        cfg.get_base = base;
+        cfg.test_hook = Some(xshelld::server::TestHook(Arc::new(move |_, point| {
+            if point == xshelld::server::TestPoint::FetchBeforeDirCleanup {
+                *p2.0.lock().unwrap() = true;
+                p2.1.notify_all();
+                let mut g = g2.0.lock().unwrap();
+                while !*g {
+                    g = g2.1.wait(g).unwrap();
+                }
+            }
+            false
+        })));
+    });
+    let mut a = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let mut b = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let rid = a.request_id();
+    a.send(&ClientMsg::DaemonUpdateLatest, Some(rid));
+    {
+        let mut p = paused.0.lock().unwrap();
+        while !*p {
+            p = paused.1.wait(p).unwrap();
+        }
+    }
+    // Between the part file's removal and the directory's: the slot is still reserved.
+    let dir = root(&h).join(install_dir_name(NEXT, Some(&build)));
+    assert!(dir.is_dir());
+    assert!(part_files(&h).is_empty());
+    assert!(srv.stage_active());
+    let e = b
+        .request(&ClientMsg::DaemonStageBegin {
+            version: NEXT.into(),
+            build: build.clone(),
+            sha256: sha(&script),
+            length: script.len() as u64,
+        })
+        .unwrap_err();
+    assert_eq!(e, STAGE_BUSY);
+    *go.0.lock().unwrap() = true;
+    go.1.notify_all();
+    let e = a.wait_res(rid).unwrap_err();
+    assert_prefix(&e, UPDATE_LATEST_BAD_BUILD);
+    assert!(!dir.exists());
+    assert!(!srv.stage_active());
+}
+
 /// An earlier update still on trial (a watchdog holds the trial lock, or the trial record is
 /// there): the fetch is refused at once as busy, before anything is downloaded.
 #[test]

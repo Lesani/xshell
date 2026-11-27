@@ -819,6 +819,16 @@ fn same_bytes(f: &std::fs::File, bytes: &[u8]) -> std::io::Result<bool> {
 /// `~/.xshell` is refused).
 #[cfg(unix)]
 pub fn ensure_server_dir(home: &std::path::Path, dir_name: &str) -> std::io::Result<PathBuf> {
+    ensure_server_dir_created(home, dir_name).map(|(dir, _)| dir)
+}
+
+/// [`ensure_server_dir`], also saying whether this call created the install directory
+/// itself (its last component).
+#[cfg(unix)]
+pub fn ensure_server_dir_created(
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<(PathBuf, bool)> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     if !valid_version(dir_name) {
@@ -829,10 +839,11 @@ pub fn ensure_server_dir(home: &std::path::Path, dir_name: &str) -> std::io::Res
     }
     let uid = unsafe { libc::getuid() };
     let mut dir = home.to_path_buf();
+    let mut created = false;
     for part in [".xshell", "server", dir_name] {
         dir.push(part);
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
+            Ok(()) => created = part == dir_name,
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
@@ -856,7 +867,7 @@ pub fn ensure_server_dir(home: &std::path::Path, dir_name: &str) -> std::io::Res
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    Ok(dir)
+    Ok((dir, created))
 }
 
 #[cfg(test)]

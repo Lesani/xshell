@@ -182,7 +182,9 @@ impl Staging {
             _ => drop(slot.take()),
         }
         let id = Uuid::new_v4();
-        let worker = self.open_worker(d, id, who, version, build, dir, verifier)?;
+        let (worker, _) = self
+            .open_worker(d, id, who, version, build, dir, verifier, true)
+            .map_err(|(e, _)| e)?;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let idle = d.cfg.stage_idle;
         std::thread::Builder::new()
@@ -205,6 +207,9 @@ impl Staging {
 
     /// The part file and the worker that receives build `version`+`build` into install
     /// directory `dir` as stage `id`.
+    /// `holds_slot`: the worker releases the reservation when it finishes (a stage); a
+    /// fetch keeps it until its own cleanup is done. Also says whether this call created
+    /// the install directory; `Err` carries that too, so a fetch can clean up.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     fn open_worker(
@@ -216,16 +221,21 @@ impl Staging {
         build: &BuildId,
         dir: String,
         verifier: crate::stage::Verifier,
-    ) -> Result<Worker, String> {
+        holds_slot: bool,
+    ) -> Result<(Worker, bool), (String, bool)> {
         let home = &d.cfg.home;
         sweep_parts(&xshell_core::server::server_root(home));
-        let dir_path =
-            xshell_hostlink::install::ensure_server_dir(home, &dir).map_err(|e| e.to_string())?;
+        let (dir_path, created) = xshell_hostlink::install::ensure_server_dir_created(home, &dir)
+            .map_err(|e| (e.to_string(), false))?;
         let part = dir_path.join(format!(".xshelld.stage-{}.part", id.simple()));
-        let file = create_part(&part).map_err(|e| e.to_string())?;
-        Ok(Worker {
+        let file = create_part(&part).map_err(|e| (e.to_string(), created))?;
+        let worker = Worker {
             d: Arc::downgrade(d),
-            slot: Arc::downgrade(&self.slot),
+            slot: if holds_slot {
+                Arc::downgrade(&self.slot)
+            } else {
+                Weak::new()
+            },
             id,
             who,
             dir,
@@ -238,7 +248,8 @@ impl Staging {
             verifier: Some(verifier),
             published: false,
             finished: false,
-        })
+        };
+        Ok((worker, created))
     }
 
     /// `daemon.update-latest` (capability `daemon.update-latest`): ask the release server for
@@ -388,16 +399,24 @@ impl Staging {
         if fs::symlink_metadata(root.join(&dir).join("xshelld")).is_ok() {
             return Err(bad(&format!("{dir} holds another file")));
         }
-        // A directory this fetch creates goes again when nothing was published into it;
-        // one that existed before is never removed.
+        // A directory this fetch created (as its creation call says) goes again when nothing
+        // was published into it; one that existed before is never removed. The worker does
+        // not hold the update slot: the caller's reservation keeps it until this cleanup is
+        // done, so no stage can begin into the directory meanwhile.
         let dir_path = root.join(&dir);
-        let existed = fs::symlink_metadata(&dir_path).is_ok();
+        let mut created = false;
         let r = (|| {
-            let mut worker = self.open_worker(&d, id, who, &version, &stamp, dir, verifier)?;
-            drop(d);
+            let (mut worker, made) = self
+                .open_worker(&d, id, who, &version, &stamp, dir, verifier, false)
+                .map_err(|(e, made)| {
+                    created = made;
+                    e
+                })?;
+            created = made;
             worker.write(&bytes).map_err(|e| e.to_string())?;
             drop(bytes);
             let r = worker.commit();
+            // Removes the part file (unless published); the slot stays reserved.
             worker.finish();
             match r {
                 Ok(_) => Ok(installed),
@@ -405,7 +424,8 @@ impl Staging {
                 Err(CommitError::Other(e)) => Err(e),
             }
         })();
-        if r.is_err() && !existed {
+        if r.is_err() && created {
+            d.test_point(id, TestPoint::FetchBeforeDirCleanup);
             // `remove_dir` removes only an empty directory.
             if fs::remove_dir(&dir_path).is_ok() {
                 let _ = sync(&root);

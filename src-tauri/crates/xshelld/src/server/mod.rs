@@ -285,6 +285,9 @@ pub enum TestPoint {
     /// A staged build passed validation and is about to be published (no lock held; a hook
     /// may block).
     StageBeforePublish,
+    /// A refused `daemon.update-latest` is about to remove the install directory it created
+    /// (no lock held; the update slot is still reserved; a hook may block).
+    FetchBeforeDirCleanup,
     /// A selected update is about to check its requester again and commit (no lock held;
     /// a hook may block).
     UpgradeBeforeCommit,

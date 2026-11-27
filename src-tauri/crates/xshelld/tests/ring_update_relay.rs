@@ -882,16 +882,56 @@ fn capable_host_current_answer_finishes_quietly() {
     assert_eq!(offer(&s), (None, None, None));
     let e = reply(|w| host.upgrade(w)).unwrap_err();
     assert!(e.message.contains("does not need an update"), "{e:?}");
-    // The same value again changes nothing; a newer one is offered again.
+    // The withdrawal lasts until the Desktop's next refresh: the same value learnt again
+    // offers it again (the Host is asked again; its release server may have caught up).
     desktop.manager.set_latest_release(ver(&next));
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(offer(&host.status()), (None, None, None));
-    desktop.manager.set_latest_release(ver("99.0.0"));
-    wait("offered again", || {
+    wait("offered again after a refresh", || {
         let s = host.status();
-        s.status == xshell_hostlink::StatusKind::UpgradePending
-            && offer(&s) == release_offer("99.0.0")
+        s.status == xshell_hostlink::StatusKind::UpgradePending && offer(&s) == release_offer(&next)
     });
+    // A newer value is offered too.
+    desktop.manager.set_latest_release(ver("99.0.0"));
+    wait("the newer value offered", || {
+        offer(&host.status()) == release_offer("99.0.0")
+    });
+}
+
+/// Sol: the Host answers "current" for the value the update was asked with (B), but the
+/// Desktop learnt a newer one (C) meanwhile: C is still offered; only B was withdrawn.
+#[test]
+fn current_answer_for_an_older_value_keeps_a_newer_one_offered() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    stub.body("/latest", format!("{VERSION}\n"));
+    stub.gate("/latest");
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let url = stub.url();
+    let (_m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    let b = next_version();
+    desktop.manager.set_latest_release(ver(&b));
+    wait("B offered", || offer(&host.status()) == release_offer(&b));
+    let (tx, rx) = std::sync::mpsc::channel();
+    host.upgrade(Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    // The Host is asking its release server; the Desktop learns C meanwhile.
+    stub.wait_hits("/latest", 1, WAIT);
+    desktop.manager.set_latest_release(ver("99.0.0"));
+    stub.open("/latest");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(60)).unwrap().unwrap(),
+        serde_json::Value::Null
+    );
+    let s = host.status();
+    assert_eq!(
+        s.status,
+        xshell_hostlink::StatusKind::UpgradePending,
+        "{s:?}"
+    );
+    assert_eq!(offer(&s), release_offer("99.0.0"));
+    assert!(s.phase.is_none() && s.last_error.is_none(), "{s:?}");
 }
 
 /// Every failure of the download leaves the Host running its build, reachable, with nothing
