@@ -1093,6 +1093,85 @@ fn update_latest_requester_gone_publishes_nothing() {
     nothing_installed(&h, &build);
 }
 
+/// An earlier update still on trial (a watchdog holds the trial lock, or the trial record is
+/// there): the fetch is refused at once as busy, before anything is downloaded.
+#[test]
+fn update_latest_refused_while_a_trial_is_open() {
+    use xshell_protocol::msg::UPDATE_ON_TRIAL;
+    let stub = GetStub::start();
+    let build = release_build();
+    stub.release(
+        NEXT,
+        triple(),
+        &stamped_script_v(&build, NEXT, "exit 3"),
+        None,
+    );
+    let h = TestHome::new();
+    let srv = start_with_stub(&h, &stub);
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    // The trial lock held.
+    let held = xshell_hostlink::trial::try_lock(&h.home())
+        .unwrap()
+        .unwrap();
+    let at = Instant::now();
+    assert_eq!(update_latest(&mut c).unwrap_err(), UPDATE_ON_TRIAL);
+    assert!(at.elapsed() < Duration::from_secs(2));
+    drop(held);
+    // The trial record there.
+    fs::create_dir_all(root(&h)).unwrap();
+    fs::set_permissions(root(&h), fs::Permissions::from_mode(0o700)).unwrap();
+    xshell_hostlink::trial::write(
+        &h.home(),
+        &xshell_hostlink::trial::Trial {
+            target: install_dir_name(VERSION, Some(&build)),
+            previous: Some(own_dir()),
+            previous_exe: PathBuf::from(bin()),
+            ring: false,
+            at_ms: 1,
+            pid: std::process::id(),
+        },
+    )
+    .unwrap();
+    assert_eq!(update_latest(&mut c).unwrap_err(), UPDATE_ON_TRIAL);
+    // Nothing was asked for, nothing installed, the slot is free.
+    assert!(stub.hits().is_empty(), "{:?}", stub.hits());
+    assert!(!root(&h).join(install_dir_name(NEXT, Some(&build))).exists());
+    assert!(part_files(&h).is_empty());
+    assert!(!srv.stage_active());
+    // Once the trial is over, the same request goes through.
+    xshell_hostlink::trial::remove(&h.home()).unwrap();
+    assert_eq!(update_latest(&mut c).unwrap()["current"], json!(false));
+}
+
+/// `daemon.upgrade-selected` while an earlier update is on trial is refused at once with the
+/// busy answer, on any path (the build was staged over the link or fetched).
+#[test]
+fn upgrade_selected_refused_while_a_trial_is_open() {
+    let h = TestHome::new();
+    let srv = start(&h, |_| {});
+    let mut c = Client::in_process_within(&srv, Role::Desktop, WAIT);
+    let (bytes, build) = patched_bytes("0123456789ab");
+    stage(&mut c, &build, &bytes).unwrap();
+    let held = xshell_hostlink::trial::try_lock(&h.home())
+        .unwrap()
+        .unwrap();
+    let at = Instant::now();
+    let e = c
+        .request(&ClientMsg::DaemonUpgradeSelected {
+            version: VERSION.into(),
+            build,
+        })
+        .unwrap_err();
+    assert_eq!(e, xshell_protocol::msg::UPDATE_ON_TRIAL);
+    assert!(at.elapsed() < Duration::from_secs(2));
+    drop(held);
+    assert_eq!(selected(&h), None, "nothing selected");
+    assert!(
+        c.request(&ClientMsg::DaemonUpdateInfo).is_ok(),
+        "still serving"
+    );
+}
+
 /// Amendment 6: an install directory of the release that holds other bytes is never
 /// overwritten and never reported as installed.
 #[test]
@@ -1996,7 +2075,7 @@ fn plain_upgrade_refused_when_trial_cannot_be_prepared() {
         .unwrap()
         .unwrap();
     let e = c.request(&ClientMsg::DaemonUpgrade).unwrap_err();
-    assert!(e.contains("already running"), "{e}");
+    assert!(e.contains(xshell_protocol::msg::UPDATE_ON_TRIAL), "{e}");
     drop(held);
     assert!(c.request(&ClientMsg::DaemonUpdateInfo).is_ok());
     assert!(

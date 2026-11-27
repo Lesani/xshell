@@ -324,7 +324,14 @@ fn submit_probe(cfg: &mut server::Config) {
     }
     // `XSHELLD_TEST_HIDE_CAPABILITIES=a,b`: hello does not offer these (a Daemon of an
     // older build, as far as a Desktop can tell).
-    if let Ok(v) = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES") {
+    // `XSHELLD_TEST_HIDE_CAPABILITIES_ONLY_IN=<install dir>`: only that build hides them (a
+    // Host of an older build that an update replaces with one that offers them).
+    let hide_here = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES_ONLY_IN")
+        .map_or(true, |d| d == upgrade::own_dir());
+    if let Some(v) = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES")
+        .ok()
+        .filter(|_| hide_here)
+    {
         cfg.hide_capabilities = v.split(',').map(str::to_string).collect();
     }
     let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());

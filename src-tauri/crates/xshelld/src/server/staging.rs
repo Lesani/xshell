@@ -267,6 +267,11 @@ impl Staging {
         if let Err(e) = authorized(d, who) {
             return reply(Err(e));
         }
+        // Nothing is downloaded while the previous update is on trial: it could not be
+        // selected anyway.
+        if xshell_hostlink::trial::open(&d.cfg.home) {
+            return reply(Err(xshell_protocol::msg::UPDATE_ON_TRIAL.into()));
+        }
         let id = Uuid::new_v4();
         {
             let mut slot = self.slot.lock().unwrap();

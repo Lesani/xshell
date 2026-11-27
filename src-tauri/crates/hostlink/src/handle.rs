@@ -112,10 +112,17 @@ pub fn release_bad(name: &str) -> String {
 /// How long a Ring Host may take to download and install the latest release (D5).
 const UPDATE_LATEST_WAIT: Duration = Duration::from_secs(150);
 
+/// The Daemon refused an update because another one is in progress or still on trial.
+fn update_busy(e: &HostError) -> bool {
+    e.code == HostErrorCode::Remote
+        && (e.message.starts_with(xshell_protocol::msg::STAGE_BUSY)
+            || e.message.starts_with(xshell_protocol::msg::UPDATE_ON_TRIAL))
+}
+
 /// A failed `daemon.update-latest` in approved words; the detail goes to the log only.
 fn release_failure(name: &str, e: HostError) -> HostError {
     use xshell_protocol::msg::{
-        STAGE_BUSY, UPDATE_LATEST_BAD_BUILD, UPDATE_LATEST_NO_BUILD, UPDATE_LATEST_UNREACHABLE,
+        UPDATE_LATEST_BAD_BUILD, UPDATE_LATEST_NO_BUILD, UPDATE_LATEST_UNREACHABLE,
     };
     eprintln!(
         "xshell: host {name}: update from the release failed: {}",
@@ -128,7 +135,7 @@ fn release_failure(name: &str, e: HostError) -> HostError {
         HostError::offline(RING_NO_BUILD)
     } else if remote && e.message.starts_with(UPDATE_LATEST_BAD_BUILD) {
         HostError::offline(release_bad(name))
-    } else if remote && e.message.starts_with(STAGE_BUSY) {
+    } else if update_busy(&e) {
         HostError::new(HostErrorCode::Busy, ring_busy(name))
     } else if matches!(e.code, HostErrorCode::Offline | HostErrorCode::Timeout) {
         HostError::offline(ring_offline(name))
@@ -2940,7 +2947,17 @@ fn request_upgrade(
     let weak = Arc::downgrade(sh);
     let o = once.clone();
     let w: Waiter = Box::new(move |r| {
+        let mut r = r;
         if let Some(sh) = weak.upgrade() {
+            // The Host is busy with another update (one still on trial): say so in the
+            // approved words, at once.
+            if let Err(e) = &r {
+                if update_busy(e) {
+                    let name = sh.lock().cfg.name.clone();
+                    eprintln!("xshell: host {name}: update refused: {}", e.message);
+                    r = Err(HostError::new(HostErrorCode::Busy, ring_busy(&name)));
+                }
+            }
             match &r {
                 Ok(_) => accept_upgrade(&sh, op, original_gen, true),
                 Err(e) => {

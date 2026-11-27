@@ -286,6 +286,11 @@ pub const STAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const STAGE_MAX_CHUNK: u64 = 1024 * 1024;
 /// The refusal of a `daemon.stage-begin` while another connection sends a build.
 pub const STAGE_BUSY: &str = "another update is being sent to this machine";
+/// The refusal of `daemon.update-latest` and `daemon.upgrade-selected` (and of a plain
+/// `daemon.upgrade` that selects another build) while an earlier update of this machine is
+/// still on trial: nothing was downloaded, selected or restarted. Try again once that trial
+/// is accepted or rolled back.
+pub const UPDATE_ON_TRIAL: &str = "an earlier update of this machine is still on trial";
 /// Prefix of a `daemon.update-latest` refusal: the release server could not be reached or
 /// answered something unusable (an error status, no version).
 pub const UPDATE_LATEST_UNREACHABLE: &str = "the xshell release server cannot be reached";

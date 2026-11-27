@@ -1204,3 +1204,97 @@ fn broker_view_shows_release_offer_and_refuses_update() {
     assert_eq!(wire["updateVersion"], serde_json::json!(next));
     assert_eq!(wire["updateSource"], serde_json::json!("release"));
 }
+
+/// Mario's sequence: an rjw.3 Host is updated by the old path; while that update is still on
+/// trial, the release is offered and Update is clicked. The Host refuses at once as busy
+/// (approved sentence, within seconds), keeps running the first target, and the same
+/// Update succeeds once the trial is accepted.
+#[test]
+fn release_update_during_open_trial_reports_busy_then_succeeds() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    stub.release(&next, triple(), &rel, None);
+    let (bytes, first) = patched("aaaaaaaaaaaa");
+    let desktop = Desktop::new(&relay, first.clone(), bytes);
+    let url = stub.url();
+    let own = install_dir_name(VERSION, Some(&own_build()));
+    let (m, key) = Machine::start(
+        &relay,
+        &desktop,
+        &[
+            ("XSHELL_GET_URL", &url),
+            // Only the first build is "rjw.3"; the build it is updated to offers the release.
+            ("XSHELLD_TEST_HIDE_CAPABILITIES", "daemon.update-latest"),
+            ("XSHELLD_TEST_HIDE_CAPABILITIES_ONLY_IN", &own),
+            // The first update stays on trial long enough to update again meanwhile.
+            ("XSHELLD_TEST_TRIAL_SETTLE_MS", "12000"),
+        ],
+    );
+    let host = desktop.host(key);
+    let name = name_of(&desktop, host.id());
+    let before = host.status().link_generation;
+    reply(|w| host.upgrade(w)).unwrap_or_else(|e| panic!("{e:?}\n{}", m.log()));
+    let first_dir = install_dir_name(VERSION, Some(&first));
+    wait("on the first target, offering the release", || {
+        let s = host.status();
+        s.usable()
+            && s.phase.is_none()
+            && s.link_generation > before
+            && s.daemon_build.as_ref() == Some(&first)
+            && s.daemon_capabilities
+                .iter()
+                .any(|c| c == "daemon.update-latest")
+    });
+    assert!(!m.trial_closed(), "the first update is still on trial");
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let pid = m.pid();
+    let at = Instant::now();
+    let e = reply(|w| host.upgrade(w)).unwrap_err();
+    assert!(
+        at.elapsed() < Duration::from_secs(10),
+        "answered after {:?}",
+        at.elapsed()
+    );
+    assert_eq!(
+        e.message,
+        xshell_hostlink::handle::ring_busy(&name),
+        "{}",
+        m.log()
+    );
+    let s = host.status();
+    assert!(s.usable() && s.phase.is_none(), "{s:?}");
+    assert_eq!(
+        s.last_error.as_deref(),
+        Some(xshell_hostlink::handle::ring_busy(&name).as_str())
+    );
+    assert_eq!(s.daemon_build.as_ref(), Some(&first));
+    assert!(alive(pid));
+    assert_eq!(exe_of(pid), m.installed(&first_dir));
+    assert_eq!(
+        stub.count(&GetStub::asset(&next, triple())),
+        0,
+        "nothing downloaded"
+    );
+    assert!(!m
+        .installed(&install_dir_name(&next, Some(&rel_build)))
+        .parent()
+        .unwrap()
+        .exists());
+    // The trial is accepted; the same Update then goes through.
+    wait("first trial accepted", || m.trial_closed());
+    let before = host.status().link_generation;
+    reply(|w| host.upgrade(w)).unwrap_or_else(|e| panic!("{e:?}\n{}", m.log()));
+    wait("on the release", || {
+        let s = host.status();
+        s.usable()
+            && s.phase.is_none()
+            && s.link_generation > before
+            && s.daemon_version.as_deref() == Some(next.as_str())
+            && s.daemon_build.as_ref() == Some(&rel_build)
+    });
+    assert_eq!(host.status().last_error, None);
+}

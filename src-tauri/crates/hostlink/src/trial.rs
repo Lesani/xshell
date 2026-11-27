@@ -185,6 +185,13 @@ pub fn read(home: &Path) -> io::Result<Option<Trial>> {
     }
 }
 
+/// Whether an update trial of this machine is open: its lock is held (a watchdog runs) or
+/// its record is there. A record that cannot be read counts as open.
+#[cfg(unix)]
+pub fn open(home: &Path) -> bool {
+    held(home) || !matches!(read(home), Ok(None))
+}
+
 #[cfg(unix)]
 pub fn write(home: &Path, t: &Trial) -> io::Result<()> {
     durable_write(&root(home).join(TRIAL), t.encode().as_bytes())

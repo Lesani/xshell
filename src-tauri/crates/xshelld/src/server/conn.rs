@@ -1018,6 +1018,11 @@ fn selected_linux(
         .ok_or_else(|| format!("{dir} is not installed"))?;
     // C8: before the installed build runs at all.
     super::staging::authorized(d, who)?;
+    // Refused at once while the previous update is on trial (`upgrade::begin` checks again
+    // under the trial lock).
+    if xshell_hostlink::trial::open(&d.cfg.home) {
+        return Err(xshell_protocol::msg::UPDATE_ON_TRIAL.into());
+    }
     let (v, b) = crate::stage::native_identity(&file).map_err(|e| e.to_string())?;
     if v != version || !b.is_some_and(|b| b.same(build)) {
         return Err("installed target identity differs".into());

@@ -128,9 +128,9 @@ mod linux {
         };
         let lock = trial::try_lock(home)
             .map_err(|e| e.to_string())?
-            .ok_or("an update of this machine is already running")?;
+            .ok_or(xshell_protocol::msg::UPDATE_ON_TRIAL)?;
         if trial::read(home).map_err(|e| e.to_string())?.is_some() {
-            return Err("an earlier update of this machine is not finished".into());
+            return Err(xshell_protocol::msg::UPDATE_ON_TRIAL.into());
         }
         let t = Trial {
             target: target.to_string(),
