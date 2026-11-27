@@ -97,11 +97,11 @@ describe("Skip this version", () => {
     await bar.skip("box-a");
     expect(bar.rows()).toHaveLength(1);
     expect(bar.rows()[0]).toContain("box-b");
-    // An earlier attempt's error is hidden with the skipped offer, also once the machine is offline.
+    // An earlier attempt's error is hidden with the skipped offer; with nothing offered, an error shows.
     await bar.show({ r_a: { ...release("r_a"), lastError: "stage failed", errorHint: "update-failed" }, r_b: release("r_b") });
     expect(bar.html()).not.toContain("box-a");
     await bar.show({ r_a: { ...release("r_a"), status: "offline", updateAction: null, updateSource: null, updateVersion: null, lastError: "offline: deadline reached", errorHint: "update-failed" }, r_b: release("r_b") });
-    expect(bar.html()).not.toContain("box-a");
+    expect(bar.html()).toContain("box-a");
     // A newer release is another target.
     await bar.show({ r_a: release("r_a", "1.7.0"), r_b: release("r_b") });
     expect(bar.rows().map(t => t.slice(0, 5))).toEqual(["box-a", "box-b"]);

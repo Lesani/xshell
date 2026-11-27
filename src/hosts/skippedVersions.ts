@@ -30,16 +30,14 @@ function parse(raw: unknown): SkippedTargets {
   return Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === "string" && v)) as SkippedTargets;
 }
 
-/// The bar hides this machine's offer: its skipped target is the one offered now. With a
-/// skipped target and nothing offered now (the machine went offline after a failed attempt),
-/// only an earlier attempt's error would be left to show: hidden too. Until the stored
-/// targets are loaded every offer counts as skipped, so a skipped row never flashes.
+/// The bar hides this machine's offer: its skipped target is the one offered now. With
+/// nothing offered now there is nothing to skip: an error of a later attempt (started from
+/// Settings) stays visible. Until the stored targets are loaded every offer counts as
+/// skipped, so a skipped row never flashes.
 export function isVersionSkipped(snapshot: Snapshot, host: HostId, status: HostStatus | undefined): boolean {
   const offered = updateTargetKey(status);
   if (!snapshot.loaded) return offered !== null;
-  const skipped = snapshot.skipped[host];
-  if (!skipped) return false;
-  return offered === null ? !status?.updateUnavailable && !status?.routeUpdateUnavailable : offered === skipped;
+  return offered !== null && snapshot.skipped[host] === offered;
 }
 
 // Kept in settings.json, so a skip survives a restart. One target per machine: a new skip
