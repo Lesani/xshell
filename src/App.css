@@ -1867,7 +1867,9 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .ds-stale .ds-icon { opacity: 0.55; }
 .ds-host-status { position: absolute; top: 1px; left: calc(50% - 21px); width: 8px; height: 8px; border-radius: 50%; border: 2px solid var(--bg-surface); background: var(--text-muted); z-index: 2; pointer-events: none; }
 .ds-host-status-offline, .ds-host-status-incompatible { background: #b53333; }
-.ds-host-status-reconnecting { background: #c9a042; }
+/* A Host that is connecting shows a turning ring where its status dot would be. */
+.ds-host-status-reconnecting { box-sizing: border-box; width: 12px; height: 12px; top: 0; left: calc(50% - 22px); background: var(--bg-surface); border: 2px solid rgba(201, 160, 66, 0.3); border-top-color: #c9a042; animation: spin 0.8s linear infinite; }
+.host-spin { display: inline-block; flex: none; box-sizing: border-box; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid rgba(201, 160, 66, 0.3); border-top-color: #c9a042; animation: spin 0.8s linear infinite; }
 .usage-hosts { margin-left: 6px; font-size: 10px; color: var(--text-muted); }
 .session-item-host { margin-right: 2px; }
 .sessions-view-host { margin-right: 6px; vertical-align: middle; }
@@ -1896,6 +1898,11 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .host-chip-connected .host-chip-dot { background: var(--success); }
 .host-chip-upgrade-pending .host-chip-dot, .host-chip-build-differs .host-chip-dot, .host-chip-reconnecting .host-chip-dot { background: #c9a042; }
 .host-chip-offline .host-chip-dot, .host-chip-incompatible .host-chip-dot { background: #b53333; }
+.host-chip-reconnecting .host-chip-dot { box-sizing: border-box; width: 9px; height: 9px; background: transparent; border: 1.5px solid rgba(201, 160, 66, 0.3); border-top-color: #c9a042; animation: spin 0.8s linear infinite; }
+/* Reduced motion: the open ring stays, it does not turn. */
+@media (prefers-reduced-motion: reduce) {
+  .host-spin, .host-chip-reconnecting .host-chip-dot, .ds-host-status-reconnecting { animation: none; }
+}
 .host-row-note { font-size: 11px; color: var(--text-secondary); }
 .host-row-warn { color: #d97757; }
 .host-row-error { font-size: 11px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }

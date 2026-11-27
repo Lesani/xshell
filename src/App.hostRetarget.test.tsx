@@ -194,6 +194,7 @@ it.each(["success", "admission", "abort", "partial-abort", "offline-abort"])("ac
     expect(xterms).toHaveLength(1); expect(xterm.dispose).not.toHaveBeenCalled();
     // K is unavailable: the original UUID remains stale, never attached to K2.
     expect(container.querySelector(".terminal-remote-banner")?.textContent).toContain("Waiting");
+    expect(container.querySelector(".terminal-remote-banner [data-host-connecting]")).not.toBeNull();
     writeTerminalInput(captured, "late-after-configure");
     snapshots = [{ status: status(h, 2), terminals: [] }, { status: status(r, 3), terminals: [info] }];
     await act(async () => {

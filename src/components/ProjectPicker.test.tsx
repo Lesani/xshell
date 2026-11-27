@@ -39,6 +39,7 @@ it("selects Ring history at the real command/event boundary with zero saved SSH,
     expect(container.querySelectorAll(".picker-group")).toHaveLength(1);
     expect(container.textContent).toContain("Ring-only Daemon");
     expect(container.textContent).not.toContain("Local equivalent");
+    expect(container.querySelector("[data-host-connecting]")).toBeNull();
     const row = container.querySelector<HTMLElement>(".picker-group .picker-item")!;
     expect(row.textContent).toContain("ring-project");
     await act(async () => { row.click(); });
@@ -50,6 +51,13 @@ it("selects Ring history at the real command/event boundary with zero saved SSH,
       render("offline");
     });
     expect(container.querySelector(".picker-group-stale")?.textContent).toContain("Cached");
+    // A turning ring only while the Host is being connected.
+    expect(container.querySelector("[data-host-connecting]")).toBeNull();
+    await act(async () => {
+      native.handlers.get("hosts:status")!({ payload: { host: id, status: "reconnecting" } });
+      render("reconnecting");
+    });
+    expect(container.querySelector(".picker-group-head [data-host-connecting]")).not.toBeNull();
     expect(container.querySelector(".picker-group .picker-item")?.textContent).toContain("ring-project");
     expect(registry.getSnapshot().configs).toEqual([]);
     expect(native.invoke.mock.calls.some(([command]) => ["host_test", "host_upgrade"].includes(command))).toBe(false);

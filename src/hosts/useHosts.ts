@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { AGENT_IDS, type AgentId } from "../agents";
 import { registry, isUsableStatus, type RegistrySnapshot } from "./registry";
+export { isConnecting, isRelayAway } from "./registry";
 import { fmt } from "./strings";
 import { LOCAL_HOST } from "./localHost";
 import type { AvailableHost, HostConfig, HostId, HostStatus, TerminalInfo } from "./types";

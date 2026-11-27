@@ -115,6 +115,18 @@ it("a machine that left: the tab stays, says so by name, never shows its Host id
   await emit("hosts:status", status(OLD, "offline"));
   expect(container.textContent).toContain("hotel is offline. Reconnecting…");
   expect(container.querySelector("[data-tab-removed]")).toBeNull();
+  // Offline only when the Relay says the machine is away and the Relay is the route in use;
+  // otherwise the Host is being connected.
+  await emit("hosts:status", status(OLD, "reconnecting"));
+  expect(container.textContent).toContain("hotel is offline. Reconnecting…");
+  await available([{ ...row(OLD), reachability: { kind: "unknown" } }]);
+  expect(container.textContent).not.toContain("hotel is offline");
+  expect(container.textContent).toContain("Waiting for hotel…");
+  await available([{ ...row(OLD), activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "unreachable", at: 1 } }]);
+  expect(container.textContent).not.toContain("hotel is offline");
+  expect(container.textContent).toContain("Waiting for hotel…");
+  await available([row(OLD, "closed")]);
+  await emit("hosts:status", status(OLD, "offline"));
 
   // hotel leaves the Ring (the Roster drops it; it is no longer available).
   await emit("ring:status", member({ members: [me] }));
