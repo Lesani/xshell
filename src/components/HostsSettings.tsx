@@ -14,7 +14,8 @@ import { buildText } from "../buildId";
 import { phaseLabel, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostConfig, HostStatus, HostTestResult } from "../hosts/types";
 
-// Settings → Hosts: add, edit, test, reconnect, upgrade and remove Remote Hosts.
+// Settings → Hosts: this computer's Daemon, and SSH Hosts (add, edit, test, reconnect, upgrade,
+// remove). The Ring's machines are in Settings → Ring.
 // Saving persists the `hosts` key in settings.json and reconfigures the registry (App).
 
 interface Props {

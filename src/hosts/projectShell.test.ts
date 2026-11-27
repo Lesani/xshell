@@ -7,7 +7,7 @@ import type { ProjectInfo } from "../types";
 const project: ProjectInfo = { host: "h_ab12cd34", name: "project", path: "C:\\work\\project", encoded_name: "project", session_count: 0, last_active: "" };
 const context: OpenContext = {
   now: 1, uuid: () => "terminal-uuid", fullscreenRendering: false, forceSyncOutput: false,
-  isConfigured: () => true, isUsable: () => true, status: () => undefined,
+  isAvailable: () => true, isUsable: () => true, status: () => undefined,
   hostName: () => "Host", statusLabel: () => "Offline",
 };
 function shellPlan(os: string | undefined, p = project, ctx = context) {

@@ -46,10 +46,12 @@ const hostB: HostConfig = { id: "h_bbbbbbbb", name: "Remote B", sshTarget: "fixt
 const localProject: ProjectInfo = { name: "LocalProject", path: "/projects/local", encoded_name: "-projects-local", session_count: 0, last_active: "" };
 const projectA: ProjectInfo = { name: "ProjectA", path: "/projects/a", encoded_name: "-projects-a", session_count: 0, last_active: "", host: hostA.id };
 const projectB: ProjectInfo = { name: "ProjectB", path: "/projects/b", encoded_name: "-projects-b", session_count: 0, last_active: "", host: hostB.id };
-const localInfo: LocalHostInfo = {
+// The Daemon is ready (start-up waits for live readiness in Daemon mode).
+const localInfo = {
   mode: "daemon", reason: null,
   persistent: { supported: true, enabled: true, running: "persistent", log: "/fixture/xshelld.log" },
-};
+  daemon: { state: "ready", error: null, errorKind: null, log: "/fixture/xshelld.log" }, service: null,
+} as LocalHostInfo;
 const eligibleStatus = (host: string): HostStatus => ({
   host, status: "build-differs", phase: null, lastError: null, errorHint: null,
   daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1,
@@ -112,21 +114,33 @@ async function focusPane(terminal: TerminalInfo) {
   expect(pane!.classList.contains("group-pane-active")).toBe(true);
 }
 const banner = () => container.querySelector(".main-content > .host-update-banner");
+// The bar lists every eligible Remote Host wherever the user is; what is left is this computer's.
+const rows = () => [...banner()?.querySelectorAll(".host-update-action") ?? []];
+const remoteRow = (host: HostConfig) => rows().find(r => r.textContent?.includes(host.name));
+const localRows = () => rows().filter(r => ![hostA, hostB].some(h => r.textContent?.includes(h.name)));
+const localText = () => localRows().map(r => r.textContent).join("");
+const order = () => rows().map(r => [hostA, hostB].find(h => r.textContent?.includes(h.name))?.name ?? "local");
 function expectNoControls() {
-  expect(banner()?.querySelectorAll("button, a, input, [role='button']").length ?? 0).toBe(0);
+  expect(localRows().flatMap(r => [...r.querySelectorAll("button, a, input, [role='button']")]).length).toBe(0);
 }
-function expectLocalNotice(context: string, description = differentBuildText) {
-  const text = banner()?.textContent ?? "";
-  // Only required Local presence is soft so all native/navigation controls run on RED.
-  expect.soft(text, `${context}: native Local description`).toContain(description);
-  expect.soft(text, `${context}: textual Settings guidance`).toContain(settingsHint);
-  expect(text).not.toContain(hostA.name);
-  expect(text).not.toContain(hostB.name);
+// This computer switches its own background program: no notice with versions, build hashes or
+// "check Settings" guidance (only a progress line while it switches).
+function expectLocalNotice(context: string, _description?: string) {
+  expect(localText(), `${context}: no Local notice`).toBe("");
+  expect(banner()?.textContent ?? "").not.toContain(settingsHint);
+  expect(banner()?.textContent ?? "").not.toContain("This computer");
+  expect(banner()?.textContent ?? "").not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expectNoControls();
+  // No Remote focus: the Remote Hosts keep their configured order.
+  expect(order(), context).toEqual([hostA.name, hostB.name]);
 }
+// The focused Remote Host comes first; the other is still offered.
 function expectRemoteNotice(host: HostConfig) {
-  expect(banner()?.textContent).toContain(`${host.name} is running a different build of xshell`);
-  expect(banner()?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
+  const other = host === hostA ? hostB : hostA;
+  expect(order()).toEqual([host.name, other.name]);
+  expect(remoteRow(host)?.textContent).toContain(`${host.name}: Update available`);
+  expect(banner()?.textContent).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
+  expect(remoteRow(host)?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
   expect(banner()?.textContent).not.toContain("This computer");
   expect(banner()?.textContent).not.toContain(settingsHint);
 }
@@ -138,7 +152,7 @@ async function localStatus(patch: Partial<HostStatus>) {
   expect(registry.getStatus(LOCAL_HOST)).toEqual(status);
 }
 
-it("shows only text guidance for eligible native Local Daemon contexts, preserving Remote actions and status/navigation guards", async () => {
+it("shows only text guidance for eligible native Local Daemon contexts while the bar keeps every Remote action, the focused one first, with status/navigation guards", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
   const snapshots: HostSnapshot[] = [
@@ -178,11 +192,17 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return localInfo;
+      // The Ring start view and the quit prompt: no Ring status here (no setup screen).
+      case "ring_status": case "ring_join_overview": case "local_quit_prompt_ready": return null;
       // Daemon startup reads this even with no legacy Tabs. Keep migration real.
       case "local_migration_journal_read": return null;
+      // Settings → Hosts mounts the Ring section (#87).
+      case "ring_status": case "ring_join_overview": return null;
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(LOCAL_HOST).desktopBuild };
+      case "app_updates_enabled": return true;
       case "list_claude_projects": return [host === hostA.id ? projectA : host === hostB.id ? projectB : localProject];
       case "list_pi_projects":
       case "get_all_recent_sessions":
@@ -209,8 +229,9 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
   expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "local_migration_journal_read")).toHaveLength(1);
   expect(unexpectedNativeCalls).toEqual([]);
 
-  // Eligible Local metadata alone does not make global Home a Host context.
-  expect(banner()).toBeNull();
+  // Eligible Local metadata alone does not make global Home a Host context; the Remote
+  // Hosts are offered anyway.
+  expectLocalNotice("global Home");
   await click(`[data-drop-path='${keyOf(localProject)}']`);
   expect(container.querySelector(".project-detail-main .sessions-view-title")?.textContent).toBe(localProject.name);
   expectLocalNotice("selected Local Project");
@@ -247,7 +268,8 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
   await clickText(".settings-nav-item", "Hosts");
   const localSection = [...container.querySelectorAll(".settings-section")].find(section => section.querySelector(".settings-section-title")?.textContent === "This computer");
   expect(localSection, "existing This computer Settings section").toBeDefined();
-  expect(localSection!.textContent).toContain("Terminal setup 1.5.0 (3b9c9a89c10e) · keeps running");
+  expect(localSection!.textContent).toContain("Terminal setup 1.5.0 · keeps running");
+  expect(localSection!.textContent).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expect(localSection!.textContent).toContain("Different build");
   const replace = [...localSection!.querySelectorAll("button")].find(button => button.textContent?.trim() === "Replace with Desktop’s build");
   expect(replace, "existing Settings replacement control").toBeDefined();
@@ -256,13 +278,13 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
 
   await click(".ds-home");
   expect(container.querySelector(".project-detail-split")).toBeNull();
-  expect(banner()).toBeNull();
+  expectLocalNotice("global Home after Settings");
   await click(`[data-drag-id="${tabId(localTerminal)}"]`);
   expectLocalNotice("active Local Daemon Tab");
 
   await localStatus({ status: "upgrade-pending", daemonVersion: "1.4.0", updateAction: "update" });
   expectLocalNotice("native older version", "This computer is running xshell 1.4.0. This Desktop uses 1.5.0.");
-  expect(banner()?.textContent ?? "").not.toContain("different build");
+  expect(localText()).not.toContain("different build");
   await localStatus({});
   expectLocalNotice("native different build");
   await localStatus({ daemonBuild: null });
@@ -275,15 +297,20 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
     { label: "reconnecting despite stale fields", patch: { status: "reconnecting" } },
     { label: "missing Daemon version", patch: { daemonVersion: null } },
     { label: "empty Daemon version", patch: { daemonVersion: "" } },
-    { label: "preparing", patch: { phase: "preparing" } },
-    { label: "upgrading", patch: { phase: "upgrading" } },
     { label: "incompatible older Daemon", patch: { status: "incompatible", incompatibleReason: "daemon-older" } },
   ];
   for (const { label, patch } of excluded) {
     await localStatus(patch);
-    expect(banner()?.textContent ?? "", `excluded Local status: ${label}`).toBe("");
+    expect(localText(), `excluded Local status: ${label}`).toBe("");
     expectNoControls();
   }
+  // While this computer switches: the approved progress line only.
+  await localStatus({ phase: "preparing" });
+  expect(localText()).toBe("Sending update…");
+  expect(order()).toEqual(["local", hostA.name, hostB.name]);
+  await localStatus({ phase: "upgrading" });
+  expect(localText()).toBe("Restarting…");
+  expectNoControls();
   await localStatus({});
   expectLocalNotice("reactive different-build reappearance");
   expect(container.querySelector(`[data-drag-id="${tabId(localTerminal)}"].active`)).not.toBeNull();

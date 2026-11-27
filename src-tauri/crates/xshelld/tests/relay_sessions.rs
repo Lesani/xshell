@@ -1,4 +1,8 @@
 #![cfg(unix)]
+#![cfg_attr(
+    not(feature = "legacy-pair-test-control"),
+    allow(unused_imports, dead_code)
+)]
 //! Seam 2: sessions through the Relay into the Daemon. The test Relay, the real
 //! `DesktopRing` (pairing), in-process Daemons and the protocol's Ring client standing in for
 //! the phone. A session is one more protocol connection with the peer's Roster role.
@@ -156,8 +160,9 @@ fn refused_attach(c: &mut Client, t: Uuid) {
     assert!(e.starts_with(FORBIDDEN), "{e}");
 }
 
-/// The second computer `h2` (running `srv2`) pairs itself with `xshelld pair`, its code
-/// typed on the Desktop: it never gets a local `ring.join`. Returns once it is online.
+/// Genuine v1 helper control for the second Host, not the production v2 CLI.
+/// Its old code is typed on the Desktop; returns once the Host is online.
+#[cfg(feature = "legacy-pair-test-control")]
 fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: &ServerHandle) {
     let (d2, _, _) = identity(srv2);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -185,7 +190,13 @@ fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: 
     };
     let paths2 = h2.paths();
     let pairing = std::thread::spawn(move || {
-        xshelld::pair::run_pair_to(&opts, &paths2, &mut Lines(tx, Vec::new()))
+        xshelld::pair::run_legacy_pair_test_control(
+            &opts,
+            &paths2,
+            &mut Lines(tx, Vec::new()),
+            Duration::from_secs(30),
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     });
     let code = loop {
         let l = rx.recv_timeout(T).expect("the code is shown");
@@ -196,12 +207,13 @@ fn pair_second_computer(r: &TestRelay, ring: &DesktopRing, h2: &TestHome, srv2: 
     std::thread::sleep(Duration::from_millis(200));
     ring.pair_computer(&code, Arc::new(Events::default()))
         .unwrap();
-    assert_eq!(pairing.join().unwrap(), 0);
+    assert!(pairing.join().unwrap().is_ok());
     let id = ring.chain().unwrap().ring_id().clone();
     wait_until("the second daemon is online", T, || online(r, &id, &d2));
 }
 
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn every_daemon_accepts_new_member_within_seconds() {
     let r = relay();
     let (h1, h2) = (TestHome::new(), TestHome::new());
@@ -461,6 +473,7 @@ fn tampering_relay_end_to_end() {
 /// seconds through the Relay alone (neither gets a local `ring.join` after the removal; the
 /// second never got one). The phone stops, and can neither log in nor open a session again.
 #[test]
+#[cfg(feature = "legacy-pair-test-control")]
 fn removing_a_phone_cuts_it_on_every_daemon_within_seconds() {
     let r = relay();
     let (h1, h2) = (TestHome::new(), TestHome::new());
@@ -756,4 +769,94 @@ fn mobile_answers_prompt_over_relay() {
         l.iter()
             .any(|i| i.terminal == term && i.permission_prompt.is_none())
     });
+}
+
+fn deadline_during_roster_io_enforces_removal(write_error: bool) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use xshelld::server::{TestHook, TestPoint};
+    let armed = Arc::new(AtomicBool::new(false));
+    let hit = Arc::new(AtomicBool::new(false));
+    let (a, h) = (armed.clone(), hit.clone());
+    let request = timeouts().request; // existing timeout, never increased or renewed
+    let mut s = setup_with(|c| {
+        fast(c);
+        c.test_hook = Some(TestHook(Arc::new(move |_, point| {
+            if point == TestPoint::RingRosterTempSynced && a.load(Ordering::Acquire) {
+                h.store(true, Ordering::Release);
+                // Deliberately cross the captured request deadline inside actual
+                // temp-write/sync -> rename IO, not in an admission prerequisite.
+                let (_held, wait) = mpsc::channel::<()>();
+                assert!(wait
+                    .recv_timeout(request + Duration::from_millis(100))
+                    .is_err());
+                return write_error;
+            }
+            false
+        })));
+    });
+    let phone = Peer::new(&s.r, &s.ring.chain, &s.mobile);
+    let base = settled(&s.srv);
+    let mut live = phone.client(&s.daemon);
+    assert!(live.call("list_claude_projects", json!({})).is_ok());
+    s.r.ignore_roster_puts(true); // no Relay observation can silently repair the owner
+    let before = std::fs::read(s.h.paths().ring_dir.join("roster.json")).unwrap();
+    let key = s.mobile.sign_key();
+    s.ring.next(|d| {
+        d.remove(&key);
+    });
+    armed.store(true, Ordering::Release);
+    let mut local = Client::in_process(&s.srv, Role::Desktop);
+    let error = local
+        .request(&ClientMsg::RingJoin {
+            rosters: tokens(&s.ring.chain),
+            expect: None,
+        })
+        .unwrap_err();
+    armed.store(false, Ordering::Release);
+    assert!(hit.load(Ordering::Acquire));
+    assert!(
+        error.contains(if write_error {
+            "could not be saved"
+        } else {
+            "counterpart request deadline"
+        }),
+        "{error}"
+    );
+    let current = local.request(&ClientMsg::RingIdentity).unwrap();
+    assert_eq!(
+        current["ring"]["version"],
+        s.ring.chain.head().version(),
+        "cache must enforce settled authority despite error"
+    );
+    local.shutdown(); // exclude this test's administration connection from the count
+    wait_connections(&s.srv, base, Duration::from_secs(3));
+    assert!(
+        online(&s.r, s.ring.chain.ring_id(), &key),
+        "Relay deliberately retains old authority"
+    );
+    assert!(
+        phone.sessions.open(&s.daemon).is_err(),
+        "fresh admission must use the revoked owner authority"
+    );
+    let bytes = std::fs::read(s.h.paths().ring_dir.join("roster.json")).unwrap();
+    if write_error {
+        assert_eq!(bytes, before);
+    } else {
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["rosters"].as_array().unwrap().last().unwrap(),
+            s.ring.chain.head().token()
+        );
+    }
+}
+#[test]
+fn expired_after_roster_sync_still_revokes_live_and_fresh_sessions() {
+    deadline_during_roster_io_enforces_removal(false);
+}
+#[test]
+fn expired_after_roster_sync_write_error_still_revokes_live_and_fresh_sessions() {
+    deadline_during_roster_io_enforces_removal(true);
 }

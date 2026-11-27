@@ -1,11 +1,12 @@
 import type { RightPanel } from "../tabs/rightPanel";
+import { C, fmtc } from "../ring/copy";
 import { effectiveTabName } from "../tabs/tabName";
 import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } from "react";
 import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
 import type { HostId } from "../hosts/types";
-import { captureTerminalInput, writeTerminalInput, type TerminalInputAction, localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
+import { captureTerminalInput, writeTerminalInput, remoteTerminals, type TerminalInputAction, localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
 import { usesClaudeBranchDetection } from "../tabs/sessionBranch";
 import { sessionKeyOf, sessionKeyOfTab } from "../hosts/projectKey";
 import { skipPermsOn, skipPermsState } from "../tabs/skipPermissions";
@@ -180,6 +181,8 @@ interface TerminalTabProps {
   // A Local Tab's agent restarted with skip permissions turned on or off. Remote Tabs learn
   // it from the Host's terminals list instead.
   onSkipPermissionsChange: (tabId: string, value: boolean) => void;
+  // Closes only this Tab (its machine left the Ring: nothing is closed there).
+  onCloseDeparted?: (tabId: string) => void;
 }
 
 // Compact USD formatter for the header strip — keeps the value tight on narrow terminals
@@ -219,13 +222,14 @@ const DEFAULT_PANEL = 280;
 // panel is dragged to its widest, so it can cover most of the terminal but stay usable.
 const PANEL_EDGE_RESERVE = 140; // = the CSS max-width reserve on .terminal-side-panel
 
-export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPolling, gitChangesTree, rightPanel, onRightPanelChange, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange }: TerminalTabProps) {
+export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPolling, gitChangesTree, rightPanel, onRightPanelChange, terminalBgColor, defaultFontSize, defaultShellId, fullscreenRendering, forceSyncOutput, webglRendering, terminalFontWeight, eagerInit, theme, projectEncodedName, showTerminalHeaderStats, onBranchSwitch, onSkipPermissionsChange, onCloseDeparted }: TerminalTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const [_error, setError] = useState<string | null>(null);
   const tabRef = useRef(tab);
+  tabRef.current = tab;
   const observedCompletionRef = useRef(observedCompletionId);
   observedCompletionRef.current = observedCompletionId;
   // Loading state: true from spawn until the PTY emits its first byte. That window covers
@@ -235,6 +239,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
   const sawFirstOutputRef = useRef(false);
   // Lifecycle bookkeeping for the Terminal (local PTY or remote Terminal).
   const startedRef = useRef(false);
+  const rebindTransportRef = useRef<(() => void) | null>(null);
+  useEffect(() => { rebindTransportRef.current?.(); }, [tab.host]);
   const startOptsRef = useRef<StartOptions | null>(null);
   const isActiveRef = useRef(isActive);
   useEffect(() => { isActiveRef.current = isActive; }, [isActive]);
@@ -245,7 +251,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
   const hostStatus = useHostStatus(liveHost ?? undefined);
   const hostLive = useHostLive(liveHost ?? undefined);
   const hostsSnap = useHostsSnapshot();
-  const hostName = tab.host ? (hostsSnap.configs.find(c => c.id === tab.host)?.name || tab.host) : localDaemonTab ? fmt("picker.group.local") : "";
+  const hostName = tab.host ? registry.hostName(tab.host) : localDaemonTab ? fmt("picker.group.local") : "";
   const [inputPaused, setInputPaused] = useState(false);
   const inputPausedTimerRef = useRef<number | null>(null);
   const flashInputPaused = useCallback(() => {
@@ -510,6 +516,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     const signal = abort.signal;
     // The Terminal's output sink, registered before anything starts.
     const conn: MountedTerminal = mountTerminal(tabRef.current, {
+      // RIS must share xterm's write queue: synchronous reset leaves queued bytes/parser state.
+      reset: () => term.write(new Uint8Array([0x1b, 0x63])),
       data: (bytes) => {
         if (!sawFirstOutputRef.current) {
           sawFirstOutputRef.current = true;
@@ -527,9 +535,10 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
         term.write("\r\n\x1b[90m[Session ended]\x1b[0m\r\n");
         setEnded(true);
       },
-    });
+    }, () => tabRef.current);
     // The Host whose Daemon runs this Tab's Terminal ("local" for a Local Daemon Tab).
     const remoteHost = daemonHost(tabRef.current);
+    let selectedHost = remoteHost ? registry.resolveAlias(remoteHost) : null;
     let inputDisposable: { dispose(): void } | null = null;
     let resizeDisposable: { dispose(): void } | null = null;
     let resizeTimer: number | undefined;
@@ -592,10 +601,10 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     containerRef.current.addEventListener("contextmenu", onContextMenu);
 
     async function spawnBackend(term: Terminal, _fitAddon: FitAddon) {
-      inputDisposable = term.onData((data) => {
+      if (!inputDisposable) inputDisposable = term.onData((data) => {
         // Remote Terminal while its Host is not usable: input is dropped, with a hint.
-        const inputHost = pasteAction ? daemonHost(pasteAction) : remoteHost;
-        if (inputHost && !registry.isUsable(inputHost)) { flashInputPaused(); return; }
+        const inputHost = pasteAction ? daemonHost(pasteAction) : daemonHost(tabRef.current);
+        if (inputHost && (!registry.isUsable(inputHost) || (!!tabRef.current.terminal && remoteTerminals.inputBlocked(tabRef.current.terminal, inputHost)))) { flashInputPaused(); return; }
         if (pasteAction) writeTerminalInput(pasteAction, data);
         else writeTerminal(tabRef.current, data, observedCompletionRef.current);
       });
@@ -605,7 +614,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
       // user drags the git-panel splitter or resizes the window causes a redraw storm. We let
       // fit() reflow xterm live for instant feedback, but coalesce the actual PTY resize to a
       // single call ~150ms after the drag settles.
-      resizeDisposable = term.onResize(({ cols, rows }) => {
+      if (!resizeDisposable) resizeDisposable = term.onResize(({ cols, rows }) => {
         if (resizeTimer) window.clearTimeout(resizeTimer);
         resizeTimer = window.setTimeout(() => {
           resizeTimer = undefined;
@@ -619,13 +628,13 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
         startOptsRef.current = opts;
         // A remote start that failed for a connection reason waits for the Host and retries.
         let r: Awaited<ReturnType<MountedTerminal["start"]>>;
-        if (remoteHost) {
-          try { r = await startWithRetry(remoteHost, () => conn.start(opts, signal), signal); }
+        if (daemonHost(tabRef.current)) {
+          try { r = await startWithRetry(daemonHost(tabRef.current)!, () => conn.start(opts, signal), signal); }
           catch (err) { if (signal.aborted || (err as Error)?.name === "AbortError" || err instanceof HostUnknownError) return; throw err; }
         } else {
           r = await conn.start(opts, signal);
         }
-        if (signal.aborted) return;
+        if (signal.aborted || r === null) return;
         startedRef.current = true;
         if (r && r.exitCode != null && !sawFirstOutputRef.current) {
           // Attached to a Terminal that already ended: nothing more will arrive.
@@ -652,8 +661,14 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
         sawFirstOutputRef.current = true;
         setIsInitializing(false);
         if (remoteHost) {
+          // Never the backend's text or a Host id: a machine that left says so in its banner;
+          // otherwise the approved offline line. The detail goes to the debug console only.
           const message = typeof err === "string" ? err : (err as { message?: string })?.message ?? String(err);
-          term.write(`\x1b[31m${terminalOpenFailedText(isLocalHost(remoteHost), registry.hostName(remoteHost), message)}\x1b[0m\r\n`);
+          console.debug("terminal start failed:", (err as { code?: string })?.code ?? "error");
+          void message;
+          const host = daemonHost(tabRef.current) ?? remoteHost;
+          if (isLocalHost(host)) term.write(`\x1b[31m${C["local.failed.title"]}\x1b[0m\r\n`);
+          else if (!registry.isDeparted(host)) term.write(`\x1b[31m${fmtc("tab.offline.state", { name: registry.machineName(host) })}\x1b[0m\r\n`);
           return;
         }
         term.write(`\x1b[31mFailed to start terminal: ${err}\x1b[0m\r\n`);
@@ -665,10 +680,25 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
 
     // Amendment 20: the Host's connection was replaced — re-run the (single-flight) attach
     // once usable. Rust re-attaches on its own; this is the fallback.
-    const offReattach = remoteHost ? registry.onReattach((h) => {
-      if (h !== remoteHost || !startedRef.current || !startOptsRef.current) return;
+    const reattach = () => {
+      const host = daemonHost(tabRef.current);
+      if (!host || signal.aborted || (tabRef.current.terminal && remoteTerminals.inputBlocked(tabRef.current.terminal, host) && !remoteTerminals.needsResync(tabRef.current.terminal))) return;
+      if (!startOptsRef.current || (!startedRef.current && !(tabRef.current.terminal && remoteTerminals.needsResync(tabRef.current.terminal)))) {
+        if (tabRef.current.terminal && remoteTerminals.identityHost(tabRef.current.terminal, host) !== remoteHost) void spawnBackend(term, fitAddon);
+        return;
+      }
+      selectedHost = registry.resolveAlias(host);
       const opts = { ...startOptsRef.current, cols: term.cols, rows: term.rows };
-      registry.waitUsable(remoteHost, signal).then(() => conn.reattach(opts, signal)).catch(() => {});
+      registry.waitUsable(host, signal).then(() => conn.reattach(opts, signal)).catch(() => {});
+    };
+    rebindTransportRef.current = reattach;
+    const matches = (h: string) => {
+      const host = daemonHost(tabRef.current);
+      return !!host && registry.resolveAlias(h) === registry.resolveAlias(host);
+    };
+    const offReattach = remoteHost ? registry.onReattach(h => { if (matches(h)) reattach(); }) : null;
+    const offUsable = remoteHost ? registry.onUsable(h => {
+      if (matches(h) && ((tabRef.current.terminal && (remoteTerminals.hasIdentityRebind(tabRef.current.terminal) || remoteTerminals.needsResync(tabRef.current.terminal))) || registry.resolveAlias(h) !== selectedHost)) reattach();
     }) : null;
 
     const containerEl = containerRef.current;
@@ -679,6 +709,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
       containerEl?.removeEventListener("wheel", onWheel);
       abort.abort();
       offReattach?.();
+      offUsable?.();
+      rebindTransportRef.current = null;
       if (resizeTimer) window.clearTimeout(resizeTimer);
       inputDisposable?.dispose();
       resizeDisposable?.dispose();
@@ -1123,7 +1155,13 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
   // to the plain path in that case (or whenever the user has explicitly disabled the strip).
   // Daemon Host state for the overlay/banner: null for in-process Tabs or when usable.
   const remoteState = liveHost ? terminalHostState(hostStatus, hostLive, startedRef.current) : null;
-  const remoteStateText = terminalHostStateText(remoteState, localDaemonTab, hostName, hostStatus?.lastError);
+  // The machine left the Ring: the Tab stays readable, says so and offers Close tab. A Ring
+  // machine that is only unreachable says it is offline.
+  const departed = !!tab.host && registry.isDeparted(tab.host);
+  const machine = tab.host ? registry.machineName(tab.host) : "";
+  const ringRow = tab.host ? hostsSnap.available.find(h => h.id === tab.host || h.aliases.includes(tab.host!)) : undefined;
+  const ringOffline = !!remoteState && !!ringRow && ringRow.routes.includes("relay") && ringRow.reachability.kind !== "online";
+  const remoteStateText = departed ? null : ringOffline ? fmtc("tab.offline.state", { name: machine }) : terminalHostStateText(remoteState, localDaemonTab, hostName, null); // never the backend error
   const remoteEnded = !!tab.terminal && !!hostLive?.some(t => t.terminal === tab.terminal && t.exitCode != null);
   const agentLabel = AGENTS[tab.agent || "claude"].label;
   const skipState = skipPermsState(tab, { live: hostLive, status: hostStatus, hostName, localEnded: ended, busy: skipBusy });
@@ -1229,7 +1267,17 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
             terminalRef.current?.focus();
           }}
         >
-          {isInitializing && (
+          {departed && (
+            <div className="terminal-remote-banner terminal-removed-banner" role="status" data-tab-removed={tab.id}>
+              <AlertTriangle size={12} />
+              <div className="terminal-removed-text">
+                <div className="terminal-removed-state">{fmtc("tab.removed.state", { name: machine })}</div>
+                <div>{C["tab.removed.body"]}</div>
+              </div>
+              <button className="btn btn-ghost" data-tab-removed-close onClick={() => onCloseDeparted?.(tab.id)}>{C["tab.removed.close"]}</button>
+            </div>
+          )}
+          {isInitializing && !departed && (
             <div className="terminal-loading-overlay">
               <div className="spinner" />
               <span>{remoteStateText ?? (isClaudeSession ? `Starting ${AGENTS[tab.agent || "claude"].label}…` : "Starting shell…")}</span>
@@ -1244,7 +1292,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
           {!isInitializing && remoteStateText && (
             <div className="terminal-remote-banner"><AlertTriangle size={12} /><span>{remoteStateText}</span></div>
           )}
-          {inputPaused && remoteState && !localDaemonTab && (
+          {inputPaused && remoteState && !localDaemonTab && !departed && (
             <div className="terminal-remote-hint">{fmt("terminal.remote.inputPaused")}</div>
           )}
         </div>

@@ -69,18 +69,23 @@ async function click(selector: string) {
   await act(async () => { element!.click(); });
 }
 const banner = () => container.querySelector(".main-content > .host-update-banner");
+const rows = () => [...banner()?.querySelectorAll(".host-update-action") ?? []];
+const rowOf = (host: HostConfig) => rows().find(r => r.textContent?.includes(host.name));
+// The bar's machines in order, by name.
+const order = () => rows().map(r => [hostA, hostB].find(h => r.textContent?.includes(h.name))?.name);
 function expectNotice(host: HostConfig, owned = false) {
   // Soft assertions let the rest of the navigation controls execute on the RED tree.
-  expect.soft(banner()?.textContent ?? "", `${host.name} notice in production App banner`).toContain(host.name);
+  const row = rowOf(host);
+  expect.soft(row?.textContent ?? "", `${host.name} notice in production App banner`).toContain(host.name);
   if (owned) {
-    expect.soft(banner()?.textContent).toContain("different build of xshell");
-    expect.soft(banner()?.textContent).toContain(`Update xshell on ${host.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
-    expect.soft(banner()?.querySelector("button")).toBeNull();
+    expect.soft(row?.textContent).toContain(`${host.name}: Update available`);
+    expect.soft(row?.textContent).toContain(`Update xshell on ${host.name}. xshell there manages terminals, so this update must be made on that machine.`);
+    expect.soft(row?.querySelector("button")).toBeNull();
     expect.soft(container.querySelector(".host-confirm-panel")).toBeNull();
-  } else expect.soft(banner()?.querySelector("button")?.textContent ?? "", `${host.name} replacement action`).toBe("Use this Desktop’s build");
+  } else expect.soft(row?.querySelector("button")?.textContent ?? "", `${host.name} replacement action`).toBe("Use this Desktop’s build");
 }
 
-it("scopes production App update actions and Desktop-owned guidance to the selected Remote Project", async () => {
+it("lists every eligible Remote Host in the production App bar, the focused one first, with Desktop-owned guidance per row", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   // The updater's optional changelog fetch must not use the network.
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
@@ -113,9 +118,15 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
     const method = command === "host_call" ? a?.method : command;
     switch (method) {
       case "local_host_info": return { mode: "in-process", reason: null };
+      // The Ring start view and the quit prompt: no Ring status here (no setup screen).
+      case "ring_status": case "ring_join_overview": case "local_quit_prompt_ready": return null;
+      // Settings → Hosts mounts the Ring section (#87).
+      case "ring_status": case "ring_join_overview": return null;
+      case "hosts_available": return { sequence: 0, hosts: [] };
       case "hosts_configure": return;
       case "hosts_status": return snapshots;
       case "app_build": return { version: "1.5.0", build: eligibleStatus(hostA.id).desktopBuild };
+      case "app_updates_enabled": return true;
       case "list_claude_projects": return [host === hostA.id ? projectA : host === hostB.id ? projectB : localProject];
       case "list_pi_projects":
       case "get_all_recent_sessions":
@@ -138,49 +149,49 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
   expect(registry.getStatus(hostA.id)?.updateAction).toBe("replace");
   expect(registry.getStatus(hostB.id)?.updateAction).toBe("replace");
 
-  // Global Home has no Host context even with eligible Remote Hosts connected.
-  expect(banner()).toBeNull();
+  // Global Home: no Host context, yet every eligible Remote Host is offered.
+  expect(order()).toEqual([hostA.name, hostB.name]);
+  expectNotice(hostA);
+  expectNotice(hostB);
   await click(`[data-drop-path='${keyOf(projectA)}']`);
   expect(container.querySelector(".project-detail-main .sessions-view-title")?.textContent).toContain(projectA.name);
-  expectNotice(hostA);
+  expect(order()).toEqual([hostA.name, hostB.name]);
 
-  // Selecting a real restored Local Tab leaves Project A selected in App state.
+  // A real restored Local Tab has no Remote focus; both machines stay offered.
   await click('[data-drag-id="local-tab"]');
   expect(container.querySelector('[data-drag-id="local-tab"].active')).not.toBeNull();
   expect(container.querySelector(".project-detail-main .sessions-view-title")?.textContent).toBe(projectA.name);
-  expect(banner()).toBeNull();
+  expect(order()).toEqual([hostA.name, hostB.name]);
+  expect(banner()?.querySelector("[data-local-switching]")).toBeNull();
 
-  // The same Host's Terminal already renders the real notice/action on the RED
-  // tree, isolating the omission to the Project navigation/wiring boundary.
   await click('[data-drag-id="remote-terminal-a"]');
-  expect(banner()?.textContent).toContain(hostA.name);
-  expectNotice(hostA);
+  expect(order()).toEqual([hostA.name, hostB.name]);
 
-  // A different Terminal overrides the retained Project A selection.
+  // A Terminal of B puts B first and still offers A.
   await click('[data-drag-id="remote-terminal-b"]');
-  expect(banner()?.textContent).toContain(hostB.name);
-  expect(banner()?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
-  expect(banner()?.textContent).not.toContain(hostA.name);
+  expect(order()).toEqual([hostB.name, hostA.name]);
+  expectNotice(hostB);
+  expectNotice(hostA);
 
   await click(`[data-drop-path='${keyOf(projectB)}']`);
   expect(container.querySelector(".project-detail-main .sessions-view-title")?.textContent).toBe(projectB.name);
-  expectNotice(hostB);
-  expect(banner()?.textContent ?? "").not.toContain(hostA.name);
+  expect(order()).toEqual([hostB.name, hostA.name]);
 
+  // Settings has its own rows: no bar.
   await click(`[data-drop-path='${keyOf(projectA)}']`);
   await click('[aria-label="Settings"]');
   expect(container.querySelector(".tb-settings-btn.active")).not.toBeNull();
   expect(banner()).toBeNull();
 
-  // Explicit Go Home must clear, rather than inherit, the selected Remote Project.
+  // Explicit Go Home clears the selected Remote Project; the bar lists both again.
   await click(`[data-drop-path='${keyOf(projectA)}']`);
   await click(".ds-home");
   expect(container.querySelector("[data-drop-path].active")).toBeNull();
   expect(container.querySelector(".project-detail-split")).toBeNull();
-  expect(banner()).toBeNull();
+  expect(order()).toEqual([hostA.name, hostB.name]);
 
   await click(`[data-drop-path='${keyOf(localProject)}']`);
-  expect(banner()).toBeNull();
+  expect(order()).toEqual([hostA.name, hostB.name]);
 
   // Eligibility remains authoritative in the existing Host status / Action seam.
   await click(`[data-drop-path='${keyOf(projectA)}']`);
@@ -189,6 +200,7 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
   for (const status of ["build-differs", "incompatible", "reconnecting"] as const) {
     await act(async () => { registry.applyStatus({ ...eligibleStatus(hostA.id), status, updateUnavailable: "desktop-owned" }); });
     expectNotice(hostA, true);
+    expectNotice(hostB);
     expect(banner()?.textContent).not.toContain("Windows");
     hostUpdates.ask(hostA, registry.getStatus(hostA.id)!);
     expect(hostUpdates.getSnapshot().confirmation).toBeNull();
@@ -196,31 +208,46 @@ it("scopes production App update actions and Desktop-owned guidance to the selec
   // An old target's exact refusal stays visible, alongside ownership-specific guidance.
   const legacyRefusal = "xshell on this machine runs these terminals; update xshell there instead";
   await act(async () => { registry.applyStatus({ ...eligibleStatus(hostA.id), updateUnavailable: "desktop-owned", errorHint: "update-failed", lastError: legacyRefusal }); });
-  expect(banner()?.textContent).toContain(legacyRefusal);
+  // Never the backend's text: the approved line, beside the ownership guidance.
+  expect(banner()?.textContent).not.toContain(legacyRefusal);
+  expect(rowOf(hostA)?.textContent).toContain("reconnected after the update");
   await click('[aria-label="Settings"]');
   const hostsTab = [...container.querySelectorAll<HTMLElement>(".settings-nav-item")].find(b => b.textContent === "Hosts");
   expect(hostsTab).toBeDefined();
   await act(async () => { hostsTab!.click(); });
   const row = [...container.querySelectorAll(".host-row")].find(r => r.textContent?.includes(hostA.name));
-  expect.soft(row?.textContent).toContain(`Update xshell on ${hostA.name}. The Desktop there manages this Daemon, so its build cannot be replaced from here.`);
+  expect.soft(row?.textContent).toContain(`Update xshell on ${hostA.name}. xshell there manages terminals, so this update must be made on that machine.`);
   expect.soft(row?.querySelector(".host-update-action button")).toBeNull();
   await click(`[data-drop-path='${keyOf(projectB)}']`);
   expectNotice(hostB);
   await click(`[data-drop-path='${keyOf(projectA)}']`);
+  // A current machine leaves the bar; the other stays.
   const matching = eligibleStatus(hostA.id);
   await act(async () => {
     registry.applyStatus({ ...matching, status: "connected", updateAction: null, daemonBuild: matching.desktopBuild });
   });
-  expect(container.querySelector(".main-content > .host-update-banner .host-update-action")).toBeNull();
-  expect(banner()?.textContent ?? "").toBe("");
+  expect(order()).toEqual([hostB.name]);
+  // Healthy is "nothing offered", not "this Desktop's version": a release Host is current.
+  await act(async () => {
+    registry.applyStatus({ ...matching, status: "connected", updateAction: null, daemonVersion: "1.6.0", daemonBuild: null });
+  });
+  expect(order()).toEqual([hostB.name]);
 
-  // A stale selected Project cannot manufacture an action after its config is removed.
+  // A Host whose config is removed leaves the bar, even with its Project still selected.
   await act(async () => {
     registry.applyStatus(eligibleStatus(hostA.id));
-    await registry.configure([hostB]);
   });
+  expect(order()).toEqual([hostA.name, hostB.name]);
+  await act(async () => { await registry.configure([hostB]); });
   expect(registry.config(hostA.id)).toBeUndefined();
-  expect(banner()).toBeNull();
+  expect(order()).toEqual([hostB.name]);
+  expect(banner()?.textContent).not.toContain(hostA.name);
+  // Nothing offered anywhere: no row (the bar's padding needs a row, App.css).
+  await act(async () => {
+    registry.applyStatus({ ...eligibleStatus(hostB.id), status: "connected", updateAction: null, daemonBuild: matching.desktopBuild });
+  });
+  expect(rows()).toEqual([]);
+  expect(banner()?.textContent ?? "").toBe("");
   // No replacement is invoked by navigation or rendering an eligible action.
   expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "host_upgrade")).toBe(false);
   expect(vi.mocked(invoke).mock.calls.some(([command, args]) => command === "host_call" && /prepare|upgrade|update/.test(String((args as { method?: string })?.method)))).toBe(false);

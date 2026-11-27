@@ -3,10 +3,27 @@
 
 import type { BuildId } from "../buildId";
 
-// ^h_[a-z0-9]{8}$ for Remote Hosts. "local" (`LOCAL_HOST`) names the Local Host on the wire
+// Saved SSH: h_[a-z0-9]{8}; Ring: r_[0-9a-f]{64}. "local" (`LOCAL_HOST`) names the Local Host on the wire
 // only (its Terminals through the Daemon this Desktop runs); it is never configured and never a
 // Tab's or Project's `host`.
 export type HostId = string;
+
+// Display projection from Manager; never an authorization capability or saved SSH config.
+export type RouteKind = "local" | "ssh" | "relay";
+export type Reachability = { kind: "unknown" | "online" | "never-connected" }
+  | { kind: "closed"; reason: string; at: number | null }
+  | { kind: "unreachable"; at: number | null };
+export interface AvailableHost {
+  id: HostId;
+  aliases: HostId[];
+  name: string;
+  color: string | null;
+  daemonKey: string | null; // Rust SignKey's base64 serialization, not a route token
+  routes: RouteKind[];
+  activeRoute: RouteKind;
+  reachability: Reachability;
+}
+export interface AvailableSnapshot { sequence: number; hosts: AvailableHost[] }
 
 export interface HostConfig {
   id: HostId;
@@ -48,7 +65,15 @@ export interface HostStatus {
   os: "linux" | "macos" | "windows" | null;
   linkGeneration?: number;
   updateAction?: "update" | "replace" | null;
+  // The version the offered update leads to, and who supplies it: "release" = the Host
+  // downloads the latest release itself, "desktop" = this Desktop sends its own build. Absent
+  // when nothing is offered; an older Rust side sends neither (read as "desktop").
+  updateVersion?: string | null;
+  updateSource?: "release" | "desktop" | null;
   updateUnavailable?: "windows-owner" | "desktop-owned" | null;
+  // "ring-update-unsupported": a Ring Host whose xshell cannot take an update over the Ring
+  // (no `daemon.stage`, or no common protocol); it is updated with the install command there.
+  routeUpdateUnavailable?: "ring-update-unsupported" | "identity-bound-alias" | null;
   arch: string | null;
   incompatibleReason: "daemon-older" | "daemon-newer" | null;
   nextRetryAt: number | null; // ms epoch

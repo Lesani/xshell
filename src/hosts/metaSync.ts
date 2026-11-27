@@ -1,3 +1,4 @@
+import { registry } from "./registry";
 import type { Tab } from "../types";
 import type { HostId, TerminalInfo } from "./types";
 import { daemonHost } from "./localHost";
@@ -101,7 +102,7 @@ export class MetaSync {
   observe(host: HostId, list: TerminalInfo[], tabs: Tab[]) {
     const byUuid = new Map(list.map(i => [i.terminal, i]));
     for (const tab of tabs) {
-      if (!tab.terminal || daemonHost(tab) !== host) continue;
+      if (!tab.terminal || registry.resolveAlias(daemonHost(tab) ?? "") !== registry.resolveAlias(host)) continue;
       const fields = this.entries.get(tab.id);
       if (!fields) continue;
       const info = byUuid.get(tab.terminal);

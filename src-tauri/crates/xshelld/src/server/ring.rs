@@ -23,10 +23,10 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xshell_protocol::msg::{JoinExpect, MEMBERSHIP_CHANGED};
 use xshell_protocol::ring::relay::sessions::Sessions;
 use xshell_protocol::ring::relay::wire::{ErrorCode, MemberPresence};
@@ -37,6 +37,8 @@ use xshell_protocol::ring::relay::{
 use xshell_protocol::ring::{
     member_name, DeviceKeys, Role, RosterChain, RosterError, SecretSeed, SignKey,
 };
+
+pub(crate) mod ownership;
 
 /// What a Host is called when its hostname is unusable.
 const FALLBACK_NAME: &str = "this computer";
@@ -59,24 +61,98 @@ struct RosterFile {
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Stored objects have different semantic sizes; none is implicitly one Host frame.
+#[derive(Clone, Copy)]
+pub(crate) enum PrivateRingFile {
+    Keys,
+    RosterHistory,
+    PushRegistrations,
+    #[cfg(any(unix, windows))]
+    CompanionPolicy,
+    #[cfg(any(unix, windows))]
+    StandaloneJournal,
+    #[cfg(any(unix, windows))]
+    CompletionMailbox,
+}
+const MAX_STORED_TOKEN_ARRAY_JSON_BYTES: usize = xshell_protocol::ring::chain::MAX_CHAIN_LEN
+    .checked_mul(
+        xshell_protocol::ring::roster::MAX_ROSTER_TOKEN
+            .checked_add(3)
+            .expect("token delimiters"),
+    )
+    .expect("stored token history")
+    .checked_add(2)
+    .expect("array framing");
+impl PrivateRingFile {
+    fn maximum(self) -> usize {
+        match self {
+            // Two canonical base64url32-byte seeds, u32 version and fixed JSON labels.
+            Self::Keys => 512,
+            // Tokens' ASCII base64url/prefix alphabet needs no JSON escaping. Account
+            // for every supported token, quotes/comma, and the normal writer's wrapper.
+            Self::RosterHistory => MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                .checked_add(br#"{"v":4294967295,"rosters":}"#.len())
+                .expect("roster file framing"),
+            // on_head prunes to at most64 roster members; each registration has a
+            // MAX_BLOB ASCII value, fixed keys/triggers/counters and bounded dormant code.
+            Self::PushRegistrations => xshell_protocol::ring::roster::MAX_MEMBERS
+                .checked_mul(
+                    xshell_protocol::ring::push::MAX_BLOB
+                        .checked_add(512)
+                        .expect("push registration framing"),
+                )
+                .expect("push member storage")
+                .checked_add(512)
+                .expect("push file framing"),
+            Self::CompanionPolicy => xshell_core::companion_policy::MAX_COMPANION_POLICY_JSON_BYTES,
+            // Standalone stores full proposal-predecessor and accepted histories.
+            // Completion stores full initial/accepted histories plus a prepared proposal
+            // (whose additional predecessor is bounded by the companion envelope).
+            Self::StandaloneJournal | Self::CompletionMailbox => MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                .checked_mul(2)
+                .expect("journal histories")
+                .checked_add(xshell_core::companion_policy::MAX_COMPANION_POLICY_JSON_BYTES)
+                .expect("journal metadata/proposal framing"),
+        }
+    }
+}
+
 /// Opens `path` for reading if it is a regular file of ours (not a symlink); tightens a mode
 /// broader than 0600. `None`: it does not exist.
 #[cfg(windows)]
-pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+pub(crate) fn read_private(
+    path: &Path,
+    kind: PrivateRingFile,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let Some(f) = xshell_core::private_fs::open_read(path)? else {
         return Ok(None);
     };
-    let len = f.metadata()?.len() as usize;
-    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(len + 1));
-    (&f).read_to_end(&mut buf)?;
+    let len = f.metadata()?.len();
+    let maximum = kind.maximum();
+    if len > maximum as u64 {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
+    // Sized up front, so no reallocation leaves a copy of a secret behind.
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(len as usize + 1));
+    (&f).take(maximum as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > maximum {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     Ok(Some(buf))
 }
 
 #[cfg(unix)]
-pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+pub(crate) fn read_private(
+    path: &Path,
+    kind: PrivateRingFile,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     let f = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -110,15 +186,34 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Option<zeroize::Zeroizing<
     if meta.mode() & 0o077 != 0 {
         f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    let maximum = kind.maximum();
+    if meta.len() > maximum as u64 {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     // Sized up front, so no reallocation leaves a copy of a secret behind.
     let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(meta.len() as usize + 1));
-    (&f).read_to_end(&mut buf)?;
+    (&f).take(maximum as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > maximum {
+        return Err(io::Error::other(
+            "private Ring file exceeds stored-object bound",
+        ));
+    }
     Ok(Some(buf))
 }
 
 /// Writes `bytes` to `path` atomically: an exclusive 0600 temp file with a unique name (never
 /// following a symlink), synced, then renamed over `path`.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_private_inner(path, bytes, None)
+}
+
+fn write_private_inner(
+    path: &Path,
+    bytes: &[u8],
+    roster_hook: Option<&super::TestHook>,
+) -> io::Result<()> {
     let mut name = path.as_os_str().to_owned();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -138,10 +233,17 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        if roster_hook
+            .is_some_and(|hook| (hook.0)(uuid::Uuid::nil(), super::TestPoint::RingRosterTempSynced))
+        {
+            return Err(io::Error::other(
+                "injected roster commit failure after temp sync",
+            ));
+        }
         fs::rename(&tmp, path)
     })();
     if r.is_err() {
@@ -150,15 +252,99 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     r
 }
 
-/// This Host's name for the Roster: its hostname, cleaned up.
-#[cfg(windows)]
+/// The files one identity reset moves aside, in this order.
+const RESET_FILES: [&str; 4] = [
+    "roster.json",
+    "keys.json",
+    "companion.json",
+    // A finished standalone obligation belongs to the membership set aside.
+    "standalone-adoption.json",
+];
+const RESET_OBLIGATION: &str = "reset-pending.json";
+
+#[derive(Serialize, Deserialize)]
+struct ResetObligation {
+    suffix: String,
+    stamp: u64,
+}
+
+#[cfg(test)]
+static RESET_STOP_AFTER: Mutex<Option<usize>> = Mutex::new(None);
+
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Records, durably, that this Store's identity is being reset (temp, fsync, rename,
+/// fsync of the directory). Under ring.lock.
+fn write_reset_obligation(store: &Store, suffix: &str, stamp: u64) -> Result<(), String> {
+    let bytes = serde_json::to_vec(&ResetObligation {
+        suffix: suffix.into(),
+        stamp,
+    })
+    .map_err(|e| e.to_string())?;
+    write_private(&store.dir.join(RESET_OBLIGATION), &bytes).map_err(|e| e.to_string())?;
+    sync_dir(&store.dir)
+}
+
+/// Finishes an identity reset that a crash interrupted: every file still in place is moved
+/// aside, then the obligation goes. `Ok(true)`: there was one. Run at Daemon start (before
+/// the counterpart endpoint serves and before the Ring resumes) and by the registration
+/// child, so the old keys are never used again.
+pub(crate) fn complete_pending_reset(store: &Store) -> Result<bool, String> {
+    complete_pending_reset_until(store, None)
+}
+
+fn complete_pending_reset_until(store: &Store, stop: Option<usize>) -> Result<bool, String> {
+    let path = store.dir.join(RESET_OBLIGATION);
+    let Some(bytes) = read_private(&path, PrivateRingFile::Keys).map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let o: ResetObligation =
+        serde_json::from_slice(&bytes).map_err(|e| format!("unreadable reset obligation: {e}"))?;
+    for (n, name) in RESET_FILES.iter().enumerate() {
+        if stop.is_some_and(|s| n >= s) {
+            return Ok(true);
+        }
+        let from = store.dir.join(name);
+        if fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        fs::rename(
+            &from,
+            store.dir.join(format!("{name}.{}-{}", o.suffix, o.stamp)),
+        )
+        .map_err(|e| e.to_string())?;
+        sync_dir(&store.dir)?;
+    }
+    fs::remove_file(&path).map_err(|e| e.to_string())?;
+    sync_dir(&store.dir)?;
+    Ok(true)
+}
+
+/// This Host's name for the Roster: `XSHELL_MACHINE_NAME` when set (several test
+/// machines on one host), else its hostname, cleaned up.
 pub(crate) fn host_name() -> String {
+    match std::env::var("XSHELL_MACHINE_NAME") {
+        Ok(name) if !name.trim().is_empty() => member_name(name.trim(), FALLBACK_NAME),
+        _ => system_host_name(),
+    }
+}
+
+#[cfg(windows)]
+fn system_host_name() -> String {
     let raw = std::env::var("COMPUTERNAME").unwrap_or_default();
     member_name(&raw, FALLBACK_NAME)
 }
 
 #[cfg(unix)]
-pub(crate) fn host_name() -> String {
+fn system_host_name() -> String {
     let mut buf = [0u8; 256];
     let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     let raw = if r == 0 {
@@ -168,6 +354,12 @@ pub(crate) fn host_name() -> String {
         String::new()
     };
     member_name(&raw, FALLBACK_NAME)
+}
+
+/// A stopped or unreadable registration is still a binding, never headless permission.
+pub(crate) fn companion_registered(dir: &Path) -> bool {
+    ["companion.json", "companion-pending.json"].iter().any(|name|
+        !matches!(fs::symlink_metadata(dir.join(name)), Err(error) if error.kind() == io::ErrorKind::NotFound))
 }
 
 /// The files in the ring directory.
@@ -200,16 +392,15 @@ impl Saved {
 pub(crate) struct StoreLock(#[allow(dead_code)] fs::File);
 
 impl Store {
-    #[cfg_attr(windows, allow(dead_code))] // `xshelld pair` is Unix only
     pub fn new(dir: PathBuf) -> Store {
         Store { dir }
     }
 
     /// Takes `ring.lock`, waiting for another process (or thread) that holds it. Never
     /// nested: every caller takes it once around one read-modify-write.
-    pub fn lock(&self) -> Result<StoreLock, String> {
+    fn open_lock(&self, name: &str) -> Result<fs::File, String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
-        let path = self.dir.join("ring.lock");
+        let path = self.dir.join(name);
         #[cfg(windows)]
         let f = xshell_core::private_fs::open_or_create(&path);
         #[cfg(unix)]
@@ -219,12 +410,111 @@ impl Store {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path);
-        let f = f.map_err(|e| format!("cannot open the ring lock: {e}"))?;
-        f.lock()
+        let f = f.map_err(|e| format!("cannot open {name}: {e}"))?;
+        #[cfg(unix)]
+        {
+            let metadata = f.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("foreign or nonregular Ring lock".into());
+            }
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(f)
+    }
+    pub fn lock(&self) -> Result<StoreLock, String> {
+        let file = self.open_lock("ring.lock")?;
+        file.lock()
             .map_err(|e| format!("cannot take the ring lock: {e}"))?;
-        Ok(StoreLock(f))
+        Ok(StoreLock(file))
+    }
+    pub(super) fn lock_until(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<StoreLock, String> {
+        budget.check().map_err(|e| e.to_string())?;
+        let file = self.open_lock("ring.lock")?;
+        loop {
+            budget.check().map_err(|e| e.to_string())?;
+            match file.try_lock() {
+                Ok(()) => return Ok(StoreLock(file)),
+                Err(fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+                Err(fs::TryLockError::Error(error)) => return Err(error.to_string()),
+            }
+        }
+    }
+    #[cfg(any(unix, windows))]
+    fn offer_lock(&self) -> Result<StoreLock, String> {
+        let file = self.open_lock("ring-legacy-offer.lock")?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => {
+                "legacy_offer_active: a legacy pairing offer is still open".into()
+            }
+            fs::TryLockError::Error(error) => error.to_string(),
+        })?;
+        Ok(StoreLock(file))
+    }
+    /// A nonblocking, process-lifetime admission lease. The Ring transaction lock is
+    /// released before the legacy offer waits for a person/network; process death closes it.
+    #[cfg(unix)]
+    #[cfg(any(test, feature = "legacy-pair-test-control"))]
+    pub(crate) fn reserve_legacy_offer(&self) -> Result<StoreLock, String> {
+        let offer = self.offer_lock()?;
+        let _ring = self.lock()?;
+        self.refuse_registered_join()?;
+        Ok(offer)
+    }
+    #[cfg(unix)]
+    pub(super) fn reserve_standalone_offer(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<StoreLock, String> {
+        let offer = self.offer_lock()?;
+        let _ring = self.lock_until(budget)?;
+        self.refuse_registered_join()?;
+        Ok(offer)
+    }
+    /// The offer lock if nobody holds it, `None` while another holder (a running `xshelld
+    /// pair` command, or another open file in this process) does. flock semantics: a second
+    /// open of the same file conflicts even inside one process.
+    #[cfg(unix)]
+    pub(crate) fn try_offer_lock(&self) -> Result<Option<StoreLock>, String> {
+        let file = self.open_lock("ring-legacy-offer.lock")?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StoreLock(file))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => Err(error.to_string()),
+        }
+    }
+    /// The raw offer lease a pair command holds, without its admission checks.
+    #[cfg(all(test, unix))]
+    pub(crate) fn offer_lock_for_test(&self) -> Result<StoreLock, String> {
+        self.offer_lock()
+    }
+    /// Called only while ring.lock is held; refuses instead of waiting for a live offer.
+    #[cfg(any(unix, windows))]
+    pub(super) fn registration_admission(&self) -> Result<StoreLock, String> {
+        self.offer_lock()
+    }
+    pub(crate) fn refuse_registered_join(&self) -> Result<(), String> {
+        #[cfg(any(unix, windows))]
+        super::standalone_journal::refuse_unresolved_standalone(self)?;
+        self.refuse_registered_binding()
+    }
+    pub(super) fn refuse_registered_binding(&self) -> Result<(), String> {
+        if companion_registered(&self.dir) {
+            return Err("protected_counterpart_required: registered Computer installation is not a legacy/Host commit".into());
+        }
+        Ok(())
+    }
+    #[cfg(any(unix, windows))]
+    pub(super) fn keys_locked(&self) -> Result<DeviceKeys, String> {
+        match self.load_keys()? {
+            Some(keys) => Ok(keys),
+            None => self.create_keys(),
+        }
     }
 
     /// The stored keys, or new ones, under the lock: a key file another process wrote
@@ -253,6 +543,17 @@ impl Store {
         // `xshell_core::private_fs`).
         #[cfg(windows)]
         {
+            // Validate the existing ancestor before recursive private creation can traverse it.
+            for ancestor in self.dir.ancestors() {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(_) => {
+                        xshell_core::server::no_reparse(ancestor)?;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                }
+            }
             xshell_core::private_fs::ensure_dir(&self.dir)
         }
         #[cfg(unix)]
@@ -267,7 +568,8 @@ impl Store {
         }
         self.ensure_dir().map_err(|e| e.to_string())?;
         let p = self.keys_path();
-        let Some(bytes) = read_private(&p).map_err(|e| e.to_string())? else {
+        let Some(bytes) = read_private(&p, PrivateRingFile::Keys).map_err(|e| e.to_string())?
+        else {
             return Ok(None);
         };
         let bad = || {
@@ -313,7 +615,9 @@ impl Store {
     /// unreadable or does not verify.
     pub fn read_chain(&self) -> Result<Option<RosterChain>, String> {
         let p = self.roster_path();
-        let Some(bytes) = read_private(&p).map_err(|e| e.to_string())? else {
+        let Some(bytes) =
+            read_private(&p, PrivateRingFile::RosterHistory).map_err(|e| e.to_string())?
+        else {
             return Ok(None);
         };
         serde_json::from_slice::<RosterFile>(&bytes)
@@ -331,7 +635,7 @@ impl Store {
     /// and logged: this Host is then in no Ring until a Desktop sends `ring.join` again.
     fn load_chain(&self) -> Option<RosterChain> {
         let p = self.roster_path();
-        match read_private(&p) {
+        match read_private(&p, PrivateRingFile::RosterHistory) {
             Ok(Some(_)) => {}
             Ok(None) => return None,
             Err(e) => {
@@ -366,14 +670,106 @@ impl Store {
     /// Ring the stored chain must accept `chain` by the chain rules
     /// ([`RosterChain::extended`]): versions it holds are skipped, so a newer stored head
     /// (another process saved it meanwhile) wins. A fork of the stored chain is a trust
-    /// conflict: nothing is written and the stored chain stays the trusted one. Another Ring
-    /// (an explicit replacement), or no readable file: `chain` is the one. A write that fails
+    /// conflict: nothing is written and the stored chain stays the trusted one. Foreign Ring
+    /// replacement requires Leave. A write that fails
     /// is reported apart: the settled chain is trusted all the same.
     pub fn save_chain(&self, chain: &RosterChain) -> Saved {
         let _l = match self.lock() {
             Ok(l) => l,
             Err(e) => return Saved::new(chain.clone(), Some(e)),
         };
+        self.settle_locked(chain, None)
+    }
+    pub(super) fn save_join_chain(
+        &self,
+        chain: &RosterChain,
+        effective_base: Option<&RosterChain>,
+        origin: &JoinOrigin,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+        hook: Option<&super::TestHook>,
+    ) -> Result<Saved, String> {
+        let _lock = match budget {
+            Some(budget) => self.lock_until(budget)?,
+            None => self.lock()?,
+        };
+        match origin {
+            JoinOrigin::Host => self.refuse_registered_join()?,
+            #[cfg(unix)]
+            JoinOrigin::Standalone { operation } => {
+                super::standalone_journal::validate_standalone_install(self, operation, chain)?
+            }
+            #[cfg(any(unix, windows))]
+            JoinOrigin::Companion { operation } => {
+                super::companion::validate_install_locked(self, operation, chain)?
+            }
+        }
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
+        self.settle_accepted_locked(chain, effective_base, budget, hook)
+    }
+
+    /// `chain` has already been verified against the guarded effective owner. Any
+    /// newer disk suffix must extend that effective ancestry BEFORE a write or adoption.
+    fn settle_accepted_locked(
+        &self,
+        chain: &RosterChain,
+        effective_base: Option<&RosterChain>,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+        hook: Option<&super::TestHook>,
+    ) -> Result<Saved, String> {
+        let disk = match self.read_chain() {
+            Ok(disk) => disk,
+            // Keep an independently validated revocation in force even when the
+            // private file is unavailable. Never label that as a durable receipt or
+            // overwrite unreadable evidence with a guessed disk ancestry.
+            Err(error) => return Ok(Saved::new(chain.clone(), Some(error))),
+        };
+        let next = match disk {
+            Some(disk) if disk.ring_id() == chain.ring_id() => {
+                // Establish disk authority from the guarded base first. A valid newer
+                // disk wins a candidate fork, but a terminal-signed disk suffix cannot.
+                let durable = match effective_base {
+                    Some(base) => {
+                        base.extended(disk.versions())
+                            .map_err(|e| {
+                                format!("effective accepted ancestry refuses durable suffix: {e}")
+                            })?
+                            .0
+                    }
+                    None => disk.clone(),
+                };
+                let merged = match durable.extended(chain.versions()) {
+                    Ok((merged, _)) => merged,
+                    Err(error) => {
+                        return Ok(Saved {
+                            trusted: durable,
+                            conflict: Some(format!(
+                                "the roster conflicts with the one stored here ({})",
+                                error.as_code()
+                            )),
+                            write_error: None,
+                        })
+                    }
+                };
+                if merged.versions() == disk.versions() {
+                    return Ok(Saved::new(merged, None));
+                }
+                merged
+            }
+            Some(_) => {
+                return Err("leave_required: accepted install cannot replace a foreign Ring".into())
+            }
+            None => chain.clone(),
+        };
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
+        let error = self.write_chain_inner(&next, hook).err();
+        Ok(Saved::new(next, error))
+    }
+
+    fn settle_locked(&self, chain: &RosterChain, hook: Option<&super::TestHook>) -> Saved {
         let next = match self.read_chain() {
             Ok(Some(disk)) if disk.ring_id() == chain.ring_id() => {
                 match disk.extended(chain.versions()) {
@@ -391,14 +787,31 @@ impl Store {
                     }
                 }
             }
+            Ok(Some(disk)) => {
+                return Saved {
+                    trusted: disk,
+                    conflict: Some("leave_required: this Host already retains another Ring".into()),
+                    write_error: None,
+                }
+            }
             _ => chain.clone(),
         };
-        let err = self.write_chain(&next).err();
+        let err = match hook {
+            Some(hook) => self.write_chain_inner(&next, Some(hook)).err(),
+            None => self.write_chain(&next).err(),
+        };
         Saved::new(next, err)
     }
 
     /// Writes `chain` as it is; only with the lock held.
     pub fn write_chain(&self, chain: &RosterChain) -> Result<(), String> {
+        self.write_chain_inner(chain, None)
+    }
+    fn write_chain_inner(
+        &self,
+        chain: &RosterChain,
+        hook: Option<&super::TestHook>,
+    ) -> Result<(), String> {
         self.ensure_dir().map_err(|e| e.to_string())?;
         let f = RosterFile {
             v: 1,
@@ -409,7 +822,12 @@ impl Store {
                 .collect(),
         };
         let json = serde_json::to_vec(&f).map_err(|e| e.to_string())?;
-        write_private(&self.roster_path(), &json).map_err(|e| e.to_string())
+        if hook.is_some_and(|hook| {
+            (hook.0)(uuid::Uuid::nil(), super::TestPoint::BeforeRingRosterWrite)
+        }) {
+            return Err("injected roster write failure after prerequisite reads".into());
+        }
+        write_private_inner(&self.roster_path(), &json, hook).map_err(|e| e.to_string())
     }
 }
 
@@ -426,11 +844,15 @@ pub(crate) type HeadHook = Arc<dyn Fn(u64, &RosterChain) + Send + Sync>;
 
 /// The chain the store holds, shared with the Connector's callbacks.
 struct Persist {
+    admission: std::sync::OnceLock<std::sync::Weak<ownership::StoreAdmission>>,
+    test_hook: std::sync::OnceLock<super::TestHook>,
     store: Store,
     chain: Mutex<Option<RosterChain>>,
     on_head: std::sync::OnceLock<HeadHook>,
     /// Bumped, with the chain's lock held, every time a chain is adopted.
     epoch: AtomicU64,
+    /// The Ring a local Leave set aside (its id), while no chain is trusted.
+    left: Mutex<Option<String>>,
 }
 
 impl Persist {
@@ -454,11 +876,38 @@ impl Persist {
     /// joins hold for the same sequence. A chain not newer than the trusted one (a callback
     /// that lost the race to a local join) changes nothing.
     fn keep_newer(&self, chain: &RosterChain, connector: Option<&Connector>, sessions: &Sessions) {
+        let _operation = if let Some(admission) = self.admission.get() {
+            let Some(admission) = admission.upgrade() else {
+                return;
+            };
+            let Ok(operation) = admission.admit() else {
+                return;
+            };
+            Some(operation)
+        } else {
+            None
+        };
+        if let Some(hook) = self.test_hook.get() {
+            // `true` drops the callback: a Daemon that never received this roster.
+            if (hook.0)(uuid::Uuid::nil(), super::TestPoint::RosterCallbackAdmitted) {
+                return;
+            }
+        }
         let mut cur = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cur.as_ref() {
             if c.ring_id() != chain.ring_id() || c.head().version() >= chain.head().version() {
                 return;
             }
+        } else if self
+            .left
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|left| left == &chain.ring_id().to_string())
+        {
+            // A late callback of the Connector a local Leave retired must not resurrect
+            // the Ring it left.
+            return;
         }
         let saved = self.store.save_chain(chain);
         if let Some(e) = &saved.conflict {
@@ -484,6 +933,8 @@ impl Persist {
 struct Events {
     persist: Arc<Persist>,
     sessions: Sessions,
+    removal_signal: Arc<AtomicBool>,
+    last_refusal: Arc<Mutex<Option<String>>>,
     /// The Connector these events are of (set once it exists).
     connector: Arc<std::sync::OnceLock<std::sync::Weak<Connector>>>,
 }
@@ -500,6 +951,7 @@ impl ConnectorEvents for Events {
                 "ring: relay connection failed ({error}); retrying in {retry_in:?}"
             ),
             LinkState::Stopped { error: Some(e) } => {
+                *self.last_refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
                 crate::log!("WARN", "ring: no longer connecting: {e}")
             }
             LinkState::Connecting { .. } | LinkState::Stopped { error: None } => {}
@@ -522,6 +974,14 @@ impl ConnectorEvents for Events {
     fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
         self.sessions.error(code, to);
     }
+
+    fn removed(&self) {
+        crate::log!(
+            "INFO",
+            "ring: the relay says this Host was removed; checking the signed history"
+        );
+        self.removal_signal.store(true, Ordering::Release);
+    }
 }
 
 /// The Connector's lifecycle, under one lock: whether the Daemon is exiting, the installed
@@ -535,8 +995,48 @@ struct Life {
     retiring: Vec<JoinHandle<()>>,
 }
 
+/// Why [`Ring::set_aside`] sets the membership aside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Aside {
+    /// An unsupported stored membership (format 1 or a transitional shape).
+    V1,
+    /// A verified removal.
+    Removed,
+    /// The Relay kept refusing this Host for terminal expiry (a Ring with a finite policy
+    /// from an earlier build) although the signed chain still lists it: see the
+    /// maintenance loop. Never inferred from a plain refusal.
+    Expired,
+}
+
+/// What [`Ring::check_removal`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RemovalOutcome {
+    NoMembership,
+    SetAside,
+    /// Still a member, and the signed head moved: reconnected at once.
+    MemberChanged,
+    /// Still a member at the same head: the caller reconnects with backoff.
+    MemberSame,
+}
+
+pub(super) enum JoinOrigin {
+    Host,
+    #[cfg(unix)]
+    Standalone {
+        operation: String,
+    },
+    #[cfg(any(unix, windows))]
+    Companion {
+        operation: String,
+    },
+}
+
+#[cfg(test)]
+type HostBudgetHook = Box<dyn Fn(&xshell_core::local_ipc::RequestBudget) + Send>;
+
 /// This Host's Ring membership.
 pub(crate) struct Ring {
+    test_hook: std::sync::OnceLock<super::TestHook>,
     persist: Arc<Persist>,
     keys: Mutex<Option<Arc<DeviceKeys>>>,
     life: Mutex<Life>,
@@ -545,9 +1045,17 @@ pub(crate) struct Ring {
     name: String,
     backoff_unit: Duration,
     timeouts: RingTimeouts,
+    /// Set by the Connector's `removed` report; taken by the maintenance loop.
+    removal_signal: Arc<AtomicBool>,
+    /// The text of the Connector's last stop, as the Relay gave it.
+    last_refusal: Arc<Mutex<Option<String>>>,
     /// Test hook: runs in `join` between the `stopped` check and the install.
     #[cfg(test)]
     install_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    #[cfg(test)]
+    host_budget_hook: Mutex<Option<HostBudgetHook>>,
+    #[cfg(test)]
+    effective_query_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 fn link_json(s: &LinkState) -> (&'static str, Option<String>) {
@@ -567,11 +1075,15 @@ impl Ring {
         write_stall: Duration,
     ) -> Ring {
         Ring {
+            test_hook: std::sync::OnceLock::new(),
             persist: Arc::new(Persist {
+                admission: std::sync::OnceLock::new(),
+                test_hook: std::sync::OnceLock::new(),
                 store: Store { dir },
                 chain: Mutex::new(None),
                 on_head: std::sync::OnceLock::new(),
                 epoch: AtomicU64::new(0),
+                left: Mutex::new(None),
             }),
             keys: Mutex::new(None),
             life: Mutex::new(Life::default()),
@@ -579,9 +1091,24 @@ impl Ring {
             name: host_name(),
             backoff_unit,
             timeouts,
+            removal_signal: Arc::default(),
+            last_refusal: Arc::default(),
             #[cfg(test)]
             install_hook: Mutex::new(None),
+            #[cfg(test)]
+            host_budget_hook: Mutex::new(None),
+            #[cfg(test)]
+            effective_query_hook: Mutex::new(None),
         }
+    }
+
+    pub(super) fn set_test_hook(&self, hook: super::TestHook) {
+        let _ = self.persist.test_hook.set(hook.clone());
+        let _ = self.test_hook.set(hook);
+    }
+
+    pub(super) fn bind_store_admission(&self, admission: &Arc<ownership::StoreAdmission>) {
+        let _ = self.persist.admission.set(Arc::downgrade(admission));
     }
 
     pub fn hub(&self) -> &super::relay_conn::Hub {
@@ -595,6 +1122,335 @@ impl Ring {
     }
 
     /// The chain this Host trusts, if it is in a Ring.
+    #[cfg(any(unix, windows))]
+    pub(super) fn lock_trusted_chain_until<'a>(
+        &'a self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<std::sync::MutexGuard<'a, Option<RosterChain>>, String> {
+        budget.lock(&self.persist.chain).map_err(|e| e.to_string())
+    }
+    /// Read effective evidence under lifecycle -> cache -> Connector -> file order.
+    /// Identity and evidence stay fixed through the local read/receipt; no network,
+    /// session/event callback or join is allowed in the closure. Observations release
+    /// Connector state before calling persistence, so no reverse cache lock is held.
+    #[cfg(any(unix, windows))]
+    pub(super) fn with_effective_chain_until<T>(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        read: impl FnOnce(Option<RosterChain>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let life = budget.lock(&self.life).map_err(|e| e.to_string())?;
+        if life.stopped {
+            return Err("Daemon Ring is stopping".into());
+        }
+        let cached = self.lock_trusted_chain_until(budget)?;
+        // Keep the read guard through the local file comparison/receipt so an owner
+        // observation cannot become effective halfway through that transaction.
+        let owner_guard = if let Some(joined) = &life.joined {
+            Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = joined.connector.try_accepted_install() {
+                    break guard;
+                }
+                std::thread::yield_now();
+            })
+        } else {
+            None
+        };
+        let mut effective = cached.clone();
+        if let Some(guard) = &owner_guard {
+            let owner = guard.current();
+            effective = Some(match effective {
+                Some(mut chain) => {
+                    chain.merge_terminal_from(owner);
+                    chain
+                        .extended(owner.versions())
+                        .map_err(|e| e.to_string())?
+                        .0
+                }
+                None => owner.clone(),
+            });
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if let Some(hook) = self.effective_query_hook.lock().unwrap().as_ref() {
+            hook();
+        }
+        let result = read(effective);
+        drop(owner_guard);
+        result
+    }
+
+    /// Unit-test coordination at the guarded local-read boundary; never authority.
+    #[cfg(test)]
+    // Used only by the Unix-only adoption reconciliation tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn set_effective_query_hook(&self, hook: Box<dyn Fn() + Send>) {
+        *self.effective_query_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn standalone_installed_before_journal(&self) {
+        if let Some(hook) = self.test_hook.get() {
+            (hook.0)(
+                uuid::Uuid::nil(),
+                super::TestPoint::StandaloneInstalledBeforeJournal,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn standalone_store(&self) -> &Store {
+        &self.persist.store
+    }
+
+    /// The established order is runtime chain, then ring.lock. Never hold a file lock
+    /// while waiting for the chain owner (including a paused ordinary Host commit).
+    #[cfg(unix)]
+    pub(super) fn standalone_transaction<T>(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        change: impl FnOnce(&Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let live = self.lock_trusted_chain_until(budget)?;
+        let store = &self.persist.store;
+        let _lock = store.lock_until(budget)?;
+        store.refuse_registered_join()?;
+        if live.is_some() || super::companion::trusted(store)?.is_some() {
+            return Err("leave_required: standalone adoption requires an unpaired Daemon".into());
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        change(store)
+    }
+
+    /// Sets this Daemon's membership aside, under the lifecycle, runtime-chain and
+    /// ring.lock order. `check` validates the registration and refuses while a counterpart
+    /// or standalone operation is open (the caller defers and retries).
+    ///
+    /// [`Aside::Removed`]: a durable, cached or Connector chain that still authorizes this
+    /// Daemon (it missed the removal while offline) is accepted only with `evidence`: a
+    /// verified extension of that same chain whose head authorizes no key of this Daemon's
+    /// unit and retires the unit. The settled removal is written, `retire` durably retires
+    /// the last installation authority, then `roster.json` is renamed aside
+    /// (`roster.json.removed-<ms>`). [`Aside::V1`]: a format-1 chain is renamed
+    /// `roster.json.v1-<ms>` without evidence.
+    ///
+    /// Either way the identity rotates (one rule for every set-aside): `keys.json` and the
+    /// registration `companion.json` are renamed aside too, so the next Descriptor makes new
+    /// keys and the Desktop registers again. The cached chain is dropped and the Connector
+    /// retired. Terminals keep running.
+    #[cfg(any(unix, windows))]
+    pub(super) fn set_aside(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        reason: Aside,
+        evidence: Option<&RosterChain>,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
+        retire: impl FnOnce(&Store) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut life = budget.lock(&self.life).map_err(|e| e.to_string())?;
+        if life.stopped {
+            return Err("Daemon Ring is stopping".into());
+        }
+        let mut cached = self.lock_trusted_chain_until(budget)?;
+        let owner = match &life.joined {
+            Some(joined) => Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = joined.connector.try_accepted_install() {
+                    break guard.current().clone();
+                }
+                std::thread::yield_now();
+            }),
+            None => None,
+        };
+        let store = &self.persist.store;
+        let _lock = store.lock_until(budget)?;
+        let keys = store.load_keys()?.ok_or("retained Daemon keys missing")?;
+        check(store, &keys)?;
+        let durable = match reason {
+            Aside::V1 => store.read_chain().ok().flatten(),
+            Aside::Removed | Aside::Expired => super::companion::trusted(store)?,
+        };
+        // Every retained view that still authorizes this Daemon must be superseded by the
+        // evidence; the merged removal is what is settled.
+        let mut settled: Option<RosterChain> = None;
+        if reason == Aside::Removed {
+            for chain in [durable.as_ref(), cached.as_ref(), owner.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|chain| is_daemon_member(chain, &keys))
+            {
+                let evidence =
+                    evidence.ok_or("not_removed: this Host is still a member of its Ring")?;
+                let merged = removal_extension(chain, evidence, &keys.sign_key())?;
+                if settled
+                    .as_ref()
+                    .is_none_or(|s| merged.head().version() > s.head().version())
+                {
+                    settled = Some(merged);
+                }
+            }
+        } else if reason == Aside::V1
+            && durable.as_ref().is_none_or(|c| {
+                !xshell_protocol::ring::membership::unsupported_stored_membership(c.head())
+            })
+        {
+            return Err("no unsupported membership to set aside".into());
+        }
+        budget.check().map_err(|e| e.to_string())?;
+        retire(store)?;
+        if let (Some(settled), Some(_)) = (&settled, &durable) {
+            // The aside file keeps the verified removal, not the stale membership.
+            store.write_chain(settled)?;
+        }
+        let suffix = match reason {
+            Aside::V1 => "v1",
+            Aside::Removed | Aside::Expired => "removed",
+        };
+        // Durable first (P1-3): the reset obligation is written before the first rename,
+        // and startup finishes an interrupted reset before anything can use the old keys.
+        write_reset_obligation(store, suffix, super::registry::now_ms())?;
+        #[cfg(test)]
+        if let Some(stop) = *RESET_STOP_AFTER.lock().unwrap() {
+            complete_pending_reset_until(store, Some(stop))?;
+            return Err("test: reset interrupted".into());
+        }
+        complete_pending_reset(store)?;
+        if let Some(ring) = durable
+            .as_ref()
+            .or(cached.as_ref())
+            .or(owner.as_ref())
+            .map(|c| c.ring_id().to_string())
+        {
+            *self.persist.left.lock().unwrap_or_else(|e| e.into_inner()) = Some(ring);
+        }
+        *self.keys.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *cached = None;
+        self.persist.adopt();
+        let retired = life.joined.take();
+        drop(cached);
+        drop(life);
+        if let Some(old) = retired {
+            old.sessions.stop();
+            old.connector.stop(ByeReason::quit());
+        }
+        crate::log!(
+            "INFO",
+            "ring: membership set aside ({suffix}); this Host is in no Ring"
+        );
+        Ok(())
+    }
+
+    /// The Connector stopped on the Relay's word that this Host was removed: the removal
+    /// check runs from the maintenance loop.
+    pub(super) fn take_removal_signal(&self) -> bool {
+        self.removal_signal.swap(false, Ordering::AcqRel)
+    }
+
+    /// The Relay's text of the Connector's last stop.
+    pub(super) fn last_refusal(&self) -> Option<String> {
+        self.last_refusal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Lets a stopped Connector dial again (after the removal check found this Host still a
+    /// member).
+    pub(super) fn kick_connector(&self) {
+        if let Some(j) = self.lock_life().joined.as_ref() {
+            j.connector.kick();
+        }
+    }
+
+    /// Ask the Relay, as a (possibly former) member, for the signed history. Removed: the
+    /// membership is set aside (deferred with an `Err("busy: …")` while a counterpart or
+    /// standalone operation is open). Still a member: the newer chain is kept and the
+    /// Connector kicked, even when the head is unchanged. The Relay's word alone never
+    /// sets anything aside.
+    #[cfg(any(unix, windows))]
+    pub(super) fn check_removal(
+        &self,
+        budget: &xshell_core::local_ipc::RequestBudget,
+        check: impl FnOnce(&Store, &DeviceKeys) -> Result<(), String>,
+        retire: impl FnOnce(&Store) -> Result<(), String>,
+    ) -> Result<RemovalOutcome, String> {
+        let Some(chain) = self.trusted_chain() else {
+            return Ok(RemovalOutcome::NoMembership);
+        };
+        let Some(keys) = self.keys(false)? else {
+            return Ok(RemovalOutcome::NoMembership);
+        };
+        // What this check is about, captured now (P1-1): the identity and its unit.
+        let captured = keys.sign_key();
+        let unit = chain.versions().iter().rev().find_map(|h| {
+            h.roster()
+                .membership()
+                .ok()?
+                .unit_for(&captured)
+                .map(|u| u.id.clone())
+        });
+        let signer: Arc<dyn xshell_protocol::ring::Signer> = keys.clone();
+        match xshell_protocol::ring::relay::check_removal(
+            &chain,
+            signer,
+            None,
+            self.timeouts.connect,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            xshell_protocol::ring::relay::RemovalCheck::Removed(evidence) => {
+                // Delayed evidence is discarded unless it still concerns this identity and
+                // unit and extends the chain stored now.
+                let fenced = |store: &Store, keys: &DeviceKeys| -> Result<(), String> {
+                    let refuse = |why: &str| Err(format!("removal evidence discarded: {why}"));
+                    if keys.sign_key() != captured {
+                        return refuse("this Host's identity changed");
+                    }
+                    let Some(durable) = super::companion::trusted(store)? else {
+                        return refuse("no stored membership any more");
+                    };
+                    let Ok((merged, _)) = durable.extended(evidence.versions()) else {
+                        return refuse("it does not extend the stored chain");
+                    };
+                    let retired = merged
+                        .head()
+                        .roster()
+                        .membership()
+                        .map(|m| m.retired)
+                        .unwrap_or_default();
+                    if merged.authorized_member(&captured).is_some()
+                        || unit.as_ref().is_none_or(|u| !retired.contains(u))
+                    {
+                        return refuse("it does not remove this Host's unit");
+                    }
+                    check(store, keys)
+                };
+                self.set_aside(budget, Aside::Removed, Some(&evidence), fenced, retire)?;
+                Ok(RemovalOutcome::SetAside)
+            }
+            xshell_protocol::ring::relay::RemovalCheck::Member(newer) => {
+                let joined = self
+                    .lock_life()
+                    .joined
+                    .as_ref()
+                    .map(|j| (j.connector.clone(), j.sessions.clone()));
+                let same = newer.head() == chain.head();
+                if let Some((connector, sessions)) = joined {
+                    self.persist.keep_newer(&newer, Some(&connector), &sessions);
+                    if !same {
+                        connector.kick();
+                    }
+                }
+                Ok(if same {
+                    RemovalOutcome::MemberSame
+                } else {
+                    RemovalOutcome::MemberChanged
+                })
+            }
+        }
+    }
+
     pub fn trusted_chain(&self) -> Option<RosterChain> {
         self.persist
             .chain
@@ -617,6 +1473,11 @@ impl Ring {
 
     /// At start: rejoin the stored Ring, if this Host is a member of it.
     pub fn resume(&self) {
+        match complete_pending_reset(&self.persist.store) {
+            Ok(true) => crate::log!("INFO", "ring: finished an interrupted identity reset"),
+            Ok(false) => {}
+            Err(e) => crate::log!("ERROR", "ring: cannot finish an identity reset: {e}"),
+        }
         let keys = match self.persist.store.load_keys() {
             Ok(Some(k)) => Arc::new(k),
             Ok(None) => return,
@@ -635,6 +1496,42 @@ impl Ring {
             self.persist.adopt()
         };
         self.persist.head_changed(epoch, &chain);
+        // Format 1 (D2a) and a stored chain that no longer authorizes this Host are set
+        // aside at start; a busy counterpart or standalone operation defers the removal to
+        // the maintenance loop.
+        #[cfg(any(unix, windows))]
+        {
+            let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_secs(10),
+                Arc::new(AtomicBool::new(false)),
+            );
+            if xshell_protocol::ring::membership::unsupported_stored_membership(chain.head()) {
+                match self.set_aside(
+                    &budget,
+                    Aside::V1,
+                    None,
+                    |_, _| Ok(()),
+                    super::companion::retire_for_format_reset,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => crate::log!("ERROR", "ring: cannot set the format-1 Ring aside: {e}"),
+                }
+                return;
+            }
+            if !is_daemon_member(&chain, &keys) {
+                if let Err(e) = self.set_aside(
+                    &budget,
+                    Aside::Removed,
+                    None,
+                    super::companion::idle_for_set_aside,
+                    super::companion::retire_for_set_aside,
+                ) {
+                    crate::log!("INFO", "ring: removed membership not set aside yet: {e}");
+                    self.removal_signal.store(true, Ordering::Release);
+                }
+                return;
+            }
+        }
         if !is_daemon_member(&chain, &keys) {
             crate::log!("INFO", "ring: this Host is not in the stored Roster");
             return;
@@ -697,6 +1594,8 @@ impl Ring {
             Arc::new(Events {
                 persist: self.persist.clone(),
                 sessions: sessions.clone(),
+                removal_signal: self.removal_signal.clone(),
+                last_refusal: self.last_refusal.clone(),
                 connector: slot.clone(),
             }),
         )
@@ -754,15 +1653,91 @@ impl Ring {
     /// `expect`, only while this Host's membership (as `ring.identity` reports it) is still
     /// the expected one, checked under the same locks as the commit.
     pub fn join(&self, tokens: &[String], expect: Option<&JoinExpect>) -> Result<Value, String> {
+        // Host IPC supplies no deadline. Bound this local install once at ingress
+        // using the existing request timeout; never renew internal accepted budgets.
+        let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+            Instant::now() + self.timeouts.request,
+            Arc::new(AtomicBool::new(false)),
+        );
+        #[cfg(test)]
+        if let Some(hook) = self.host_budget_hook.lock().unwrap().as_ref() {
+            hook(&budget);
+        }
+        self.join_inner(tokens, expect, JoinOrigin::Host, Some(&budget))
+    }
+    #[cfg(test)]
+    pub(super) fn test_host_join_until(
+        &self,
+        tokens: &[String],
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(tokens, None, JoinOrigin::Host, Some(budget))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn join_accepted_standalone(
+        &self,
+        tokens: &[String],
+        operation: &str,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(
+            tokens,
+            None,
+            JoinOrigin::Standalone {
+                operation: operation.into(),
+            },
+            Some(budget),
+        )
+    }
+    #[cfg(any(unix, windows))]
+    pub(super) fn join_accepted_companion(
+        &self,
+        tokens: &[String],
+        operation: &str,
+        budget: &xshell_core::local_ipc::RequestBudget,
+    ) -> Result<Value, String> {
+        self.join_inner(
+            tokens,
+            None,
+            JoinOrigin::Companion {
+                operation: operation.into(),
+            },
+            Some(budget),
+        )
+    }
+    fn join_inner(
+        &self,
+        tokens: &[String],
+        expect: Option<&JoinExpect>,
+        origin: JoinOrigin,
+        budget: Option<&xshell_core::local_ipc::RequestBudget>,
+    ) -> Result<Value, String> {
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
+        }
         let refused = |e: RosterError| format!("roster refused: {}", e.as_code());
         let chain = RosterChain::from_tokens(tokens).map_err(refused)?;
-        let keys = self.keys(true)?.ok_or("no keys")?;
+        let keys = match budget {
+            Some(budget) => {
+                let mut cached = budget.lock(&self.keys).map_err(|e| e.to_string())?;
+                if cached.is_none() {
+                    *cached = self.persist.store.load_keys()?.map(Arc::new);
+                }
+                cached.clone()
+            }
+            None => self.keys(false)?,
+        }
+        .ok_or("no retained Daemon identity; request ring.identity first")?;
         if !is_daemon_member(&chain, &keys) {
             return Err("not a member of this Roster".into());
         }
         // The lifecycle lock for the whole commit and install (never taken by the Connector's
         // callbacks), then the persisted chain's: the Connector's own saves wait.
-        let mut life = self.lock_life();
+        let mut life = match budget {
+            Some(budget) => budget.lock(&self.life).map_err(|e| e.to_string())?,
+            None => self.lock_life(),
+        };
         if life.stopped {
             return Err("xshelld is exiting".into());
         }
@@ -770,14 +1745,60 @@ impl Ring {
         if let Some(h) = self.install_hook.lock().unwrap().as_ref() {
             h();
         }
-        let mut cur = self.persist.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cur = match budget {
+            Some(budget) => budget
+                .lock(&self.persist.chain)
+                .map_err(|e| e.to_string())?,
+            None => self.persist.chain.lock().unwrap_or_else(|e| e.into_inner()),
+        };
         if let Some(x) = expect {
             if !expected(x, membership(cur.as_ref(), &life)) {
                 return Err(MEMBERSHIP_CHANGED.into());
             }
         }
-        let same_ring = cur.as_ref().is_some_and(|c| c.ring_id() == chain.ring_id());
-        let next = match cur.as_ref() {
+        let owner = life.joined.as_ref().map(|j| j.connector.clone());
+        // The earlier lifecycle/cache locks serialize all file -> Connector paths in
+        // this Ring. Owner callbacks drop Connector state before taking the cache lock.
+        let install_guard = if let Some(owner) = &owner {
+            let budget = budget.ok_or("accepted install requires its original request budget")?;
+            Some(loop {
+                budget.check().map_err(|e| e.to_string())?;
+                if let Some(guard) = owner.try_accepted_install() {
+                    break guard;
+                }
+                std::thread::yield_now();
+            })
+        } else {
+            None
+        };
+        let current = match (&install_guard, cur.as_ref()) {
+            (Some(guard), Some(cached)) => Some(guard.extend(cached).map_err(|e| e.to_string())?),
+            (Some(guard), None) => Some(guard.current().clone()),
+            (None, cached) => cached.cloned(),
+        };
+        // A standalone Daemon whose unit the approver retired in this same approval is
+        // regrouped into the Computer the counterpart consented to: the accepted chain
+        // (verified against the counterpart obligation before this call) extends the
+        // retained one and authorizes this Daemon again.
+        #[cfg(any(unix, windows))]
+        let regroup = matches!(origin, JoinOrigin::Companion { .. })
+            && is_daemon_member(&chain, &keys)
+            && current
+                .as_ref()
+                .is_some_and(|c| c.extended(chain.versions()).is_ok());
+        #[cfg(not(any(unix, windows)))]
+        let regroup = false;
+        if current.as_ref().is_some_and(|c| {
+            c.ring_id() != chain.ring_id() || (!is_daemon_member(c, &keys) && !regroup)
+        }) {
+            return Err(
+                "leave_required: retained foreign or terminal membership cannot be replaced".into(),
+            );
+        }
+        let same_ring = current
+            .as_ref()
+            .is_some_and(|c| c.ring_id() == chain.ring_id());
+        let next = match current.as_ref() {
             Some(c) if same_ring => {
                 let (merged, a) = c.extended(chain.versions()).map_err(refused)?;
                 if a.added == 0 && chain.head().version() < c.head().version() {
@@ -789,16 +1810,54 @@ impl Ring {
         };
         // Settled against the store first (under ring.lock): a newer stored head wins, and a
         // fork of the stored chain is refused, leaving the established trust in force.
-        let changed = cur.as_ref() != Some(&next);
-        let saved = if changed {
-            self.persist.store.save_chain(&next)
-        } else {
-            Saved::new(next, None)
-        };
+        if matches!(origin, JoinOrigin::Host) {
+            if let Some(hook) = self.test_hook.get() {
+                (hook.0)(
+                    uuid::Uuid::nil(),
+                    super::TestPoint::BeforeHostRingJoinCommit,
+                );
+            }
+        }
+        let saved = self.persist.store.save_join_chain(
+            &next,
+            current.as_ref(),
+            &origin,
+            budget,
+            self.test_hook.get(),
+        )?;
         let trusted = saved.trusted;
+        // Settlement may already have changed disk, or produced an unsaved removal
+        // that must rule now. Report budget failure only after coherent enforcement.
+        let committed = match install_guard
+            .map(|guard| guard.commit(&trusted))
+            .transpose()
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                // The same guarded ancestry was verified before settlement, so this
+                // is an invariant failure. Never return with the old owner live.
+                *cur = Some(trusted.clone());
+                let epoch = self.persist.adopt();
+                life.stopped = true;
+                let failed = life.joined.take();
+                drop(cur);
+                drop(life);
+                if let Some(failed) = failed {
+                    failed.sessions.stop();
+                    failed.connector.stop(ByeReason::quit());
+                }
+                self.persist.head_changed(epoch, &trusted);
+                return Err(format!(
+                    "accepted state application failed; Ring owner stopped: {error}"
+                ));
+            }
+        };
+        // The guard is now released; no session callback runs under Connector state.
         // Then in force at once, whether or not the write succeeded: in memory, in the
         // Connector (whose head new handshakes are checked against), and in the sweep.
-        let same_ring = cur
+        // An existing guarded owner always uses the non-fallible same-Ring branch;
+        // initial Connector creation below has no old authority to leave running.
+        let same_ring = current
             .as_ref()
             .is_some_and(|c| c.ring_id() == trusted.ring_id());
         let moved = cur.as_ref() != Some(&trusted);
@@ -806,10 +1865,12 @@ impl Ring {
         let epoch = moved.then(|| self.persist.adopt());
         match life.joined.as_ref() {
             Some(j) if same_ring => {
-                if moved {
-                    j.connector.set_chain(trusted.clone());
-                } else {
-                    j.connector.kick();
+                if committed.is_none() {
+                    if moved {
+                        j.connector.set_chain(trusted.clone());
+                    } else {
+                        j.connector.kick();
+                    }
                 }
                 j.sessions.sweep(trusted.head());
             }
@@ -817,6 +1878,10 @@ impl Ring {
             _ => self.install(&mut life, trusted.clone(), keys)?,
         }
         drop(cur);
+        drop(life);
+        if let Some(committed) = committed {
+            committed.finish();
+        }
         if let Some(epoch) = epoch {
             self.persist.head_changed(epoch, &trusted);
         }
@@ -832,6 +1897,9 @@ impl Ring {
             return Err(format!(
                 "the roster is in force but could not be saved: {e}"
             ));
+        }
+        if let Some(budget) = budget {
+            budget.check().map_err(|e| e.to_string())?;
         }
         let version = trusted.head().version();
         Ok(json!({ "version": version }))
@@ -872,19 +1940,583 @@ fn expected(x: &JoinExpect, now: Option<(String, u64)>) -> bool {
     }
 }
 
+/// `evidence` as removal proof for `retained`: the same Ring, a verified extension of the
+/// retained ancestry (every successor signed and authorized by the chain rules), whose
+/// head authorizes neither this Daemon nor its registered Desktop and, on a v2 Ring,
+/// retires the unit that held this Daemon. Returns the merged chain.
+#[cfg(any(unix, windows))]
+fn removal_extension(
+    retained: &RosterChain,
+    evidence: &RosterChain,
+    daemon: &SignKey,
+) -> Result<RosterChain, String> {
+    if evidence.ring_id() != retained.ring_id() {
+        return Err("removal evidence is for another Ring".into());
+    }
+    let (merged, _) = retained
+        .extended(evidence.versions())
+        .map_err(|e| format!("removal evidence does not extend retained membership: {e}"))?;
+    // Every key of the unit that held this Daemon (a standalone Daemon, or a Computer's
+    // Desktop and Daemon) must be gone.
+    let unit_keys = retained
+        .head()
+        .roster()
+        .membership()
+        .ok()
+        .and_then(|m| m.unit_for(daemon).map(|u| u.members.clone()))
+        .unwrap_or_else(|| vec![*daemon]);
+    if merged.head().version() <= retained.head().version()
+        || merged.authorized_member(daemon).is_some()
+        || unit_keys
+            .iter()
+            .any(|k| merged.authorized_member(k).is_some())
+    {
+        return Err("removal evidence does not remove this Computer".into());
+    }
+    let head = retained.head().roster();
+    if head.v == 2 {
+        let unit = head
+            .membership()
+            .map_err(|e| e.to_string())?
+            .unit_for(daemon)
+            .map(|u| u.id.clone());
+        let retired = merged
+            .head()
+            .roster()
+            .membership()
+            .map_err(|e| e.to_string())?
+            .retired;
+        if unit.is_some_and(|id| !retired.contains(&id)) {
+            return Err("removal evidence does not retire this Computer".into());
+        }
+    }
+    Ok(merged)
+}
+
 pub(crate) fn is_daemon_member(chain: &RosterChain, keys: &DeviceKeys) -> bool {
     chain
-        .head()
-        .member(&keys.sign_key())
+        .authorized_member(&keys.sign_key())
         .is_some_and(|m| m.role == Role::Daemon)
+}
+
+/// Signed historical-format data for storage compatibility tests only, not an adoption
+/// fixture or a principal/counterpart authorization receipt.
+#[cfg(test)]
+pub(super) fn historical_storage_chain(daemon: &DeviceKeys) -> (DeviceKeys, RosterChain) {
+    use xshell_protocol::ring::{Member, SignedRoster};
+    let signer = DeviceKeys::generate().unwrap();
+    let genesis = SignedRoster::genesis(
+        &signer,
+        signer.noise_key(),
+        "historical Desktop",
+        "ws://127.0.0.1:9",
+        1,
+    )
+    .unwrap();
+    let mut versions = vec![genesis];
+    for version in 2..=1401 {
+        let next = versions
+            .last()
+            .unwrap()
+            .next(&signer, version, |draft| {
+                if version == 2 {
+                    draft.add(Member::new(
+                        "historical Daemon",
+                        Role::Daemon,
+                        daemon.sign_key(),
+                        daemon.noise_key(),
+                        2,
+                    ));
+                    draft.extra.insert(
+                        "historicalStoragePadding".into(),
+                        serde_json::Value::String("x".repeat(40 * 1024)),
+                    );
+                }
+            })
+            .unwrap();
+        assert!(next.token().len() <= xshell_protocol::ring::roster::MAX_ROSTER_TOKEN);
+        versions.push(next);
+    }
+    assert!(versions.len() <= xshell_protocol::ring::chain::MAX_CHAIN_LEN);
+    (signer, RosterChain::from_chain(versions).unwrap())
+}
+#[cfg(test)]
+pub(super) fn storage_test_directory() -> tempfile::TempDir {
+    let scratch = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    tempfile::Builder::new()
+        .prefix("signed-history-storage-")
+        .tempdir_in(scratch)
+        .unwrap()
+}
+
+/// The Daemon's background membership upkeep: the removal check after the Connector
+/// reported a refusal or close as removed (retried with backoff from 5 s to 5 min, and
+/// deferred while a counterpart or standalone operation is open), and, on Unix, the
+/// automatic reconcile of an unfinished standalone `xshelld pair` (backoff 1 s to 60 s):
+/// installed when enrolled, ended when not a member once its code expired.
+#[cfg(any(unix, windows))]
+/// `expiry_span`: how long the terminal-expiry refusals must span before the Daemon stops
+/// waiting (10 minutes in production).
+pub(crate) fn start_membership_maintenance(
+    d: &Arc<super::registry::Daemon>,
+    expiry_span: Duration,
+) {
+    let weak = Arc::downgrade(d);
+    let _ = std::thread::Builder::new()
+        .name("ring-maintenance".into())
+        .spawn(move || {
+            let mut removal_at: Option<Instant> = None;
+            let mut removal_delay = Duration::from_secs(5);
+            let mut kick_at: Option<Instant> = None;
+            let mut member_delay = Duration::from_secs(5);
+            let mut expiries: Vec<Instant> = Vec::new();
+            #[cfg(unix)]
+            let mut standalone_at = Instant::now();
+            #[cfg(unix)]
+            let mut standalone_delay = Duration::from_secs(1);
+            // The standalone journal as it was when the last step found nothing to do: a
+            // new or changed obligation (a pair command that ended unresolved) is looked at
+            // on the next tick instead of after the idle minute.
+            #[cfg(unix)]
+            let mut standalone_idle: Option<Option<std::time::SystemTime>> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let Some(d) = weak.upgrade() else { return };
+                if d.exiting.load(Ordering::Acquire) || d.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                let now = Instant::now();
+                if d.ring.take_removal_signal() && removal_at.is_none() {
+                    removal_at = Some(now);
+                }
+                if kick_at.is_some_and(|at| now >= at) {
+                    kick_at = None;
+                    d.ring.kick_connector();
+                }
+                if removal_at.is_some_and(|at| now >= at) {
+                    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+                        now + Duration::from_secs(30),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    match d.ring.check_removal(
+                        &budget,
+                        super::companion::idle_for_set_aside,
+                        super::companion::retire_for_set_aside,
+                    ) {
+                        Ok(RemovalOutcome::MemberSame) => {
+                            // The Relay refused but the signed head did not move: reconnect
+                            // with backoff, never in a tight loop (P2-6).
+                            removal_at = None;
+                            kick_at = Some(now + member_delay);
+                            member_delay = (member_delay * 2).min(Duration::from_secs(300));
+                            // A refusal that names terminal expiry while the chain still
+                            // lists this Host (a finite-policy Ring of an earlier build):
+                            // after 3 of them over at least 10 minutes, stop waiting.
+                            if d.ring.last_refusal().is_some_and(|e| e.contains("expir")) {
+                                expiries.push(now);
+                                if expiries.len() >= 3
+                                    && now.duration_since(expiries[expiries.len() - 3])
+                                        >= expiry_span
+                                {
+                                    let budget =
+                                        xshell_core::local_ipc::RequestBudget::for_operation(
+                                            now + Duration::from_secs(30),
+                                            Arc::new(AtomicBool::new(false)),
+                                        );
+                                    match d.ring.set_aside(
+                                        &budget,
+                                        Aside::Expired,
+                                        None,
+                                        super::companion::idle_for_set_aside,
+                                        super::companion::retire_for_set_aside,
+                                    ) {
+                                        Ok(()) => {
+                                            kick_at = None;
+                                            expiries.clear();
+                                        }
+                                        Err(e) => {
+                                            crate::log!("INFO", "ring: expiry set-aside: {e}")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(outcome) => {
+                            removal_at = None;
+                            removal_delay = Duration::from_secs(5);
+                            if outcome != RemovalOutcome::MemberSame {
+                                member_delay = Duration::from_secs(5);
+                                expiries.clear();
+                            }
+                        }
+                        // An operation is open: look again soon (it ends by itself).
+                        Err(e) if e.starts_with("busy:") => {
+                            removal_at = Some(now + Duration::from_secs(1));
+                        }
+                        Err(e) => {
+                            crate::log!(
+                                "INFO",
+                                "ring: removal check: {e}; retrying in {removal_delay:?}"
+                            );
+                            removal_at = Some(now + removal_delay);
+                            removal_delay = (removal_delay * 2).min(Duration::from_secs(300));
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                let journal = || {
+                    fs::metadata(d.cfg.paths.ring_dir.join("standalone-adoption.json"))
+                        .and_then(|m| m.modified())
+                        .ok()
+                };
+                #[cfg(unix)]
+                if now >= standalone_at || standalone_idle.is_some_and(|seen| seen != journal()) {
+                    let seen = journal();
+                    standalone_idle = None;
+                    // Never a ServerHandle here: dropping one shuts the Daemon down.
+                    let handle = super::adoption::Standalone { d: &d };
+                    match maintain_standalone(&handle) {
+                        Ok(true) => {
+                            standalone_delay = Duration::from_secs(1);
+                            standalone_at = now + Duration::from_secs(60);
+                            standalone_idle = Some(seen);
+                        }
+                        // A pair command is still running: look again soon, no backoff.
+                        Err(e) if e == STANDALONE_PENDING => {
+                            standalone_at = now + Duration::from_secs(1);
+                        }
+                        // Not enrolled (yet) while the code is valid: the approver may
+                        // still publish. Look again soon, without growing the backoff.
+                        Err(e) if e == STANDALONE_NOT_YET => {
+                            standalone_at = now + standalone_delay.min(Duration::from_secs(5));
+                        }
+                        Ok(false) | Err(_) => {
+                            standalone_at = now + standalone_delay;
+                            standalone_delay = (standalone_delay * 2).min(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(unix)]
+pub(super) const STANDALONE_PENDING: &str = "pending: the pair command still owns its obligation";
+#[cfg(unix)]
+pub(super) const STANDALONE_NOT_YET: &str =
+    "waiting: the standalone obligation is not enrolled yet and its code is still valid";
+
+/// One automatic step for an unfinished standalone obligation. `Ok(true)`: nothing left.
+#[cfg(unix)]
+fn maintain_standalone(handle: &super::adoption::Standalone<'_>) -> Result<bool, String> {
+    maintain_standalone_with(handle, || handle.reconcile_standalone_adoption())
+}
+
+/// [`maintain_standalone`] with the reconcile step given (tests observe without a Relay).
+///
+/// The obligation belongs to the `xshelld pair` command while it holds the offer lock;
+/// a free lock means that command has exited, and the step runs at once instead of
+/// waiting for the code to expire (expiry stays the upper bound). The step itself holds
+/// the lock, so no new command can start in the middle of it. A Daemon handler the exited
+/// command had already started (its accepted install) may still overlap: both are fenced by
+/// journal equality and the runtime chain, never by this lock alone.
+#[cfg(unix)]
+pub(super) fn maintain_standalone_with(
+    handle: &super::adoption::Standalone<'_>,
+    reconcile: impl FnOnce() -> Result<super::adoption::StandaloneRecoveryStatus, String>,
+) -> Result<bool, String> {
+    use super::adoption::StandaloneRecoveryState as S;
+    let Some(status) = handle.standalone_adoption_status()? else {
+        return Ok(true);
+    };
+    // Idle ticks never probe the lock, so they never collide with a new pair command.
+    if status.state == S::Installed {
+        return Ok(true);
+    }
+    let expired = |expires_at: u64| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            >= expires_at
+    };
+    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
+    let _offer = match store.try_offer_lock()? {
+        Some(guard) => Some(guard),
+        // A pair command still running owns its obligation: never compete with it (its
+        // own journal writes would see a changed record).
+        None if !expired(status.expires_at) => return Err(STANDALONE_PENDING.into()),
+        None => None,
+    };
+    let Some(status) = handle.standalone_adoption_status()? else {
+        return Ok(true);
+    };
+    if status.state == S::Installed {
+        return Ok(true);
+    }
+    if let Some(hook) = &handle.d.cfg.test_hook {
+        if (hook.0)(
+            uuid::Uuid::nil(),
+            super::TestPoint::StandaloneMaintenanceActs,
+        ) {
+            return Err(STANDALONE_PENDING.into());
+        }
+    }
+    let expired = || expired(status.expires_at);
+    match status.state {
+        S::Installed => Ok(true),
+        S::Terminal => {
+            abandon_standalone(handle, &status.operation)?;
+            Ok(true)
+        }
+        S::ReconciliationRequired | S::AcceptedInstalling => {
+            match reconcile() {
+                Ok(s) if s.state == S::Installed => Ok(true),
+                Ok(s) if s.state == S::Terminal => {
+                    abandon_standalone(handle, &s.operation)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(e)
+                    if expired()
+                        && ["not_member", "bad_signature", "removed", "no_roster"]
+                            .iter()
+                            .any(|c| e.contains(c)) =>
+                {
+                    abandon_standalone(handle, &status.operation)?;
+                    Ok(true)
+                }
+                // Before expiry "not a member" means not approved yet (or the answer was
+                // lost): never abandon, and do not back off as for a failure.
+                Err(e)
+                    if !expired() && ["not_member", "no_roster"].iter().any(|c| e.contains(c)) =>
+                {
+                    Err(STANDALONE_NOT_YET.into())
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// The standalone obligation never enrolled (or was removed): its journal is renamed
+/// aside so a new pair command or registration can start.
+#[cfg(unix)]
+fn abandon_standalone(
+    handle: &super::adoption::Standalone<'_>,
+    operation: &str,
+) -> Result<(), String> {
+    let store = Store::new(handle.d.cfg.paths.ring_dir.clone());
+    let budget = xshell_core::local_ipc::RequestBudget::for_operation(
+        Instant::now() + Duration::from_secs(5),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _lock = store.lock_until(&budget)?;
+    let path = store.dir.join("standalone-adoption.json");
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(());
+    }
+    fs::rename(
+        &path,
+        store.dir.join(format!(
+            "standalone-adoption.json.abandoned-{}",
+            super::registry::now_ms()
+        )),
+    )
+    .map_err(|e| e.to_string())?;
+    crate::log!(
+        "INFO",
+        "ring: standalone pairing {operation} ended without membership"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_identity_reset_is_finished_and_old_keys_never_return() {
+        for stop in 0..RESET_FILES.len() {
+            let dir = storage_test_directory();
+            let store = Store::new(dir.path().join("ring"));
+            store.ensure_dir().unwrap();
+            let old = store.load_or_create_keys().unwrap();
+            for name in ["roster.json", "companion.json", "standalone-adoption.json"] {
+                write_private(&store.dir.join(name), b"{}").unwrap();
+            }
+            write_reset_obligation(&store, "removed", 7).unwrap();
+            // The crash: only the first `stop` files were moved.
+            complete_pending_reset_until(&store, Some(stop)).unwrap();
+            assert!(store.dir.join(RESET_OBLIGATION).exists(), "cut {stop}");
+            // Startup finishes it before anything reads the keys.
+            assert!(complete_pending_reset(&store).unwrap());
+            assert!(!store.dir.join(RESET_OBLIGATION).exists());
+            for name in RESET_FILES {
+                assert!(!store.dir.join(name).exists(), "{name} after cut {stop}");
+                assert!(store.dir.join(format!("{name}.removed-7")).exists());
+            }
+            assert!(
+                store.load_keys().unwrap().is_none(),
+                "old keys gone at cut {stop}"
+            );
+            let new = store.load_or_create_keys().unwrap();
+            assert_ne!(
+                new.sign_key(),
+                old.sign_key(),
+                "a new identity at cut {stop}"
+            );
+            assert!(!complete_pending_reset(&store).unwrap(), "idempotent");
+        }
+    }
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    /// Historical v1 storage compatibility, not a new adoption/bootstrap authority.
+    #[test]
+    fn valid_signed_roster_history_larger_than_a_host_frame_survives_storage_restart() {
+        let temp = storage_test_directory();
+        let store = Store::new(temp.path().join("ring"));
+        let daemon = store.load_or_create_keys().unwrap();
+        let (_, chain) = historical_storage_chain(&daemon);
+        {
+            let _lock = store.lock().unwrap();
+            store.write_chain(&chain).unwrap();
+        }
+        let stored_bytes = fs::metadata(store.roster_path()).unwrap().len();
+        assert!(
+            stored_bytes > xshell_protocol::frame::MAX_FRAME_LEN as u64,
+            "fixture must exceed the old Host-frame cap"
+        );
+        eprintln!(
+            "STORAGE_COMPAT roster.json bytes={stored_bytes} signed_versions={}",
+            chain.versions().len()
+        );
+        let readback = store
+            .read_chain()
+            .expect("valid signed retained history must be readable")
+            .unwrap();
+        assert!(
+            readback == chain,
+            "exact verified historical tokens must survive readback"
+        );
+        drop(readback);
+        drop(store);
+        let restarted_store = Store::new(temp.path().join("ring"));
+        // This is the same retained-trust loader used by Ring::resume; no Relay is dialed.
+        let restarted = restarted_store
+            .load_chain()
+            .expect("restart must retain valid signed history");
+        assert!(
+            restarted == chain,
+            "restart must retain exact history, not truncate or replace it"
+        );
+        assert_eq!(
+            restarted_store.load_keys().unwrap().unwrap().sign_key(),
+            daemon.sign_key()
+        );
+        assert_eq!(
+            fs::metadata(restarted_store.roster_path()).unwrap().len(),
+            stored_bytes
+        );
+        assert!(!fs::read_dir(&restarted_store.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".bad-")));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn stored_object_bounds_cover_histories_and_reject_each_sparse_oversize() {
+        let temp = storage_test_directory();
+        for kind in [
+            PrivateRingFile::Keys,
+            PrivateRingFile::RosterHistory,
+            PrivateRingFile::PushRegistrations,
+            PrivateRingFile::CompanionPolicy,
+            PrivateRingFile::StandaloneJournal,
+            PrivateRingFile::CompletionMailbox,
+        ] {
+            let path = temp.path().join("object.json");
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let limit = kind.maximum();
+            file.set_len(limit as u64 + 1).unwrap();
+            assert!(read_private(&path, kind).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().len(), limit as u64 + 1);
+        }
+        let history = PrivateRingFile::RosterHistory.maximum();
+        assert!(history > xshell_protocol::frame::MAX_FRAME_LEN as usize);
+        assert!(
+            PrivateRingFile::StandaloneJournal.maximum() >= 2 * MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+        );
+        assert!(
+            PrivateRingFile::CompletionMailbox.maximum()
+                >= 2 * MAX_STORED_TOKEN_ARRAY_JSON_BYTES
+                    + xshell_protocol::ring::companion::MAX_COMPANION_FRAME
+        );
+        assert!(PrivateRingFile::Keys.maximum() < 1024);
+        assert!(PrivateRingFile::PushRegistrations.maximum() < 1024 * 1024);
+        assert_eq!(
+            PrivateRingFile::CompanionPolicy.maximum(),
+            xshell_core::companion_policy::MAX_COMPANION_POLICY_JSON_BYTES
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_ring_file_size_bound_rejects_sparse_oversize_before_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("keys.json");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let length = PrivateRingFile::Keys.maximum() as u64 + 1;
+        file.set_len(length).unwrap();
+        assert!(read_private(&path, PrivateRingFile::Keys).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), length);
+    }
+    /// Windows mirrors the Unix per-kind bound: a sparse oversize file of each kind is
+    /// refused before an unbounded read, and the file is left as found.
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_private_enforces_each_kind_maximum() {
+        let temp = tempfile::tempdir().unwrap();
+        xshell_core::private_fs::ensure_dir(temp.path()).unwrap();
+        for kind in [
+            PrivateRingFile::Keys,
+            PrivateRingFile::RosterHistory,
+            PrivateRingFile::PushRegistrations,
+            PrivateRingFile::CompanionPolicy,
+            PrivateRingFile::StandaloneJournal,
+            PrivateRingFile::CompletionMailbox,
+        ] {
+            let path = temp.path().join("object.json");
+            let _ = fs::remove_file(&path);
+            let file = xshell_core::private_fs::create_new(&path).unwrap();
+            let limit = kind.maximum() as u64;
+            file.set_len(limit + 1).unwrap();
+            drop(file);
+            assert!(read_private(&path, kind).is_err());
+            assert_eq!(fs::metadata(&path).unwrap().len(), limit + 1);
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(limit.min(64)).unwrap();
+            drop(file);
+            assert_eq!(
+                read_private(&path, kind).unwrap().unwrap().len() as u64,
+                limit.min(64)
+            );
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn private_files_refuse_symlinks_and_tighten_modes() {
@@ -894,16 +2526,155 @@ mod tests {
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            read_private(&p).unwrap().as_deref().map(|v| v.as_slice()),
+            read_private(&p, PrivateRingFile::Keys)
+                .unwrap()
+                .as_deref()
+                .map(|v| v.as_slice()),
             Some(&b"x"[..])
         );
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
         let link = t.path().join("link.json");
         symlink(&p, &link).unwrap();
-        assert!(read_private(&link).is_err());
-        assert_eq!(read_private(&t.path().join("none")).unwrap(), None);
+        assert!(read_private(&link, PrivateRingFile::Keys).is_err());
+        assert_eq!(
+            read_private(&t.path().join("none"), PrivateRingFile::Keys).unwrap(),
+            None
+        );
         // Only the target is left: no temp files.
         assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_chain_query_bounds_lifecycle_chain_and_file_admission() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = Ring::new(
+            dir.path().join("ring"),
+            Duration::from_millis(10),
+            RingTimeouts::default(),
+            Duration::from_secs(5),
+        );
+        let budget = || {
+            xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_millis(30),
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
+        let life = ring.lock_life();
+        let error = ring
+            .with_effective_chain_until(&budget(), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        drop(life);
+        let cached = ring.persist.chain.lock().unwrap();
+        let error = ring
+            .with_effective_chain_until(&budget(), |_| Ok(()))
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        drop(cached);
+        let _file = ring.persist.store.lock().unwrap();
+        let budget = budget();
+        let error = ring
+            .with_effective_chain_until(&budget, |_| {
+                let _file = ring.persist.store.lock_until(&budget)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("deadline"));
+        assert!(ring.life.try_lock().is_ok());
+        assert!(ring.persist.chain.try_lock().is_ok());
+    }
+
+    #[test]
+    fn host_join_spends_one_budget_across_lifecycle_and_file_admission() {
+        use std::sync::mpsc;
+        use xshell_protocol::ring::{Member, SignedRoster};
+        let home = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(180);
+        let ring = Arc::new(Ring::new(
+            home.path().join("ring"),
+            Duration::from_millis(10),
+            RingTimeouts {
+                request: timeout,
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+        ));
+        ring.identity().unwrap();
+        let keys = ring.persist.store.load_keys().unwrap().unwrap();
+        let desktop = DeviceKeys::generate().unwrap();
+        let genesis = SignedRoster::genesis(
+            &desktop,
+            desktop.noise_key(),
+            "desktop",
+            "ws://127.0.0.1:9",
+            1000,
+        )
+        .unwrap();
+        let joined = genesis
+            .next(&desktop, 1001, |r| {
+                r.add(Member::new(
+                    "D",
+                    Role::Daemon,
+                    keys.sign_key(),
+                    keys.noise_key(),
+                    1001,
+                ))
+            })
+            .unwrap();
+        let chain = RosterChain::from_chain(vec![genesis, joined]).unwrap();
+        let tokens: Vec<String> = chain.versions().iter().map(|r| r.token().into()).collect();
+        // Setup only: the first install creates the store's files (on Windows each one gets
+        // its private DACL and a write-through rename, and a scanner may look at it). Its
+        // time is not what this test bounds, so it gets its own generous budget; the short
+        // `timeout` applies to the join under test below.
+        let started = Instant::now();
+        ring.test_host_join_until(
+            &tokens,
+            &xshell_core::local_ipc::RequestBudget::for_operation(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .unwrap();
+        eprintln!("setup join took {:?}", started.elapsed());
+        let successor = chain.head().next(&desktop, 1002, |_| {}).unwrap();
+        let next = chain.extended(&[successor]).unwrap().0;
+        let next_tokens: Vec<String> = next.versions().iter().map(|r| r.token().into()).collect();
+        let (entry, entered) = mpsc::channel();
+        *ring.host_budget_hook.lock().unwrap() = Some(Box::new(move |b| {
+            entry.send(b.clone()).unwrap();
+        }));
+        let life = ring.lock_life();
+        let file = ring.persist.store.lock().unwrap();
+        let before = std::fs::read(ring.persist.store.roster_path()).unwrap();
+        let r = ring.clone();
+        let worker = std::thread::spawn(move || r.join(&next_tokens, None));
+        let original = entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Deliberately spend part of this known captured request budget at the first
+        // admission; this is a deadline control, not a fixture-stabilization sleep.
+        let (_unreleased, wait) = mpsc::channel::<()>();
+        assert!(wait.recv_timeout(timeout / 2).is_err());
+        original.check().unwrap();
+        drop(life);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(
+            original.check().is_err(),
+            "later file admission cannot renew the entry budget"
+        );
+        assert_eq!(
+            std::fs::read(ring.persist.store.roster_path()).unwrap(),
+            before
+        );
+        assert!(ring.life.try_lock().is_ok());
+        assert!(ring.persist.chain.try_lock().is_ok());
+        let owner = ring.lock_life().joined.as_ref().unwrap().connector.clone();
+        assert!(owner.try_accepted_install().is_some());
+        drop(file);
+        ring.stop(ByeReason::quit());
     }
 
     /// A `join` that passed the `stopped` check installs under the lifecycle lock; a `stop`
@@ -1097,7 +2868,7 @@ mod tests {
         assert!(e.contains("conflicts"), "{e}");
         assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
         assert_eq!(ring.identity().unwrap()["ring"]["version"], 5);
-        // Another Ring is an explicit replacement, not a fork.
+        // Foreign membership requires an explicit Leave, even with a matching expected head.
         let desk2 = DeviceKeys::generate().unwrap();
         let g2 =
             SignedRoster::genesis(&desk2, desk2.noise_key(), "d2", "ws://127.0.0.1:9", 1).unwrap();
@@ -1107,8 +2878,25 @@ mod tests {
             })
             .unwrap();
         let other_ring = RosterChain::from_chain(vec![g2, v2b]).unwrap();
-        assert_eq!(ring.join(&tokens(&other_ring), None).unwrap()["version"], 2);
-        assert_eq!(store.read_chain().unwrap().unwrap(), other_ring);
+        assert!(ring
+            .join(&tokens(&other_ring), None)
+            .unwrap_err()
+            .starts_with("leave_required:"));
+        let expect = JoinExpect {
+            ring_id: Some(upto(5).ring_id().to_string()),
+            version: Some(5),
+        };
+        assert!(ring
+            .join(&tokens(&other_ring), Some(&expect))
+            .unwrap_err()
+            .starts_with("leave_required:"));
+        let refused = store.save_chain(&other_ring);
+        assert!(refused
+            .conflict
+            .as_ref()
+            .is_some_and(|e| e.starts_with("leave_required:")));
+        assert_eq!(store.read_chain().unwrap().unwrap(), upto(5));
+        assert_eq!(ring.identity().unwrap()["ring"]["version"], 5);
         ring.stop(ByeReason::quit());
     }
 

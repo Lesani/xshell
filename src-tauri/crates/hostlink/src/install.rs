@@ -310,14 +310,7 @@ pub fn parse_probe(stdout: &str) -> Result<Probe, String> {
 }
 
 pub fn target_triple(os: &str, arch: &str) -> Result<&'static str, String> {
-    match (os, arch) {
-        ("windows" | "Windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        ("Linux", "x86_64" | "amd64") => Ok("x86_64-unknown-linux-musl"),
-        ("Linux", "aarch64" | "arm64") => Ok("aarch64-unknown-linux-musl"),
-        ("Darwin", "arm64" | "aarch64") => Ok("aarch64-apple-darwin"),
-        ("Darwin", "x86_64") => Ok("x86_64-apple-darwin"),
-        _ => Err(format!("unsupported host platform: {os} {arch}")),
-    }
+    xshell_protocol::build::host_triple(os, arch)
 }
 
 /// `linux` / `macos` for the status, from `uname -s`.
@@ -655,7 +648,7 @@ pub fn select_remote(
 pub fn local_server_bin(home: &std::path::Path, dir: &str) -> PathBuf {
     xshell_core::server::server_root(home)
         .join(dir)
-        .join("xshelld")
+        .join(format!("xshelld{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Copy the app's `xshelld` (`src`) to [`local_server_bin`] unless an identical private copy
@@ -672,8 +665,19 @@ pub fn install_local(
     home: &std::path::Path,
     dir_name: &str,
 ) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(src)?;
+    install_local_bytes(&bytes, home, dir_name)
+}
+
+/// [`install_local`] from bytes in memory (the Desktop's embedded `xshelld`).
+#[cfg(unix)]
+pub fn install_local_bytes(
+    bytes: &[u8],
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind, Write};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     if !valid_version(dir_name) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -681,33 +685,8 @@ pub fn install_local(
         ));
     }
     let dest = local_server_bin(home, dir_name);
+    let dir = ensure_server_dir(home, dir_name)?;
     let uid = unsafe { libc::getuid() };
-    let mut dir = home.to_path_buf();
-    for part in [".xshell", "server", dir_name] {
-        dir.push(part);
-        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
-        let m = std::fs::symlink_metadata(&dir)?;
-        if !m.file_type().is_dir() {
-            return Err(Error::other(format!(
-                "{} is not a directory",
-                dir.display()
-            )));
-        }
-        if m.uid() != uid {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
-            ));
-        }
-        if m.mode() & 0o077 != 0 {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    let bytes = std::fs::read(src)?;
     if let Ok(m) = std::fs::symlink_metadata(&dest) {
         let same = m.file_type().is_file()
             && m.uid() == uid
@@ -734,7 +713,7 @@ pub fn install_local(
             .create_new(true)
             .mode(0o700)
             .open(&tmp)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         // The umask may have narrowed it.
         f.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         f.sync_all()?;
@@ -745,6 +724,150 @@ pub fn install_local(
         let _ = std::fs::remove_file(&tmp);
     }
     r.map(|_| dest)
+}
+
+/// Windows [`install_local`]: reads `src` and installs its bytes.
+#[cfg(windows)]
+pub fn install_local(
+    src: &std::path::Path,
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
+    let bytes = std::fs::read(src)?;
+    install_local_bytes(&bytes, home, dir_name)
+}
+
+/// Windows [`install_local`] from bytes in memory (the Desktop's embedded `xshelld.exe`):
+/// `home\.xshell\server\<dir_name>\xshelld.exe`, every directory private to this user
+/// and no reparse point on the way. An identical file is left alone (a running Daemon of
+/// this build keeps running from it); otherwise a new private file is written, synced and
+/// renamed over it. A destination that cannot be replaced because it runs is accepted
+/// when it reports this build's identity.
+#[cfg(windows)]
+pub fn install_local_bytes(
+    bytes: &[u8],
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    if !valid_version(dir_name) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid version string {dir_name:?}"),
+        ));
+    }
+    let dir = xshell_core::server::windows_server_root(home)?.join(dir_name);
+    xshell_core::private_fs::ensure_dir(&dir)?;
+    xshell_core::server::no_reparse(&dir)?;
+    let dest = dir.join("xshelld.exe");
+    // An existing file is used only through `open_read`: ours, not a reparse point, and its
+    // DACL made private again, before its bytes count as installed.
+    if let Some(existing) = xshell_core::private_fs::open_read(&dest)? {
+        if same_bytes(&existing, bytes)? {
+            return Ok(dest);
+        }
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".xshelld.{}.{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let r = (|| {
+        let mut f = xshell_core::private_fs::create_new(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &dest)
+    })();
+    match r {
+        Ok(()) => Ok(dest),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // A running image cannot be replaced; one of this very version and build is
+            // what we wanted to install anyway, once it is checked like any existing file.
+            if xshell_core::private_fs::open_read(&dest)?.is_none() {
+                return Err(e);
+            }
+            match xshell_core::server::native_identity(&dest) {
+                Ok(id)
+                    if xshell_protocol::build::install_dir_name(&id.version, Some(&id.build))
+                        == dir_name =>
+                {
+                    Ok(dest)
+                }
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+/// Whether the open file `f` holds exactly `bytes`.
+#[cfg(windows)]
+fn same_bytes(f: &std::fs::File, bytes: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    if f.metadata()?.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut got = Vec::with_capacity(bytes.len());
+    f.take(bytes.len() as u64 + 1).read_to_end(&mut got)?;
+    Ok(got == bytes)
+}
+
+/// `home/.xshell/server/<dir_name>`, created where missing: every directory on the way 0700
+/// and a real directory owned by this user (a wider one is narrowed; a shared, writable
+/// `~/.xshell` is refused).
+#[cfg(unix)]
+pub fn ensure_server_dir(home: &std::path::Path, dir_name: &str) -> std::io::Result<PathBuf> {
+    ensure_server_dir_created(home, dir_name).map(|(dir, _)| dir)
+}
+
+/// [`ensure_server_dir`], also saying whether this call created the install directory
+/// itself (its last component).
+#[cfg(unix)]
+pub fn ensure_server_dir_created(
+    home: &std::path::Path,
+    dir_name: &str,
+) -> std::io::Result<(PathBuf, bool)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if !valid_version(dir_name) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid version string {dir_name:?}"),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    let mut dir = home.to_path_buf();
+    let mut created = false;
+    for part in [".xshell", "server", dir_name] {
+        dir.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => created = part == dir_name,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let m = std::fs::symlink_metadata(&dir)?;
+        if !m.file_type().is_dir() {
+            return Err(Error::other(format!(
+                "{} is not a directory",
+                dir.display()
+            )));
+        }
+        if m.uid() != uid {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{} is owned by uid {}, not by us", dir.display(), m.uid()),
+            ));
+        }
+        if part == ".xshell" {
+            xshell_core::server::refuse_writable_shared_root(&dir, m.mode())?;
+        }
+        if m.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok((dir, created))
 }
 
 #[cfg(test)]
@@ -820,6 +943,116 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn local_server_bin_exe_suffix() {
+        let bin = local_server_bin(std::path::Path::new("/h"), "1.6.0+abc");
+        assert_eq!(
+            bin,
+            xshell_core::server::server_root(std::path::Path::new("/h"))
+                .join("1.6.0+abc")
+                .join(if cfg!(windows) {
+                    "xshelld.exe"
+                } else {
+                    "xshelld"
+                })
+        );
+    }
+
+    /// A private test home (the profile's owner may be Administrators).
+    #[cfg(windows)]
+    fn windows_home(t: &tempfile::TempDir) -> std::path::PathBuf {
+        let home = t.path().join("home");
+        xshell_core::private_fs::ensure_dir(&home).unwrap();
+        home
+    }
+
+    /// B1: an identical existing `xshelld.exe` whose DACL lets everyone write is not taken
+    /// as installed as it is: its DACL is made private first.
+    #[cfg(windows)]
+    #[test]
+    fn windows_identical_install_with_a_broad_dacl_is_repaired() {
+        let t = tempfile::tempdir().unwrap();
+        let home = windows_home(&t);
+        let bytes = b"MZ fake daemon bytes";
+        let dest = install_local_bytes(bytes, &home, "1.6.0+abc").unwrap();
+        assert_eq!(dest, local_server_bin(&home, "1.6.0+abc"));
+        let status = std::process::Command::new("icacls.exe")
+            .arg(&dest)
+            .args(["/grant", "*S-1-1-0:F"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let broad = xshell_core::private_fs::security_sddl(&dest).unwrap();
+        assert!(broad.contains(";;;WD)"), "{broad}");
+        assert_eq!(
+            install_local_bytes(bytes, &home, "1.6.0+abc").unwrap(),
+            dest
+        );
+        let after = xshell_core::private_fs::security_sddl(&dest).unwrap();
+        assert!(!after.contains("WD"), "{after}");
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        // Other bytes replace it, privately.
+        install_local_bytes(b"MZ other bytes", &home, "1.6.0+abc").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"MZ other bytes");
+        assert!(!xshell_core::private_fs::security_sddl(&dest)
+            .unwrap()
+            .contains("WD"));
+    }
+
+    /// B1: the check every existing destination goes through refuses a file this user does
+    /// not own (a system file here: a test cannot give a file to another user) and a
+    /// directory where the executable should be.
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_destination_must_be_ours() {
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("notepad.exe");
+        assert!(xshell_core::private_fs::open_read(&system).is_err());
+        let t = tempfile::tempdir().unwrap();
+        let home = windows_home(&t);
+        let dest = local_server_bin(&home, "1.6.0+abc");
+        std::fs::create_dir_all(&dest).unwrap();
+        assert!(install_local_bytes(b"MZ", &home, "1.6.0+abc").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_local_bytes_idempotent_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let p = install_local_bytes(b"#!/bin/sh\necho one\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(p, local_server_bin(home, "1.5.0+abc"));
+        let m = std::fs::metadata(&p).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o700);
+        for d in [".xshell", ".xshell/server", ".xshell/server/1.5.0+abc"] {
+            let m = std::fs::metadata(home.join(d)).unwrap();
+            assert_eq!(m.mode() & 0o777, 0o700, "{d}");
+        }
+        // Identical: the file is not replaced (same inode).
+        let ino = m.ino();
+        install_local_bytes(b"#!/bin/sh\necho one\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+        // Different bytes or a loosened mode: replaced atomically.
+        install_local_bytes(b"#!/bin/sh\necho two\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\necho two\n");
+        assert_ne!(std::fs::metadata(&p).unwrap().ino(), ino);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install_local_bytes(b"#!/bin/sh\necho two\n", home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o700);
+        // No temp files left; a bad directory name is refused.
+        let left = std::fs::read_dir(p.parent().unwrap()).unwrap().count();
+        assert_eq!(left, 1);
+        assert!(install_local_bytes(b"x", home, "../x").is_err());
+        // The path wrapper is the same operation.
+        let src = home.join("src");
+        std::fs::write(&src, b"#!/bin/sh\necho three\n").unwrap();
+        install_local(&src, home, "1.5.0+abc").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"#!/bin/sh\necho three\n");
+    }
 
     /// The `selected` probe of a Daemon command Host (#55), through a real `sh` with a fake
     /// HOME: a name only for a valid, private install not older than the command's Daemon.

@@ -13,8 +13,8 @@
 //! - Jobs arriving within [`BATCH_WINDOW`] form one batch: identities are asked for together,
 //!   those answered within [`IDENTITY_DEADLINE`] go into one Roster transaction (at most one
 //!   new version), and a late answer goes into the next batch.
-//! - A Remote Host already in another Ring is left there (`other-ring`) until the user pairs
-//!   it with this Desktop ([`SyncWorker::claim`]); the Local Host follows this Desktop's Ring.
+//! - A Host already in another Ring is left there (`other-ring`), Local included.
+//!   Claim refuses leave-required; it is never an implicit membership replacement.
 //! - Joins are conditional when the Daemon has `ring.cjoin`: the Daemon refuses unless its
 //!   membership is still what its identity reported, so two Desktops never take a Host from
 //!   each other. A Daemon without `ring.cjoin` is joined only when it is in no Ring or in this
@@ -62,7 +62,13 @@ impl Seen {
             usable,
             ring: has(RING_CAPABILITY),
             cjoin: has(RING_CJOIN_CAPABILITY),
-            link_gen: if usable { s.link_generation } else { 0 },
+            link_gen: if usable {
+                s.raw_action_target
+                    .map(|target| target.link_generation)
+                    .unwrap_or(s.link_generation)
+            } else {
+                0
+            },
         }
     }
 }
@@ -147,6 +153,9 @@ impl HostSync {
     /// From the Observer, under the Host's lock: records the Host's connection and queues a
     /// job when a usable one is new or changed. Never blocks.
     pub fn observe(&self, s: &HostStatus) {
+        if s.route_update_unavailable.is_some() || s.host.starts_with("r_") {
+            return;
+        }
         let seen = Seen::of(s);
         let mut st = self.lock();
         let st = &mut *st;
@@ -229,7 +238,7 @@ pub struct HostRingState {
     /// Its Settings → Hosts name.
     pub name: String,
     /// `too-old` (its xshelld cannot join), `other-ring` (paired with another Desktop's
-    /// devices; [`SyncWorker::claim`] pairs it here), `full` or `failed`.
+    /// devices; explicit Leave is required), `full` or `failed`.
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -289,7 +298,7 @@ fn observed_ring(v: &Value) -> Option<(String, Option<u64>)> {
 }
 
 /// Where a Remote Host is reached: a new key at the same place is a reinstall.
-fn target_of(cfg: &crate::HostConfig) -> String {
+pub(crate) fn target_of(cfg: &crate::HostConfig) -> String {
     format!(
         "{}|{}",
         cfg.ssh_target,
@@ -375,7 +384,7 @@ impl SyncWorker {
             .filter_map(|(host, state, error)| {
                 let h = (self.host)(&host)?;
                 Some(HostRingState {
-                    name: h.config().name,
+                    name: h.display_name(),
                     host,
                     state,
                     error,
@@ -405,7 +414,13 @@ impl SyncWorker {
             }),
         );
         match rx.recv_timeout(IDENTITY_TIMEOUT).ok()? {
-            Ok(v) => LocalIdentity::from_json(&v).ok(),
+            Ok(v) => {
+                let identity = LocalIdentity::from_json(&v).ok();
+                if identity.is_some() {
+                    self.ring.host_identity_observed();
+                }
+                identity
+            }
             Err(e) => {
                 eprintln!("xshell: ring.identity on {host} failed: {}", e.message);
                 None
@@ -421,10 +436,8 @@ impl SyncWorker {
         self.ring.remove_member(key)
     }
 
-    /// Pairs a Host that is in another Ring with this Desktop's: bound to the key and the
-    /// Ring observed on its current connection, and conditional on the Daemon still being
-    /// there. Fails when the Host is not waiting for that, reconnected since, or cannot join
-    /// conditionally.
+    /// Legacy claim entry point. Foreign membership requires explicit Leave; no Roster
+    /// edit or conditional join is queued by this command.
     pub fn claim(&self, host: &str) -> Result<(), String> {
         let c = self
             .notes()
@@ -441,13 +454,7 @@ impl SyncWorker {
         if self.ring.chain().map(|ch| ch.ring_id().clone()) != Some(c.ours.clone()) {
             return Err("your devices changed; try again in a moment".into());
         }
-        self.post(Msg::Job {
-            host: host.to_string(),
-            gen: c.gen,
-            claim: Some(c),
-            retry: false,
-        });
-        Ok(())
+        Err("leave_required: leave this Host's retained Ring before pairing it elsewhere".into())
     }
 
     fn run(&self, rx: Receiver<Msg>) {
@@ -639,11 +646,11 @@ impl SyncWorker {
                     continue;
                 }
             };
+            self.ring.host_identity_observed();
             let observed = observed_ring(&v);
-            let local = host == LOCAL_HOST_ID;
             if let Some((rid, version)) = &observed {
-                if !local && rid != ours.as_str() {
-                    // Another Desktop's devices: left alone until the user pairs it here.
+                if rid != ours.as_str() {
+                    // Host streaming access is not permission to replace its Ring.
                     let claim = Claim {
                         gen,
                         identity,
@@ -708,7 +715,7 @@ impl SyncWorker {
                 target: String::new(),
             });
         }
-        let cfg = (self.host)(host)?.config();
+        let cfg = (self.host)(host)?.saved_config()?;
         Some(HostRef {
             id: host.to_string(),
             name: cfg.name.clone(),
@@ -777,7 +784,13 @@ impl SyncWorker {
                     Some("its key is already one of your devices, with another role".into()),
                     None,
                 ),
+                Some(HostOutcome::Revoked) => self.note(id, "revoked", None, None),
                 Some(HostOutcome::Full) => self.note(id, "full", None, None),
+                // A v2 Ring: the Host joins through its own enrollment, not this worker.
+                Some(HostOutcome::NeedsEnrollment) => self.clear(id),
+                // A v2 Computer unit's Daemon (this Computer's own included) follows the
+                // Ring itself; it refuses the legacy `ring.join`, so none is sent.
+                Some(HostOutcome::Registered) => self.clear(id),
                 // Decided for a Ring that is gone: look again, against the new one.
                 Some(HostOutcome::RingChanged) => {
                     if self.sync.current(id, r.gen).is_some() {
@@ -1171,7 +1184,118 @@ mod tests {
     }
 
     #[test]
-    fn other_ring_left_alone_until_claimed() {
+    fn contradictory_foreign_identity_withdraws_retained_alias_before_enrollment() {
+        let f = fx();
+        f.ring.attach_manager(&f.m).unwrap();
+        f.ring.enable(None, false).unwrap();
+        let original = FakeDaemon::start(Opts::default());
+        let changed = FakeDaemon::start(Opts {
+            ring: serde_json::json!({"ringId":"foreign", "version":3}),
+            ..Default::default()
+        });
+        let id = "h_aaaaaaaa";
+        f.serve(id, &original);
+        let worker = f.worker();
+        worker.start().unwrap();
+        f.m.configure(vec![host_cfg(id, "Saved")]).unwrap();
+        let alias = crate::ring::hosts::relay_host_id(&original.keys.sign_key());
+        wait("retained alias established by HostSync", || {
+            f.m.host(&alias).is_some_and(|h| h.id() == id)
+        });
+        let configured = f.m.host(id).unwrap();
+        f.serve(id, &changed);
+        if let Some(join) = configured.stop_begin() {
+            join.join().unwrap();
+        }
+        configured.start();
+        wait("foreign identity observed", || {
+            worker.state_of(id) == Some("other-ring")
+        });
+        assert!(
+            f.m.host(&alias).is_none_or(|h| h.id() != configured.id()),
+            "r_K resolved to the configured handle now serving K2"
+        );
+        assert!(
+            f.m.host(id).unwrap().status().usable(),
+            "independent saved access must survive"
+        );
+        assert!(
+            changed.joins().is_empty(),
+            "foreign membership must not be replaced"
+        );
+        assert!(f
+            .ring
+            .chain()
+            .unwrap()
+            .authorized_member(&changed.keys.sign_key())
+            .is_none());
+    }
+
+    #[test]
+    fn contradictory_identity_withdraws_retained_alias_when_enrollment_commit_fails() {
+        struct Restore(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if self.1.exists() {
+                    std::fs::remove_dir(&self.0).unwrap();
+                    std::fs::rename(&self.1, &self.0).unwrap();
+                }
+            }
+        }
+        let f = fx();
+        f.ring.attach_manager(&f.m).unwrap();
+        f.ring.enable(None, false).unwrap();
+        let original = FakeDaemon::start(Opts::default());
+        let changed = FakeDaemon::start(Opts::default());
+        let id = "h_aaaaaaaa";
+        f.serve(id, &original);
+        let worker = f.worker();
+        worker.start().unwrap();
+        f.m.configure(vec![host_cfg(id, "Saved")]).unwrap();
+        let alias = crate::ring::hosts::relay_host_id(&original.keys.sign_key());
+        wait("retained alias established", || {
+            f.m.host(&alias).is_some_and(|h| h.id() == id)
+        });
+        joined_with(&original, 2);
+        let path = f._dir.path().join("ring/ring.json");
+        let backup = path.with_extension("held");
+        let _restore = Restore(path.clone(), backup.clone());
+        let installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *worker.before_commit.lock().unwrap() = Some(Box::new({
+            let installed = installed.clone();
+            move || {
+                if !installed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    std::fs::rename(&path, &backup).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+            }
+        }));
+        let configured = f.m.host(id).unwrap();
+        f.serve(id, &changed);
+        if let Some(join) = configured.stop_begin() {
+            join.join().unwrap();
+        }
+        configured.start();
+        wait("enrollment commit failed after current identity", || {
+            installed.load(std::sync::atomic::Ordering::SeqCst)
+                && worker.state_of(id) == Some("failed")
+        });
+        assert!(
+            f.m.host(&alias).is_none_or(|h| h.id() != configured.id()),
+            "failed enrollment retained r_K pointing at K2"
+        );
+        assert!(configured.status().usable());
+        assert!(changed.joins().is_empty());
+        assert!(f
+            .ring
+            .chain()
+            .unwrap()
+            .authorized_member(&changed.keys.sign_key())
+            .is_none());
+    }
+
+    #[test]
+    fn other_ring_requires_leave_before_claim() {
         let f = fx();
         f.ring.enable(None, false).unwrap();
         let d = FakeDaemon::start(Opts {
@@ -1190,84 +1314,34 @@ mod tests {
         assert!(d.joins().is_empty(), "left alone");
         assert_eq!(f.ring.chain().unwrap().head().version(), 1);
         assert!(w.claim("h_bbbbbbbb").is_err(), "nothing to claim there");
-        w.claim("h_aaaaaaaa").unwrap();
-        let c = joined_with(&d, 2);
-        assert!(c.head().member(&d.keys.sign_key()).is_some());
-        let (_, expect) = d.joins().last().unwrap().clone();
-        assert_eq!(
-            expect,
-            Some(JoinExpect {
-                ring_id: Some("foreign".into()),
-                version: Some(3)
-            })
-        );
-        wait("claimed", || w.state_of("h_aaaaaaaa").is_none());
-        assert!(w.host_states().is_empty());
+        assert!(w
+            .claim("h_aaaaaaaa")
+            .unwrap_err()
+            .starts_with("leave_required:"));
+        std::thread::sleep(BATCH_WINDOW * 2);
+        assert!(d.joins().is_empty());
+        assert_eq!(f.ring.chain().unwrap().head().version(), 1);
+        assert_eq!(w.state_of("h_aaaaaaaa"), Some("other-ring"));
     }
 
-    /// The destination Ring is replaced between the claim's checks and the transaction: no
-    /// transfer, no Roster change, and the Host is looked at again against the new Ring.
     #[test]
-    fn a_claim_for_a_replaced_ring_transfers_nothing() {
+    fn local_sync_cannot_replace_foreign_membership() {
         let f = fx();
         f.ring.enable(None, false).unwrap();
-        let d = FakeDaemon::start(Opts {
+        let daemon = FakeDaemon::start(Opts {
             ring: serde_json::json!({"ringId": "foreign", "version": 3}),
             ..Default::default()
         });
-        f.serve("h_aaaaaaaa", &d);
-        let w = f.worker();
-        let dir = f._dir.path().join("ring");
-        let replaced = Arc::new(Mutex::new(None::<RosterChain>));
-        let rep = replaced.clone();
-        *w.before_commit.lock().unwrap() = Some(Box::new(move || {
-            let mut g = rep.lock().unwrap();
-            if g.is_some() {
-                return;
-            }
-            // Another window started over: a new Ring on disk.
-            let keys = Arc::new(DeviceKeys::generate().unwrap());
-            let v1 = xshell_protocol::ring::SignedRoster::genesis(
-                &*keys,
-                keys.noise_key(),
-                "desk",
-                "ws://127.0.0.1:9",
-                1,
-            )
-            .unwrap();
-            let chain = RosterChain::from_chain(vec![v1]).unwrap();
-            let st = crate::ring::store::RingState {
-                keys,
-                chain: chain.clone(),
-                local_member: None,
-                farewells: Vec::new(),
-                held_relays: Default::default(),
-                host_members: Default::default(),
-            };
-            crate::ring::store::Store::new(dir.clone())
-                .transact(|_, _| Ok((Some(st), ())))
-                .unwrap();
-            *g = Some(chain);
-        }));
-        w.start().unwrap();
-        f.m.configure(vec![host_cfg("h_aaaaaaaa", "Shared")])
-            .unwrap();
-        wait("other ring", || {
-            w.state_of("h_aaaaaaaa") == Some("other-ring")
+        let worker = f.worker();
+        worker.start().unwrap();
+        f.local(&daemon);
+        wait("local foreign Ring refused", || {
+            worker.state_of(LOCAL_HOST_ID) == Some("other-ring")
         });
-        w.claim("h_aaaaaaaa").unwrap();
-        wait("replaced", || replaced.lock().unwrap().is_some());
-        let new = replaced.lock().unwrap().clone().unwrap();
-        // Looked at again: still another Ring's, against the new one too.
-        wait("adopted", || {
-            f.ring.chain().is_some_and(|c| c.ring_id() == new.ring_id())
-        });
-        std::thread::sleep(BATCH_WINDOW * 3);
-        assert!(d.joins().is_empty(), "no transfer");
-        let c = f.ring.chain().unwrap();
-        assert_eq!(c, new, "no Roster change");
-        assert!(c.head().member(&d.keys.sign_key()).is_none());
-        assert_eq!(w.state_of("h_aaaaaaaa"), Some("other-ring"));
+        assert!(worker.claim(LOCAL_HOST_ID).is_err());
+        std::thread::sleep(BATCH_WINDOW * 2);
+        assert!(daemon.joins().is_empty());
+        assert_eq!(f.ring.chain().unwrap().head().version(), 1);
     }
 
     #[test]

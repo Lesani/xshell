@@ -25,6 +25,7 @@ enum Ev {
     Entitlement(Option<String>),
     Error(ErrorCode, Option<SignKey>),
     Accepted,
+    Removed,
 }
 
 #[derive(Default)]
@@ -99,6 +100,10 @@ impl ConnectorEvents for Rec {
     }
     fn error(&self, code: &ErrorCode, to: Option<SignKey>) {
         self.ev.lock().unwrap().push(Ev::Error(code.clone(), to));
+        self.cv.notify_all();
+    }
+    fn removed(&self) {
+        self.ev.lock().unwrap().push(Ev::Removed);
         self.cv.notify_all();
     }
     fn accepted(&self) {
@@ -262,6 +267,45 @@ fn new_head_with_other_relay_url_moves_connection() {
     // The new Relay got the whole chain staged.
     assert_eq!(b.head_version(&ring.ring_id()), Some(3));
     assert_eq!(c.chain().head().version(), 3);
+    c.stop(ByeReason::quit());
+}
+
+#[test]
+fn removed_close_and_not_member_fire_removed_once() {
+    let r = relay();
+    let mut ring = TestRing::new(&r.url());
+    let mobile = ring.mobile.sign_key();
+    let removed = |rec: &Rec| {
+        rec.all()
+            .iter()
+            .filter(|e| matches!(e, Ev::Removed))
+            .count()
+    };
+    // Closed as removed while connected.
+    let (c, rec) = start(cfg(&r, &ring.chain, ring.mobile.clone()));
+    assert!(rec.connected());
+    assert_eq!(removed(&rec), 0, "a connected member hears no removal");
+    let (desk, _) = connect(&r.target(), &ring.chain, ring.desktop.clone());
+    let v3 = ring.next(|d| {
+        d.remove(&mobile);
+    });
+    desk.publish_roster(&v3).unwrap();
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
+    // The Relay's word only: the owner checks and, still a member after all, kicks: the
+    // Connector dials again and is refused again, once more reported.
+    rec.clear();
+    c.kick();
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
+    c.stop(ByeReason::quit());
+    // Refused as not a member at connect.
+    let (c, rec) = start(cfg(&r, &ring.up_to(2), ring.mobile.clone()));
+    assert!(rec.wait(WAIT, |e| matches!(e, Ev::Removed)).is_some());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed(&rec), 1, "{:?}", rec.all());
     c.stop(ByeReason::quit());
 }
 
@@ -1702,7 +1746,11 @@ fn an_unfinished_catch_up_with_the_old_relay_gone_stays_on_the_reachable_one() {
 fn an_older_prefix_from_the_owner_is_an_echo() {
     let m = split_move(Some(GetFault::Close), true, false, Then::ToC, Fetches::Open);
     let key = m.ring.daemon.sign_key();
-    wait_long("the Daemon on C", || online(&m.c, &m.ring, &key));
+    // Presence on C can precede the Daemon's own Connected report; wait for both, or a late
+    // Connected lands after the clear below and looks like a redial.
+    wait_long("the Daemon on C", || {
+        online(&m.c, &m.ring, &key) && m.dmn.state() == LinkState::Connected { limited: false }
+    });
     assert_eq!(m.dmn.chain().head().version(), 4);
     m.mrec.clear();
     m.dmn.set_chain(m.ring.up_to(2));
@@ -1993,4 +2041,99 @@ fn a_quota_close_during_a_farewell_backs_off() {
     assert!(!online(&a, &ring, &key), "no redial during the wait");
     assert!(quota_errors(&rec).is_empty(), "{:?}", rec.all());
     desk.stop(ByeReason::quit());
+}
+
+/// Legacy transport control only: TestRelay does not implement v2 proposals.
+#[test]
+fn proposal_connection_capture_does_not_replace_the_creator_socket() {
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let events = Rec::new();
+    let connector =
+        Connector::start(cfg(&relay, &chain, ring.desktop.clone()), events.clone()).unwrap();
+    assert!(events.connected());
+    let before = connector.connection().unwrap();
+    let captured = connector.proposal_connection().unwrap();
+    assert_eq!(connector.connection(), Some(before));
+    connector.stop(ByeReason::quit());
+    assert!(connector.proposal_connection().is_err());
+    let guest = keys();
+    let intent = xshell_protocol::ring::pairing::adoption::AdoptionIntent {
+        operation: xshell_protocol::ring::b64::encode(&[31; 32]),
+        expires_at: now() + 600,
+        target: xshell_protocol::ring::pairing::adoption::JoinTarget::StandaloneDaemon {
+            daemon: xshell_protocol::ring::pairing::adoption::PublicIdentity {
+                name: "computer".into(),
+                sign_key: guest.sign_key(),
+                noise_key: guest.noise_key(),
+            },
+        },
+    };
+    let error = captured
+        .create(&intent, [32; 32], chain.head().roster())
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("creator connection or predecessor changed"));
+}
+
+/// Legacy readback control; v2 publication readback is covered by actualworkerd public
+/// Join/Approve, not by pretending TestRelay implements the v2 proposal protocol.
+#[test]
+fn accepted_chain_readback_uses_existing_client_and_rejects_wrong_pin() {
+    use xshell_protocol::ring::relay::{ChainPin, RingClient};
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let client = RingClient::connect(
+        config(&relay.target(), &chain, ring.desktop.clone()),
+        xshell_protocol::ring::relay::contract::Recorder::new(),
+    )
+    .unwrap();
+    let accepted = client
+        .read_accepted_chain(&ChainPin {
+            version: 1,
+            hash: chain.head().hash(),
+        })
+        .unwrap();
+    assert_eq!(accepted, chain);
+    assert!(client
+        .read_accepted_chain(&ChainPin {
+            version: 1,
+            hash: xshell_protocol::ring::b64::encode(&[99; 32])
+        })
+        .is_err());
+    assert!(!client.is_closed());
+    assert_eq!(client.chain(), chain);
+    client.bye(ByeReason::quit()).unwrap();
+}
+
+#[test]
+fn accepted_chain_readback_timeout_does_not_replace_or_poison_the_client() {
+    use xshell_protocol::ring::relay::{ChainPin, RingClient};
+    let relay = relay();
+    let ring = TestRing::new(&relay.url());
+    let chain = ring.up_to(1);
+    let mut config = config(&relay.target(), &chain, ring.desktop.clone());
+    config.timeouts.request = Duration::from_millis(150);
+    let client = RingClient::connect(
+        config,
+        xshell_protocol::ring::relay::contract::Recorder::new(),
+    )
+    .unwrap();
+    relay.fail_next_roster_get(GetFault::Ignore);
+    let pin = ChainPin {
+        version: 1,
+        hash: chain.head().hash(),
+    };
+    let started = Instant::now();
+    assert!(matches!(
+        client.read_accepted_chain(&pin),
+        Err(RingError::Timeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!client.is_closed());
+    assert_eq!(client.read_accepted_chain(&pin).unwrap(), chain);
+    client.bye(ByeReason::quit()).unwrap();
 }

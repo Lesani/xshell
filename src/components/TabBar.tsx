@@ -7,7 +7,7 @@ import { TabNameMenu } from "./TabNameMenu";
 import { RenameTabDialog } from "./RenameTabDialog";
 import { useState, useEffect, useRef, useLayoutEffect, useCallback, useSyncExternalStore } from "react";
 import { loadProjectSessions } from "../hosts/projectSessions";
-import { keyOf, keyOfTab, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
+import { lookupProjectValue, keyOf, keyOfTab, lookupKey, sessionKeyOf, type ProjectKey } from "../hosts/projectKey";
 import { X, Minus, Square, X as XIcon, Plus, ChevronDown, ChevronLeft, ChevronRight, Terminal as TerminalIcon, Command, Settings, Bot } from "lucide-react";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -15,7 +15,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { timeAgo, processSessions } from "../utils";
 import type { ProjectInfo, ProjectSettings, SessionInfo, Tab } from "../types";
 import { getAvailableShells, shellsForPlatform } from "../shells";
-import { registry } from "../hosts/registry";
+import { registry, resolveHostAlias } from "../hosts/registry";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import { agentStatusOf, agentStatusTooltip } from "../tabs/agentStatus";
@@ -126,7 +126,9 @@ export function RecentSessionsDropdown({ project, displayName, openSessionIds, a
     ...(canOpenRight ? { left: Math.max(4, anchorRect.left) } : { left: Math.min(maxLeft, Math.max(4, anchorRect.right - dropdownWidth)) }),
   };
 
-  // A Remote Host offers its own OS's shells, never the Desktop's.
+  // A Remote Host offers its own OS's shells, never the Desktop's. Read on every render: the
+  // TabBar that renders this dropdown re-renders on each Host snapshot (`useHostsSnapshot`),
+  // so the list follows the OS as it becomes known.
   const shells = project?.host ? shellsForPlatform(registry.getStatus(project.host)?.os ?? "linux") : getAvailableShells();
   // If there's no project, collapsing the shells makes no sense — there's nothing else in the dropdown.
   const [shellsOpen, setShellsOpen] = useState(!project);
@@ -244,7 +246,8 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
   const nameTrigger = useRef<HTMLElement | null>(null);
   const closeNameMenu = useCallback(() => setNameMenu(null), []);
   const hostsSnap = useHostsSnapshot();
-  const hostNameOf = (h: string) => hostsSnap.configs.find(c => c.id === h)?.name || h;
+  // `hostsSnap` re-renders on changes; the name never falls back to the raw Host id.
+  const hostNameOf = (h: string) => registry.hostName(h);
   const localAgentStatuses = useLocalAgentStatuses();
   useEffect(() => { names.invalidate(); }, [names, tabs, hostsSnap, closingTabIds]);
   const menuTab = nameMenu ? tabs.find(t => t.id === nameMenu.tabId && (!nameMenu.target || customTitleTargetMatches(nameMenu.target, t, hostsSnap)) && !t.groupId && !closingTabIds.has(t.id)) : undefined;
@@ -391,7 +394,7 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
             const tab = entry.tab;
             const tabKey = keyOfTab(tab);
             const isClosing = closingTabIds.has(tab.id);
-            const projectSettings = tabKey ? projectIcons[lookupKey(tabKey)] : undefined;
+            const projectSettings = tabKey ? lookupProjectValue(projectIcons, tabKey) : undefined;
             const customName = projectSettings?.customName;
             const projectDisplayName = customName || tab.projectName || "";
             const isRawShell = tab.shellMode === "raw";
@@ -400,11 +403,11 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
             const permsTooltip = tab.skipPermissions ? `${hostTooltip} · ${fmt("tab.skipPerms.tabTooltip")}` : hostTooltip;
             const liveHost = daemonHost(tab);
             const agentStatus = agentStatusOf(tab, {
-              live: liveHost ? hostsSnap.live[liveHost] : undefined,
-              status: liveHost ? hostsSnap.status[liveHost] : undefined,
+              live: liveHost ? hostsSnap.live[resolveHostAlias(hostsSnap, liveHost)] : undefined,
+              status: liveHost ? hostsSnap.status[resolveHostAlias(hostsSnap, liveHost)] : undefined,
               local: localAgentStatuses,
             });
-            const info = liveHost ? hostsSnap.live[liveHost]?.find(i => i.terminal === tab.terminal) : undefined;
+            const info = liveHost ? hostsSnap.live[resolveHostAlias(hostsSnap, liveHost)]?.find(i => i.terminal === tab.terminal) : undefined;
             const observed = liveHost ? info?.completionAttention?.completionId : localAgentStatus.completionOf(tab.id);
             const ring = attentionRing(agentStatus, info, completionSeen[attentionKey(tab)], observed, viewingIds.has(tab.id), isClosing);
             const statusHost = tab.host ? hostNameOf(tab.host) : liveHost ? fmt("picker.group.local") : "";
@@ -450,7 +453,7 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
       </div>
 
       {(() => {
-        const activeDisplayName = activeTabProject ? (projectIcons[lookupKey(keyOf(activeTabProject))]?.customName || activeTabProject.name) : null;
+        const activeDisplayName = activeTabProject ? (lookupProjectValue(projectIcons, keyOf(activeTabProject))?.customName || activeTabProject.name) : null;
         const defaultShellName = activeTabProject
           ? `Open ${defaultShell} in ${activeDisplayName}`
           : `Open ${defaultShell} in home`;
@@ -490,7 +493,7 @@ export function TabBar({ onSaveInProcessTitle, onDialogOpenChange, completionSee
       </div>
 
       {dropdown && (
-        <RecentSessionsDropdown project={activeTabProject} displayName={activeTabProject ? (projectIcons[lookupKey(keyOf(activeTabProject))]?.customName || activeTabProject.name) : ""} openSessionIds={openSessionIds} anchorRect={dropdown.rect} anchorEl={dropdown.el} installedAgents={installedAgents} onPick={(s) => activeTabProject && onOpenSession(s, activeTabProject)} onPickShell={(id, name) => onNewShell(activeTabProject, id, name)} onNewChat={onNewChatInActive} onClose={() => setDropdown(null)} />
+        <RecentSessionsDropdown project={activeTabProject} displayName={activeTabProject ? (lookupProjectValue(projectIcons, keyOf(activeTabProject))?.customName || activeTabProject.name) : ""} openSessionIds={openSessionIds} anchorRect={dropdown.rect} anchorEl={dropdown.el} installedAgents={installedAgents} onPick={(s) => activeTabProject && onOpenSession(s, activeTabProject)} onPickShell={(id, name) => onNewShell(activeTabProject, id, name)} onNewChat={onNewChatInActive} onClose={() => setDropdown(null)} />
       )}
 
       {nameMenu && menuTab && <TabNameMenu anchor={nameMenu.anchor} x={nameMenu.x} y={nameMenu.y}

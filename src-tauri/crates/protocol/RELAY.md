@@ -256,7 +256,7 @@ parsing; every byte limit in this document counts UTF-8 bytes):
 |---|---|
 | `auth.chain` | 1 MiB |
 | `env` | 96 KiB (and its decoded `payload` at most 64 KiB) |
-| `roster.put` | 72 KiB |
+| `roster.put`, `leave.put`, `proposal.create` | 72 KiB |
 | every other frame | 8 KiB |
 | any Relay to client frame (`roster.chain` included) | 1 MiB |
 
@@ -884,3 +884,253 @@ one machine than the default 10 opens a minute allows. A runner therefore config
 Relay it runs pairing scenarios on with a raised limit (at least 100 opens a minute; the
 `xshell-remote` runner uses 10000), except the Relay for `PAIR_RATE_SCENARIOS`. The test
 Relay has no rate limit unless configured with one.
+
+## Format-v2 membership substrate
+
+The v1 wire/token rules above remain the historical contract. New security-bearing
+membership is a strict `xro2.<payload>.<signature>` token, signed over
+`xshell-roster-v2\n` plus the encoded payload. Prefix/format substitution is refused.
+The ordinary payload fields and limits are unchanged; `v` is 2 and a mandatory,
+strictly decoded `membership` object carries `enrollments`, cumulative `retired`
+enrollment IDs, `policy` and a typed `change`. Unknown v2 top-level, membership,
+member, operation and proof fields are refused, not silently granted authority.
+Unsupported legacy extensions must be handled explicitly by a migration caller;
+there is no reset or lossy automatic conversion. Existing v1 creation/edit helpers
+remain legacy-only; production callers switch to typed v2 in the adoption slice.
+
+`ring/membership.rs` is the canonical representation and verifier. Computer units
+contain distinct role-correct Desktop and Daemon identities, standalone Daemon and
+Mobile units contain one identity, and `legacyDesktop` is introduced only by an
+Upgrade preserving an actual v1 Desktop. Units and their enrollment IDs are
+immutable. `CompleteComputer` replaces only explicitly referenced Desktop/Daemon
+singletons with a fresh Computer ID and fresh consent/possession proofs, preserving
+retained public identities. Removal never splits a Computer; terminal empty heads
+are valid. A retired ID cannot be reused, including after the same public keys
+are enrolled again. Existing token/count/chain/frame caps still apply; tombstones
+are not an exemption from the 64-KiB token limit.
+
+Typed changes are `genesis`, `upgrade`, `enroll`, `completeComputer`, `remove`,
+`expire` and `setPolicy`. Previous Desktop and Mobile identities administer
+membership/policy. Daemons can remove their own whole unit or publish independently
+proven expiry, not enroll peers, regroup arbitrary units or change policy. Fresh
+Mobile native confirmation and actual local Desktop consent are controller gates
+in later slices, not properties inferred from a Roster row.
+
+Each consent proof signs a domain-separated exact-proposal digest, approving
+identity, expiry and required flow-tagged context hash. The proposal digest excludes
+proofs/signatures/context self-reference, and includes the predecessor, operation,
+fresh enrollment nonce, full keyset/roles/names, policy and retained-unit descriptors.
+Local genesis/upgrade/completion contexts are derived through the separately
+domain-separated local transcript helper; they do not pretend to have a Noise
+session. Enrollment uses the Pairing context derived from the actual authenticated
+Noise transcript plus exact proposal. The Slice1 verifier checks representation,
+signature and allowed-flow mapping; the real Pairing controller must compare its
+independently derived expected transcript before consent/signing in Slice2. Test
+transcripts in contract fixtures do not claim to exercise that native operation.
+
+### Activity and terminal authority
+
+The creating/upgrading Desktop discovers `activity.key` at the configured Ring
+WebSocket endpoint and pins it in signed policy. Discovery uses the existing
+`RelayUrl` transport policy: authenticated non-loopback `wss://`, permitted
+loopback-only `ws://`, normalized origin/path and no redirect discovery. The Worker
+persists its private activity key. A missing v2 key is unavailable, never an
+opportunistic new pin. A mismatch is `activity_unavailable`.
+
+Activity tokens use `xae2` and `xshell-ring-activity-v2\n`; `ring/activity.rs`
+defines their strict signed fields. They bind Ring, Relay, verified policy-head
+hash, deterministic policy hash, observation time and complete target-unit keysets.
+A signed offline snapshot alone cannot authorize expiry: independently verified
+terminal evidence must establish elapsed finite timeout, no online half and the
+same immutable unit under an actual ancestor policy. The activity key never signs
+Roster tokens or grants membership. The documented compromised-Relay availability
+risk is not membership-granting or session-decryption authority.
+
+The active Worker finalizes elapsed expiry durably before reconnect activity or
+any candidate mutation. Every transition of a staged candidate is checked in order,
+including intermediate policies, not merely the authenticating final key or final
+head. Terminal signers cannot grant a new member through another transporter,
+complete a Computer or increase/disable policy. Narrow self-removal and proven
+expiry cleanup remain possible. Either genuinely live Computer half prevents
+expiry. Legacy unknown activity starts from its signed Upgrade baseline once;
+restarts do not refresh that baseline. Live activity is checkpointed by the existing
+Ring alarm (30 seconds), so a crash retains the last durably observed activity,
+not an invented crash/restart timestamp.
+
+`activity.preview` is nonterminal. Its signed snapshot binds the exact head,
+proposed policy and affected set. The confirmed `setPolicy` carries that preview;
+the Worker recomputes the set before mutation and conflicts if time/activity changed
+it, even when the head did not change. On commit it immediately terminal-blocks
+eligible units under the accepted policy before further admission/traffic, then
+`activity.get` supplies terminal evidence bound to that accepted head. Ordinary
+exact-head `expire` cleanup can follow; a policy increase/Never cannot resurrect
+already-final expiry. Reports include bounded, target-scoped historical terminal
+proofs for currently present units, not unbounded history in one frame.
+
+`RosterChain::observe_activity` retains independently verified terminal IDs;
+`authorized_member` is its effective membership view without rewriting the signed
+head. Candidate verification, the client send/receive path and Sessions sweeps
+honor learned terminal evidence, including same-head Connector updates. Consumers
+cannot infer evidence never supplied to them. Durable application-store integration
+of learned evidence and Pending Leave is a later-slice obligation.
+
+### Restricted departure
+
+`leave.sync` signs a fresh challenge under `xshell-ring-leave-query-v2` and binds
+origin, Ring, historical enrollment descriptor, signer, exact trusted head pin and
+pagination position. It returns bounded signed-chain pages, not a Relay-signed
+membership receipt. This lane cannot authenticate normally, refresh activity, route
+envelopes or publish arbitrary changes. `leave.put` accepts only the historical
+signer's ordinary exact-head self-`remove` for that exact enrollment, through the
+same chain verifier. The Worker never rewrites or re-signs a successor.
+
+`DepartureClient` fetches/verifies, signs locally, retries a concurrent-head conflict
+with a new signature (at most five attempts) and verifies signed-chain absence
+before completion. Absence is terminal by the never-reuse-ID invariant; old cleanup
+cannot remove a replacement enrollment even when it retains the same keys. Empty
+Rings remain readable through this historical cleanup lane. Missing/malformed chain
+proof, timeout or a bare acknowledgment cannot complete departure. Persistence of
+its old scoped signer/chain outside optional current membership remains Slice5 work.
+
+### Executable contracts and development pins
+
+`testdata/ring/membership-v2.json` is generated and checked by the canonical Rust
+`tests/ring_membership.rs` signed-token tests, then copied unchanged to the Worker's
+vectors. `relay/membership_contract.rs` runs real Rust clients against workerd,
+including policy evidence, terminal/absent cleanup, concurrent re-signing and reused
+keys. Controlled-clock workerd tests exercise admission bypass counterexamples.
+The older in-process `TestRelay` explicitly refuses v2 with `unsupported`; its v1
+passes are not v2 conformance evidence. V2 conformance comes from the active Worker.
+
+During uncommitted cross-source development an explicit temporary local Cargo patch
+may validate the real source pair. Delivery requires the parent's reviewed,
+published exact core revision in every remote manifest/lock and freshly synchronized
+vectors. No local patch or unpushed/fictitious SHA is a delivery pin.
+
+## Computer adoption proposal continuation (development v2)
+
+This is an additive metadata-only lane at the **existing Ring endpoint**, not a
+provisional membership, a new Relay, a generic upload/capability service or a new
+trust anchor. Controller/local IPC/UI adoption and application pin migration are
+not provided by this protocol substrate.
+
+### Credential and encrypted exchange
+
+`ring::device_code::DeviceCode` version1 maps12 random bytes to eight12-bit indices
+in the frozen4096-word asset. All96 bits are used without modulo bias. Parsing
+normalizes ASCII case and space/hyphen separators. Credentials and formatted words
+are wiping/redacted and memory-only. The EFF/Joseph Bonneau subset, original source,
+source/subset SHA256, selection rule and CC-BY-4.0 attribution are under
+`ring/device_code/`; code remains MIT. `THIRD_PARTY_NOTICES.txt` is also a Desktop
+bundle resource. No separate frontend dictionary exists.
+
+The pair pipe keeps its existing eight messages/direction,8192 decoded bytes/message,
+16KiB frame and600-second slot limits, including all anonymous, prefix, global and
+Mobile restrictions. Computer/headless adoption uses the same XXpsk3 handshake:
+
+| Guest sends | Approving Desktop sends |
+|---|---|
+| message1 | message2 |
+| message3: complete public target/operation/deadline and independent possession proofs | encrypted frozen proposal handle |
+| encrypted explicit consent (or cancellation) | encrypted commit acknowledgment |
+
+`JoinTarget` is either a standalone Daemon or a Computer with public Desktop and
+Daemon identities. The Computer's initiator/read principal is its Desktop; a
+standalone uses its Daemon. Both Computer keys prove possession of the exact intent
+and message2 transcript; no seed leaves its owner. The **actual final** handshake
+hash is captured after message3, before consuming Noise handshake state. Transport
+nonces increase monotonically and separately per direction. A final-hash/target/
+approver mismatch or replay fails before consent.
+
+Ordinary network steps retain15-second default deadlines. Human consent uses the
+original absolute operation/code deadline, cancellable reads and ordinary ping/pong,
+never periodic encrypted wait messages, page chains in the pair pipe, renewed
+credentials or derived slots. The callbacks in `relay::pair` separate preparation,
+local consent, publication and read-grant cancellation. Possession alone does not
+produce consent signatures. `apply_consent` checks both genuine signatures, exact
+proposal, original expiry and actual final Noise context before the approver signs.
+A commit acknowledgment is not membership installation: the guest independently
+fetches/verifies the accepted signed head before returning it to its controller.
+
+### Frozen resource and frames
+
+`proposal.create` is authenticated and72KiB-capped, like `roster.put`. Fields:
+`id, operation, head, guest, context, expiresAt, proposal`. `operation`, `head` and
+`context` are canonical32-byte base64url values; `context` is the actual final Noise
+hash; `proposal` is the exact **unsigned JSON string**, not a signed Roster token.
+Only a currently authorized Computer/LegacyDesktop Desktop may create it. The
+Worker rechecks exact accepted predecessor, signer authority/terminal state,
+Ring/Relay, valid Enroll delta and exact proposed unit/read principal. It grants no
+membership and allows no new Mobile/Daemon creation authority.
+
+`proposal.created { id, handle }` returns a random32-byte grant and resource digest.
+The handle contains exactly `ringId, relayUrl, operation, head, version, guest,
+context, expiresAt, grant, resource`. It travels only inside the real encrypted pair
+session. The guest compares every binding and original expiry before reading.
+
+The resource digest is SHA256 over the exact UTF-8 serialization
+`{"chain":[accepted tokens through head],"proposal":unsignedString,"pages":[cuts]}`
+with those field names/order and JSON serialization. Cuts are zero-based inclusive
+first/exclusive last chain indices. Fixed pages use at most768KiB of quoted token
+data, leaving room for metadata/proposal overhead; every complete response is also
+checked against1MiB. The proposal appears only on the last page. Storage references
+immutable accepted-chain versions instead of copying the full chain per grant.
+Unsigned proposal data uses the existing96KiB chunk utility in a distinct namespace,
+with bounded manifests/accounting and a separate absolute deadline/sweeper.
+
+Each token is at most64KiB. The **final** chain may have4096 versions, not4097.
+Candidate accounting includes the completed proposed token with actual encoded
+proof/signature widths, and is at most16MiB. Aggregate additional serialized staging
+is at most16MiB+64KiB and4096 physical chunks (including bounded grant manifests).
+There is at most one live grant per approver, guest or operation, and64 per Ring;
+capacity admission fails explicitly with `too_many`, never evicting another grant.
+
+On a fresh ordinary preauth socket the guest sends `proposal.read { handle, sig }`
+against the existing fresh challenge. The distinct signed bytes are:
+
+```text
+xshell-proposal-read-v2\n
+{normalizedOrigin}\n{ringId}\n{relayUrl}\n{grant}\n{resource}\n{operation}\n
+{head}\n{version}\n{guest}\n{context}\n{expiresAt}\n{freshChallenge}
+```
+
+(The display line breaks above are only formatting; fields are newline-separated,
+without a final newline.) Descriptor/deadline/possession failures close4003 without
+resource metadata. A leaked handle cannot read, and every reconnect requires a new
+challenge/signature. The successful phase is **read-only**, with
+`proposal.ready { cursor, pages }`; it never runs ordinary authentication, changes
+member generations/index/presence/activity, evicts a member socket, routes envelopes
+or Sessions, calls Hosts, or gains `auth.chain`, `roster.get/put` or departure-lane
+authority. At most one reader socket per grant is admitted; another is refused.
+
+`proposal.get { cursor }` returns `proposal.page { cursor, chain, proposal }`, with
+`proposal:null` except on the final page. Requests/read/cancel remain8KiB-capped.
+The persisted cursor admits its next page or the immediately preceding page for
+bounded recovery; arbitrary ranges/skips/older pages are refused. Page-data bytes
+(the exact JSON `{chain,proposal}`) are limited to twice resource length and page
+responses to twice the manifest page count, **across reconnects/hibernation**. Each
+socket's queue serializes page handling. The guest independently checks the digest,
+full signed chain, predecessor, approving Desktop, exact target/delta and final
+Noise context; the handle alone proves none of these.
+
+`proposal.cancel { id, grant }` is allowed only on the creating approver's current
+authenticated connection. It deletes the resource and closes readers; guest
+cancellation closes its own reader/operation, not somebody else's grant. The
+approver driver invokes read-grant cleanup on success/failure/decline after a handle
+was created. Any changed/publication head, creating-connection loss/replacement,
+revocation, terminal expiry or fixed absolute expiry also invalidates it. The
+maximum lifetime is600 seconds, never renewed. Alarm and every admitted read
+recheck authority/deadline; a process restart with a lost creator cannot revive it.
+
+Read-only traffic remains in RingCore's bounded **preauth** queue pool and uses its
+two verification slots, but is not subject to the short ordinary-auth deadline
+after successful possession admission. Creating authenticated frames and admitted
+read requests count against the existing Ring daily-frame quota, with the same
+32-refusal close rule and no activity refresh by readers. Reader accounting is
+flushed durably; cursor/replay/manifest/quota-refusal state survives hibernation.
+Exact auto-answered pings keep their existing exemption. Other anonymous/Mobile
+budgets do not change.
+
+Production-workerd Rust contracts are exported as `PROPOSAL_SCENARIOS` alongside
+membership contracts; controlled-clock workerd tests exercise hibernation, process
+restart, expiry, quotas and invalidation. TestRelay remains explicitly legacy-only.

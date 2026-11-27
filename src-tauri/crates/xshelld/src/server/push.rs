@@ -426,7 +426,7 @@ impl Push {
     /// Loads `ring_dir/push.json`. An unreadable file is moved aside and logged.
     pub fn new(ring_dir: PathBuf, cfg: PushConfig) -> Push {
         let path = ring_dir.join("push.json");
-        let file = match read_private(&path) {
+        let file = match read_private(&path, super::ring::PrivateRingFile::PushRegistrations) {
             Ok(None) => PushFile::default(),
             Ok(Some(bytes)) => match serde_json::from_slice::<PushFile>(&bytes) {
                 Ok(f) if f.v == 1 => f,

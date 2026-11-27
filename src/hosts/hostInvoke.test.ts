@@ -152,3 +152,29 @@ it("Pi discovery and context retain offline cached values independently", async 
     await expect(hostQuery(H, method, args)).resolves.toMatchObject({ value, stale: true });
   }
 });
+
+it("hostQuery rejects delayed old-generation reads without caching them or replacing the last good data", async () => {
+  const config = { id: H, name: "Host", sshTarget: "old" };
+  cache.bindHosts([], [config], {});
+  cache.put(H, "list_claude_projects", undefined, ["previous"]);
+  let resolve!: (value: unknown) => void;
+  invoke.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+  const reading = hostQuery(H, "list_claude_projects");
+  cache.bindHosts([], [{ ...config, sshTarget: "new" }], {});
+  resolve(["late-old-data"]);
+  await expect(reading).rejects.toMatchObject({ code: "offline" });
+  expect(cache.get(H, "list_claude_projects")).toBeUndefined();
+  expect(JSON.stringify(cache.getState())).toContain("previous");
+  expect(JSON.stringify(cache.getState())).not.toContain("late-old-data");
+});
+
+it("offline verified alias fallback keeps per-result stale/at provenance; a failed read never becomes empty success", async () => {
+  const r = `r_${"a".repeat(64)}`;
+  cache.bindHosts([{ id: H, aliases: [H, r], name: "Host", color: null, daemonKey: "key", routes: ["ssh", "relay"], activeRoute: "ssh", reachability: { kind: "unknown" } }], [], {});
+  cache.put(H, "list_claude_projects", undefined, ["history"]);
+  const at = cache.get(H, "list_claude_projects")!.at;
+  invoke.mockRejectedValue({ code: "offline", message: "gone" });
+  await expect(hostQuery(r, "list_claude_projects")).resolves.toEqual({ value: ["history"], stale: true, at });
+  await expect(hostQuery(r, "get_sessions", { encodedName: "missing" })).rejects.toMatchObject({ code: "offline" });
+  expect(cache.get(H, "list_claude_projects")?.v).toEqual(["history"]);
+});

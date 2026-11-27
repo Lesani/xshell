@@ -2,7 +2,7 @@
 name = "xshell-protocol"
 version = "0.0.0"
 edition = "2021"
-license = "MIT"
+license = "MIT AND CC-BY-4.0"
 publish = false
 description = "The xshell wire protocol: framing, messages, version negotiation, the Ring and the Relay client. No PTY, SQLite or Tauri."
 

@@ -1,37 +1,9 @@
-import { fmt, type StringKey } from "./strings";
-import type { HostRingState, MemberRole, MemberView, RingStatus } from "./types";
-import { timeAgo } from "../utils";
+import { fmt } from "./strings";
+import type { RingStatus } from "./types";
+import { C, fmtc } from "./copy";
 
-// Settings → Mobile, the pure part: status lines, labels and the Relay URL form.
-
-const STATUS_KEY: Record<MemberView["presence"]["kind"], StringKey> = {
-  online: "mobile.status.online",
-  closed: "mobile.status.closed",
-  unreachable: "mobile.status.unreachable",
-  never: "mobile.status.never",
-  unknown: "mobile.status.unknown",
-};
-
-// A member's status chip. Without a Relay connection of its own the Desktop cannot know how
-// the others stand.
-export function presenceKey(m: MemberView, s: Pick<RingStatus, "connection">): StringKey {
-  if (s.connection !== "connected" && !m.thisApp) return "mobile.status.unknown";
-  return STATUS_KEY[m.presence.kind];
-}
-
-// The chip's colour class, reusing the Host chips.
-export function presenceChip(key: StringKey): string {
-  switch (key) {
-    case "mobile.status.online": return "connected";
-    case "mobile.status.unreachable": return "offline";
-    case "mobile.status.closed": return "reconnecting";
-    default: return "unknown";
-  }
-}
-
-export function roleKey(role: MemberRole): StringKey {
-  return role === "desktop" ? "mobile.role.desktop" : role === "daemon" ? "mobile.role.daemon" : "mobile.role.mobile";
-}
+// Settings → Ring, the pure part of the lines kept from the earlier Ring section: the Relay,
+// the connection, the daily quota, and why pairing a phone waits.
 
 // A Relay URL as the copy names it: the host, with the port if any, never the full URL.
 export function relayHost(url: string | null | undefined): string {
@@ -40,17 +12,42 @@ export function relayHost(url: string | null | undefined): string {
   return m ? m[1].replace(/^[^@]*@/, "") : url;
 }
 
-// The connection line under the Relay settings; null while Mobile access is off.
+// The Ring uses the default service (no address is shown) rather than a self-chosen address.
+export function usesDefaultService(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl" | "relayHosted">): boolean {
+  return !s.relayUrl || s.relayHosted || s.relayUrl === s.hostedRelayUrl;
+}
+
+// "{n} seconds", or "1 second" (copy-rjw-3: "second" when n is 1).
+function seconds(text: string, n: number): string {
+  return n === 1 ? text.replace(/\b1 seconds\b/, "1 second") : text;
+}
+
+// The connection line in Settings → Ring; null while there is nothing to report.
 export function connectionLine(s: RingStatus): string | null {
-  const relay = relayHost(s.relayUrl);
+  const address = relayHost(s.relayUrl);
+  const def = usesDefaultService(s);
   switch (s.connection) {
-    case "connected": return s.limited ? fmt("mobile.conn.limited") : fmt("mobile.conn.connected", { relay });
-    case "connecting": return fmt("mobile.conn.connecting", { relay });
-    case "waiting": return fmt("mobile.conn.retrying", { relay, s: Math.max(1, s.retryIn ?? 1) });
+    // COPY-GAP: `mobile.conn.limited` predates the new copy and still names the hosted relay.
+    case "connected": return s.limited ? fmt("mobile.conn.limited") : def ? C["ring.connection.default.connected"] : fmtc("ring.connection.custom.connected", { address });
+    // COPY-GAP: no text while connecting to the default service; a chosen address keeps the
+    // earlier line (it names only the address).
+    case "connecting": return def ? null : fmt("mobile.conn.connecting", { relay: address });
+    case "waiting": {
+      const n = Math.max(1, s.retryIn ?? 1);
+      return seconds(def ? fmtc("ring.connection.default.retry", { n }) : fmtc("ring.connection.custom.retry", { address, n }), n);
+    }
     case "stopped": return fmt("mobile.conn.stopped");
     case "other-window": return fmt("mobile.conn.otherWindow");
     default: return null;
   }
+}
+
+// Why Pair a phone / Add a machine cannot work now, or null: the service cannot be reached, or
+// this machine is no longer a member. While connecting they are offered.
+export function pairingLine(s: Pick<RingStatus, "connection" | "relayUrl" | "hostedRelayUrl" | "relayHosted">, offerShown = false): string | null {
+  if (s.connection === "stopped") return fmt("mobile.pair.needsMember");
+  if (s.connection !== "waiting" || offerShown) return null;
+  return usesDefaultService(s) ? C["ring.connection.default.required"] : fmtc("ring.connection.custom.required", { address: relayHost(s.relayUrl) });
 }
 
 // The reset time of the daily quota, in local time (HH:MM), as the phone app shows it.
@@ -69,189 +66,25 @@ export function quotaLine(
   return fmt(s.relayHosted ? "mobile.quota.hosted" : "mobile.quota.ownRelay", { time: fmtTime(s.quotaResetAt) });
 }
 
-// One line per old Relay that still owes a farewell (ADR-0012); it never changes the
-// connection line, which is about the current Relay.
-export function farewellLines(s: Pick<RingStatus, "farewells">): { text: string; warn: boolean }[] {
-  return s.farewells.map(f => ({
-    text: fmt(f.state === "sending" ? "mobile.farewell.sending" : "mobile.farewell.owed", { relay: relayHost(f.relayUrl) }),
-    warn: f.state === "waiting" && f.failures > 0,
-  }));
-}
-
+// This machine's Daemon is too old to join a Ring.
 export function localLine(s: Pick<RingStatus, "local">): string | null {
-  if (s.local === "in-process") return fmt("mobile.local.inProcess");
-  if (s.local === "too-old") return fmt("mobile.local.tooOld");
-  return null;
+  return s.local === "too-old" ? C["mobile.local.tooOld"] : null;
 }
 
-const HOST_KEY: Record<HostRingState["state"], StringKey> = {
-  "too-old": "mobile.host.tooOld",
-  "other-ring": "mobile.host.otherRing",
-  full: "mobile.host.full",
-  failed: "mobile.host.failed",
-};
-
-// The note for a Remote Host that is not in the Ring.
-export function hostLine(h: HostRingState): string {
-  return fmt(HOST_KEY[h.state], { name: h.name, error: h.error ?? "" });
+// Refused Ring settings (left in place), without the backend's detail. A `recovered` file needs
+// no line: Create starts over and clears it.
+export function problemLine(s: Pick<RingStatus, "problem">): string | null {
+  return s.problem === "unreadable" ? C["mobile.problem.unreadable"] : null;
 }
 
-// Whether the note offers "Pair with this desktop".
-export function canClaim(h: HostRingState): boolean {
-  return h.state === "other-ring";
+// ── Pairing a phone and the connection (xshell#38) ──────────────────────────
+
+// Whether pairing cannot succeed now (its buttons are disabled; `pairingLine` says why).
+export function pairingBlocked(s: Pick<RingStatus, "connection">): boolean {
+  return s.connection === "waiting" || s.connection === "stopped";
 }
 
-// Whether Enable is the deliberate start-over after unreadable settings were set aside (the
-// recovery-required state, whatever else the status says).
-export function startsOver(s: Pick<RingStatus, "enabled" | "problem">): boolean {
-  return s.problem === "recovered";
-}
-
-// Whether the Enable button is offered: off or recovery required, and not blocked by refused
-// settings.
-export function canEnable(s: Pick<RingStatus, "enabled" | "problem">): boolean {
-  if (s.problem === "unreadable") return false;
-  return s.problem === "recovered" || !s.enabled;
-}
-
-export function problemLine(s: RingStatus): string | null {
-  if (s.problem === "recovered") return fmt("mobile.problem.recovered", { path: s.problemDetail ?? "" });
-  if (s.problem === "unreadable") return fmt("mobile.problem.unreadable", { error: s.problemDetail ?? "" });
-  return null;
-}
-
-// ── Pairing and the connection (xshell#38) ──────────────────────────────────
-
-// Why pairing cannot succeed now, as the note shown with its buttons disabled; null when it
-// can. While connecting it is offered: the Desktop waits for the connection to add a device.
-export function pairingBlocked(s: Pick<RingStatus, "connection">): StringKey | null {
-  switch (s.connection) {
-    case "waiting": return "mobile.pair.needsRelay";
-    case "stopped": return "mobile.pair.needsMember";
-    default: return null;
-  }
-}
-
-// The note under a pairing panel's title: that pairing waits for the connection (while
-// connecting, or while an offer already shown stays valid during a retry), or why it is
-// disabled; null when connected.
-export function pairingNote(s: Pick<RingStatus, "connection">, offerShown = false): StringKey | null {
-  if (s.connection === "connecting" || (offerShown && s.connection === "waiting")) return "mobile.pair.connecting";
-  return pairingBlocked(s);
-}
-
-// ── Removing a device (#22) ─────────────────────────────────────────────────
-
-// Whether a member's row offers Remove: the Desktop says it may go, and this window runs the
-// connection (another window's removal would be refused).
-export function canRemove(m: MemberView, s: Pick<RingStatus, "connection">): boolean {
-  return m.removable && !m.thisApp && !m.thisComputer && s.connection !== "other-window";
-}
-
-// Why a Host's row (this computer's, or a configured Remote Host's) has no Remove button.
-export function removeHint(m: MemberView): string | null {
-  if (m.removable || m.thisApp) return null;
-  return m.thisComputer || m.hostId ? fmt("mobile.remove.hostHint") : null;
-}
-
-// "Last seen …" under a device that is closed or unreachable, while this Desktop is connected
-// and so knows. Uses Date.now().
-export function lastSeenLine(m: MemberView, s: Pick<RingStatus, "connection">): string | null {
-  if (s.connection !== "connected" || m.thisApp) return null;
-  const { kind, at } = m.presence;
-  if ((kind !== "closed" && kind !== "unreachable") || at == null) return null;
-  const ago = timeAgo(new Date(at * 1000).toISOString());
-  return ago ? fmt("mobile.member.lastSeen", { ago }) : null;
-}
-
-const CONFIRM_BODY: Record<MemberRole, StringKey> = {
-  mobile: "mobile.remove.confirmBody.mobile",
-  daemon: "mobile.remove.confirmBody.daemon",
-  desktop: "mobile.remove.confirmBody.desktop",
-};
-
-export function removeConfirm(m: Pick<MemberView, "name" | "role">): { title: string; body: string; confirm: string } {
-  return {
-    title: fmt("mobile.remove.confirmTitle", { name: m.name }),
-    body: fmt(CONFIRM_BODY[m.role], { name: m.name }),
-    confirm: fmt("mobile.remove.confirm"),
-  };
-}
-
-const REMOVE_REFUSAL: Record<string, StringKey> = {
-  in_use: "mobile.remove.err.inUse",
-  self: "mobile.remove.err.self",
-  other_window: "mobile.remove.err.otherWindow",
-};
-
-// A failed removal: the Desktop's refusals start with a code (`in_use: …`).
-export function removeErrorLine(name: string, e: unknown): string {
-  const text = errorText(e);
-  const m = /^([a-z_]+): (.*)$/s.exec(text);
-  const key = m ? REMOVE_REFUSAL[m[1]] : undefined;
-  if (key) return fmt(key);
-  return fmt("mobile.remove.failed", { name, error: m ? m[2] : text });
-}
-
-// After a removal while this Desktop is not connected to the relay: removed here only, so far.
-export function removePendingLine(s: Pick<RingStatus, "connection">, name: string): string | null {
-  return s.connection === "connected" ? null : fmt("mobile.remove.pending", { name });
-}
-
-// A removal as Settings → Mobile follows it, kept apart from the member list (the row goes
-// away when it succeeds; the notes stay).
-export type Removal =
-  | { state: "idle" }
-  | { state: "confirming"; member: MemberView }
-  | { state: "removing"; signKey: string; name: string }
-  | { state: "failed"; signKey: string; line: string }
-  | { state: "removed"; pending: string | null };
-
-export type RemovalAction =
-  | { type: "ask"; member: MemberView }
-  | { type: "cancel" }
-  | { type: "start" }
-  | { type: "done"; status: Pick<RingStatus, "connection"> }
-  | { type: "failed"; error: unknown };
-
-export const REMOVAL_IDLE: Removal = { state: "idle" };
-
-export function removalReducer(r: Removal, a: RemovalAction): Removal {
-  switch (a.type) {
-    case "ask": return r.state === "removing" ? r : { state: "confirming", member: a.member };
-    case "cancel": return r.state === "confirming" ? REMOVAL_IDLE : r;
-    case "start": return r.state === "confirming" ? { state: "removing", signKey: r.member.signKey, name: r.member.name } : r;
-    case "done": return r.state === "removing" ? { state: "removed", pending: removePendingLine(a.status, r.name) } : r;
-    case "failed": return r.state === "removing" ? { state: "failed", signKey: r.signKey, line: removeErrorLine(r.name, a.error) } : r;
-  }
-}
-
-// The note under the device list for a removal, if any.
-export function removalNote(r: Removal): { text: string; error: boolean } | null {
-  if (r.state === "failed") return { text: r.line, error: true };
-  if (r.state === "removed" && r.pending) return { text: r.pending, error: false };
-  return null;
-}
-
-// ── The Relay form ────────────────────────────────────────────────────────
-
-export type RelayChoice = "hosted" | "custom";
-
-export interface RelayForm {
-  choice: RelayChoice;
-  // The self-hosted URL as typed.
-  url: string;
-}
-
-export function relayChoice(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">): RelayChoice {
-  return !s.relayUrl || s.relayUrl === s.hostedRelayUrl ? "hosted" : "custom";
-}
-
-// The form as the Ring stands: Hosted preselected unless the Ring is on another Relay.
-export function initialForm(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">): RelayForm {
-  const choice = relayChoice(s);
-  return { choice, url: choice === "custom" ? (s.relayUrl ?? "") : "" };
-}
+// ── The Relay chosen before the Ring exists ──────────────────────────────────
 
 const LOOPBACK = /^(localhost|127(\.\d{1,3}){3}|\[::1\])(:\d{1,5})?$/i;
 
@@ -266,31 +99,8 @@ export function validRelayUrl(raw: string): boolean {
   return authority.length > 0 && !authority.startsWith(":");
 }
 
-// The URL saving would set.
-export function targetUrl(f: RelayForm, s: Pick<RingStatus, "hostedRelayUrl">): string {
-  return f.choice === "hosted" ? s.hostedRelayUrl : f.url.trim();
-}
-
-// The inline error under the URL field, if any (nothing for an empty field).
-export function urlError(f: RelayForm): string | null {
-  if (f.choice !== "custom" || f.url.trim() === "" || validRelayUrl(f.url)) return null;
+// The inline error under the URL field, if any (nothing for an empty field: the hosted Relay).
+export function relayUrlError(raw: string): string | null {
+  if (raw.trim() === "" || validRelayUrl(raw)) return null;
   return fmt("mobile.relay.err.invalid");
-}
-
-// Whether the form differs from the Ring's Relay.
-export function isDirty(f: RelayForm, s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">): boolean {
-  return targetUrl(f, s) !== (s.relayUrl ?? "");
-}
-
-// Saving never waits for a farewell: a relay change takes effect at once.
-export function canSave(f: RelayForm, s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">, busy: boolean): boolean {
-  if (busy || !isDirty(f, s)) return false;
-  return f.choice === "hosted" || validRelayUrl(f.url);
-}
-
-// Command errors arrive as strings (or objects with a message).
-export function errorText(e: unknown): string {
-  if (typeof e === "string") return e;
-  const m = (e as { message?: unknown })?.message;
-  return typeof m === "string" ? m : String(e);
 }

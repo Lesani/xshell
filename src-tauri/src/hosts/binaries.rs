@@ -15,6 +15,112 @@ use xshell_protocol::build::{install_dir_name, scan_stamp};
 #[path = "../../windows_asset.rs"]
 mod windows_asset;
 include!(concat!(env!("OUT_DIR"), "/windows-daemon.rs"));
+#[path = "../../daemon_asset.rs"]
+mod daemon_asset;
+include!(concat!(env!("OUT_DIR"), "/own-daemon.rs"));
+include!(concat!(env!("OUT_DIR"), "/linux-daemon.rs"));
+
+/// The `xshelld` of this Desktop's own target, embedded at build time (ADR-0017;
+/// `XSHELL_DAEMON_ASSET`). `None` in debug and test builds that embed nothing.
+pub fn embedded_own() -> Option<&'static [u8]> {
+    EMBEDDED_OWN_DAEMON.map(|(bytes, _)| bytes)
+}
+
+/// The embedded own-target Daemon as a source: only for this Desktop's own triple, version
+/// and build. Anything else falls through to the next source.
+pub struct EmbeddedOwnSource {
+    pub embedded: Option<(&'static [u8], &'static str)>,
+    pub triple: Option<&'static str>,
+    pub version: String,
+    pub build: Option<xshell_protocol::build::BuildId>,
+}
+
+impl EmbeddedOwnSource {
+    pub fn production() -> Self {
+        Self {
+            embedded: EMBEDDED_OWN_DAEMON,
+            triple: own_triple(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: crate::build_id::BUILD.clone(),
+        }
+    }
+}
+
+impl BinarySource for EmbeddedOwnSource {
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String> {
+        let (bytes, hash) = self.embedded.ok_or("no embedded Daemon")?;
+        if self.triple != Some(want.triple.as_str()) {
+            return Err(format!("the embedded Daemon is not for {}", want.triple));
+        }
+        let same_build = match (&want.build, &self.build) {
+            (Some(w), Some(b)) => w.same(b),
+            _ => false,
+        };
+        if want.version != self.version || !same_build {
+            return Err("the embedded Daemon is another build".into());
+        }
+        if let Some(b) = &want.build {
+            daemon_asset::verify_own(bytes, hash, b, std::env::consts::OS, std::env::consts::ARCH)?;
+        }
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        Ok(Fetched {
+            bytes: bytes.to_vec(),
+            origin: Origin::Bundled("<embedded Daemon>".into()),
+        })
+    }
+}
+
+/// The x86_64 musl `xshelld` of this build, embedded in a Desktop that is not Linux (W5;
+/// `XSHELL_LINUX_DAEMON_ASSET`): a Windows Desktop updates Linux machines over the Ring
+/// without a download. Only for that triple, this version and this build.
+pub struct EmbeddedLinuxSource {
+    pub embedded: Option<(&'static [u8], &'static str)>,
+    pub version: String,
+    pub build: Option<xshell_protocol::build::BuildId>,
+}
+
+impl EmbeddedLinuxSource {
+    pub const TRIPLE: &'static str = "x86_64-unknown-linux-musl";
+
+    pub fn production() -> Self {
+        Self {
+            embedded: EMBEDDED_LINUX_DAEMON,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: crate::build_id::BUILD.clone(),
+        }
+    }
+}
+
+impl BinarySource for EmbeddedLinuxSource {
+    fn fetch(&self, want: &Wanted, cancel: &CancelToken) -> Result<Fetched, String> {
+        let (bytes, hash) = self.embedded.ok_or("no embedded Linux Daemon")?;
+        if want.triple != Self::TRIPLE {
+            return Err(format!(
+                "the embedded Linux Daemon is not for {}",
+                want.triple
+            ));
+        }
+        let same_build = match (&want.build, &self.build) {
+            (Some(w), Some(b)) => w.same(b),
+            _ => false,
+        };
+        if want.version != self.version || !same_build {
+            return Err("the embedded Linux Daemon is another build".into());
+        }
+        if let Some(b) = &want.build {
+            daemon_asset::verify_own(bytes, hash, b, "linux", "x86_64")?;
+        }
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        Ok(Fetched {
+            bytes: bytes.to_vec(),
+            origin: Origin::Bundled("<embedded Linux Daemon>".into()),
+        })
+    }
+}
 
 /// Windows updates use only bytes embedded in the delivered Desktop. Missing assets do
 /// not fall back to a same-version GitHub release from a different source revision.
@@ -45,9 +151,15 @@ impl BinarySource for DesktopBinarySource {
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 
+/// Where builds are published (D8: pre-releases on `Lesani/xshell` for now).
 pub fn release_repo() -> &'static str {
-    option_env!("XSHELL_RELEASE_REPO").unwrap_or("MertPROJ/xshell")
+    option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
 }
+
+/// The command shown for a machine that cannot be updated over the Ring: the latest
+/// release's installer from the release server, which verifies the download before it runs
+/// anything (design-update-from-get D6).
+pub const GET_INSTALL_COMMAND: &str = "curl -fsSL https://get.xshell.sh | sh";
 
 pub fn release_base(repo: &str) -> String {
     format!("https://github.com/{repo}/releases/download")
@@ -329,10 +441,14 @@ impl BinarySource for CargoArtifactSource {
     }
 }
 
-/// Next to the executable first (shipped or copied binaries), then (debug builds) the
-/// workspace's own build output, then the release download.
+/// The embedded Daemons first (this Desktop's own target, then the musl one a non-Linux
+/// Desktop carries), next to the executable (shipped or copied binaries), then (debug
+/// builds) the workspace's own build output, then the release download.
 pub fn production_source(exe_dir: Option<PathBuf>, cache_dir: PathBuf) -> DesktopBinarySource {
-    let mut v: Vec<Box<dyn BinarySource>> = Vec::new();
+    let mut v: Vec<Box<dyn BinarySource>> = vec![
+        Box::new(EmbeddedOwnSource::production()),
+        Box::new(EmbeddedLinuxSource::production()),
+    ];
     if let Some(d) = &exe_dir {
         v.push(Box::new(DirSource(d.clone())));
         if cfg!(debug_assertions) {
@@ -352,6 +468,223 @@ mod tests {
     use super::*;
     use std::time::Instant;
     use xshell_protocol::build::BuildId;
+
+    #[test]
+    fn embedded_own_source_only_own_triple_and_build() {
+        let build = BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+            return;
+        }
+        // An x86_64 ELF carrying the build's stamp.
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf.extend_from_slice(b"@@XSHELL-BUILD-V1:85ee920a1b2c:7@@");
+        let bytes: &'static [u8] = Box::leak(elf.into_boxed_slice());
+        let hash: &'static str = Box::leak(sha256_hex(bytes).into_boxed_str());
+        let src = EmbeddedOwnSource {
+            embedded: Some((bytes, hash)),
+            triple: Some("x86_64-unknown-linux-musl"),
+            version: "1.5.0".into(),
+            build: Some(build.clone()),
+        };
+        let mut w = want("x86_64-unknown-linux-musl", "1.5.0");
+        w.build = Some(build.clone());
+        let got = src.fetch(&w, &CancelToken::new()).unwrap();
+        assert_eq!(got.bytes, bytes);
+        // Corrupt bytes for the recorded hash are refused.
+        let bad = EmbeddedOwnSource {
+            embedded: Some((b"daemon-bytes", hash)),
+            triple: src.triple,
+            version: src.version.clone(),
+            build: src.build.clone(),
+        };
+        assert!(bad.fetch(&w, &CancelToken::new()).is_err());
+        assert_eq!(got.origin, Origin::Bundled("<embedded Daemon>".into()));
+        // Another triple, version, build, or an unknown build: not this source's.
+        let mut other = w.clone();
+        other.triple = "aarch64-unknown-linux-musl".into();
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let mut other = w.clone();
+        other.version = "1.6.0".into();
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let mut other = w.clone();
+        other.build = Some(BuildId {
+            commit: "000000000000".into(),
+            ..build.clone()
+        });
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let mut other = w.clone();
+        other.build = None;
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        // Nothing embedded.
+        let none = EmbeddedOwnSource {
+            embedded: None,
+            ..src
+        };
+        assert!(none.fetch(&w, &CancelToken::new()).is_err());
+        // This test build embeds nothing (no XSHELL_DAEMON_ASSET).
+        assert_eq!(embedded_own().is_some(), EMBEDDED_OWN_DAEMON.is_some());
+    }
+
+    fn stamped_elf(stamp: &str) -> &'static [u8] {
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf.extend_from_slice(stamp.as_bytes());
+        Box::leak(elf.into_boxed_slice())
+    }
+
+    /// W5: the musl Daemon a non-Linux Desktop embeds answers only the musl triple, this
+    /// version and this build, verified at fetch time.
+    #[test]
+    fn embedded_linux_source_only_musl_same_build() {
+        let build = BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let bytes = stamped_elf("@@XSHELL-BUILD-V1:85ee920a1b2c:7@@");
+        let hash: &'static str = Box::leak(sha256_hex(bytes).into_boxed_str());
+        let src = EmbeddedLinuxSource {
+            embedded: Some((bytes, hash)),
+            version: "1.6.0".into(),
+            build: Some(build.clone()),
+        };
+        let mut w = want("x86_64-unknown-linux-musl", "1.6.0");
+        w.build = Some(build.clone());
+        let got = src.fetch(&w, &CancelToken::new()).unwrap();
+        assert_eq!(got.bytes, bytes);
+        assert_eq!(
+            got.origin,
+            Origin::Bundled("<embedded Linux Daemon>".into())
+        );
+        xshell_hostlink::install::check_fetched(&got, &w).unwrap();
+        // Corrupt bytes for the recorded hash.
+        let corrupt = EmbeddedLinuxSource {
+            embedded: Some((b"daemon-bytes", hash)),
+            version: src.version.clone(),
+            build: src.build.clone(),
+        };
+        assert!(corrupt.fetch(&w, &CancelToken::new()).is_err());
+        // Bytes of another build under their own (correct) hash.
+        let other_bytes = stamped_elf("@@XSHELL-BUILD-V1:000000000000:7@@");
+        let other_hash: &'static str = Box::leak(sha256_hex(other_bytes).into_boxed_str());
+        let mislabelled = EmbeddedLinuxSource {
+            embedded: Some((other_bytes, other_hash)),
+            version: src.version.clone(),
+            build: src.build.clone(),
+        };
+        assert!(mislabelled.fetch(&w, &CancelToken::new()).is_err());
+        // Another triple, version, build, or an unknown build.
+        for triple in [
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+        ] {
+            let mut other = w.clone();
+            other.triple = triple.into();
+            assert!(src.fetch(&other, &CancelToken::new()).is_err(), "{triple}");
+        }
+        let mut other = w.clone();
+        other.version = "1.6.1".into();
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let mut other = w.clone();
+        other.build = Some(BuildId {
+            commit: "000000000000".into(),
+            ..build.clone()
+        });
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let mut other = w.clone();
+        other.build = None;
+        assert!(src.fetch(&other, &CancelToken::new()).is_err());
+        let none = EmbeddedLinuxSource {
+            embedded: None,
+            ..src
+        };
+        assert!(none.fetch(&w, &CancelToken::new()).is_err());
+        // A Linux Desktop never embeds it (its own Daemon covers Linux).
+        if cfg!(target_os = "linux") {
+            assert!(EMBEDDED_LINUX_DAEMON.is_none());
+        }
+    }
+
+    /// The own-target check on a Windows Desktop is the Windows asset check: an x86_64 PE
+    /// of this clean build; an ELF, another arch or a dirty build is refused.
+    #[test]
+    fn verify_own_windows_arm_accepts_pe_refuses_elf() {
+        let build = BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 7,
+        };
+        let mut pe = vec![0u8; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        pe[64..70].copy_from_slice(b"PE\0\0\x64\x86");
+        pe.extend_from_slice(b"@@XSHELL-BUILD-V1:85ee920a1b2c:7@@");
+        let hash = sha256_hex(&pe);
+        daemon_asset::verify_own(&pe, &hash, &build, "windows", "x86_64").unwrap();
+        assert!(daemon_asset::verify_own(&pe, &hash, &build, "windows", "aarch64").is_err());
+        assert!(daemon_asset::verify_own(&pe, "00", &build, "windows", "x86_64").is_err());
+        let dirty = BuildId {
+            dirty: Some("aaaaaaaaaaaa".into()),
+            ..build.clone()
+        };
+        assert!(daemon_asset::verify_own(&pe, &hash, &dirty, "windows", "x86_64").is_err());
+        let elf = stamped_elf("@@XSHELL-BUILD-V1:85ee920a1b2c:7@@");
+        assert!(
+            daemon_asset::verify_own(elf, &sha256_hex(elf), &build, "windows", "x86_64").is_err()
+        );
+        // And the PE is no Linux Daemon.
+        assert!(daemon_asset::verify_own(&pe, &hash, &build, "linux", "x86_64").is_err());
+    }
+
+    /// A6: the Windows Desktop's production source serves its embedded musl Daemon for a
+    /// Ring update of a Linux machine: the exact bytes, accepted by the install check and
+    /// within the staging bound. The test build must set `XSHELL_LINUX_DAEMON_*`.
+    #[cfg(windows)]
+    #[test]
+    fn musl_asset_served_for_ring_update() {
+        let (bytes, hash) = EMBEDDED_LINUX_DAEMON
+            .expect("build the Windows Desktop tests with XSHELL_LINUX_DAEMON_ASSET/_SHA256 set");
+        let build = scan_stamp(bytes).unwrap().unwrap();
+        assert!(
+            crate::build_id::BUILD
+                .as_ref()
+                .is_some_and(|own| own.same(&build)),
+            "the embedded musl Daemon is this build"
+        );
+        daemon_asset::verify_own(bytes, hash, &build, "linux", "x86_64").unwrap();
+        let source = production_source(None, PathBuf::from("unused-cache"));
+        let mut wanted = want("x86_64-unknown-linux-musl", env!("CARGO_PKG_VERSION"));
+        wanted.build = Some(build.clone());
+        let fetched = source.fetch(&wanted, &CancelToken::new()).unwrap();
+        assert_eq!(fetched.bytes, bytes);
+        assert_eq!(
+            fetched.origin,
+            Origin::Bundled("<embedded Linux Daemon>".into())
+        );
+        xshell_hostlink::install::check_fetched(&fetched, &wanted).unwrap();
+        assert!(fetched.bytes.len() as u64 <= xshell_protocol::msg::STAGE_MAX_BYTES);
+        // Another build is not served from the embed (and this test never downloads).
+        let mut other = wanted.clone();
+        other.build = Some(BuildId {
+            commit: "000000000000".into(),
+            ..build
+        });
+        assert!(EmbeddedLinuxSource::production()
+            .fetch(&other, &CancelToken::new())
+            .is_err());
+    }
 
     #[test]
     fn embedded_windows_source_is_exact_or_explicitly_unavailable() {
@@ -389,6 +722,24 @@ mod tests {
         assert_eq!(
             sha256_url(&base, "1.5.0", "x86_64-unknown-linux-musl"),
             "https://github.com/MertPROJ/xshell/releases/download/v1.5.0/xshelld-x86_64-unknown-linux-musl.sha256"
+        );
+    }
+
+    #[test]
+    fn install_command_uses_release_repo() {
+        assert_eq!(
+            release_repo(),
+            option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
+        );
+        assert_eq!(
+            release_base("Lesani/xshell"),
+            "https://github.com/Lesani/xshell/releases/download"
+        );
+        // What a machine that cannot be updated over the Ring is told to run: the latest
+        // release's installer from the release server (D6).
+        assert_eq!(
+            super::super::commands::host_install_command(),
+            "curl -fsSL https://get.xshell.sh | sh"
         );
     }
 

@@ -1,9 +1,10 @@
+import { registry } from "./registry";
 import type { ProjectInfo, Tab } from "../types";
 import { normalizeProjectPath } from "../utils";
 
 // Runtime Project identity must not use the legacy case-folded sidebar layout key.
 export function runtimeProjectKey(project: { host?: string; path: string }): string {
-  return JSON.stringify([project.host ?? null, normalizeProjectPath(project.path)]);
+  return JSON.stringify([registry.dataHost(project.host) ?? null, normalizeProjectPath(project.path)]);
 }
 
 export function runtimeTabProjectKey(tab: Pick<Tab, "host" | "projectPath">): string | null {

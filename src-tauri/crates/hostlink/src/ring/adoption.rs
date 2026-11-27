@@ -1,0 +1,733 @@
+//! Public consented Computer Create, Join and Approve controllers. Confirmation is a local
+//! backend capability, never a Host/Relay request. Retained v1 Upgrade and this Desktop's
+//! local completion are explicit; retained v2 Daemon-only completion uses typed Host
+//! administration. Restart reconciliation is read-only except for missing local stores;
+//! native window origins remain a separate integration boundary.
+use super::companion_ipc::CompanionClient;
+use super::store::{AdoptionJournal, AdoptionPhase, RingState};
+use super::DesktopRing;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use xshell_protocol::ring::companion::*;
+use xshell_protocol::ring::membership::*;
+use xshell_protocol::ring::pairing::adoption::{AdoptionIntent, PublicIdentity};
+use xshell_protocol::ring::relay::{
+    ByeReason, ChainPin, CloseReason, RingClient, RingClientConfig, RingEvents,
+};
+use xshell_protocol::ring::{
+    DeviceKeys, Member, RingId, Roster, RosterChain, SignKey, Signature, Signer,
+};
+
+mod completion;
+mod reconcile;
+mod retained;
+pub use completion::{CompletionApproval, CompletionOutcome};
+pub use reconcile::{
+    AdoptionRecovery, AdoptionRecoveryState, AdoptionRecoveryStatus, PublicationRecoveryState,
+    PublicationRecoveryStatus,
+};
+mod join;
+pub use join::{ApprovalOutcome, JoinOffer, JoinOfferInput, JoinStatus};
+mod ui;
+pub use ui::MembershipState;
+
+/// See `DesktopRing::adoption_baseline`.
+pub(in crate::ring) type AdoptionBaseline =
+    Arc<std::sync::Mutex<Option<std::collections::HashSet<String>>>>;
+/// The one v2 membership-mutation reservation. Every v2 membership publisher holds it from
+/// its final predecessor validation through publication and accepted installation: the
+/// adoption controllers (Create, Join approval, Upgrade, completion, reconciliation) for
+/// their whole operation, v2 phone enrollment and v2 removal (`reserve_membership_mutation`)
+/// around their publication. It is not the commit lock, so a holder may wait on the Relay
+/// while Connector callbacks commit. While held, `adoption_busy` reports busy; the baseline
+/// only scopes which durable adoption records approval readiness attributes to the live
+/// admission (a phone or removal reservation writes none, so readiness is unchanged).
+pub(in crate::ring) struct AdoptionAdmission(Arc<AtomicBool>, AdoptionBaseline);
+impl Drop for AdoptionAdmission {
+    fn drop(&mut self) {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.0.store(false, Ordering::Release);
+    }
+}
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+fn nonce() -> Result<String, String> {
+    xshell_protocol::ring::relay::wire::new_nonce().map_err(|e| e.to_string())
+}
+#[derive(Clone, Debug)]
+pub struct ConsentPreview {
+    pub operation: String,
+    pub proposal_hash: String,
+    pub ring_id: RingId,
+    pub relay_url: String,
+    pub profile: CompanionProfile,
+    pub context: ConsentContext,
+    pub proposal: Roster,
+    pub expires_at: u64,
+}
+/// An in-process, operation-specific lease, introduced for Create and also used by Join.
+/// It cannot be deserialized or sent over Host IPC. Native window-origin integration is
+/// deliberately not claimed by this backend capability.
+#[derive(Clone)]
+pub struct CreateConfirmationLease {
+    operation: String,
+    proposal_hash: String,
+    until: Instant,
+    expires_at: u64,
+    cancelled: Arc<AtomicBool>,
+}
+pub struct CreateConfirmation {
+    operation: String,
+    proposal_hash: String,
+    lease: Arc<AtomicBool>,
+}
+pub enum CreateDecision {
+    Decline,
+    Confirm(CreateConfirmation),
+}
+pub enum AdoptionOutcome {
+    Declined {
+        operation: String,
+    },
+    Installed {
+        operation: String,
+        chain: RosterChain,
+    },
+}
+impl CreateConfirmationLease {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+    fn live(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire)
+            || Instant::now() >= self.until
+            || now() >= self.expires_at
+        {
+            return Err("Create confirmation lease cancelled or expired".into());
+        }
+        Ok(())
+    }
+    pub fn confirm(&self, proposal_hash: &str) -> Result<CreateConfirmation, String> {
+        self.live()?;
+        if self.proposal_hash != proposal_hash {
+            return Err("Create confirmation proposal mismatch".into());
+        }
+        Ok(CreateConfirmation {
+            operation: self.operation.clone(),
+            proposal_hash: proposal_hash.into(),
+            lease: self.cancelled.clone(),
+        })
+    }
+    fn verify(&self, proof: &CreateConfirmation) -> Result<(), String> {
+        self.live()?;
+        if proof.operation != self.operation
+            || proof.proposal_hash != self.proposal_hash
+            || !Arc::ptr_eq(&self.cancelled, &proof.lease)
+        {
+            return Err("Create confirmation belongs to another operation or lease".into());
+        }
+        Ok(())
+    }
+}
+struct BootstrapEvents;
+impl RingEvents for BootstrapEvents {
+    fn envelope(&self, _: SignKey, _: Vec<u8>) {}
+    fn closed(&self, _: CloseReason) {}
+    fn presence(&self, _: SignKey, _: xshell_protocol::ring::relay::MemberPresence) {}
+    fn roster(&self, _: &xshell_protocol::ring::SignedRoster) {}
+    fn roster_rejected(&self, _: xshell_protocol::ring::RosterError) {}
+}
+impl DesktopRing {
+    pub(in crate::ring) fn adoption_test_point(&self, point: super::desktop::AdoptionTestPoint) {
+        if let Some(hook) = &self.cfg.adoption_test_hook {
+            (hook.0)(point);
+        }
+    }
+    fn reserve_adoption(&self) -> Result<AdoptionAdmission, String> {
+        self.try_reserve_adoption()
+            .ok_or_else(|| "another adoption operation is active".into())
+    }
+    // Pure admission only: a failed CAS has no registration or transaction effects.
+    fn try_reserve_adoption(&self) -> Option<AdoptionAdmission> {
+        self.adoption
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| {
+                // Read-only: which records predate this admission. Unreadable: none is
+                // treated as live (safe: they stay unresolved).
+                let baseline = self
+                    .store
+                    .load_profile()
+                    .ok()
+                    .map(|(p, _)| p.as_ref().map(ui::record_operations).unwrap_or_default());
+                *self
+                    .adoption_baseline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = baseline;
+                AdoptionAdmission(self.adoption.clone(), self.adoption_baseline.clone())
+            })
+    }
+
+    /// The membership-mutation reservation for a short publisher: polls (holding no Ring
+    /// lock) until `until`, then `None` (busy). See [`AdoptionAdmission`].
+    pub(in crate::ring) fn reserve_membership_mutation(
+        &self,
+        until: Instant,
+    ) -> Option<AdoptionAdmission> {
+        loop {
+            if let Some(admission) = self.try_reserve_adoption() {
+                return Some(admission);
+            }
+            if Instant::now() >= until || self.is_quitting() {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Metadata-only startup fence, including when no usable sidecar exists. Never cleared
+    /// by Desktop shutdown/cancellation; not evidence of counterpart registration.
+    #[cfg(unix)]
+    pub fn reserve_local_companion(&self, home: &std::path::Path) -> Result<bool, String> {
+        // First run: the election lock lives in the Desktop Store (a private leaf).
+        super::store::ensure_private_dir(self.store.dir()).map_err(|e| e.to_string())?;
+        if !self.pairing_ipc_owner() {
+            return Ok(false);
+        }
+        // `~/.xshell` is created 0700 whatever the umask; an existing read-only exposure
+        // (0755) is tightened, but a group/world-writable one is refused unchanged, never
+        // repaired into an accepted ancestry.
+        xshell_core::server::prepare_shared_root(home).map_err(|e| e.to_string())?;
+        let desktop = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
+        xshell_core::companion_reservation::reserve(home, &desktop).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    /// The same elected startup path used by Tauri before any adoption action.
+    #[cfg(any(unix, windows))]
+    pub fn register_local_companion(
+        &self,
+        daemon: &crate::LocalDaemon,
+    ) -> Result<Option<CompanionProfile>, String> {
+        super::store::ensure_private_dir(self.store.dir()).map_err(|e| e.to_string())?;
+        if !self.pairing_ipc_owner() {
+            return Ok(None);
+        }
+        let desktop_dir = self.store.dir().canonicalize().map_err(|e| e.to_string())?;
+        daemon
+            .with_registration_endpoint(&desktop_dir, |client| self.register_companion(client))
+            .map(Some)
+    }
+
+    pub fn register_companion(&self, client: &CompanionClient) -> Result<CompanionProfile, String> {
+        let _admission = self.reserve_adoption()?;
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::RegistrationAdmitted);
+        if !self.pairing_ipc_owner() {
+            return Err("another process owns the Desktop counterpart".into());
+        }
+        self.register_companion_inner(client)
+            .map(|(_, profile)| profile)
+    }
+    fn register_companion_inner(
+        &self,
+        client: &CompanionClient,
+    ) -> Result<(Arc<DeviceKeys>, CompanionProfile), String> {
+        let keys = self.store.retained_keys()?;
+        let (daemon, existing) = match client.request(CompanionRequest::Descriptor)? {
+            CompanionResponse::Identity { identity, profile } => (identity, profile),
+            _ => return Err("invalid counterpart identity response".into()),
+        };
+        let desktop_dir =
+            xshell_core::local_ipc::canonical_store(self.store.dir()).map_err(|e| e.to_string())?;
+        // Windows pipe endpoints have no parent directory; the client carries the store.
+        let daemon_dir = client.daemon_store();
+        let membership = self.store.load()?.0;
+        let retained_name = |key: &SignKey| {
+            membership
+                .as_ref()
+                .and_then(|state| state.chain.head().member(key))
+                .map(|member| member.name.clone())
+        };
+        // A registration the Daemon still holds for an earlier identity of this Desktop
+        // (before a set-aside rotated it) only lends its names; the Daemon replaces it.
+        let existing = existing.filter(|p| p.desktop_store == desktop_dir.to_string_lossy());
+        let desktop_name = existing
+            .as_ref()
+            .map(|p| p.desktop.name.clone())
+            .or_else(|| retained_name(&keys.sign_key()))
+            .unwrap_or_else(|| xshell_protocol::ring::member_name(&self.cfg.name, "computer"));
+        let mut daemon = daemon;
+        daemon.name = existing
+            .as_ref()
+            .map(|p| p.daemon.name.clone())
+            .or_else(|| retained_name(&daemon.sign_key))
+            .unwrap_or(daemon.name);
+        let profile = CompanionProfile::for_stores(
+            desktop_dir
+                .to_str()
+                .ok_or("Desktop profile path is not UTF-8")?
+                .into(),
+            daemon_dir
+                .to_str()
+                .ok_or("Daemon profile path is not UTF-8")?
+                .into(),
+            PublicIdentity {
+                name: desktop_name,
+                sign_key: keys.sign_key(),
+                noise_key: keys.noise_key(),
+            },
+            daemon,
+            client
+                .endpoint()
+                .to_str()
+                .ok_or("counterpart endpoint is not UTF-8")?
+                .into(),
+        );
+        profile.validate()?;
+        // The Daemon answered with another identity than the one stored here: it set its
+        // own membership aside and rotated. A stale binding of a Desktop in no Ring goes
+        // (refused while a membership or an unresolved record exists).
+        if let Some(stale) = self
+            .store
+            .load_profile()?
+            .0
+            .and_then(|p| p.companion)
+            .filter(|c| c.daemon.sign_key != profile.daemon.sign_key)
+        {
+            self.store.forget_companion(&stale)?;
+        }
+        // Retain the association before registration can escape to the other store. A
+        // stopped/unavailable counterpart is never grounds to discard this descriptor.
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained Desktop profile missing")?;
+            if stored
+                .companion
+                .as_ref()
+                .is_some_and(|existing| existing != &profile)
+            {
+                return Err("Desktop profile is bound to another counterpart".into());
+            }
+            stored.companion = Some(profile.clone());
+            Ok((Some(stored), ()))
+        })?;
+        let proof = Signature::from_bytes(
+            keys.sign(&registration_message(&profile))
+                .map_err(|e| e.to_string())?,
+        );
+        match client.request(CompanionRequest::Register {
+            profile: profile.clone(),
+            proof,
+        })? {
+            CompanionResponse::Descriptor {
+                profile: Some(accepted),
+            } if accepted == profile => Ok((keys, profile)),
+            _ => Err("counterpart did not retain this registration".into()),
+        }
+    }
+    fn journal_update(
+        &self,
+        operation: &str,
+        update: impl FnOnce(&mut AdoptionJournal),
+    ) -> Result<(), String> {
+        self.store
+            .transact_profile(|profile, _| {
+                let mut profile = profile.ok_or("retained profile missing")?;
+                let journal = profile
+                    .journal
+                    .as_mut()
+                    .filter(|journal| journal.intent.operation == operation)
+                    .ok_or("Create operation changed")?;
+                update(journal);
+                Ok((Some(profile), ()))
+            })
+            .map(|_| ())
+    }
+    fn create_live(&self, lease: &CreateConfirmationLease) -> Result<(), String> {
+        lease.live()?;
+        if !self.pairing_ipc_owner() {
+            return Err("Create owner process ended or changed".into());
+        }
+        Ok(())
+    }
+    fn install_joined_computer(
+        &self,
+        client: &CompanionClient,
+        operation: &str,
+        profile: &CompanionProfile,
+        accepted: &RosterChain,
+    ) -> Result<(), String> {
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::AcceptedBeforeJournal);
+        let tokens: Vec<String> = accepted
+            .versions()
+            .iter()
+            .map(|roster| roster.token().into())
+            .collect();
+        let stored = self
+            .store
+            .load_profile()?
+            .0
+            .ok_or("retained profile missing")?;
+        let journal = stored
+            .journal
+            .as_ref()
+            .filter(|j| j.intent.operation == operation)
+            .ok_or("adoption journal changed")?;
+        journal.verify_accepted(accepted)?;
+        if stored.companion.as_ref() != Some(profile)
+            || profile.target() != journal.intent.target
+            || stored.keys.sign_key() != profile.desktop.sign_key
+            || [profile.desktop.sign_key, profile.daemon.sign_key]
+                .iter()
+                .any(|key| accepted.authorized_member(key).is_none())
+        {
+            return Err("accepted local Computer is mismatched or terminal".into());
+        }
+        self.journal_update(operation, |journal| {
+            if journal.phase != AdoptionPhase::Installed {
+                journal.phase = AdoptionPhase::Accepted;
+            }
+            journal.accepted = tokens.clone();
+        })?;
+        self.adoption_test_point(super::desktop::AdoptionTestPoint::AcceptedBeforeCompanionInstall);
+        match client.request(CompanionRequest::InstallAccepted {
+            operation: operation.into(),
+            rosters: tokens,
+        })? {
+            CompanionResponse::Installed { hash } if hash == accepted.head().hash() => {}
+            _ => return Err("counterpart durable installation receipt missing".into()),
+        }
+        self.adoption_test_point(
+            super::desktop::AdoptionTestPoint::CompanionInstalledBeforeDesktop,
+        );
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained profile missing")?;
+            let journal = stored
+                .journal
+                .as_mut()
+                .filter(|journal| journal.intent.operation == operation)
+                .ok_or("adoption journal changed")?;
+            let current = reconcile::merge(
+                stored.membership.as_ref().map(|member| &member.chain),
+                accepted.clone(),
+            )?;
+            journal.verify_accepted(&current)?;
+            if [profile.desktop.sign_key, profile.daemon.sign_key]
+                .iter()
+                .any(|key| current.authorized_member(key).is_none())
+            {
+                return Err("local Computer became terminal before Desktop installation".into());
+            }
+            journal.accepted = current
+                .versions()
+                .iter()
+                .map(|r| r.token().into())
+                .collect();
+            journal.daemon_installed = true;
+            journal.desktop_installed = true;
+            journal.phase = AdoptionPhase::Installed;
+            if let Some(member) = &mut stored.membership {
+                member.chain = current;
+                member.local_member = Some(profile.daemon.sign_key);
+                member.retarget_farewells();
+            } else {
+                stored.membership = Some(RingState {
+                    keys: stored.keys.clone(),
+                    chain: accepted.clone(),
+                    local_member: Some(profile.daemon.sign_key),
+                    farewells: vec![],
+                    held_relays: [accepted.head().roster().relay_url.clone()]
+                        .into_iter()
+                        .collect(),
+                    host_members: Default::default(),
+                });
+            }
+            Ok((Some(stored), ()))
+        })?;
+        self.reload();
+        Ok(())
+    }
+
+    /// Explicit Create only. No connection/setup path calls this automatically. The callback
+    /// must present the verified preview and return a matching in-process confirmation.
+    pub fn create_computer(
+        &self,
+        client: &CompanionClient,
+        confirm: impl FnOnce(
+            &ConsentPreview,
+            &CreateConfirmationLease,
+        ) -> Result<CreateDecision, String>,
+    ) -> Result<AdoptionOutcome, String> {
+        let relay = self.cfg.default_relay_url.clone();
+        self.create_computer_on(client, &relay, confirm)
+    }
+
+    /// [`DesktopRing::create_computer`] on the Relay `relay_url` (the user's own Relay chosen
+    /// before Create), bound into the genesis proposal.
+    pub fn create_computer_on(
+        &self,
+        client: &CompanionClient,
+        relay_url: &str,
+        confirm: impl FnOnce(
+            &ConsentPreview,
+            &CreateConfirmationLease,
+        ) -> Result<CreateDecision, String>,
+    ) -> Result<AdoptionOutcome, String> {
+        xshell_protocol::ring::url::RelayUrl::parse(relay_url).map_err(|e| e.to_string())?;
+        let _admission = self.reserve_adoption()?;
+        if !self.pairing_ipc_owner() {
+            return Err("other_window: another window owns Create".into());
+        }
+        // An explicit Create starts over after an unreadable profile.
+        self.store.clear_moved_aside()?;
+        if let Some(profile) = self.store.load_profile()?.0 {
+            if profile.membership.is_some() {
+                return Err("already_member: this computer is already in a Ring".into());
+            }
+            if profile.pending_join.is_some()
+                || profile
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| !journal.phase.permits_new_operation())
+            {
+                self.kick_reconciler();
+                return Err("finishing: an earlier Join or Create is being finished".into());
+            }
+        }
+        let (keys, profile) = self.register_companion_inner(client)?;
+        let operation = nonce()?;
+        let ttl = self.cfg.pair_ttl.min(Duration::from_secs(600));
+        let expires_at = now() + ttl.as_secs();
+        let until = Instant::now() + ttl;
+        let intent = AdoptionIntent {
+            operation: operation.clone(),
+            expires_at,
+            target: profile.target(),
+        };
+        let ring_id = RingId::derive(&keys.sign_key());
+        let activity_key =
+            RingClient::activity_key(relay_url, &ring_id, None, self.cfg.timeouts.connect)
+                .map_err(|e| format!("offline: {e}"))?;
+        let at = now();
+        let mut proposal = Roster {
+            v: 2,
+            ring_id: ring_id.clone(),
+            version: 1,
+            prev: None,
+            relay_url: relay_url.to_string(),
+            signed_by: keys.sign_key(),
+            issued_at: at,
+            members: intent
+                .target
+                .identities()
+                .iter()
+                .map(|(identity, role)| {
+                    Member::new(
+                        &identity.name,
+                        *role,
+                        identity.sign_key,
+                        identity.noise_key,
+                        at,
+                    )
+                })
+                .collect(),
+            extra: Default::default(),
+        };
+        proposal.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: operation.clone(),
+                kind: EnrollmentKind::Computer,
+                members: vec![profile.desktop.sign_key, profile.daemon.sign_key],
+                enrolled_at: at,
+            }],
+            retired: vec![],
+            // Rings do not expire members (B5): a machine that was off for weeks comes
+            // back by itself; a stale machine goes away with Remove.
+            policy: RingPolicy {
+                inactivity_seconds: None,
+                activity_key,
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        });
+        verify_local_proposal(None, &proposal).map_err(|e| e.to_string())?;
+        let context = local_consent_context(&proposal).map_err(|e| e.to_string())?;
+        let proposal_hash = consent_proposal_hash(&proposal).map_err(|e| e.to_string())?;
+        let lease = CreateConfirmationLease {
+            operation: operation.clone(),
+            proposal_hash: proposal_hash.clone(),
+            until,
+            expires_at,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        *self
+            .adoption_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&lease.cancelled));
+        self.store.transact_profile(|stored, _| {
+            let mut stored = stored.ok_or("retained profile missing")?;
+            if stored.membership.is_some() {
+                return Err("already_member: membership appeared before Create preparation".into());
+            }
+            stored.removed = None;
+            stored.old_ring = None;
+            stored.journal = Some(AdoptionJournal {
+                intent: intent.clone(),
+                predecessor: vec![],
+                proposal: proposal.clone(),
+                context: context.clone(),
+                transcript: ConsentTranscript::Local,
+                phase: AdoptionPhase::Prepared,
+                signed_candidate: None,
+                accepted: vec![],
+                desktop_installed: false,
+                daemon_installed: false,
+            });
+            Ok((Some(stored), ()))
+        })?;
+        let result = (|| {
+            client.request(CompanionRequest::Start {
+                intent: intent.clone(),
+            })?;
+            client.request(CompanionRequest::Prepare {
+                proposal: Box::new(CompanionProposal {
+                    operation: operation.clone(),
+                    predecessor: vec![],
+                    proposal: proposal.clone(),
+                    transcript: ConsentTranscript::Local,
+                }),
+            })?;
+            self.create_live(&lease)?;
+            let preview = ConsentPreview {
+                operation: operation.clone(),
+                proposal_hash,
+                ring_id,
+                relay_url: proposal.relay_url.clone(),
+                profile: profile.clone(),
+                context: context.clone(),
+                proposal: proposal.clone(),
+                expires_at,
+            };
+            let decision = confirm(&preview, &lease)?;
+            if let CreateDecision::Decline = decision {
+                client.request(CompanionRequest::Cancel {
+                    operation: operation.clone(),
+                })?;
+                self.journal_update(&operation, |journal| {
+                    journal.phase = AdoptionPhase::DeclinedBeforeProof
+                })?;
+                return Ok(AdoptionOutcome::Declined {
+                    operation: operation.clone(),
+                });
+            }
+            let CreateDecision::Confirm(confirmation) = decision else {
+                unreachable!()
+            };
+            lease.verify(&confirmation)?;
+            self.create_live(&lease)?;
+            // Durable before either local enrollment proof can escape. Expiry/cancellation
+            // after this point must retain uncertainty, not regenerate a Ring or an offer.
+            self.journal_update(&operation, |journal| {
+                journal.phase = AdoptionPhase::ConsentMayHaveLeft
+            })?;
+            let message =
+                consent_message(&proposal, expires_at, &context).map_err(|e| e.to_string())?;
+            let desktop_proof = ConsentProof {
+                key: keys.sign_key(),
+                expires_at,
+                context: context.clone(),
+                signature: Signature::from_bytes(keys.sign(&message).map_err(|e| e.to_string())?),
+            };
+            let daemon_proof = match client.request(CompanionRequest::Consent {
+                operation: operation.clone(),
+                desktop_proof: desktop_proof.clone(),
+            })? {
+                CompanionResponse::Consent { proof } => proof,
+                _ => return Err("counterpart consent response refused".into()),
+            };
+            let mut membership = proposal.membership().map_err(|e| e.to_string())?;
+            membership.change = RosterChange::Genesis {
+                proofs: vec![desktop_proof, daemon_proof],
+            };
+            let mut completed = proposal;
+            completed.set_membership(&membership);
+            let signed = completed.sign(&*keys).map_err(|e| e.to_string())?;
+            let candidate =
+                RosterChain::from_chain(vec![signed.clone()]).map_err(|e| e.to_string())?;
+            self.create_live(&lease)?;
+            self.journal_update(&operation, |journal| {
+                journal.signed_candidate = Some(signed.token().into());
+                journal.phase = AdoptionPhase::PublicationUncertain;
+            })?;
+            self.create_live(&lease)?;
+            // No normal Connector knows this candidate. One explicit bootstrap client
+            // uploads exactly these journalled bytes; no retry/reconnect loop exists here.
+            let mut config = RingClientConfig::new(candidate, keys.clone());
+            config.timeouts = self.cfg.timeouts;
+            let bootstrap = RingClient::connect(config, Arc::new(BootstrapEvents))
+                .map_err(|e| e.to_string())?;
+            // Only after a positively closed bootstrap socket may the independent pinned
+            // fetch authenticate with this same key. Failure leaves uncertainty, no retry.
+            bootstrap
+                .bye(ByeReason::quit())
+                .map_err(|e| e.to_string())?;
+            let accepted = RingClient::fetch_chain(
+                &completed.relay_url,
+                &completed.ring_id,
+                keys.clone(),
+                &ChainPin {
+                    version: signed.version(),
+                    hash: signed.hash(),
+                },
+                None,
+                self.cfg.timeouts,
+            )
+            .map_err(|e| e.to_string())?;
+            if accepted.get(signed.version()) != Some(&signed)
+                || [profile.desktop.sign_key, profile.daemon.sign_key]
+                    .iter()
+                    .any(|key| accepted.authorized_member(key).is_none())
+            {
+                return Err(
+                    "accepted Create is forked or no longer authorizes this Computer".into(),
+                );
+            }
+            self.install_joined_computer(client, &operation, &profile, &accepted)?;
+            Ok(AdoptionOutcome::Installed {
+                operation: operation.clone(),
+                chain: accepted,
+            })
+        })();
+        if let Err(error) = result {
+            let phase = self
+                .store
+                .load_profile()?
+                .0
+                .and_then(|profile| profile.journal)
+                .map(|journal| journal.phase);
+            if phase == Some(AdoptionPhase::Prepared) {
+                if client
+                    .request(CompanionRequest::Cancel {
+                        operation: operation.clone(),
+                    })
+                    .is_ok()
+                {
+                    self.journal_update(&operation, |journal| {
+                        journal.phase = if now() >= journal.intent.expires_at {
+                            AdoptionPhase::ExpiredBeforeProof
+                        } else {
+                            AdoptionPhase::Cancelled
+                        };
+                    })?;
+                }
+                return Err(error);
+            }
+            self.kick_reconciler();
+            return Err(format!("finishing: {error}"));
+        }
+        result
+    }
+}

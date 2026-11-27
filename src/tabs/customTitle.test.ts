@@ -9,7 +9,7 @@ const terminal: TerminalInfo = { terminal: "uuid", spec: { cwd: "/p" }, meta: { 
 const status: HostStatus = { host: "local", status: "connected", phase: null, lastError: null, errorHint: null, daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1, os: "linux", arch: "x86_64", incompatibleReason: null, nextRetryAt: null, sinceMs: 0, configGeneration: 2, daemonCapabilities: ["term.custom-title"] };
 function fixture() {
   let tabs: Tab[] = [{ id: "tab", terminal: "uuid", type: "terminal", title: "Automatic", customTitle: "Original" }];
-  const snap: RegistrySnapshot = { configs: [], status: { local: { ...status } }, live: { local: [terminal] }, agents: {}, epochs: {} };
+  const snap: RegistrySnapshot = { configs: [], available: [], status: { local: { ...status } }, live: { local: [terminal] }, agents: {}, epochs: {} };
   const send = vi.fn<(_: string, args: Record<string, unknown>) => Promise<unknown>>().mockResolvedValue(undefined);
   const controller = new CustomTitleController(() => tabs, () => snap, send);
   return { controller, snap, send, get tabs() { return tabs; }, set tabs(value: Tab[]) { tabs = value; } };
@@ -160,4 +160,18 @@ describe("CustomTitleController", () => {
     expect(customTitleError("\u2003 name \u2003")).toBeNull();
     for (const control of ["\n", "\r", "\t", "\x00", "\x7f", "\x9f", "\u2028", "\u2029"]) expect(customTitleError(`name${control}`)).toBe(fmt("tab.rename.controls"));
   });
+});
+
+it("Ring name capture fences a changed verified identity without inventing a saved SSH config (#102)", async () => {
+  const f = fixture();
+  const r = `r_${"e".repeat(64)}`;
+  f.tabs = [{ ...f.tabs[0], host: r }];
+  f.snap.available = [{ id: r, aliases: [r], name: "Ring Host", color: null, daemonKey: "first", activeRoute: "relay", routes: ["relay"], reachability: { kind: "online" } }];
+  f.snap.status[r] = { ...status, host: r };
+  f.snap.live[r] = [terminal];
+  expect(f.controller.open(f.tabs[0])).toBe(true);
+  f.snap.available = [{ ...f.snap.available[0], daemonKey: "replacement" }];
+  await f.controller.submit("must not send");
+  expect(f.send).not.toHaveBeenCalled();
+  expect(f.snap.configs).toEqual([]);
 });

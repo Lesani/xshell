@@ -1,5 +1,5 @@
 // What the `ring_*` commands answer and the `ring:status` event carries (src-tauri/src/ring.rs,
-// xshell_hostlink::ring::RingView).
+// src-tauri/src/ring/join.rs, xshell_hostlink::ring::RingView).
 
 export type MemberRole = "desktop" | "daemon" | "mobile";
 export type PresenceKind = "online" | "closed" | "unreachable" | "never" | "unknown";
@@ -14,11 +14,21 @@ export interface MemberView {
   thisComputer: boolean;
   // The configured Remote Host (still in Settings → Hosts) whose Daemon this member is.
   hostId: string | null;
-  // Settings → Mobile offers to remove it: not this app, not this computer, and no configured
-  // Host's Daemon.
+  // Every row of a format-2 Ring, this machine's own included.
   removable: boolean;
   presence: { kind: PresenceKind; reason?: string; at?: number };
+  // The member's enrollment unit. A Computer is one row: its Desktop's name and signKey, its
+  // Daemon in daemonKey (equal to its `AvailableHost.daemonKey`); removing it removes both.
+  enrollmentId: string | null;
+  kind: EnrollmentKind | null;
+  daemonKey: string | null;
+  // A grouped Computer: its Daemon's own presence (presence is online when either key is).
+  daemonPresence: { kind: PresenceKind; reason?: string; at?: number } | null;
 }
+
+export type EnrollmentKind = "computer" | "daemon" | "mobile" | "legacyDesktop";
+
+export type Membership = "none" | "member" | "finishing" | "removed";
 
 export interface RingStatus {
   enabled: boolean;
@@ -31,8 +41,8 @@ export interface RingStatus {
   retryIn: number | null;
   connectionError: string | null;
   limited: boolean;
-  // Old Relays that still owe a farewell: devices there are told about the current Relay.
-  farewells: FarewellView[];
+  // `recovered`: an unreadable file was set aside (Create clears it); `unreadable`: refused,
+  // left in place until it can be read.
   problem: "recovered" | "unreadable" | null;
   problemDetail: string | null;
   members: MemberView[];
@@ -41,23 +51,24 @@ export interface RingStatus {
   quotaResetAt: number | null;
   // The Ring's Relay is the Hosted one, not the user's own (the Desktop compares origins).
   relayHosted: boolean;
-  // How this computer's terminals run: a Daemon that can join, inside the app, or a Daemon too
-  // old to join.
-  local: "daemon" | "in-process" | "too-old";
+  // This computer's Daemon can join, or is too old to.
+  local: "daemon" | "too-old";
   // The Remote Hosts not in the Ring, and why (empty when every connected Host joined).
   hosts: HostRingState[];
+  // `finishing`: earlier Join/Create/approval work is finished automatically (Create and
+  // Join wait); `removed`: another device removed this machine.
+  membership: Membership;
+  // Set while `membership` is `removed` (Unix seconds).
+  removed: { ringId: string; at: number } | null;
+  // A stored format-1 Ring was set aside at start, until Create or Join (Unix seconds).
+  oldRing: { at: number } | null;
+  // `membership` is `finishing` and the Relay cannot be reached right now.
+  finishingOffline: boolean;
+  // An adoption, approval or registration runs now: nothing new can start.
+  busy: boolean;
 }
 
-// `other-ring`: paired with another Desktop's devices; `ring_claim_host` pairs it here.
 export type HostRingKind = "too-old" | "other-ring" | "full" | "failed";
-
-export interface FarewellView {
-  relayUrl: string;
-  state: "pending" | "sending" | "waiting";
-  error?: string;
-  retryIn?: number;
-  failures: number;
-}
 
 export interface HostRingState {
   host: string;
@@ -66,7 +77,7 @@ export interface HostRingState {
   error?: string;
 }
 
-// Pairing (#9): what `ring_pair_phone_start` answers and the `ring:pairing` event carries.
+// Phone pairing (#9): what `ring_pair_phone_start` answers and the `ring:pairing` event carries.
 
 // `rows[y][x]` is "1" for a dark module. No quiet zone; the UI adds the margin.
 export interface Qr {
@@ -90,3 +101,37 @@ export type PairingEvent = { operation: string } & (
   | { flow: PairingFlow; state: "paired"; name: string; role: MemberRole }
   | { flow: PairingFlow; state: "expired" }
   | { flow: PairingFlow; state: "failed"; code: string });
+
+// Create, Join and Add a machine: `ring_join_start`'s reply (the only place the words appear),
+// the `ring:join` event and `ring_join_overview`.
+
+export interface JoinStarted {
+  operation: string;
+  // Eight words joined by `-`.
+  words: string;
+  expiresAt: number;
+}
+
+export type JoinOrigin = "gui" | "cli";
+export type JoinStateName = "waiting" | "completing" | "installed" | "finishing" | "expired" | "cancelled" | "failed";
+
+export interface JoinEvent {
+  operation: string;
+  origin: JoinOrigin;
+  state: JoinStateName;
+  // `code: detail`.
+  error?: string;
+  expiresAt: number;
+}
+
+export interface JoinOverview {
+  unavailable?: "not-registered" | null;
+  // This window owns pairing (otherwise another xshell window does).
+  owner: boolean;
+  joins: JoinEvent[];
+}
+
+export interface ApprovedComputer {
+  names: string[];
+  version: number;
+}

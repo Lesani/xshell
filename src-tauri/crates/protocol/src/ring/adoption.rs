@@ -1,0 +1,531 @@
+//! Computer/headless XXpsk3 payloads. Only public counterpart identities cross the pipe.
+//! Possession is not consent: enrollment proofs are produced only after verified metadata
+//! reaches the explicit callback in `relay::pair::adopt_as_guest`.
+use super::*;
+use crate::ring::membership::{ConsentProof, EnrollmentKind, RosterChange};
+use crate::ring::{Member, Roster};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicIdentity {
+    pub sign_key: SignKey,
+    pub noise_key: NoiseKey,
+    pub name: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum JoinTarget {
+    StandaloneDaemon {
+        daemon: PublicIdentity,
+    },
+    Computer {
+        desktop: PublicIdentity,
+        daemon: PublicIdentity,
+    },
+    /// A phone joining a v2 Ring by scanning a Desktop's v2 `PairingOffer`. The phone signs
+    /// its own Pairing consent proof; there is no companion.
+    Mobile {
+        phone: PublicIdentity,
+    },
+}
+impl JoinTarget {
+    pub fn principal(&self) -> &PublicIdentity {
+        match self {
+            Self::StandaloneDaemon { daemon } => daemon,
+            Self::Computer { desktop, .. } => desktop,
+            Self::Mobile { phone } => phone,
+        }
+    }
+    pub fn identities(&self) -> Vec<(&PublicIdentity, Role)> {
+        match self {
+            Self::StandaloneDaemon { daemon } => vec![(daemon, Role::Daemon)],
+            Self::Computer { desktop, daemon } => {
+                vec![(desktop, Role::Desktop), (daemon, Role::Daemon)]
+            }
+            Self::Mobile { phone } => vec![(phone, Role::Mobile)],
+        }
+    }
+    /// The enrollment unit kind this target creates.
+    pub fn enrollment_kind(&self) -> EnrollmentKind {
+        match self {
+            Self::StandaloneDaemon { .. } => EnrollmentKind::Daemon,
+            Self::Computer { .. } => EnrollmentKind::Computer,
+            Self::Mobile { .. } => EnrollmentKind::Mobile,
+        }
+    }
+    pub fn validate(&self) -> Result<(), PairError> {
+        let identities = self.identities();
+        let fallback = match self {
+            Self::Mobile { .. } => "phone",
+            _ => "computer",
+        };
+        if identities
+            .iter()
+            .any(|(p, _)| p.name != member_name(&p.name, fallback))
+            || (identities.len() == 2
+                && (identities[0].0.sign_key == identities[1].0.sign_key
+                    || identities[0].0.noise_key == identities[1].0.noise_key))
+        {
+            return Err(PairError::Payload("invalid target identities".into()));
+        }
+        Ok(())
+    }
+    pub fn matches_proposal(&self, r: &Roster) -> Result<(), PairError> {
+        self.validate()?;
+        let m = r
+            .membership()
+            .map_err(|e| PairError::Payload(e.to_string()))?;
+        let RosterChange::Enroll { enrollment_id, .. } = &m.change else {
+            return Err(PairError::Payload("not Enroll".into()));
+        };
+        let u = m
+            .unit(enrollment_id)
+            .ok_or_else(|| PairError::Payload("missing target unit".into()))?;
+        let kind = self.enrollment_kind();
+        let ids = self.identities();
+        if u.kind != kind
+            || u.members.len() != ids.len()
+            || ids.iter().any(|(p, role)| {
+                !u.members.contains(&p.sign_key)
+                    || r.member(&p.sign_key)
+                        != Some(&Member::new(
+                            &p.name,
+                            *role,
+                            p.sign_key,
+                            p.noise_key,
+                            r.issued_at,
+                        ))
+            })
+        {
+            return Err(PairError::Payload(
+                "proposal changed intended identities".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+/// The honestly unsigned v2 `Enroll` successor of `head` that adds `intent`'s target as one
+/// new unit, issued at `at` and to be signed by `signer`. Structurally verified with
+/// `verify_enroll_proposal`; it carries no proofs (consent is collected afterwards).
+pub fn enroll_proposal(
+    head: &crate::ring::SignedRoster,
+    signer: SignKey,
+    intent: &AdoptionIntent,
+    at: u64,
+) -> Result<Roster, PairError> {
+    use crate::ring::membership::{verify_enroll_proposal, Enrollment};
+    // Never before the head: another machine (whose clock may run ahead of ours) issued it,
+    // and a successor issued earlier reads as a clock rollback (as Remove does).
+    let at = at.max(head.roster().issued_at);
+    let mut proposal = head.roster().clone();
+    proposal.version += 1;
+    proposal.prev = Some(head.hash());
+    proposal.signed_by = signer;
+    proposal.issued_at = at;
+    for (identity, role) in intent.target.identities() {
+        proposal.members.push(Member::new(
+            &identity.name,
+            role,
+            identity.sign_key,
+            identity.noise_key,
+            at,
+        ));
+    }
+    let mut membership = proposal
+        .membership()
+        .map_err(|e| PairError::Payload(e.to_string()))?;
+    membership.enrollments.push(Enrollment {
+        id: intent.operation.clone(),
+        kind: intent.target.enrollment_kind(),
+        members: intent
+            .target
+            .identities()
+            .iter()
+            .map(|(identity, _)| identity.sign_key)
+            .collect(),
+        enrolled_at: at,
+    });
+    membership.change = RosterChange::Enroll {
+        enrollment_id: intent.operation.clone(),
+        proofs: vec![],
+    };
+    proposal.set_membership(&membership);
+    verify_enroll_proposal(head, &proposal).map_err(|e| PairError::Payload(e.to_string()))?;
+    Ok(proposal)
+}
+
+/// The standalone `Daemon` unit an approval must remove before it enrolls `intent`'s
+/// Computer: a machine whose headless Daemon is already a member joins with its Desktop,
+/// and the Terminals stay. `Some(id)` only when the target is a Computer and `head` has a
+/// `Daemon` unit whose only member is exactly the intent's Daemon (same signing and Noise
+/// keys). `None` when no target key is a member. `Err` for every other overlap: a target
+/// key in any other unit is never taken over. Call only after possession of both target
+/// keys was verified in this same pairing.
+pub fn standalone_unit_to_replace(
+    head: &crate::ring::SignedRoster,
+    intent: &AdoptionIntent,
+) -> Result<Option<String>, PairError> {
+    let refuse = || PairError::Payload("a target key is already enrolled".into());
+    let m = head
+        .roster()
+        .membership()
+        .map_err(|e| PairError::Payload(e.to_string()))?;
+    let enrolled = |key: &SignKey| head.member(key).is_some() || m.unit_for(key).is_some();
+    match &intent.target {
+        JoinTarget::Computer { desktop, daemon } => {
+            if enrolled(&desktop.sign_key) {
+                return Err(refuse());
+            }
+            if !enrolled(&daemon.sign_key) {
+                return Ok(None);
+            }
+            let unit = m.unit_for(&daemon.sign_key).ok_or_else(refuse)?;
+            let member = head.member(&daemon.sign_key).ok_or_else(refuse)?;
+            if unit.kind != EnrollmentKind::Daemon
+                || unit.members != [daemon.sign_key]
+                || member.role != Role::Daemon
+                || member.noise_key != daemon.noise_key
+            {
+                return Err(refuse());
+            }
+            Ok(Some(unit.id.clone()))
+        }
+        other => {
+            if other
+                .identities()
+                .iter()
+                .any(|(i, _)| enrolled(&i.sign_key))
+            {
+                return Err(refuse());
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionIntent {
+    pub operation: String,
+    pub expires_at: u64,
+    pub target: JoinTarget,
+}
+impl AdoptionIntent {
+    pub fn validate(&self) -> Result<(), PairError> {
+        if b64::decode_array::<32>(&self.operation).is_err() || self.expires_at > MAX_SAFE_INT {
+            return Err(PairError::Payload("operation bounds".into()));
+        }
+        self.target.validate()
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Possession {
+    key: SignKey,
+    signature: Signature,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinPayload {
+    v: u8,
+    intent: AdoptionIntent,
+    proofs: Vec<Possession>,
+}
+pub fn possession_message(intent: &AdoptionIntent, h2: &[u8]) -> Vec<u8> {
+    let bytes = serde_json::to_vec(intent).expect("intent serializes");
+    format!(
+        "xshell-adoption-possession-v2\n{}\n{}",
+        b64::encode(h2),
+        b64::encode(&Sha256::digest(bytes))
+    )
+    .into_bytes()
+}
+/// Local signers remain owned by their actual identities. A future protected IPC adapter
+/// can implement Signer; no private seed or invented GUI-consent bit is part of this API.
+pub struct AdoptionSigners<'a> {
+    pub principal: &'a dyn Signer,
+    pub companion: Option<&'a dyn Signer>,
+}
+impl AdoptionSigners<'_> {
+    pub fn sign(
+        &self,
+        target: &JoinTarget,
+        message: &[u8],
+    ) -> Result<Vec<(SignKey, Signature)>, PairError> {
+        let ids = target.identities();
+        let signers: Vec<&dyn Signer> = std::iter::once(self.principal)
+            .chain(self.companion)
+            .collect();
+        if signers.len() != ids.len()
+            || signers
+                .iter()
+                .zip(&ids)
+                .any(|(s, (p, _))| s.sign_key() != p.sign_key)
+        {
+            return Err(PairError::Payload("counterpart possession required".into()));
+        }
+        signers
+            .iter()
+            .map(|s| {
+                s.sign(message)
+                    .map(|sig| (s.sign_key(), Signature::from_bytes(sig)))
+                    .map_err(|e| PairError::Relay(e.to_string()))
+            })
+            .collect()
+    }
+}
+impl Guest {
+    pub fn join_adoption(
+        &mut self,
+        keys: &DeviceKeys,
+        intent: &AdoptionIntent,
+        signers: &AdoptionSigners<'_>,
+    ) -> Result<Vec<u8>, PairError> {
+        intent.validate()?;
+        if keys.sign_key() != intent.target.principal().sign_key
+            || keys.noise_key() != intent.target.principal().noise_key
+        {
+            return Err(PairError::Pin);
+        }
+        let h2 = self.h2.take().ok_or(PairError::Cancelled)?;
+        let proofs = signers
+            .sign(&intent.target, &possession_message(intent, &h2))?
+            .into_iter()
+            .map(|(key, signature)| Possession { key, signature })
+            .collect();
+        let payload = serde_json::to_vec(&JoinPayload {
+            v: 2,
+            intent: intent.clone(),
+            proofs,
+        })
+        .expect("join serializes");
+        let mut hs = self.hs.take().ok_or(PairError::Cancelled)?;
+        let message = write(&mut hs, &payload)?;
+        self.final_hash = Some(
+            hs.get_handshake_hash()
+                .try_into()
+                .map_err(|_| PairError::Crypto)?,
+        );
+        self.transport = Some(
+            hs.into_stateless_transport_mode()
+                .map_err(|_| PairError::Crypto)?,
+        );
+        Ok(message)
+    }
+}
+impl Host {
+    pub fn read_adoption(&mut self, msg3: &[u8]) -> Result<AdoptionIntent, PairError> {
+        if self.step != 2 {
+            return Err(PairError::Cancelled);
+        }
+        let mut hs = self.hs.take().ok_or(PairError::Cancelled)?;
+        let h2 = self.h2.take().ok_or(PairError::Cancelled)?;
+        let payload = read(&mut hs, msg3)?;
+        strict_object(&payload).map_err(PairError::Payload)?;
+        let p: JoinPayload = serde_json::from_slice(&payload)
+            .map_err(|_| PairError::Payload("adoption payload".into()))?;
+        p.intent.validate()?;
+        let ids = p.intent.target.identities();
+        if p.v != 2
+            || p.proofs.len() != ids.len()
+            || hs.get_remote_static()
+                != Some(p.intent.target.principal().noise_key.as_bytes().as_slice())
+            || p.proofs.iter().zip(ids).any(|(proof, (id, _))| {
+                proof.key != id.sign_key
+                    || !verify(
+                        &proof.key,
+                        &possession_message(&p.intent, &h2),
+                        &proof.signature,
+                    )
+            })
+        {
+            return Err(PairError::Crypto);
+        }
+        self.final_hash = Some(
+            hs.get_handshake_hash()
+                .try_into()
+                .map_err(|_| PairError::Crypto)?,
+        );
+        self.transport = Some(
+            hs.into_stateless_transport_mode()
+                .map_err(|_| PairError::Crypto)?,
+        );
+        self.step = 3;
+        Ok(p.intent)
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptionConsent {
+    pub operation: String,
+    pub proposal_hash: String,
+    pub proofs: Vec<ConsentProof>,
+}
+/// Check received real signatures, not placeholder proofs, before an approver signs a token.
+pub fn apply_consent(
+    r: &Roster,
+    intent: &AdoptionIntent,
+    hash: &[u8; 32],
+    consent: AdoptionConsent,
+) -> Result<Roster, PairError> {
+    use crate::ring::membership::{
+        consent_message, consent_proposal_hash, pairing_consent_context,
+    };
+    intent.target.matches_proposal(r)?;
+    let context =
+        pairing_consent_context(r, hash).map_err(|e| PairError::Payload(e.to_string()))?;
+    let proposal_hash = consent_proposal_hash(r).map_err(|e| PairError::Payload(e.to_string()))?;
+    if consent.operation != intent.operation
+        || consent.proposal_hash != proposal_hash
+        || consent.proofs.len() != intent.target.identities().len()
+        || intent.target.identities().iter().any(|(id, _)| {
+            consent
+                .proofs
+                .iter()
+                .filter(|p| p.key == id.sign_key)
+                .count()
+                != 1
+        })
+        || consent.proofs.iter().any(|p| {
+            p.context != context
+                || p.expires_at != intent.expires_at
+                || !verify(
+                    &p.key,
+                    &consent_message(r, p.expires_at, &context).unwrap_or_default(),
+                    &p.signature,
+                )
+        })
+    {
+        return Err(PairError::Crypto);
+    }
+    let mut r = r.clone();
+    let mut m = r
+        .membership()
+        .map_err(|e| PairError::Payload(e.to_string()))?;
+    let RosterChange::Enroll { proofs, .. } = &mut m.change else {
+        return Err(PairError::Crypto);
+    };
+    *proofs = consent.proofs;
+    r.set_membership(&m);
+    Ok(r)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AdoptionDecision {
+    Consent {
+        consent: AdoptionConsent,
+    },
+    Cancel {
+        operation: String,
+        proposal_hash: String,
+    },
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+    use crate::ring::membership::{
+        consent_message, local_consent_context, Enrollment, Membership, RingPolicy,
+    };
+    use crate::ring::{b64, DeviceKeys, RingId, Role, Signature, Signer};
+
+    /// A v2 genesis issued at `at` by `keys` (a Desktop and its Daemon).
+    fn genesis(keys: &DeviceKeys, daemon: &DeviceKeys, at: u64) -> crate::ring::SignedRoster {
+        let mut g = Roster {
+            v: 2,
+            ring_id: RingId::derive(&keys.sign_key()),
+            version: 1,
+            prev: None,
+            relay_url: "ws://127.0.0.1:9".into(),
+            signed_by: keys.sign_key(),
+            issued_at: at,
+            members: vec![
+                Member::new("desk", Role::Desktop, keys.sign_key(), keys.noise_key(), at),
+                Member::new(
+                    "desk",
+                    Role::Daemon,
+                    daemon.sign_key(),
+                    daemon.noise_key(),
+                    at,
+                ),
+            ],
+            extra: Default::default(),
+        };
+        g.set_membership(&Membership {
+            enrollments: vec![Enrollment {
+                id: b64::encode(&[1; 32]),
+                kind: EnrollmentKind::Computer,
+                members: vec![keys.sign_key(), daemon.sign_key()],
+                enrolled_at: at,
+            }],
+            retired: vec![],
+            policy: RingPolicy {
+                inactivity_seconds: None,
+                activity_key: keys.sign_key(),
+            },
+            change: RosterChange::Genesis { proofs: vec![] },
+        });
+        let context = local_consent_context(&g).unwrap();
+        let proofs = [keys, daemon]
+            .iter()
+            .map(|k| ConsentProof {
+                key: k.sign_key(),
+                expires_at: at + 600,
+                context: context.clone(),
+                signature: Signature::from_bytes(
+                    k.sign(&consent_message(&g, at + 600, &context).unwrap())
+                        .unwrap(),
+                ),
+            })
+            .collect();
+        let mut m = g.membership().unwrap();
+        m.change = RosterChange::Genesis { proofs };
+        g.set_membership(&m);
+        g.sign(keys).unwrap()
+    }
+
+    /// Round 5: an approver whose clock runs behind the machine that issued the head
+    /// proposes at the head's time (never a "clock rollback"); one running ahead keeps its
+    /// own time. Members and the enrollment carry the proposal's time either way.
+    #[test]
+    fn enroll_proposal_never_precedes_the_head() {
+        let (keys, daemon, phone) = (
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+            DeviceKeys::generate().unwrap(),
+        );
+        let head = genesis(&keys, &daemon, 10_000);
+        let intent = AdoptionIntent {
+            operation: b64::encode(&[7; 32]),
+            expires_at: 10_600,
+            target: JoinTarget::Mobile {
+                phone: PublicIdentity {
+                    sign_key: phone.sign_key(),
+                    noise_key: phone.noise_key(),
+                    name: "phone".into(),
+                },
+            },
+        };
+        for (at, want) in [
+            (10_000 - 30, 10_000),
+            (10_000, 10_000),
+            (10_000 + 30, 10_030),
+        ] {
+            let p = enroll_proposal(&head, keys.sign_key(), &intent, at).unwrap();
+            assert_eq!(p.issued_at, want, "approver at {at}");
+            assert!(p
+                .members
+                .iter()
+                .all(|m| m.added_at == want || m.added_at == 10_000));
+            let m = p.membership().unwrap();
+            assert!(m.enrollments.last().is_some_and(|e| e.enrolled_at == want));
+        }
+    }
+}

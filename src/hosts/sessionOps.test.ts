@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 
-import { planNewChat, planNewShell, planOpenSession, type OpenContext } from "./sessionOps";
+import { planNewChat, planNewShell, planOpenSession, refusal, type OpenContext } from "./sessionOps";
 import type { ProjectInfo, SessionInfo, Tab } from "../types";
 import type { HostStatus } from "./types";
 
@@ -16,7 +16,7 @@ function ctx(over: Partial<OpenContext> & { usable?: boolean; st?: HostStatus["s
     fullscreenRendering: true,
     forceSyncOutput: true,
     isUsable: () => usable,
-    isConfigured: (h) => h === H,
+    isAvailable: (h) => h === H,
     status: () => ({ status: over.st ?? (usable ? "connected" : "offline") } as HostStatus),
     hostName: () => "Dev",
     statusLabel: (s) => (s?.status === "offline" ? "Offline" : "Connected"),
@@ -125,7 +125,7 @@ describe("skip permissions is never part of a remote open", () => {
 describe("local Daemon mode (ADR-0005): new Local Tabs are Daemon Terminals", () => {
   const UUID = "11111111-2222-3333-4444-555555555555";
   // The Local Host is never refused, whatever its status: the Tab waits while it starts.
-  const lctx = (over: Partial<OpenContext> = {}) => ctx({ localDaemon: true, usable: false, isConfigured: () => false, ...over });
+  const lctx = (over: Partial<OpenContext> = {}) => ctx({ localDaemon: true, usable: false, isAvailable: () => false, ...over });
 
   it("open session: remote-<uuid> id, no host, pending on \"local\", agent spec without a wrapper", () => {
     const plan = planOpenSession(session(), project, [], lctx());
@@ -224,5 +224,16 @@ describe("Pi exact project session identity", () => {
     if (a.kind !== "create") throw new Error("expected create");
     expect(planOpenSession(session({ agent: "pi", project_path: "c:/work/proj/" }), undefined, [a.tab], ctx())).toEqual({ kind: "focus", tab: a.tab });
     expect(planOpenSession(session({ agent: "pi", project_path: "/Project" }), undefined, [{ ...a.tab, projectPath: "/project" }], ctx()).kind).toBe("create");
+  });
+});
+
+describe("refusal for a Host that is not listed", () => {
+  it("a Ring machine is offline, never 'add it again in Settings → Hosts'", () => {
+    const c = ctx({ isAvailable: () => false, hostName: () => "hotel" });
+    expect(refusal("r_00ff" as never, c)).toBe("hotel is offline. Reconnecting…");
+  });
+  it("an SSH Host keeps the Hosts wording", () => {
+    const c = ctx({ isAvailable: () => false });
+    expect(refusal(H as never, c)).toContain("Settings → Hosts");
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  asProjectKey, encodedNameFor, isPinned, keyOf, keyOfTab, lookupKey, newHostId, parseProjectKey,
+  asProjectKey, encodedNameFor, isHostId, isPinned, keyOf, keyOfTab, lookupKey, newHostId, parseProjectKey,
   sameKey, sessionKey, sessionKeyOf, sessionKeyOfTab, toProjectKey, HOST_ID_RE,
 } from "./projectKey";
 
@@ -97,4 +97,32 @@ it("Pi session keys scope custom IDs by agent, Host and normalized Project path"
   expect(sessionKeyOf(pi)).not.toBe(sessionKeyOf({ ...pi, agent: "claude" }));
   expect(sessionKeyOf(pi)).not.toBe(sessionKeyOf({ ...pi, host: "h_ab12cd34" }));
   expect(sessionKeyOf({ ...pi, project_path: "C:\\Work\\P" })).toBe(sessionKeyOf({ ...pi, project_path: "c:/work/p/" }));
+});
+
+it("parses the full lowercase Ring key namespace without weakening saved SSH IDs or bare Local paths", () => {
+  const host = `r_${"0123456789abcdef".repeat(4)}`;
+  expect(parseProjectKey(`host:${host}:/projects/a:b`)).toEqual({ host, path: "/projects/a:b" });
+  expect(isHostId(host)).toBe(false); // saved SSH schema stays strict
+  for (const invalid of [host.toUpperCase(), host.slice(0, -1), `${host}0`, host.replace("a", "g")]) {
+    const key = `host:${invalid}:/p`;
+    expect(parseProjectKey(key)).toEqual({ path: key });
+  }
+  expect(parseProjectKey("C:\\local\\p")).toEqual({ path: "C:\\local\\p" });
+});
+
+import { registry } from "./registry";
+import { lookupProjectValue, lookupProjectValueKey } from "./projectKey";
+it("runtime aliases share Project/session claims and old personal settings without rewriting their keys", () => {
+  const host = `r_${"a".repeat(64)}`, saved = "h_ab12cd34";
+  registry.applyAvailable({ sequence: 1, hosts: [{ id: saved, aliases: [saved, host], name: "Proven", color: null, daemonKey: "key", activeRoute: "ssh", routes: ["ssh", "relay"], reachability: { kind: "unknown" } }] });
+  const old = toProjectKey(host, "/p");
+  expect(sameKey(old, toProjectKey(saved, "/p"))).toBe(true);
+  expect(sessionKey(host, "s")).toBe(sessionKey(saved, "s"));
+  expect(isPinned([old], saved, "/p")).toBe(true);
+  const values = { [old]: { customName: "Personal layout", folders: ["kept"] } };
+  expect(lookupProjectValue(values, toProjectKey(saved, "/p"))).toEqual(values[old]);
+  expect(lookupProjectValueKey(values, toProjectKey(saved, "/p"))).toBe(old);
+  expect(Object.keys(values)).toEqual([old]);
+  registry.applyAvailable({ sequence: 2, hosts: [] });
+  expect(sameKey(old, toProjectKey(saved, "/p"))).toBe(false);
 });

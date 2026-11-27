@@ -191,9 +191,20 @@ pub fn windows_spawn_target(home: &Path, bundled: &Path) -> io::Result<PathBuf> 
     let identity = native_identity(&selected)?;
     let selected_version = semver::Version::parse(&identity.version).map_err(io::Error::other)?;
     let own_version = semver::Version::parse(&own.version).map_err(io::Error::other)?;
-    Ok(if selected_version.cmp_precedence(&own_version).is_lt() {
-        bundled.into()
-    } else {
-        selected
-    })
+    let honoured = super::selected_build_honoured(
+        selected_version.cmp_precedence(&own_version),
+        &identity.build,
+        &own.build,
+    );
+    if honoured {
+        return Ok(selected);
+    }
+    let own_dir = install_dir_name(&own.version, Some(&own.build));
+    // Rewritten only when the bundle is the private install of our build (the embedded
+    // Daemon); a sidecar elsewhere just wins this start. Best effort: every start
+    // compares again.
+    if bundled == root.join(&own_dir).join("xshelld.exe") {
+        let _ = write_windows_selected(home, &own_dir);
+    }
+    Ok(bundled.into())
 }

@@ -66,6 +66,11 @@ pub fn local_log_path(home: &Path) -> PathBuf {
     home.join(".xshell").join("log").join("xshelld.log")
 }
 
+/// The Daemon's Ring store, as `xshelld`'s `paths::resolve` places it.
+pub fn local_daemon_ring_dir(home: &Path) -> PathBuf {
+    home.join(".xshell").join("daemon").join("ring")
+}
+
 /// The mode marker (`gui-bound` / `persistent`): how the Daemon that last held the lock runs.
 pub fn local_mode_path(home: &Path) -> PathBuf {
     home.join(".xshell").join("daemon").join("mode")
@@ -74,6 +79,157 @@ pub fn local_mode_path(home: &Path) -> PathBuf {
 /// The pidfile next to `socket`, written by the `serve` that holds the lock.
 pub fn local_pid_path(socket: &Path) -> PathBuf {
     socket.parent().unwrap_or(Path::new("/")).join("daemon.pid")
+}
+
+/// `home/.xshell/run/daemon.endpoint`: the pid and socket of the `serve` that holds the lock
+/// (written by `xshelld`, A2). Under the home whatever `XDG_RUNTIME_DIR` says.
+pub fn local_endpoint_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.endpoint")
+}
+
+/// The pid and socket an endpoint record names (`<pid>\n<socket>\n`); `None` when missing
+/// or malformed.
+#[cfg(unix)]
+pub fn read_local_endpoint(path: &Path) -> Option<(u32, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::fs::read(path).ok()?;
+    if raw.len() > 4096 {
+        return None;
+    }
+    let mut lines = raw.split(|b| *b == b'\n');
+    let pid: u32 = std::str::from_utf8(lines.next()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let sock = lines.next().filter(|l| !l.is_empty())?;
+    let sock = PathBuf::from(std::ffi::OsStr::from_bytes(sock));
+    (pid > 1 && sock.is_absolute()).then_some((pid, sock))
+}
+
+/// `home/.xshell/run/daemon.owner`: held exclusively (`flock`) by the `serve` that owns this
+/// home's endpoint, for its whole life, taken before it writes the endpoint record. Probed
+/// with a shared lock released at once; the owner takes it with a blocking lock, so a probe
+/// never makes a starting `serve` fail.
+pub fn local_owner_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.owner")
+}
+
+/// `home/.xshell/run/daemon.start`: held exclusively by every Unix `serve` from before its
+/// login-environment preparation to its exit, so a second starter knows one is coming.
+pub fn local_start_path(home: &Path) -> PathBuf {
+    home.join(".xshell").join("run").join("daemon.start")
+}
+
+/// Whether some process holds `path`'s lock: a shared try-lock that is released at once.
+/// A missing file is free.
+#[cfg(unix)]
+pub fn lock_held(path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    match f.try_lock_shared() {
+        Ok(()) => {
+            let _ = f.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+/// The socket of the Daemon serving this home (A2): the one its endpoint record names while
+/// that Daemon holds the home's owner lock, else `fallback` (the socket this process's
+/// environment derives). A record whose owner lock is free is stale and removed (under a
+/// shared hold of the owner lock, so a starting owner's fresh record is never removed).
+#[cfg(unix)]
+pub fn local_live_socket(home: &Path, fallback: &Path) -> PathBuf {
+    let endpoint = local_endpoint_path(home);
+    let owner = local_owner_path(home);
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&owner) {
+        match f.try_lock_shared() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some((_, sock)) = read_local_endpoint(&endpoint) {
+                    return sock;
+                }
+                return fallback.to_path_buf();
+            }
+            Ok(()) => {
+                // Free: no owner. Any record is stale.
+                let _ = std::fs::remove_file(&endpoint);
+                let _ = f.unlock();
+                return fallback.to_path_buf();
+            }
+            Err(_) => {}
+        }
+    } else if endpoint.exists() {
+        // A record without an owner file: stale too.
+        let _ = std::fs::remove_file(&endpoint);
+    }
+    fallback.to_path_buf()
+}
+
+/// Whether a Daemon of this home is alive or starting: it holds the owner or the start lock,
+/// or (a Daemon of an older build, which takes neither) the environment's socket answers.
+#[cfg(unix)]
+pub fn local_daemon_alive(home: &Path, env_socket: &Path) -> bool {
+    lock_held(&local_owner_path(home))
+        || lock_held(&local_start_path(home))
+        || std::os::unix::net::UnixStream::connect(env_socket).is_ok()
+}
+
+/// THE decision which installed build starts this machine's Daemon (ADR-0017; the launcher
+/// script `xshelld service install` writes mirrors it in `sh`): the build the `selected`
+/// record names; only when there is no record, the newest installed build (by mtime).
+/// `Ok(None)`: nothing installed. `Err`: a record exists but names no valid install.
+///
+/// An update trial is settled first (S4 C4, C5): while one runs this waits; one nobody
+/// owns any more is rolled back, so `selected` names the previous build again.
+#[cfg(unix)]
+pub fn start_binary(home: &Path) -> Result<Option<PathBuf>, String> {
+    crate::trial::settle(home).map_err(|e| e.to_string())?;
+    let root = xshell_core::server::server_root(home);
+    let record = root.join(xshell_core::server::SELECTED);
+    match std::fs::read(&record) {
+        Ok(raw) => {
+            let text = String::from_utf8_lossy(&raw);
+            let name = text.lines().next().unwrap_or("").trim_end();
+            return xshell_core::server::valid_install(&root, name)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "{} names {name:?}, which is not a valid install",
+                        record.display()
+                    )
+                });
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read {}: {e}", record.display())),
+    }
+    let Ok(dir) = std::fs::read_dir(&root) else {
+        return Ok(None);
+    };
+    let newest = dir
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let bin = xshell_core::server::valid_install(&root, &name)?;
+            let at = std::fs::metadata(&bin).and_then(|m| m.modified()).ok()?;
+            Some((at, bin))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(newest.map(|(_, b)| b))
+}
+
+/// The one "may I start a Daemon now" hook every launch path passes (the Desktop's start,
+/// `service run`, `service ensure`; the launcher script has the matching marked spot).
+/// It waits while an update trial holds `~/.xshell/server/trial.lock` and rolls back a trial
+/// nobody owns ([`crate::trial::settle`]).
+#[cfg(unix)]
+pub fn wait_until_may_start(home: &Path) {
+    if let Err(e) = crate::trial::settle(home) {
+        eprintln!("xshell: {e}");
+    }
 }
 
 /// The recorded mode; `None` when there is no marker or it is unreadable.
@@ -118,6 +274,16 @@ fn reap_in_background(mut child: Child) {
 
 type SpawnReply = mpsc::Sender<io::Result<Child>>;
 
+/// See [`LocalDaemon::set_prepare`].
+pub type PrepareHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// See [`LocalDaemon::set_blocker`].
+pub type BlockerHook = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The start error (and its prefix, the UI's `older-desktop` kind) while an older xshell
+/// window runs this computer's terminals.
+pub const OLDER_DESKTOP: &str = "older-desktop: another xshell window of an older version runs this computer's terminals. Close the other xshell window first, then retry.";
+
 /// What [`LocalDaemon`] needs to know about this machine.
 pub struct LocalDaemonConfig {
     /// The app's `xshelld` (the sidecar).
@@ -155,7 +321,20 @@ pub struct LocalDaemon {
     persistent: AtomicBool,
     keeper: Mutex<mpsc::Sender<(Command, SpawnReply)>>,
     child: Mutex<Option<Spawned>>,
-    quitting: AtomicBool,
+    /// Shared, so a registration request in flight is cancelled by quitting too.
+    quitting: Arc<AtomicBool>,
+    #[cfg(unix)]
+    registration_child: Mutex<Option<std::sync::Weak<Mutex<Child>>>>,
+    /// Runs once when nothing listens, before anything is spawned (the Desktop installs its
+    /// embedded `xshelld` here and waits briefly for the service). An error is the start error.
+    prepare: Mutex<Option<PrepareHook>>,
+    /// Asked before starting a Daemon when nothing listens: `Some(reason)` refuses the start
+    /// (an older xshell window still runs and would start its own GUI-bound Daemon).
+    blocker: Mutex<Option<BlockerHook>>,
+    /// Registration starts the normal `serve` rather than the registration helper child.
+    serve_first: AtomicBool,
+    /// Why the last start failed; cleared by a connection.
+    start_error: Mutex<Option<String>>,
     /// Windows: the kill-on-close job every GUI-bound Daemon joins (`--job`), held for this
     /// value's life: when the Desktop ends, the OS ends the Daemon and its Terminals.
     #[cfg(windows)]
@@ -196,7 +375,13 @@ impl LocalDaemon {
             persistent: AtomicBool::new(false),
             keeper: Mutex::new(tx),
             child: Mutex::new(None),
-            quitting: AtomicBool::new(false),
+            quitting: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            registration_child: Mutex::new(None),
+            prepare: Mutex::new(None),
+            blocker: Mutex::new(None),
+            serve_first: AtomicBool::new(false),
+            start_error: Mutex::new(None),
             #[cfg(windows)]
             job,
             #[cfg(all(test, unix))]
@@ -210,6 +395,216 @@ impl LocalDaemon {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The socket to dial now: the live Daemon's own (A2), else the configured one.
+    pub fn live_socket(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            local_live_socket(&self.home, &self.socket)
+        }
+        #[cfg(not(unix))]
+        self.socket.clone()
+    }
+
+    /// Run `hook` when nothing listens, before spawning (see [`PrepareHook`]).
+    pub fn set_prepare(&self, hook: PrepareHook) {
+        *self.prepare.lock().unwrap() = Some(hook);
+    }
+
+    /// Ask `hook` before starting a Daemon when nothing listens (see [`BlockerHook`]).
+    pub fn set_blocker(&self, hook: BlockerHook) {
+        *self.blocker.lock().unwrap() = Some(hook);
+    }
+
+    /// Registration starts the normal `serve` first (ADR-0017), never the helper child.
+    pub fn set_serve_first(&self, on: bool) {
+        self.serve_first.store(on, Ordering::SeqCst);
+    }
+
+    /// Why the last start failed (spawn error, early exit, timeout, prepare error); `None`
+    /// once a connection succeeded.
+    pub fn start_error(&self) -> Option<String> {
+        self.start_error.lock().unwrap().clone()
+    }
+
+    pub fn clear_start_error(&self) {
+        *self.start_error.lock().unwrap() = None;
+    }
+
+    fn fail_start(&self, msg: String) -> DialError {
+        *self.start_error.lock().unwrap() = Some(msg.clone());
+        DialError::failed(msg, None)
+    }
+
+    fn see_log(&self, what: String) -> String {
+        format!("{what}; see {}", self.log.display())
+    }
+
+    /// A Daemon of the old build's GUI-bound mode answers and is not ours: its Desktop still
+    /// runs (it would end that Daemon's Terminals when it quits). Refused while always-on
+    /// (A10), so it is never presented as this machine's always-on Daemon.
+    fn foreign_gui_bound(&self) -> bool {
+        self.persistent() && self.running_mode() == Some(MODE_GUI_BOUND) && self.gui_pid().is_none()
+    }
+
+    /// A `gui-bound` marker with nothing listening is stale: its Desktop is gone. Rewritten
+    /// to `persistent` (privately, atomically) before an always-on Daemon starts.
+    #[cfg(unix)]
+    fn rewrite_stale_gui_bound_marker(&self) {
+        let path = local_mode_path(&self.home);
+        if read_local_mode(&path) != Some(MODE_GUI_BOUND) {
+            return;
+        }
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        let r = (|| {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            writeln!(f, "{MODE_PERSISTENT}")?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Connect to this user's Daemon, starting one when nothing listens: run the prepare
+    /// hook, try again, then spawn and wait for it to listen. Every failure to start is
+    /// recorded as [`LocalDaemon::start_error`]; a connection clears it.
+    pub fn connect_or_start(&self, cancel: &CancelToken) -> Result<LocalStream, DialError> {
+        if let Some(s) = self.try_connect(cancel)? {
+            return Ok(s);
+        }
+        // An older xshell window still runs (its GUI-bound Daemon not started yet, or between
+        // two of them): starting ours now would take the machine from under it (A10).
+        let blocker = self.blocker.lock().unwrap().clone();
+        if let Some(reason) = blocker.and_then(|b| b()) {
+            return Err(self.fail_start(reason));
+        }
+        let prepare = self.prepare.lock().unwrap().clone();
+        if let Some(p) = prepare {
+            p().map_err(|e| self.fail_start(e))?;
+            // The service may serve by now.
+            if let Some(s) = self.try_connect(cancel)? {
+                return Ok(s);
+            }
+        }
+        #[cfg(unix)]
+        if self.persistent() {
+            self.rewrite_stale_gui_bound_marker();
+        }
+        self.ensure_spawned().map_err(|e| {
+            self.fail_start(self.see_log(format!("cannot start {}: {e}", self.bin.display())))
+        })?;
+        let deadline = Instant::now() + SPAWN_WAIT;
+        let mut delay = Duration::from_millis(10);
+        let mut lost_lock = false;
+        loop {
+            if cancel.sleep(delay) {
+                return Err(DialError::Cancelled);
+            }
+            delay = (delay * 2).min(Duration::from_millis(200));
+            let left = deadline.saturating_duration_since(Instant::now());
+            match connect_local(
+                &self.live_socket(),
+                cancel,
+                left.max(Duration::from_millis(1)),
+            ) {
+                Ok(s) => {
+                    self.listening_now();
+                    return self.accept(s);
+                }
+                Err(e) if e.no_listener() => {}
+                Err(e) => return Err(e),
+            }
+            if !lost_lock {
+                match self.take_exit() {
+                    // Another `serve` won the lock; it will listen shortly.
+                    Some(Some(LOST_LOCK_EXIT)) => lost_lock = true,
+                    Some(code) => {
+                        let how = code.map_or("by a signal".to_string(), |c| format!("with {c}"));
+                        return Err(
+                            self.fail_start(self.see_log(format!("xshelld serve exited {how}")))
+                        );
+                    }
+                    None => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(self.fail_start(self.see_log(format!(
+                    "xshelld serve did not start listening within {SPAWN_WAIT:?}"
+                ))));
+            }
+        }
+    }
+
+    /// One connection attempt: `Some` when a Daemon answered (and may be used), `None` when
+    /// nothing listens.
+    fn try_connect(&self, cancel: &CancelToken) -> Result<Option<LocalStream>, DialError> {
+        match connect_local(&self.live_socket(), cancel, CONNECT_TIMEOUT) {
+            // A previous build's GUI-bound Daemon whose Desktop is gone (still ending, or
+            // stuck): taken over without asking anyone; then nothing listens.
+            #[cfg(target_os = "linux")]
+            Ok(s) if self.foreign_gui_bound() && self.take_over_orphan(&s) => Ok(None),
+            Ok(s) => self.accept(s).map(Some),
+            Err(e) if e.no_listener() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The GUI-bound Daemon serving `s` has lost its Desktop (its `--parent-pid` is gone, or
+    /// no longer its parent): end it (SIGCONT, SIGTERM through a handle pinned to it) and wait
+    /// until it is gone. `false`: its Desktop still runs (A10), or it is not ours to end.
+    #[cfg(target_os = "linux")]
+    fn take_over_orphan(&self, s: &LocalStream) -> bool {
+        let Ok(pinned) = Pinned::peer(s) else {
+            return false;
+        };
+        if !gui_bound_orphan(pinned.pid) {
+            return false;
+        }
+        let socket = self.live_socket();
+        let _ = pinned.signal(&socket, libc::SIGCONT);
+        if pinned.signal(&socket, libc::SIGTERM).is_err() {
+            return pinned.exited();
+        }
+        wait_for(Instant::now() + STOP_WAIT, || {
+            pinned.exited()
+                || matches!(
+                    connect_local(&socket, &CancelToken::new(), Duration::from_millis(200)),
+                    Err(e) if e.no_listener()
+                )
+        })
+    }
+
+    /// A Daemon answered: usable unless it is another Desktop's GUI-bound one (A10).
+    fn accept(&self, s: LocalStream) -> Result<LocalStream, DialError> {
+        if self.foreign_gui_bound() {
+            drop(s);
+            return Err(self.fail_start(OLDER_DESKTOP.into()));
+        }
+        self.clear_start_error();
+        Ok(s)
+    }
+
+    /// A Daemon serves this user's socket, started if need be (registration, ADR-0017).
+    #[cfg(unix)]
+    pub fn ensure_serving(&self, cancel: &CancelToken) -> Result<(), String> {
+        self.connect_or_start(cancel)
+            .map(drop)
+            .map_err(|e| match e {
+                DialError::Cancelled => "cancelled".to_string(),
+                e => self.start_error().unwrap_or_else(|| format!("{e:?}")),
+            })
     }
 
     /// Whether new Daemons start Persistent (the setting).
@@ -261,6 +656,189 @@ impl LocalDaemon {
         };
         *cache = Some((id, r.clone()));
         r.map_err(io::Error::other)
+    }
+
+    /// Runs only the bounded registration child when normal serve is absent. The Daemon
+    /// process owns its Store/keys; Desktop receives public receipts over protected IPC.
+    #[cfg(unix)]
+    pub fn with_registration_endpoint<T>(
+        &self,
+        desktop_store: &Path,
+        action: impl FnOnce(&crate::ring::companion_ipc::CompanionClient) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use std::io::Write;
+        use xshell_protocol::ring::companion::{CompanionRequest, CompanionResponse};
+        let home = self.home.canonicalize().map_err(|e| e.to_string())?;
+        let directory = xshell_core::companion_reservation::reserve(&home, desktop_store)
+            .map_err(|e| e.to_string())?;
+        let endpoint = directory.join("companion.sock");
+        let daemon_store = directory.canonicalize().map_err(|e| e.to_string())?;
+        let client =
+            crate::ring::companion_ipc::CompanionClient::for_endpoint_in(daemon_store, endpoint);
+        let reserve = || {
+            client.request(CompanionRequest::ReserveRegistration {
+                desktop_store: desktop_store
+                    .to_str()
+                    .ok_or("Desktop store path is not UTF-8")?
+                    .into(),
+            })
+        };
+        if matches!(reserve(), Ok(CompanionResponse::Descriptor { .. })) {
+            return action(&client);
+        }
+        if self.quitting.load(Ordering::Acquire) {
+            return Err("Desktop is quitting".into());
+        }
+        // ADR-0017: `serve` always runs first; the registration helper child is not used.
+        if self.serve_first.load(Ordering::SeqCst) {
+            self.ensure_serving(&CancelToken::new())?;
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if self.quitting.load(Ordering::Acquire) {
+                    return Err("Desktop is quitting".into());
+                }
+                if matches!(reserve(), Ok(CompanionResponse::Descriptor { .. })) {
+                    return action(&client);
+                }
+                if Instant::now() >= until {
+                    return Err("counterpart registration pending: serve deadline".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        self.check_bin().map_err(|e| e.to_string())?;
+        struct RegistrationChild(Arc<Mutex<Child>>);
+        impl Drop for RegistrationChild {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().stdin.take();
+                // Give EOF shutdown a bounded drain, then reap our child even on error.
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until {
+                    if self.0.lock().unwrap().try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let mut child = self.0.lock().unwrap();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let mut command = Command::new(&self.bin);
+        command
+            .args(["companion-registration", "--home"])
+            .arg(&self.home)
+            .arg("--socket")
+            .arg(&self.socket)
+            .envs(self.env.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = {
+            let mut owned = self.registration_child.lock().unwrap();
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            if owned.as_ref().and_then(std::sync::Weak::upgrade).is_some() {
+                return Err("another registration child is active".into());
+            }
+            let child = Arc::new(Mutex::new(command.spawn().map_err(|e| e.to_string())?));
+            *owned = Some(Arc::downgrade(&child));
+            RegistrationChild(child)
+        };
+        let input = serde_json::to_vec(
+            &desktop_store
+                .to_str()
+                .ok_or("Desktop store path is not UTF-8")?,
+        )
+        .map_err(|e| e.to_string())?;
+        if input.len() > 4096 {
+            return Err("Desktop store path too long".into());
+        }
+        {
+            let mut process = child.0.lock().unwrap();
+            let stdin = process
+                .stdin
+                .as_mut()
+                .ok_or("registration child stdin unavailable")?;
+            stdin
+                .write_all(&input)
+                .and_then(|()| stdin.write_all(b"\n"))
+                .map_err(|e| e.to_string())?;
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            if matches!(reserve(), Ok(CompanionResponse::Descriptor { .. })) {
+                return action(&client);
+            }
+            if child
+                .0
+                .lock()
+                .unwrap()
+                .try_wait()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                // A live serve may have won the owner lock. Never steal its endpoint.
+                return match reserve()? {
+                    CompanionResponse::Descriptor { .. } => action(&client),
+                    _ => Err("counterpart reservation unavailable".into()),
+                };
+            }
+            if Instant::now() >= until {
+                return Err("counterpart registration pending: helper deadline".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Windows: waits for the live GUI-bound Daemon's counterpart pipe, then runs `action`
+    /// on it. Never starts anything (no reservation, no registration child): the Local
+    /// Host's dialer owns the start, its failure view and Retry; the caller retries.
+    #[cfg(windows)]
+    pub fn with_registration_endpoint<T>(
+        &self,
+        _desktop_store: &Path,
+        action: impl FnOnce(&crate::ring::companion_ipc::CompanionClient) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use xshell_protocol::ring::companion::CompanionRequest;
+        let daemon_store = local_daemon_ring_dir(&self.home);
+        // One readiness deadline for every attempt; quitting cancels a request in flight.
+        let until = Instant::now() + Duration::from_secs(10);
+        let late = |last: &str| format!("protected counterpart readiness unavailable: {last}");
+        loop {
+            if self.quitting.load(Ordering::Acquire) {
+                return Err("Desktop is quitting".into());
+            }
+            let last = match crate::ring::companion_ipc::CompanionClient::for_store(&daemon_store) {
+                Ok(client) => {
+                    match client.request_until(
+                        CompanionRequest::Descriptor,
+                        until,
+                        self.quitting.clone(),
+                    ) {
+                        Ok(_) => {
+                            if self.quitting.load(Ordering::Acquire) {
+                                return Err("Desktop is quitting".into());
+                            }
+                            if Instant::now() >= until {
+                                return Err(late("the Daemon answered after the deadline"));
+                            }
+                            return action(&client);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e,
+            };
+            if Instant::now() >= until {
+                return Err(late(&last));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Before an upgrade or a replacement stops the running Persistent Daemon (#49, C1):
@@ -363,11 +941,10 @@ impl LocalDaemon {
             .filter(|_| self.build.is_some())
             .ok_or(e)?,
         };
-        let exe = xshell_core::server::resolve_selected(
-            &xshell_core::server::server_root(&self.home),
-            &self.version,
-        )
-        .unwrap_or(own);
+        let exe = start_binary(&self.home)
+            .map_err(io::Error::other)?
+            .unwrap_or(own);
+        wait_until_may_start(&self.home);
         let log = open_log(&self.log)?;
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
@@ -436,6 +1013,20 @@ impl LocalDaemon {
         self.running_child(Some(Kind::GuiBound))
     }
 
+    /// [`LocalDaemon::gui_pid`] without waiting: `None` while a start holds the child slot
+    /// (validating or spawning, which may take seconds), `Some(gui_pid)` otherwise.
+    pub fn try_gui_pid(&self) -> Option<Option<u32>> {
+        let mut slot = match self.child.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        Some(slot.as_mut().and_then(|s| {
+            (s.kind == Kind::GuiBound && matches!(s.child.try_wait(), Ok(None)))
+                .then(|| s.child.id())
+        }))
+    }
+
     /// Quitting: stop a GUI-bound child in order (SIGTERM; Windows: its stop event), which
     /// ends its Terminals, and
     /// start no other. A Persistent child, even one still starting, is left running and only
@@ -443,6 +1034,19 @@ impl LocalDaemon {
     pub fn hang_up(&self) {
         let mut slot = self.child.lock().unwrap();
         self.quitting.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        if let Some(child) = self
+            .registration_child
+            .lock()
+            .unwrap()
+            .take()
+            .and_then(|c| c.upgrade())
+        {
+            let mut child = child.lock().unwrap();
+            child.stdin.take();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         match slot.take() {
             Some(mut s) if s.kind == Kind::GuiBound => {
                 if matches!(s.child.try_wait(), Ok(None)) {
@@ -494,7 +1098,12 @@ impl LocalDaemon {
 
     /// Whether a Daemon answers on the socket.
     fn listening(&self) -> bool {
-        connect_local(&self.socket, &CancelToken::new(), Duration::from_secs(2)).is_ok()
+        connect_local(
+            &self.live_socket(),
+            &CancelToken::new(),
+            Duration::from_secs(2),
+        )
+        .is_ok()
     }
 
     /// SIGTERM the Persistent Daemon serving the socket, once its pidfile and the socket agree
@@ -515,7 +1124,8 @@ impl LocalDaemon {
     #[cfg(unix)]
     pub fn stop_verified(&self, within: Duration) -> Result<(), SwitchError> {
         let failed = |m: String| SwitchError::Failed(m);
-        let s = match connect_local(&self.socket, &CancelToken::new(), Duration::from_secs(2)) {
+        let socket = self.live_socket();
+        let s = match connect_local(&socket, &CancelToken::new(), Duration::from_secs(2)) {
             Ok(s) => s,
             Err(e) if e.no_listener() => return Ok(()),
             Err(e) => return Err(failed(format!("{e:?}"))),
@@ -523,7 +1133,7 @@ impl LocalDaemon {
         if self.running_mode() != Some(MODE_PERSISTENT) {
             return Err(SwitchError::OtherApp);
         }
-        let pidfile = local_pid_path(&self.socket);
+        let pidfile = local_pid_path(&socket);
         let named: i32 = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -538,7 +1148,7 @@ impl LocalDaemon {
                 "{} names pid {named}, but pid {} serves {}",
                 pidfile.display(),
                 pinned.pid,
-                self.socket.display()
+                socket.display()
             )));
         }
         if self.gui_pid() == Some(named as u32) {
@@ -548,7 +1158,7 @@ impl LocalDaemon {
         if let Some(h) = self.before_signal.lock().unwrap().take() {
             h();
         }
-        match pinned.signal(&self.socket, libc::SIGTERM) {
+        match pinned.signal(&socket, libc::SIGTERM) {
             Ok(()) => {}
             // Gone already, or replaced: nothing of ours to stop.
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
@@ -558,7 +1168,7 @@ impl LocalDaemon {
         loop {
             let gone = pinned.exited()
                 || matches!(
-                    connect_local(&self.socket, &CancelToken::new(), Duration::from_millis(500)),
+                    connect_local(&socket, &CancelToken::new(), Duration::from_millis(500)),
                     Err(e) if e.no_listener()
                 );
             if gone {
@@ -822,6 +1432,32 @@ fn wait_or_kill(mut c: Child, deadline: Instant) {
     let _ = c.wait();
 }
 
+/// Whether `pid`, a `serve --gui-bound --parent-pid P`, has lost its Desktop: P is gone or
+/// is no longer its parent (it was reparented). Anything unreadable: not an orphan.
+#[cfg(target_os = "linux")]
+fn gui_bound_orphan(pid: i32) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    let Some(parent) = argv
+        .iter()
+        .position(|a| *a == b"--parent-pid")
+        .and_then(|i| argv.get(i + 1))
+        .and_then(|p| std::str::from_utf8(p).ok()?.parse::<i32>().ok())
+    else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let ppid = stat
+        .rfind(')')
+        .and_then(|i| stat[i + 1..].split_whitespace().nth(1))
+        .and_then(|p| p.parse::<i32>().ok());
+    ppid != Some(parent)
+}
+
 /// Ask a GUI-bound child to shut down in order: SIGTERM, on Windows its stop event. A child
 /// that has no stop event yet has started nothing, so it is killed.
 #[cfg(unix)]
@@ -1080,7 +1716,7 @@ fn spawn_retrying(cmd: &mut Command) -> io::Result<Child> {
 const VERSION_WAIT: Duration = Duration::from_secs(10);
 
 /// The build `bin --version` reports (`None`: unknown, or not an xshelld's answer).
-fn bin_build(bin: &Path) -> io::Result<Option<BuildId>> {
+pub fn bin_build(bin: &Path) -> io::Result<Option<BuildId>> {
     let mut cmd = Command::new(bin);
     cmd.arg("--version")
         .stdin(Stdio::null())
@@ -1128,66 +1764,24 @@ impl LocalDialer {
     fn connected(&self, s: LocalStream, cancel: &CancelToken) -> Result<Dialed, DialError> {
         Dialed::from_local_stream(s, cancel).map_err(|e| {
             DialError::failed(
-                format!("cannot connect to {}: {e}", self.daemon.socket.display()),
+                format!(
+                    "cannot connect to {}: {e}",
+                    self.daemon.live_socket().display()
+                ),
                 None,
             )
         })
-    }
-
-    fn see_log(&self, what: String) -> DialError {
-        DialError::failed(format!("{what}; see {}", self.daemon.log.display()), None)
     }
 }
 
 impl Dialer for LocalDialer {
     fn dial(&self, cancel: &CancelToken) -> Result<Dialed, DialError> {
-        let socket = &self.daemon.socket;
-        match connect_local(socket, cancel, CONNECT_TIMEOUT) {
-            Ok(s) => return self.connected(s, cancel),
-            Err(e) if e.no_listener() => {}
-            Err(e) => return Err(e),
-        }
-        self.daemon.ensure_spawned().map_err(|e| {
-            self.see_log(format!("cannot start {}: {e}", self.daemon.bin.display()))
-        })?;
-        let deadline = Instant::now() + SPAWN_WAIT;
-        let mut delay = Duration::from_millis(10);
-        let mut lost_lock = false;
-        loop {
-            if cancel.sleep(delay) {
-                return Err(DialError::Cancelled);
-            }
-            delay = (delay * 2).min(Duration::from_millis(200));
-            let left = deadline.saturating_duration_since(Instant::now());
-            match connect_local(socket, cancel, left.max(Duration::from_millis(1))) {
-                Ok(s) => {
-                    self.daemon.listening_now();
-                    return self.connected(s, cancel);
-                }
-                Err(e) if e.no_listener() => {}
-                Err(e) => return Err(e),
-            }
-            if !lost_lock {
-                match self.daemon.take_exit() {
-                    // Another `serve` won the lock; it will listen shortly.
-                    Some(Some(LOST_LOCK_EXIT)) => lost_lock = true,
-                    Some(code) => {
-                        let how = code.map_or("by a signal".to_string(), |c| format!("with {c}"));
-                        return Err(self.see_log(format!("xshelld serve exited {how}")));
-                    }
-                    None => {}
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(self.see_log(format!(
-                    "xshelld serve did not start listening within {SPAWN_WAIT:?}"
-                )));
-            }
-        }
+        let s = self.daemon.connect_or_start(cancel)?;
+        self.connected(s, cancel)
     }
 
     fn describe(&self) -> String {
-        self.daemon.socket.display().to_string()
+        self.daemon.live_socket().display().to_string()
     }
 
     /// While the setting is on, the Local Host's Daemon is this Desktop's to upgrade.
@@ -1327,6 +1921,10 @@ mod tests {
             PathBuf::from("/h/.xshell/log/xshelld.log")
         );
         assert_eq!(local_mode_path(h), PathBuf::from("/h/.xshell/daemon/mode"));
+        assert_eq!(
+            local_daemon_ring_dir(h),
+            PathBuf::from("/h/.xshell/daemon/ring")
+        );
         assert_eq!(
             local_pid_path(Path::new("/r/xshell/daemon.sock")),
             PathBuf::from("/r/xshell/daemon.pid")
@@ -1944,5 +2542,200 @@ while True:\n    conns.append(s.accept()[0])\n";
         // GUI-bound starts from the sidecar only: still refused.
         d.set_persistent(false);
         assert!(d.ensure_spawned().is_err());
+    }
+
+    // ── Always-on start path (ADR-0017) ──────────────────────────────────
+
+    #[test]
+    fn prepare_error_is_start_error_and_nothing_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exec sleep 30");
+        d.daemon.set_persistent(true);
+        d.daemon
+            .set_prepare(Arc::new(|| Err("this build carries no xshelld".into())));
+        let r = d.dial(&CancelToken::new()).map(|_| ());
+        assert!(
+            matches!(&r, Err(e) if format!("{e:?}").contains("carries no xshelld")),
+            "{r:?}"
+        );
+        assert_eq!(
+            d.daemon.start_error().as_deref(),
+            Some("this build carries no xshelld")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(starts(dir.path()).is_empty());
+        assert_eq!(d.daemon.pid(), None);
+    }
+
+    #[test]
+    fn prepare_that_starts_listener_spawns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exec sleep 30");
+        d.daemon.set_persistent(true);
+        let sock = dir.path().join("s.sock");
+        let held = Arc::new(Mutex::new(None));
+        let (h, calls) = (
+            held.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let c = calls.clone();
+        d.daemon.set_prepare(Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            *h.lock().unwrap() = Some(UnixListener::bind(&sock).map_err(|e| e.to_string())?);
+            Ok(())
+        }));
+        assert!(d.dial(&CancelToken::new()).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(starts(dir.path()).is_empty());
+        assert_eq!(d.daemon.start_error(), None);
+        // Listening now: prepare does not run again.
+        assert!(d.dial(&CancelToken::new()).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn start_error_clears_on_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exit 7");
+        d.daemon.set_persistent(true);
+        let r = d.dial(&CancelToken::new()).map(|_| ());
+        assert!(r.is_err());
+        let e = d.daemon.start_error().expect("a start error");
+        assert!(
+            e.contains("exited with 7") && e.contains("xshelld.log"),
+            "{e}"
+        );
+        let _l = UnixListener::bind(dir.path().join("s.sock")).unwrap();
+        assert!(d.dial(&CancelToken::new()).is_ok());
+        assert_eq!(d.daemon.start_error(), None);
+        d.daemon.clear_start_error();
+    }
+
+    #[test]
+    fn stale_gui_bound_marker_rewritten_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        set_mode(dir.path(), MODE_GUI_BOUND);
+        let mode = local_mode_path(&dir.path().join("home"));
+        let seen = dir.path().join("seen");
+        let d = dialer(
+            dir.path(),
+            &format!(
+                "cat '{}' >> '{}'\nexec sleep 30",
+                mode.display(),
+                seen.display()
+            ),
+        );
+        d.daemon.set_persistent(true);
+        let r = d.dial(&cancel_after(500)).map(|_| ());
+        assert!(matches!(r, Err(DialError::Cancelled)), "{r:?}");
+        wait_starts(dir.path(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "persistent");
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(&mode).unwrap().permissions().mode();
+        assert_eq!(m & 0o777, 0o600);
+        if let Some(pid) = d.daemon.pid() {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    /// An older Desktop that still runs without a listening Daemon blocks the start (A10);
+    /// once it is gone, the same Daemon setup starts its Daemon.
+    #[test]
+    fn blocker_refuses_the_start_until_it_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exec sleep 30");
+        d.daemon.set_persistent(true);
+        let older = Arc::new(AtomicBool::new(true));
+        let o = older.clone();
+        d.daemon.set_blocker(Arc::new(move || {
+            o.load(Ordering::SeqCst).then(|| OLDER_DESKTOP.to_string())
+        }));
+        let r = d.dial(&CancelToken::new()).map(|_| ());
+        assert!(
+            matches!(&r, Err(e) if format!("{e:?}").contains("Close the other xshell window first")),
+            "{r:?}"
+        );
+        assert!(d
+            .daemon
+            .start_error()
+            .is_some_and(|e| e.starts_with("older-desktop:")));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            starts(dir.path()).is_empty(),
+            "started despite the older window"
+        );
+        older.store(false, Ordering::SeqCst);
+        let r = d.dial(&cancel_after(500)).map(|_| ());
+        assert!(matches!(r, Err(DialError::Cancelled)), "{r:?}");
+        assert_eq!(
+            wait_starts(dir.path(), 1),
+            vec!["serve --interactive-env".to_string()]
+        );
+        if let Some(pid) = d.daemon.pid() {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    /// A10: an old Desktop's live GUI-bound Daemon is never used as the always-on Daemon.
+    #[test]
+    fn live_gui_bound_marker_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        set_mode(dir.path(), MODE_GUI_BOUND);
+        let d = dialer(dir.path(), "exec sleep 30");
+        d.daemon.set_persistent(true);
+        let _l = UnixListener::bind(dir.path().join("s.sock")).unwrap();
+        let r = d.dial(&CancelToken::new()).map(|_| ());
+        assert!(
+            matches!(&r, Err(e) if format!("{e:?}").contains("Close the other xshell window first")),
+            "{r:?}"
+        );
+        assert!(d
+            .daemon
+            .start_error()
+            .is_some_and(|e| e.starts_with("older-desktop:")));
+        assert_eq!(
+            read_local_mode(&local_mode_path(&dir.path().join("home"))),
+            Some(MODE_GUI_BOUND)
+        );
+        assert!(starts(dir.path()).is_empty());
+        // The GUI-bound mode (Windows) uses it as before.
+        d.daemon.set_persistent(false);
+        assert!(d.dial(&CancelToken::new()).is_ok());
+        assert_eq!(d.daemon.start_error(), None);
+    }
+
+    /// A2 / P1-b: the Daemon's record is followed only while its owner lock is held; a
+    /// record naming a live but unrelated PID is stale and removed.
+    #[test]
+    fn live_socket_follows_the_endpoint_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dialer(dir.path(), "exec sleep 30");
+        let home = dir.path().join("home");
+        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
+        let rec = local_endpoint_path(&home);
+        std::fs::create_dir_all(rec.parent().unwrap()).unwrap();
+        std::fs::write(
+            &rec,
+            format!("{}\n/other/daemon.sock\n", std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_local_endpoint(&rec),
+            Some((std::process::id(), PathBuf::from("/other/daemon.sock")))
+        );
+        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
+        assert!(!rec.exists(), "a record without its owner is removed");
+        // Owner lock held (another open file description): followed.
+        let owner = std::fs::File::create(local_owner_path(&home)).unwrap();
+        owner.lock().unwrap();
+        std::fs::write(&rec, "999999999\n/other/daemon.sock\n").unwrap();
+        assert_eq!(d.daemon.live_socket(), PathBuf::from("/other/daemon.sock"));
+        assert!(lock_held(&local_owner_path(&home)));
+        owner.unlock().unwrap();
+        assert_eq!(d.daemon.live_socket(), dir.path().join("s.sock"));
     }
 }

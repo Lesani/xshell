@@ -1,67 +1,20 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { canClaim, canEnable, canRemove, canSave, connectionLine, formatResetTime, quotaLine, hostLine, lastSeenLine, startsOver, initialForm, isDirty, farewellLines, localLine, relayHost, pairingBlocked, pairingNote, presenceChip, presenceKey, problemLine, relayChoice, removalNote, removalReducer, REMOVAL_IDLE, removeConfirm, removeErrorLine, removeHint, removePendingLine, roleKey, targetUrl, urlError, validRelayUrl } from "./mobileSettings";
+import { describe, expect, it } from "vitest";
+import { connectionLine, formatResetTime, localLine, pairingBlocked, pairingLine, problemLine, quotaLine, relayHost, relayUrlError, validRelayUrl } from "./mobileSettings";
 import { fmt, S } from "./strings";
-import type { HostRingState, MemberView, RingStatus } from "./types";
+import { C } from "./copy";
+import type { RingStatus } from "./types";
 
 const HOSTED = "wss://relay.xshell.sh";
 
 function status(over: Partial<RingStatus> = {}): RingStatus {
   return {
-    enabled: true,
-    ringId: "r",
-    version: 1,
-    relayUrl: HOSTED,
-    hostedRelayUrl: HOSTED,
-    connection: "connected",
-    retryIn: null,
-    connectionError: null,
-    limited: false,
-    farewells: [],
-    problem: null,
-    problemDetail: null,
-    members: [],
-    quotaResetAt: null,
-    relayHosted: true,
-    local: "daemon",
-    hosts: [],
+    enabled: true, ringId: "r", version: 1, relayUrl: HOSTED, hostedRelayUrl: HOSTED, connection: "connected",
+    retryIn: null, connectionError: null, limited: false, problem: null, problemDetail: null, members: [],
+    quotaResetAt: null, relayHosted: true, local: "daemon", hosts: [], membership: "member", removed: null,
+    oldRing: null, finishingOffline: false, busy: false,
     ...over,
   };
 }
-
-function member(kind: MemberView["presence"]["kind"], over: Partial<MemberView> = {}): MemberView {
-  return { name: "m", role: "daemon", signKey: "k", thisApp: false, thisComputer: false, hostId: null, removable: false, presence: { kind }, ...over };
-}
-
-describe("presence", () => {
-  it("maps each presence to its status", () => {
-    const s = status();
-    expect(presenceKey(member("online"), s)).toBe("mobile.status.online");
-    expect(presenceKey(member("closed"), s)).toBe("mobile.status.closed");
-    expect(presenceKey(member("unreachable"), s)).toBe("mobile.status.unreachable");
-    expect(presenceKey(member("never"), s)).toBe("mobile.status.never");
-    expect(fmt(presenceKey(member("closed"), s))).toBe("xshell closed");
-  });
-
-  it("is unknown for others while this Desktop is not connected", () => {
-    for (const connection of ["connecting", "waiting", "stopped"] as const) {
-      expect(presenceKey(member("online"), status({ connection }))).toBe("mobile.status.unknown");
-    }
-    expect(presenceKey(member("online", { thisApp: true }), status({ connection: "connected" }))).toBe("mobile.status.online");
-  });
-
-  it("colours chips like the Host chips", () => {
-    expect(presenceChip("mobile.status.online")).toBe("connected");
-    expect(presenceChip("mobile.status.unreachable")).toBe("offline");
-    expect(presenceChip("mobile.status.unknown")).toBe("unknown");
-  });
-
-  it("never says daemon to the user", () => {
-    expect(fmt(roleKey("daemon"))).toBe("Host");
-    expect(fmt(roleKey("desktop"))).toBe("Desktop");
-    expect(fmt(roleKey("mobile"))).toBe("Phone");
-    for (const v of Object.values(S)) expect(v.toLowerCase()).not.toContain("daemon");
-  });
-});
 
 describe("quota notice (#42)", () => {
   const now = Date.UTC(2026, 9, 10, 12, 0, 0);
@@ -92,149 +45,63 @@ describe("quota notice (#42)", () => {
   });
 });
 
-describe("connection line", () => {
-  it("says how the Relay connection stands", () => {
-    expect(connectionLine(status())).toBe("Connected to relay.xshell.sh");
-    expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
-    expect(connectionLine(status({ connection: "connecting" }))).toBe("Connecting to relay.xshell.sh…");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach relay.xshell.sh. Retrying in 4s");
-    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach relay.xshell.sh. Retrying in 1s");
+describe("connection line (copy-rjw-3)", () => {
+  it("the default service: no address, \"second\" when n is 1", () => {
+    expect(connectionLine(status())).toBe("Connected to the service.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 4 }))).toBe("Can't reach the service. Retrying in 4 seconds.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 1 }))).toBe("Can't reach the service. Retrying in 1 second.");
+    expect(connectionLine(status({ connection: "waiting", retryIn: 0 }))).toBe("Can't reach the service. Retrying in 1 second.");
+    expect(connectionLine(status({ connection: "connecting" }))).toBeNull();
+    // The build's default address (a test Relay) is the default service too.
+    expect(connectionLine(status({ relayUrl: "ws://127.0.0.1:48790", hostedRelayUrl: "ws://127.0.0.1:48790", relayHosted: true }))).toBe("Connected to the service.");
     expect(connectionLine(status({ connection: "stopped" }))).toBe(fmt("mobile.conn.stopped"));
-    expect(connectionLine(status({ connection: "off", enabled: false }))).toBeNull();
-    expect(connectionLine(status({ connection: "other-window" }))).toBe("Another xshell window manages the connection to your devices.");
+    expect(connectionLine(status({ connection: "off", enabled: false, membership: "none" }))).toBeNull();
+    expect(connectionLine(status({ limited: true }))).toBe(fmt("mobile.conn.limited"));
   });
 
-  it("names the host of the current relay, with the port, never the full URL", () => {
-    const s = status({ relayUrl: "wss://mine.example:8443/path?x=1" });
-    expect(relayHost(s.relayUrl)).toBe("mine.example:8443");
-    expect(connectionLine(s)).toBe("Connected to mine.example:8443");
-    expect(connectionLine(status({ ...s, connection: "connecting" }))).toBe("Connecting to mine.example:8443…");
-    expect(connectionLine(status({ ...s, connection: "waiting", retryIn: 3 }))).toBe("Can't reach mine.example:8443. Retrying in 3s");
-    expect(connectionLine(status({ ...s, limited: true }))).toBe(fmt("mobile.conn.limited"));
+  it("a self-chosen address names its host, never the full URL", () => {
+    const own = { relayUrl: "wss://mine.example:8443/path?x=1", relayHosted: false };
+    expect(relayHost(own.relayUrl)).toBe("mine.example:8443");
+    expect(connectionLine(status(own))).toBe("Connected to mine.example:8443.");
+    expect(connectionLine(status({ ...own, connection: "waiting", retryIn: 3 }))).toBe("Can't reach mine.example:8443. Retrying in 3 seconds.");
+    expect(connectionLine(status({ ...own, connection: "waiting", retryIn: 1 }))).toBe("Can't reach mine.example:8443. Retrying in 1 second.");
   });
 
-  it("farewellLines names each old relay", () => {
-    expect(farewellLines(status())).toEqual([]);
-    const lines = farewellLines(status({ farewells: [
-      { relayUrl: "wss://old.example/x", state: "pending", failures: 0 },
-      { relayUrl: "wss://older.example:9000", state: "sending", failures: 1 },
-      { relayUrl: "wss://dead.example", state: "waiting", failures: 2, retryIn: 30 },
-    ] }));
-    expect(lines).toEqual([
-      { text: fmt("mobile.farewell.owed", { relay: "old.example" }), warn: false },
-      { text: fmt("mobile.farewell.sending", { relay: "older.example:9000" }), warn: false },
-      { text: fmt("mobile.farewell.owed", { relay: "dead.example" }), warn: true },
-    ]);
-    expect(lines[0].text).not.toContain("wss://");
-  });
-
-  it("a farewell does not change the connection line", () => {
-    const farewells = [{ relayUrl: "wss://old.example", state: "waiting" as const, failures: 3, retryIn: 5 }];
-    expect(connectionLine(status({ farewells }))).toBe(connectionLine(status()));
+  it("never says relay", () => {
+    for (const over of [{}, { connection: "waiting" as const, retryIn: 2 }, { connection: "connecting" as const }, { relayUrl: "wss://own.example", relayHosted: false, connection: "connecting" as const }]) {
+      expect((connectionLine(status(over)) ?? "").toLowerCase()).not.toContain("relay");
+    }
   });
 
   it("reports local limits and recovery", () => {
     expect(localLine(status())).toBeNull();
-    expect(localLine(status({ local: "in-process" }))).toBe(fmt("mobile.local.inProcess"));
-    expect(localLine(status({ local: "too-old" }))).toBe(fmt("mobile.local.tooOld"));
-    expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toContain("/p/ring.json.bad-1");
+    expect(localLine(status({ local: "too-old" }))).toBe(C["mobile.local.tooOld"]);
+    expect(problemLine(status({ problem: "recovered", problemDetail: "/p/ring.json.bad-1" }))).toBeNull();
+    expect(problemLine(status({ problem: "unreadable", problemDetail: "bad json" }))).toBe(C["mobile.problem.unreadable"]);
     expect(problemLine(status())).toBeNull();
   });
 });
 
-describe("pairing and the connection", () => {
-  it("disables pairing only where it cannot succeed", () => {
-    expect(pairingBlocked(status({ connection: "connected" }))).toBeNull();
-    expect(pairingBlocked(status({ connection: "connecting" }))).toBeNull();
-    expect(pairingBlocked(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
-    expect(pairingBlocked(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
+describe("Pair a phone / Add a machine and the connection", () => {
+  it("blocks only where pairing cannot succeed", () => {
+    expect(pairingBlocked(status({ connection: "connected" }))).toBe(false);
+    expect(pairingBlocked(status({ connection: "connecting" }))).toBe(false);
+    expect(pairingBlocked(status({ connection: "waiting", retryIn: 4 }))).toBe(true);
+    expect(pairingBlocked(status({ connection: "stopped" }))).toBe(true);
   });
 
-  it("notes that pairing waits for the connection, or why it is disabled", () => {
-    expect(pairingNote(status({ connection: "connecting" }))).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connected" }))).toBeNull();
-    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }))).toBe("mobile.pair.needsRelay");
-    expect(pairingNote(status({ connection: "stopped" }))).toBe("mobile.pair.needsMember");
-  });
-
-  it("keeps a shown offer waiting for the connection while it retries", () => {
-    expect(pairingNote(status({ connection: "waiting", retryIn: 4 }), true)).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connecting" }), true)).toBe("mobile.pair.connecting");
-    expect(pairingNote(status({ connection: "connected" }), true)).toBeNull();
-    // No longer a member: the offer cannot succeed.
-    expect(pairingNote(status({ connection: "stopped" }), true)).toBe("mobile.pair.needsMember");
-  });
-
-  it("has the notes' strings", () => {
-    for (const k of ["mobile.pair.connecting", "mobile.pair.needsRelay", "mobile.pair.needsMember"] as const) {
-      expect(S[k], k).toBeTruthy();
-    }
+  it("says why with the required line: default service, or the chosen address", () => {
+    expect(pairingLine(status({ connection: "connected" }))).toBeNull();
+    expect(pairingLine(status({ connection: "connecting" }))).toBeNull();
+    expect(pairingLine(status({ connection: "waiting", retryIn: 4 }))).toBe(C["ring.connection.default.required"]);
+    expect(pairingLine(status({ connection: "waiting", relayUrl: "wss://own.example", relayHosted: false }))).toBe("Can't reach own.example. Check your connection and try again.");
+    // A phone offer already shown stays valid while the connection retries.
+    expect(pairingLine(status({ connection: "waiting" }), true)).toBeNull();
+    expect(pairingLine(status({ connection: "stopped" }))).toBe(S["mobile.pair.needsMember"]);
   });
 });
 
-describe("remote hosts", () => {
-  const host = (state: HostRingState["state"], error?: string): HostRingState => ({ host: "h_aaaaaaaa", name: "build-box", state, error });
-
-  it("says why a Host is not among the devices", () => {
-    expect(hostLine(host("too-old"))).toBe("Update xshelld on build-box in Settings → Hosts to make it reachable from your phone.");
-    expect(hostLine(host("other-ring"))).toBe("build-box is paired with another set of devices. Pairing here will end their mobile access to it.");
-    expect(hostLine(host("full"))).toBe("build-box can't join your devices. You've reached the limit of 64. Remove a device, then try again.");
-    expect(hostLine(host("failed", "timed out"))).toBe("Couldn't pair build-box: timed out");
-    expect(fmt("mobile.host.claim")).toBe("Pair with this desktop");
-  });
-
-  it("offers pairing only for a Host of another set of devices", () => {
-    expect(canClaim(host("other-ring"))).toBe(true);
-    for (const s of ["too-old", "full", "failed"] as const) expect(canClaim(host(s))).toBe(false);
-  });
-
-  it("lists nothing when every Host joined", () => {
-    expect(status().hosts).toEqual([]);
-    expect(status().hosts.map(hostLine)).toEqual([]);
-  });
-});
-
-describe("relay form", () => {
-  it("preselects Hosted, or the self-hosted URL in use", () => {
-    expect(relayChoice(status())).toBe("hosted");
-    expect(initialForm(status())).toEqual({ choice: "hosted", url: "" });
-    const custom = status({ relayUrl: "wss://mine.example" });
-    expect(relayChoice(custom)).toBe("custom");
-    expect(initialForm(custom)).toEqual({ choice: "custom", url: "wss://mine.example" });
-    expect(relayChoice(status({ relayUrl: null, enabled: false }))).toBe("hosted");
-  });
-
-  it("is dirty and savable only when it changes the Relay", () => {
-    const s = status();
-    expect(isDirty({ choice: "hosted", url: "" }, s)).toBe(false);
-    expect(canSave({ choice: "hosted", url: "" }, s, false)).toBe(false);
-    expect(canSave({ choice: "custom", url: "" }, s, false)).toBe(false);
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, s, false)).toBe(true);
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, s, true)).toBe(false);
-    expect(canSave({ choice: "custom", url: "ws://mine.example" }, s, false)).toBe(false);
-    const custom = status({ relayUrl: "wss://mine.example" });
-    expect(canSave({ choice: "custom", url: " wss://mine.example " }, custom, false)).toBe(false);
-    expect(canSave({ choice: "hosted", url: "wss://mine.example" }, custom, false)).toBe(true);
-    expect(targetUrl({ choice: "hosted", url: "wss://x" }, custom)).toBe(HOSTED);
-  });
-
-  it("canSave never waits for a farewell", () => {
-    const farewells = [{ relayUrl: "wss://old.example", state: "waiting" as const, failures: 4 }];
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, status({ farewells }), false)).toBe(true);
-    expect(canSave({ choice: "custom", url: "wss://mine.example" }, status({ farewells: [{ relayUrl: "wss://old.example", state: "sending", failures: 0 }] }), false)).toBe(true);
-  });
-
-  it("starts over only explicitly, after a recovery", () => {
-    expect(startsOver(status({ enabled: false, problem: "recovered" }))).toBe(true);
-    expect(startsOver(status({ enabled: false }))).toBe(false);
-    // Independent of a stale enabled flag.
-    expect(startsOver(status({ enabled: true, problem: "recovered" }))).toBe(true);
-    expect(canEnable(status({ enabled: true, problem: "recovered" }))).toBe(true);
-    expect(canEnable(status({ enabled: false, problem: "recovered" }))).toBe(true);
-    expect(canEnable(status({ enabled: false, problem: "unreadable" }))).toBe(false);
-    expect(canEnable(status())).toBe(false);
-  });
-
+describe("the Relay chosen before the Ring exists", () => {
   it("checks wss, and ws only to loopback", () => {
     for (const ok of ["wss://relay.example.com", "wss://relay.example.com:8443/x", "ws://localhost:8787", "ws://127.0.0.1", "ws://[::1]:80", " wss://r.example "]) {
       expect(validRelayUrl(ok), ok).toBe(true);
@@ -242,88 +109,8 @@ describe("relay form", () => {
     for (const bad of ["", "relay.example.com", "https://r.example", "ws://r.example", "ws://10.0.0.1", "wss://u@r.example", "wss://r.example?x", "wss://r.example#f", "wss://r%2e.example", "wss://"]) {
       expect(validRelayUrl(bad), bad).toBe(false);
     }
-    expect(urlError({ choice: "custom", url: "" })).toBeNull();
-    expect(urlError({ choice: "custom", url: "ws://r.example" })).toBe(fmt("mobile.relay.err.invalid"));
-    expect(urlError({ choice: "hosted", url: "ws://r.example" })).toBeNull();
-  });
-});
-
-describe("removing a device", () => {
-  const phone = (over: Partial<MemberView> = {}) => member("online", { name: "Pixel", role: "mobile", signKey: "p", removable: true, ...over });
-
-  it("offers Remove only for removable devices, in the window that runs the connection", () => {
-    expect(canRemove(phone(), status())).toBe(true);
-    expect(canRemove(phone(), status({ connection: "waiting" }))).toBe(true);
-    expect(canRemove(phone(), status({ connection: "other-window" }))).toBe(false);
-    expect(canRemove(phone({ removable: false }), status())).toBe(false);
-    expect(canRemove(phone({ thisApp: true }), status())).toBe(false);
-    expect(canRemove(phone({ thisComputer: true }), status())).toBe(false);
-  });
-
-  it("explains why a Host has no Remove button", () => {
-    const hint = fmt("mobile.remove.hostHint");
-    expect(removeHint(member("online", { thisComputer: true }))).toBe(hint);
-    expect(removeHint(member("online", { hostId: "h_aaaaaaaa" }))).toBe(hint);
-    expect(removeHint(member("online", { thisApp: true, role: "desktop" }))).toBeNull();
-    expect(removeHint(phone())).toBeNull();
-    expect(removeHint(member("online", { removable: true }))).toBeNull();
-  });
-
-  describe("last seen", () => {
-    afterEach(() => { vi.useRealTimers(); });
-
-    it("says when a closed or unreachable device was last seen", () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date("2026-10-10T12:00:00Z"));
-      const at = Date.parse("2026-10-10T11:55:00Z") / 1000;
-      expect(lastSeenLine(member("closed", { presence: { kind: "closed", reason: "quit", at } }), status())).toBe("Last seen 5m ago");
-      expect(lastSeenLine(member("unreachable", { presence: { kind: "unreachable", at: at + 290 } }), status())).toBe("Last seen just now");
-      const closed = member("closed", { presence: { kind: "closed", at } });
-      expect(lastSeenLine(closed, status({ connection: "waiting" }))).toBeNull();
-      expect(lastSeenLine(member("closed"), status())).toBeNull();
-      expect(lastSeenLine(member("online", { presence: { kind: "online", at } }), status())).toBeNull();
-      expect(lastSeenLine(member("never"), status())).toBeNull();
-    });
-  });
-
-  it("confirms with a body for the device's role", () => {
-    const c = removeConfirm({ name: "Pixel", role: "mobile" });
-    expect(c.title).toBe("Remove Pixel?");
-    expect(c.body).toBe(fmt("mobile.remove.confirmBody.mobile", { name: "Pixel" }));
-    expect(c.body).toContain("Pixel");
-    expect(c.confirm).toBe("Remove");
-    expect(removeConfirm({ name: "build-box", role: "daemon" }).body).toBe(fmt("mobile.remove.confirmBody.daemon", { name: "build-box" }));
-    expect(removeConfirm({ name: "laptop", role: "desktop" }).body).toBe(fmt("mobile.remove.confirmBody.desktop", { name: "laptop" }));
-  });
-
-  it("maps the Desktop's refusals", () => {
-    expect(removeErrorLine("Pixel", "in_use: this device belongs to a host")).toBe(fmt("mobile.remove.err.inUse"));
-    expect(removeErrorLine("Pixel", "self: this app can't remove itself")).toBe(fmt("mobile.remove.err.self"));
-    expect(removeErrorLine("Pixel", "other_window: another xshell window manages your devices")).toBe(fmt("mobile.remove.err.otherWindow"));
-    expect(removeErrorLine("Pixel", "not_enabled: mobile access is not enabled")).toBe("Couldn't remove Pixel: mobile access is not enabled");
-    expect(removeErrorLine("Pixel", { message: "disk full" })).toBe("Couldn't remove Pixel: disk full");
-  });
-
-  it("notes a removal made while not connected to the relay", () => {
-    expect(removePendingLine(status(), "Pixel")).toBeNull();
-    for (const connection of ["connecting", "waiting", "stopped"] as const) {
-      expect(removePendingLine(status({ connection }), "Pixel")).toBe(fmt("mobile.remove.pending", { name: "Pixel" }));
-    }
-  });
-
-  it("follows a removal from the question to its note", () => {
-    const m = phone();
-    let r = removalReducer(REMOVAL_IDLE, { type: "ask", member: m });
-    expect(r).toEqual({ state: "confirming", member: m });
-    expect(removalReducer(r, { type: "cancel" })).toEqual(REMOVAL_IDLE);
-    r = removalReducer(r, { type: "start" });
-    expect(r).toEqual({ state: "removing", signKey: "p", name: "Pixel" });
-    // Another row's Remove does nothing meanwhile.
-    expect(removalReducer(r, { type: "ask", member: member("online") })).toBe(r);
-    const failed = removalReducer(r, { type: "failed", error: "in_use: x" });
-    expect(removalNote(failed)).toEqual({ text: fmt("mobile.remove.err.inUse"), error: true });
-    const done = removalReducer(r, { type: "done", status: status({ connection: "waiting" }) });
-    expect(removalNote(done)).toEqual({ text: fmt("mobile.remove.pending", { name: "Pixel" }), error: false });
-    expect(removalNote(removalReducer(r, { type: "done", status: status() }))).toBeNull();
+    // Empty: the hosted Relay, no error.
+    expect(relayUrlError("")).toBeNull();
+    expect(relayUrlError("ws://r.example")).toBe(fmt("mobile.relay.err.invalid"));
   });
 });

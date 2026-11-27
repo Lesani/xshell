@@ -15,6 +15,7 @@ const settingsStore = vi.hoisted(() => ({ set: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-store", () => ({ load: vi.fn(async () => settingsStore) }));
 const store = vi.hoisted(() => ({ snap: null as unknown as RegistrySnapshot, listeners: new Set<() => void>() }));
 vi.mock("../hosts/registry", async original => ({ ...await original<typeof import("../hosts/registry")>(), registry: {
+  dataHost: (id: string | undefined) => id === "local" ? undefined : id,
   getSnapshot: () => store.snap, subscribe: (listener: () => void) => { store.listeners.add(listener); return () => { store.listeners.delete(listener); }; }, getStatus: (host: string) => store.snap.status[host],
 } }));
 vi.mock("../hosts/useHosts", () => ({ useHostsSnapshot: () => useSyncExternalStore(listener => { store.listeners.add(listener); return () => { store.listeners.delete(listener); }; }, () => store.snap) }));
@@ -32,7 +33,7 @@ beforeEach(() => {
   settingsStore.set.mockReset().mockResolvedValue(undefined); settingsStore.save.mockReset().mockResolvedValue(undefined);
   vi.mocked(invoke).mockReset().mockResolvedValue(undefined);
   tabs = [{ id: "tab", type: "terminal", title: "Auto agent", customTitle: "Shared agent", projectName: "Project", projectPath: "/p", terminal: "uuid" }, { id: "shell", type: "terminal", title: "Bash", customTitle: "Shared shell", shellMode: "raw", terminal: "shell-uuid", projectName: "Project", projectPath: "/p" }];
-  store.snap = { configs: [], status: { local: { ...status } }, live: { local: tabs.map(t => ({ terminal: t.terminal!, meta: { title: t.title, customTitle: t.customTitle }, spec: { cwd: "/p" }, createdAtMs: 0, pid: 1, exitCode: null })) }, agents: {}, epochs: {} };
+  store.snap = { configs: [], available: [], status: { local: { ...status } }, live: { local: tabs.map(t => ({ terminal: t.terminal!, meta: { title: t.title, customTitle: t.customTitle }, spec: { cwd: "/p" }, createdAtMs: 0, pid: 1, exitCode: null })) }, agents: {}, epochs: {} };
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
   props = { tabs, entries: tabs.map(tab => ({ kind: "tab", id: tab.id, tab })), closingTabIds: new Set(), activeTabId: "tab", selectedProject: null, hoveredProjectKey: null, linkedProjectKey: null, activeTabProject: null, openSessionIds: new Set(), projectIcons: {}, pinnedProjects: [], sidebarCollapsed: false, defaultShell: "bash", updateAvailable: false, installedAgents: Object.fromEntries(AGENT_IDS.map(a => [a, true])) as Record<AgentId, boolean>, onExpandSidebar: vi.fn(), onSelectTab: vi.fn(), onCloseTab: vi.fn(), onReorderTabs: vi.fn(), onNewChat: vi.fn(), onNewChatInActive: vi.fn(), onNewShellInContext: vi.fn(), onOpenSession: vi.fn(), onNewShell: vi.fn(), onRenameGroup: vi.fn(), onGoHome: vi.fn(), onOpenSettings: vi.fn(), onToggleSidebar: vi.fn() };
 });

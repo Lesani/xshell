@@ -19,7 +19,7 @@ semver = "1"
 
 [package]
 name = "xshell"
-version = "1.5.0"
+version = "1.6.0-rjw.4"
 edition = "2021"
 
 [lib]
@@ -49,11 +49,15 @@ xshell-pairing-access = { path = "crates/pairing-access" }
 dirs = { workspace = true }
 # All already in the tree via tauri-plugin-updater: no new crates.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# The latest release (hosts::latest), compared by semver precedence.
+semver = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["sync"] }
 sha2 = "0.10"
 # The pairing QR code (Settings → Mobile); no image or SVG renderers, the UI draws it.
 qrcode = { version = "=0.14.1", default-features = false }
+# Device Code words returned to the Join screen are wiped after serialization.
+zeroize = "=1.8.2"
 # Opens explorer files in their default app (Lesani/xshell#46): ShellExecuteExW on Windows
 # (no `cmd /c start`, which mangles `&` and `^` in names), `open` on macOS, xdg-open / gio on
 # Linux. Not tauri-plugin-opener: its versions for tauri 2.10 pull in zbus.
@@ -69,7 +73,8 @@ libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Already in the tree (xshell-core): file identity for the open-copies install check.
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# Win32_UI_WindowsAndMessaging: `GetSystemMetrics(SM_SHUTTINGDOWN)` for the close prompt.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

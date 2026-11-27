@@ -1,6 +1,6 @@
 [package]
 name = "xshelld"
-version = "1.5.0"
+version = "1.6.0-rjw.4"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -19,6 +19,7 @@ path = "src/main.rs"
 xshell-buildinfo = { path = "../buildinfo" }
 
 [dependencies]
+xshell-hostlink = { path = "../hostlink" }
 base64 = "=0.22.1"
 sha2 = "=0.10.9"
 xshell-core = { path = "../core" }
@@ -35,6 +36,9 @@ semver = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# daemon.update-latest: blocking HTTPS, rustls+ring, bundled web PKI roots (same rustls and
+# webpki-roots as the Relay client). 3.4.3 and later need webpki-roots 1.0.10.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -60,7 +64,6 @@ windows-sys = { version = "0.61", features = [
 vt100 = "=0.16.2"
 md5 = { workspace = true }
 tempfile = "3"
-xshell-hostlink = { path = "../hostlink" }
 xshell-protocol = { path = "../protocol", features = ["test-relay"] }
 # Reads the Codex `-c notify=…` override in tests the way Codex does.
 toml = "0.9"
@@ -80,3 +83,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[features]
+legacy-pair-test-control = ["xshell-protocol/test-relay"]

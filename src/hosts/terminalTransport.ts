@@ -4,7 +4,7 @@ import { getShellById } from "../shells";
 import { registry } from "./registry";
 import { daemonHost } from "./localHost";
 import { backoffDelay, sleep } from "./backoff";
-import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type OpenResult, type RemoteExit, type TerminalMeta } from "./types";
+import { isHostError, type HostErrorCode, type HostId, type HostSnapshot, type LaunchSpec, type OpenResult, type RemoteExit, type TerminalMeta } from "./types";
 
 // The one place TerminalTab talks to a PTY. In-process Local tabs use today's
 // spawn/write/resize/close commands unchanged; Daemon Tabs (Remote, and Local ones under the
@@ -14,6 +14,7 @@ import { isHostError, type HostErrorCode, type HostId, type LaunchSpec, type Ope
 export interface TerminalSinks {
   data(bytes: Uint8Array): void;
   exit(code: number): void;
+  reset?(): void;
 }
 
 export interface StartOptions {
@@ -95,6 +96,11 @@ interface Entry {
   closing: Promise<void> | null;
   closeAbort: AbortController | null; // cancels a close waiting to be retried
   gone: boolean;          // no longer listed by the Daemon
+  inputGeneration: number; // advanced only when resync retires or restores this viewer
+  resyncPending: boolean; // this viewer must reconcile before accepting input/output again
+  resync: Promise<RemoteStartResult | null> | null;
+  resyncAbort: AbortController | null;
+  signal?: AbortSignal;
 }
 
 // A close the Host rejected for good while the Terminal is still listed. The Tab is restored
@@ -161,10 +167,58 @@ export class RemoteTerminals {
   // A pending open was answered with another Terminal: its Tab should give way to that one's.
   onAdopted(cb: (a: Adoption) => void): () => void { this.adoptedListeners.add(cb); return () => { this.adoptedListeners.delete(cb); }; }
 
+  private identityRebinds = new Map<string, { host: HostId; ready: boolean }>();
+
+  hasIdentityRebind(uuid: string): boolean { return this.identityRebinds.has(uuid); }
+  identityHost(uuid: string, fallback: HostId): HostId { return this.identityRebinds.get(uuid)?.host ?? fallback; }
+  inputBlocked(uuid: string, host: HostId): boolean {
+    const binding = this.identityRebinds.get(uuid);
+    return !!this.entries.get(uuid)?.resyncPending || registry.isRetargeting(host) || (!!binding && (!binding.ready || binding.host !== host || !this.deps.isUsable(host)));
+  }
+
+  needsResync(uuid: string): boolean { return !!this.entries.get(uuid)?.resyncPending; }
+  inputGeneration(uuid: string): number | undefined { return this.entries.get(uuid)?.inputGeneration; }
+
+  // A positively verified old identity is retained through explicit SSH retarget. Fence
+  // bytes/input first, then await Detach (never Close) before configure may replace h_.
+  async prepareIdentityRebind(host: HostId, identity: HostId, uuids: string[]): Promise<void> {
+    const old = uuids.map(uuid => {
+      this.identityRebinds.set(uuid, { host: identity, ready: false });
+      const entry = this.entries.get(uuid);
+      if (entry) { entry.resyncAbort?.abort(); entry.epoch++; entry.sinks = null; entry.gone = true; }
+      return { uuid, entry };
+    });
+    const results = await Promise.allSettled(old.map(async ({ uuid, entry }) => {
+      try {
+        if (entry?.inflight) await entry.inflight.catch(() => {});
+        if (entry?.resync) await entry.resync.catch(() => {});
+        await invoke("host_term_detach", { host, terminal: uuid });
+      } finally {
+        if (this.entries.get(uuid) === entry) this.entries.delete(uuid);
+        pendingOpens.delete(uuid); // commit and recovery only Attach, never replay Open
+      }
+    }));
+    // A late successful Detach must not tear down a subscription already recovered after
+    // another UUID failed. Wait for every disposition before exposing commit or abort.
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+  abortIdentityRebind(identity: HostId, uuids: string[]) {
+    // Old channel generations remain retired. Mounted transports recover fresh sinks via
+    // the original r_ identity; this never restores the saved-h access or replays Open.
+    this.finishIdentityRebind(identity, uuids);
+  }
+  finishIdentityRebind(identity: HostId, uuids: string[]) {
+    for (const uuid of uuids) {
+      const binding = this.identityRebinds.get(uuid);
+      if (binding?.host === identity) binding.ready = true;
+    }
+  }
+
   private entry(host: HostId, uuid: string): Entry {
     let e = this.entries.get(uuid);
     if (!e) {
-      e = { host, uuid, mountGen: 0, sinks: null, inflight: null, epoch: 0, attached: false, opening: null, closeIntent: false, closing: null, closeAbort: null, gone: false };
+      e = { host, uuid, mountGen: 0, sinks: null, inflight: null, epoch: 0, attached: false, opening: null, closeIntent: false, closing: null, closeAbort: null, gone: false, inputGeneration: 0, resyncPending: false, resync: null, resyncAbort: null };
       this.entries.set(uuid, e);
     }
     return e;
@@ -173,6 +227,14 @@ export class RemoteTerminals {
   // Registers the xterm that receives this Terminal's output; returns the mount generation.
   mount(host: HostId, uuid: string, sinks: TerminalSinks): number {
     const e = this.entry(host, uuid);
+    // The Tab moved to another Host (its machine left the Ring and joined again under a new
+    // id): the entry follows. Nothing is attached on a Host that left, and an idle entry has
+    // nothing to keep.
+    if (e.host !== host && !e.closeIntent && (registry.isDeparted(e.host) || (!e.attached && !e.inflight))) {
+      e.host = host;
+      e.attached = false;
+      e.resyncPending = false;
+    }
     e.mountGen = ++this.gen;
     e.sinks = sinks;
     return e.mountGen;
@@ -183,8 +245,19 @@ export class RemoteTerminals {
   // Opens (pending) or attaches the Terminal. Concurrent starts for one uuid share one call.
   // Returns null when the mount went stale, the signal aborted or the Tab is being closed.
   async start(host: HostId, uuid: string, gen: number, o: StartOptions, signal?: AbortSignal): Promise<RemoteStartResult | null> {
+    // A deferred, already-admitted start is still pending, not cancelled. Continue on
+    // its original host after commit/abort; doStart alone decides Open versus Attach.
+    while (registry.isRetargeting(host)) await registry.waitRetarget(host, signal);
     const e = this.entry(host, uuid);
-    if (signal?.aborted || e.closeIntent || e.mountGen !== gen) return null;
+    if (signal?.aborted || e.closeIntent || e.mountGen !== gen || !e.sinks) return null;
+    e.signal = signal;
+    if (e.resyncPending) {
+      // A remount may arrive before its cancelled predecessor's Attach has settled.
+      if (e.resyncAbort?.signal.aborted && e.resync) await e.resync.catch(() => {});
+      if (signal?.aborted || e.closeIntent || e.mountGen !== gen || !e.sinks || e.gone) return null;
+      return this.recover(e);
+    }
+    if (this.inputBlocked(uuid, host)) return null;
     if (!e.inflight) {
       const p = this.doStart(e, o);
       e.inflight = p;
@@ -213,7 +286,7 @@ export class RemoteTerminals {
     const epoch = ++e.epoch;
     let received = 0;
     let pendingExit: RemoteExit | null = null;
-    const current = () => e.epoch === epoch;
+    const current = () => !e.gone && !e.signal?.aborted && e.epoch === epoch;
     const fireExit = (code: number) => { if (current()) e.sinks?.exit(code); };
     const onData = new Channel<ArrayBuffer>();
     onData.onmessage = (buf) => {
@@ -230,18 +303,89 @@ export class RemoteTerminals {
       if (received >= x.bytes) fireExit(x.code);
       else pendingExit = x;
     };
-    return { onData, onExit };
+    const onResync = new Channel<null>();
+    onResync.onmessage = () => {
+      if (!current() || !e.sinks || e.closeIntent || e.signal?.aborted) return;
+      // Retire this viewer synchronously. Other UUIDs/channels are untouched, and input
+      // remains paused until an authorized list and a fresh same-identity Attach succeed.
+      e.epoch++;
+      e.attached = false;
+      e.resyncPending = true;
+      e.inputGeneration++;
+      void this.recover(e).catch(() => {});
+    };
+    return { onData, onExit, onResync };
+  }
+
+  private recover(e: Entry): Promise<RemoteStartResult | null> {
+    if (e.resync) return e.resync;
+    const gen = e.mountGen, signal = e.signal;
+    const abort = new AbortController();
+    e.resyncAbort = abort;
+    const cancel = () => abort.abort();
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+    const current = () => this.entries.get(e.uuid) === e && e.mountGen === gen && !!e.sinks && !e.gone && !e.closeIntent && !abort.signal.aborted;
+    const run = (async () => {
+      // Resync may precede the original Open/Attach reply. Never overlap that operation
+      // or replay its Open intent, including an indeterminate Open.
+      if (e.inflight) await e.inflight.catch(() => {});
+      if (!current()) return null;
+      return startWithRetry(e.host, async () => {
+        for (;;) {
+          await this.deps.waitUsable(e.host, abort.signal);
+          if (!current()) return null;
+          while (registry.isRetargeting(e.host)) await registry.waitRetarget(e.host, abort.signal);
+          if (!current()) return null;
+          let snapshots: HostSnapshot[];
+          try { snapshots = await invoke<HostSnapshot[]>("hosts_status"); }
+          catch (error) { throw isRetryableStartError(error, "attach") ? new RetryableStartError(error) : error; }
+          if (!current()) return null;
+          // A transaction may begin during hosts_status. Discard that observation and
+          // wait through all replacement guards before reading inventory again.
+          if (registry.isRetargeting(e.host)) continue;
+          if (!this.deps.isUsable(e.host)) throw new RetryableStartError({ code: "offline", message: "Host is not usable" });
+          // Resolve only the observation's key. The command always retains the original r_
+          // (or explicit saved/local) authority, never the representative saved h_ alias.
+          const snapshot = snapshots.find(s => s.status.host === registry.resolveAlias(e.host));
+          const status = registry.getStatus(e.host);
+          if (!snapshot || (status && (status.configGeneration !== snapshot.status.configGeneration || status.linkGeneration !== snapshot.status.linkGeneration)) || !["connected", "upgrade-pending", "build-differs"].includes(snapshot.status.status) || snapshot.terminals === null) {
+            throw new RetryableStartError({ code: "offline", message: "Terminal list is not current" });
+          }
+          if (!snapshot.terminals.some(t => t.terminal === e.uuid)) return null;
+          pendingOpens.delete(e.uuid); // the authorized list confirms it; recovery never replays Open
+          e.sinks?.reset?.();
+          if (!current()) return null;
+          if (registry.isRetargeting(e.host)) continue;
+          const channels = this.channels(e), epoch = e.epoch;
+          const result = await this.attach(e, channels);
+          if (!current()) return null;
+          if (e.epoch !== epoch) throw new RetryableStartError({ code: "busy", message: "Terminal viewer requires resync" });
+          e.resyncPending = false;
+          e.inputGeneration++;
+          return result;
+        }
+      }, abort.signal);
+    })();
+    e.resync = run;
+    run.finally(() => {
+      signal?.removeEventListener("abort", cancel);
+      if (e.resync === run) { e.resync = null; e.resyncAbort = null; }
+      if (!e.sinks && e.attached && !e.closeIntent && !e.gone) this.detachNow(e);
+    }).catch(() => {});
+    return run;
   }
 
   private async doStart(e: Entry, o: StartOptions): Promise<RemoteStartResult> {
-    const pending = pendingOpens.get(e.uuid);
-    const { onData, onExit } = this.channels(e);
+    const pending = this.identityRebinds.has(e.uuid) ? undefined : pendingOpens.get(e.uuid);
+    const channels = this.channels(e);
+    const { onData, onExit, onResync } = channels;
     if (pending && pending.state === "opening") {
       pending.state = "sent";
       // `adopt`: a Daemon that already runs this agent session answers with its Terminal
       // instead of starting a second agent on it.
       const call = invoke<OpenResult>("host_term_open", {
-        host: e.host, terminal: e.uuid, spec: pending.spec, meta: pending.meta, cols: o.cols, rows: o.rows, onData, onExit, adopt: true,
+        host: e.host, terminal: e.uuid, spec: pending.spec, meta: pending.meta, cols: o.cols, rows: o.rows, onData, onExit, onResync, adopt: true,
       });
       e.opening = call;
       try {
@@ -268,9 +412,13 @@ export class RemoteTerminals {
       }
     }
     if (pending && pending.state === "failed") throw pending.error ?? "open failed";
+    return this.attach(e, channels);
+  }
+
+  private async attach(e: Entry, channels: ReturnType<RemoteTerminals["channels"]>): Promise<RemoteStartResult> {
     let r: { exitCode: number | null };
     try {
-      r = await invoke<{ exitCode: number | null }>("host_term_attach", { host: e.host, terminal: e.uuid, onData, onExit });
+      r = await invoke<{ exitCode: number | null }>("host_term_attach", { host: e.host, terminal: e.uuid, ...channels });
     } catch (err) {
       throw isRetryableStartError(err, "attach") ? new RetryableStartError(err) : err;
     }
@@ -290,6 +438,8 @@ export class RemoteTerminals {
     const e = this.entries.get(uuid);
     if (!e || e.mountGen !== gen) return;
     e.sinks = null;
+    if (e.resyncPending) e.epoch++;
+    e.resyncAbort?.abort();
     if (e.closeIntent || e.gone) return;
     if (e.inflight) return; // the start's settle handler detaches
     if (e.attached) this.detachNow(e);
@@ -302,7 +452,9 @@ export class RemoteTerminals {
   // usable (with backoff while it stays busy). A close the Host rejects for good restores the
   // Tab (attachable again) and reports the error through onCloseFailed.
   close(host: HostId, uuid: string): Promise<void> {
+    host = this.identityHost(uuid, host);
     const e = this.entry(host, uuid);
+    e.resyncAbort?.abort();
     e.closeIntent = true;
     if (e.closing) return e.closing;
     const abort = new AbortController();
@@ -348,7 +500,7 @@ export class RemoteTerminals {
   // done — the Terminal is gone).
   forget(uuid: string) {
     const e = this.entries.get(uuid);
-    if (e) { e.gone = true; e.sinks = null; e.closeAbort?.abort(); }
+    if (e) { e.gone = true; e.sinks = null; e.resyncAbort?.abort(); e.closeAbort?.abort(); }
     this.entries.delete(uuid);
   }
 
@@ -356,12 +508,12 @@ export class RemoteTerminals {
   // so their close intent is retired (a close waiting to be retried stops).
   forgetUnlisted(host: HostId, listed: readonly string[]) {
     const keep = new Set(listed);
-    for (const [uuid, e] of [...this.entries]) if (e.host === host && e.closeIntent && !keep.has(uuid) && !pendingOpens.has(uuid)) this.forget(uuid);
+    for (const [uuid, e] of [...this.entries]) if (registry.resolveAlias(e.host) === registry.resolveAlias(host) && e.closeIntent && !keep.has(uuid) && !pendingOpens.has(uuid)) this.forget(uuid);
   }
 
   // Host removed from settings: drop every attachment without ending anything.
   dropHost(host: HostId) {
-    for (const [uuid, e] of this.entries) if (e.host === host) { e.gone = true; e.sinks = null; e.closeAbort?.abort(); this.entries.delete(uuid); }
+    for (const [uuid, e] of this.entries) if (e.host === host) { e.gone = true; e.sinks = null; e.resyncAbort?.abort(); e.closeAbort?.abort(); this.entries.delete(uuid); }
   }
 }
 
@@ -375,14 +527,22 @@ export interface MountedTerminal {
   end(): void;
 }
 
-export function mountTerminal(tab: Tab, sinks: TerminalSinks): MountedTerminal {
+export function mountTerminal(tab: Tab, sinks: TerminalSinks, currentTab: () => Tab = () => tab): MountedTerminal {
   const dh = daemonHost(tab);
   if (dh && tab.terminal) {
-    const host = dh, uuid = tab.terminal;
-    const gen = remoteTerminals.mount(host, uuid, sinks);
+    const uuid = tab.terminal;
+    let host = dh, gen = remoteTerminals.mount(host, uuid, sinks);
+    const bind = () => {
+      const next = remoteTerminals.identityHost(uuid, daemonHost(currentTab()) ?? host);
+      if (next !== host) {
+        remoteTerminals.unmount(uuid, gen);
+        host = next;
+        gen = remoteTerminals.mount(host, uuid, sinks);
+      }
+    };
     return {
-      start: (o, signal) => remoteTerminals.start(host, uuid, gen, o, signal),
-      reattach: (o, signal) => remoteTerminals.reattach(host, uuid, gen, o, signal),
+      start: (o, signal) => { bind(); return remoteTerminals.start(host, uuid, gen, o, signal); },
+      reattach: (o, signal) => { bind(); return remoteTerminals.reattach(host, uuid, gen, o, signal); },
       end: () => {
         // A close intent was already acted on by markClosing; otherwise this detaches.
         remoteTerminals.unmount(uuid, gen);
@@ -420,6 +580,7 @@ export interface TerminalInputAction {
   readonly tabId: string;
   readonly host?: HostId;
   readonly terminal?: string;
+  readonly inputGeneration?: number;
   readonly handledCompletionId?: string | null;
   readonly inputTarget?: Readonly<{ configGeneration: number; linkGeneration: number }>;
 }
@@ -429,13 +590,18 @@ export function captureTerminalInput(tab: Tab, handledCompletionId?: string | nu
   const status = host ? registry.getStatus(host) : undefined;
   const inputTarget = status?.configGeneration !== undefined && status.linkGeneration !== undefined
     ? Object.freeze({ configGeneration: status.configGeneration, linkGeneration: status.linkGeneration }) : undefined;
-  return Object.freeze({ tabId: tab.id, host: tab.host, terminal: tab.terminal, handledCompletionId, inputTarget });
+  // Capture a positively verified stable alias before clipboard/upload work. A delayed
+  // action must not acquire the replacement target's authority through a saved h_ ID.
+  const available = tab.host ? registry.availableHost(tab.host) : undefined;
+  const identity = available?.daemonKey ? available.aliases.find(alias => /^r_[0-9a-f]{64}$/.test(alias)) : undefined;
+  return Object.freeze({ tabId: tab.id, host: identity ?? tab.host, terminal: tab.terminal, ...(tab.terminal ? { inputGeneration: remoteTerminals.inputGeneration(tab.terminal) } : {}), handledCompletionId, inputTarget });
 }
 
 export function writeTerminalInput(action: TerminalInputAction, data: string) {
   const host = daemonHost(action);
   const { handledCompletionId, inputTarget } = action;
   if (host) {
+    if (action.terminal && (remoteTerminals.inputBlocked(action.terminal, host) || (action.inputGeneration !== undefined && action.inputGeneration !== remoteTerminals.inputGeneration(action.terminal)))) return;
     invoke("host_term_input", { host, terminal: action.terminal, data, ...(handledCompletionId ? { handledCompletionId } : {}), ...(inputTarget ? { inputTarget } : {}) }).catch(() => {});
   } else invoke("write_terminal", { id: action.tabId, data }).catch(() => {});
 }
@@ -451,6 +617,7 @@ export function writeTerminal(tab: Tab, data: string, handledCompletionId?: stri
 export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> {
   const h = daemonHost(tab);
   if (h) {
+    if (tab.terminal && remoteTerminals.inputBlocked(tab.terminal, h)) throw new Error("Terminal identity is changing");
     await invoke("host_term_relaunch", { host: h, terminal: tab.terminal, skipPermissions: value });
   } else {
     await invoke("relaunch_terminal", { id: tab.id, skipPermissions: value, sessionId: tab.sessionId || null, agent: tab.agent || null });
@@ -459,6 +626,7 @@ export async function relaunchTerminal(tab: Tab, value: boolean): Promise<void> 
 
 export function resizeTerminal(tab: Tab, cols: number, rows: number) {
   const h = daemonHost(tab);
+  if (h && tab.terminal && remoteTerminals.inputBlocked(tab.terminal, h)) return;
   if (h) invoke("host_term_resize", { host: h, terminal: tab.terminal, cols, rows }).catch(() => {});
   else invoke("resize_terminal", { id: tab.id, cols, rows }).catch(() => {});
 }

@@ -3,6 +3,15 @@
 //! thread owns the socket and delivers [`RingEvents`]. There is no automatic reconnect: the
 //! caller's supervisor decides when to dial again.
 
+#[path = "membership.rs"]
+mod membership;
+#[path = "proposal_client.rs"]
+mod proposal_client;
+pub use membership::{
+    check_removal, ActivityReport, DepartureClient, DepartureStatus, PolicyPreview, RemovalCheck,
+};
+pub use proposal_client::{ProposalReader, VerifiedProposal};
+
 use super::super::chain::RosterChain;
 use super::super::url::RelayUrl;
 use super::super::{b64, Member, RingError, RosterError, SignKey, Signature, SignedRoster, Signer};
@@ -137,6 +146,10 @@ enum Kind {
     Request,
     /// A probe's `roster.get`: answered by `roster.chain`.
     Probe,
+    ActivityEvidence,
+    PolicyPreview,
+    ProposalCreated,
+    ChainSnapshot,
 }
 
 /// A request awaiting its answer.
@@ -155,6 +168,7 @@ struct State {
     entitlement: Option<String>,
     limited: bool,
     waiting: HashMap<u64, Pending>,
+    replies: HashMap<u64, RelayFrame>,
     last_error: Option<ErrorCode>,
     closed: bool,
 }
@@ -612,7 +626,7 @@ impl RingClient {
         let deadline = Instant::now() + cfg.timeouts.connect;
         let mut chain = cfg.chain.clone();
         let me = cfg.signer.sign_key();
-        if chain.head().member(&me).is_none() {
+        if chain.authorized_member(&me).is_none() {
             return Err(RingError::Invalid(
                 "this device is not in its Roster".into(),
             ));
@@ -690,6 +704,7 @@ impl RingClient {
             entitlement,
             limited,
             waiting: HashMap::new(),
+            replies: HashMap::new(),
             last_error: None,
             closed: false,
         }));
@@ -737,6 +752,7 @@ impl RingClient {
             .roster()
             .members
             .iter()
+            .filter(|m| st.chain.authorized_member(&m.sign_key).is_some())
             .map(|m| MemberStatus {
                 member: m.clone(),
                 presence: if m.sign_key == self.me && !st.closed {
@@ -771,6 +787,56 @@ impl RingClient {
         lock(&self.state).chain.clone()
     }
 
+    /// Independently read accepted signed metadata on this existing authenticated socket.
+    /// Used by the proposal owner: no competing same-key fetch connection is opened.
+    /// All pages share one request deadline; page progress never renews the budget.
+    pub fn read_accepted_chain(&self, pin: &ChainPin) -> Result<RosterChain, RingError> {
+        let mut tokens = Vec::new();
+        let mut bytes = 0;
+        let until = Instant::now() + self.timeouts.request;
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RingError::Timeout);
+            }
+            let since = tokens.len() as u64;
+            let RelayFrame::RosterChain { rosters, more, .. } = self
+                .membership_request_with_timeout(
+                    Kind::ChainSnapshot,
+                    |id| ClientFrame::RosterGet { id, since },
+                    remaining,
+                )?
+            else {
+                return Err(RingError::Protocol(
+                    "expected accepted roster snapshot".into(),
+                ));
+            };
+            if rosters.is_empty() && more {
+                return Err(RingError::Protocol(
+                    "nonprogressing accepted snapshot".into(),
+                ));
+            }
+            bytes += rosters.iter().map(String::len).sum::<usize>();
+            if tokens.len() + rosters.len() > 4096 || bytes > super::wire::MAX_CANDIDATE_BYTES {
+                return Err(RingError::Invalid("accepted snapshot bounds".into()));
+            }
+            tokens.extend(rosters);
+            if !more {
+                break;
+            }
+        }
+        let mut chain = RosterChain::from_tokens(&tokens)?;
+        if chain
+            .get(pin.version)
+            .is_none_or(|roster| roster.hash() != pin.hash)
+        {
+            return Err(RingError::Invalid("accepted snapshot pin mismatch".into()));
+        }
+        let current = self.chain();
+        chain.merge_terminal_from(&current);
+        Ok(current.extended(chain.versions())?.0)
+    }
+
     pub fn entitlement(&self) -> Option<String> {
         lock(&self.state).entitlement.clone()
     }
@@ -789,6 +855,18 @@ impl RingClient {
     /// Sends one envelope (at most 64 KiB) to `to`. Delivery failures come back as
     /// [`RingEvents::error`].
     pub fn send(&self, to: &SignKey, payload: &[u8]) -> Result<(), RingError> {
+        {
+            let st = lock(&self.state);
+            if (st.chain.head().member(&self.me).is_some()
+                && st.chain.authorized_member(&self.me).is_none())
+                || (st.chain.head().member(to).is_some()
+                    && st.chain.authorized_member(to).is_none())
+            {
+                return Err(RingError::Invalid(
+                    "terminal or absent Ring enrollment".into(),
+                ));
+            }
+        }
         if payload.len() > MAX_ENVELOPE_PAYLOAD {
             return Err(RingError::Invalid("envelope payload over 64 KiB".into()));
         }
@@ -868,6 +946,41 @@ impl RingClient {
                 id,
                 roster: next.token().to_string(),
             }
+        })
+    }
+
+    /// [`RingClient::publish_roster_start`] fenced by the owner's effective evidence: under
+    /// this client's state lock, the one its own terminal observations are learned under,
+    /// `next` is checked against this client's chain with `fence`'s same-ancestry terminal
+    /// enrollments merged in, and only then queued. An observation is therefore either seen
+    /// by the check or ordered after the upload was queued, never between them. The lock is
+    /// released before any wait for the Relay's answer.
+    pub(crate) fn publish_roster_start_fenced(
+        &self,
+        next: &SignedRoster,
+        fence: &RosterChain,
+    ) -> Result<Ticket, RingError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            if st.closed {
+                return Err(RingError::Closed(CloseReason::Local));
+            }
+            fenced_put(&mut st, fence, next, id, tx, || {
+                self.outbox.send_text(
+                    ClientFrame::RosterPut {
+                        id,
+                        roster: next.token().to_string(),
+                    }
+                    .encode(),
+                )
+            })?;
+        }
+        Ok(Ticket {
+            id,
+            rx,
+            state: self.state.clone(),
         })
     }
 
@@ -1072,11 +1185,55 @@ impl Handler for ClientHandler {
             return;
         };
         match frame {
+            f @ RelayFrame::ProposalCreated { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::ProposalCreated) {
+                    lock(&self.state).replies.insert(id, f);
+                    let _ = p.waiter.send(Ok(()));
+                }
+            }
+            RelayFrame::ProposalReady { .. } | RelayFrame::ProposalPage { .. } => {}
+            RelayFrame::ActivityKey { .. } => {}
+            f @ RelayFrame::ActivityPreview { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::PolicyPreview) {
+                    lock(&self.state).replies.insert(id, f);
+                    let _ = p.waiter.send(Ok(()));
+                }
+            }
+            f @ RelayFrame::ActivityEvidence { id, .. } => {
+                if let Some(p) = self.take_waiter(id, Kind::ActivityEvidence) {
+                    let result = (|| {
+                        let RelayFrame::ActivityEvidence {
+                            ref snapshot,
+                            ref evidence,
+                            ..
+                        } = f
+                        else {
+                            unreachable!()
+                        };
+                        let mut st = lock(&self.state);
+                        let mut chain = st.chain.clone();
+                        chain.observe_activity(snapshot)?;
+                        for token in evidence {
+                            chain.observe_activity(token)?;
+                        }
+                        st.chain = chain.clone();
+                        st.replies.insert(id, f);
+                        drop(st);
+                        self.events.chain(&chain);
+                        Ok(())
+                    })();
+                    let _ = p.waiter.send(result);
+                }
+            }
             RelayFrame::Env { from, payload } => {
                 if check_payload(&payload).is_err() {
                     return;
                 }
-                let member = lock(&self.state).chain.head().member(&from).is_some();
+                let member = {
+                    let st = lock(&self.state);
+                    st.chain.authorized_member(&self.me).is_some()
+                        && st.chain.authorized_member(&from).is_some()
+                };
                 if !member || from == self.me {
                     return;
                 }
@@ -1091,7 +1248,7 @@ impl Handler for ClientHandler {
                 }
                 {
                     let mut st = lock(&self.state);
-                    if st.chain.head().member(&key).is_none() {
+                    if st.chain.authorized_member(&key).is_none() {
                         return;
                     }
                     st.presence.insert(key, p.clone());
@@ -1106,6 +1263,13 @@ impl Handler for ClientHandler {
             }
             RelayFrame::RosterChain { id, rosters, more } => {
                 self.events.accepted();
+                if let Some(pending) = self.take_waiter(id, Kind::ChainSnapshot) {
+                    lock(&self.state)
+                        .replies
+                        .insert(id, RelayFrame::RosterChain { id, rosters, more });
+                    let _ = pending.waiter.send(Ok(()));
+                    return;
+                }
                 let gap = matches!(self.accept(&rosters), Acceptance::Gap);
                 if more || gap {
                     let since = lock(&self.state).chain.head().version();
@@ -1207,5 +1371,168 @@ impl Handler for ClientHandler {
             let _ = w.send(Err(RingError::Closed(why.clone())));
         }
         self.events.closed(why);
+    }
+}
+
+/// The checked half of [`RingClient::publish_roster_start_fenced`], with the client state
+/// locked by the caller: `enqueue` runs only for a `next` that extends the client's chain
+/// under the merged terminal fence.
+fn fenced_put(
+    st: &mut State,
+    fence: &RosterChain,
+    next: &SignedRoster,
+    id: u64,
+    waiter: Waiter,
+    enqueue: impl FnOnce() -> Result<(), RingError>,
+) -> Result<(), RingError> {
+    let mut effective = st.chain.clone();
+    effective.merge_terminal_from(fence);
+    effective.extended(std::slice::from_ref(next))?;
+    st.waiting.insert(
+        id,
+        Pending {
+            waiter,
+            accept: Some(next.token().to_string()),
+            kind: Kind::Request,
+        },
+    );
+    if let Err(e) = enqueue() {
+        st.waiting.remove(&id);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod fenced_tests {
+    use super::*;
+    use crate::ring::activity::{policy_hash, ActivityEvidence, UnitActivity};
+    use crate::ring::membership::{
+        remove_unit, Enrollment, EnrollmentKind, Membership, RingPolicy, RosterChange,
+    };
+    use crate::ring::{DeviceKeys, Member, Role};
+
+    /// Two retained Desktops (k1, k2) as v2 singletons; `source` signs activity. The
+    /// candidate removes k2's unit, signed by k1: valid until k1 is terminal.
+    pub(crate) fn fixture() -> (RosterChain, SignedRoster, String) {
+        let k1 = DeviceKeys::from_seeds(&[11; 32], &[12; 32]);
+        let k2 = DeviceKeys::from_seeds(&[13; 32], &[14; 32]);
+        let source = DeviceKeys::from_seeds(&[15; 32], &[16; 32]);
+        let g =
+            SignedRoster::genesis(&k1, k1.noise_key(), "one", "ws://127.0.0.1:8787", 100).unwrap();
+        let v1 = g
+            .next(&k1, 100, |d| {
+                d.add(Member::new(
+                    "two",
+                    Role::Desktop,
+                    k2.sign_key(),
+                    k2.noise_key(),
+                    100,
+                ))
+            })
+            .unwrap();
+        let mut r = v1.roster().clone();
+        r.v = 2;
+        r.version = 3;
+        r.prev = Some(v1.hash());
+        r.issued_at = 101;
+        let unit = |n: u8, k: &DeviceKeys| Enrollment {
+            id: b64::encode(&[n; 32]),
+            kind: EnrollmentKind::LegacyDesktop,
+            members: vec![k.sign_key()],
+            enrolled_at: 101,
+        };
+        let policy = RingPolicy {
+            inactivity_seconds: Some(30),
+            activity_key: source.sign_key(),
+        };
+        r.set_membership(&Membership {
+            enrollments: vec![unit(1, &k1), unit(2, &k2)],
+            retired: vec![],
+            policy: policy.clone(),
+            change: RosterChange::Upgrade { proofs: vec![] },
+        });
+        let u = r.sign(&k1).unwrap();
+        let chain = RosterChain::from_chain(vec![g, v1, u]).unwrap();
+        let candidate = remove_unit(chain.head(), &k1, 102, &b64::encode(&[2; 32])).unwrap();
+        let evidence = ActivityEvidence {
+            ring_id: chain.ring_id().clone(),
+            relay_url: r.relay_url,
+            policy_head_hash: chain.head().hash(),
+            policy_hash: policy_hash(&policy),
+            observed_at: 140,
+            units: vec![UnitActivity {
+                enrollment_id: b64::encode(&[1; 32]),
+                member_keys: vec![k1.sign_key()],
+                online: false,
+                last_active: 101,
+                terminal_expired: true,
+            }],
+        }
+        .sign(&source)
+        .unwrap();
+        (chain, candidate, evidence)
+    }
+
+    fn state(chain: RosterChain) -> State {
+        State {
+            chain,
+            caps: vec![],
+            presence: HashMap::new(),
+            entitlement: None,
+            limited: false,
+            waiting: HashMap::new(),
+            replies: HashMap::new(),
+            last_error: None,
+            closed: false,
+        }
+    }
+
+    fn put(
+        st: &mut State,
+        fence: &RosterChain,
+        next: &SignedRoster,
+    ) -> (Result<(), RingError>, bool) {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let mut queued = false;
+        let r = fenced_put(st, fence, next, 1, tx, || {
+            queued = true;
+            Ok(())
+        });
+        (r, queued)
+    }
+
+    #[test]
+    fn fenced_put_queues_an_authorized_candidate() {
+        let (chain, candidate, _) = fixture();
+        let mut st = state(chain.clone());
+        let (r, queued) = put(&mut st, &chain, &candidate);
+        r.unwrap();
+        assert!(queued && st.waiting.contains_key(&1));
+    }
+
+    /// Evidence the transport learned after the owner's check (before the enqueue, under
+    /// the client lock) refuses the upload before anything is queued.
+    #[test]
+    fn evidence_arriving_before_enqueue_refuses_the_upload() {
+        let (chain, candidate, evidence) = fixture();
+        let mut st = state(chain.clone());
+        // What the ActivityEvidence handler does, under the same lock.
+        st.chain.observe_activity(&evidence).unwrap();
+        let (r, queued) = put(&mut st, &chain, &candidate);
+        assert!(r.unwrap_err().to_string().contains("terminal"));
+        assert!(!queued && st.waiting.is_empty());
+    }
+
+    /// The owner's (Connector's) same-head evidence fences a client that has not seen it.
+    #[test]
+    fn owner_evidence_fences_the_transport_check() {
+        let (chain, candidate, evidence) = fixture();
+        let mut owner = chain.clone();
+        owner.observe_activity(&evidence).unwrap();
+        let mut st = state(chain);
+        let (r, queued) = put(&mut st, &owner, &candidate);
+        assert!(r.unwrap_err().to_string().contains("terminal"));
+        assert!(!queued && st.waiting.is_empty());
     }
 }

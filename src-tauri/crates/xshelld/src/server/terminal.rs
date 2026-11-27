@@ -796,11 +796,15 @@ fn lock_noting_wait<'a, T>(
     m: &'a Mutex<T>,
     note: bool,
     waited: &mut bool,
+    on_wait: impl FnOnce(),
 ) -> std::sync::MutexGuard<'a, T> {
     if note {
         match m.try_lock() {
             Ok(g) => return g,
-            Err(std::sync::TryLockError::WouldBlock) => *waited = true,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                *waited = true;
+                on_wait();
+            }
             Err(std::sync::TryLockError::Poisoned(e)) => panic!("poisoned lock: {e}"),
         }
     }
@@ -1708,9 +1712,12 @@ impl Terminal {
         // agent ran meanwhile.
         let mut waited = false;
         let gated_write = check && mode.is_some();
-        let g = lock_noting_wait(&self.screen, gated_write, &mut waited);
-        let mut p = lock_noting_wait(&self.prompt, gated_write, &mut waited);
-        let mut c = lock_noting_wait(&self.status, gated_write, &mut waited);
+        let g = lock_noting_wait(&self.screen, gated_write, &mut waited, || {
+            #[cfg(any(test, debug_assertions))]
+            d.test_point(self.id, TestPoint::SubmitScreenWait);
+        });
+        let mut p = lock_noting_wait(&self.prompt, gated_write, &mut waited, || {});
+        let mut c = lock_noting_wait(&self.status, gated_write, &mut waited, || {});
         if check {
             Self::reply_ready(&g, &p, &c)?;
             if waited || mode.is_some_and(|m| !m.allows(step, d.cfg.mode_fresh)) {
@@ -1850,6 +1857,10 @@ impl Terminal {
                 .write_if_ready(&dg, step, write, &base, gm.as_deref());
             if let Ok(Ok(n)) = &r {
                 sent += n;
+                #[cfg(any(test, debug_assertions))]
+                if *n > 0 && step == SubmitStep::Paste {
+                    dg.test_point(id, TestPoint::SubmitPasteWritten);
+                }
             }
             r
         });

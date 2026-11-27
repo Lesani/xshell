@@ -1,8 +1,9 @@
-import { fmt, type StringKey } from "./strings";
+import { fmt } from "./strings";
+import { C } from "./copy";
 import type { PairingEvent, PhoneStart, Qr, RingStatus } from "./types";
 
-// Settings → Mobile, pairing (#9), the pure part: the countdown, the pair code as typed, the
-// two panels' state machines and the failure lines.
+// Settings → Ring, pairing, the pure part: the countdown, the eight words as typed (Add a
+// machine), the phone panel's state machine and its failure lines.
 
 // ── Countdown ─────────────────────────────────────────────────────────────
 
@@ -21,43 +22,23 @@ export function expiresLine(expiresAt: number, nowMs: number): string {
   return fmt("mobile.pair.phone.expires", countdown(expiresAt, nowMs));
 }
 
-// ── The pair code (`xshelld pair`) ────────────────────────────────────────
+// ── The eight-word Device Code (Add a machine) ─────────────────────────────
 
-// Crockford base32: 0-9 and A-Z without I, L, O and U.
-const CODE = /^[0-9A-HJKMNP-TV-Z]{16}$/;
-export const CODE_LEN = 16;
+export const WORD_COUNT = 8;
 
-// The code as the Desktop sends it: case, hyphens and spaces ignored, O→0, I/L→1. Other
-// characters stay, so the code reads as invalid.
-export function normalizeCode(raw: string): string {
-  return raw
-    .toUpperCase()
-    .replace(/[\s-]+/g, "")
-    .replace(/O/g, "0")
-    .replace(/[IL]/g, "1");
+// The words as the Desktop sends them: lowercase, split on spaces and hyphens, joined by `-`.
+export function normalizeWords(raw: string): string {
+  return raw.toLowerCase().split(/[\s-]+/).filter(Boolean).join("-");
 }
 
-export function validCode(raw: string): boolean {
-  return CODE.test(normalizeCode(raw));
+function words(raw: string): string[] {
+  return normalizeWords(raw).split("-").filter(Boolean);
 }
 
-// The field's text: the normalized code in groups of four, XXXX-XXXX-XXXX-XXXX.
-export function formatCode(raw: string): string {
-  return normalizeCode(raw).replace(/(.{4})(?=.)/g, "$1-");
-}
-
-// The inline error under the field: only once the code cannot become valid by typing on.
-export function codeError(raw: string): string | null {
-  const c = normalizeCode(raw);
-  if (c === "" || validCode(c)) return null;
-  if (c.length >= CODE_LEN || /[^0-9A-HJKMNP-TV-Z]/.test(c)) return fmt("mobile.pair.computer.invalid");
-  return null;
-}
-
-// `mobile.pair.computer.desc` with ` --relay <url>` when the Ring is not on the Hosted Relay.
-export function computerDesc(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">): string {
-  const relayArg = s.relayUrl && s.relayUrl !== s.hostedRelayUrl ? ` --relay ${s.relayUrl}` : "";
-  return fmt("mobile.pair.computer.desc", { relayArg });
+// Exactly eight words of letters a–z. (Whether each word is in the list is the Desktop's check.)
+export function validWords(raw: string): boolean {
+  const w = words(raw);
+  return w.length === WORD_COUNT && w.every(x => /^[a-z]+$/.test(x));
 }
 
 // ── Failures ──────────────────────────────────────────────────────────────
@@ -66,6 +47,7 @@ export function computerDesc(s: Pick<RingStatus, "relayUrl" | "hostedRelayUrl">)
 const CODES = new Set([
   "expired", "used", "role", "duplicate", "full", "publish_failed", "not_found", "crypto", "pin",
   "relay", "timeout", "protocol", "cancelled", "busy", "other_window", "not_enabled", "invalid_code",
+  "not_approver",
 ]);
 
 // The failure code a command error starts with, or "other".
@@ -74,21 +56,17 @@ export function errorCode(error: string): string {
   return m && CODES.has(m[1]) ? m[1] : "other";
 }
 
-export function failureKey(code: string): StringKey {
+// The fixed line a phone pairing failure shows; never the backend's text or code.
+export function failureLine(code: string): string {
   switch (code) {
-    case "role": return "mobile.pair.err.role";
-    case "full": return "mobile.pair.err.full";
-    case "not_found": return "mobile.pair.computer.notFound";
-    case "invalid_code": return "mobile.pair.computer.invalid";
-    case "expired": return "mobile.pair.expired";
-    case "publish_failed": return "mobile.pair.err.publishFailed";
-    default: return "mobile.pair.failed";
+    case "role": return C["mobile.pair.err.role"];
+    case "full": return fmt("mobile.pair.err.full");
+    case "not_approver": return C["mobile.pair.err.notApprover"];
+    case "busy": return fmt("mobile.pair.err.busy");
+    case "expired": return fmt("mobile.pair.expired");
+    case "publish_failed": return fmt("mobile.pair.err.publishFailed");
+    default: return C["mobile.pair.failed"];
   }
-}
-
-// The line a failure shows. `error` is the command's text, if the failure came from one.
-export function failureLine(code: string, error?: string): string {
-  return fmt(failureKey(code), { error: error ?? code });
 }
 
 export function pairedLine(name: string): string {
@@ -103,7 +81,7 @@ export type PhoneState =
   | { state: "waiting"; offer: PhoneStart }
   | { state: "paired"; name: string }
   | { state: "expired" }
-  | { state: "failed"; code: string; error?: string };
+  | { state: "failed"; code: string };
 
 export type PhoneAction =
   | { type: "start"; operation: string }
@@ -134,7 +112,7 @@ export function phoneReducer(s: PhoneState, a: PhoneAction): PhoneState {
     case "started":
       return s.state === "starting" && s.operation === a.offer.operation ? { state: "waiting", offer: a.offer } : s;
     case "startFailed":
-      return s.state === "starting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
+      return s.state === "starting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error) } : s;
     case "event": {
       if (a.event.flow !== "phone" || (s.state !== "starting" && s.state !== "waiting")) return s;
       const operation = s.state === "starting" ? s.operation : s.offer.operation;
@@ -151,60 +129,6 @@ export function phoneReducer(s: PhoneState, a: PhoneAction): PhoneState {
 // Whether the panel offers "New code" (otherwise "Pair a phone", or nothing while it runs).
 export function offersNewCode(s: PhoneState): boolean {
   return s.state === "expired" || s.state === "failed";
-}
-
-// ── The "Add a computer" section ──────────────────────────────────────────
-
-export type ComputerState =
-  | { state: "idle" }
-  | { state: "connecting"; operation: string }
-  | { state: "paired"; name: string }
-  | { state: "failed"; code: string; error?: string };
-
-export type ComputerAction =
-  | { type: "submit"; operation: string }
-  | { type: "submitFailed"; operation: string; error: string }
-  | { type: "event"; event: PairingEvent }
-  // The code was edited: a finished attempt's line goes away.
-  | { type: "edit" }
-  | { type: "cancel"; operation: string };
-
-export const COMPUTER_IDLE: ComputerState = { state: "idle" };
-
-export function computerReducer(s: ComputerState, a: ComputerAction): ComputerState {
-  switch (a.type) {
-    case "submit":
-      return s.state === "connecting" ? s : { state: "connecting", operation: a.operation };
-    case "submitFailed":
-      return s.state === "connecting" && s.operation === a.operation ? { state: "failed", code: errorCode(a.error), error: a.error } : s;
-    case "event": {
-      if (a.event.flow !== "computer" || s.state !== "connecting" || a.event.operation !== s.operation) return s;
-      switch (a.event.state) {
-        case "paired": return { state: "paired", name: a.event.name };
-        case "expired": return { state: "failed", code: "expired" };
-        case "failed": return a.event.code === "cancelled" ? s : { state: "failed", code: a.event.code };
-        default: return s;
-      }
-    }
-    case "edit":
-      return s.state === "connecting" ? s : COMPUTER_IDLE;
-    case "cancel":
-      return s.state === "connecting" && s.operation === a.operation ? COMPUTER_IDLE : s;
-  }
-}
-
-export function canSubmit(code: string, s: ComputerState): boolean {
-  return s.state !== "connecting" && validCode(code);
-}
-
-// The line under the code field, if any.
-export function computerLine(s: ComputerState): string | null {
-  switch (s.state) {
-    case "connecting": return fmt("mobile.pair.computer.connecting");
-    case "paired": return pairedLine(s.name);
-    case "failed": return failureLine(s.code, s.error);
-    default: return null;
-  }
 }
 
 // ── The QR code as SVG rectangles ─────────────────────────────────────────

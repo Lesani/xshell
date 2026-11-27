@@ -1,3 +1,4 @@
+import { registry } from "./registry";
 import type { HostId } from "./types";
 import { normalizePath, normalizeProjectPath } from "../utils";
 
@@ -13,7 +14,8 @@ export type ProjectKey = string & { readonly __projectKey: unique symbol };
 // `config::validate`; hostMethods.test.ts asserts the two strings are equal.
 export const HOST_ID_PATTERN = "^h_[a-z0-9]{8}$";
 export const HOST_ID_RE = new RegExp(HOST_ID_PATTERN);
-const REMOTE_KEY_RE = new RegExp(`^host:(${HOST_ID_PATTERN.slice(1, -1)}):(.+)$`, "s");
+export const EFFECTIVE_HOST_ID_PATTERN = "^(?:h_[a-z0-9]{8}|r_[0-9a-f]{64})$";
+const REMOTE_KEY_RE = new RegExp(`^host:(${EFFECTIVE_HOST_ID_PATTERN.slice(1, -1)}):(.+)$`, "s");
 
 export function isHostId(id: string): boolean {
   return HOST_ID_RE.test(id);
@@ -51,10 +53,23 @@ export const keyOfTab = (t: { host?: HostId; projectPath?: string }): ProjectKey
 
 // Keeps today's case-insensitive comparison. Host ids are lower-case, so lower-casing a
 // remote key never changes its host part.
-export const sameKey = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+export const sameKey = (a: string, b: string): boolean => {
+  const x = parseProjectKey(a), y = parseProjectKey(b);
+  return registry.dataHost(x.host) === registry.dataHost(y.host) && x.path.toLowerCase() === y.path.toLowerCase();
+};
 
 // Index for `projectIcons` / active-count maps (lower-cased, like today's path keys).
 export const lookupKey = (k: ProjectKey | string): string => k.toLowerCase();
+
+// Personal settings keep their stored spelling. Verified runtime equivalence may find an
+// old alias entry, but never rewrites it or merges unverified Hosts by path/name.
+export function lookupProjectValueKey<T>(values: Record<string, T>, key: string): string {
+  const raw = lookupKey(key);
+  return raw in values ? raw : Object.keys(values).find(stored => sameKey(stored, key)) ?? raw;
+}
+export function lookupProjectValue<T>(values: Record<string, T>, key: string): T | undefined {
+  return values[lookupProjectValueKey(values, key)];
+}
 
 // The encoded Claude project-dir name: Claude's recorded one, else the Rust encoding of the
 // raw on-Host path. Never derived from the key.
@@ -72,12 +87,13 @@ export function keyBasename(key: string): string {
 // Runtime identity of a session for dedup, tab claims, open-state maps and React keys.
 // RPCs keep raw IDs; new Pi folder entries use scoped keys too.
 export function sessionKey(host: HostId | undefined, id: string): string {
+  host = registry.dataHost(host);
   return host ? `${host}:${id}` : id;
 }
 // Pi permits the same custom ID in different Projects and alongside other agents.
 // Keep every other agent's existing Host + raw-ID identity unchanged.
 export function scopedSessionKey(host: HostId | undefined, agent: string | null | undefined, id: string, path = ""): string {
-  return agent === "pi" ? JSON.stringify([host ?? null, "pi", normalizeProjectPath(path), id]) : sessionKey(host, id);
+  return agent === "pi" ? JSON.stringify([registry.dataHost(host) ?? null, "pi", normalizeProjectPath(path), id]) : sessionKey(host, id);
 }
 export const sessionKeyOf = (s: { host?: HostId; id: string; agent?: string; project_path?: string }): string =>
   scopedSessionKey(s.host, s.agent, s.id, s.project_path);
@@ -95,6 +111,6 @@ export function isPinned(savedKeys: readonly string[], host: HostId | undefined,
   const target = normalizePath(path);
   return savedKeys.some(k => {
     const parsed = parseProjectKey(k);
-    return (parsed.host ?? undefined) === (host ?? undefined) && normalizePath(parsed.path) === target;
+    return registry.dataHost(parsed.host) === registry.dataHost(host) && normalizePath(parsed.path) === target;
   });
 }

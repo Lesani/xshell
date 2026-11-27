@@ -335,7 +335,7 @@ fn reinstalled_host_replaces_its_member() {
 }
 
 #[test]
-fn host_in_another_ring_is_left_alone_until_claimed() {
+fn host_in_another_ring_requires_leave_before_claim() {
     let r = relay();
     let a = Remote::start();
     // Another Desktop's Ring holds the Host.
@@ -379,15 +379,20 @@ fn host_in_another_ring_is_left_alone_until_claimed() {
         "left alone"
     );
     assert_eq!(version(&app.ring), 1);
-    app.worker.claim(A).unwrap();
-    wait("claimed and online", || online(&app.ring, &key));
-    let ours = app.ring.view().ring_id.unwrap();
-    assert_eq!(a.ring_id().as_deref(), Some(ours.as_str()));
-    // The member can be online on the Relay before the worker has the join's answer, which
-    // is what clears the Host's `other-ring` state (#39): wait for that, not for a moment.
-    wait("the other-ring state cleared", || {
-        app.worker.host_states().is_empty()
-    });
+    assert!(app
+        .worker
+        .claim(A)
+        .unwrap_err()
+        .starts_with("leave_required:"));
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!online(&app.ring, &key));
+    assert_eq!(a.ring_id().as_deref(), Some(foreign_id.as_str()));
+    assert_eq!(
+        version(&app.ring),
+        1,
+        "claim refusal must precede any Roster mutation"
+    );
+    assert_eq!(app.worker.state_of(A), Some("other-ring"));
 }
 
 /// A Host added with a managed install (probe, upload, `xshelld connect`) joins too.

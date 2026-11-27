@@ -4,9 +4,9 @@ import { hostInvoke } from "../hosts/hostInvoke";
 import { fmt } from "../hosts/strings";
 import type { HostConfig } from "../hosts/types";
 import { HostsSettings } from "./HostsSettings";
-import { MobileSettings } from "./MobileSettings";
-import { fmt as ringFmt } from "../ring/strings";
-import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server, Smartphone } from "lucide-react";
+import { RingSettings } from "./RingSettings";
+import { C, fmtc } from "../ring/copy";
+import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server, Network } from "lucide-react";
 import { getAvailableShells } from "../shells";
 import { ShellIcon } from "./ShellIcon";
 import { AGENT_IDS, AGENTS, AgentIcon, type AgentId } from "../agents";
@@ -71,15 +71,23 @@ interface SettingsViewProps {
   showProjectStatsChart: boolean;
   onSetShowProjectStatsChart: (enabled: boolean) => void;
   updateInfo: UpdateInfo;
+  // Settings is the active view (it stays mounted while hidden).
+  visible?: boolean;
+  // Settings → Ring → Set up your Ring (or Join again): opens the setup screen.
+  onOpenRingSetup?: (initial?: "join") => void;
 }
 
-type Category = "appearance" | "agents" | "hosts" | "mobile" | "terminal" | "behavior" | "about";
+// Settings → Ring: the machines and phones of the Ring; Hosts keeps this computer and SSH Hosts.
+// Where this build's releases are, when the backend does not say (`app_build.releasePage`).
+const DEFAULT_RELEASE_PAGE = "https://github.com/Lesani/xshell/releases";
+
+type Category = "appearance" | "agents" | "ring" | "hosts" | "terminal" | "behavior" | "about";
 
 const CATEGORIES: { id: Category; label: string; icon: React.ComponentType<{ size?: number }> }[] = [
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "agents",     label: "Agents",     icon: Bot },
+  { id: "ring",       label: C["ring.title"], icon: Network },
   { id: "hosts",      label: fmt("settings.nav.hosts"), icon: Server },
-  { id: "mobile",     label: ringFmt("settings.nav.mobile"), icon: Smartphone },
   { id: "terminal",   label: "Terminal",   icon: TerminalIcon },
   { id: "behavior",   label: "Behavior",   icon: SettingsIcon },
   { id: "about",      label: "About",      icon: Info },
@@ -181,8 +189,9 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo }: SettingsViewProps) {
+export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo, visible: settingsVisible = true, onOpenRingSetup = () => {} }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
+  const ringVisible = settingsVisible && active === "ring";
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
   // metrics toggles — there's no point letting users enable features that have no data
@@ -269,8 +278,9 @@ export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSa
             </>
           )}
 
+          {active === "ring" && <RingSettings visible={ringVisible} onOpenRingSetup={onOpenRingSetup} />}
+
           {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} />}
-          {active === "mobile" && <MobileSettings />}
 
           {active === "agents" && (
             <>
@@ -476,6 +486,14 @@ export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSa
               <SettingRow title="Installed version" description="The version and build running now. A +d. suffix identifies uncommitted source changes.">
                 <span className="settings-version-current">{updateInfo.currentVersion ? (appBuild ? versionWithBuild(updateInfo.currentVersion, appBuild.build) : updateInfo.currentVersion) : "—"}</span>
               </SettingRow>
+              {updateInfo.disabled ? (
+                // This build does not update itself (W7): say how to update by hand.
+                <SettingRow title="Update" description={fmtc("update.app.manual", { url: appBuild?.releasePage ?? DEFAULT_RELEASE_PAGE })}>
+                  <div className="settings-version-row" data-update-manual>
+                    <button className="btn btn-ghost settings-action-btn" onClick={() => invoke("open_url", { url: appBuild?.releasePage ?? DEFAULT_RELEASE_PAGE }).catch(() => {})}><ExternalLink size={11} /> Open releases</button>
+                  </div>
+                </SettingRow>
+              ) : (
               <SettingRow title="Latest release" description={updateInfo.error ? `Couldn't reach GitHub: ${updateInfo.error}` : updateInfo.loading ? "Checking GitHub Releases…" : updateInfo.publishedAt ? `Published ${new Date(updateInfo.publishedAt).toLocaleDateString()}` : "Latest tagged release on GitHub."}>
                 <div className="settings-version-row">
                   {updateInfo.loading ? (
@@ -495,6 +513,7 @@ export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSa
                   <button className="btn btn-ghost settings-action-btn" onClick={updateInfo.refresh} disabled={updateInfo.loading} {...ttProps(tt, "Re-check GitHub Releases")}><RefreshCw size={11} /> Refresh</button>
                 </div>
               </SettingRow>
+              )}
               {updateInfo.updateAvailable && (
                 <SettingRow title="Update" description="Download and install the new version in place. xshell restarts automatically when the install finishes.">
                   <div className="settings-update-col">

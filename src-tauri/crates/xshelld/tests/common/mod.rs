@@ -2,7 +2,11 @@
 //! binary, and a protocol client built only from xshell-protocol's codec.
 #![allow(dead_code)]
 
+pub mod get_stub;
+#[cfg(feature = "legacy-pair-test-control")]
+pub mod legacy_pair;
 pub mod ring;
+pub use get_stub::closed_get_url;
 
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -62,6 +66,7 @@ pub fn isolate_home() -> &'static Path {
             .keep();
         let dir = dir.canonicalize().unwrap();
         std::env::set_var("HOME", &dir);
+        get_stub::no_release_server();
         dir
     })
 }
@@ -171,6 +176,8 @@ pub fn config(h: &TestHome) -> Config {
     c.kill_grace = Duration::from_millis(300);
     c.write_stall_timeout = Duration::from_secs(1);
     c.resize_persist_delay = Duration::from_millis(200);
+    // Never the real release server (`daemon.update-latest`).
+    c.get_base = closed_get_url();
     c
 }
 
@@ -511,6 +518,21 @@ pub fn git_fixture(dir: &Path) -> bool {
     true
 }
 
+/// Spawn `c`, retrying briefly on ETXTBSY: a file this test process just wrote may still be
+/// open for writing in a child another test thread forked meanwhile.
+pub fn spawn_retrying(c: &mut Command) -> std::io::Result<Child> {
+    let mut tries = 0;
+    loop {
+        match c.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 200 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
+}
+
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_xshelld")
 }
@@ -523,6 +545,7 @@ pub fn bin_cmd(h: &TestHome) -> Command {
         .env("XDG_RUNTIME_DIR", h.run())
         .env("XSHELLD_LOGIN_ENV", "0")
         .env("XSHELLD_IDLE_TIMEOUT_MS", "3000")
+        .env("XSHELL_GET_URL", closed_get_url())
         .env_remove("XSHELLD_HOME")
         .env_remove("XSHELLD_SOCKET");
     c
@@ -1140,8 +1163,14 @@ pub struct ConnectProc {
 
 impl ConnectProc {
     pub fn start(h: &TestHome) -> ConnectProc {
-        let mut child = bin_cmd(h)
-            .arg("connect")
+        let mut c = bin_cmd(h);
+        c.arg("connect");
+        Self::spawn(c)
+    }
+
+    /// `cmd` (an `xshelld connect` command line) with a protocol client over its stdio.
+    pub fn spawn(mut cmd: Command) -> ConnectProc {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

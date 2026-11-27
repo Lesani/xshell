@@ -5,6 +5,12 @@
 //! and a protected DACL that lets only the user in. An existing one is opened as itself,
 //! never through a reparse point (a symlink or junction is refused), must be owned by the
 //! user (another owner is refused), and gets that DACL again, replacing whatever it had.
+//! For an elevated administrator, whose token makes Administrators the default owner of
+//! what it creates without an explicit owner, Administrators counts as the user too.
+//!
+//! Directories xshell does not create (the home, the profile, anything above `.xshell`)
+//! are only checked with [`check_anchor_dir`]: a real directory owned by the user, SYSTEM,
+//! Administrators or TrustedInstaller, as Windows creates profiles.
 //!
 //! The descriptors are pure strings, so their tests run everywhere.
 
@@ -31,7 +37,9 @@ pub use update_home::check_update_home_anchor;
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::pipe::{current_user_sid, last_error, os_error, owned, raw, wide, SecDesc, Sid};
+    use crate::pipe::{
+        current_user_sid, last_error, os_error, owned, raw, token_owner_sid, wide, SecDesc, Sid,
+    };
     use std::fs::File;
     use std::io;
     use std::os::windows::io::OwnedHandle;
@@ -45,7 +53,8 @@ mod win {
         SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        GetSecurityDescriptorDacl, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -58,12 +67,74 @@ mod win {
     struct Me {
         sid: Sid,
         text: String,
+        /// Administrators, when this token is an elevated administrator's (its default
+        /// owner): what it created without an explicit owner belongs to it.
+        elevated: Option<Sid>,
     }
 
     fn me() -> io::Result<Me> {
         let sid = current_user_sid()?;
         let text = sid.to_string_sid()?;
-        Ok(Me { sid, text })
+        let elevated = token_owner_sid().ok().filter(|owner| {
+            !sid.equals(owner.as_psid())
+                && unsafe { IsWellKnownSid(owner.as_psid(), WinBuiltinAdministratorsSid) != 0 }
+        });
+        Ok(Me {
+            sid,
+            text,
+            elevated,
+        })
+    }
+
+    /// Owned by this user (or, for an elevated administrator, by Administrators).
+    fn owned_by_me(h: &OwnedHandle, me: &Me) -> io::Result<bool> {
+        if owner_is(h, &me.sid)? {
+            return Ok(true);
+        }
+        match &me.elevated {
+            Some(admins) => owner_is(h, admins),
+            None => Ok(false),
+        }
+    }
+
+    /// TrustedInstaller (`NT SERVICE\TrustedInstaller`).
+    const TRUSTED_INSTALLER: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+    /// SYSTEM, Administrators or TrustedInstaller: owners Windows itself gives the
+    /// directories it creates (`null`: no).
+    pub(super) fn system_sid(sid: PSID) -> bool {
+        !sid.is_null()
+            && (unsafe {
+                IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+            } || Sid::copy(sid)
+                .and_then(|s| s.to_string_sid())
+                .is_ok_and(|s| s == TRUSTED_INSTALLER))
+    }
+
+    /// A directory xshell does not create and never changes (the home or profile, anything
+    /// above `.xshell`): a real directory (not a reparse point) owned by this user, or owned
+    /// by SYSTEM, Administrators or TrustedInstaller with no mutation grant to anyone else
+    /// (the update home's read-only DACL scan). Nothing is repaired.
+    pub fn check_anchor_dir(path: &Path) -> io::Result<()> {
+        let me = me()?;
+        let h = open(path, READ_CONTROL, OPEN_EXISTING, None)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let attrs = attributes(&h)?;
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(refuse(path, "is not a real directory"));
+        }
+        if owned_by_me(&h, &me)? {
+            return Ok(());
+        }
+        if super::update_home::privileged_anchor_allowed(&h, &me.sid)? {
+            return Ok(());
+        }
+        Err(refuse(
+            path,
+            "is owned by another user, or others may change it",
+        ))
     }
 
     pub(super) fn refuse(path: &Path, why: &str) -> io::Error {
@@ -177,7 +248,7 @@ mod win {
                 },
             ));
         }
-        if !owner_is(h, &me.sid)? {
+        if !owned_by_me(h, me)? {
             return Err(refuse(path, "is owned by another user"));
         }
         let sddl = if dir {
@@ -198,8 +269,34 @@ mod win {
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(refuse(path, "is not a real directory"));
         }
-        if !owner_is(&h, &me.sid)? {
+        if !owned_by_me(&h, &me)? {
             return Err(refuse(path, "is owned by another user"));
+        }
+        Ok(())
+    }
+
+    /// Validate an existing private store without tightening an arbitrary caller directory.
+    pub fn check_private_dir(path: &Path) -> io::Result<()> {
+        check_owned_dir(path)?;
+        let sid = current_user_sid()?.to_string_sid()?;
+        // Windows adds auto-inheritance bookkeeping to an otherwise identical protected
+        // DACL. Keep every ACE and the protection flag exact; only ignore that bookkeeping.
+        fn normalized(sddl: String) -> String {
+            let Some((owner, dacl)) = sddl.split_once("D:") else {
+                return sddl;
+            };
+            let end = dacl.find('(').unwrap_or(dacl.len());
+            format!(
+                "{owner}D:{}{}",
+                dacl[..end].replace("AI", "").replace("AR", ""),
+                &dacl[end..]
+            )
+        }
+        if normalized(security_sddl(path)?) != normalized(canonical_sddl(&dir_sddl(&sid))?) {
+            return Err(refuse(
+                path,
+                "does not have the protected user-only store DACL",
+            ));
         }
         Ok(())
     }
@@ -405,6 +502,93 @@ mod win_tests {
     fn owner(sddl: &str) -> String {
         let o = &sddl[sddl.find("O:").expect("an owner") + 2..];
         o[..o.find("D:").unwrap_or(o.len())].to_string()
+    }
+
+    /// The OS profile: `C:\Users\<user>`, as Windows created it (often owned by
+    /// Administrators or SYSTEM, not the user).
+    fn profile() -> std::path::PathBuf {
+        std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .expect("USERPROFILE")
+    }
+
+    /// A home anchor xshell does not create is accepted when Windows owns it the usual way
+    /// (the profile) or this user owns it; the strict check stays strict for system-owned
+    /// directories.
+    #[test]
+    fn anchor_accepts_user_and_system_owned_directories() {
+        check_anchor_dir(&profile()).unwrap();
+        let canonical = profile().canonicalize().unwrap();
+        check_anchor_dir(&canonical).unwrap();
+        // `C:\Windows` is TrustedInstaller's: never "ours" (TrustedInstaller as an anchor
+        // owner is covered by the descriptor tests in `update_home`).
+        let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        assert!(
+            check_owned_dir(&windows).is_err(),
+            "{}",
+            security_sddl(&windows).unwrap()
+        );
+        let sid = user_sid_string().unwrap();
+        if owner(&security_sddl(&profile()).unwrap()) != sid {
+            // The case that kept the Daemon from starting: strict refuses, the anchor passes.
+            assert!(check_owned_dir(&profile()).is_err());
+        }
+        let t = tempfile::tempdir().unwrap();
+        check_anchor_dir(t.path()).unwrap();
+    }
+
+    /// An anchor that is a junction or a file is refused, whoever owns it.
+    #[test]
+    fn anchor_refuses_reparse_points_and_files() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let junction = t.path().join("junction");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&real)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let e = check_anchor_dir(&junction).unwrap_err();
+        assert!(e.to_string().contains("not a real directory"), "{e}");
+        let file = t.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(check_anchor_dir(&file).is_err());
+        assert_eq!(
+            check_anchor_dir(&t.path().join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// What xshell creates stays strict: a private directory inside the profile is the
+    /// user's, and Administrators is accepted as its owner only for an elevated token
+    /// (whose default owner it is).
+    #[test]
+    fn created_directories_stay_strict() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("store");
+        ensure_dir(&d).unwrap();
+        check_owned_dir(&d).unwrap();
+        check_private_dir(&d).unwrap();
+        let token_owner = crate::pipe::token_owner_sid()
+            .unwrap()
+            .to_string_sid()
+            .unwrap();
+        let user = user_sid_string().unwrap();
+        let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        // `C:\Windows` is TrustedInstaller's: never "ours", elevated or not.
+        assert!(check_owned_dir(&windows).is_err());
+        if token_owner == user {
+            // Not elevated: an Administrators-owned profile is not "ours".
+            if owner(&security_sddl(&profile()).unwrap()) == "BA" {
+                assert!(check_owned_dir(&profile()).is_err());
+            }
+        }
     }
 
     #[test]

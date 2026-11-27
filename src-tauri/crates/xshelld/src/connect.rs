@@ -1,5 +1,7 @@
 //! `xshelld connect`: a binary stdio bridge to the Daemon; diagnostics go to stderr.
-//! Unix may start a Persistent Daemon unless the GUI-bound marker forbids it.
+//! Unix starts the always-on Daemon when none runs (ADR-0017); a `gui-bound` mode marker
+//! with nothing listening is stale (its Desktop is gone) and no longer stops it. The socket
+//! is the one the Daemon of this home recorded, whatever this process's `XDG_RUNTIME_DIR`.
 //! Windows attaches only to the existing GUI-bound Daemon (ADR-0013), and fully
 //! disconnects on either direction ending: Windows pipes have no half-close.
 
@@ -17,24 +19,19 @@ pub use unix::run_connect;
 #[cfg(unix)]
 mod unix {
     use super::*;
-    use crate::paths::{check_socket_path_len, read_mode, Mode};
+    use crate::paths::{check_socket_path_len, live_socket_at};
     use std::io::{self, Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
-    use xshell_protocol::{NOT_RUNNING_EXIT, NOT_RUNNING_MESSAGE};
 
     const SPAWN_WAIT: Duration = Duration::from_secs(10);
 
     pub fn run_connect(opts: &Opts, paths: &Paths) -> i32 {
         match connect_or_spawn(paths, opts) {
             Ok(sock) => bridge(sock),
-            Err(Refused::NotRunning) => {
-                eprintln!("xshelld: {NOT_RUNNING_MESSAGE}");
-                NOT_RUNNING_EXIT
-            }
             Err(Refused::Io(e)) => {
                 eprintln!("xshelld: {e}");
                 1
@@ -43,8 +40,6 @@ mod unix {
     }
 
     enum Refused {
-        /// No Daemon runs, and only xshell may start one here.
-        NotRunning,
         Io(io::Error),
     }
 
@@ -54,9 +49,18 @@ mod unix {
         }
     }
 
+    /// The socket to dial: the live Daemon's (A2) unless `--socket` / `XSHELLD_SOCKET` names one.
+    fn target(paths: &Paths, opts: &Opts) -> std::path::PathBuf {
+        if opts.socket.is_some() {
+            return paths.socket.clone();
+        }
+        live_socket_at(&paths.endpoint, &paths.socket)
+    }
+
     fn connect_or_spawn(paths: &Paths, opts: &Opts) -> Result<UnixStream, Refused> {
-        check_socket_path_len(&paths.socket)?;
-        match UnixStream::connect(&paths.socket) {
+        let socket = target(paths, opts);
+        check_socket_path_len(&socket)?;
+        match UnixStream::connect(&socket) {
             Ok(s) => return Ok(s),
             Err(e)
                 if matches!(
@@ -65,15 +69,12 @@ mod unix {
                 ) => {}
             Err(e) => return Err(e.into()),
         }
-        if read_mode(&paths.mode) == Some(Mode::GuiBound) {
-            return Err(Refused::NotRunning);
-        }
         let mut child = Reaped(Some(spawn_detached_serve(paths, opts)?));
         let deadline = Instant::now() + SPAWN_WAIT;
         let mut delay = Duration::from_millis(10);
         let mut lost_race = false;
         loop {
-            if let Ok(s) = UnixStream::connect(&paths.socket) {
+            if let Ok(s) = UnixStream::connect(target(paths, opts)) {
                 return Ok(s);
             }
             if !lost_race {

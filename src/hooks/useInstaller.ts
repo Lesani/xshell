@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 
 // Drives the auto-update download/install flow (used from Settings → About and the on-start
 // UpdateDialog). The Update object comes from useUpdateCheck — same signed handle the updater
@@ -47,6 +48,8 @@ export function useInstaller(update: Update | null): Installer {
         }
       });
       setState("restarting");
+      // The relaunch closes the window: no quit prompt for it.
+      await invoke("local_quit_bypass").catch(() => {});
       await relaunch();
     } catch (e: any) {
       setError(e?.message || String(e));

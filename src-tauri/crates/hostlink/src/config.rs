@@ -71,6 +71,56 @@ pub fn is_host_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// Effective remote IDs extend, but never loosen, the saved SSH schema.
+pub fn is_effective_host_id(id: &str) -> bool {
+    is_host_id(id)
+        || id.strip_prefix("r_").is_some_and(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// Display and launch settings are not SSH authority. Local retains its configured direct
+/// route; a Relay route has no HostConfig and cannot reach a transport factory.
+#[derive(Clone)]
+pub(crate) struct HostDefinition {
+    pub id: String,
+    pub name: String,
+    pub route: HostRoute,
+}
+#[derive(Clone)]
+pub(crate) enum HostRoute {
+    Configured(HostConfig),
+    Relay(crate::ring::dial::RelayDialer),
+}
+impl From<HostConfig> for HostDefinition {
+    fn from(cfg: HostConfig) -> Self {
+        Self {
+            id: cfg.id.clone(),
+            name: cfg.name.clone(),
+            route: HostRoute::Configured(cfg),
+        }
+    }
+}
+impl HostDefinition {
+    pub fn configured(&self) -> Option<&HostConfig> {
+        match &self.route {
+            HostRoute::Configured(c) => Some(c),
+            HostRoute::Relay(_) => None,
+        }
+    }
+    pub fn launch_prefix(&self, spec: &LaunchSpec) -> Option<Vec<String>> {
+        self.configured().and_then(|c| c.launch_prefix(spec))
+    }
+    pub fn authorized(&self) -> bool {
+        match &self.route {
+            HostRoute::Configured(_) => true,
+            HostRoute::Relay(d) => d.authorized(),
+        }
+    }
+}
+
 pub fn validate_one(h: &HostConfig) -> Result<(), String> {
     if !is_host_id(&h.id) {
         return Err(format!(

@@ -1,0 +1,35 @@
+{
+  "source": "https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt",
+  "sourceSHA256": "addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e",
+  "sourceCount": 7776,
+  "eligibleCount": 7772,
+  "excludedSeparatorWords": [
+    [
+      "24255",
+      "drop-down"
+    ],
+    [
+      "26522",
+      "felt-tip"
+    ],
+    [
+      "61534",
+      "t-shirt"
+    ],
+    [
+      "66622",
+      "yo-yo"
+    ]
+  ],
+  "selection": "exclude four hyphenated words; indices floor(i*7772/4096), i=0..4095, remaining source order",
+  "licenseSource": "https://www.eff.org/copyright",
+  "license": "CC-BY-4.0 original EFF material unless otherwise noted",
+  "attribution": "Electronic Frontier Foundation; original list by Joseph Bonneau; subset derived for xshell",
+  "minWordLength": 3,
+  "maxWordLength": 9,
+  "asset": "words-v1.txt",
+  "version": 1,
+  "assetCount": 4096,
+  "assetSHA256": "e74126bde834e51fa9a56ae79eb2776571e7f7ae73ea36a468cd09b08fff285e",
+  "status": "audited and frozen version 1"
+}

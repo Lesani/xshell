@@ -229,10 +229,18 @@ pub(crate) fn check(role: Role, ctx: &HostCtx, msg: &ClientMsg) -> Result<(), St
         ClientMsg::TermUpdate { .. } => Err(forbidden("term.update")),
         ClientMsg::DaemonUpgrade => Err(forbidden("daemon.upgrade")),
         ClientMsg::DaemonUpgradeSelected { .. } => Err(forbidden("daemon.upgrade-selected")),
+        // Updates over the Ring are a Desktop's (C8); refused before any disk access.
+        ClientMsg::DaemonUpdateInfo => Err(forbidden("daemon.update-info")),
+        ClientMsg::DaemonStageBegin { .. } => Err(forbidden("daemon.stage-begin")),
+        ClientMsg::DaemonStageChunk { .. } => Err(forbidden("daemon.stage-chunk")),
+        ClientMsg::DaemonStageCommit { .. } => Err(forbidden("daemon.stage-commit")),
+        ClientMsg::DaemonStageAbort { .. } => Err(forbidden("daemon.stage-abort")),
+        ClientMsg::DaemonUpdateLatest => Err(forbidden("daemon.update-latest")),
         // Agent hooks report from the Host itself, over the local socket, never from a phone.
         ClientMsg::TermEvent { .. } => Err(forbidden("term.event")),
         // Ring membership is the Desktop's to manage.
         ClientMsg::RingIdentity => Err(forbidden("ring.identity")),
+        ClientMsg::RingCompanion { .. } => Err(forbidden("ring.companion-pending")),
         ClientMsg::RingJoin { .. } => Err(forbidden("ring.join")),
         // A Mobile's own push registration; the handler refuses anyone else.
         ClientMsg::PushRegister { .. } | ClientMsg::PushUnregister => Ok(()),
@@ -929,7 +937,29 @@ pub(crate) mod tests {
                 },
             },
             &ClientMsg::RingIdentity,
+            &ClientMsg::RingCompanion {
+                request: xshell_protocol::ring::companion::CompanionAdminRequest::Pending,
+            },
             &join,
+            &ClientMsg::DaemonUpdateInfo,
+            &ClientMsg::DaemonStageBegin {
+                version: "1.5.0".into(),
+                build: xshell_protocol::build::BuildId {
+                    commit: "85ee920a1b2c".into(),
+                    dirty: None,
+                    time: 7,
+                },
+                sha256: "00".repeat(32),
+                length: 1,
+            },
+            &ClientMsg::DaemonStageChunk {
+                stage: t,
+                offset: 0,
+                data: String::new(),
+            },
+            &ClientMsg::DaemonStageCommit { stage: t },
+            &ClientMsg::DaemonStageAbort { stage: t },
+            &ClientMsg::DaemonUpdateLatest,
         ] {
             assert!(check(Role::Mobile, &ctx, m)
                 .unwrap_err()
@@ -985,6 +1015,15 @@ pub(crate) mod tests {
 
     pub(crate) fn daemon(dir: &Path) -> Arc<Daemon> {
         let paths = crate::paths::resolve(dir, None, None);
+        let ownership =
+            match crate::server::ring::ownership::StoreOwnershipLease::acquire(&paths.ring_dir)
+                .unwrap()
+            {
+                crate::server::ring::ownership::StoreOwnership::Acquired(lease) => lease,
+                crate::server::ring::ownership::StoreOwnership::Busy => {
+                    panic!("test Store already owned")
+                }
+            };
         Arc::new(Daemon {
             cfg: Config::new(dir.into(), paths),
             ctx: Arc::new(HostCtx::with_home(dir, dir)),
@@ -995,6 +1034,10 @@ pub(crate) mod tests {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(None),
+            owner_file: Mutex::new(None),
+            store_admission: crate::server::ring::ownership::StoreAdmission::new(ownership),
+            #[cfg(any(unix, windows))]
+            companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks: None,
             next_run: AtomicU64::new(1),
@@ -1027,6 +1070,8 @@ pub(crate) mod tests {
                 16,
                 256,
             ),
+            staging: Default::default(),
+            restore_failures: Default::default(),
         })
     }
 
@@ -1080,7 +1125,14 @@ pub(crate) mod tests {
             .unwrap();
         let d2 = d.clone();
         let thread = std::thread::spawn(move || {
-            crate::server::conn::handle(d2, server, 1, Role::Desktop, None)
+            crate::server::conn::handle(
+                d2,
+                server,
+                1,
+                Role::Desktop,
+                None,
+                crate::server::conn::Ingress::InProcess,
+            )
         });
         let read = |client: &mut crate::server::transport::Stream| {
             let Frame::Json(j) = read_frame(client, MAX_FRAME_LEN).unwrap().unwrap() else {

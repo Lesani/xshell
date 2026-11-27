@@ -1,12 +1,12 @@
 //! The values the frontend sees: `hosts:status` payloads, snapshots and test results.
 
 use crate::errors::HostErrorHint;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xshell_protocol::build::BuildId;
 use xshell_protocol::msg::TerminalInfo;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusKind {
     Reconnecting,
@@ -20,7 +20,7 @@ pub enum StatusKind {
     Incompatible,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     Probing,
@@ -29,26 +29,45 @@ pub enum Phase {
     Preparing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatibleReason {
     DaemonOlder,
     DaemonNewer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateAction {
     Update,
     Replace,
 }
 
+/// Who supplies the offered update: the Host downloads the latest release itself
+/// (`daemon.update-latest`), or this Desktop sends its own build over the link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateSource {
+    Release,
+    Desktop,
+}
+
 /// Evidence that this Host cannot accept the remote update path. Not a connectivity error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateUnavailable {
     WindowsOwner,
     DesktopOwned,
+}
+
+/// Access-route limitation, independent of evidence about who owns this Daemon (#102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteUpdateUnavailable {
+    /// A Ring Host whose xshell cannot take an update over the Ring (no `daemon.stage`,
+    /// or no common protocol): update xshell on that machine itself (`install.sh`).
+    RingUpdateUnsupported,
+    IdentityBoundAlias,
 }
 
 impl UpdateUnavailable {
@@ -73,9 +92,12 @@ impl UpdateUnavailable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
+    /// Transport-only hint for internal HostSync observers; never serialized as authority.
+    #[serde(skip)]
+    pub(crate) raw_action_target: Option<crate::handle::InputTarget>,
     pub host: String,
     pub status: StatusKind,
     pub phase: Option<Phase>,
@@ -106,6 +128,15 @@ pub struct HostStatus {
     /// Retained during reconnect: capability absence alone is not an old-owner diagnosis.
     pub update_unavailable: Option<UpdateUnavailable>,
     pub update_action: Option<UpdateAction>,
+    /// The version the offered update leads to (the latest release, or this Desktop's);
+    /// `None` when nothing is offered. Defaulted so a broker follower reads an older owner's
+    /// publication.
+    #[serde(default)]
+    pub update_version: Option<String>,
+    /// Who supplies the offered update; `None` when nothing is offered.
+    #[serde(default)]
+    pub update_source: Option<UpdateSource>,
+    pub route_update_unavailable: Option<RouteUpdateUnavailable>,
 }
 
 impl HostStatus {
@@ -116,6 +147,7 @@ impl HostStatus {
         config_generation: u64,
     ) -> Self {
         Self {
+            raw_action_target: None,
             host: host.into(),
             status: StatusKind::Reconnecting,
             phase: None,
@@ -136,6 +168,9 @@ impl HostStatus {
             link_generation: 0,
             update_unavailable: None,
             update_action: None,
+            update_version: None,
+            update_source: None,
+            route_update_unavailable: None,
         }
     }
 
@@ -155,7 +190,7 @@ impl HostStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSnapshot {
     pub status: HostStatus,
@@ -163,7 +198,7 @@ pub struct HostSnapshot {
     pub terminals: Option<Vec<TerminalInfo>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostTestResult {
     pub ok: bool,
@@ -201,8 +236,26 @@ mod tests {
                 "errorHint":"host-key","daemonVersion":null,"desktopVersion":"1.5.0",
                 "daemonBuild":null,"desktopBuild":null,"protocol":null,
                 "daemonCapabilities":[],"os":null,"arch":null,"incompatibleReason":"daemon-older","nextRetryAt":null,
-                "sinceMs":1,"configGeneration":7,"linkGeneration":0,"updateUnavailable":null,"updateAction":null
+                "sinceMs":1,"configGeneration":7,"linkGeneration":0,"updateUnavailable":null,"updateAction":null,"updateVersion":null,"updateSource":null,
+                "routeUpdateUnavailable":null
             })
+        );
+        let mut offered = s.clone();
+        offered.update_action = Some(UpdateAction::Update);
+        offered.update_version = Some("1.6.0-rjw.5".into());
+        offered.update_source = Some(UpdateSource::Release);
+        let v = serde_json::to_value(&offered).unwrap();
+        assert_eq!(
+            (&v["updateAction"], &v["updateVersion"], &v["updateSource"]),
+            (
+                &serde_json::json!("update"),
+                &serde_json::json!("1.6.0-rjw.5"),
+                &serde_json::json!("release")
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateSource::Desktop).unwrap(),
+            serde_json::json!("desktop")
         );
         s.set_kind(StatusKind::UpgradePending);
         assert_eq!(
@@ -237,5 +290,19 @@ mod tests {
             s.set_kind(k);
             assert!(!s.usable(), "{k:?}");
         }
+    }
+
+    /// A broker follower reads the publication of an owner from before `updateVersion` and
+    /// `updateSource`.
+    #[test]
+    fn status_without_update_fields_deserializes() {
+        let s = HostStatus::initial("h_ab12cd34", "1.5.0", None, 7);
+        let mut v = serde_json::to_value(&s).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("updateVersion").unwrap();
+        o.remove("updateSource").unwrap();
+        let back: HostStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+        assert_eq!((back.update_version, back.update_source), (None, None));
     }
 }

@@ -31,6 +31,11 @@ pub(crate) struct Daemon {
     pub exit: Mutex<Option<ExitReason>>,
     pub exit_cv: Condvar,
     pub lock_file: Mutex<Option<fs::File>>,
+    /// The home's owner lock (`daemon.owner`, Unix), released after the endpoint record.
+    pub owner_file: Mutex<Option<fs::File>>,
+    pub store_admission: Arc<super::ring::ownership::StoreAdmission>,
+    #[cfg(any(unix, windows))]
+    pub companion: Mutex<Option<xshell_core::local_ipc::Server>>,
     pub next_conn: AtomicU64,
     /// How agents report their Agent Status; `None` when they launch without hooks.
     pub hooks: Option<xshell_core::agent_status::AgentHooks>,
@@ -55,6 +60,11 @@ pub(crate) struct Daemon {
     pub session_streams: super::session_stream::SessionStreams,
     /// The dropped files replies hold, kept out of the sweep.
     pub drops: Arc<super::drops::Drops>,
+    /// A build being received over a link (`daemon.stage-*`, S4).
+    pub staging: super::staging::Staging,
+    /// Terminal records the last restore could not start again (an update trial fails on
+    /// any, S4 C1).
+    pub restore_failures: std::sync::atomic::AtomicUsize,
 }
 
 /// Installed snapshots suppress older prepared writes, but only a confirmed durable
@@ -476,11 +486,17 @@ impl Daemon {
                     "cannot read {}: {e}",
                     self.cfg.paths.state.display()
                 );
+                if self.cfg.strict_restore {
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                }
                 state::Loaded::default()
             }
         };
         if let Some(p) = &loaded.moved_aside {
             crate::log!("WARN", "corrupt state file moved to {}", p.display());
+            if self.cfg.strict_restore {
+                self.restore_failures.fetch_add(1, Ordering::SeqCst);
+            }
         }
         let mut reg = self.reg.lock().unwrap();
         let had = loaded.terminals.len();
@@ -511,10 +527,20 @@ impl Daemon {
                     );
                     let t = terminal::unresolved(self, p);
                     reg.terminals.insert(t.id, t);
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
             }
             let floor = p.prompt_id_floor.unwrap_or(0);
+            if self.cfg.test_fail_restore && self.restore_failures.load(Ordering::SeqCst) == 0 {
+                crate::log!(
+                    "WARN",
+                    "dropping {}: test hook fails its restore",
+                    p.terminal
+                );
+                self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
             match terminal::spawn(
                 self,
                 p.terminal,
@@ -529,7 +555,10 @@ impl Daemon {
                     t.restore_prompt_floor(floor);
                     reg.terminals.insert(t.id, t);
                 }
-                Err(e) => crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal),
+                Err(e) => {
+                    self.restore_failures.fetch_add(1, Ordering::SeqCst);
+                    crate::log!("WARN", "dropping {}: relaunch failed: {e}", p.terminal)
+                }
             }
         }
         if self.aborted() {
@@ -560,7 +589,16 @@ impl Daemon {
                     // The socket carries Desktops only: local ones and `xshelld connect`.
                     let r = std::thread::Builder::new()
                         .name(format!("conn-{id}-r"))
-                        .spawn(move || conn::handle(d, sock, id, Role::Desktop, None));
+                        .spawn(move || {
+                            conn::handle(
+                                d,
+                                sock,
+                                id,
+                                Role::Desktop,
+                                None,
+                                conn::Ingress::LocalOrSsh,
+                            )
+                        });
                     if let Err(e) = r {
                         crate::log!("ERROR", "cannot start connection thread: {e}");
                     }
@@ -574,11 +612,16 @@ impl Daemon {
     }
 
     pub fn supervise(self: Arc<Self>) {
-        // A GUI-bound Daemon lives exactly as long as the app.
-        if self.cfg.gui_bound.is_some() {
+        // A GUI-bound Daemon lives exactly as long as the app; any other is always on
+        // (ADR-0017) unless a test set an idle timeout.
+        let Some(idle_timeout) = self
+            .cfg
+            .idle_timeout
+            .filter(|_| self.cfg.gui_bound.is_none())
+        else {
             return;
-        }
-        let tick = (self.cfg.idle_timeout / 4).min(Duration::from_secs(1));
+        };
+        let tick = (idle_timeout / 4).min(Duration::from_secs(1));
         loop {
             std::thread::sleep(tick);
             if self.exiting.load(Ordering::SeqCst) {
@@ -586,11 +629,10 @@ impl Daemon {
             }
             let idle = {
                 let reg = self.reg.lock().unwrap();
-                reg.idle_since
-                    .is_some_and(|t| t.elapsed() >= self.cfg.idle_timeout)
+                reg.idle_since.is_some_and(|t| t.elapsed() >= idle_timeout)
             };
             if idle {
-                crate::log!("INFO", "idle for {:?}; exiting", self.cfg.idle_timeout);
+                crate::log!("INFO", "idle for {idle_timeout:?}; exiting");
                 self.exit(ExitReason::Idle);
                 return;
             }
@@ -629,8 +671,17 @@ impl Daemon {
     /// End every Terminal, close every connection, release the socket and the lock.
     /// Idempotent; only the first caller does the work.
     pub fn exit(self: &Arc<Self>, reason: ExitReason) {
-        if self.exiting.swap(true, Ordering::SeqCst) {
+        if !self.store_admission.close(&self.exiting) {
             return;
+        }
+        // No registry/Ring/handler lock is held while cancellation drains workers. The
+        // endpoint and all admitted requests end before the elected owner can transfer.
+        #[cfg(any(unix, windows))]
+        {
+            let endpoint = { self.companion.lock().unwrap().take() };
+            if let Some(mut endpoint) = endpoint {
+                endpoint.shutdown();
+            }
         }
         self.push.stop();
         self.last_lines.stop();
@@ -688,6 +739,11 @@ impl Daemon {
         xshell_core::transfer::abort_all();
         let _ = transport::remove_endpoint(&self.cfg.paths.socket);
         let _ = fs::remove_file(&self.cfg.paths.pid);
+        #[cfg(unix)]
+        crate::paths::remove_endpoint_of(&self.cfg.paths.endpoint, std::process::id());
+        if let Some(o) = self.owner_file.lock().unwrap().take() {
+            let _ = o.unlock();
+        }
         if let Some(h) = bye {
             let _ = h.join();
         }
@@ -699,6 +755,7 @@ impl Daemon {
         if let Some(l) = self.lock_file.lock().unwrap().take() {
             let _ = l.unlock();
         }
+        self.store_admission.release();
         *self.exit.lock().unwrap() = Some(reason);
         self.exit_cv.notify_all();
     }

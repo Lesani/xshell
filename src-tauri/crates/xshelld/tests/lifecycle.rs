@@ -15,7 +15,7 @@ use xshelld::server::{ExitReason, Server, StartError};
 #[test]
 fn idle_exit_when_empty() {
     let h = TestHome::new();
-    let srv = start(&h, |c| c.idle_timeout = Duration::from_millis(300));
+    let srv = start(&h, |c| c.idle_timeout = Some(Duration::from_millis(300)));
     let sock = srv.socket.clone();
     assert_eq!(
         srv.wait_timeout(Duration::from_secs(3)),
@@ -28,7 +28,7 @@ fn idle_exit_when_empty() {
 #[test]
 fn no_idle_exit_with_connection() {
     let h = TestHome::new();
-    let srv = start(&h, |c| c.idle_timeout = Duration::from_millis(300));
+    let srv = start(&h, |c| c.idle_timeout = Some(Duration::from_millis(300)));
     let mut a = Client::connect(&srv.socket);
     a.hello(range(1, 1));
     assert_eq!(srv.wait_timeout(Duration::from_millis(1500)), None);
@@ -43,7 +43,7 @@ fn no_idle_exit_with_connection() {
 #[test]
 fn no_idle_exit_with_terminal() {
     let h = TestHome::new();
-    let srv = start(&h, |c| c.idle_timeout = Duration::from_millis(300));
+    let srv = start(&h, |c| c.idle_timeout = Some(Duration::from_millis(300)));
     let mut a = Client::connect(&srv.socket);
     a.hello(range(1, 1));
     a.open(Uuid::new_v4(), sh_spec(&h.project("p")));

@@ -1,7 +1,11 @@
-//! How the Local Host runs its Terminals: in a Daemon (ADR-0005) when the app finds its
-//! `xshelld`, otherwise in this process as before. The Daemon is GUI-bound unless the
-//! Persistent Daemon setting (#25, Linux and macOS) is on; on Windows it is always
-//! GUI-bound (#24).
+//! How the Local Host runs its Terminals.
+//!
+//! Always in a Daemon of this machine: on Linux and macOS the one always-on Daemon
+//! (ADR-0017), on Windows the GUI-bound Daemon in this Desktop's Job (ADR-0005, W1). The
+//! Desktop embeds its own `xshelld` and installs it under `~/.xshell/server/<dir>/`; a
+//! sidecar or `XSHELL_DAEMON_BIN` wins for development and tests. In-process Terminals are
+//! unreachable (`XSHELL_LOCAL_DAEMON=0` remains, for tests only): failing to start the
+//! Daemon is an error with the log path and Retry, never a fallback.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -12,21 +16,63 @@ use std::path::{Path, PathBuf};
 /// needed before the frontend loads, when the Local Host starts dialing.
 pub const PERSISTENT_KEY: &str = "local_persistent_daemon";
 
+/// Where the Daemon binary comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonSource {
+    /// A file: `XSHELL_DAEMON_BIN` or the sidecar next to the app.
+    File,
+    /// The bytes embedded in this Desktop, installed to `bin` before the first start.
+    Embedded,
+    /// This build carries no `xshelld` (debug builds): every start fails with this reason.
+    Missing(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalMode {
     /// New local Tabs are Terminals of a Daemon started from `bin`.
-    Daemon { bin: PathBuf },
+    Daemon { bin: PathBuf, source: DaemonSource },
     /// Local Tabs run in this process; `reason` is logged and returned to the frontend.
+    /// Only `XSHELL_LOCAL_DAEMON=0` (tests).
     InProcess { reason: String },
+    /// The Local Host's Daemon cannot even be set up (no home directory, …).
+    Failed { reason: String },
 }
 
-/// What `local_host_info` returns.
+/// What `local_host_info` returns (and the `local:daemon` event carries).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalHostInfo {
-    /// `"daemon"` or `"in-process"`.
+    /// `"daemon"`, `"in-process"` or `"failed"`.
     pub mode: &'static str,
     pub reason: Option<String>,
+    /// Legacy (always unsupported on every platform now); S7 removes it.
     pub persistent: PersistentInfo,
+    /// The Daemon's state; `None` outside Daemon mode.
+    pub daemon: Option<DaemonInfo>,
+    /// What keeps the Daemon running; `None` outside Daemon mode (and on Windows).
+    pub service: Option<ServiceInfo>,
+}
+
+/// The Local Host's Daemon as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonInfo {
+    /// `"starting"`, `"ready"` (hello done and Terminals listed) or `"failed"`.
+    pub state: &'static str,
+    pub error: Option<String>,
+    /// `"older-desktop"`: a window of an older xshell runs this computer's Terminals in its
+    /// GUI-bound Daemon; close it first (A10). `None` otherwise.
+    pub error_kind: Option<&'static str>,
+    /// The Daemon log, for the error view.
+    pub log: Option<String>,
+}
+
+/// `xshelld service install`'s outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ServiceInfo {
+    /// `"systemd"`, `"cron"`, `"profile"` or `"none"`; `None` until the report arrives.
+    pub mechanism: Option<String>,
+    pub linger: Option<bool>,
+    pub error: Option<String>,
 }
 
 /// The Persistent Daemon setting, for Settings → Hosts.
@@ -44,25 +90,147 @@ pub struct PersistentInfo {
 }
 
 impl LocalMode {
-    pub fn info(&self, persistent: PersistentInfo) -> LocalHostInfo {
+    pub fn info(
+        &self,
+        persistent: PersistentInfo,
+        daemon: Option<DaemonInfo>,
+        service: Option<ServiceInfo>,
+    ) -> LocalHostInfo {
         match self {
             LocalMode::Daemon { .. } => LocalHostInfo {
                 mode: "daemon",
                 reason: None,
                 persistent,
+                daemon,
+                service,
             },
             LocalMode::InProcess { reason } => LocalHostInfo {
                 mode: "in-process",
                 reason: Some(reason.clone()),
                 persistent: PersistentInfo::default(),
+                daemon: None,
+                service: None,
+            },
+            // The Daemon object is kept: the error view needs the log path.
+            LocalMode::Failed { reason } => LocalHostInfo {
+                mode: "failed",
+                reason: Some(reason.clone()),
+                persistent: PersistentInfo::default(),
+                daemon,
+                service: None,
             },
         }
     }
 }
 
-/// The setting is offered only on Linux and macOS, and only when local Tabs run in a Daemon.
-pub fn persistent_supported(mode: &LocalMode, linux_or_macos: bool) -> bool {
-    linux_or_macos && matches!(mode, LocalMode::Daemon { .. })
+/// The Persistent Daemon setting is no longer offered anywhere: Linux and macOS always run
+/// the always-on Daemon (ADR-0017), Windows only the GUI-bound one.
+pub fn persistent_supported(_mode: &LocalMode, _linux_or_macos: bool) -> bool {
+    false
+}
+
+/// The Local Host Daemon's state from what hostlink knows: `ready` once the Local Host
+/// finished hello and has its Terminal list (A8); `failed` when a start failed, the Daemon
+/// is incompatible, or the link is offline with an error; otherwise `starting`.
+pub fn daemon_state(
+    start_error: Option<String>,
+    status: Option<&xshell_hostlink::HostStatus>,
+    listed: bool,
+) -> (&'static str, Option<String>) {
+    use xshell_hostlink::StatusKind;
+    if let Some(e) = start_error {
+        return ("failed", Some(e));
+    }
+    let Some(st) = status else {
+        return ("starting", None);
+    };
+    match st.status {
+        _ if st.usable() && listed => ("ready", None),
+        StatusKind::Incompatible => (
+            "failed",
+            Some(
+                st.last_error
+                    .clone()
+                    .unwrap_or_else(|| "this computer's Daemon is incompatible".into()),
+            ),
+        ),
+        StatusKind::Offline => ("failed", st.last_error.clone()),
+        _ => ("starting", None),
+    }
+}
+
+/// The [`DaemonInfo::error_kind`] of a start error.
+pub fn error_kind(error: Option<&str>) -> Option<&'static str> {
+    error
+        .filter(|e| e.starts_with("older-desktop:"))
+        .map(|_| "older-desktop")
+}
+
+/// Whether the Local Host's Daemon is an older or other build that this Desktop moves the
+/// machine off by itself (Unix, ADR-0017): a Daemon of another build of this version
+/// (`build-differs`), of an older version (`upgrade-pending`, or incompatible as older). Its
+/// running Terminals are restored by the new Daemon, as on any update. Not while an update
+/// already runs.
+pub fn auto_replace_wanted(
+    st: &xshell_hostlink::HostStatus,
+    own_version: &str,
+    own_build: Option<&xshell_protocol::build::BuildId>,
+) -> bool {
+    use xshell_hostlink::StatusKind;
+    if st.host != xshell_hostlink::LOCAL_HOST_ID || st.phase.is_some() {
+        return false;
+    }
+    let other = match st.status {
+        StatusKind::BuildDiffers | StatusKind::UpgradePending => true,
+        StatusKind::Incompatible => matches!(
+            st.incompatible_reason,
+            Some(xshell_hostlink::status::IncompatibleReason::DaemonOlder)
+        ),
+        _ => false,
+    };
+    let same = st.daemon_version.as_deref() == Some(own_version)
+        && match (&st.daemon_build, own_build) {
+            (Some(d), Some(o)) => d.same(o),
+            _ => false,
+        };
+    other && !same
+}
+
+/// The `settings.json` key of the quit prompt's setting.
+pub const KEEP_SESSIONS_KEY: &str = "local_keep_sessions";
+
+/// Whether quitting asks before leaving local Terminals running (ADR-0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepSessions {
+    /// Ask "Keep N sessions running?" (the default).
+    Ask,
+    /// Always keep them running, without asking.
+    Always,
+}
+
+impl KeepSessions {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeepSessions::Ask => "ask",
+            KeepSessions::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<KeepSessions> {
+        match s {
+            "ask" => Some(KeepSessions::Ask),
+            "always" => Some(KeepSessions::Always),
+            _ => None,
+        }
+    }
+}
+
+/// The stored setting; `Ask` when missing or invalid.
+pub fn read_keep_sessions(store: Option<&dyn SettingStore>) -> KeepSessions {
+    store
+        .and_then(|s| s.get(KEEP_SESSIONS_KEY))
+        .and_then(|v| v.as_str().and_then(KeepSessions::parse))
+        .unwrap_or(KeepSessions::Ask)
 }
 
 /// The store plugin's view of `settings.json`: a cache that `set` changes at once and `save`
@@ -176,38 +344,83 @@ pub fn apply_switch(
     }
 }
 
-/// The Daemon binary, in this order:
-/// 1. `XSHELL_DAEMON_BIN` (development and tests);
-/// 2. `xshelld` (`xshelld.exe` on Windows) next to the app's executable: the bundled sidecar
-///    (Tauri strips the target triple from sidecar names), the one in the portable zip, and
-///    `target/debug/xshelld` under `tauri dev`.
-///
-/// `XSHELL_LOCAL_DAEMON=0` keeps local Tabs in this process, as does an app without one
-/// (the bare portable `xshell.exe`).
-pub fn resolve_daemon_binary(
+/// Which Daemon the Local Host uses, the same on every platform (Windows too, W2):
+/// 1. `XSHELL_LOCAL_DAEMON=0`: in-process (tests only);
+/// 2. `XSHELL_DAEMON_BIN`, even if it is not a file (the start then reports it);
+/// 3. the sidecar next to the app (`xshelld`, `xshelld.exe` on Windows);
+/// 4. the embedded Daemon, installed at `install_bin` (`~/.xshell/server/<dir>/xshelld`);
+/// 5. otherwise `Missing`: every start fails with the reason, and Retry shows it.
+pub fn resolve_local(
     exe_dir: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
+    embedded: bool,
+    install_bin: Option<&Path>,
+    sidecar_matches: &dyn Fn(&Path) -> bool,
 ) -> LocalMode {
-    let in_process = |reason: String| LocalMode::InProcess { reason };
     if env("XSHELL_LOCAL_DAEMON").as_deref() == Some("0".as_ref()) {
-        return in_process("XSHELL_LOCAL_DAEMON=0".into());
-    }
-    if let Some(p) = env("XSHELL_DAEMON_BIN").filter(|p| !p.is_empty()) {
-        let p = PathBuf::from(p);
-        return if p.is_file() {
-            LocalMode::Daemon { bin: p }
-        } else {
-            in_process(format!("XSHELL_DAEMON_BIN {} is not a file", p.display()))
+        return LocalMode::InProcess {
+            reason: "XSHELL_LOCAL_DAEMON=0".into(),
         };
     }
-    let Some(dir) = exe_dir else {
-        return in_process("the app's directory is unknown".into());
+    let file = |bin: PathBuf| LocalMode::Daemon {
+        bin,
+        source: DaemonSource::File,
     };
-    let bin = dir.join(daemon_file_name());
-    if bin.is_file() {
-        LocalMode::Daemon { bin }
-    } else {
-        in_process(format!("no xshelld in {}", dir.display()))
+    if let Some(p) = env("XSHELL_DAEMON_BIN").filter(|p| !p.is_empty()) {
+        return file(PathBuf::from(p));
+    }
+    let sidecar = exe_dir.map(|d| d.join(daemon_file_name()));
+    // A sidecar of another build (an older xshell's, left in ~/.xshell/bin) is ignored when
+    // this Desktop carries its own Daemon; without one it is used, and refused at start.
+    if let Some(s) = sidecar
+        .as_ref()
+        .filter(|s| s.is_file() && (!embedded || sidecar_matches(s)))
+    {
+        return file(s.clone());
+    }
+    if embedded {
+        return match install_bin {
+            Some(bin) => LocalMode::Daemon {
+                bin: bin.to_path_buf(),
+                source: DaemonSource::Embedded,
+            },
+            None => LocalMode::Failed {
+                reason: "the home directory is unknown".into(),
+            },
+        };
+    }
+    LocalMode::Daemon {
+        bin: sidecar.unwrap_or_else(|| PathBuf::from(daemon_file_name())),
+        source: DaemonSource::Missing(
+            "this build carries no xshelld; for development: cargo build -p xshelld".into(),
+        ),
+    }
+}
+
+/// Logged when a sidecar of another build is ignored for the embedded Daemon.
+pub const IGNORED_SIDECAR: &str = "The older background program beside the app cannot be used.";
+
+/// Whether the sidecar in `exe_dir` is ignored: it exists, this Desktop embeds its own
+/// Daemon, and the sidecar is another build.
+pub fn sidecar_ignored(
+    exe_dir: Option<&Path>,
+    embedded: bool,
+    sidecar_matches: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let Some(s) = exe_dir.map(|d| d.join(daemon_file_name())) else {
+        return false;
+    };
+    embedded && s.is_file() && !sidecar_matches(&s)
+}
+
+/// Whether the binary at `p` reports `build` (`--version`); an unknown own build matches.
+pub fn binary_is_build(p: &Path, build: Option<&xshell_protocol::build::BuildId>) -> bool {
+    match build {
+        None => true,
+        Some(b) => xshell_hostlink::local::bin_build(p)
+            .ok()
+            .flatten()
+            .is_some_and(|f| f.same(b)),
     }
 }
 
@@ -221,117 +434,333 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn resolve(dir: Option<&Path>, env: &[(&str, &str)]) -> LocalMode {
-        let env: HashMap<String, OsString> = env
-            .iter()
+    fn env_of(env: &[(&str, &str)]) -> HashMap<String, OsString> {
+        env.iter()
             .map(|(k, v)| (k.to_string(), OsString::from(v)))
-            .collect();
-        resolve_daemon_binary(dir, &|k| env.get(k).cloned())
+            .collect()
     }
 
+    fn resolve(
+        dir: Option<&Path>,
+        env: &[(&str, &str)],
+        embedded: bool,
+        install: Option<&Path>,
+    ) -> LocalMode {
+        let env = env_of(env);
+        resolve_local(dir, &|k| env.get(k).cloned(), embedded, install, &|_| true)
+    }
+
+    fn file(bin: PathBuf) -> LocalMode {
+        LocalMode::Daemon {
+            bin,
+            source: DaemonSource::File,
+        }
+    }
+
+    /// One order on every platform (W2): never in-process except the test switch.
     #[test]
-    fn daemon_binary_resolution_order() {
+    fn resolve_order_same_on_every_platform() {
         let t = tempfile::tempdir().unwrap();
         let exe_dir = t.path().join("app");
         std::fs::create_dir(&exe_dir).unwrap();
         let other = t.path().join("dev-xshelld");
         std::fs::write(&other, "").unwrap();
         let other_s = other.to_str().unwrap();
-
-        // Nothing found: in-process, with the reason.
-        let m = resolve(Some(&exe_dir), &[]);
-        assert!(matches!(&m, LocalMode::InProcess { reason } if reason.contains("no xshelld")));
-        assert_eq!(m.info(Default::default()).mode, "in-process");
+        let install = t
+            .path()
+            .join("home/.xshell/server/1.5.0+abc")
+            .join(daemon_file_name());
+        // Nothing beside the app, nothing embedded: Missing, with the reason, never in-process.
+        match resolve(Some(&exe_dir), &[], false, Some(&install)) {
+            LocalMode::Daemon {
+                source: DaemonSource::Missing(r),
+                bin,
+            } => {
+                assert!(r.contains("carries no xshelld"), "{r}");
+                assert_eq!(bin, exe_dir.join(daemon_file_name()));
+            }
+            m => panic!("{m:?}"),
+        }
+        // Embedded: installed under the home.
         assert_eq!(
-            resolve(None, &[]),
-            LocalMode::InProcess {
-                reason: "the app's directory is unknown".into()
+            resolve(Some(&exe_dir), &[], true, Some(&install)),
+            LocalMode::Daemon {
+                bin: install.clone(),
+                source: DaemonSource::Embedded
             }
         );
-
-        // The sidecar next to the executable: `xshelld.exe` on Windows, and only that.
+        assert!(matches!(
+            resolve(Some(&exe_dir), &[], true, None),
+            LocalMode::Failed { .. }
+        ));
+        // Nothing beside the app and no home: never in-process either.
+        assert!(matches!(
+            resolve(None, &[], false, None),
+            LocalMode::Daemon {
+                source: DaemonSource::Missing(_),
+                ..
+            }
+        ));
+        // The sidecar wins over the embedded copy.
         let sidecar = exe_dir.join(daemon_file_name());
-        if cfg!(windows) {
-            std::fs::write(exe_dir.join("xshelld"), "").unwrap();
-            assert!(matches!(
-                resolve(Some(&exe_dir), &[]),
-                LocalMode::InProcess { .. }
-            ));
-            assert_eq!(daemon_file_name(), "xshelld.exe");
-        }
         std::fs::write(&sidecar, "").unwrap();
         assert_eq!(
-            resolve(Some(&exe_dir), &[]),
-            LocalMode::Daemon { bin: sidecar }
+            resolve(Some(&exe_dir), &[], true, Some(&install)),
+            file(sidecar.clone())
+        );
+        // The environment wins, even a path that is not a file (the start reports it).
+        assert_eq!(
+            resolve(
+                Some(&exe_dir),
+                &[("XSHELL_DAEMON_BIN", other_s)],
+                true,
+                None
+            ),
+            file(other.clone())
         );
         assert_eq!(
-            resolve(Some(&exe_dir), &[]).info(Default::default()).mode,
-            "daemon"
+            resolve(
+                Some(&exe_dir),
+                &[("XSHELL_DAEMON_BIN", "/nonexistent/xshelld")],
+                true,
+                None
+            ),
+            file("/nonexistent/xshelld".into())
         );
-        assert_eq!(
-            resolve(Some(&exe_dir), &[]).info(Default::default()).reason,
-            None
-        );
-
-        // The environment goes first; a wrong path does not fall back silently.
-        assert_eq!(
-            resolve(Some(&exe_dir), &[("XSHELL_DAEMON_BIN", other_s)]),
-            LocalMode::Daemon { bin: other.clone() }
-        );
+        // The test switch wins over everything.
         assert!(matches!(
             resolve(
                 Some(&exe_dir),
-                &[("XSHELL_DAEMON_BIN", "/nonexistent/xshelld")]
+                &[("XSHELL_LOCAL_DAEMON", "0"), ("XSHELL_DAEMON_BIN", other_s)],
+                true,
+                Some(&install)
             ),
             LocalMode::InProcess { .. }
         ));
-        // The escape hatch wins over everything.
-        assert!(matches!(
-            resolve(
-                Some(&exe_dir),
-                &[("XSHELL_LOCAL_DAEMON", "0"), ("XSHELL_DAEMON_BIN", other_s)]
+    }
+
+    /// A real stale sidecar (another build's `--version`) is ignored when this Desktop
+    /// embeds its Daemon; a matching one and `XSHELL_DAEMON_BIN` keep winning; without an
+    /// embedded Daemon the stale one is selected (and refused at start).
+    #[cfg(unix)]
+    #[test]
+    fn stale_sidecar_is_ignored_for_the_embedded_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("bin");
+        std::fs::create_dir(&app).unwrap();
+        let sidecar = app.join("xshelld");
+        let install = t
+            .path()
+            .join("home/.xshell/server/1.5.0+48511d0d3473/xshelld");
+        let own = xshell_protocol::build::BuildId {
+            commit: "48511d0d3473".into(),
+            dirty: None,
+            time: 2,
+        };
+        let write = |commit: &str| {
+            let line = serde_json::json!({
+                "name": "xshelld", "version": "1.5.0", "protocol": {"min": 1, "max": 1},
+                "os": "Linux", "arch": "x86_64",
+                "build": {"commit": commit, "dirty": null, "time": 1}
+            });
+            std::fs::write(&sidecar, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let matches = |p: &Path| binary_is_build(p, Some(&own));
+        let env: HashMap<String, OsString> = HashMap::new();
+        let resolve = |embedded: bool| {
+            resolve_local(
+                Some(&app),
+                &|k| env.get(k).cloned(),
+                embedded,
+                Some(&install),
+                &matches,
+            )
+        };
+        write("42c9be9636a9");
+        assert!(!binary_is_build(&sidecar, Some(&own)));
+        assert!(sidecar_ignored(Some(&app), true, &matches));
+        assert_eq!(
+            resolve(true),
+            LocalMode::Daemon {
+                bin: install.clone(),
+                source: DaemonSource::Embedded
+            }
+        );
+        assert_eq!(
+            IGNORED_SIDECAR,
+            "The older background program beside the app cannot be used."
+        );
+        // No embedded Daemon: the mismatching sidecar is selected, never ignored.
+        assert!(!sidecar_ignored(Some(&app), false, &matches));
+        assert_eq!(resolve(false), file(sidecar.clone()));
+        // A matching sidecar wins (development), and so does XSHELL_DAEMON_BIN.
+        write("48511d0d3473");
+        assert!(!sidecar_ignored(Some(&app), true, &matches));
+        assert_eq!(resolve(true), file(sidecar.clone()));
+        write("42c9be9636a9");
+        let env2: HashMap<String, OsString> = [(
+            "XSHELL_DAEMON_BIN".to_string(),
+            OsString::from("/dev/xshelld"),
+        )]
+        .into();
+        assert_eq!(
+            resolve_local(
+                Some(&app),
+                &|k| env2.get(k).cloned(),
+                true,
+                Some(&install),
+                &matches
             ),
-            LocalMode::InProcess { .. }
-        ));
-        assert!(matches!(
-            resolve(Some(&exe_dir), &[("XSHELL_LOCAL_DAEMON", "1")]),
-            LocalMode::Daemon { .. }
-        ));
-    }
-
-    #[test]
-    fn info_json() {
-        let i = LocalMode::InProcess { reason: "r".into() }.info(PersistentInfo {
-            supported: true,
-            ..Default::default()
-        });
-        assert_eq!(
-            serde_json::to_string(&i).unwrap(),
-            r#"{"mode":"in-process","reason":"r","persistent":{"supported":false,"enabled":false,"running":null,"log":null}}"#
-        );
-        let i = LocalMode::Daemon { bin: "/x".into() }.info(PersistentInfo {
-            supported: true,
-            enabled: true,
-            running: Some("persistent"),
-            log: Some("/l".into()),
-        });
-        assert_eq!(
-            serde_json::to_string(&i).unwrap(),
-            r#"{"mode":"daemon","reason":null,"persistent":{"supported":true,"enabled":true,"running":"persistent","log":"/l"}}"#
+            file("/dev/xshelld".into())
         );
     }
 
     #[test]
-    fn persistent_supported_only_linux_macos_daemon_mode() {
-        let d = LocalMode::Daemon { bin: "/x".into() };
-        let p = LocalMode::InProcess { reason: "r".into() };
-        assert!(persistent_supported(&d, true));
-        assert!(!persistent_supported(&d, false));
-        assert!(!persistent_supported(&p, true));
-        assert_eq!(
-            super::super::linux_or_macos(),
-            cfg!(any(target_os = "linux", target_os = "macos"))
+    fn info_json_daemon_state_and_service() {
+        let i = LocalMode::InProcess { reason: "r".into() }.info(
+            PersistentInfo {
+                supported: true,
+                ..Default::default()
+            },
+            None,
+            None,
         );
+        assert_eq!(
+            serde_json::to_string(&i).unwrap(),
+            r#"{"mode":"in-process","reason":"r","persistent":{"supported":false,"enabled":false,"running":null,"log":null},"daemon":null,"service":null}"#
+        );
+        let i = LocalMode::Failed {
+            reason: "no home".into(),
+        }
+        .info(Default::default(), None, None);
+        assert_eq!(
+            serde_json::to_string(&i).unwrap(),
+            r#"{"mode":"failed","reason":"no home","persistent":{"supported":false,"enabled":false,"running":null,"log":null},"daemon":null,"service":null}"#
+        );
+        let i = file("/x".into()).info(
+            Default::default(),
+            Some(DaemonInfo {
+                state: "ready",
+                error: None,
+                error_kind: None,
+                log: Some("/h/.xshell/log/xshelld.log".into()),
+            }),
+            Some(ServiceInfo {
+                mechanism: Some("profile".into()),
+                linger: None,
+                error: None,
+            }),
+        );
+        assert_eq!(
+            serde_json::to_string(&i).unwrap(),
+            r#"{"mode":"daemon","reason":null,"persistent":{"supported":false,"enabled":false,"running":null,"log":null},"daemon":{"state":"ready","error":null,"errorKind":null,"log":"/h/.xshell/log/xshelld.log"},"service":{"mechanism":"profile","linger":null,"error":null}}"#
+        );
+    }
+
+    #[test]
+    fn daemon_state_ready_only_when_negotiated_and_listed() {
+        use xshell_hostlink::{HostStatus, StatusKind};
+        let mut st = HostStatus::initial("local", "1.5.0", None, 1);
+        assert_eq!(daemon_state(None, None, false), ("starting", None));
+        assert_eq!(daemon_state(None, Some(&st), false), ("starting", None));
+        st.set_kind(StatusKind::Connected);
+        // Connected but no Terminal list yet: not ready.
+        assert_eq!(daemon_state(None, Some(&st), false), ("starting", None));
+        assert_eq!(daemon_state(None, Some(&st), true), ("ready", None));
+        // A start error wins.
+        assert_eq!(
+            daemon_state(Some("exited with 1".into()), Some(&st), true),
+            ("failed", Some("exited with 1".into()))
+        );
+        // An incompatible (older) Daemon or a refused hello: failed, with the reason.
+        st.set_kind(StatusKind::Incompatible);
+        st.last_error = Some("the Daemon is older".into());
+        assert_eq!(
+            daemon_state(None, Some(&st), true),
+            ("failed", Some("the Daemon is older".into()))
+        );
+        st.set_kind(StatusKind::Offline);
+        st.last_error = Some("hello refused".into());
+        assert_eq!(
+            daemon_state(None, Some(&st), false),
+            ("failed", Some("hello refused".into()))
+        );
+    }
+
+    #[test]
+    fn auto_replace_only_for_an_older_or_other_local_build() {
+        use xshell_hostlink::{HostStatus, StatusKind};
+        let own = xshell_protocol::build::BuildId {
+            commit: "81badb2ccf31".into(),
+            dirty: None,
+            time: 2,
+        };
+        let old = xshell_protocol::build::BuildId {
+            commit: "42c9be9636a9".into(),
+            dirty: None,
+            time: 1,
+        };
+        let mut st = HostStatus::initial("local", "1.5.0", Some(own.clone()), 1);
+        st.daemon_version = Some("1.5.0".into());
+        st.daemon_build = Some(old.clone());
+        st.set_kind(StatusKind::BuildDiffers);
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.set_kind(StatusKind::UpgradePending);
+        st.daemon_version = Some("1.4.0".into());
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.set_kind(StatusKind::Incompatible);
+        st.incompatible_reason = Some(xshell_hostlink::status::IncompatibleReason::DaemonOlder);
+        assert!(auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.incompatible_reason = Some(xshell_hostlink::status::IncompatibleReason::DaemonNewer);
+        assert!(
+            !auto_replace_wanted(&st, "1.5.0", Some(&own)),
+            "a newer Daemon is left"
+        );
+        // Our own build, an update already running, a connected Daemon, another Host: no.
+        st.set_kind(StatusKind::BuildDiffers);
+        st.daemon_version = Some("1.5.0".into());
+        st.daemon_build = Some(own.clone());
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.daemon_build = Some(old.clone());
+        st.phase = Some(xshell_hostlink::Phase::Preparing);
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        st.phase = None;
+        st.set_kind(StatusKind::Connected);
+        assert!(!auto_replace_wanted(&st, "1.5.0", Some(&own)));
+        let mut remote = HostStatus::initial("h1", "1.5.0", Some(own.clone()), 1);
+        remote.daemon_build = Some(old);
+        remote.set_kind(StatusKind::BuildDiffers);
+        assert!(!auto_replace_wanted(&remote, "1.5.0", Some(&own)));
+    }
+
+    #[test]
+    fn persistent_never_offered() {
+        for m in [
+            file("/x".into()),
+            LocalMode::InProcess { reason: "r".into() },
+        ] {
+            assert!(!persistent_supported(&m, true));
+            assert!(!persistent_supported(&m, false));
+        }
+    }
+
+    #[test]
+    fn keep_sessions_defaults_to_ask() {
+        assert_eq!(read_keep_sessions(None), KeepSessions::Ask);
+        let f = Fake::with(None);
+        assert_eq!(read_keep_sessions(Some(&*f)), KeepSessions::Ask);
+        f.set_saved(KEEP_SESSIONS_KEY, Value::from("bogus"))
+            .unwrap();
+        assert_eq!(read_keep_sessions(Some(&*f)), KeepSessions::Ask);
+        f.set_saved(KEEP_SESSIONS_KEY, Value::Bool(true)).unwrap();
+        assert_eq!(read_keep_sessions(Some(&*f)), KeepSessions::Ask);
+        f.set_saved(KEEP_SESSIONS_KEY, Value::from("always"))
+            .unwrap();
+        assert_eq!(read_keep_sessions(Some(&*f)), KeepSessions::Always);
+        assert_eq!(KeepSessions::parse("ask"), Some(KeepSessions::Ask));
+        assert_eq!(KeepSessions::Always.as_str(), "always");
     }
 
     use std::sync::Mutex;

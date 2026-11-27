@@ -1,4 +1,4 @@
-//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`,
+//! Command line: `xshelld serve | connect [--home DIR] [--socket PATH]`, `xshelld service …`,
 //! `xshelld serve [--gui-bound --parent-pid PID] [--interactive-env]`, `xshelld --version`,
 //! `xshelld event …`, the agent hook client, and (Windows) `xshelld job-exec`, the launcher
 //! of each Terminal, and `xshelld console-mode`, the reply gate's helper. `--home`, `--socket` and `--idle-timeout-ms` fall back to an
@@ -11,6 +11,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Serve(Opts),
+    /// Private, bounded registration-only child of the elected Desktop.
+    CompanionRegistration(Opts),
     Connect(Opts),
     /// `pair [--relay URL] [--name NAME] [--force]`: add this computer to a Ring.
     Pair(Opts),
@@ -35,8 +37,75 @@ pub enum Command {
         length: u64,
     },
     Maintenance(crate::maintenance::Cleanup),
+    /// Hidden `upgrade-watch …`: the watchdog of an update trial (`crate::upgrade`).
+    UpgradeWatch(Vec<OsString>),
+    /// `self-install [--select] [--switch] [--home DIR]`: what `install.sh` runs with the
+    /// verified download (`crate::upgrade::self_install_main`).
+    SelfInstall(Vec<OsString>),
+    /// `service install|uninstall|status|run|ensure [--home DIR] [--json] [--mechanism M]`:
+    /// keep this machine's Daemon running (ADR-0017; Linux and macOS).
+    Service {
+        action: ServiceAction,
+        opts: ServiceOpts,
+    },
     Version,
     Help,
+}
+
+/// What `xshelld service` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Install,
+    Uninstall,
+    Status,
+    /// Hidden: what the unit, the crontab and `ensure` run (waits, then becomes `serve`).
+    Run,
+    /// Hidden: what the shell profile runs (starts `run` unless a Daemon is alive).
+    Ensure,
+}
+
+/// How the Daemon is kept running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    Systemd,
+    Cron,
+    Profile,
+    None,
+}
+
+impl Mechanism {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mechanism::Systemd => "systemd",
+            Mechanism::Cron => "cron",
+            Mechanism::Profile => "profile",
+            Mechanism::None => "none",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Mechanism> {
+        Some(match s {
+            "systemd" => Mechanism::Systemd,
+            "cron" => Mechanism::Cron,
+            "profile" => Mechanism::Profile,
+            "none" => Mechanism::None,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceOpts {
+    /// `--home` / `XSHELLD_HOME`.
+    pub home: Option<PathBuf>,
+    /// `--json`: one line of JSON.
+    pub json: bool,
+    /// `--mechanism`: force one (the environment's `XSHELL_SERVICE_MECHANISM` is read by
+    /// `service`, so it stays out of this parse).
+    pub mechanism: Option<Mechanism>,
+    /// Hidden `run --once` (what `ensure` starts): give up at once when a Daemon is alive or
+    /// starting, instead of waiting behind it.
+    pub once: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,7 +132,7 @@ pub struct Opts {
     pub relay: Option<String>,
     /// `pair --name`: this computer's name in the Roster (default: the hostname).
     pub name: Option<String>,
-    /// `pair --force`: pair again although this computer is in a Ring already.
+    /// Legacy `pair --force`; retained membership still requires an explicit Leave.
     pub force: bool,
 }
 
@@ -72,11 +141,18 @@ usage: xshelld <command> [options]
 
 commands:
   connect     bridge stdin/stdout to the Daemon
-              Unix may start a Persistent Daemon; Windows attaches only, never starts
-              a Daemon. A GUI-bound Daemon needs xshell open; if missing, exit 4.
+              Unix starts the Daemon when none runs; Windows attaches only, never
+              starts a Daemon: the GUI-bound Daemon needs xshell open; if missing, exit 4.
   serve       run the Daemon in the foreground
-  pair        add this computer to your devices: shows a code to enter in xshell
-              on another computer (Settings → Mobile → Add a computer)
+  service     install|uninstall|status [--json] [--mechanism systemd|cron|profile|none]
+              Linux and macOS: keep the Daemon running (systemd user unit, else crontab
+              @reboot, else the shell profile); env XSHELL_SERVICE_MECHANISM forces one
+  pair        Unix: request Computer pairing in the registered xshell window,
+              or pair an unregistered standalone Host with eight Device Code words
+              (Settings → Hosts → Ring). Windows Pair is not supported.
+  self-install [--select] [--switch] [--home DIR]
+              Linux and macOS: install this binary as the selected build (--select) and
+              move a running Daemon onto it (--switch); what install.sh runs
   maintenance cleanup-installs --home ABS [--reference-home ABS]... [--keep DIR]...
               [--delete --confirm-quiescent]
               Linux only, dry-run by default; see docs/host-daemon-updates.md
@@ -97,8 +173,16 @@ serve options:
 
 pair options:
   --relay URL   the relay your xshell uses (default: the hosted relay)
-  --name NAME   this computer's name on your other devices (default: hostname)
-  --force       pair again although this computer is paired already
+  --name NAME   standalone Host name (default: hostname); registered names are retained
+  --force       legacy option; cannot replace a retained Ring (Leave required)
+
+pair exit codes:
+  5             the words expired before another device used them
+  6             approved, but not confirmed when the command ended, or an earlier
+                pairing of this machine is still being finished: xshell on this
+                machine finishes it by itself; do not run pair again first
+  7             too many pairing attempts from this network in the last minute: wait
+                about a minute, then run pair again
 ";
 
 /// The `--version` line. The Desktop parses it, so keep exactly these keys. `os` and `arch`
@@ -118,7 +202,7 @@ pub fn version_json() -> String {
     )
 }
 
-fn uname_os() -> &'static str {
+pub(crate) fn uname_os() -> &'static str {
     match std::env::consts::OS {
         "linux" => "Linux",
         "macos" => "Darwin",
@@ -164,10 +248,13 @@ pub fn parse(
             });
         }
         "maintenance" => return crate::maintenance::parse(args).map(Command::Maintenance),
+        "upgrade-watch" => return Ok(Command::UpgradeWatch(args.collect())),
+        "self-install" => return Ok(Command::SelfInstall(args.collect())),
         "event" => return Ok(Command::Event(args.collect())),
         "job-exec" => return parse_job_exec(args),
         "console-mode" => return parse_console_mode(args),
-        "serve" | "connect" | "pair" => {}
+        "service" => return parse_service(args, env),
+        "serve" | "connect" | "pair" | "companion-registration" => {}
         other => return Err(format!("unknown command: {other}")),
     }
     let mut opts = Opts::default();
@@ -248,9 +335,68 @@ pub fn parse(
     }
     Ok(match cmd {
         "serve" => Command::Serve(opts),
+        "companion-registration" => {
+            if opts.gui_bound
+                || opts.parent_pid.is_some()
+                || opts.interactive_env
+                || opts.job.is_some()
+                || opts.idle_timeout.is_some()
+            {
+                return Err("registration helper accepts only --home and --socket".into());
+            }
+            Command::CompanionRegistration(opts)
+        }
         "pair" => Command::Pair(opts),
         _ => Command::Connect(opts),
     })
+}
+
+/// `service <action> [--home DIR] [--json] [--mechanism M]`.
+fn parse_service(
+    mut args: impl Iterator<Item = OsString>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Command, String> {
+    let usage = "usage: xshelld service install|uninstall|status [--home DIR] [--json] [--mechanism systemd|cron|profile|none]";
+    let action = match args.next().as_ref().and_then(|a| a.to_str()) {
+        Some("install") => ServiceAction::Install,
+        Some("uninstall") => ServiceAction::Uninstall,
+        Some("status") => ServiceAction::Status,
+        Some("run") => ServiceAction::Run,
+        Some("ensure") => ServiceAction::Ensure,
+        Some(other) => return Err(format!("unknown service action: {other}\n{usage}")),
+        None => return Err(usage.into()),
+    };
+    let mut opts = ServiceOpts::default();
+    while let Some(a) = args.next() {
+        let s = a.to_string_lossy().into_owned();
+        let (flag, inline) = match s.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(OsString::from(v))),
+            _ => (s.clone(), None),
+        };
+        let mut value = || -> Result<OsString, String> {
+            inline
+                .clone()
+                .or_else(|| args.next())
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match flag.as_str() {
+            "--home" => opts.home = Some(value()?.into()),
+            "--json" if inline.is_none() => opts.json = true,
+            "--once" if inline.is_none() && action == ServiceAction::Run => opts.once = true,
+            "--mechanism" => {
+                let v = value()?;
+                let m = v.to_str().and_then(Mechanism::parse).ok_or_else(|| {
+                    format!("--mechanism: expected systemd, cron, profile or none, got {v:?}")
+                })?;
+                opts.mechanism = Some(m);
+            }
+            _ => return Err(format!("unknown option: {s}\n{usage}")),
+        }
+    }
+    if opts.home.is_none() {
+        opts.home = env("XSHELLD_HOME").map(PathBuf::from);
+    }
+    Ok(Command::Service { action, opts })
 }
 
 /// `console-mode <pid>`.
@@ -301,8 +447,8 @@ mod tests {
 
     #[test]
     fn connect_help_describes_windows_attach_only() {
-        assert!(USAGE.contains("Unix may start a Persistent Daemon"));
-        assert!(USAGE.contains("Windows attaches only, never starts"));
+        assert!(USAGE.contains("Unix starts the Daemon when none runs"));
+        assert!(USAGE.contains("Windows attaches only, never"));
         assert!(USAGE.contains("if missing, exit 4"));
         assert!(USAGE.contains("Windows pipe name"));
     }
@@ -348,6 +494,87 @@ mod tests {
         assert!(run(&["frobnicate"], &[]).is_err());
         assert_eq!(run(&["--version"], &[]), Ok(Command::Version));
         assert_eq!(run(&[], &[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn parses_service_actions() {
+        let svc = |action, opts| Ok(Command::Service { action, opts });
+        assert_eq!(
+            run(&["service", "install"], &[]),
+            svc(ServiceAction::Install, ServiceOpts::default())
+        );
+        assert_eq!(
+            run(
+                &[
+                    "service",
+                    "status",
+                    "--json",
+                    "--home=/h",
+                    "--mechanism",
+                    "profile"
+                ],
+                &[]
+            ),
+            svc(
+                ServiceAction::Status,
+                ServiceOpts {
+                    home: Some("/h".into()),
+                    json: true,
+                    mechanism: Some(Mechanism::Profile),
+                    once: false,
+                }
+            )
+        );
+        // `--home` falls back to the environment, as for serve.
+        assert_eq!(
+            run(&["service", "uninstall"], &[("XSHELLD_HOME", "/e")]),
+            svc(
+                ServiceAction::Uninstall,
+                ServiceOpts {
+                    home: Some("/e".into()),
+                    ..Default::default()
+                }
+            )
+        );
+        assert_eq!(
+            run(&["service", "run", "--home", "/h"], &[]),
+            svc(
+                ServiceAction::Run,
+                ServiceOpts {
+                    home: Some("/h".into()),
+                    ..Default::default()
+                }
+            )
+        );
+        assert!(matches!(
+            run(&["service", "ensure"], &[]),
+            Ok(Command::Service {
+                action: ServiceAction::Ensure,
+                ..
+            })
+        ));
+        for bad in [
+            &["service"][..],
+            &["service", "restart"],
+            &["service", "install", "--mechanism", "launchd"],
+            &["service", "install", "--json=1"],
+            &["service", "install", "--socket", "/s"],
+            &["service", "install", "--home"],
+        ] {
+            assert!(run(bad, &[]).is_err(), "{bad:?}");
+        }
+        // `run` and `ensure` are internal: not in the help.
+        assert!(USAGE.contains("service     install|uninstall|status"));
+        assert!(!USAGE.contains("ensure"));
+        assert_eq!(Mechanism::parse("none"), Some(Mechanism::None));
+        for m in [
+            Mechanism::Systemd,
+            Mechanism::Cron,
+            Mechanism::Profile,
+            Mechanism::None,
+        ] {
+            assert_eq!(Mechanism::parse(m.as_str()), Some(m));
+        }
     }
 
     #[test]

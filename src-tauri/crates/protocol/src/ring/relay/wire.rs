@@ -59,7 +59,7 @@ pub fn client_frame_cap(t: &str) -> usize {
     match t {
         "auth.chain" => MAX_FRAME,
         "env" => MAX_ENV_FRAME,
-        "roster.put" => MAX_ROSTER_PUT_FRAME,
+        "proposal.create" | "roster.put" | "leave.put" => MAX_ROSTER_PUT_FRAME,
         _ => MAX_CONTROL_FRAME,
     }
 }
@@ -369,7 +369,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// Every wire integer is at most 2^53−1, so JavaScript reads it exactly.
-mod safe {
+pub(super) mod safe {
     use crate::ring::MAX_SAFE_INT;
     use serde::{Deserialize, Deserializer};
 
@@ -393,6 +393,69 @@ mod safe {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "t")]
 pub enum ClientFrame {
+    #[serde(rename = "proposal.create", rename_all = "camelCase")]
+    ProposalCreate {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        operation: String,
+        head: String,
+        guest: SignKey,
+        context: String,
+        #[serde(deserialize_with = "safe::int")]
+        expires_at: u64,
+        proposal: String,
+    },
+    #[serde(rename = "proposal.read")]
+    ProposalRead {
+        handle: super::proposal::ProposalHandle,
+        sig: Signature,
+    },
+    #[serde(rename = "proposal.get")]
+    ProposalGet {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+    },
+    #[serde(rename = "proposal.cancel")]
+    ProposalCancel {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        grant: String,
+    },
+    #[serde(rename = "activity.key")]
+    ActivityKey {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+    },
+    #[serde(rename = "activity.get")]
+    ActivityGet {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+    },
+    #[serde(rename = "activity.preview")]
+    ActivityPreview {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        policy: super::super::membership::RingPolicy,
+    },
+    #[serde(rename = "leave.sync", rename_all = "camelCase")]
+    LeaveSync {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        #[serde(deserialize_with = "safe::int")]
+        since: u64,
+        #[serde(deserialize_with = "safe::int")]
+        pin_version: u64,
+        pin_hash: String,
+        target: super::super::membership::Enrollment,
+        sign_key: SignKey,
+        sig: Signature,
+    },
+    #[serde(rename = "leave.put")]
+    LeavePut {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        roster: String,
+    },
     /// Before `auth`: Roster versions to stage as the authentication candidate.
     #[serde(rename = "auth.chain")]
     AuthChain { rosters: Vec<String> },
@@ -446,6 +509,15 @@ pub enum ClientFrame {
 }
 
 const CLIENT_TYPES: &[&str] = &[
+    "proposal.create",
+    "proposal.read",
+    "proposal.get",
+    "proposal.cancel",
+    "activity.key",
+    "activity.get",
+    "activity.preview",
+    "leave.sync",
+    "leave.put",
     "auth.chain",
     "auth",
     "env",
@@ -462,6 +534,45 @@ const CLIENT_TYPES: &[&str] = &[
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "t")]
 pub enum RelayFrame {
+    #[serde(rename = "proposal.created")]
+    ProposalCreated {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        handle: super::proposal::ProposalHandle,
+    },
+    #[serde(rename = "proposal.ready")]
+    ProposalReady {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+        pages: Vec<[u64; 2]>,
+    },
+    #[serde(rename = "proposal.page")]
+    ProposalPage {
+        #[serde(deserialize_with = "safe::int")]
+        cursor: u64,
+        chain: Vec<String>,
+        proposal: Option<String>,
+    },
+    #[serde(rename = "activity.key")]
+    ActivityKey {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        key: SignKey,
+    },
+    #[serde(rename = "activity.evidence")]
+    ActivityEvidence {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        snapshot: String,
+        evidence: Vec<String>,
+    },
+    #[serde(rename = "activity.preview")]
+    ActivityPreview {
+        #[serde(deserialize_with = "safe::int")]
+        id: u64,
+        preview: String,
+        affected: Vec<String>,
+    },
     #[serde(rename = "challenge", rename_all = "camelCase")]
     Challenge {
         v: u32,
@@ -533,6 +644,12 @@ pub enum RelayFrame {
 }
 
 const RELAY_TYPES: &[&str] = &[
+    "proposal.created",
+    "proposal.ready",
+    "proposal.page",
+    "activity.key",
+    "activity.evidence",
+    "activity.preview",
     "challenge",
     "welcome",
     "presence",
@@ -762,6 +879,46 @@ pub fn entitlement_well_formed(token: &str) -> bool {
         .and_then(|p| strict_object(&p).ok())
         .is_some();
     payload_ok && b64::decode_array::<64>(sig).is_ok()
+}
+
+/// Historical-key query signatures cannot authenticate a socket or sign a Roster.
+// Keep the signed transcript inputs explicit so their byte ordering remains auditable.
+#[allow(clippy::too_many_arguments)]
+pub fn leave_message(
+    origin: &str,
+    ring: &RingId,
+    nonce: &str,
+    key: &SignKey,
+    target: &super::super::membership::Enrollment,
+    pin_version: u64,
+    pin_hash: &str,
+    since: u64,
+) -> Vec<u8> {
+    let kind = match target.kind {
+        super::super::membership::EnrollmentKind::Computer => "computer",
+        super::super::membership::EnrollmentKind::Daemon => "daemon",
+        super::super::membership::EnrollmentKind::Mobile => "mobile",
+        super::super::membership::EnrollmentKind::LegacyDesktop => "legacyDesktop",
+    };
+    let mut lines = vec![
+        "xshell-ring-leave-query-v2".into(),
+        origin.into(),
+        ring.to_string(),
+        nonce.into(),
+        key.to_string(),
+        target.id.clone(),
+        kind.into(),
+        target.enrolled_at.to_string(),
+    ];
+    let mut keys = target
+        .members
+        .iter()
+        .map(|k| k.to_string())
+        .collect::<Vec<_>>();
+    keys.sort();
+    lines.extend(keys);
+    lines.extend([pin_version.to_string(), pin_hash.into(), since.to_string()]);
+    lines.join("\n").into_bytes()
 }
 
 #[cfg(test)]

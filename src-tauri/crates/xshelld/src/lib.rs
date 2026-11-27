@@ -9,16 +9,27 @@ pub mod connect;
 pub mod console_mode;
 pub mod env;
 pub mod job_exec;
+#[cfg(unix)]
+mod latest;
 pub mod log;
 pub mod maintenance;
 #[cfg(unix)]
 pub mod pair;
 pub mod paths;
 pub mod server;
+#[cfg(unix)]
+pub mod service;
 pub mod stage;
+pub mod upgrade;
 
 use cli::Command;
 use std::path::PathBuf;
+
+/// Where `daemon.update-latest` asks for the latest release (overridden by `XSHELL_GET_URL`).
+pub const GET_BASE_DEFAULT: &str = "https://get.xshell.sh";
+/// The environment variable that overrides [`GET_BASE_DEFAULT`]: tests and end-to-end runs
+/// point it at a local stub. Read in release builds too, since end-to-end runs use them.
+pub const GET_URL_ENV: &str = "XSHELL_GET_URL";
 
 /// The `xshelld` binary: returns the process exit code.
 pub fn main_entry() -> i32 {
@@ -31,6 +42,15 @@ pub fn main_entry() -> i32 {
     };
     let (opts, serve) = match cmd {
         Command::Maintenance(opts) => return maintenance::run(opts),
+        Command::UpgradeWatch(args) => return upgrade::watch_main(args),
+        Command::SelfInstall(args) => return upgrade::self_install_main(args),
+        #[cfg(unix)]
+        Command::Service { action, opts } => return service::main(action, &opts),
+        #[cfg(not(unix))]
+        Command::Service { .. } => {
+            eprintln!("xshelld: service is Linux and macOS only");
+            return 1;
+        }
         Command::StageBuild {
             dir,
             sha256,
@@ -73,6 +93,24 @@ pub fn main_entry() -> i32 {
         }
         Command::JobExec { job, program, args } => return job_exec::run(&job, &program, &args),
         Command::ConsoleMode { pid } => return console_mode::run(pid),
+        Command::CompanionRegistration(o) => {
+            #[cfg(unix)]
+            {
+                return server::registration_child(&o).map_or_else(
+                    |e| {
+                        eprintln!("xshelld: {e}");
+                        1
+                    },
+                    |()| 0,
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = o;
+                eprintln!("xshelld: protected registration adapter unavailable");
+                return 1;
+            }
+        }
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
         #[cfg(windows)]
@@ -87,7 +125,10 @@ pub fn main_entry() -> i32 {
                 return 1;
             };
             let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-            let paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            let mut paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            if o.socket.is_none() {
+                paths.socket = paths::live_socket(&home, &paths.socket);
+            }
             return pair::run_pair(&o, &paths);
         }
     };
@@ -115,6 +156,44 @@ pub fn main_entry() -> i32 {
     if !serve {
         return connect::run_connect(&opts, &paths);
     }
+    // S4 P1-1: never start beside an update trial another process owns; wait it out.
+    #[cfg(target_os = "linux")]
+    upgrade::wait_for_foreign_trial(&home);
+    // Unix: one starter at a time per home, from before the (slow) login-environment
+    // preparation to exit, so a second `serve` (an `ensure`, a Desktop, a `connect`) gives up
+    // at once instead of preparing in parallel. Exit 3: another `serve` will listen.
+    #[cfg(unix)]
+    let _start_lock = match paths::hold_exclusive(&paths::start_path(&home)) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            crate::log!(
+                "INFO",
+                "another xshelld serve is starting or running; exiting"
+            );
+            server::hold_loser_for_tests();
+            return 3;
+        }
+        Err(e) => {
+            eprintln!("xshelld: cannot start: {e}");
+            return 1;
+        }
+    };
+    #[cfg(unix)]
+    if let Some(m) = std::env::var_os(service::SERVICE_ENV) {
+        crate::log!("INFO", "started by the {} service", m.to_string_lossy());
+    }
+    // An update trial (S4): this process may be the build on trial, or find one nobody
+    // owns any more (then it goes back to the previous build).
+    #[cfg(target_os = "linux")]
+    let trial = match upgrade::on_start(&home) {
+        upgrade::Decision::Normal => None,
+        upgrade::Decision::Busy => {
+            crate::log!("INFO", "an update of this machine is running; exiting");
+            return 3;
+        }
+        upgrade::Decision::Trial(t) => Some(t),
+        upgrade::Decision::Exec(bin) => return upgrade::exec_previous(&bin),
+    };
     let gui_bound = opts
         .parent_pid
         .map(|parent_pid| server::GuiBound { parent_pid });
@@ -147,14 +226,16 @@ pub fn main_entry() -> i32 {
     env::prepare(gui_bound.is_some() || opts.interactive_env, &|| {
         stop.is_set()
     });
+    // The login shells above ran with the guard; Terminals start without it, so a shell the
+    // user opens later behaves as any other login (it finds this Daemon alive).
+    #[cfg(unix)]
+    std::env::remove_var(service::GUARD_ENV);
     if stop.is_set() {
         crate::log!("INFO", "stopped while starting; exiting");
         return 0;
     }
     let mut cfg = server::Config::new(home, paths);
-    if let Some(t) = opts.idle_timeout {
-        cfg.idle_timeout = t;
-    }
+    cfg.idle_timeout = opts.idle_timeout;
     cfg.gui_bound = gui_bound;
     cfg.supports_selected_restart = cfg!(windows) && opts.supports_selected_restart;
     cfg.test_hook = test_hook();
@@ -166,10 +247,73 @@ pub fn main_entry() -> i32 {
         }
     }
     submit_probe(&mut cfg);
-    server::run_serve(cfg, stop)
+    #[cfg(target_os = "linux")]
+    {
+        cfg.test_fail_restore = trial.is_some() && fail_restore_for_tests();
+        cfg.strict_restore = trial.is_some();
+        if trial.is_some() {
+            upgrade::corrupt_state_for_tests(&cfg.home);
+        }
+    }
+    let home = cfg.home.clone();
+    let paths = cfg.paths.clone();
+    #[cfg(target_os = "linux")]
+    let in_trial = trial.is_some();
+    #[cfg(target_os = "linux")]
+    let after_start = {
+        let home = home.clone();
+        move |probe: server::DaemonProbe| {
+            if let Some(t) = trial {
+                std::thread::spawn(move || upgrade::report(home, t, probe));
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let after_start = |_probe: server::DaemonProbe| {};
+    let served = server::run_serve_with(cfg, stop, after_start);
+    #[cfg(target_os = "linux")]
+    if in_trial && served.reason == Some(server::ExitReason::Shutdown) {
+        upgrade::stopped_during_trial(&home);
+    }
+    if served.reason == Some(server::ExitReason::Upgrade)
+        && !gui_bound_upgrade(&opts)
+        && upgrade::in_place()
+    {
+        return upgrade::reexec(&home, &paths);
+    }
+    exit_delay_for_tests();
+    served.code
 }
 
-/// Test hook, debug builds only (a release build ignores it): the Windows reply probes
+/// Test hook (debug builds): `XSHELLD_TEST_EXIT_DELAY_MS=<ms>`: after serving ends, wait
+/// that long before exiting, still holding the start lock (an older Daemon that is slow to
+/// go).
+fn exit_delay_for_tests() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Some(ms) = std::env::var("XSHELLD_TEST_EXIT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// A GUI-bound Daemon is replaced by the app that owns it, never in place.
+fn gui_bound_upgrade(opts: &cli::Opts) -> bool {
+    opts.parent_pid.is_some()
+}
+
+/// Test hook (debug builds): `XSHELLD_TEST_FAIL_RESTORE=<install dir>`: that build, on an
+/// update trial, fails to restore the first Terminal record (S4 C1).
+#[cfg(target_os = "linux")]
+fn fail_restore_for_tests() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("XSHELLD_TEST_FAIL_RESTORE").is_ok_and(|d| d == upgrade::own_dir())
+}
+
+/// Test hooks, debug builds only (a release build ignores them): the Windows reply probes
 /// (`tests/windows_submit.rs`) let this Daemon take replies without offering
 /// `term.submit` (`XSHELLD_TEST_SUBMIT=1`, before the build gate allows it), and write them
 /// in pieces of at most `XSHELLD_TEST_SUBMIT_PIECE` bytes, refused once
@@ -177,6 +321,18 @@ pub fn main_entry() -> i32 {
 fn submit_probe(cfg: &mut server::Config) {
     if !cfg!(debug_assertions) {
         return;
+    }
+    // `XSHELLD_TEST_HIDE_CAPABILITIES=a,b`: hello does not offer these (a Daemon of an
+    // older build, as far as a Desktop can tell).
+    // `XSHELLD_TEST_HIDE_CAPABILITIES_ONLY_IN=<install dir>`: only that build hides them (a
+    // Host of an older build that an update replaces with one that offers them).
+    let hide_here = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES_ONLY_IN")
+        .map_or(true, |d| d == upgrade::own_dir());
+    if let Some(v) = std::env::var("XSHELLD_TEST_HIDE_CAPABILITIES")
+        .ok()
+        .filter(|_| hide_here)
+    {
+        cfg.hide_capabilities = v.split(',').map(str::to_string).collect();
     }
     let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     if std::env::var_os("XSHELLD_TEST_SUBMIT").as_deref() == Some("1".as_ref()) {

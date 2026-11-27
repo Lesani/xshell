@@ -1,0 +1,17 @@
+DeviceCode version 1 word list — attribution and license
+
+The word-list asset is adapted from EFF's Long Wordlist, by Joseph Bonneau,
+Electronic Frontier Foundation (2016):
+https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt
+Method: https://www.eff.org/dice
+
+Licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0):
+https://creativecommons.org/licenses/by/4.0/
+Legal terms: https://creativecommons.org/licenses/by/4.0/legalcode
+EFF copyright policy: https://www.eff.org/copyright
+
+Modification by xshell: remove the four entries containing hyphens; choose 4096
+entries in the remaining original order at indices floor(i*7772/4096), i=0..4095.
+The original source and provenance hashes are retained alongside the frozen asset.
+No endorsement by EFF or Joseph Bonneau is implied. The asset is provided as-is,
+without warranties. The remainder of xshell's own code remains MIT licensed.

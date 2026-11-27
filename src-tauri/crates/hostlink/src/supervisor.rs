@@ -9,7 +9,9 @@ use crate::handle::Shared;
 use crate::install::{build_text, ensure_installed, kill_daemon_script, os_name, selected_remote};
 use crate::link::{Link, LinkError};
 use crate::process::run_script;
-use crate::status::{now_ms, IncompatibleReason, Phase, StatusKind, UpdateUnavailable};
+use crate::status::{
+    now_ms, IncompatibleReason, Phase, RouteUpdateUnavailable, StatusKind, UpdateUnavailable,
+};
 use crate::transport::{connect_command, sh_wrap, Transport};
 use crate::version::{self, classify, Classified};
 use std::sync::atomic::Ordering;
@@ -85,7 +87,7 @@ struct Sup {
     cancel: CancelToken,
     /// Install and the upgrade kill script; also what `dialer` runs `connect` through,
     /// unless the Host is reached directly.
-    transport: Arc<dyn Transport>,
+    transport: Option<Arc<dyn Transport>>,
     dialer: Box<dyn Dialer>,
     /// Installed over the transport (no Daemon command, not direct).
     managed: bool,
@@ -100,21 +102,45 @@ struct Sup {
     backoff: Backoff,
     install_verified: bool,
     last_gen: u64,
+    /// A Ring Host reached through the Relay: updated over its link when its Daemon offers
+    /// `daemon.stage` (S4).
+    relay: bool,
 }
 
 pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
     let cfg = sh.lock().cfg.clone();
-    let transport: Arc<dyn Transport> = sh.mc.transports.for_host(&cfg).into();
-    let direct = sh.mc.transports.direct(&cfg);
-    let override_ = cfg.daemon_override();
-    let scripted = direct.is_none();
-    let managed = override_.is_none() && scripted;
-    let dialer = direct.unwrap_or_else(|| {
-        Box::new(CommandDialer {
-            transport: transport.clone(),
-            remote_cmd: connect_command(override_, &sh.mc.install_dir()),
-        })
-    });
+    let relay = matches!(cfg.route, crate::config::HostRoute::Relay(_));
+    let (transport, dialer, managed, scripted, override_) = match &cfg.route {
+        crate::config::HostRoute::Relay(d) => (
+            None,
+            Box::new(d.clone()) as Box<dyn Dialer>,
+            false,
+            false,
+            None,
+        ),
+        crate::config::HostRoute::Configured(cfg) => {
+            let direct = sh.mc.transports.direct(cfg);
+            let override_ = cfg.daemon_override().map(String::from);
+            match direct {
+                Some(d) => (None, d, false, false, override_),
+                None => {
+                    let transport: Arc<dyn Transport> = sh.mc.transports.for_host(cfg).into();
+                    let dialer = Box::new(CommandDialer {
+                        transport: transport.clone(),
+                        remote_cmd: connect_command(override_.as_deref(), &sh.mc.install_dir()),
+                    });
+                    let managed = override_.is_none();
+                    (
+                        Some(transport),
+                        dialer as Box<dyn Dialer>,
+                        managed,
+                        true,
+                        override_,
+                    )
+                }
+            }
+        }
+    };
     let mut s = Sup {
         sh,
         cancel,
@@ -122,10 +148,11 @@ pub(crate) fn run(sh: Arc<Shared>, cancel: CancelToken) {
         dialer,
         managed,
         scripted,
-        override_: override_.map(String::from),
+        override_,
         backoff: Backoff::default(),
         install_verified: false,
         last_gen: 0,
+        relay,
     };
     s.run();
 }
@@ -203,7 +230,10 @@ impl Sup {
                                 Some("linux" | "macos")
                             )
                         {
-                            let _ = kill_daemon(&*self.transport, &self.cancel);
+                            let _ = kill_daemon(
+                                self.transport.as_deref().expect("scripted route"),
+                                &self.cancel,
+                            );
                         } else if self.dialer.upgradable() && cfg!(unix) {
                             let _ = self.dialer.stop_incompatible(&self.cancel);
                         }
@@ -338,8 +368,14 @@ impl Sup {
                         .unwrap_or_else(|| "connection lost".into()),
                 );
             }
-            // Connected: a kick has nothing to retry.
-            self.sh.kick.store(false, Ordering::SeqCst);
+            // Fresh identity proof may make previously gated attachments eligible.
+            // Preserve the same bounded backpressure retries as ordinary adoption.
+            if self.sh.kick.swap(false, Ordering::SeqCst) {
+                left = self.sh.reattach_locked(&mut st, c.gen, &c.link);
+                retries = 0;
+                retry_delay = Duration::from_millis(10);
+                retry_at = Instant::now() + retry_delay;
+            }
             let now = Instant::now();
             if left > 0 && retry_at <= now {
                 left = self.sh.reattach_locked(&mut st, c.gen, &c.link);
@@ -377,7 +413,7 @@ impl Sup {
             self.set_phase(Some(Phase::Probing));
             let on_upload = || self.set_phase(Some(Phase::Installing));
             match ensure_installed(
-                &*self.transport,
+                self.transport.as_deref().expect("scripted route"),
                 &*mc.binaries,
                 &version,
                 mc.desktop_build.as_ref(),
@@ -408,7 +444,12 @@ impl Sup {
             // Each attempt: the selected build may have changed since (an upgrade, another
             // Desktop). A host that refuses the script keeps the plain command.
             // Platform probe is the exact configured command, before any POSIX script.
-            let probe = crate::install::probe_override(&*self.transport, cmd, &self.cancel).ok();
+            let probe = crate::install::probe_override(
+                self.transport.as_deref().expect("scripted route"),
+                cmd,
+                &self.cancel,
+            )
+            .ok();
             let platform = probe
                 .as_ref()
                 .and_then(|p| p.os.as_deref())
@@ -422,7 +463,11 @@ impl Sup {
                 self.sh.publish(&mut st);
             }
             let dir = if matches!(platform.as_deref(), Some("linux" | "macos")) {
-                selected_remote(&*self.transport, cmd, &self.cancel)
+                selected_remote(
+                    self.transport.as_deref().expect("scripted route"),
+                    cmd,
+                    &self.cancel,
+                )
             } else {
                 None
             };
@@ -430,7 +475,7 @@ impl Sup {
                 return Attempt::Cancelled;
             }
             self.dialer = Box::new(CommandDialer {
-                transport: self.transport.clone(),
+                transport: self.transport.clone().expect("scripted route"),
                 remote_cmd: match &dir {
                     Some(d) => connect_command(None, d),
                     None => connect_command(Some(cmd), ""),
@@ -474,8 +519,29 @@ impl Sup {
                 n.trim()
             );
         }
-        let upgradable = self.upgradable();
+        if self.cancel.is_cancelled() || !self.dialer.authorized() {
+            link.close();
+            return Attempt::Cancelled;
+        }
+        let ring_stage = self.relay
+            && hello
+                .capabilities
+                .iter()
+                .any(|c| c == xshell_protocol::cap::DAEMON_STAGE);
+        let upgradable = self.upgradable() || ring_stage;
         let ours_build = mc.desktop_build.as_ref();
+        // A Ring Host that differs from this Desktop and cannot take an update over the Ring
+        // shows how to update it there instead (S4).
+        let ring_unsupported = self.relay
+            && !ring_stage
+            && version::update_eligible(&version, ours_build, &hello.version, hello.build.as_ref());
+        // A Ring Host that updates itself from the latest release (ADR-0019 amendment, D4):
+        // outdated only against that release, never "build differs".
+        let release_capable = self.relay
+            && hello
+                .capabilities
+                .iter()
+                .any(|c| c == xshell_protocol::cap::DAEMON_UPDATE_LATEST);
         let (negotiated, upgrade_pending, build_differs) =
             match classify(&version, ours_build, mc.ours, &hello, upgradable) {
                 Classified::Compatible {
@@ -485,8 +551,14 @@ impl Sup {
                 } => (negotiated, upgrade_pending, build_differs),
                 Classified::Incompatible { reason, message } => {
                     let mut st = self.sh.lock();
+                    st.release_updates = false;
                     st.status.update_unavailable =
                         UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                    if self.relay {
+                        // No common protocol: not over the Ring either.
+                        st.status.route_update_unavailable =
+                            Some(RouteUpdateUnavailable::RingUpdateUnsupported);
+                    }
                     drop(st);
                     link.close();
                     return Attempt::Failed(Failure {
@@ -497,6 +569,14 @@ impl Sup {
                     });
                 }
             };
+        let (upgrade_pending, build_differs) = if release_capable {
+            (
+                version::release_outdated(mc.latest().as_ref(), &hello.version),
+                false,
+            )
+        } else {
+            (upgrade_pending, build_differs)
+        };
         if !self.sh.wait_first_list(gen, FIRST_LIST_TIMEOUT) {
             link.close();
             if self.cancel.is_cancelled() {
@@ -509,15 +589,37 @@ impl Sup {
                 reinstall: false,
             });
         }
+        let relay = self.relay;
+        // A Ring Host is published with its OS already known (or known to be unknown), so an
+        // OS-dependent launch right after it connects never falls back to Linux.
+        let platform = if relay {
+            self.platform_now(&link, PLATFORM_WAIT)
+        } else {
+            None
+        };
         let adopted = self.sh.adopt(gen, &link, |st| {
+            if let Some((os, arch)) = &platform {
+                st.status.os = Some((*os).into());
+                st.status.arch = Some(arch.clone());
+            }
             // After an upgrade or a replacement (R7, C4): the Daemon must be this Desktop's
             // version and build. Another Desktop's connector may have won the restart.
             // Authorization/classification belongs to the current mode; completion belongs
             // to the already accepted operation, including a GUI-bound successor.
             let expect = st.upgrade_expect;
-            let ver_mismatch = expect && hello.version != version;
+            st.release_updates = release_capable;
+            // The identity the update must come back with: the release the Host installed
+            // (D5), or this Desktop's build.
+            let (want_v, want_b) = st
+                .upgrade_identity
+                .clone()
+                .map(|(v, b)| (v, Some(b)))
+                .unwrap_or_else(|| (version.clone(), ours_build.cloned()));
+            let ver_mismatch = expect && hello.version != want_v;
             let build_mismatch = expect
-                && ours_build.is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
+                && want_b
+                    .as_ref()
+                    .is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
             st.status.set_kind(if upgrade_pending || ver_mismatch {
                 StatusKind::UpgradePending
             } else if build_differs || build_mismatch {
@@ -527,6 +629,10 @@ impl Sup {
             });
             st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
             st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+            if relay {
+                st.status.route_update_unavailable =
+                    ring_unsupported.then_some(RouteUpdateUnavailable::RingUpdateUnsupported);
+            }
             st.status.daemon_version = Some(hello.version.clone());
             st.status.daemon_build = hello.build.clone();
             st.status.protocol = Some(negotiated);
@@ -535,15 +641,15 @@ impl Sup {
                 .then(|| st.status.last_error.clone()).flatten();
             st.status.last_error = if ver_mismatch {
                 Some(format!(
-                    "xshelld {} is still running after the upgrade to {version}",
+                    "xshelld {} is still running after the upgrade to {want_v}",
                     hello.version
                 ))
             } else if build_mismatch {
                 Some(format!(
-                    "xshelld {} ({}) is still running after replacement; expected {version} ({}). Try Replace again. If this repeats, quit other xshell apps using this host.",
+                    "xshelld {} ({}) is still running after replacement; expected {want_v} ({}). Try Replace again. If this repeats, quit other xshell apps using this host.",
                     hello.version,
                     build_text(hello.build.as_ref()),
-                    build_text(ours_build)
+                    build_text(want_b.as_ref())
                 ))
             } else { previous_update_error };
             st.status.error_hint = st.status.last_error.as_ref().map(|_| HostErrorHint::UpdateFailed);
@@ -552,6 +658,7 @@ impl Sup {
             if expect {
                 st.upgrading = false;
                 st.upgrade_expect = false;
+                st.upgrade_identity = None;
                 st.upgrade_operation = None;
                 st.upgrade_complete_deadline = None;
                 st.upgrade_deadline = None;
@@ -575,6 +682,9 @@ impl Sup {
                 reinstall: false,
             });
         };
+        if ring_stage {
+            self.check_rolled_back(&link, gen, &hello);
+        }
         Attempt::Connected(Connected {
             link,
             conn,
@@ -584,6 +694,70 @@ impl Sup {
         })
     }
 
+    /// A Ring Host is never probed over SSH, so its OS is unknown until its Daemon says which
+    /// target it is (`daemon.update-info`, answered by every Ring-era Daemon whether or not
+    /// it stages updates). Asked once on link-up, before the Host is published as usable,
+    /// waiting at most `wait`. `None`: unknown (an older Daemon answers the request with an
+    /// error, or it did not answer in time); the Desktop's fallback then applies.
+    fn platform_now(&self, link: &Arc<Link>, wait: Duration) -> Option<(&'static str, String)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        link.request(
+            xshell_protocol::msg::ClientMsg::DaemonUpdateInfo,
+            wait,
+            Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        )
+        .ok()?;
+        let info = rx.recv_timeout(wait).ok()?.ok()?;
+        let info = serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(info).ok()?;
+        platform_of_target(&info.target)
+    }
+
+    /// After this Desktop updated a Ring Host and another build came back: ask the Daemon
+    /// whether that update was rolled back, and say so (S4, copy `update.rolledBack`).
+    fn check_rolled_back(&self, link: &Arc<Link>, gen: u64, hello: &xshell_protocol::msg::Hello) {
+        const ASK_FOR: Duration = Duration::from_secs(15 * 60);
+        let theirs = xshell_protocol::build::install_dir_name(&hello.version, hello.build.as_ref());
+        let dir = {
+            let mut st = self.sh.lock();
+            match st.ring_update.clone() {
+                Some((_, at)) if at.elapsed() > ASK_FOR => {
+                    st.ring_update = None;
+                    return;
+                }
+                Some((dir, _)) if dir != theirs => dir,
+                _ => return,
+            }
+        };
+        let weak = Arc::downgrade(&self.sh);
+        let old = hello.version.clone();
+        let _ = link.request(
+            xshell_protocol::msg::ClientMsg::DaemonUpdateInfo,
+            self.sh.mc.term_timeout,
+            Box::new(move |r| {
+                let Some(sh) = weak.upgrade() else { return };
+                let Ok(info) = r.and_then(|v| {
+                    serde_json::from_value::<xshell_protocol::msg::UpdateInfo>(v)
+                        .map_err(|e| crate::errors::HostError::offline(e.to_string()))
+                }) else {
+                    return;
+                };
+                if !info.last_failure.is_some_and(|f| f.target == dir) {
+                    return;
+                }
+                let mut st = sh.lock();
+                if st.gen != gen || st.upgrading {
+                    return;
+                }
+                st.ring_update = None;
+                st.status.last_error = Some(crate::handle::ring_rolled_back(&st.cfg.name, &old));
+                st.status.error_hint = Some(HostErrorHint::UpdateFailed);
+                sh.publish(&mut st);
+            }),
+        );
+    }
+
     fn link_failure(&self, conn: &dyn Connection, e: LinkError) -> Failure {
         match e {
             LinkError::Incompatible { hello, message } => {
@@ -591,6 +765,10 @@ impl Sup {
                     let mut st = self.sh.lock();
                     st.status.update_unavailable =
                         UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                    if self.relay {
+                        st.status.route_update_unavailable =
+                            Some(RouteUpdateUnavailable::RingUpdateUnsupported);
+                    }
                 }
                 let reason = match version::classify(
                     &self.sh.mc.desktop_version,
@@ -630,8 +808,51 @@ fn reason_json(r: version::IncompatibleReason) -> IncompatibleReason {
     }
 }
 
+/// How long link-up waits for a Ring Host's platform before publishing it as unknown.
+const PLATFORM_WAIT: Duration = Duration::from_secs(3);
+
+/// The OS (as `HostStatus::os` names it) and arch of a Daemon target triple
+/// (`xshell_protocol::build::host_triple`).
+pub(crate) fn platform_of_target(target: &str) -> Option<(&'static str, String)> {
+    let arch = target
+        .split('-')
+        .next()
+        .filter(|a| !a.is_empty())?
+        .to_string();
+    let os = if target.contains("-windows") {
+        "windows"
+    } else if target.contains("-linux") {
+        "linux"
+    } else if target.contains("-apple-darwin") {
+        "macos"
+    } else {
+        return None;
+    };
+    Some((os, arch))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn platform_of_every_daemon_target() {
+        use super::platform_of_target as p;
+        for (os, arch) in [
+            ("windows", "x86_64"),
+            ("Linux", "x86_64"),
+            ("Linux", "aarch64"),
+            ("Darwin", "arm64"),
+            ("Darwin", "x86_64"),
+        ] {
+            let triple = xshell_protocol::build::host_triple(os, arch).unwrap();
+            let (got, got_arch) = p(triple).unwrap();
+            assert_eq!(Some(got), crate::install::os_name(os), "{triple}");
+            assert_eq!(got_arch, triple.split('-').next().unwrap());
+        }
+        assert_eq!(p("x86_64-pc-windows-msvc").unwrap().0, "windows");
+        assert!(p("riscv64-unknown-freebsd").is_none());
+        assert!(p("").is_none());
+    }
+
     use super::*;
     use crate::config::test_host;
     use crate::manager::tests::{script_factory, test_config, Recorder};
@@ -648,7 +869,7 @@ mod tests {
         let supervisor = Sup {
             sh: sh.clone(),
             cancel: CancelToken::new(),
-            transport: transport.clone(),
+            transport: Some(transport.clone()),
             dialer: Box::new(CommandDialer {
                 transport,
                 remote_cmd: "unused".into(),
@@ -659,6 +880,7 @@ mod tests {
             backoff: Backoff::default(),
             install_verified: true,
             last_gen: 0,
+            relay: false,
         };
         {
             let mut st = sh.lock();

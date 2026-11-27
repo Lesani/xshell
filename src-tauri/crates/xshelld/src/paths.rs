@@ -14,7 +14,7 @@ pub struct Paths {
     /// The socket (a pipe name on Windows).
     pub socket: PathBuf,
     /// `daemon.lock`, next to the socket (Windows: in `home/.xshell/run`): held by the one
-    /// running `serve`.
+    /// endpoint owner. Store lifetime exclusion uses `ring/runtime-owner.lock`.
     pub lock: PathBuf,
     /// `daemon.pid` next to the lock, written by `serve`.
     pub pid: PathBuf,
@@ -35,6 +35,10 @@ pub struct Paths {
     /// Per-user private temp dir for `HostCtx.temp_dir` (dropped files):
     /// `$XDG_RUNTIME_DIR/xshell/tmp`, else `home/.xshell/tmp`.
     pub tmp: PathBuf,
+    /// `home/.xshell/run/daemon.endpoint`: the pid and socket of the `serve` that holds the
+    /// lock, written once it holds it (Unix). Always under the home, whatever
+    /// `XDG_RUNTIME_DIR` says, so every client finds the one Daemon of this home.
+    pub endpoint: PathBuf,
 }
 
 /// The paths of this platform. Environment values are passed in; on Windows
@@ -101,11 +105,125 @@ fn with_home(home: &Path, socket: PathBuf, lock_dir: &Path, tmp: PathBuf) -> Pat
         server_root: xshell_core::server::server_root(home),
         ring_dir: home.join(".xshell").join("daemon").join("ring"),
         tmp,
+        endpoint: endpoint_path(home),
     }
 }
 
-/// How the Daemon on this machine is run: by the xshell app (GUI-bound, ADR-0005) or on its
-/// own (Persistent). Recorded in [`Paths::mode`] by each `serve` that takes the lock.
+/// `home/.xshell/run/daemon.endpoint` (see [`Paths::endpoint`]).
+pub fn endpoint_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_endpoint_path(home)
+}
+
+/// Record the socket this Daemon (pid `pid`) listens on: `<pid>\n<socket>\n`, written to a
+/// private temp file and renamed over `path`, in a private directory.
+#[cfg(unix)]
+pub fn write_endpoint(path: &Path, pid: u32, socket: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = private_file(
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&tmp)?;
+        let mut body = format!("{pid}\n").into_bytes();
+        body.extend_from_slice(socket.as_os_str().as_bytes());
+        body.push(b'\n');
+        f.write_all(&body)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// The pid and socket an endpoint record names; `None` when missing or malformed.
+#[cfg(unix)]
+pub fn read_endpoint(path: &Path) -> Option<(u32, PathBuf)> {
+    xshell_hostlink::local::read_local_endpoint(path)
+}
+
+/// Remove the endpoint record if it still names `pid` (a clean exit).
+#[cfg(unix)]
+pub fn remove_endpoint_of(path: &Path, pid: u32) {
+    if read_endpoint(path).is_some_and(|(p, _)| p == pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// `home/.xshell/run/daemon.owner` (see `xshell_hostlink::local::local_owner_path`).
+pub fn owner_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_owner_path(home)
+}
+
+/// `home/.xshell/run/daemon.start` (see `xshell_hostlink::local::local_start_path`).
+pub fn start_path(home: &Path) -> PathBuf {
+    xshell_hostlink::local::local_start_path(home)
+}
+
+/// The socket of the Daemon that serves this home (A2): the one its endpoint record names
+/// while that Daemon holds the owner lock, else `fallback` (the socket the environment
+/// derives); a stale record is removed. Callers with an explicit `--socket` /
+/// `XSHELLD_SOCKET` skip this.
+#[cfg(unix)]
+pub fn live_socket(home: &Path, fallback: &Path) -> PathBuf {
+    xshell_hostlink::local::local_live_socket(home, fallback)
+}
+
+/// [`live_socket`] given the endpoint record's path (`home/.xshell/run/daemon.endpoint`).
+#[cfg(unix)]
+pub fn live_socket_at(endpoint: &Path, fallback: &Path) -> PathBuf {
+    match endpoint.ancestors().nth(3) {
+        Some(home) => live_socket(home, fallback),
+        None => fallback.to_path_buf(),
+    }
+}
+
+/// Whether a Daemon of this home is alive or starting (owner or start lock held), or an
+/// older-build Daemon answers on the environment's socket.
+#[cfg(unix)]
+pub fn daemon_alive(home: &Path, env_socket: &Path) -> bool {
+    xshell_hostlink::local::local_daemon_alive(home, env_socket)
+}
+
+/// Take `path`'s lock exclusively for this process's life (the file stays open, close-on-exec):
+/// `Ok(Some)` held, `Ok(None)` another process holds it. Retried briefly, so a client's
+/// momentary shared probe never makes us give up.
+#[cfg(unix)]
+pub fn hold_exclusive(path: &Path) -> io::Result<Option<fs::File>> {
+    if let Some(dir) = path.parent() {
+        ensure_private_dir(dir)?;
+    }
+    let f = private_file(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false),
+    )
+    .open(path)?;
+    for _ in 0..10 {
+        match f.try_lock() {
+            Ok(()) => return Ok(Some(f)),
+            Err(fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     GuiBound,
@@ -168,12 +286,24 @@ pub fn private_file(o: &mut fs::OpenOptions) -> &mut fs::OpenOptions {
 /// Create `dir` (and parents) as 0700. An existing dir must be owned by us; a mode broader
 /// than 0700 is tightened. Windows: created, and it must be a directory; the user profile's
 /// ACL is inherited.
+/// Create `dir` and every missing ancestor with mode 0700 whatever the umask (S4 P1-7);
+/// existing directories are left as they are.
+#[cfg(unix)]
+pub fn create_private_dirs(dir: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    for d in missing.into_iter().rev() {
+        match fs::DirBuilder::new().mode(0o700).create(d) {
+            Ok(()) => fs::set_permissions(d, fs::Permissions::from_mode(0o700))?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    create_private_dirs(dir)?;
     #[cfg(not(unix))]
     fs::create_dir_all(dir)?;
     let meta = fs::symlink_metadata(dir)?;
@@ -246,6 +376,55 @@ mod tests {
         assert_eq!(p.lock, PathBuf::from("/r/xshell/daemon.lock"));
         assert_eq!(p.pid, PathBuf::from("/r/xshell/daemon.pid"));
         assert_eq!(p.tmp, PathBuf::from("/r/xshell/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_record_round_trip_and_liveness() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let p = resolve_unix(home, Some(Path::new("/r")), None);
+        assert_eq!(p.endpoint, home.join(".xshell/run/daemon.endpoint"));
+        // Whatever XDG says, the record is under the home.
+        assert_eq!(resolve_unix(home, None, None).endpoint, p.endpoint);
+        let fallback = Path::new("/env/daemon.sock");
+        assert_eq!(live_socket(home, fallback), fallback);
+        assert!(!daemon_alive(home, fallback));
+        // A record naming a live process (this one), but nobody holds the owner lock:
+        // stale, ignored and removed. A PID never decides liveness.
+        write_endpoint(&p.endpoint, std::process::id(), Path::new("/x/daemon.sock")).unwrap();
+        assert_eq!(
+            read_endpoint(&p.endpoint),
+            Some((std::process::id(), PathBuf::from("/x/daemon.sock")))
+        );
+        let mode = fs::metadata(&p.endpoint).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(live_socket(home, fallback), fallback);
+        assert!(!p.endpoint.exists(), "the stale record was removed");
+        // The owner lock held: the record is followed, and the Daemon counts as alive.
+        let owner = hold_exclusive(&owner_path(home)).unwrap().unwrap();
+        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
+        assert_eq!(live_socket(home, fallback), PathBuf::from("/x/daemon.sock"));
+        assert!(daemon_alive(home, fallback));
+        drop(owner);
+        assert_eq!(live_socket(home, fallback), fallback);
+        // The start lock alone (a Daemon still preparing) counts as alive too.
+        let start = hold_exclusive(&start_path(home)).unwrap().unwrap();
+        assert!(daemon_alive(home, fallback));
+        assert!(hold_exclusive(&start_path(home)).unwrap().is_none());
+        drop(start);
+        assert!(!daemon_alive(home, fallback));
+        // Removed only by its own pid.
+        write_endpoint(&p.endpoint, 999_999_999, Path::new("/x/daemon.sock")).unwrap();
+        remove_endpoint_of(&p.endpoint, 42);
+        assert!(p.endpoint.exists());
+        remove_endpoint_of(&p.endpoint, 999_999_999);
+        assert!(!p.endpoint.exists());
+        // Malformed records are ignored.
+        fs::write(&p.endpoint, "abc\n/x\n").unwrap();
+        assert_eq!(read_endpoint(&p.endpoint), None);
+        fs::write(&p.endpoint, "1234\nrelative\n").unwrap();
+        assert_eq!(read_endpoint(&p.endpoint), None);
     }
 
     #[cfg(unix)]

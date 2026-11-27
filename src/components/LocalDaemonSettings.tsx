@@ -4,66 +4,92 @@ import { ArrowUpCircle, RefreshCcw } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { fmt } from "../hosts/strings";
 import { LOCAL_HOST, type LocalHostInfo, type LocalPersistentInfo } from "../hosts/localHost";
-import { confirmAgainCount, controls, effectivePersistent, errorCode, initialState, localDaemonLine, localDaemonVisible, otherBuildNote, reduce, startsSwitch, startsUpgrade, statusErrorText, switchErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
+import { controls, errorCode, initialState, localDaemonLine, localDaemonVisible, otherBuildNote, reduce, startsUpgrade, statusErrorText, trackMounted, type Action, type State } from "../hosts/localDaemon";
+import { C, fmtc } from "../ring/copy";
+import type { LocalStatus } from "../local/localInfo";
 import { updateTarget, type UpdateTarget } from "../hosts/hostUpdate";
-import { buildText } from "../buildId";
 import { statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostStatus, TerminalInfo } from "../hosts/types";
 
-// Settings → Hosts → "This computer": keep this computer's terminals running after quit (a
-// Persistent Daemon, #25). Self-contained, so it can move to another settings page as is.
+// Settings → Hosts → "This computer": the Local Host's Daemon (its build, upgrade) and whether
+// closing xshell asks before leaving this machine's terminals running (D5). Self-contained.
 
-// Its own toggle: the shared one shows a disabled toggle as off, but this one keeps showing
-// the stored value while a switch runs.
-function PersistentToggle({ checked, disabled, onChange }: { checked: boolean; disabled: boolean; onChange: (v: boolean) => void }) {
+// "Always keep terminals running in the background" (D5): `local_keep_sessions` is `ask` (the
+// quit prompt asks) or `always`. Only where the Daemon is kept running (not on Windows).
+export function KeepSessionsRow() {
+  const [value, setValue] = useState<"ask" | "always" | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const mounted = useRef(false);
+  useEffect(() => trackMounted(mounted), []);
+  useEffect(() => {
+    invoke<string>("local_keep_sessions_get").then(v => { if (mounted.current) setValue(v === "always" ? "always" : "ask"); }).catch(() => { if (mounted.current) setValue("ask"); });
+  }, []);
+  const change = async (on: boolean) => {
+    const before = value;
+    const next = on ? "always" : "ask";
+    setValue(next);
+    setSaving(true);
+    setFailed(false);
+    try {
+      await invoke("local_keep_sessions_set", { value: next });
+    } catch {
+      // Not saved: the toggle shows what is stored.
+      if (mounted.current) { setValue(before); setFailed(true); }
+    } finally {
+      if (mounted.current) setSaving(false);
+    }
+  };
   return (
-    <label className={`settings-toggle ${disabled ? "settings-toggle-disabled" : ""}`}>
-      <input type="checkbox" aria-label={fmt("local.persistent.title")} checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
-      <span className="settings-toggle-slider" />
-    </label>
+    <>
+      <div className="settings-row" data-keep-sessions>
+        <div className="settings-row-text">
+          <div className="settings-row-title">{C["quit.setting"]}</div>
+          <div className="settings-row-desc">{C["quit.setting.body"]}</div>
+        </div>
+        <div className="settings-row-control">
+          <label className={`settings-toggle ${value === null || saving ? "settings-toggle-disabled" : ""}`}>
+            <input type="checkbox" aria-label={C["quit.setting"]} checked={value === "always"} disabled={value === null || saving} onChange={(e) => void change(e.target.checked)} />
+            <span className="settings-toggle-slider" />
+          </label>
+        </div>
+      </div>
+      {failed && <div className="host-form-error" role="alert">{C["quit.setting.failed"]}</div>}
+    </>
   );
 }
 
+const NO_PERSISTENT: LocalPersistentInfo = { supported: false, enabled: false, running: null, log: null };
+
 export interface ViewProps {
   persistent: LocalPersistentInfo;
+  // The keep-terminals setting applies (a kept-running Daemon, not Windows).
+  keep?: boolean;
   status: HostStatus | undefined;
   live: TerminalInfo[] | null | undefined;
   state: State;
   dispatch: (a: Action) => void;
 }
 
-export function LocalDaemonView({ persistent, status, live, state, dispatch }: ViewProps) {
+export function LocalDaemonView({ persistent, keep = false, status, live, state, dispatch }: ViewProps) {
   const c = controls(state, persistent, status, live);
-  const line = localDaemonLine(status, persistent.running);
+  // This computer is never shown with build hashes: versions only.
+  const line = localDaemonLine(status ? { ...status, daemonBuild: undefined } : status, persistent.running);
   const n = live?.length ?? 0;
   const pending = status?.status === "upgrade-pending" || status?.status === "build-differs" || status?.status === "incompatible";
-  const other = otherBuildNote(status, persistent.running);
+  const other = otherBuildNote(status, persistent.running) ? fmt("local.daemon.otherBuild", { build: status?.daemonVersion ?? "" }) : null;
+  // The backend's diagnostic is not shown (no raw backend text); it goes to the debug console.
   const backendError = statusErrorText(status, state.error);
+  useEffect(() => { if (backendError) console.debug("local Daemon update:", backendError); }, [backendError]);
   const phase = state.phase;
   return (
     <div className="settings-section">
       <div className="settings-section-head">
         <div className="settings-section-title">{fmt("local.section.title")}</div>
-        {persistent.supported && <div className="settings-section-desc">{fmt("local.section.desc")}</div>}
       </div>
       <div className="settings-section-body">
-        {persistent.supported && <div className="settings-row">
-          <div className="settings-row-text">
-            <div className="settings-row-title">{fmt("local.persistent.title")}</div>
-            <div className="settings-row-desc">{fmt("local.persistent.desc")}</div>
-          </div>
-          <div className="settings-row-control">
-            <PersistentToggle checked={c.checked} disabled={c.disabled} onChange={(target) => dispatch({ type: "toggle", target, terminals: n })} />
-          </div>
-        </div>}
-        {persistent.supported && c.hint && <div className="host-row-note">{c.hint}</div>}
+        {keep && <KeepSessionsRow />}
         {state.error && <div className="host-row-error"><span className="host-row-error-text">{state.error}</span></div>}
-        {backendError && (
-          <div className="host-row-error">
-            <span className="host-row-error-label">{fmt("hosts.row.lastError")}</span>
-            <span className="host-row-error-text">{backendError}</span>
-          </div>
-        )}
         {(line || (pending && persistent.enabled)) && (
           <div className="host-row-info">
             {line && <span>{line}</span>}
@@ -79,7 +105,7 @@ export function LocalDaemonView({ persistent, status, live, state, dispatch }: V
               </button>
             )}
             {c.showReplace && (
-              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "replace", terminals: n, build: buildText(status?.desktopBuild) })}>
+              <button className="btn btn-ghost settings-action-btn" disabled={c.upgradeDisabled} onClick={() => dispatch({ type: "replace", terminals: n, build: status?.desktopVersion ?? "" })}>
                 <RefreshCcw size={11} /> {c.replaceBusy ? fmt("hosts.row.replacing") : fmt("hosts.row.replaceBuild")}
               </button>
             )}
@@ -95,9 +121,11 @@ export function LocalDaemonView({ persistent, status, live, state, dispatch }: V
 
 // What the settings page renders for the backend's `local_host_info`: nothing without a
 // Local Daemon; its build and notes everywhere; persistence only where supported.
-export function LocalDaemonSection({ info, ...rest }: Omit<ViewProps, "persistent"> & { info: LocalHostInfo | null }) {
+export function LocalDaemonSection({ info, ...rest }: Omit<ViewProps, "persistent" | "keep"> & { info: LocalHostInfo | null }) {
   if (!localDaemonVisible(info)) return null;
-  return <LocalDaemonView persistent={effectivePersistent(info)} {...rest} />;
+  // The always-on Daemon has no GUI-bound/Persistent mode any more: the raw (legacy) info, so
+  // no mode wording is derived from it.
+  return <LocalDaemonView persistent={info.persistent ?? NO_PERSISTENT} keep={(info as LocalStatus).service != null} {...rest} />;
 }
 
 export function LocalDaemonSettings() {
@@ -126,24 +154,13 @@ export function LocalDaemonSettings() {
     const next = reduce(prev, a);
     stateRef.current = next;
     setState(next);
-    const start = startsSwitch(prev, next);
-    if (start) {
-      invoke<LocalHostInfo>("local_daemon_set_persistent", { enabled: start.target, confirmed: start.confirmed })
-        .then(i => { if (mounted.current) setInfo(i); dispatch({ type: "switched" }); })
-        .catch(e => {
-          const code = errorCode(e);
-          const again = confirmAgainCount(code);
-          if (again !== null) dispatch({ type: "confirm-again", terminals: again });
-          else dispatch({ type: "failed", error: switchErrorText(code, info?.persistent?.log) });
-          refresh();
-        });
-    }
     if (startsUpgrade(prev, next)) {
       invoke("host_upgrade", { host: LOCAL_HOST, target: confirmedTarget.current })
         .then(() => dispatch({ type: "upgraded" }))
-        .catch(e => dispatch({ type: "failed", error: fmt("local.persistent.err.failed", { error: errorCode(e) }) }));
+        // COPY-GAP: no text for "the local update failed"; the nearest approved line.
+        .catch(e => { console.debug("local Daemon update failed:", errorCode(e)); dispatch({ type: "failed", error: fmtc("update.notBack", { name: fmt("local.section.title") }) }); });
     }
-  }, [info, refresh, status]);
+  }, [status]);
 
   return <LocalDaemonSection info={info} status={status} live={live} state={state} dispatch={dispatch} />;
 }

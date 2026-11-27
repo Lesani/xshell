@@ -14,7 +14,7 @@ import { timeAgo, processSessions, sessionMessageLabel } from "../utils";
 import { useProjectImage } from "../hooks/useProjectImage";
 import logo from "../assets/logo.png";
 import type { ProjectInfo, ProjectSettings, SessionFolder, SessionInfo } from "../types";
-import { keyOf, lookupKey, sessionKeyOf, sessionFolderId, type ProjectKey } from "../hosts/projectKey";
+import { lookupProjectValue, keyOf, lookupKey, sessionKeyOf, sessionFolderId, type ProjectKey } from "../hosts/projectKey";
 import { HostBadge } from "./HostBadge";
 import { registry } from "../hosts/registry";
 import { fmt } from "../hosts/strings";
@@ -535,7 +535,7 @@ function Tile({ label, value, sub, accent }: { label: string; value: string; sub
 }
 
 function ProjectIcon({ project, projectIcons, size }: { project: ProjectInfo; projectIcons: Record<string, ProjectSettings>; size: number }) {
-  const settings = projectIcons[lookupKey(keyOf(project))];
+  const settings = lookupProjectValue(projectIcons, keyOf(project));
   const iconValue = settings?.icon;
   const displayName = settings?.customName || project.name;
   const imgSrc = useProjectImage(iconValue);
@@ -605,7 +605,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
   // Live-read folders for the selected project. A new array identity only when it actually changes.
   const folders: SessionFolder[] = useMemo(() => {
     if (!selectedProject) return [];
-    return projectIcons[lookupKey(keyOf(selectedProject))]?.folders || [];
+    return lookupProjectValue(projectIcons, keyOf(selectedProject))?.folders || [];
   }, [selectedProject, projectIcons]);
 
   // Reset search / any in-progress folder ops when project changes
@@ -753,7 +753,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
                 <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
                   <ProjectIcon project={selectedProject} projectIcons={projectIcons} size={40} />
                   <div>
-                    <div className="sessions-view-title">{projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name}</div>
+                    <div className="sessions-view-title">{lookupProjectValue(projectIcons, keyOf(selectedProject))?.customName || selectedProject.name}</div>
                     <div className="sessions-view-path">{selectedProject.host && <HostBadge host={selectedProject.host} size="md" className="sessions-view-host" tooltip={fmt("home.session.hostBadge", { host: registry.hostName(selectedProject.host) })} tt={tt} />}{selectedProject.path}</div>
                   </div>
                 </div>
@@ -902,7 +902,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
           );
         })()}
         </div>
-        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} host={selectedProject.host} projectName={projectIcons[lookupKey(keyOf(selectedProject))]?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity"), pi: projectSessions.some(s => s.agent === "pi") }} />}
+        {contextTreeEnabled && <SkillsPanel projectPath={selectedProject.path} host={selectedProject.host} projectName={lookupProjectValue(projectIcons, keyOf(selectedProject))?.customName || selectedProject.name} agentPresence={{ claude: projectSessions.some(s => s.agent === "claude"), codex: projectSessions.some(s => s.agent === "codex"), cursor: projectSessions.some(s => s.agent === "cursor"), opencode: projectSessions.some(s => s.agent === "opencode"), antigravity: projectSessions.some(s => s.agent === "antigravity"), pi: projectSessions.some(s => s.agent === "pi") }} />}
       </div>
     );
   }
@@ -946,7 +946,7 @@ export function HomeView({ projectTerminals = [], onFocusTerminal, projects, act
                       return (
                         <div key={keyOf(project)} className={`project-pill ${activeCount > 0 ? "is-active" : ""}`} onClick={() => onSelectProject(project)} {...ttProps(tt, activeCount > 0 ? `${project.path} · ${activeCount} active session${activeCount === 1 ? "" : "s"}` : project.path)}>
                           <ProjectIcon project={project} projectIcons={projectIcons} size={20} />
-                          <span className="project-pill-name">{projectIcons[lookupKey(keyOf(project))]?.customName || project.name}</span>
+                          <span className="project-pill-name">{lookupProjectValue(projectIcons, keyOf(project))?.customName || project.name}</span>
                           {activeCount > 0 && <span className="project-pill-badge">{activeCount}</span>}
                         </div>
                       );

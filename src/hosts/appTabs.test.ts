@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: class {} }));
 
-import { isRemoteDataHost, listsForReconcile, needsCache, persistableTabs, restorableTabs, restoreGroups, withHostData } from "./appTabs";
+import { isRemoteDataHost, listsForReconcile, persistableTabs, restorableTabs, restoreGroups, withHostData } from "./appTabs";
 import type { Group, ProjectInfo, SessionInfo, Tab } from "../types";
 import type { TerminalInfo } from "./types";
 
@@ -60,10 +60,10 @@ describe("restorableTabs", () => {
     expect(a.map(t => t.id)).toEqual(["terminal-s1-a", "remote-r1"]);
   });
 
-  it("needs the cache with Remote Hosts or in local Daemon mode (M6)", () => {
-    expect(needsCache(0, false)).toBe(false);
-    expect(needsCache(1, false)).toBe(true);
-    expect(needsCache(0, true)).toBe(true);
+  it("restores retained Ring cache with no saved SSH or Local Daemon", () => {
+    const r = `r_${"b".repeat(64)}`;
+    expect(restorableTabs({ saved: [], hosts: [r], localDaemon: false, cached: () => [info("offline", 1)] })[0])
+      .toMatchObject({ host: r, terminal: "offline" });
   });
 });
 
@@ -159,4 +159,16 @@ describe("in-process custom name persistence round trip", () => {
       expect(restored[0].customTitle).toBe(value); expect(restored[0].title).toBe("Latest auto");
     }
   });
+});
+
+import { registry } from "./registry";
+it("restorableTabs deduplicates verified r/h aliases and excludes proven Local while retaining offline UUIDs", async () => {
+  const r = `r_${"c".repeat(64)}`, local = `r_${"d".repeat(64)}`;
+  registry.applyAvailable({ sequence: 1, hosts: [
+    { id: H, aliases: [H, r], name: "SSH equivalent", color: null, daemonKey: "key", routes: ["ssh", "relay"], activeRoute: "ssh", reachability: { kind: "unknown" } },
+    { id: "local", aliases: ["local", local], name: "Local", color: null, daemonKey: "local-key", routes: ["local", "relay"], activeRoute: "local", reachability: { kind: "unknown" } },
+  ] });
+  const tabs = restorableTabs({ saved: [], hosts: [H, r, local], localDaemon: true,
+    cached: host => host === "local" ? [info("local", 1)] : [info("retained", 2)] });
+  expect(tabs.map(t => [t.terminal, t.host])).toEqual([["retained", r], ["local", undefined]]);
 });

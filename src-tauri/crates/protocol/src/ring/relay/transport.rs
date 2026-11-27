@@ -247,6 +247,81 @@ pub(crate) fn dial_with_headers(
     deadline: Instant,
     write_buffer_max: usize,
 ) -> Result<WebSocket<Conn>, RingError> {
+    dial_mapped(
+        url,
+        endpoint,
+        headers,
+        tls,
+        deadline,
+        write_buffer_max,
+        map_ws_error,
+    )
+    .map_err(|e| match e {
+        DialFailure::Ring(e) => e,
+        DialFailure::RateLimited => unreachable!("dial maps HTTP answers to RingError"),
+    })
+}
+
+/// Why a pairing slot could not be opened ([`dial_pair`]).
+#[derive(Debug)]
+pub(crate) enum DialFailure {
+    /// The Relay answered HTTP 429 before the upgrade: too many pairing opens from this
+    /// address in its sliding minute (#112).
+    RateLimited,
+    Ring(RingError),
+}
+
+/// [`dial`] for a pairing slot: the Relay's HTTP 429 is its own outcome, every other
+/// failure is what [`dial`] gives.
+pub(crate) fn dial_pair(
+    url: &RelayUrl,
+    endpoint: &str,
+    tls: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    write_buffer_max: usize,
+) -> Result<WebSocket<Conn>, DialFailure> {
+    dial_mapped(
+        url,
+        endpoint,
+        &[],
+        tls,
+        deadline,
+        write_buffer_max,
+        |e| match e {
+            tungstenite::Error::Http(resp) if resp.status().as_u16() == 429 => {
+                DialFailure::RateLimited
+            }
+            e => DialFailure::Ring(map_ws_error(e)),
+        },
+    )
+}
+
+/// The shared dial body; `ws` maps a failed WebSocket handshake.
+fn dial_mapped<E: Into<DialFailure>>(
+    url: &RelayUrl,
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    tls: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    write_buffer_max: usize,
+    ws: impl Fn(tungstenite::Error) -> E,
+) -> Result<WebSocket<Conn>, DialFailure> {
+    dial_body(url, endpoint, headers, tls, deadline, write_buffer_max)
+        .map_err(DialFailure::Ring)?
+        .map_err(|e| ws(e).into())
+}
+
+/// Dials and upgrades; the outer error is local (TCP, TLS, request), the inner one the
+/// WebSocket handshake's.
+#[allow(clippy::type_complexity)]
+fn dial_body(
+    url: &RelayUrl,
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    tls: Option<Arc<ClientConfig>>,
+    deadline: Instant,
+    write_buffer_max: usize,
+) -> Result<Result<WebSocket<Conn>, tungstenite::Error>, RingError> {
     let mut req = endpoint
         .into_client_request()
         .map_err(|e| RingError::Invalid(e.to_string()))?;
@@ -281,10 +356,16 @@ pub(crate) fn dial_with_headers(
         tungstenite::client::client_with_config(req, conn, Some(ws_config(write_buffer_max)));
     loop {
         match r {
-            Ok((ws, _)) => return Ok(ws),
+            Ok((ws, _)) => return Ok(Ok(ws)),
             Err(HandshakeError::Interrupted(mid)) => r = mid.handshake(),
-            Err(HandshakeError::Failure(e)) => return Err(map_ws_error(e)),
+            Err(HandshakeError::Failure(e)) => return Ok(Err(e)),
         }
+    }
+}
+
+impl From<RingError> for DialFailure {
+    fn from(e: RingError) -> Self {
+        DialFailure::Ring(e)
     }
 }
 

@@ -18,13 +18,23 @@
 //! pipeline's state lock comes after `Registry` and the Ring's locks; under it only a push
 //! frame is queued on the Relay connection (never blocking).
 
+#[cfg(unix)]
+pub mod adoption;
 mod agent;
 mod calls;
 mod codex_link;
+#[cfg(any(unix, windows))]
+pub(crate) mod companion;
+#[cfg(unix)]
+pub use companion::registration_child;
+#[cfg(any(unix, windows))]
+mod completion;
 mod conn;
 mod drops;
 mod last_line;
 mod orphans;
+#[cfg(any(unix, windows))]
+pub(crate) mod standalone_journal;
 pub use orphans::Cleanup;
 mod outbox;
 pub mod parent;
@@ -39,8 +49,13 @@ mod role;
 mod session_stream;
 pub use role::Role;
 mod signals;
+#[cfg(unix)]
+pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;
+mod staging;
+#[doc(hidden)]
+pub use staging::FAIL_WRITES as STAGE_FAIL_WRITES;
 mod terminal;
 pub use terminal::OPTIONAL_FIELDS_BYTES;
 pub mod transport;
@@ -63,8 +78,9 @@ pub(crate) type ConnId = u64;
 pub struct Config {
     pub home: PathBuf,
     pub paths: Paths,
-    /// Exit after this long with no Terminals and no connections.
-    pub idle_timeout: Duration,
+    /// Exit after this long with no Terminals and no connections. `None` (the default): never;
+    /// the Daemon is always on (ADR-0017). Only `--idle-timeout-ms` (tests) sets it.
+    pub idle_timeout: Option<Duration>,
     /// SIGHUP → SIGKILL delay when ending a Terminal.
     pub kill_grace: Duration,
     /// How long a refused `term.open` (its Terminal could not be saved) waits for the
@@ -112,6 +128,10 @@ pub struct Config {
     pub ring_backoff_unit: Duration,
     /// The Relay client's timeouts (tests shorten them).
     pub ring_timeouts: xshell_protocol::ring::relay::RingTimeouts,
+    /// How long the Relay's refusals naming terminal expiry must keep coming (three of them,
+    /// at an unchanged signed head) before the Daemon sets its membership aside (10 minutes;
+    /// tests shorten it).
+    pub ring_expiry_span: Duration,
     /// Pushes to one Mobile go out at most once per window (leading and trailing).
     pub push_window: Duration,
     /// How long a push waits for the Relay's answer; past it the outcome is unknown and the
@@ -189,6 +209,18 @@ pub struct Config {
     /// Test hook: capabilities left out of `hello`, as an older Daemon would.
     #[doc(hidden)]
     pub hide_capabilities: Vec<String>,
+    /// A stage (`daemon.stage-*`) that gets nothing for this long is removed.
+    pub stage_idle: Duration,
+    /// The release server `daemon.update-latest` asks: `XSHELL_GET_URL` when set and not
+    /// empty (read here, so in-process Daemons of tests honour it too), else
+    /// [`crate::GET_BASE_DEFAULT`].
+    pub get_base: String,
+    /// Test hook (S4 C1): restore fails the first Terminal record.
+    #[doc(hidden)]
+    pub test_fail_restore: bool,
+    /// An update trial runs (S4 P1-5): unreadable or corrupt Terminal records count as
+    /// restore failures instead of an empty list.
+    pub strict_restore: bool,
     /// Test hook: the range offered in `hello` and negotiated against, as an older or newer
     /// Daemon would.
     #[doc(hidden)]
@@ -196,7 +228,7 @@ pub struct Config {
     /// Test hook: replaces crash-leftover cleanup during restore.
     #[doc(hidden)]
     pub cleanup_override: Option<fn(&Leader, Duration) -> Cleanup>,
-    /// Test hook: runs at the [`TestPoint`]s of a Terminal's start, exit and Relaunch.
+    /// Test hook: runs at the documented Terminal, Ring and counterpart [`TestPoint`]s.
     #[doc(hidden)]
     pub test_hook: Option<TestHook>,
 }
@@ -206,8 +238,59 @@ pub struct Config {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestPoint {
+    /// A real Relay Noise session reached the Host worker, before Host hello. No locks
+    /// held; tests may pause this worker to exercise cancellation and late Link fencing.
+    /// Returning `true` refuses the session (it closes before Host hello).
+    RelayHostAccepted,
+    /// Ordinary Host RingJoin before store admission (Ring lifecycle/state locked).
+    /// May coordinate registration, but must not re-enter Ring methods.
+    BeforeHostRingJoinCommit,
+    /// Decoded companion request before store admission; no handler locks held.
+    CompanionRequestAdmitted,
+    /// Admitted roster callback before any persistence/runtime guard; `true` drops it
+    /// (a Daemon that never received that roster).
+    RosterCallbackAdmitted,
+    /// Admitted Host completion administration, before runtime/Store access.
+    RingCompanionAdmitted,
+    /// Actual roster write after prerequisite reads (ring.lock held); true injects a write error.
+    BeforeRingRosterWrite,
+    /// Actual roster temp bytes are written and synced, before rename (file/owner locks
+    /// held). Returning true injects commit failure; must not re-enter Ring/session APIs.
+    RingRosterTempSynced,
+    /// Standalone recovery installed its store, before the final journal lock. No locks
+    /// held; may order concurrent recovery without supplying authority or a receipt.
+    StandaloneInstalledBeforeJournal,
+    /// Protected command preparation before validation; no locks held. Test ordering
+    /// only, never signing or confirmation authority.
+    StandaloneCommandBeforePrepare,
+    /// Conservative preparation is durable, before its reply; no locks held. A test
+    /// may delay delivery to exercise loss of the acknowledgment under the original budget.
+    StandaloneCommandPreparedBeforeReply,
+    /// The maintenance loop is about to reconcile or abandon an unfinished standalone
+    /// obligation: the pair command has exited (or its code expired), the offer lock is
+    /// held by this step. Returning `true` defers the step (as if the command still ran).
+    StandaloneMaintenanceActs,
+    /// A running owner's `InstallStandaloneAccepted` handler installed the accepted chain,
+    /// before its final receipt. No locks held; a test may pause it to overlap with
+    /// maintenance after the command exited.
+    StandaloneHandoffInstalled,
+    /// That handler has ended; `installed`: it replied with an installation receipt. No
+    /// locks held.
+    StandaloneHandoffEnded { installed: bool },
     /// Selected-update worker reservation (registry locked); true refuses its spawn.
     UpgradeWorker,
+    /// A staged build is complete and about to be run for validation, before the requester
+    /// is checked again (no lock held; a hook may block).
+    StageBeforeVerify,
+    /// A staged build passed validation and is about to be published (no lock held; a hook
+    /// may block).
+    StageBeforePublish,
+    /// A refused `daemon.update-latest` is about to remove the install directory it created
+    /// (no lock held; the update slot is still reserved; a hook may block).
+    FetchBeforeDirCleanup,
+    /// A selected update is about to check its requester again and commit (no lock held;
+    /// a hook may block).
+    UpgradeBeforeCommit,
     /// Selected-update commit has been acknowledged; on its worker, outside all locks.
     UpgradeCommitted,
     /// A Relaunch was accepted and is about to start its worker thread (registry locked: do
@@ -233,6 +316,8 @@ pub enum TestPoint {
     /// A `term.open` passed its own checks and is about to lock the registry to look for the
     /// Terminal that holds its agent session (no lock held; a hook may block).
     OpenDecide,
+    /// A `term.attach` before registry admission (no locks held; tests may order attempts).
+    AttachDecide,
     /// A `term.open` that resumes an agent session found no Terminal holding it and is about
     /// to start its own (registry locked: do not block on the Daemon).
     OpenLooked,
@@ -266,6 +351,12 @@ pub enum TestPoint {
     /// The input thread is about to check that the agent still accepts a `term.submit` reply
     /// and then write (a piece of) its paste (no lock held).
     SubmitPaste,
+    /// A real positive Paste write returned, after all readiness locks were released.
+    /// Observation only: the hook's return value is ignored. Excludes Close and Enter.
+    SubmitPasteWritten,
+    /// A reply's screen try-lock actually would block, before its blocking acquisition.
+    /// No Terminal locks held; observation only, return value ignored.
+    SubmitScreenWait,
     /// The paste was written and the pause is over: the input thread is about to check again
     /// and then write Enter (no lock held).
     SubmitEnter,
@@ -507,7 +598,7 @@ impl Config {
         Self {
             home,
             paths,
-            idle_timeout: Duration::from_secs(3600),
+            idle_timeout: None,
             kill_grace: Duration::from_secs(2),
             refused_open_wait: None,
             write_stall_timeout: Duration::from_secs(60),
@@ -531,6 +622,7 @@ impl Config {
             abort: None,
             ring_backoff_unit: Duration::from_secs(1),
             ring_timeouts: Default::default(),
+            ring_expiry_span: Duration::from_secs(600),
             push_window: Duration::from_secs(10),
             push_timeout: Duration::from_secs(20),
             push_retry: Duration::from_secs(2),
@@ -558,6 +650,13 @@ impl Config {
             drop_grace: Duration::from_secs(10 * 60),
             submit_attach_timeout: Duration::from_secs(10),
             hide_capabilities: Vec::new(),
+            stage_idle: Duration::from_secs(120),
+            get_base: std::env::var(crate::GET_URL_ENV)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| crate::GET_BASE_DEFAULT.to_string()),
+            test_fail_restore: false,
+            strict_restore: false,
             protocol: xshell_protocol::PROTOCOL,
             cleanup_override: None,
             test_hook: None,
@@ -618,7 +717,22 @@ pub struct Server;
 
 impl Server {
     /// Lock, bind, restore the persisted Terminals, then serve in background threads.
-    pub fn start(cfg: Config) -> Result<ServerHandle, StartError> {
+    pub fn start(mut cfg: Config) -> Result<ServerHandle, StartError> {
+        cfg.paths.ring_dir = ring::ownership::canonical_store(&cfg.paths.ring_dir)?;
+        let ownership = match ring::ownership::StoreOwnershipLease::acquire(&cfg.paths.ring_dir)
+            .map_err(io::Error::other)?
+        {
+            ring::ownership::StoreOwnership::Acquired(lease) => lease,
+            ring::ownership::StoreOwnership::Busy => return Err(StartError::AlreadyRunning),
+        };
+        // Only an unmerged x87 build wrote a Windows startup reservation; it would block
+        // registration for good.
+        #[cfg(windows)]
+        if let Err(e) =
+            companion::set_aside_stale_reservation(&ring::Store::new(cfg.paths.ring_dir.clone()))
+        {
+            crate::log!("ERROR", "ring: cannot set the stale reservation aside: {e}");
+        }
         let paths = cfg.paths.clone();
         check_endpoint(&paths.socket)?;
         // The lock's directory: the socket's on Unix.
@@ -646,8 +760,11 @@ impl Server {
         let mut starting = Starting {
             paths: &paths,
             lock: Some(lock),
+            ownership: Some(ownership),
             pid: false,
             socket: false,
+            endpoint: false,
+            owner: None,
         };
         // Holding the lock, record how this Daemon runs: `connect` starts none while xshell
         // owns it, and a Persistent `serve` hands it back.
@@ -676,6 +793,34 @@ impl Server {
         transport::remove_endpoint(&paths.socket)?;
         let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
+        // Every client of this home finds this socket, whatever its XDG_RUNTIME_DIR (A2): the
+        // owner lock first (blocking: clients only probe it with a momentary shared lock),
+        // then the record, so a record is trusted only while its owner holds the lock.
+        #[cfg(unix)]
+        {
+            let owner = crate::paths::owner_path(&cfg.home);
+            if let Some(dir) = owner.parent() {
+                ensure_private_dir(dir)?;
+            }
+            let f = private_file(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false),
+            )
+            .open(&owner)?;
+            f.lock()?;
+            starting.owner = Some(f);
+            crate::paths::write_endpoint(&paths.endpoint, std::process::id(), &paths.socket)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("cannot write {}: {e}", paths.endpoint.display()),
+                    )
+                })?;
+            starting.endpoint = true;
+        }
 
         let ctx = HostCtx::with_home(cfg.home.clone(), paths.tmp.clone());
         xshell_core::files::sweep_dropped_files(&ctx, cfg.drop_max_age, SystemTime::now());
@@ -686,6 +831,9 @@ impl Server {
             cfg.ring_timeouts,
             cfg.write_stall_timeout,
         );
+        if let Some(hook) = &cfg.test_hook {
+            ring.set_test_hook(hook.clone());
+        }
         let push = Arc::new(push::Push::new(
             paths.ring_dir.clone(),
             push::PushConfig {
@@ -708,6 +856,8 @@ impl Server {
             cfg.max_session_queue,
         );
         let drops = drops::Drops::new(cfg.drop_grace);
+        #[cfg(any(unix, windows))]
+        let expiry_span = cfg.ring_expiry_span;
         let d = Arc::new(Daemon {
             cfg,
             drops,
@@ -718,6 +868,12 @@ impl Server {
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
             lock_file: Mutex::new(starting.lock.take()),
+            owner_file: Mutex::new(starting.owner.take()),
+            store_admission: ring::ownership::StoreAdmission::new(
+                starting.ownership.take().unwrap(),
+            ),
+            #[cfg(any(unix, windows))]
+            companion: Mutex::new(None),
             next_conn: AtomicU64::new(1),
             hooks,
             // Runs are told apart across restarts too: a hook of the previous Daemon's
@@ -731,7 +887,10 @@ impl Server {
             saves: Mutex::new(registry::SaveStatus::default()),
             snap_seq: AtomicU64::new(0),
             session_streams,
+            staging: Default::default(),
+            restore_failures: std::sync::atomic::AtomicUsize::new(0),
         });
+        d.ring.bind_store_admission(&d.store_admission);
         // Sessions through the Relay are served by this Daemon.
         d.ring.hub().bind(Arc::downgrade(&d));
         d.push.bind(Arc::downgrade(&d));
@@ -743,9 +902,26 @@ impl Server {
             d.exit(ExitReason::Shutdown);
             return Err(StartError::Aborted);
         }
+        // The existing Daemon owner lock also owns the distinct private counterpart
+        // endpoint. Bind before resuming any Relay client; a second owner fails closed.
+        #[cfg(any(unix, windows))]
+        let companion = match companion::serve(Arc::downgrade(&d)) {
+            Ok(server) => server,
+            Err(error) => {
+                d.exit(ExitReason::Shutdown);
+                return Err(error.into());
+            }
+        };
+        #[cfg(any(unix, windows))]
+        {
+            *d.companion.lock().unwrap() = companion;
+        }
         // A member of a Ring connects to its Relay; the Relay socket is not a connection for
         // idle tracking.
         d.ring.resume();
+        // Removal detection and unfinished standalone pairing are finished in the background.
+        #[cfg(any(unix, windows))]
+        ring::start_membership_maintenance(&d, expiry_span);
         let da = d.clone();
         let ds = d.clone();
         let threads = std::thread::Builder::new()
@@ -787,8 +963,14 @@ struct Starting<'a> {
     paths: &'a Paths,
     /// Taken by the Daemon once it exists; from then on its `exit` cleans up.
     lock: Option<fs::File>,
+    ownership: Option<ring::ownership::StoreOwnershipLease>,
     pid: bool,
     socket: bool,
+    /// The endpoint record was written (Unix).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    endpoint: bool,
+    /// The home's owner lock (Unix), held from before the record is written.
+    owner: Option<fs::File>,
 }
 
 impl Drop for Starting<'_> {
@@ -796,6 +978,13 @@ impl Drop for Starting<'_> {
         let Some(lock) = self.lock.take() else {
             return;
         };
+        #[cfg(unix)]
+        if self.endpoint {
+            crate::paths::remove_endpoint_of(&self.paths.endpoint, std::process::id());
+        }
+        if let Some(o) = self.owner.take() {
+            let _ = o.unlock();
+        }
         if self.socket {
             let _ = transport::remove_endpoint(&self.paths.socket);
         }
@@ -824,6 +1013,24 @@ impl Stopper {
 }
 
 impl ServerHandle {
+    /// Protected local counterpart, derived from the separately retained Daemon store.
+    pub fn companion_endpoint(&self) -> io::Result<PathBuf> {
+        #[cfg(any(unix, windows))]
+        {
+            let store = xshell_core::local_ipc::canonical_store(&self.d.cfg.paths.ring_dir)?;
+            let path = xshell_core::local_ipc::companion_endpoint(&store)?;
+            xshell_core::local_ipc::check_path(&path)?;
+            Ok(path)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "counterpart IPC is not implemented on this platform",
+            ))
+        }
+    }
+
     pub fn wait(self) -> ExitReason {
         let mut g = self.d.exit.lock().unwrap();
         loop {
@@ -906,13 +1113,65 @@ impl ServerHandle {
         let d = self.d.clone();
         std::thread::Builder::new()
             .name(format!("conn-{id}-r"))
-            .spawn(move || conn::handle(d, server, id, role, None))?;
+            .spawn(move || conn::handle(d, server, id, role, None, conn::Ingress::InProcess))?;
         Ok(client)
     }
 
     pub fn stopper(&self) -> Stopper {
         Stopper(self.d.clone())
     }
+
+    /// What an update trial asks of this server (S4).
+    pub fn probe(&self) -> DaemonProbe {
+        DaemonProbe(self.d.clone())
+    }
+
+    /// Test hook: whether a `daemon.stage-*` stage is open.
+    #[doc(hidden)]
+    pub fn stage_active(&self) -> bool {
+        self.d.staging.active()
+    }
+}
+
+/// A running server's answers for an update trial (S4 C1, C2).
+#[derive(Clone)]
+pub struct DaemonProbe(Arc<Daemon>);
+
+impl DaemonProbe {
+    /// Terminal records restore could not start again.
+    pub fn restore_failures(&self) -> usize {
+        self.0.restore_failures.load(Ordering::SeqCst)
+    }
+
+    /// The Terminals listed now.
+    pub fn terminal_ids(&self) -> Vec<Uuid> {
+        self.0
+            .reg
+            .lock()
+            .unwrap()
+            .terminals
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Connected to (authenticated at) its Ring's Relay now.
+    pub fn ring_connected(&self) -> bool {
+        ring_connected(&self.0)
+    }
+
+    pub fn exiting(&self) -> bool {
+        self.0.exiting.load(Ordering::SeqCst)
+    }
+}
+
+/// Whether `d` is connected to its Ring's Relay now (`ring.identity`'s state).
+pub(crate) fn ring_connected(d: &Daemon) -> bool {
+    d.store_admission
+        .admit()
+        .and_then(|_operation| d.ring.identity())
+        .ok()
+        .is_some_and(|v| v["ring"]["state"] == "connected")
 }
 
 impl Drop for ServerHandle {
@@ -924,36 +1183,80 @@ impl Drop for ServerHandle {
 }
 
 /// `serve` as a process: shut down orderly when `stop` fires (see [`watch_exit_signals`]).
-pub fn run_serve(mut cfg: Config, stop: Arc<StopLatch>) -> i32 {
+pub fn run_serve(cfg: Config, stop: Arc<StopLatch>) -> i32 {
+    run_serve_with(cfg, stop, |_| {}).code
+}
+
+/// How a `serve` ended: its exit code, and why it stopped serving (`None`: it never served).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Served {
+    pub code: i32,
+    pub reason: Option<ExitReason>,
+}
+
+/// [`run_serve`], calling `after_start` once the server serves (restore done).
+pub fn run_serve_with(
+    mut cfg: Config,
+    stop: Arc<StopLatch>,
+    after_start: impl FnOnce(DaemonProbe),
+) -> Served {
     cfg.abort = Some(stop.clone());
     let h = match Server::start(cfg) {
         Ok(h) => h,
         Err(StartError::AlreadyRunning) => {
             crate::log!("INFO", "another xshelld serve holds the lock; exiting");
             hold_loser_for_tests();
-            return 3;
+            return Served {
+                code: 3,
+                reason: None,
+            };
         }
-        Err(StartError::Aborted) => return 0,
+        Err(StartError::Aborted) => {
+            return Served {
+                code: 0,
+                reason: None,
+            }
+        }
         Err(e) => {
             crate::log!("ERROR", "cannot start: {e}");
-            return 1;
+            return Served {
+                code: 1,
+                reason: None,
+            };
         }
     };
     stop.arm(&h);
+    after_start(h.probe());
     let reason = h.wait();
     crate::log!("INFO", "exiting: {reason:?}");
-    0
+    Served {
+        code: 0,
+        reason: Some(reason),
+    }
 }
 
 /// Test hook: with `XSHELLD_TEST_HOLD_LOSER=<path>`, a `serve` that lost the lock waits
 /// (at most 30 s) until `<path>` exists before exiting, so a test can order its exit after
 /// `connect` has already bridged to the winner.
-fn hold_loser_for_tests() {
+pub(crate) fn hold_loser_for_tests() {
     let Some(p) = std::env::var_os("XSHELLD_TEST_HOLD_LOSER") else {
         return;
     };
     let deadline = Instant::now() + Duration::from_secs(30);
     while !std::path::Path::new(&p).exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0017: a Daemon is always on; only a test's `--idle-timeout-ms` lets it go idle.
+    #[test]
+    fn default_config_has_no_idle_exit() {
+        let paths = crate::paths::resolve(Path::new("/h"), None, None);
+        let cfg = Config::new(PathBuf::from("/h"), paths);
+        assert_eq!(cfg.idle_timeout, None);
     }
 }

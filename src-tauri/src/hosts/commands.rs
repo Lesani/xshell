@@ -6,19 +6,19 @@ use super::{ChannelSink, Hosts, RemoteExit};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::sync::Arc;
-use tauri::ipc::{Channel, Response};
+use tauri::ipc::{Channel, JavaScriptChannelId, Response};
 use tauri::State;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use xshell_core::LaunchSpec;
 use xshell_hostlink::config::validate_one;
-use xshell_hostlink::{HostConfig, HostError, HostHandle, HostSnapshot, HostTestResult};
+use xshell_hostlink::{HostAccess, HostConfig, HostError, HostSnapshot, HostTestResult};
 use xshell_protocol::msg::OpenSpec;
 
-pub(crate) fn handle(state: &Hosts, host: &str) -> Result<Arc<HostHandle>, HostError> {
+pub(crate) fn handle(state: &Hosts, host: &str) -> Result<HostAccess, HostError> {
     state
         .manager
-        .host(host)
+        .access(host)
         .ok_or_else(|| HostError::unknown_host(host))
 }
 
@@ -50,11 +50,77 @@ pub async fn hosts_configure(
         .map_err(|e| e.to_string())?
 }
 
-/// How local Tabs run: `daemon` (Daemon Terminals on host `local`) or `in-process`, and the
-/// Persistent Daemon setting.
+/// How local Tabs run (`daemon`, `in-process` or `failed`), the Daemon's state and what
+/// keeps it running.
 #[tauri::command]
 pub fn local_host_info(state: State<'_, Hosts>) -> super::local::LocalHostInfo {
     state.local_info()
+}
+
+/// Retry the Local Host's Daemon: clear the start error and dial again; in mode `failed` set
+/// the Daemon up again; rerun the service install when it failed. Answers the new info.
+#[tauri::command]
+pub async fn local_daemon_retry(
+    app: tauri::AppHandle,
+) -> Result<super::local::LocalHostInfo, String> {
+    use tauri::Manager as _;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.try_state::<Hosts>()
+            .map(|h| h.retry_local())
+            .ok_or_else(|| "not ready".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The frontend listens for `local:quit-prompt`: closing may now ask, and a window-bound
+/// prompt raised before this is shown now.
+#[tauri::command]
+pub fn local_quit_prompt_ready(app: tauri::AppHandle) {
+    super::quit::prompt_ready(&app);
+}
+
+/// Whether closing now would ask, and why (informational).
+#[tauri::command]
+pub fn local_quit_check(app: tauri::AppHandle) -> Result<super::quit::QuitCheck, String> {
+    super::quit::check(&app).ok_or_else(|| "not ready".into())
+}
+
+/// Answer the prompt `id`: `keep` (with `remember`: never ask again), `stop` (ends exactly
+/// the Terminals shown), or `cancel`. `null`, `{changed:{id, added}}` (new Terminals since
+/// the prompt: the shown ones are stopped, ask again about `added`), or an error
+/// (`failed:<n> …`: n did not stop; `stale…`).
+#[tauri::command]
+pub async fn local_quit_resolve(
+    app: tauri::AppHandle,
+    id: String,
+    choice: String,
+    remember: bool,
+) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || super::quit::resolve(&app, &id, &choice, remember))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The updater relaunches: no prompt from here on.
+#[tauri::command]
+pub fn local_quit_bypass(quit: State<'_, super::quit::QuitState>) {
+    quit.set_bypass();
+}
+
+/// `local_keep_sessions`: `"ask"` (default) or `"always"`.
+#[tauri::command]
+pub fn local_keep_sessions_get(state: State<'_, Hosts>) -> &'static str {
+    super::local::read_keep_sessions(state.store.as_deref()).as_str()
+}
+
+/// Save `local_keep_sessions` durably.
+#[tauri::command]
+pub fn local_keep_sessions_set(state: State<'_, Hosts>, value: String) -> Result<(), String> {
+    let v = super::local::KeepSessions::parse(&value)
+        .ok_or_else(|| format!("invalid value {value:?}: ask or always"))?;
+    let store = state.store.as_deref().ok_or("settings are unavailable")?;
+    store.set_saved(super::local::KEEP_SESSIONS_KEY, Value::from(v.as_str()))
 }
 
 /// How long a switch may take for its Daemon to come up before it is undone.
@@ -111,7 +177,7 @@ pub fn hosts_status(state: State<'_, Hosts>) -> Vec<HostSnapshot> {
 pub fn hosts_kick(state: State<'_, Hosts>, host: Option<String>) {
     match host {
         Some(h) => {
-            if let Some(h) = state.manager.host(&h) {
+            if let Some(h) = state.manager.access(&h) {
                 h.kick();
             }
         }
@@ -156,6 +222,7 @@ pub struct AttachResult {
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn host_term_open(
+    webview: tauri::Webview,
     state: State<'_, Hosts>,
     host: String,
     terminal: String,
@@ -165,6 +232,7 @@ pub async fn host_term_open(
     rows: u16,
     on_data: Channel<Response>,
     on_exit: Channel<RemoteExit>,
+    on_resync: Option<JavaScriptChannelId>,
     adopt: Option<bool>,
 ) -> Result<OpenResult, HostError> {
     let h = handle(&state, &host)?;
@@ -182,6 +250,7 @@ pub async fn host_term_open(
     let sink = Arc::new(ChannelSink {
         data: on_data,
         exit: on_exit,
+        resync: on_resync.map(|id| id.channel_on(webview)),
     });
     let r = reply(|w| h.term_open(open, sink, w)).await?;
     Ok(OpenResult {
@@ -193,17 +262,20 @@ pub async fn host_term_open(
 
 #[tauri::command]
 pub async fn host_term_attach(
+    webview: tauri::Webview,
     state: State<'_, Hosts>,
     host: String,
     terminal: String,
     on_data: Channel<Response>,
     on_exit: Channel<RemoteExit>,
+    on_resync: Option<JavaScriptChannelId>,
 ) -> Result<AttachResult, HostError> {
     let h = handle(&state, &host)?;
     let t = uuid(&terminal)?;
     let sink = Arc::new(ChannelSink {
         data: on_data,
         exit: on_exit,
+        resync: on_resync.map(|id| id.channel_on(webview)),
     });
     let exit_code = reply(|w| h.term_attach(t, sink, w)).await?;
     Ok(AttachResult { exit_code })
@@ -295,8 +367,10 @@ pub async fn host_upgrade(
     host: String,
     target: xshell_hostlink::handle::UpdateTarget,
 ) -> Result<(), HostError> {
-    let h = handle(&state, &host)?;
-    reply(|w| h.upgrade_target(Some(target), w))
+    // Not the UI access: a Ring Host's update is staged over the owning window's own link
+    // (the broker cannot update a Daemon); the Manager checks the UI's target first.
+    let manager = state.manager.clone();
+    reply(move |w| manager.upgrade_target(&host, target, w))
         .await
         .map(|_| ())
 }
@@ -311,6 +385,13 @@ pub async fn host_test(
     tauri::async_runtime::spawn_blocking(move || m.test(&config))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The command that installs or updates xshell on a machine whose xshell cannot be updated
+/// over the Ring (S4): the release `install.sh` of this Desktop's version.
+#[tauri::command]
+pub fn host_install_command() -> String {
+    super::binaries::GET_INSTALL_COMMAND.to_string()
 }
 
 #[tauri::command]

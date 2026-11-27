@@ -1,3 +1,4 @@
+import { registry } from "./registry";
 import type { Group, Tab } from "../types";
 import { removeLeaf, collectLeafIds } from "../layout";
 import { getShellById } from "../shells";
@@ -60,8 +61,9 @@ export function reconcile(
   pending: ReadonlySet<string>,
   isDirty: (tabId: string, field: "title" | "sessionId") => boolean = () => false,
 ): ReconcileDelta {
+  host = registry.dataHost(host);
   const listed = new Map(list.map(i => [i.terminal, i]));
-  const mine = tabs.filter(t => t.host === host && t.terminal);
+  const mine = tabs.filter(t => registry.dataHost(t.host) === host && t.terminal);
   const have = new Set(mine.map(t => t.terminal!));
   const remove: string[] = [];
   const update: Tab[] = [];
@@ -71,7 +73,7 @@ export function reconcile(
       if (!pending.has(t.terminal!)) remove.push(t.id);
       continue;
     }
-    let next = t;
+    let next = t; // retain the original alias; its access remains identity-bound
     const observed = tabFromTerminal(host, info);
     const title = observed.title;
     if (title !== t.title && !isDirty(t.id, "title")) next = { ...next, title };
@@ -89,10 +91,22 @@ export function reconcile(
     if (skip !== !!t.skipPermissions) next = { ...next, skipPermissions: skip };
     if (next !== t) update.push(next);
   }
-  const add = list
-    .filter(i => !have.has(i.terminal))
-    .sort((a, b) => a.createdAtMs - b.createdAtMs)
-    .map(i => tabFromTerminal(host, i));
+  // A machine that left the Ring and joined again has a new Host id; its Terminals keep their
+  // ids. Such a Terminal's Tab (still on the departed id) moves to this Host: one Tab, never two.
+  const elsewhere = new Map(tabs.filter(t => t.terminal && registry.dataHost(t.host) !== host).map(t => [t.terminal!, t]));
+  const add: Tab[] = [];
+  for (const i of [...list].sort((a, b) => a.createdAtMs - b.createdAtMs)) {
+    if (have.has(i.terminal)) continue;
+    const old = elsewhere.get(i.terminal);
+    if (old && registry.isDeparted(old.host)) {
+      const moved: Tab = { ...tabFromTerminal(host, i) };
+      if (old.customTitle && moved.customTitle === undefined) moved.customTitle = old.customTitle;
+      update.push(moved);
+      continue;
+    }
+    if (old) continue; // the same id on another current Host: the existing Tab stays
+    add.push(tabFromTerminal(host, i));
+  }
   const confirmed = list.filter(i => pending.has(i.terminal)).map(i => i.terminal);
   return { add, remove, update, confirmed };
 }
