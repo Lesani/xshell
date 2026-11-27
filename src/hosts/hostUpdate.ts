@@ -45,12 +45,16 @@ export function updateSource(status: HostStatus | undefined): UpdateSource | nul
   return status?.updateSource ?? (status?.updateAction ? "desktop" : null);
 }
 
-type Expectation = { source: UpdateSource; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
+// `sent`: what a release update may bring back instead, when the Host cannot get the release
+// itself and is sent this Desktop's build: this Desktop's version and exact build. Only for
+// a Host that ran another version when the update was confirmed.
+type Expectation = { source: UpdateSource; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"]; sent: { version: string; build: NonNullable<HostStatus["desktopBuild"]> } | null };
 // What a confirmed update must bring back. A release is checked by version only: its build
 // is whatever the release holds, not this Desktop's.
 function expectation(status: HostStatus): Expectation {
   const source = updateSource(status) ?? "desktop";
-  return { source, expectedVersion: status.updateVersion ?? status.desktopVersion, expectedBuild: source === "desktop" && status.desktopBuild ? { ...status.desktopBuild } : null };
+  const sent = source === "release" && status.desktopBuild && status.daemonVersion !== status.desktopVersion ? { version: status.desktopVersion, build: { ...status.desktopBuild } } : null;
+  return { source, expectedVersion: status.updateVersion ?? status.desktopVersion, expectedBuild: source === "desktop" && status.desktopBuild ? { ...status.desktopBuild } : null, sent };
 }
 
 type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget } & Expectation;
@@ -62,8 +66,8 @@ type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateActio
 function arrived(s: HostStatus, c: Confirmation): boolean {
   return ["connected", "upgrade-pending", "build-differs"].includes(s.status) && s.phase === null && !s.lastError && s.errorHint !== "update-failed"
     && (s.linkGeneration ?? 0) > c.target.linkGeneration
-    && (s.daemonVersion === c.expectedVersion || (c.source === "release" && s.daemonVersion === s.desktopVersion))
-    && (c.source !== "desktop" || sameBuild(s.daemonBuild, c.expectedBuild));
+    && ((s.daemonVersion === c.expectedVersion && (c.source !== "desktop" || sameBuild(s.daemonBuild, c.expectedBuild)))
+      || (!!c.sent && s.daemonVersion === c.sent.version && sameBuild(s.daemonBuild, c.sent.build)));
 }
 
 // The Host answered that it is already current: healthy, nothing offered, no restart.
@@ -201,15 +205,16 @@ export class HostUpdates {
       this.set({ invoking: { ...this.state.invoking, [id]: false } });
     }
     const r = await settled.promise;
-    return r === true ? { host: c.host, outcome: "ok", version: this.statusOf(id)?.daemonVersion ?? c.expectedVersion }
+    return typeof r === "object" ? { host: c.host, outcome: "ok", version: r.version }
       : r === false ? { host: c.host, outcome: "skipped", reason: "current" }
       : { host: c.host, outcome: "failed", error: r };
   }
 
-  // Settles `true` (arrived), `false` (the Host said it is already current) or an error.
-  private waitSettled(c: Confirmation): { promise: Promise<boolean | string>; cancel: () => void; started: () => void } {
-    let finish!: (r: boolean | string) => void;
-    const promise = new Promise<boolean | string>(resolve => { finish = resolve; });
+  // Settles with the version it arrived on, `false` (the Host said it is already current) or
+  // an error.
+  private waitSettled(c: Confirmation): { promise: Promise<{ version: string } | false | string>; cancel: () => void; started: () => void } {
+    let finish!: (r: { version: string } | false | string) => void;
+    const promise = new Promise<{ version: string } | false | string>(resolve => { finish = resolve; });
     let over = false;
     // An update error counts only once this update began: an older one may still show.
     let began = false;
@@ -217,12 +222,12 @@ export class HostUpdates {
     // not have looked yet.
     let answered = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const end = (r: boolean | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
+    const end = (r: { version: string } | false | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
     const check = () => {
       const s = this.statusOf(c.host.id);
       if (!s) return;
       if (s.phase !== null) began = true;
-      if (arrived(s, c)) end(true);
+      if (arrived(s, c)) end({ version: s.daemonVersion ?? c.expectedVersion });
       else if (answered && alreadyCurrent(s, c)) end(false);
       else if (began && s.errorHint === "update-failed" && s.phase === null && s.lastError) end(s.lastError);
     };
