@@ -1260,7 +1260,7 @@ impl Machine {
     fn serve(&mut self) -> i32 {
         let mut c = self.command(&self.installed(&own_dir()));
         c.arg("serve").arg("--interactive-env");
-        let child = c.spawn().unwrap();
+        let child = spawn_retrying(&mut c).unwrap();
         let pid = child.id() as i32;
         self.child = Some(child);
         pid

@@ -211,8 +211,9 @@ pub struct Config {
     pub hide_capabilities: Vec<String>,
     /// A stage (`daemon.stage-*`) that gets nothing for this long is removed.
     pub stage_idle: Duration,
-    /// The release server `daemon.update-latest` asks ([`crate::GET_BASE_DEFAULT`], or
-    /// `XSHELL_GET_URL`).
+    /// The release server `daemon.update-latest` asks: `XSHELL_GET_URL` when set and not
+    /// empty (read here, so in-process Daemons of tests honour it too), else
+    /// [`crate::GET_BASE_DEFAULT`].
     pub get_base: String,
     /// Test hook (S4 C1): restore fails the first Terminal record.
     #[doc(hidden)]
@@ -647,7 +648,10 @@ impl Config {
             submit_attach_timeout: Duration::from_secs(10),
             hide_capabilities: Vec::new(),
             stage_idle: Duration::from_secs(120),
-            get_base: crate::GET_BASE_DEFAULT.to_string(),
+            get_base: std::env::var(crate::GET_URL_ENV)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| crate::GET_BASE_DEFAULT.to_string()),
             test_fail_restore: false,
             strict_restore: false,
             protocol: xshell_protocol::PROTOCOL,

@@ -535,6 +535,13 @@ impl Sup {
         let ring_unsupported = self.relay
             && !ring_stage
             && version::update_eligible(&version, ours_build, &hello.version, hello.build.as_ref());
+        // A Ring Host that updates itself from the latest release (ADR-0019 amendment, D4):
+        // outdated only against that release, never "build differs".
+        let release_capable = self.relay
+            && hello
+                .capabilities
+                .iter()
+                .any(|c| c == xshell_protocol::cap::DAEMON_UPDATE_LATEST);
         let (negotiated, upgrade_pending, build_differs) =
             match classify(&version, ours_build, mc.ours, &hello, upgradable) {
                 Classified::Compatible {
@@ -544,6 +551,7 @@ impl Sup {
                 } => (negotiated, upgrade_pending, build_differs),
                 Classified::Incompatible { reason, message } => {
                     let mut st = self.sh.lock();
+                    st.release_updates = false;
                     st.status.update_unavailable =
                         UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
                     if self.relay {
@@ -561,6 +569,14 @@ impl Sup {
                     });
                 }
             };
+        let (upgrade_pending, build_differs) = if release_capable {
+            (
+                version::release_outdated(mc.latest().as_ref(), &hello.version),
+                false,
+            )
+        } else {
+            (upgrade_pending, build_differs)
+        };
         if !self.sh.wait_first_list(gen, FIRST_LIST_TIMEOUT) {
             link.close();
             if self.cancel.is_cancelled() {
@@ -591,9 +607,19 @@ impl Sup {
             // Authorization/classification belongs to the current mode; completion belongs
             // to the already accepted operation, including a GUI-bound successor.
             let expect = st.upgrade_expect;
-            let ver_mismatch = expect && hello.version != version;
+            st.release_updates = release_capable;
+            // The identity the update must come back with: the release the Host installed
+            // (D5), or this Desktop's build.
+            let (want_v, want_b) = st
+                .upgrade_identity
+                .clone()
+                .map(|(v, b)| (v, Some(b)))
+                .unwrap_or_else(|| (version.clone(), ours_build.cloned()));
+            let ver_mismatch = expect && hello.version != want_v;
             let build_mismatch = expect
-                && ours_build.is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
+                && want_b
+                    .as_ref()
+                    .is_some_and(|b| !version::same_build(hello.build.as_ref(), b));
             st.status.set_kind(if upgrade_pending || ver_mismatch {
                 StatusKind::UpgradePending
             } else if build_differs || build_mismatch {
@@ -615,15 +641,15 @@ impl Sup {
                 .then(|| st.status.last_error.clone()).flatten();
             st.status.last_error = if ver_mismatch {
                 Some(format!(
-                    "xshelld {} is still running after the upgrade to {version}",
+                    "xshelld {} is still running after the upgrade to {want_v}",
                     hello.version
                 ))
             } else if build_mismatch {
                 Some(format!(
-                    "xshelld {} ({}) is still running after replacement; expected {version} ({}). Try Replace again. If this repeats, quit other xshell apps using this host.",
+                    "xshelld {} ({}) is still running after replacement; expected {want_v} ({}). Try Replace again. If this repeats, quit other xshell apps using this host.",
                     hello.version,
                     build_text(hello.build.as_ref()),
-                    build_text(ours_build)
+                    build_text(want_b.as_ref())
                 ))
             } else { previous_update_error };
             st.status.error_hint = st.status.last_error.as_ref().map(|_| HostErrorHint::UpdateFailed);
@@ -632,6 +658,7 @@ impl Sup {
             if expect {
                 st.upgrading = false;
                 st.upgrade_expect = false;
+                st.upgrade_identity = None;
                 st.upgrade_operation = None;
                 st.upgrade_complete_deadline = None;
                 st.upgrade_deadline = None;

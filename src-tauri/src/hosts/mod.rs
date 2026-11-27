@@ -7,6 +7,7 @@
 pub mod available;
 pub mod binaries;
 pub mod commands;
+pub mod latest;
 pub mod local;
 pub mod presence;
 pub mod quit;
@@ -299,6 +300,12 @@ impl Hosts {
             home_of,
         };
         hosts.start_service_install();
+        // The latest release, for Ring Hosts that update themselves from it (D3); never
+        // waited for.
+        latest::spawn(
+            hosts.manager.clone(),
+            latest::get_base(&|k| std::env::var_os(k)),
+        );
         hosts
     }
 

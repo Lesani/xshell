@@ -39,5 +39,5 @@ pub use install::{BinarySource, ChainSource, DirSource, Fetched, FileSource, Ori
 pub use link::Waiter;
 pub use local::{LocalDaemon, LocalDaemonConfig, LocalDialer};
 pub use manager::{Manager, ManagerConfig, Observer};
-pub use status::{HostSnapshot, HostStatus, HostTestResult, Phase, StatusKind};
+pub use status::{HostSnapshot, HostStatus, HostTestResult, Phase, StatusKind, UpdateSource};
 pub use transport::{LocalShellTransport, SshTransport, Transport, TransportFactory};

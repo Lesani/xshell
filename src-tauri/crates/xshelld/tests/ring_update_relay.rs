@@ -6,7 +6,8 @@ mod common;
 #[path = "desktop/workerd.rs"]
 #[allow(dead_code)]
 mod workerd;
-use common::{alive, bin, TestHome};
+use common::get_stub::GetStub;
+use common::{alive, bin, closed_get_url, TestHome};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +33,8 @@ use xshell_protocol::ring::{RosterChain, SignKey};
 use xshelld::server::{Config, Server, ServerHandle};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// A Daemon from before `daemon.update-latest` (1.6.0-rjw.3), as far as a Desktop can tell.
+const RJW3: (&str, &str) = ("XSHELLD_TEST_HIDE_CAPABILITIES", "daemon.update-latest");
 const WAIT: Duration = Duration::from_secs(30);
 
 fn own_build() -> BuildId {
@@ -84,6 +87,62 @@ fn patched(commit: &str) -> (Vec<u8>, BuildId) {
             ..own
         },
     )
+}
+
+/// The next version after this build's (its last digit plus one): same length, so it can
+/// replace this build's version in the binary.
+fn next_version() -> String {
+    let last = VERSION.chars().last().unwrap();
+    let d = last.to_digit(10).expect("the version ends in a digit");
+    assert!(
+        d < 9,
+        "next_version: {VERSION} ends in 9; pick another way to make a newer version"
+    );
+    format!("{}{}", &VERSION[..VERSION.len() - 1], d + 1)
+}
+
+/// The release a Ring Host downloads: [`patched`] with every occurrence of this build's
+/// version replaced by [`next_version`], checked through its own `--version`.
+fn released(commit: &str) -> (Vec<u8>, BuildId, String) {
+    let (mut bytes, build) = patched(commit);
+    let next = next_version();
+    let (from, to) = (VERSION.as_bytes(), next.as_bytes());
+    let mut i = 0;
+    let mut n = 0;
+    while let Some(at) = bytes[i..].windows(from.len()).position(|w| w == from) {
+        let start = i + at;
+        bytes[start..start + to.len()].copy_from_slice(to);
+        i = start + to.len();
+        n += 1;
+    }
+    assert!(n > 0, "no version string in the build");
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("xshelld");
+    fs::write(&p, &bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut c = Command::new(&p);
+    c.arg("--version").stdout(Stdio::piped());
+    let out = common::spawn_retrying(&mut c)
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["version"], serde_json::json!(next), "{v}");
+    assert_eq!(v["build"]["commit"], serde_json::json!(commit), "{v}");
+    (bytes, build, next)
+}
+
+fn triple() -> &'static str {
+    xshell_protocol::build::host_triple("Linux", std::env::consts::ARCH).unwrap()
+}
+
+/// A Desktop's build source that must never be asked: a release update sends no bytes.
+struct NoFetch;
+impl BinarySource for NoFetch {
+    fn fetch(&self, w: &Wanted, _: &CancelToken) -> Result<Fetched, String> {
+        panic!("a release update must not fetch this Desktop's build ({w:?})")
+    }
 }
 
 /// The build a Desktop sends: fixed bytes for every target.
@@ -163,8 +222,14 @@ struct Desktop {
 
 impl Desktop {
     fn new(relay: &Relay, build: BuildId, bytes: Vec<u8>) -> Desktop {
+        Self::with_source(relay, build, Arc::new(Bytes(bytes)))
+    }
+
+    fn with_source(relay: &Relay, build: BuildId, source: Arc<dyn BinarySource>) -> Desktop {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
+        // Never the real release server.
+        cfg.get_base = closed_get_url();
         cfg.ring_backoff_unit = Duration::from_millis(10);
         let daemon = Server::start(cfg).unwrap();
         let mut rc = DesktopRingConfig::new(home.root().join("desktop"), "desk".into());
@@ -173,12 +238,7 @@ impl Desktop {
         rc.backoff_unit = Duration::from_millis(10);
         let ring = DesktopRing::open(rc, Arc::new(Quiet));
         let events = Arc::new(Events::default());
-        let mut mc = ManagerConfig::new(
-            VERSION,
-            Arc::new(NoSsh),
-            Arc::new(Bytes(bytes)),
-            events.clone(),
-        );
+        let mut mc = ManagerConfig::new(VERSION, Arc::new(NoSsh), source, events.clone());
         mc.desktop_build = Some(build);
         mc.backoff_unit = Duration::from_millis(20);
         let manager = Arc::new(Manager::new(mc));
@@ -229,10 +289,13 @@ struct Machine {
 }
 
 impl Machine {
-    fn start(relay: &Relay, desktop: &Desktop, env: &[(&str, &str)]) -> (Machine, SignKey) {
-        let h = TestHome::new();
+    /// `serve` from this home's installed copy of this build. `XSHELL_GET_URL` is a closed
+    /// local port unless `env` names a stub.
+    fn spawn(h: &TestHome, env: &[(&str, &str)]) -> Child {
         let own = install_dir_name(VERSION, Some(&own_build()));
-        let exe = xshell_hostlink::install::install_local(stripped(), &h.home(), &own).unwrap();
+        let exe = xshell_core::server::server_root(&h.home())
+            .join(&own)
+            .join("xshelld");
         let mut c = Command::new(&exe);
         c.arg("serve")
             .arg("--interactive-env")
@@ -242,6 +305,7 @@ impl Machine {
             .env("XSHELL_SERVICE_MECHANISM", "none")
             .env("XSHELLD_TEST_TRIAL_SETTLE_MS", "800")
             .env("XSHELLD_TEST_TRIAL_TERM_MS", "1000")
+            .env("XSHELL_GET_URL", closed_get_url())
             .env_remove("XSHELLD_IDLE_TIMEOUT_MS")
             .env_remove("XSHELLD_HOME")
             .env_remove("XSHELLD_SOCKET")
@@ -251,8 +315,26 @@ impl Machine {
         for (k, v) in env {
             c.env(k, v);
         }
-        let child = c.spawn().unwrap();
+        let child = common::spawn_retrying(&mut c).unwrap();
         common::connect_socket(&h.paths().socket);
+        child
+    }
+
+    /// End this machine's Daemon and start it again with `env` (another build, as far as
+    /// a Desktop can tell, when `env` hides capabilities).
+    fn restart(&mut self, env: &[(&str, &str)]) {
+        if let Some(mut c) = self.child.take() {
+            unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+            let _ = c.wait();
+        }
+        self.child = Some(Self::spawn(&self.h, env));
+    }
+
+    fn start(relay: &Relay, desktop: &Desktop, env: &[(&str, &str)]) -> (Machine, SignKey) {
+        let h = TestHome::new();
+        let own = install_dir_name(VERSION, Some(&own_build()));
+        xshell_hostlink::install::install_local(stripped(), &h.home(), &own).unwrap();
+        let child = Self::spawn(&h, env);
         let store = xshell_core::local_ipc::canonical_store(&h.paths().ring_dir).unwrap();
         let endpoint = xshell_core::local_ipc::companion_endpoint(&store).unwrap();
         wait("companion endpoint", || endpoint.exists());
@@ -373,7 +455,8 @@ fn relay_desktop_updates_other_build_reexec_same_pid_terminal_resumes() {
     let relay = Relay::start();
     let (bytes, build) = patched("0123456789ab");
     let desktop = Desktop::new(&relay, build.clone(), bytes);
-    let (m, key) = Machine::start(&relay, &desktop, &[]);
+    // A Host from before `daemon.update-latest` (1.6.0-rjw.3) takes this Desktop's build.
+    let (m, key) = Machine::start(&relay, &desktop, &[RJW3]);
     let host = desktop.host(key);
     let s = host.status();
     assert_eq!(s.route_update_unavailable, None, "{s:?}");
@@ -435,7 +518,7 @@ fn update_through_the_desktop_route_reaches_the_ring_host() {
     let relay = Relay::start();
     let (bytes, build) = patched("0123456789ab");
     let desktop = Desktop::new(&relay, build.clone(), bytes);
-    let (m, key) = Machine::start(&relay, &desktop, &[]);
+    let (m, key) = Machine::start(&relay, &desktop, &[RJW3]);
     let host = desktop.host(key);
     let id = host.id().to_string();
     let before = host.status().link_generation;
@@ -510,7 +593,7 @@ fn relay_update_rolled_back_is_reported() {
         build.time
     );
     let desktop = Desktop::new(&relay, build.clone(), script.into_bytes());
-    let (m, key) = Machine::start(&relay, &desktop, &[]);
+    let (m, key) = Machine::start(&relay, &desktop, &[RJW3]);
     let host = desktop.host(key);
     let own = install_dir_name(VERSION, Some(&own_build()));
     let (t, _sink, _) = open_shell(&host, &m.h.project("p"));
@@ -607,4 +690,500 @@ fn ring_update_refused_offline() {
             name_of(&desktop, host.id())
         )
     );
+}
+
+// ---- Ring Hosts that update themselves from the latest release (D4, D5) ----
+
+fn ver(v: &str) -> semver::Version {
+    semver::Version::parse(v).unwrap()
+}
+
+/// What the Host offers: the action, the version it leads to and who supplies it.
+fn offer(
+    s: &HostStatus,
+) -> (
+    Option<xshell_hostlink::status::UpdateAction>,
+    Option<String>,
+    Option<xshell_hostlink::UpdateSource>,
+) {
+    (s.update_action, s.update_version.clone(), s.update_source)
+}
+
+fn release_offer(
+    v: &str,
+) -> (
+    Option<xshell_hostlink::status::UpdateAction>,
+    Option<String>,
+    Option<xshell_hostlink::UpdateSource>,
+) {
+    (
+        Some(xshell_hostlink::status::UpdateAction::Update),
+        Some(v.to_string()),
+        Some(xshell_hostlink::UpdateSource::Release),
+    )
+}
+
+fn selected_of(m: &Machine) -> Option<String> {
+    fs::read_to_string(xshell_core::server::server_root(&m.h.home()).join("selected"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn phases(d: &Desktop, host: &str) -> Vec<xshell_hostlink::Phase> {
+    d.events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.host == host)
+        .filter_map(|s| s.phase)
+        .collect()
+}
+
+/// A capable Ring Host is outdated only against the latest release: another Desktop build
+/// is no reason to offer anything, and an equal release neither.
+#[test]
+fn capable_host_offers_release_update_only_when_newer() {
+    let relay = Relay::start();
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let (_m, key) = Machine::start(&relay, &desktop, &[]);
+    let host = desktop.host(key);
+    let s = host.status();
+    assert!(
+        s.daemon_capabilities
+            .iter()
+            .any(|c| c == "daemon.update-latest"),
+        "{s:?}"
+    );
+    assert_eq!(s.status, xshell_hostlink::StatusKind::Connected, "{s:?}");
+    assert_eq!(offer(&s), (None, None, None));
+    desktop.manager.set_latest_release(ver(VERSION));
+    std::thread::sleep(Duration::from_millis(300));
+    let s = host.status();
+    assert_eq!(s.status, xshell_hostlink::StatusKind::Connected, "{s:?}");
+    assert_eq!(offer(&s), (None, None, None));
+    let next = next_version();
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        let s = host.status();
+        s.status == xshell_hostlink::StatusKind::UpgradePending && offer(&s) == release_offer(&next)
+    });
+    // An unknown latest release would offer nothing; a known one stays (this run).
+    assert_eq!(desktop.manager.latest_release(), Some(ver(&next)));
+}
+
+/// D5 end to end over the Relay: the Host downloads the release from the (stub) release
+/// server, installs and restarts into it in the same process; the Desktop sends no bytes.
+#[test]
+fn capable_host_updates_from_release() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    stub.release(&next, triple(), &rel, None);
+    let desk_build = BuildId {
+        commit: "bbbbbbbbbbbb".into(),
+        ..own_build()
+    };
+    let desktop = Desktop::with_source(&relay, desk_build, Arc::new(NoFetch));
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    let (t, _sink, old_terminal) = open_shell(&host, &m.h.project("p"));
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let pid = m.pid();
+    let before = host.status().link_generation;
+    reply(|w| host.upgrade(w)).unwrap_or_else(|e| panic!("{e:?}\n{}", m.log()));
+    // The latest value moves on after the Host answered: the running update still expects
+    // the version and build the Host installed.
+    desktop.manager.set_latest_release(ver("99.0.0"));
+    let dir = install_dir_name(&next, Some(&rel_build));
+    wait("updated and connected again", || {
+        let s = host.status();
+        s.usable()
+            && s.phase.is_none()
+            && s.link_generation > before
+            && s.daemon_version.as_deref() == Some(next.as_str())
+            && s.daemon_build.as_ref() == Some(&rel_build)
+    });
+    let s = host.status();
+    assert_eq!(s.last_error, None, "{s:?}");
+    assert_eq!(offer(&s), release_offer("99.0.0"));
+    assert!(alive(pid));
+    assert_eq!(exe_of(pid), m.installed(&dir), "{}", m.log());
+    wait("Terminal back under its UUID", || {
+        host.terminals().is_some_and(|l| {
+            l.iter()
+                .any(|i| i.terminal == t && i.pid.is_some() && i.pid != Some(old_terminal))
+        })
+    });
+    wait("trial accepted", || m.trial_closed());
+    assert_eq!(exe_of(pid), m.installed(&dir));
+    let seen = phases(&desktop, host.id());
+    assert!(
+        seen.contains(&xshell_hostlink::Phase::Preparing),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&xshell_hostlink::Phase::Upgrading),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.contains(&xshell_hostlink::Phase::Installing),
+        "nothing was sent: {seen:?}"
+    );
+    assert_eq!(stub.count(&GetStub::asset(&next, triple())), 1);
+}
+
+/// The Host finds nothing newer (this Desktop's latest value is stale): the update ends
+/// without a restart and without an error.
+#[test]
+fn capable_host_current_answer_finishes_quietly() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    stub.body("/latest", format!("{VERSION}\n"));
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    let next = next_version();
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let pid = m.pid();
+    let before = host.status().link_generation;
+    assert_eq!(reply(|w| host.upgrade(w)).unwrap(), serde_json::Value::Null);
+    let s = host.status();
+    assert_eq!(s.link_generation, before, "no restart");
+    assert_eq!(
+        (s.phase, s.last_error.clone(), s.error_hint),
+        (None, None, None)
+    );
+    assert!(s.usable());
+    assert!(alive(pid));
+    assert_eq!(
+        exe_of(pid),
+        m.installed(&install_dir_name(VERSION, Some(&own_build())))
+    );
+    assert!(
+        stub.hits().iter().all(|h| h == "/latest"),
+        "{:?}",
+        stub.hits()
+    );
+}
+
+/// Every failure of the download leaves the Host running its build, reachable, with nothing
+/// installed, and says so in approved words (amendments 2 and 7).
+#[test]
+fn capable_host_failed_download_keeps_running() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    let (bytes, build) = patched("bbbbbbbbbbbb");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    let name = name_of(&desktop, host.id());
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let pid = m.pid();
+    let own = install_dir_name(VERSION, Some(&own_build()));
+    let check = |what: &str, want: String| {
+        let before = host.status().link_generation;
+        let e = reply(|w| host.upgrade(w)).unwrap_err();
+        assert_eq!(e.message, want, "{what}");
+        let s = host.status();
+        assert_eq!(s.last_error.as_deref(), Some(want.as_str()), "{what}");
+        assert_eq!(
+            s.error_hint,
+            Some(xshell_hostlink::HostErrorHint::UpdateFailed),
+            "{what}"
+        );
+        assert!(s.usable() && s.phase.is_none(), "{what}: {s:?}");
+        assert_eq!(s.link_generation, before, "{what}: no restart");
+        assert_eq!(s.daemon_build.as_ref(), Some(&own_build()), "{what}");
+        assert!(alive(pid), "{what}");
+        assert_eq!(exe_of(pid), m.installed(&own), "{what}");
+        assert!(
+            !m.installed(&install_dir_name(&next, Some(&rel_build)))
+                .exists(),
+            "{what}: nothing installed"
+        );
+        assert_ne!(
+            selected_of(&m).as_deref(),
+            Some(install_dir_name(&next, Some(&rel_build)).as_str())
+        );
+    };
+    // A wrong checksum.
+    stub.release(&next, triple(), &rel, Some(&"00".repeat(32)));
+    check("checksum", xshell_hostlink::handle::release_bad(&name));
+    // A build that reports another version than the release's.
+    let (wrong, _) = patched("0123456789ab");
+    stub.release(&next, triple(), &wrong, None);
+    check("version", xshell_hostlink::handle::release_bad(&name));
+    // No build for this machine type.
+    stub.release(&next, triple(), &rel, None);
+    stub.remove(&GetStub::asset(&next, triple()));
+    check(
+        "no build",
+        xshell_hostlink::handle::RING_NO_BUILD.to_string(),
+    );
+    // The release server fails.
+    stub.set("/latest", common::get_stub::Route::Status(500));
+    check(
+        "server error",
+        xshell_hostlink::handle::release_download_failed(&name),
+    );
+}
+
+/// Sol 5: the release does not come up; the Host goes back to its build with its live
+/// Terminal restored, records the failure, and the Desktop says so in the approved words.
+#[test]
+fn relay_release_update_rolled_back_is_reported() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    stub.release(&next, triple(), &rel, None);
+    let dir = install_dir_name(&next, Some(&rel_build));
+    let desktop = Desktop::with_source(&relay, own_build(), Arc::new(NoFetch));
+    let url = stub.url();
+    let (m, key) = Machine::start(
+        &relay,
+        &desktop,
+        &[
+            ("XSHELL_GET_URL", &url),
+            ("XSHELLD_TEST_FAIL_RESTORE", &dir),
+        ],
+    );
+    let host = desktop.host(key);
+    let own = install_dir_name(VERSION, Some(&own_build()));
+    let (t, _sink, _) = open_shell(&host, &m.h.project("p"));
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let _ = reply(|w| host.upgrade(w));
+    wait("rolled back and connected again", || {
+        let s = host.status();
+        s.usable()
+            && s.daemon_build.as_ref() == Some(&own_build())
+            && s.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("back on version"))
+    });
+    let s = host.status();
+    assert_eq!(
+        s.last_error.as_deref(),
+        Some(
+            xshell_hostlink::handle::ring_rolled_back(&name_of(&desktop, host.id()), VERSION)
+                .as_str()
+        )
+    );
+    assert_eq!(
+        s.error_hint,
+        Some(xshell_hostlink::HostErrorHint::UpdateFailed)
+    );
+    // Still outdated against the release: offered again.
+    assert_eq!(offer(&s), release_offer(&next));
+    wait("trial closed", || m.trial_closed());
+    assert_eq!(selected_of(&m).as_deref(), Some(own.as_str()));
+    // Whichever process serves now (a rollback may start a new one), it runs the old build.
+    let now: i32 = fs::read_to_string(m.h.paths().pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(exe_of(now), m.installed(&own));
+    // The failure is recorded on the Host.
+    let mut c = common::Client::connect(&m.h.paths().socket);
+    c.hello(common::range(1, 1));
+    let info = c
+        .request(&xshell_protocol::msg::ClientMsg::DaemonUpdateInfo)
+        .unwrap();
+    assert_eq!(
+        info["lastFailure"]["target"],
+        serde_json::json!(dir),
+        "{info}"
+    );
+    // The live Terminal is there again under the old build.
+    wait("Terminal restored under the old build", || {
+        host.terminals()
+            .is_some_and(|l| l.iter().any(|i| i.terminal == t && i.pid.is_some()))
+    });
+}
+
+/// Sol 4: a Host busy with another update (here a fetch over its local socket) refuses the
+/// Desktop's in the approved words, and nothing restarts.
+#[test]
+fn relay_release_update_busy_is_reported() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, _, next) = released("0123456789ab");
+    stub.release(&next, triple(), &rel, None);
+    let asset = GetStub::asset(&next, triple());
+    stub.gate(&asset);
+    let desktop = Desktop::with_source(&relay, own_build(), Arc::new(NoFetch));
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let mut local = common::Client::connect(&m.h.paths().socket);
+    local.hello(common::range(1, 1));
+    local.timeout = WAIT;
+    let rid = local.request_id();
+    local.send(
+        &xshell_protocol::msg::ClientMsg::DaemonUpdateLatest,
+        Some(rid),
+    );
+    stub.wait_hits(&asset, 1, WAIT);
+    let before = host.status().link_generation;
+    let e = reply(|w| host.upgrade(w)).unwrap_err();
+    assert_eq!(
+        e.message,
+        xshell_hostlink::handle::ring_busy(&name_of(&desktop, host.id()))
+    );
+    let s = host.status();
+    assert!(s.usable() && s.phase.is_none(), "{s:?}");
+    assert_eq!(s.link_generation, before);
+    stub.open(&asset);
+    assert_eq!(
+        local.wait_res(rid).unwrap()["current"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        stub.count(&asset),
+        1,
+        "the Desktop's request downloaded nothing"
+    );
+}
+
+/// Sol 4: the link reconnects while the Host downloads; the stale operation never restarts
+/// the Host.
+#[test]
+fn relay_release_update_reconnect_during_request_does_not_restart() {
+    let mut relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    stub.release(&next, triple(), &rel, None);
+    let asset = GetStub::asset(&next, triple());
+    stub.gate(&asset);
+    let desktop = Desktop::with_source(&relay, own_build(), Arc::new(NoFetch));
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let pid = m.pid();
+    let before = host.status().link_generation;
+    let (tx, rx) = std::sync::mpsc::channel();
+    host.upgrade(Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    stub.wait_hits(&asset, 1, WAIT);
+    relay.restart();
+    wait("connected again on a new link", || {
+        let s = host.status();
+        s.usable() && s.link_generation > before
+    });
+    stub.open(&asset);
+    let r = rx.recv_timeout(Duration::from_secs(120)).unwrap();
+    assert!(r.is_err(), "{r:?}");
+    // Give a wrongly issued restart time to show.
+    std::thread::sleep(Duration::from_secs(2));
+    let own = install_dir_name(VERSION, Some(&own_build()));
+    assert!(alive(pid));
+    assert_eq!(exe_of(pid), m.installed(&own), "{}", m.log());
+    assert_ne!(
+        selected_of(&m).as_deref(),
+        Some(install_dir_name(&next, Some(&rel_build)).as_str())
+    );
+    assert!(
+        !phases(&desktop, host.id()).contains(&xshell_hostlink::Phase::Upgrading),
+        "no restart was requested"
+    );
+    let s = host.status();
+    assert!(s.usable() && s.phase.is_none(), "{s:?}");
+    assert_eq!(s.daemon_version.as_deref(), Some(VERSION));
+}
+
+/// Sol 4: a Host that comes back without `daemon.update-latest` (rolled back to an older
+/// build) is offered this Desktop's build again.
+#[test]
+fn host_back_without_capability_is_offered_the_desktop_build() {
+    let relay = Relay::start();
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let (mut m, key) = Machine::start(&relay, &desktop, &[]);
+    let host = desktop.host(key);
+    let next = next_version();
+    desktop.manager.set_latest_release(ver(&next));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer(&next)
+    });
+    let before = host.status().link_generation;
+    m.restart(&[RJW3]);
+    wait("back without the capability", || {
+        let s = host.status();
+        s.usable()
+            && s.link_generation > before
+            && !s
+                .daemon_capabilities
+                .iter()
+                .any(|c| c == "daemon.update-latest")
+    });
+    let s = host.status();
+    assert_eq!(s.status, xshell_hostlink::StatusKind::BuildDiffers, "{s:?}");
+    assert_eq!(
+        offer(&s),
+        (
+            Some(xshell_hostlink::status::UpdateAction::Replace),
+            Some(VERSION.to_string()),
+            Some(xshell_hostlink::UpdateSource::Desktop)
+        )
+    );
+}
+
+/// Sol 4: the broker view a follower window reads shows the owner's release offer, and
+/// keeps refusing an update itself.
+#[test]
+fn broker_view_shows_release_offer_and_refuses_update() {
+    let relay = Relay::start();
+    let (bytes, build) = patched("0123456789ab");
+    let desktop = Desktop::new(&relay, build, bytes);
+    let (_m, key) = Machine::start(&relay, &desktop, &[]);
+    let host = desktop.host(key);
+    let id = host.id().to_string();
+    let ui = desktop.manager.access(&id).unwrap();
+    assert!(matches!(ui, xshell_hostlink::HostAccess::Broker(_)));
+    let next = next_version();
+    desktop.manager.set_latest_release(ver(&next));
+    wait("the broker publishes the release offer", || {
+        offer(&ui.snapshot().status) == release_offer(&next)
+    });
+    let seen = ui.snapshot().status;
+    let target = xshell_hostlink::handle::UpdateTarget {
+        config_generation: seen.config_generation,
+        link_generation: seen.link_generation,
+        daemon_version: seen.daemon_version.clone(),
+        daemon_build: seen.daemon_build.clone(),
+    };
+    let refused = reply(|w| ui.upgrade_target(Some(target), w)).unwrap_err();
+    assert!(refused.message.contains("broker"), "{refused:?}");
+    // What it reads is what a follower process receives: the fields survive the wire.
+    let wire = serde_json::to_value(&seen).unwrap();
+    assert_eq!(wire["updateVersion"], serde_json::json!(next));
+    assert_eq!(wire["updateSource"], serde_json::json!("release"));
 }

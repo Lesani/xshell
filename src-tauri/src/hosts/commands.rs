@@ -391,7 +391,7 @@ pub async fn host_test(
 /// over the Ring (S4): the release `install.sh` of this Desktop's version.
 #[tauri::command]
 pub fn host_install_command() -> String {
-    super::binaries::install_command(env!("CARGO_PKG_VERSION"))
+    super::binaries::GET_INSTALL_COMMAND.to_string()
 }
 
 #[tauri::command]

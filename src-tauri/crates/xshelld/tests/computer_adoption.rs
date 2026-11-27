@@ -3,6 +3,11 @@
 #[cfg(unix)]
 #[path = "desktop/workerd.rs"]
 mod workerd;
+// No test Daemon (in process or a child) may reach the real release server.
+#[cfg(unix)]
+#[path = "common/get_stub.rs"]
+#[allow(dead_code)]
+mod get_stub;
 #[cfg(unix)]
 mod unix {
     use super::workerd::Relay;
@@ -14,6 +19,15 @@ mod unix {
     use xshell_protocol::ring::membership::{ConsentFlow, RosterChange};
     use xshell_protocol::ring::relay::contract::relay_version;
     use xshelld::server::{Config, Server, ServerHandle};
+
+    /// A Daemon configuration that cannot reach the real release server; children this
+    /// process starts inherit the same closed `XSHELL_GET_URL`.
+    fn daemon_config(home: std::path::PathBuf, paths: xshelld::paths::Paths) -> Config {
+        super::get_stub::no_release_server();
+        let mut c = Config::new(home, paths);
+        c.get_base = std::env::var("XSHELL_GET_URL").unwrap();
+        c
+    }
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -64,7 +78,7 @@ mod unix {
             let home = tempfile::Builder::new().prefix("r1-").tempdir().unwrap();
             let paths = xshelld::paths::resolve(home.path(), None, None);
             let daemon_dir = paths.ring_dir.clone();
-            let mut daemon_config = Config::new(home.path().into(), paths);
+            let mut daemon_config = daemon_config(home.path().into(), paths);
             daemon_config.test_hook = hook;
             let daemon = Server::start(daemon_config).unwrap();
             let desktop = home.path().join("desktop");
@@ -186,7 +200,7 @@ mod unix {
         let home = tempfile::Builder::new().prefix("r3-").tempdir().unwrap();
         let paths = xshelld::paths::resolve(home.path(), None, None);
         let daemon_dir = paths.ring_dir.clone();
-        let d = Server::start(Config::new(home.path().into(), paths)).unwrap();
+        let d = Server::start(daemon_config(home.path().into(), paths)).unwrap();
         let (tx, rx) = mpsc::channel();
         let url = relay.url();
         std::thread::scope(|scope| {
@@ -449,7 +463,7 @@ mod unix {
         let home = tempfile::Builder::new().prefix("r1-").tempdir().unwrap();
         let paths = xshelld::paths::resolve(home.path(), None, None);
         let daemon_dir = paths.ring_dir.clone();
-        let server = Server::start(Config::new(home.path().into(), paths.clone())).unwrap();
+        let server = Server::start(daemon_config(home.path().into(), paths.clone())).unwrap();
         let client =
             CompanionClient::for_store(server.companion_endpoint().unwrap().parent().unwrap())
                 .unwrap();
@@ -477,7 +491,7 @@ mod unix {
                 .companion,
             Some(profile.clone())
         );
-        let server = Server::start(Config::new(home.path().into(), paths)).unwrap();
+        let server = Server::start(daemon_config(home.path().into(), paths)).unwrap();
         assert_eq!(ring.register_companion(&client).unwrap(), profile);
         assert!(
             std::fs::read(daemon_dir.join("keys.json")).unwrap() == before,
@@ -565,7 +579,7 @@ mod unix {
         std::fs::create_dir(&home).unwrap();
         let runtime = temp.path().join("run");
         let paths = xshelld::paths::resolve(&home, Some(&runtime), None);
-        let server = Server::start(Config::new(home, paths.clone()));
+        let server = Server::start(daemon_config(home, paths.clone()));
         assert!(
             server.is_ok(),
             "optional companion path length must not break ordinary serving"
@@ -586,14 +600,14 @@ mod unix {
             .tempdir()
             .unwrap();
         let paths = xshelld::paths::resolve(home.path(), None, None);
-        let old = Server::start(Config::new(home.path().into(), paths.clone())).unwrap();
+        let old = Server::start(daemon_config(home.path().into(), paths.clone())).unwrap();
         let endpoint = old.companion_endpoint().unwrap();
         old.stopper().shutdown();
         assert!(old
             .wait_timeout(std::time::Duration::from_secs(2))
             .is_some());
         let removed = !endpoint.exists();
-        let next = Server::start(Config::new(home.path().into(), paths));
+        let next = Server::start(daemon_config(home.path().into(), paths));
         let usable = next.is_ok();
         // Destroy the old wrapper while the successor is live; its cleanup must not
         // remove the successor's endpoint either.
@@ -679,7 +693,7 @@ mod unix {
             .unwrap();
         let paths = xshelld::paths::resolve(home.path(), None, None);
         let (admit, admitted) = std::sync::mpsc::channel();
-        let mut config = Config::new(home.path().into(), paths.clone());
+        let mut config = daemon_config(home.path().into(), paths.clone());
         config.test_hook = Some(xshelld::server::TestHook(Arc::new(move |_, point| {
             if point == xshelld::server::TestPoint::CompanionRequestAdmitted {
                 let _ = admit.send(());
@@ -979,7 +993,7 @@ mod unix {
         std::fs::create_dir_all(&paths.ring_dir).unwrap();
         let endpoint = paths.ring_dir.join("companion.sock");
         std::fs::write(&endpoint, b"not a socket").unwrap();
-        assert!(Server::start(Config::new(home, paths)).is_err());
+        assert!(Server::start(daemon_config(home, paths)).is_err());
         assert_eq!(std::fs::read(endpoint).unwrap(), b"not a socket");
     }
 
@@ -998,7 +1012,7 @@ mod unix {
             b"retained unreadable registration",
         )
         .unwrap();
-        let server = Server::start(Config::new(home, paths.clone())).unwrap();
+        let server = Server::start(daemon_config(home, paths.clone())).unwrap();
         assert_eq!(
             server.companion_endpoint().unwrap_err().kind(),
             std::io::ErrorKind::Unsupported
@@ -1280,7 +1294,7 @@ mod unix {
         use std::sync::{atomic::AtomicBool, mpsc};
         let home = tempfile::Builder::new().prefix("r3-").tempdir().unwrap();
         let paths = xshelld::paths::resolve(home.path(), None, None);
-        let d = Server::start(Config::new(home.path().into(), paths)).unwrap();
+        let d = Server::start(daemon_config(home.path().into(), paths)).unwrap();
         let (tx, rx) = mpsc::channel();
         let chain = std::thread::scope(|scope| {
             let guest = scope.spawn(|| {

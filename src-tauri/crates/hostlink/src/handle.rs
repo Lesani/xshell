@@ -16,7 +16,7 @@ use crate::config::{HostConfig, HostDefinition, HostRoute};
 use crate::errors::{HostError, HostErrorCode};
 use crate::link::{Link, LinkEvents, Waiter};
 use crate::manager::ManagerConfig;
-use crate::status::{HostSnapshot, HostStatus, Phase, StatusKind, UpdateAction};
+use crate::status::{HostSnapshot, HostStatus, Phase, StatusKind};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -91,6 +91,50 @@ pub fn ring_offline(name: &str) -> String {
 /// An update that the Ring Host rolled back (copy `update.rolledBack`).
 pub fn ring_rolled_back(name: &str, old: &str) -> String {
     format!("The update failed. {name} is back on version {old}. Try again.")
+}
+
+/// A Ring Host busy with another update (copy `update.busy`).
+pub fn ring_busy(name: &str) -> String {
+    format!("{name} is busy with another change. This update was skipped. Try again when that change finishes.")
+}
+
+/// A Ring Host that could not download the latest release, or failed to update from it for
+/// another reason (copy `update.downloadFailed`).
+pub fn release_download_failed(name: &str) -> String {
+    format!("{name} couldn’t download the update. Check that machine’s internet connection, then try again.")
+}
+
+/// A downloaded release that failed its checks on the Ring Host (copy `update.verifyFailed`).
+pub fn release_bad(name: &str) -> String {
+    format!("Couldn’t verify the update on {name}. Nothing was installed.")
+}
+
+/// How long a Ring Host may take to download and install the latest release (D5).
+const UPDATE_LATEST_WAIT: Duration = Duration::from_secs(150);
+
+/// A failed `daemon.update-latest` in approved words; the detail goes to the log only.
+fn release_failure(name: &str, e: HostError) -> HostError {
+    use xshell_protocol::msg::{
+        STAGE_BUSY, UPDATE_LATEST_BAD_BUILD, UPDATE_LATEST_NO_BUILD, UPDATE_LATEST_UNREACHABLE,
+    };
+    eprintln!(
+        "xshell: host {name}: update from the release failed: {}",
+        e.message
+    );
+    let remote = e.code == HostErrorCode::Remote;
+    if remote && e.message.starts_with(UPDATE_LATEST_UNREACHABLE) {
+        HostError::offline(release_download_failed(name))
+    } else if remote && e.message.starts_with(UPDATE_LATEST_NO_BUILD) {
+        HostError::offline(RING_NO_BUILD)
+    } else if remote && e.message.starts_with(UPDATE_LATEST_BAD_BUILD) {
+        HostError::offline(release_bad(name))
+    } else if remote && e.message.starts_with(STAGE_BUSY) {
+        HostError::new(HostErrorCode::Busy, ring_busy(name))
+    } else if matches!(e.code, HostErrorCode::Offline | HostErrorCode::Timeout) {
+        HostError::offline(ring_offline(name))
+    } else {
+        HostError::offline(release_download_failed(name))
+    }
 }
 /// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
 ///
@@ -215,6 +259,12 @@ pub(crate) struct State {
     /// A Ring Host update this Desktop sent (S4): the install directory and when. While set,
     /// a reconnect of another build asks the Daemon whether that update was rolled back.
     pub ring_update: Option<(String, Instant)>,
+    /// The connected (or last) Daemon offers `daemon.update-latest`: over the Relay it is
+    /// offered the latest release, never this Desktop's build (D4). Kept while reconnecting.
+    pub release_updates: bool,
+    /// The version and build the running update must come back with when it is not this
+    /// Desktop's (a release the Host installed, D5).
+    pub upgrade_identity: Option<(String, xshell_protocol::build::BuildId)>,
 }
 
 impl State {
@@ -374,6 +424,8 @@ impl Shared {
                 upgrade_operation: None,
                 upgrade_complete_deadline: None,
                 ring_update: None,
+                release_updates: false,
+                upgrade_identity: None,
             }),
             cv: Condvar::new(),
             kick: AtomicBool::new(false),
@@ -422,31 +474,43 @@ impl Shared {
 
     /// Emit the status if it changed since the last emit.
     pub(crate) fn publish(&self, st: &mut State) {
-        st.status.update_action = st
-            .status
-            .daemon_version
-            .as_deref()
-            .filter(|v| {
-                crate::version::update_eligible(
-                    &self.mc.desktop_version,
-                    self.mc.desktop_build.as_ref(),
-                    v,
-                    st.status.daemon_build.as_ref(),
-                )
-            })
-            .map(|v| {
-                if semver::Version::parse(v)
-                    .ok()
-                    .zip(semver::Version::parse(&self.mc.desktop_version).ok())
-                    .is_some_and(|(d, us)| d.cmp_precedence(&us).is_lt())
-                {
-                    UpdateAction::Update
-                } else {
-                    UpdateAction::Replace
-                }
+        // Over the Relay, a Daemon that updates itself from the latest release is offered
+        // only that release (D4): outdated is "the latest release is newer", never "another
+        // build". Every other Host keeps this Desktop's build as its update.
+        let release_capable = self.relay.is_some() && st.release_updates;
+        let latest = if release_capable {
+            self.mc.latest()
+        } else {
+            None
+        };
+        let offered = st.status.daemon_version.as_deref().and_then(|v| {
+            crate::version::offered_update(
+                &self.mc.desktop_version,
+                self.mc.desktop_build.as_ref(),
+                latest.as_ref(),
+                release_capable,
+                v,
+                st.status.daemon_build.as_ref(),
+            )
+        });
+        if release_capable && st.status.usable() {
+            st.status.set_kind(if offered.is_some() {
+                StatusKind::UpgradePending
+            } else {
+                StatusKind::Connected
             });
+        }
+        let (action, version, source) = match offered {
+            Some((a, v, s)) => (Some(a), Some(v), Some(s)),
+            None => (None, None, None),
+        };
+        st.status.update_action = action;
+        st.status.update_version = version;
+        st.status.update_source = source;
         if st.status.route_update_unavailable.is_some() {
             st.status.update_action = None;
+            st.status.update_version = None;
+            st.status.update_source = None;
         }
         if st.published.as_ref() != Some(&st.status) {
             st.published = Some(st.status.clone());
@@ -458,6 +522,12 @@ impl Shared {
 
     pub(crate) fn snapshot(&self) -> HostSnapshot {
         self.snap.lock().unwrap().clone()
+    }
+
+    /// Derive and emit the status again (the latest release changed).
+    pub(crate) fn republish(&self) {
+        let mut st = self.lock();
+        self.publish(&mut st);
     }
 
     /// Start a new link generation: everything from older links is ignored from now on.
@@ -1094,6 +1164,8 @@ impl HostHandle {
             st.upgrading = false;
             st.upgrade_deadline = None;
             st.upgrade_expect = false;
+            st.upgrade_identity = None;
+            st.release_updates = false;
             st.upgrade_operation = None;
             st.upgrade_complete_deadline = None;
             self.sh.kick.store(false, Ordering::SeqCst);
@@ -1164,6 +1236,11 @@ impl HostHandle {
         }
     }
 
+    /// Derive and emit this Host's status again (the latest release changed).
+    pub(crate) fn republish(&self) {
+        self.sh.republish();
+    }
+
     pub(crate) fn set_display(&self, cfg: HostConfig) {
         self.sh.lock().cfg = cfg.into();
     }
@@ -1183,6 +1260,8 @@ impl HostHandle {
             snapshot.status.route_update_unavailable =
                 Some(crate::status::RouteUpdateUnavailable::IdentityBoundAlias);
             snapshot.status.update_action = None;
+            snapshot.status.update_version = None;
+            snapshot.status.update_source = None;
             let admitted = quick(&self.sh.ep).and_then(|ep| self.usable_endpoint(&ep));
             if let Err(error) = admitted {
                 snapshot.status.set_kind(StatusKind::Offline);
@@ -2207,6 +2286,7 @@ impl HostHandle {
             st.upgrade_operation = Some(op);
             st.upgrading = true;
             st.upgrade_expect = false;
+            st.upgrade_identity = None;
             st.status.phase = Some(Phase::Preparing);
             st.status.last_error = None;
             st.status.error_hint = None;
@@ -2260,7 +2340,7 @@ impl HostHandle {
                     check_upgrade(&sh, op, gen, &cancel)?;
                     match stop {
                         Stop::Request(link) => {
-                            request_upgrade(&sh, &link, op, gen, windows, o.clone());
+                            request_upgrade(&sh, &link, op, gen, windows, None, o.clone());
                             return Ok(());
                         }
                         Stop::Script => crate::supervisor::kill_daemon(
@@ -2345,9 +2425,11 @@ impl HostHandle {
         Ok(())
     }
 
-    /// Update a Ring Host over its link (S4; ADR-0019): send this Desktop's build
-    /// (`daemon.stage-*`), then `daemon.upgrade-selected`; the Daemon re-executes itself into
-    /// it and comes back on the same link route. Never touches a configured route.
+    /// Update a Ring Host over its link (S4; ADR-0019). A Host that updates itself from the
+    /// latest release (`daemon.update-latest`, D5) downloads and installs it; any other gets
+    /// this Desktop's build (`daemon.stage-*`). Then `daemon.upgrade-selected`: the Daemon
+    /// re-executes itself into it and comes back on the same link route. Never touches a
+    /// configured route.
     fn upgrade_ring(&self, target: Option<UpdateTarget>, public: bool, w: Waiter) {
         let once = Once::new(w);
         let reservation = (|| {
@@ -2390,32 +2472,47 @@ impl HostHandle {
             {
                 return Err(HostError::invalid(ring_update_unsupported(&name)));
             }
-            if !crate::version::update_eligible(
-                &self.sh.mc.desktop_version,
-                self.sh.mc.desktop_build.as_ref(),
-                st.status.daemon_version.as_deref().unwrap_or(""),
-                st.status.daemon_build.as_ref(),
-            ) {
-                return Err(HostError::new(
-                    crate::HostErrorCode::Invalid,
-                    "this Host does not need this Desktop's build",
-                ));
-            }
-            let build = self
-                .sh
-                .mc
-                .desktop_build
-                .clone()
-                .ok_or_else(|| HostError::offline("this Desktop's exact build is unknown"))?;
+            let daemon_version = st.status.daemon_version.clone().unwrap_or_default();
+            let build = if st.release_updates {
+                if !crate::version::release_outdated(self.sh.mc.latest().as_ref(), &daemon_version)
+                {
+                    return Err(HostError::new(
+                        crate::HostErrorCode::Invalid,
+                        "this Host does not need an update",
+                    ));
+                }
+                None
+            } else {
+                if !crate::version::update_eligible(
+                    &self.sh.mc.desktop_version,
+                    self.sh.mc.desktop_build.as_ref(),
+                    &daemon_version,
+                    st.status.daemon_build.as_ref(),
+                ) {
+                    return Err(HostError::new(
+                        crate::HostErrorCode::Invalid,
+                        "this Host does not need this Desktop's build",
+                    ));
+                }
+                Some(
+                    self.sh.mc.desktop_build.clone().ok_or_else(|| {
+                        HostError::offline("this Desktop's exact build is unknown")
+                    })?,
+                )
+            };
             let gen = st.gen;
             let op = st.next_epoch();
             st.upgrade_operation = Some(op);
             st.upgrading = true;
             st.upgrade_expect = false;
-            st.ring_update = Some((
-                xshell_protocol::build::install_dir_name(&self.sh.mc.desktop_version, Some(&build)),
-                Instant::now(),
-            ));
+            st.upgrade_identity = None;
+            // A release update records its install directory once the Host answers.
+            st.ring_update = build.as_ref().map(|b| {
+                (
+                    xshell_protocol::build::install_dir_name(&self.sh.mc.desktop_version, Some(b)),
+                    Instant::now(),
+                )
+            });
             st.status.phase = Some(Phase::Preparing);
             st.status.last_error = None;
             st.status.error_hint = None;
@@ -2429,6 +2526,26 @@ impl HostHandle {
         let sh = self.sh.clone();
         let o = once.clone();
         let cancel = self.cancel_token();
+        let Some(build) = build else {
+            let spawned = std::thread::Builder::new()
+                .name("host-release-upgrade".into())
+                .spawn(move || {
+                    match upgrade_from_release(&sh, &link, op, gen, &name, &cancel, &o) {
+                        Err(e) => {
+                            finish_upgrade(&sh, op, Some(&e));
+                            o.call(Err(e));
+                        }
+                        Ok(false) => {}
+                        Ok(true) => wait_upgrade_completion(&sh, op, &cancel),
+                    }
+                });
+            if spawned.is_err() {
+                let e = HostError::offline("cannot start the upgrade");
+                finish_upgrade(&self.sh, op, Some(&e));
+                once.call(Err(e));
+            }
+            return;
+        };
         let spawned = std::thread::Builder::new()
             .name("host-ring-upgrade".into())
             .spawn(move || {
@@ -2475,7 +2592,7 @@ impl HostHandle {
                             sh.publish(&mut st);
                         }
                     }
-                    request_upgrade(&sh, &link, op, gen, true, o.clone());
+                    request_upgrade(&sh, &link, op, gen, true, None, o.clone());
                     Ok(())
                 })();
                 match result {
@@ -2570,6 +2687,82 @@ fn check_upgrade(sh: &Shared, op: u64, gen: u64, cancel: &CancelToken) -> Result
     }
 }
 
+/// D5: the Ring Host downloads and installs the latest release (`daemon.update-latest`,
+/// phase `preparing`), then restarts into it like any Ring update, expected back on the
+/// version and build it answered. `Ok(false)`: it was current already, and the operation is
+/// finished without a restart or an error; `Ok(true)`: the restart was requested.
+fn upgrade_from_release(
+    sh: &Arc<Shared>,
+    link: &Arc<Link>,
+    op: u64,
+    gen: u64,
+    name: &str,
+    cancel: &CancelToken,
+    once: &Arc<Once<Reply>>,
+) -> Result<bool, HostError> {
+    check_upgrade(sh, op, gen, cancel)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    link.request(
+        ClientMsg::DaemonUpdateLatest,
+        UPDATE_LATEST_WAIT,
+        Box::new(move |r| {
+            let _ = tx.send(r);
+        }),
+    )
+    .map_err(|e| release_failure(name, e))?;
+    let answer = loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(r) => break r.map_err(|e| release_failure(name, e))?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => check_upgrade(sh, op, gen, cancel)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(release_failure(
+                    name,
+                    HostError::offline("the update request was dropped"),
+                ))
+            }
+        }
+    };
+    let answer = serde_json::from_value::<xshell_protocol::msg::UpdateLatest>(answer)
+        .map_err(|e| release_failure(name, HostError::new(HostErrorCode::Remote, e.to_string())))?;
+    if answer.current {
+        // Nothing newer for this Host after all (this Desktop's latest value is stale).
+        finish_upgrade(sh, op, None);
+        once.call(Ok(Value::Null));
+        return Ok(false);
+    }
+    let (Some(build), Some(dir)) = (answer.build, answer.dir) else {
+        return Err(release_failure(
+            name,
+            HostError::new(
+                HostErrorCode::Remote,
+                "an answer without build or directory",
+            ),
+        ));
+    };
+    {
+        // Only the operation that asked restarts the Host, on the link it asked over.
+        let mut st = sh.lock();
+        if cancel.is_cancelled() || st.upgrade_operation != Some(op) || st.gen != gen {
+            return Err(HostError::offline(
+                "the Host update was cancelled or its connection changed",
+            ));
+        }
+        st.upgrade_identity = Some((answer.version.clone(), build.clone()));
+        // A reconnect of another build then asks whether this update was rolled back.
+        st.ring_update = Some((dir, Instant::now()));
+    }
+    request_upgrade(
+        sh,
+        link,
+        op,
+        gen,
+        true,
+        Some((answer.version, build)),
+        once.clone(),
+    );
+    Ok(true)
+}
+
 fn finish_upgrade(sh: &Shared, op: u64, error: Option<&HostError>) {
     let mut st = sh.lock();
     if st.upgrade_operation != Some(op) {
@@ -2578,6 +2771,7 @@ fn finish_upgrade(sh: &Shared, op: u64, error: Option<&HostError>) {
     st.upgrade_operation = None;
     st.upgrading = false;
     st.upgrade_expect = false;
+    st.upgrade_identity = None;
     st.upgrade_deadline = None;
     st.upgrade_complete_deadline = None;
     st.status.phase = None;
@@ -2621,6 +2815,7 @@ pub(crate) fn expire_upgrade(sh: &Shared, st: &mut State) {
         st.upgrade_operation = None;
         st.upgrading = false;
         st.upgrade_expect = false;
+        st.upgrade_identity = None;
         st.upgrade_deadline = None;
         st.upgrade_complete_deadline = None;
         st.status.phase = None;
@@ -2658,6 +2853,7 @@ pub(crate) fn accept_upgrade(sh: &Shared, op: u64, original_gen: u64, rpc: bool)
         st.upgrade_operation = None;
         st.upgrading = false;
         st.upgrade_expect = false;
+        st.upgrade_identity = None;
         st.upgrade_deadline = None;
         st.upgrade_complete_deadline = None;
         st.status.phase = None;
@@ -2677,24 +2873,30 @@ pub(crate) fn accept_upgrade(sh: &Shared, op: u64, original_gen: u64, rpc: bool)
     sh.cv.notify_all();
 }
 
+/// `identity`: the installed build to select when it is not this Desktop's (a release the
+/// Host installed itself); used only with `selected`.
 fn request_upgrade(
     sh: &Arc<Shared>,
     link: &Arc<Link>,
     op: u64,
     original_gen: u64,
     selected: bool,
+    identity: Option<(String, xshell_protocol::build::BuildId)>,
     once: Arc<Once<Reply>>,
 ) {
     let msg = if selected {
-        let Some(build) = sh.mc.desktop_build.clone() else {
-            let e = HostError::offline("this Desktop's exact build is unknown");
-            finish_upgrade(sh, op, Some(&e));
-            return once.call(Err(e));
+        let (version, build) = match identity {
+            Some(i) => i,
+            None => {
+                let Some(build) = sh.mc.desktop_build.clone() else {
+                    let e = HostError::offline("this Desktop's exact build is unknown");
+                    finish_upgrade(sh, op, Some(&e));
+                    return once.call(Err(e));
+                };
+                (sh.mc.desktop_version.clone(), build)
+            }
         };
-        ClientMsg::DaemonUpgradeSelected {
-            version: sh.mc.desktop_version.clone(),
-            build,
-        }
+        ClientMsg::DaemonUpgradeSelected { version, build }
     } else {
         ClientMsg::DaemonUpgrade
     };
@@ -3585,7 +3787,7 @@ pub(crate) mod tests {
             st.upgrade_operation = Some(7);
         }
         let (w, rx) = res_slot();
-        request_upgrade(&sh, &link, 7, 0, false, Once::new(w));
+        request_upgrade(&sh, &link, 7, 0, false, None, Once::new(w));
         let id = peer.expect("daemon.upgrade")["id"].as_u64().unwrap();
         peer.write(&res_frame(id, Ok(Value::Null)));
         rx.recv_timeout(T5).unwrap().unwrap();
@@ -3613,7 +3815,7 @@ pub(crate) mod tests {
                 st.upgrade_operation = Some(7);
             }
             let (waiter, reply) = res_slot();
-            request_upgrade(&sh, &link, 7, generation, false, Once::new(waiter));
+            request_upgrade(&sh, &link, 7, generation, false, None, Once::new(waiter));
             let id = peer.expect("daemon.upgrade")["id"].as_u64().unwrap();
             peer.write(&res_frame(id, Err(message.clone())));
             let error = reply.recv_timeout(T5).unwrap().unwrap_err();

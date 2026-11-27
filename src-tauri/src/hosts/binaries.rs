@@ -156,18 +156,10 @@ pub fn release_repo() -> &'static str {
     option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
 }
 
-/// The one command that installs (or updates) xshell on a machine without a window: the
-/// release's `install.sh`, which verifies the download before it runs anything (ADR-0019).
-pub fn install_command(version: &str) -> String {
-    install_command_for(release_repo(), version)
-}
-
-pub fn install_command_for(repo: &str, version: &str) -> String {
-    format!(
-        "curl -fsSL {}/v{version}/install.sh | sh",
-        release_base(repo)
-    )
-}
+/// The command shown for a machine that cannot be updated over the Ring: the latest
+/// release's installer from the release server, which verifies the download before it runs
+/// anything (design-update-from-get D6).
+pub const GET_INSTALL_COMMAND: &str = "curl -fsSL https://get.xshell.sh | sh";
 
 pub fn release_base(repo: &str) -> String {
     format!("https://github.com/{repo}/releases/download")
@@ -740,13 +732,15 @@ mod tests {
             option_env!("XSHELL_RELEASE_REPO").unwrap_or("Lesani/xshell")
         );
         assert_eq!(
-            install_command_for("Lesani/xshell", "1.6.0-rjw.2"),
-            "curl -fsSL https://github.com/Lesani/xshell/releases/download/v1.6.0-rjw.2/install.sh | sh"
+            release_base("Lesani/xshell"),
+            "https://github.com/Lesani/xshell/releases/download"
         );
-        assert!(install_command("1.6.0").contains(&format!(
-            "/{}/releases/download/v1.6.0/install.sh",
-            release_repo()
-        )));
+        // What a machine that cannot be updated over the Ring is told to run: the latest
+        // release's installer from the release server (D6).
+        assert_eq!(
+            super::super::commands::host_install_command(),
+            "curl -fsSL https://get.xshell.sh | sh"
+        );
     }
 
     #[test]

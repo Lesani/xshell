@@ -126,6 +126,7 @@ impl Fixture {
             .arg(self.home.path())
             .arg("--socket")
             .arg(&self.paths.socket)
+            .env("XSHELL_GET_URL", common::closed_get_url())
             .env("XSHELLD_PAIR_TTL_MS", ttl_ms.to_string());
         for (name, value) in env {
             command.env(name, value);
@@ -1429,6 +1430,7 @@ fn offline_pair_output_failure_releases_ownership_without_starting_serve() {
         .arg(b.home.path())
         .arg("--socket")
         .arg(&b.paths.socket)
+        .env("XSHELL_GET_URL", common::closed_get_url())
         .env("XSHELLD_PAIR_TTL_MS", "5000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

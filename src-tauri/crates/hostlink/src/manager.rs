@@ -58,6 +58,10 @@ pub struct ManagerConfig {
     pub(crate) action_targets: crate::action_targets::ActionTargets,
     pub(crate) user_observer: Arc<dyn Observer>,
     pub(crate) output_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// The latest xshell release this run learned from the release server (D3); `None`
+    /// until one is known. Shared by every clone of this configuration (the Relay Hosts'
+    /// too), so one [`Manager::set_latest_release`] reaches them all.
+    pub(crate) latest_release: Arc<Mutex<Option<semver::Version>>>,
 }
 
 impl ManagerConfig {
@@ -86,7 +90,13 @@ impl ManagerConfig {
             link_limits: LinkLimits::default(),
             replay_budget: Default::default(),
             output_bytes: Default::default(),
+            latest_release: Default::default(),
         }
+    }
+
+    /// The latest release this run knows of.
+    pub(crate) fn latest(&self) -> Option<semver::Version> {
+        self.latest_release.lock().unwrap().clone()
     }
 
     /// The directory this Desktop's Daemon build is installed in under `~/.xshell/server`.
@@ -160,8 +170,10 @@ fn saved_alias_matches(
 
 impl Manager {
     pub fn new(mut cfg: ManagerConfig) -> Self {
-        // A cloned configuration must not share another Manager's public action tokens.
+        // A cloned configuration must not share another Manager's public action tokens, nor
+        // its latest release.
         cfg.action_targets = Default::default();
+        cfg.latest_release = Default::default();
         cfg.user_observer = cfg.observer.clone();
         cfg.observer = Arc::new(crate::action_targets::PublicObserver {
             targets: cfg.action_targets.clone(),
@@ -185,6 +197,30 @@ impl Manager {
             shut: AtomicBool::new(false),
             cancel: CancelToken::new(),
         }
+    }
+
+    /// Record the latest xshell release (D3). Only a change republishes the status of every
+    /// Host; a Host offers the release only when it can update itself from it (a Relay Host
+    /// with `daemon.update-latest`), so configured and Local Hosts publish nothing new.
+    pub fn set_latest_release(&self, v: semver::Version) {
+        {
+            let mut cur = self.mc.latest_release.lock().unwrap();
+            if cur.as_ref() == Some(&v) {
+                return;
+            }
+            *cur = Some(v);
+        }
+        let mut handles: Vec<Arc<HostHandle>> = self.hosts.lock().unwrap().clone();
+        handles.extend(self.local.lock().unwrap().clone());
+        handles.extend(self.relay.lock().unwrap().iter().cloned());
+        for h in handles {
+            h.republish();
+        }
+    }
+
+    /// The latest xshell release this run knows of.
+    pub fn latest_release(&self) -> Option<semver::Version> {
+        self.mc.latest()
     }
 
     pub(crate) fn replay_budget(&self) -> crate::attachments::ReplayBudget {
@@ -1465,6 +1501,84 @@ pub(crate) mod tests {
             assert_eq!(s.daemon_version.as_deref(), Some(daemon));
             m.shutdown();
         }
+    }
+
+    /// The latest release is for Ring Hosts that update themselves from it: a configured Host
+    /// whose Daemon offers `daemon.update-latest` keeps this Desktop's build as its update, and
+    /// a new latest value emits no new status for it (nor for the Local Host).
+    #[cfg(unix)]
+    #[test]
+    fn set_latest_release_leaves_configured_hosts_alone() {
+        use crate::link::testpeer::{msg_frame, terminals_frame};
+        use crate::status::{UpdateAction, UpdateSource};
+        use xshell_protocol::msg::{Hello, ServerMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let frames = dir.path().join("frames");
+        let mut b = msg_frame(&ServerMsg::Hello(Hello {
+            protocol: xshell_protocol::msg::ProtocolRange { min: 1, max: 1 },
+            version: "1.5.0".into(),
+            capabilities: vec![
+                xshell_protocol::cap::DAEMON_STAGE.into(),
+                xshell_protocol::cap::DAEMON_UPDATE_LATEST.into(),
+            ],
+            build: None,
+        }));
+        b.extend(terminals_frame(vec![]));
+        std::fs::write(&frames, b).unwrap();
+        let rec = Recorder::new();
+        let mut mc = test_config(rec.clone());
+        mc.desktop_build = Some(xshell_protocol::build::BuildId {
+            commit: "85ee920a1b2c".into(),
+            dirty: None,
+            time: 1,
+        });
+        // The link stays up (no reconnects that would publish anyway); other commands end.
+        struct Held(String);
+        impl Transport for Held {
+            fn command(&self, remote: &str) -> CommandSpec {
+                if remote.trim_end().ends_with("connect") {
+                    LocalShellTransport::default().command(&self.0)
+                } else {
+                    LocalShellTransport::default().command("exit 0")
+                }
+            }
+            fn describe(&self) -> String {
+                "held".into()
+            }
+        }
+        impl TransportFactory for Held {
+            fn for_host(&self, _: &HostConfig) -> Box<dyn Transport> {
+                Box::new(Held(self.0.clone()))
+            }
+        }
+        mc.transports = Arc::new(Held(format!("cat '{}'; sleep 30", frames.display())));
+        let m = Manager::new(mc);
+        let mut h = test_host("h_dddddddd", "d");
+        h.daemon_command = Some("xd".into());
+        m.configure(vec![h]).unwrap();
+        let s = rec.wait_status(|s| s.status == StatusKind::BuildDiffers);
+        assert_eq!(
+            (
+                s.update_action,
+                s.update_version.as_deref(),
+                s.update_source
+            ),
+            (
+                Some(UpdateAction::Replace),
+                Some("1.5.0"),
+                Some(UpdateSource::Desktop)
+            )
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let before = rec.statuses().len();
+        m.set_latest_release(semver::Version::parse("9.0.0").unwrap());
+        assert_eq!(m.latest_release().unwrap().to_string(), "9.0.0");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(rec.statuses().len(), before, "{:#?}", rec.statuses());
+        let now = m.host("h_dddddddd").unwrap().status();
+        assert_eq!(now.status, StatusKind::BuildDiffers);
+        assert_eq!(now.update_source, Some(UpdateSource::Desktop));
+        m.shutdown();
     }
 
     /// A Daemon command Host connects through the Host's selected build when the probe finds

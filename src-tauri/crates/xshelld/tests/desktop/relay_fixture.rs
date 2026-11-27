@@ -126,6 +126,7 @@ impl Computer {
     ) -> Self {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
+        cfg.get_base = common::closed_get_url();
         cfg.ring_backoff_unit = Duration::from_millis(10);
         tweak(&mut cfg);
         let daemon = Server::start(cfg).unwrap();
@@ -262,6 +263,7 @@ impl Computer {
     pub(super) fn restart_daemon(&mut self, tweak: impl FnOnce(&mut Config)) {
         assert!(self.daemon.is_none(), "Daemon still running");
         let mut cfg = Config::new(self.home.home(), self.home.paths());
+        cfg.get_base = common::closed_get_url();
         cfg.ring_backoff_unit = Duration::from_millis(10);
         tweak(&mut cfg);
         self.daemon = Some(Server::start(cfg).unwrap());

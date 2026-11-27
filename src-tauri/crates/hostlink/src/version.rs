@@ -59,6 +59,56 @@ pub fn update_eligible(
     }
 }
 
+/// A Host that updates itself from the latest release (`daemon.update-latest`) is outdated
+/// when that release is known and newer than its version (semver precedence; build metadata
+/// ignored). An unknown latest release, or a version that does not parse, is never outdated.
+pub fn release_outdated(latest: Option<&semver::Version>, daemon: &str) -> bool {
+    match (latest, semver::Version::parse(daemon)) {
+        (Some(l), Ok(d)) => l.cmp_precedence(&d).is_gt(),
+        _ => false,
+    }
+}
+
+/// The update this Desktop offers for a Daemon of `daemon` (`build`): what it does, the
+/// version it leads to, and who supplies it.
+///
+/// A release-capable Host (`daemon.update-latest`, reached over the Relay) is offered only
+/// the latest release, and only when it is newer ([`release_outdated`]); never "Use this
+/// Desktop's build". Any other Host keeps the rule of [`update_eligible`]: an older version
+/// is an Update, another build of this version a Replace, both to this Desktop's version.
+pub fn offered_update(
+    desktop: &str,
+    ours: Option<&BuildId>,
+    latest: Option<&semver::Version>,
+    release_capable: bool,
+    daemon: &str,
+    build: Option<&BuildId>,
+) -> Option<(
+    crate::status::UpdateAction,
+    String,
+    crate::status::UpdateSource,
+)> {
+    use crate::status::{UpdateAction, UpdateSource};
+    if release_capable {
+        return latest
+            .filter(|_| release_outdated(latest, daemon))
+            .map(|l| (UpdateAction::Update, l.to_string(), UpdateSource::Release));
+    }
+    if !update_eligible(desktop, ours, daemon, build) {
+        return None;
+    }
+    let older = semver::Version::parse(daemon)
+        .ok()
+        .zip(semver::Version::parse(desktop).ok())
+        .is_some_and(|(d, us)| d.cmp_precedence(&us).is_lt());
+    let action = if older {
+        UpdateAction::Update
+    } else {
+        UpdateAction::Replace
+    };
+    Some((action, desktop.to_string(), UpdateSource::Desktop))
+}
+
 pub fn same_build(daemon: Option<&BuildId>, ours: &BuildId) -> bool {
     daemon.is_some_and(|d| d.same(ours))
 }
@@ -316,6 +366,116 @@ mod tests {
         assert_eq!(
             flags(classify("1.5.0", None, R11, &hello("1.5.0+x", 1, 1), true)),
             (false, false)
+        );
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn release_outdated_uses_precedence() {
+        assert!(release_outdated(Some(&v("1.6.0-rjw.4")), "1.6.0-rjw.3"));
+        assert!(!release_outdated(Some(&v("1.6.0-rjw.3")), "1.6.0-rjw.4"));
+        assert!(!release_outdated(Some(&v("1.6.0-rjw.4")), "1.6.0-rjw.4"));
+        // Build metadata does not order versions.
+        assert!(!release_outdated(
+            Some(&v("1.6.0-rjw.4+zzz")),
+            "1.6.0-rjw.4+aaa"
+        ));
+        assert!(!release_outdated(Some(&v("1.6.0-rjw.4")), "1.6.0-rjw.4+x"));
+        assert!(release_outdated(Some(&v("1.6.0")), "1.6.0-rjw.4"));
+        // Unknown latest, or a version without order: never outdated.
+        assert!(!release_outdated(None, "1.0.0"));
+        assert!(!release_outdated(Some(&v("9.0.0")), "dev"));
+    }
+
+    #[test]
+    fn offered_update_release_capable_never_replaces() {
+        use crate::status::{UpdateAction, UpdateSource};
+        let ours = b(A, None);
+        let latest = v("1.6.0-rjw.5");
+        // Latest unknown: nothing, whatever the Desktop's build.
+        assert_eq!(
+            offered_update("1.6.0-rjw.4", Some(&ours), None, true, "1.6.0-rjw.3", None),
+            None
+        );
+        // Newer release: Update to it, from the release.
+        assert_eq!(
+            offered_update(
+                "1.6.0-rjw.4",
+                Some(&ours),
+                Some(&latest),
+                true,
+                "1.6.0-rjw.4",
+                Some(&b(B, None))
+            ),
+            Some((
+                UpdateAction::Update,
+                "1.6.0-rjw.5".to_string(),
+                UpdateSource::Release
+            ))
+        );
+        // Equal or older release, or the same version from another build: nothing (never a
+        // Replace, never this Desktop's build).
+        for (daemon, build) in [
+            ("1.6.0-rjw.5", Some(b(B, None))),
+            ("1.6.0-rjw.5", None),
+            ("1.6.0-rjw.6", None),
+            ("1.6.0-rjw.5+meta", Some(ours.clone())),
+        ] {
+            assert_eq!(
+                offered_update(
+                    "1.6.0-rjw.4",
+                    Some(&ours),
+                    Some(&latest),
+                    true,
+                    daemon,
+                    build.as_ref()
+                ),
+                None,
+                "{daemon}"
+            );
+        }
+        // Even a Desktop newer than the Host offers nothing but the release.
+        assert_eq!(
+            offered_update(
+                "1.7.0",
+                Some(&ours),
+                Some(&v("1.6.0-rjw.5")),
+                true,
+                "1.6.0-rjw.5",
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn offered_update_without_capability_is_unchanged() {
+        use crate::status::{UpdateAction, UpdateSource};
+        let ours = b(A, None);
+        let latest = v("9.0.0");
+        for (version, build, offered) in [
+            ("1.4.0", None, Some(UpdateAction::Update)),
+            ("1.5.0", None, Some(UpdateAction::Replace)),
+            ("1.5.0+meta", Some(ours.clone()), None),
+            ("1.5.0", Some(b(B, None)), Some(UpdateAction::Replace)),
+            ("1.6.0", None, None),
+            ("dev", None, None),
+        ] {
+            // The latest release plays no part without the capability.
+            for l in [None, Some(&latest)] {
+                assert_eq!(
+                    offered_update("1.5.0", Some(&ours), l, false, version, build.as_ref()),
+                    offered.map(|a| (a, "1.5.0".to_string(), UpdateSource::Desktop)),
+                    "{version}"
+                );
+            }
+        }
+        assert_eq!(
+            offered_update("1.5.0", None, None, false, "1.5.0", None),
+            None
         );
     }
 }

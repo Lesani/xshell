@@ -18,6 +18,16 @@ pub fn closed_get_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Point this test process's `XSHELL_GET_URL` at a closed local port, once: every Daemon
+/// it starts (in process, or as a child that inherits the environment, such as the Local
+/// Host a Manager launches) then has no way to the real release server unless a test gives
+/// it a stub. Called by `TestHome::new`; sites that start Daemons without a `TestHome` set
+/// the variable or `Config::get_base` themselves.
+pub fn no_release_server() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("XSHELL_GET_URL", closed_get_url()));
+}
+
 #[derive(Clone)]
 pub enum Route {
     /// 200 with this body.

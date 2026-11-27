@@ -239,9 +239,6 @@ pub fn main_entry() -> i32 {
     cfg.gui_bound = gui_bound;
     cfg.supports_selected_restart = cfg!(windows) && opts.supports_selected_restart;
     cfg.test_hook = test_hook();
-    if let Some(v) = std::env::var(GET_URL_ENV).ok().filter(|v| !v.is_empty()) {
-        cfg.get_base = v;
-    }
     // Test hook (Windows): `XSHELLD_TEST_JOB_LAUNCHER=<path>` starts Terminals through that
     // launcher instead of this executable (a missing one makes every start fail).
     if cfg!(windows) {

@@ -3,8 +3,35 @@
 The active Remote Host Terminal and Settings → Hosts use the same update action. The
 confirmation always warns about **all** running Terminals on that Host, including those
 used by other Desktops. Installation alone never stops Terminals. Completion requires a
-new usable connection reporting this Desktop's version and exact known build. An accepted
-restart that does not reconnect within 120 seconds reports failure; reconnect retries continue.
+new usable connection reporting the expected version and exact build: this Desktop's, or,
+for a Ring Host that updates from the latest release (below), the release it installed.
+An accepted restart that does not reconnect within 120 seconds reports failure; reconnect
+retries continue.
+
+## Updating a Ring Host
+
+A Host reached over the Relay is updated over its link, never over SSH (ADR-0019). How
+depends on the Host's xshell:
+
+- **1.6.0-rjw.4 and later** (capability `daemon.update-latest`): the Host updates itself
+  from the latest release. The Desktop reads the latest version from
+  `https://get.xshell.sh/latest` at start and every 3 hours. When that release is newer
+  than the Host's version, the Host is shown as having an update to that version. Update
+  asks the Host to download its own build from `get.xshell.sh` (redirected to the GitHub
+  release), check its SHA-256, build stamp and `--version`, and install it; then it
+  restarts into it in place, with the usual trial and rollback. The Desktop sends no bytes.
+  When the latest version is unknown (offline), nothing is offered for these Hosts. Such a
+  Host follows releases, not the build the Desktop runs: a Desktop build that differs is no
+  reason to offer anything.
+- **Up to 1.6.0-rjw.3**: the Desktop sends its own `xshelld` build over the link
+  (`daemon.stage-*`) when the Host runs an older version or another build of the same one.
+- A Host that can take neither shows `curl -fsSL https://get.xshell.sh | sh`, to run on
+  that machine.
+
+After publishing a release, point `get.xshell.sh` at it (`RELEASE_TAG` of the `xshell-get`
+Worker) so that Ring Hosts are offered it. Tests and end-to-end runs set `XSHELL_GET_URL`
+to a local stub for every Daemon and Desktop they start; nothing in a test may reach
+`get.xshell.sh`.
 
 Linux retains its existing side-by-side installation/selection and Persistent Daemon restart.
 Windows remains attach-only over SSH: configure the Host's **Daemon command**, for example

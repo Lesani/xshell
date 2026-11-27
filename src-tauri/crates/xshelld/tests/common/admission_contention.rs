@@ -131,6 +131,7 @@ impl ObservedChild {
             .arg("--socket")
             .arg(&f.paths.socket)
             .env("XSHELLD_PAIR_TTL_MS", "4000")
+            .env("XSHELL_GET_URL", crate::common::closed_get_url())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

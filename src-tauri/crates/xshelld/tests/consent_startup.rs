@@ -6,6 +6,10 @@ mod legacy_pair;
 #[path = "desktop/workerd.rs"]
 #[allow(dead_code)]
 mod workerd;
+// No test Daemon (in process or a child) may reach the real release server.
+#[path = "common/get_stub.rs"]
+#[allow(dead_code)]
+mod get_stub;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -56,6 +60,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        get_stub::no_release_server();
         let root = tempfile::Builder::new().prefix("xc").tempdir().unwrap();
         let home = root.path().canonicalize().unwrap();
         let desktop = home.join("desktop");

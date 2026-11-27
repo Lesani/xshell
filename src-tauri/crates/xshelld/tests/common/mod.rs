@@ -66,6 +66,7 @@ pub fn isolate_home() -> &'static Path {
             .keep();
         let dir = dir.canonicalize().unwrap();
         std::env::set_var("HOME", &dir);
+        get_stub::no_release_server();
         dir
     })
 }
@@ -515,6 +516,21 @@ pub fn git_fixture(dir: &Path) -> bool {
     fs::write(dir.join("a.txt"), "two\n").unwrap();
     fs::write(dir.join("b.txt"), "new\n").unwrap();
     true
+}
+
+/// Spawn `c`, retrying briefly on ETXTBSY: a file this test process just wrote may still be
+/// open for writing in a child another test thread forked meanwhile.
+pub fn spawn_retrying(c: &mut Command) -> std::io::Result<Child> {
+    let mut tries = 0;
+    loop {
+        match c.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 200 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
 }
 
 pub fn bin() -> &'static str {
