@@ -21,7 +21,7 @@ let cleanup: (() => Promise<void>) | undefined;
 afterEach(async () => { await cleanup?.(); cleanup = undefined; vi.unstubAllGlobals(); });
 const H = "h_aaaaaaaa", R = `r_${"a".repeat(64)}`;
 async function setup(startRingOnly = false, localAlias = false, pinSaved = false) {
-  vi.resetModules(); events.clear();
+  vi.resetModules(); events.clear(); vi.mocked(invoke).mockClear();
   const { registry } = await import("./hosts/registry"), { cache } = await import("./hosts/cache");
   const { pendingOpens } = await import("./hosts/terminalTransport");
   const { default: App } = await import("./App");
@@ -54,6 +54,7 @@ async function setup(startRingOnly = false, localAlias = false, pinSaved = false
       case "list_codex_projects": case "list_cursor_projects": case "list_opencode_projects": case "list_antigravity_projects": case "open_copies_pending": return [];
       case "detect_agent_binary": return { installed: (remote ? (a?.params as { binary?: string })?.binary : a?.binary) === "claude" };
       case "app_build": return { version: "1.5.0", build: null };
+      case "host_upgrade": return null;
       case "probe_statusline_setup": return { stats_dir_present: false, stats_session_count: 0 };
       case "get_global_rate_limits": return {};
       case "get_codex_usage": return { present: false, primary: null, secondary: null, daily_sessions: [] };
@@ -75,13 +76,26 @@ async function setup(startRingOnly = false, localAlias = false, pinSaved = false
   return { container, registry, pendingOpens, publish, click };
 }
 
-it("mixed r/h history Open retains original operational Ring identity and its banner cannot borrow SSH update authority", async () => {
+// The bar offers the row's own action, and confirming it updates the row id `H`: the alias
+// `R` the Project or Tab holds never names the update target.
+async function expectRowUpdate(f: Awaited<ReturnType<typeof setup>>) {
+  const button = f.container.querySelector(".main-content > .host-update-banner .host-update-action button");
+  expect(button?.textContent).toBe("Use this Desktop’s build");
+  expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "host_upgrade")).toBe(false);
+  await f.click(".main-content > .host-update-banner .host-update-action button");
+  expect(f.container.querySelector(".host-confirm-panel")).not.toBeNull();
+  await f.click(".host-confirm-panel .btn-primary");
+  const upgrades = vi.mocked(invoke).mock.calls.filter(([command]) => command === "host_upgrade");
+  expect(upgrades.map(([, args]) => (args as { host: string }).host)).toEqual([H]);
+}
+
+it("mixed r/h history Open retains original operational Ring identity and its bar updates the row id, never the alias", async () => {
   const f = await setup(true);
   await f.publish("K1", "none", H);
   await f.click(".session-item");
   expect([...f.pendingOpens.values()].map(p => p.host)).toEqual([R]);
   await f.click(`[data-drop-path='host:${R}:/projects/K1-Claude']`);
-  expect(f.container.querySelector(".main-content > .host-update-banner button")).toBeNull();
+  await expectRowUpdate(f);
   await f.click('[aria-label="Settings"]'); await f.click(".settings-nav-item", "Hosts");
   expect(Array.from(f.container.querySelectorAll(".host-row button")).some(b => b.textContent?.includes("Use this Desktop"))).toBe(true);
 });
@@ -111,10 +125,10 @@ it.each(["all", "projects", "history", "pi"])("App and mounted Picker never rela
   if (mode === "pi") expect(picker.textContent).toContain("K2-Pi");
 });
 
-it("a requested Ring banner cannot borrow canonical SSH lifecycle authority", async () => {
+it("a requested Ring alias shows the row's own update in the bar and confirms it for the row id", async () => {
   const f = await setup();
   await f.click(`[data-drop-path='host:${R}:/projects/K1-Claude']`);
-  expect(f.container.querySelector(".main-content > .host-update-banner button")).toBeNull();
+  await expectRowUpdate(f);
   await f.click('[aria-label="Settings"]'); await f.click(".settings-nav-item", "Hosts");
   expect(Array.from(f.container.querySelectorAll(".host-row button")).some(b => b.textContent?.includes("Use this Desktop"))).toBe(true);
 });

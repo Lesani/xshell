@@ -1,6 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { exactUpdateConnected, hostUpdates, skipReason, updateAction, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
+import { exactUpdateConnected, hostUpdates, skipReason, updateAction, updateSource, type AllResult, type UpdateHost } from "../hosts/hostUpdate";
 import { useHostsSnapshot } from "../hosts/useHosts";
 import { fmt } from "../hosts/strings";
 import type { HostStatus } from "../hosts/types";
@@ -38,7 +38,7 @@ export function RingUpdateUnsupported({ name }: { name: string }) {
 // A failed update in approved words only: never the backend's text, a Host id or a build.
 // COPY-GAP: no text for a generic update failure; "hasn't reconnected" is the nearest.
 // The backend may report an outcome already in approved words (update.rolledBack, …): kept.
-const APPROVED = (["update.rolledBack", "update.offline", "update.busy", "update.notBack", "update.tooOld", "update.noBuild"] as const)
+const APPROVED = (["update.rolledBack", "update.offline", "update.busy", "update.notBack", "update.tooOld", "update.noBuild", "update.downloadFailed", "update.verifyFailed", "update.alreadyCurrent"] as const)
   .map(k => new RegExp(`^${fmt(k).replace(/[.*+?^$()|[\]\\]/g, "\\$&").replace(/\\?\{\w+\\?\}/g, ".+")}$`));
 
 // "This updates 1 machine…" / "This updates {n} machines…".
@@ -49,6 +49,9 @@ export function updateAllBody(n: number): string {
 export function updateErrorText(name: string, error: string): string {
   if (APPROVED.some(re => re.test(error.trim())) && !/r_[0-9a-f]{8}/.test(error)) return error.trim();
   console.debug("update failed:", error.split(":")[0]);
+  // The Daemon's failure codes when it fetches a release itself.
+  if (error.includes("update-download-failed")) return fmt("update.downloadFailed", { name });
+  if (error.includes("update-verify-failed")) return fmt("update.verifyFailed", { name });
   if (/offline|unreachable|not connected/i.test(error)) return fmt("update.offline", { name });
   if (/\bbusy\b/i.test(error)) return fmt("update.busy", { name });
   return fmt("update.notBack", { name });
@@ -63,15 +66,18 @@ export function HostUpdateAction({ host, status, description = false }: { host: 
   const error = healthy ? null : state.errors[host.id] || (status?.errorHint === "update-failed" ? status.lastError : null);
   const unavailable = status?.updateUnavailable && (!!status.updateAction || !!status.routeUpdateUnavailable) ? status.updateUnavailable : null;
   const route = status?.routeUpdateUnavailable;
+  // A running update may no longer offer itself; then its source is the one confirmed.
+  const source = updateSource(status) ?? (busy ? state.sources[host.id] : null);
   const visible = action || busy || unavailable || route || error;
   if (!visible) return null;
   return <div className="host-update-action">
     {/* Never a build hash: a different build is just "Update available". */}
-    {description && !busy && status && (action || unavailable) && <span>{replace ? `${host.name}: ${fmt("update.available")}` : fmt("hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion })}</span>}
+    {description && !busy && status && (action || unavailable) && <span>{source === "release" ? fmt("update.release.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", version: status.updateVersion ?? "" })
+      : replace ? `${host.name}: ${fmt("update.available")}` : fmt("hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion })}</span>}
     {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} />}
     {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
     {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
-      {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? "update.restarting" : "update.sending")}</span>
+      {busy ? <span role="status">{fmt(status?.phase === "upgrading" ? "update.restarting" : source === "release" ? "update.downloading" : "update.sending")}</span>
         : action && <button className="btn btn-ghost settings-action-btn" disabled={!!state.confirmation || !!(state.all && !state.all.done)} onClick={() => status && hostUpdates.ask(host, status)}>{fmt(error ? "update.retry" : replace ? "hosts.update.replace" : "update.action")}</button>}
     </>}
     {error && <span className="host-row-error" role="alert">{updateErrorText(host.name, error)}</span>}
@@ -95,7 +101,7 @@ function resultText(r: AllResult): string {
 
 const count = (n: number) => n === 1 ? fmt("update.count.one") : fmt("update.count.other", { n });
 
-/// "Update all": updates every machine in `hosts` that needs this Desktop's build, one after
+/// "Update all": updates every machine in `hosts` that has an update offered, one after
 /// another, after one confirmation. Self-contained: statuses come from the Host registry.
 export function HostUpdateAll({ hosts }: { hosts: UpdateHost[] }) {
   const snap = useHostsSnapshot();
@@ -105,7 +111,7 @@ export function HostUpdateAll({ hosts }: { hosts: UpdateHost[] }) {
   const run = state.all;
   if (run && run.confirmed) {
     return <div className="host-update-all" role="status">
-      {run.current && <span>{run.current.name}: {fmt("update.sending")}</span>}
+      {run.current && <span>{run.current.name}: {fmt(state.sources[run.current.id] === "release" ? "update.downloading" : "update.sending")}</span>}
       {[...run.results, ...(run.done ? run.skipped : [])].map(r => <span key={r.host.id} className={r.outcome === "failed" ? "host-row-error" : undefined}>{resultText(r)}</span>)}
     </div>;
   }

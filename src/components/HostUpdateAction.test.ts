@@ -6,7 +6,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 import { invoke } from "@tauri-apps/api/core";
 import { registry } from "../hosts/registry";
 import { hostUpdates } from "../hosts/hostUpdate";
-import { HostUpdateAction, updateAllBody } from "./HostUpdateAction";
+import { HostUpdateAction, updateAllBody, updateErrorText } from "./HostUpdateAction";
 import type { HostStatus } from "../hosts/types";
 const host = { id: "h_aaaaaaaa", name: "Windows fixture", sshTarget: "test" };
 const status: HostStatus = { host: host.id, status: "build-differs", phase: null, lastError: null, errorHint: null, daemonVersion: "1.5.0", desktopVersion: "1.5.0", protocol: 1, os: "windows", arch: "x86_64", incompatibleReason: null, nextRetryAt: null, sinceMs: 1, updateAction: "replace" };
@@ -104,5 +104,47 @@ describe("Update all confirmation count", () => {
     expect(updateAllBody(1)).toMatch(/^This updates 1 machine and restarts its terminals/);
     expect(updateAllBody(1)).not.toContain("machines");
     expect(updateAllBody(2)).toMatch(/^This updates 2 machines and restarts their terminals/);
+  });
+});
+
+describe("an update from the latest release", () => {
+  const release: Partial<HostStatus> = { status: "upgrade-pending", updateAction: "update", updateSource: "release", updateVersion: "1.6.0", daemonVersion: "1.5.1" };
+  it("names the latest release, not this Desktop's version", () => {
+    const html = render(release);
+    expect(html).toContain("Windows fixture is running xshell 1.5.1. The latest release is 1.6.0.");
+    expect(html).not.toContain("This Desktop uses");
+    expect(html).toContain(">Update</button>");
+  });
+  it("says the Host downloads while it prepares, then restarts", () => {
+    expect(render({ ...release, phase: "preparing" })).toContain("Downloading update…");
+    expect(render({ ...release, phase: "installing" })).toContain("Downloading update…");
+    expect(render({ ...release, phase: "upgrading" })).toContain("Restarting…");
+    expect(render({ ...release, phase: "preparing" })).not.toContain("Sending update…");
+  });
+  it("an older backend without a source keeps this Desktop's sentence and sending line", () => {
+    const old: Partial<HostStatus> = { status: "upgrade-pending", updateAction: "update", daemonVersion: "1.4.0" };
+    expect(render(old)).toContain("Windows fixture is running xshell 1.4.0. This Desktop uses 1.5.0.");
+    expect(render({ ...old, phase: "preparing" })).toContain("Sending update…");
+  });
+  it("is healthy on another version than this Desktop once nothing is offered", () => {
+    expect(render({ status: "connected", updateAction: null, updateSource: null, updateVersion: null, daemonVersion: "1.7.0" })).toBe("");
+  });
+  it("keeps the confirmed source while the running update offers nothing", async () => {
+    let resolve!: () => void;
+    vi.mocked(invoke).mockImplementation(command => command === "host_upgrade" ? new Promise<void>(done => { resolve = done; }) : Promise.resolve(null));
+    hostUpdates.ask(host, { ...status, ...release });
+    const pending = hostUpdates.confirm();
+    const running: Partial<HostStatus> = { status: "connected", phase: "preparing", updateAction: null, updateSource: null, updateVersion: null };
+    expect(render(running)).toContain("Downloading update…");
+    resolve();
+    await pending;
+  });
+  it("maps the Host's download and verification failures to approved words only", () => {
+    expect(updateErrorText("box", "remote: update-download-failed: dns error for get.example")).toBe("box couldn’t download the update. Check that machine’s internet connection, then try again.");
+    expect(updateErrorText("box", "remote: update-verify-failed: sha256 mismatch")).toBe("Couldn’t verify the update on box. Nothing was installed.");
+    // Already in approved words: kept.
+    expect(updateErrorText("box", "box is already up to date.")).toBe("box is already up to date.");
+    expect(render({ ...release, lastError: "update-verify-failed: stamp names 1.5.9", errorHint: "update-failed" })).toContain("Couldn’t verify the update on Windows fixture. Nothing was installed.");
+    expect(render({ ...release, lastError: "update-verify-failed: stamp names 1.5.9", errorHint: "update-failed" })).not.toContain("stamp");
   });
 });

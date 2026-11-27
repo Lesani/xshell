@@ -32,12 +32,39 @@ export function updateTarget(status: HostStatus): UpdateTarget {
   return { configGeneration: status.configGeneration ?? 0, linkGeneration: status.linkGeneration ?? 0, daemonVersion: status.daemonVersion, daemonBuild: status.daemonBuild ? { ...status.daemonBuild } : null };
 }
 
+// Healthy: connected with nothing offered. A Host that follows releases may run another
+// version than this Desktop and still be current, so the versions are not compared here.
 export function exactUpdateConnected(status: HostStatus | undefined): boolean {
-  return !!status && status.status === "connected" && status.phase === null && !status.lastError && status.errorHint !== "update-failed"
-    && status.daemonVersion === status.desktopVersion && sameBuild(status.daemonBuild, status.desktopBuild);
+  return !!status && status.status === "connected" && status.phase === null && !status.lastError && status.errorHint !== "update-failed" && !status.updateAction;
 }
 
-type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
+export type UpdateSource = "release" | "desktop";
+
+/// Who supplies the offered update. An older backend offers only this Desktop's build.
+export function updateSource(status: HostStatus | undefined): UpdateSource | null {
+  return status?.updateSource ?? (status?.updateAction ? "desktop" : null);
+}
+
+type Expectation = { source: UpdateSource; expectedVersion: string; expectedBuild: HostStatus["desktopBuild"] };
+// What a confirmed update must bring back. A release is checked by version only: its build
+// is whatever the release holds, not this Desktop's.
+function expectation(status: HostStatus): Expectation {
+  const source = updateSource(status) ?? "desktop";
+  return { source, expectedVersion: status.updateVersion ?? status.desktopVersion, expectedBuild: source === "desktop" && status.desktopBuild ? { ...status.desktopBuild } : null };
+}
+
+type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateAction; target: UpdateTarget } & Expectation;
+
+function arrived(s: HostStatus, c: Confirmation): boolean {
+  return exactUpdateConnected(s) && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion
+    && (c.source !== "desktop" || sameBuild(s.daemonBuild, c.expectedBuild));
+}
+
+// The Host answered that it is already current: healthy, nothing offered, no restart.
+function alreadyCurrent(s: HostStatus, c: Confirmation): boolean {
+  return exactUpdateConnected(s) && s.daemonVersion !== c.expectedVersion && (s.linkGeneration ?? 0) <= c.target.linkGeneration;
+}
+
 type Invocation = { confirmation: Confirmation; succeeded: boolean };
 
 export type UpdateHost = Pick<HostConfig, "id" | "name">;
@@ -57,7 +84,9 @@ export type AllRun = {
   results: AllResult[];
   done: boolean;
 };
-type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, boolean>; errors: Record<string, string>; all: AllRun | null };
+// `sources`: the source of each confirmed update, by Host id, while it runs; the status
+// stops offering it (and naming its source) once the Host starts.
+type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, boolean>; errors: Record<string, string>; all: AllRun | null; sources: Record<string, UpdateSource> };
 
 /// Why `status` cannot be updated now; `null` when it can.
 export function skipReason(status: HostStatus | undefined): SkipReason | null {
@@ -68,13 +97,13 @@ export function skipReason(status: HostStatus | undefined): SkipReason | null {
   return updateAction(status) ? null : "current";
 }
 
-/// How long "Update all" waits for one machine to come back with this Desktop's build.
+/// How long "Update all" waits for one machine to come back with the expected version.
 export const SETTLE_MS = 150_000;
 
 // Only confirmation/invocation state is shared here. Completion and progress remain the
 // existing Host Status authority. This store outlives navigation between its two surfaces.
 export class HostUpdates {
-  private state: Snapshot = { confirmation: null, invoking: {}, errors: {}, all: null };
+  private state: Snapshot = { confirmation: null, invoking: {}, errors: {}, all: null, sources: {} };
   private listeners = new Set<() => void>();
   private inFlight = new Map<string, Invocation>();
   constructor(
@@ -89,20 +118,23 @@ export class HostUpdates {
   ask(host: Pick<HostConfig, "id" | "name">, status: HostStatus) {
     const action = updateAction(status);
     if (status.host !== host.id || !action || (status.phase === "upgrading" || status.phase === "preparing") || this.state.confirmation || this.state.invoking[host.id]) return;
-    this.set({ confirmation: { host: { ...host }, action, target: updateTarget(status), expectedVersion: status.desktopVersion, expectedBuild: status.desktopBuild ? { ...status.desktopBuild } : null } });
+    this.set({ confirmation: { host: { ...host }, action, target: updateTarget(status), ...expectation(status) } });
   }
   reconcile(status: HostStatus | undefined) {
     if (!status || !exactUpdateConnected(status)) return;
     const invocation = this.inFlight.get(status.host);
     if (invocation) {
-      const { target, expectedVersion, expectedBuild } = invocation.confirmation;
-      if ((status.configGeneration ?? 0) === target.configGeneration && (status.linkGeneration ?? 0) > target.linkGeneration
-        && status.daemonVersion === expectedVersion && sameBuild(status.daemonBuild, expectedBuild)) {
+      if ((status.configGeneration ?? 0) === invocation.confirmation.target.configGeneration && arrived(status, invocation.confirmation)) {
         // Keep this evidence until the invocation settles, even across offline/navigation.
         invocation.succeeded = true;
       }
     }
     if (this.state.errors[status.host]) this.set({ errors: { ...this.state.errors, [status.host]: "" } });
+    if (this.state.sources[status.host] && !this.state.invoking[status.host]) {
+      const sources = { ...this.state.sources };
+      delete sources[status.host];
+      this.set({ sources });
+    }
   }
   cancel = () => this.set({ confirmation: null });
 
@@ -118,7 +150,7 @@ export class HostUpdates {
         skipped.push({ host: { ...host }, outcome: "skipped", reason: reason ?? "busy" });
         continue;
       }
-      queue.push({ host: { ...host }, action, target: updateTarget(status), expectedVersion: status.desktopVersion, expectedBuild: status.desktopBuild ? { ...status.desktopBuild } : null });
+      queue.push({ host: { ...host }, action, target: updateTarget(status), ...expectation(status) });
     }
     if (!queue.length) return;
     this.set({ all: { queue, skipped, confirmed: false, current: null, results: [], done: false } });
@@ -142,8 +174,8 @@ export class HostUpdates {
     this.set({ all: { ...end, done: true } });
   };
 
-  /// One machine of "Update all": the confirmed update, then wait until it is back with
-  /// this Desktop's build, its update failed, or `settleMs` passed.
+  /// One machine of "Update all": the confirmed update, then wait until it is back on the
+  /// expected version, says it is already current, its update failed, or `settleMs` passed.
   private async updateOne(c: Confirmation): Promise<AllResult> {
     const id = c.host.id;
     const current = this.statusOf(id);
@@ -151,7 +183,7 @@ export class HostUpdates {
       return { host: c.host, outcome: "skipped", reason: skipReason(current) ?? "offline" };
     }
     const settled = this.waitSettled(c);
-    this.set({ invoking: { ...this.state.invoking, [id]: true } });
+    this.set({ invoking: { ...this.state.invoking, [id]: true }, sources: { ...this.state.sources, [id]: c.source } });
     try {
       await this.call("host_upgrade", { host: id, target: c.target });
       settled.started();
@@ -163,21 +195,28 @@ export class HostUpdates {
       this.set({ invoking: { ...this.state.invoking, [id]: false } });
     }
     const r = await settled.promise;
-    return r === true ? { host: c.host, outcome: "ok", version: c.expectedVersion } : { host: c.host, outcome: "failed", error: r };
+    return r === true ? { host: c.host, outcome: "ok", version: c.expectedVersion }
+      : r === false ? { host: c.host, outcome: "skipped", reason: "current" }
+      : { host: c.host, outcome: "failed", error: r };
   }
 
-  private waitSettled(c: Confirmation): { promise: Promise<true | string>; cancel: () => void; started: () => void } {
-    let finish!: (r: true | string) => void;
-    const promise = new Promise<true | string>(resolve => { finish = resolve; });
+  // Settles `true` (arrived), `false` (the Host said it is already current) or an error.
+  private waitSettled(c: Confirmation): { promise: Promise<boolean | string>; cancel: () => void; started: () => void } {
+    let finish!: (r: boolean | string) => void;
+    const promise = new Promise<boolean | string>(resolve => { finish = resolve; });
     let over = false;
     // An update error counts only once this update began: an older one may still show.
     let began = false;
-    const end = (r: true | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
+    // Already current is believed only after `host_upgrade` resolved: before, the Host may
+    // not have looked yet.
+    let answered = false;
+    const end = (r: boolean | string) => { if (over) return; over = true; stop(); clearTimeout(timer); finish(r); };
     const check = () => {
       const s = this.statusOf(c.host.id);
       if (!s) return;
       if (s.phase !== null) began = true;
-      if (exactUpdateConnected(s) && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion && sameBuild(s.daemonBuild, c.expectedBuild)) end(true);
+      if (arrived(s, c)) end(true);
+      else if (answered && alreadyCurrent(s, c)) end(false);
       else if (began && s.errorHint === "update-failed" && s.phase === null && s.lastError) end(s.lastError);
     };
     const stop = this.watch(check);
@@ -186,7 +225,7 @@ export class HostUpdates {
     return {
       promise,
       cancel: () => { if (!over) { over = true; stop(); clearTimeout(timer); } },
-      started: () => { began = true; check(); },
+      started: () => { began = true; answered = true; check(); },
     };
   }
   confirm = async () => {
@@ -195,7 +234,7 @@ export class HostUpdates {
     const id = pending.host.id;
     const invocation: Invocation = { confirmation: pending, succeeded: false };
     this.inFlight.set(id, invocation);
-    this.set({ confirmation: null, invoking: { ...this.state.invoking, [id]: true }, errors: { ...this.state.errors, [id]: "" } });
+    this.set({ confirmation: null, invoking: { ...this.state.invoking, [id]: true }, errors: { ...this.state.errors, [id]: "" }, sources: { ...this.state.sources, [id]: pending.source } });
     try { await this.call("host_upgrade", { host: id, target: pending.target }); }
     catch (e) {
       if (!invocation.succeeded) this.set({ errors: { ...this.state.errors, [id]: typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e) } });

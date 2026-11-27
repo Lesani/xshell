@@ -114,22 +114,33 @@ async function focusPane(terminal: TerminalInfo) {
   expect(pane!.classList.contains("group-pane-active")).toBe(true);
 }
 const banner = () => container.querySelector(".main-content > .host-update-banner");
+// The bar lists every eligible Remote Host wherever the user is; what is left is this computer's.
+const rows = () => [...banner()?.querySelectorAll(".host-update-action") ?? []];
+const remoteRow = (host: HostConfig) => rows().find(r => r.textContent?.includes(host.name));
+const localRows = () => rows().filter(r => ![hostA, hostB].some(h => r.textContent?.includes(h.name)));
+const localText = () => localRows().map(r => r.textContent).join("");
+const order = () => rows().map(r => [hostA, hostB].find(h => r.textContent?.includes(h.name))?.name ?? "local");
 function expectNoControls() {
-  expect(banner()?.querySelectorAll("button, a, input, [role='button']").length ?? 0).toBe(0);
+  expect(localRows().flatMap(r => [...r.querySelectorAll("button, a, input, [role='button']")]).length).toBe(0);
 }
 // This computer switches its own background program: no notice with versions, build hashes or
 // "check Settings" guidance (only a progress line while it switches).
 function expectLocalNotice(context: string, _description?: string) {
-  const text = banner()?.textContent ?? "";
-  expect(text, `${context}: no Local notice`).toBe("");
-  expect(text).not.toContain(settingsHint);
-  expect(text).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
+  expect(localText(), `${context}: no Local notice`).toBe("");
+  expect(banner()?.textContent ?? "").not.toContain(settingsHint);
+  expect(banner()?.textContent ?? "").not.toContain("This computer");
+  expect(banner()?.textContent ?? "").not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
   expectNoControls();
+  // No Remote focus: the Remote Hosts keep their configured order.
+  expect(order(), context).toEqual([hostA.name, hostB.name]);
 }
+// The focused Remote Host comes first; the other is still offered.
 function expectRemoteNotice(host: HostConfig) {
-  expect(banner()?.textContent).toContain(`${host.name}: Update available`);
+  const other = host === hostA ? hostB : hostA;
+  expect(order()).toEqual([host.name, other.name]);
+  expect(remoteRow(host)?.textContent).toContain(`${host.name}: Update available`);
   expect(banner()?.textContent).not.toMatch(/3b9c9a89c10e|7ab4537a9baf/);
-  expect(banner()?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
+  expect(remoteRow(host)?.querySelector("button")?.textContent).toBe("Use this Desktop’s build");
   expect(banner()?.textContent).not.toContain("This computer");
   expect(banner()?.textContent).not.toContain(settingsHint);
 }
@@ -141,7 +152,7 @@ async function localStatus(patch: Partial<HostStatus>) {
   expect(registry.getStatus(LOCAL_HOST)).toEqual(status);
 }
 
-it("shows only text guidance for eligible native Local Daemon contexts, preserving Remote actions and status/navigation guards", async () => {
+it("shows only text guidance for eligible native Local Daemon contexts while the bar keeps every Remote action, the focused one first, with status/navigation guards", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
   const snapshots: HostSnapshot[] = [
@@ -218,8 +229,9 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
   expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "local_migration_journal_read")).toHaveLength(1);
   expect(unexpectedNativeCalls).toEqual([]);
 
-  // Eligible Local metadata alone does not make global Home a Host context.
-  expect(banner()).toBeNull();
+  // Eligible Local metadata alone does not make global Home a Host context; the Remote
+  // Hosts are offered anyway.
+  expectLocalNotice("global Home");
   await click(`[data-drop-path='${keyOf(localProject)}']`);
   expect(container.querySelector(".project-detail-main .sessions-view-title")?.textContent).toBe(localProject.name);
   expectLocalNotice("selected Local Project");
@@ -266,13 +278,13 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
 
   await click(".ds-home");
   expect(container.querySelector(".project-detail-split")).toBeNull();
-  expect(banner()).toBeNull();
+  expectLocalNotice("global Home after Settings");
   await click(`[data-drag-id="${tabId(localTerminal)}"]`);
   expectLocalNotice("active Local Daemon Tab");
 
   await localStatus({ status: "upgrade-pending", daemonVersion: "1.4.0", updateAction: "update" });
   expectLocalNotice("native older version", "This computer is running xshell 1.4.0. This Desktop uses 1.5.0.");
-  expect(banner()?.textContent ?? "").not.toContain("different build");
+  expect(localText()).not.toContain("different build");
   await localStatus({});
   expectLocalNotice("native different build");
   await localStatus({ daemonBuild: null });
@@ -289,14 +301,15 @@ it("shows only text guidance for eligible native Local Daemon contexts, preservi
   ];
   for (const { label, patch } of excluded) {
     await localStatus(patch);
-    expect(banner()?.textContent ?? "", `excluded Local status: ${label}`).toBe("");
+    expect(localText(), `excluded Local status: ${label}`).toBe("");
     expectNoControls();
   }
   // While this computer switches: the approved progress line only.
   await localStatus({ phase: "preparing" });
-  expect(banner()?.textContent).toBe("Sending update…");
+  expect(localText()).toBe("Sending update…");
+  expect(order()).toEqual(["local", hostA.name, hostB.name]);
   await localStatus({ phase: "upgrading" });
-  expect(banner()?.textContent).toBe("Restarting…");
+  expect(localText()).toBe("Restarting…");
   expectNoControls();
   await localStatus({});
   expectLocalNotice("reactive different-build reappearance");

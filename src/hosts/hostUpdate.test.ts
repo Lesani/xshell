@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { activeUpdateHost, HostUpdates, skipReason, updateAction } from "./hostUpdate";
+import { activeUpdateHost, exactUpdateConnected, HostUpdates, skipReason, updateAction, updateSource } from "./hostUpdate";
 import type { HostStatus, HostConfig } from "./types";
 import type { LayoutNode } from "../types";
 
@@ -202,5 +202,100 @@ describe("Update all", () => {
     g.updates.cancelAll();
     expect(g.updates.getSnapshot().all).toBeNull();
     expect(g.calls).toEqual([]);
+  });
+});
+
+describe("Updates from the latest release", () => {
+  const build = { commit: "85ee920a1b2c", dirty: null, time: 7 };
+  const other = { commit: "3b9c9a89c10e", dirty: null, time: 9 };
+  const a = { id: "r_a", name: "box-a" };
+  // A Host that downloads the latest release (1.6.0) itself; this Desktop runs 1.5.0.
+  const release = (id: string, gen = 3): HostStatus => status({ host: id, daemonVersion: "1.5.0", desktopVersion: "1.5.0", desktopBuild: build, linkGeneration: gen, updateSource: "release", updateVersion: "1.6.0" });
+  const healthy = (id: string, gen: number, patch: Partial<HostStatus> = {}): HostStatus => status({ host: id, status: "connected", updateAction: null, updateSource: null, updateVersion: null, daemonVersion: "1.6.0", daemonBuild: other, desktopBuild: build, linkGeneration: gen, ...patch });
+  function fixture(initial: Record<string, HostStatus>, settleMs = 1000) {
+    const statuses: Record<string, HostStatus> = { ...initial };
+    const listeners = new Set<() => void>();
+    const push = (s: HostStatus) => { statuses[s.host] = s; for (const l of [...listeners]) l(); };
+    const replies = new Map<string, () => Promise<unknown>>();
+    const invoke = vi.fn(async (_cmd: string, args?: { host: string }) => (replies.get(args!.host) ?? (async () => null))());
+    const updates = new HostUpdates(invoke as never, id => statuses[id], l => { listeners.add(l); return () => { listeners.delete(l); }; }, settleMs);
+    return { updates, push, replies, statuses, invoke };
+  }
+  const run = async (f: ReturnType<typeof fixture>) => {
+    f.updates.askAll([{ host: a, status: f.statuses.r_a }]);
+    await f.updates.confirmAll();
+    return f.updates.getSnapshot().all!.results;
+  };
+
+  it("healthy means connected with nothing offered, whatever version this Desktop runs", () => {
+    const newer = status({ status: "connected", updateAction: null, daemonVersion: "1.7.0", desktopVersion: "1.5.0", daemonBuild: other, desktopBuild: build });
+    expect(exactUpdateConnected(newer)).toBe(true);
+    expect(skipReason(newer)).toBe("current");
+    expect(exactUpdateConnected({ ...newer, updateAction: "update" })).toBe(false);
+    expect(exactUpdateConnected({ ...newer, phase: "upgrading" })).toBe(false);
+    expect(exactUpdateConnected({ ...newer, lastError: "x", errorHint: "update-failed" })).toBe(false);
+  });
+
+  it("a confirmation expects the offered version and no build for a release", () => {
+    const updates = new HostUpdates(vi.fn());
+    updates.ask(host, release(host.id));
+    expect(updates.getSnapshot().confirmation).toMatchObject({ source: "release", expectedVersion: "1.6.0", expectedBuild: null });
+  });
+
+  it("an older backend without a source is read as this Desktop's build", () => {
+    const old = status({ desktopBuild: build });
+    expect(old.updateSource).toBeUndefined();
+    expect(updateSource(old)).toBe("desktop");
+    expect(updateSource(status({ updateAction: null }))).toBeNull();
+    const updates = new HostUpdates(vi.fn());
+    updates.ask(host, old);
+    expect(updates.getSnapshot().confirmation).toMatchObject({ source: "desktop", expectedVersion: "1.5.0", expectedBuild: build });
+  });
+
+  it("a release succeeds on the offered version without comparing builds", async () => {
+    const f = fixture({ r_a: release("r_a") });
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4)), 5); return null; });
+    expect(await run(f)).toEqual([{ host: a, outcome: "ok", version: "1.6.0" }]);
+  });
+
+  it("a release that comes back on another version is not a success", async () => {
+    const f = fixture({ r_a: release("r_a") }, 50);
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4, { daemonVersion: "1.5.5" })), 5); return null; });
+    expect((await run(f))[0]).toMatchObject({ host: a, outcome: "failed" });
+  });
+
+  it("this Desktop's build still has to come back with the same build", async () => {
+    const f = fixture({ r_a: status({ host: "r_a", desktopBuild: build }) }, 50);
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4, { daemonVersion: "1.5.0", daemonBuild: other })), 5); return null; });
+    expect((await run(f))[0]).toMatchObject({ host: a, outcome: "failed" });
+    const g = fixture({ r_a: status({ host: "r_a", desktopBuild: build }) }, 50);
+    g.replies.set("r_a", async () => { setTimeout(() => g.push(healthy("r_a", 4, { daemonVersion: "1.5.0", daemonBuild: build })), 5); return null; });
+    expect(await run(g)).toEqual([{ host: a, outcome: "ok", version: "1.5.0" }]);
+  });
+
+  it("settles as already current when the Host answers it is current, without waiting for the time limit", async () => {
+    const f = fixture({ r_a: release("r_a") }, 60_000);
+    // The Host looked, found nothing newer and stayed on its link: nothing offered any more.
+    f.replies.set("r_a", async () => { f.push(healthy("r_a", 3, { daemonVersion: "1.5.0" })); return null; });
+    expect(await run(f)).toEqual([{ host: a, outcome: "skipped", reason: "current" }]);
+    // The same status reported after the answer settles it too.
+    const g = fixture({ r_a: release("r_a") }, 60_000);
+    g.replies.set("r_a", async () => { setTimeout(() => g.push(healthy("r_a", 3, { daemonVersion: "1.5.0" })), 5); return null; });
+    expect(await run(g)).toEqual([{ host: a, outcome: "skipped", reason: "current" }]);
+  });
+
+  it("remembers the confirmed source while the update runs, and forgets it once the Host is healthy", async () => {
+    let resolve!: () => void;
+    const updates = new HostUpdates(vi.fn(() => new Promise<void>(done => { resolve = done; })) as never);
+    updates.ask(host, release(host.id));
+    const pending = updates.confirm();
+    expect(updates.getSnapshot().sources[host.id]).toBe("release");
+    // Running: the status offers nothing (and so names no source).
+    updates.reconcile(healthy(host.id, 4));
+    expect(updates.getSnapshot().sources[host.id]).toBe("release");
+    resolve();
+    await pending;
+    updates.reconcile(healthy(host.id, 4));
+    expect(updates.getSnapshot().sources[host.id]).toBeUndefined();
   });
 });

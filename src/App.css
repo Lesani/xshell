@@ -1951,6 +1951,7 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 .host-update-banner:has(.host-update-action) { padding: 8px 12px; border-bottom: 1px solid var(--border-default); background: var(--bg-elevated); flex-shrink: 0; }
 .host-update-action { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
 .host-update-action .host-row-error { flex-basis: 100%; }
+.host-update-banner .host-update-action + .host-update-action { margin-top: 6px; }
 
 /* Shared Terminal names: a small Tab-only menu and the existing settings modal chrome. */
 .tab-name-menu {

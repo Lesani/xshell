@@ -65,6 +65,11 @@ export interface HostStatus {
   os: "linux" | "macos" | "windows" | null;
   linkGeneration?: number;
   updateAction?: "update" | "replace" | null;
+  // The version the offered update leads to, and who supplies it: "release" = the Host
+  // downloads the latest release itself, "desktop" = this Desktop sends its own build. Absent
+  // when nothing is offered; an older Rust side sends neither (read as "desktop").
+  updateVersion?: string | null;
+  updateSource?: "release" | "desktop" | null;
   updateUnavailable?: "windows-owner" | "desktop-owned" | null;
   // "ring-update-unsupported": a Ring Host whose xshell cannot take an update over the Ring
   // (no `daemon.stage`, or no common protocol); it is updated with the install command there.

@@ -56,6 +56,12 @@ export const S = {
   "update.noBuild": "This xshell cannot update this type of machine. Update xshell directly on that machine.",
   "update.current": "Up to date",
   "update.retry": "Retry",
+  // Hosts that update themselves from the latest release (design-update-from-get D6, binding).
+  "update.release.older": "{host} is running xshell {daemonVersion}. The latest release is {version}.",
+  "update.downloading": "Downloading update…",
+  "update.downloadFailed": "{name} couldn’t download the update. Check that machine’s internet connection, then try again.",
+  "update.verifyFailed": "Couldn’t verify the update on {name}. Nothing was installed.",
+  "update.alreadyCurrent": "{name} is already up to date.",
   // Approved later (review-rjw-s3-sol.md table C, binding).
   "update.tooOld": "{name} is too old to update through your Ring. Update xshell directly on that machine.",
   "update.notBack": "{name} hasn't reconnected after the update. Check that machine, then try connecting again.",
