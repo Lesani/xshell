@@ -13,7 +13,6 @@ pub mod job_exec;
 mod latest;
 pub mod log;
 pub mod maintenance;
-#[cfg(unix)]
 pub mod pair;
 pub mod paths;
 pub mod server;
@@ -113,19 +112,15 @@ pub fn main_entry() -> i32 {
         }
         Command::Serve(o) => (o, true),
         Command::Connect(o) => (o, false),
-        #[cfg(windows)]
-        Command::Pair(_) => {
-            eprintln!("xshelld: pair is not supported on Windows.");
-            return 1;
-        }
-        #[cfg(unix)]
         Command::Pair(o) => {
             let Some(home) = o.home.clone().or_else(dirs::home_dir) else {
                 eprintln!("xshelld: cannot determine the home directory; pass --home");
                 return 1;
             };
             let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+            #[cfg_attr(windows, allow(unused_mut))]
             let mut paths = paths::resolve(&home, xdg.as_deref(), o.socket.as_deref());
+            #[cfg(unix)]
             if o.socket.is_none() {
                 paths.socket = paths::live_socket(&home, &paths.socket);
             }

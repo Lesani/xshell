@@ -12,6 +12,7 @@ pub mod local;
 pub mod presence;
 pub mod quit;
 pub mod service;
+pub mod shim;
 
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,35 @@ fn own_install_bin(version: &str, home: Option<&std::path::Path>) -> Option<std:
     Some(xshell_hostlink::install::local_server_bin(home, &dir))
 }
 
+/// `xshell pair` (#118): the Local Host's Daemon binary, resolved exactly as the running
+/// Desktop resolves it ([`setup_local`]), with the embedded Daemon installed if it is not
+/// there yet. Starts nothing.
+pub fn local_daemon_bin_for_cli() -> Result<std::path::PathBuf, String> {
+    let home = dirs::home_dir();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let install_bin = own_install_bin(env!("CARGO_PKG_VERSION"), home.as_deref());
+    let matches = |p: &std::path::Path| local::binary_is_build(p, crate::build_id::BUILD.as_ref());
+    match local::resolve_local(
+        exe_dir.as_deref(),
+        &|k| std::env::var_os(k),
+        binaries::embedded_own().is_some(),
+        install_bin.as_deref(),
+        &matches,
+    ) {
+        local::LocalMode::Daemon { bin, source } => match source {
+            local::DaemonSource::Embedded => install_embedded(&bin),
+            local::DaemonSource::File => Ok(bin),
+            local::DaemonSource::Missing(reason) => Err(reason),
+        },
+        local::LocalMode::InProcess { reason } => Err(format!(
+            "this computer's terminals run inside the app ({reason})"
+        )),
+        local::LocalMode::Failed { reason } => Err(reason),
+    }
+}
+
 /// Resolve how local Tabs run and set up the Local Host's Daemon for it.
 fn setup_local(
     version: &str,
@@ -118,6 +148,15 @@ fn setup_local(
         }
         _ => None,
     };
+    // Windows: the stable console command `xshelld` for this Daemon (#118). Never fatal.
+    #[cfg(windows)]
+    if let (local::LocalMode::Daemon { bin, source }, Some(home)) = (&mode, home.as_deref()) {
+        if !matches!(source, local::DaemonSource::Missing(_)) {
+            if let Err(e) = shim::write(home, bin) {
+                eprintln!("xshell: cannot write the xshelld command: {e}");
+            }
+        }
+    }
     match &mode {
         local::LocalMode::Daemon { bin, .. } => {
             eprintln!("xshell: local terminals run in {}", bin.display())

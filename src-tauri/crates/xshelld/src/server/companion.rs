@@ -770,8 +770,9 @@ pub(super) fn serve(
 
 /// Read-only classification for the actual CLI. Unreadable association is an error,
 /// never standalone permission; a pending reservation may contain no keys at all.
-/// Used only by the Unix-only `xshelld pair` command.
-#[cfg(unix)]
+/// Used only by the `xshelld pair` command. Windows has no startup reservation: only a
+/// completed registration names a Desktop there.
+#[cfg(any(unix, windows))]
 pub(crate) fn registered_desktop(
     store: &Store,
     budget: &xshell_core::local_ipc::RequestBudget,
@@ -785,13 +786,18 @@ pub(crate) fn registered_desktop(
         budget.check().map_err(|e| e.to_string())?;
         return Ok(policy.profile().desktop_store.clone());
     }
-    let path = xshell_core::companion_reservation::read_reservation(&store.dir)
-        .map_err(|e| e.to_string())?
-        .ok_or("registered Computer association is unreadable")?
-        .desktop_store;
-    xshell_core::local_ipc::private_dir(Path::new(&path)).map_err(|e| e.to_string())?;
-    budget.check().map_err(|e| e.to_string())?;
-    Ok(path)
+    #[cfg(unix)]
+    {
+        let path = xshell_core::companion_reservation::read_reservation(&store.dir)
+            .map_err(|e| e.to_string())?
+            .ok_or("registered Computer association is unreadable")?
+            .desktop_store;
+        xshell_core::local_ipc::private_dir(Path::new(&path)).map_err(|e| e.to_string())?;
+        budget.check().map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+    #[cfg(not(unix))]
+    Err("registered Computer association is unreadable".into())
 }
 
 /// Registration-only command: no Daemon, Host, Relay, signer RPC or membership runtime.

@@ -316,24 +316,27 @@ impl Administration {
 
 /// Blocking short-request facade over the existing protected broker, not a second election
 /// or a Host/Call tunnel. Connection loss discards this request origin and its pending work.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct AdministrationClient {
     stream: super::broker_ipc::native::Stream,
     assembly: std::sync::Arc<super::broker_ipc::Assembly>,
     epoch: Uuid,
     next: u64,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl AdministrationClient {
     pub fn connect(desktop_store: &std::path::Path, until: Instant) -> Result<Self, String> {
         let io_until = until.min(Instant::now() + Duration::from_secs(2));
         use super::broker::{ClientMessage, Event};
-        use sha2::{Digest, Sha256};
-        let dir = desktop_store.canonicalize().map_err(|e| e.to_string())?;
-        xshell_core::local_ipc::private_dir(&dir).map_err(|e| e.to_string())?;
-        let profile = format!("{:x}", Sha256::digest(dir.as_os_str().as_encoded_bytes()));
+        // The endpoint and the Hello profile exactly as the owning Desktop derives them: a
+        // socket in the Store on Unix, a pipe named after the user and the Store on Windows
+        // (whose connect refuses a pipe served by another user).
+        let dir =
+            xshell_core::local_ipc::canonical_store(desktop_store).map_err(|e| e.to_string())?;
+        let profile =
+            xshell_core::local_ipc::host_broker_profile(&dir).map_err(|e| e.to_string())?;
         let mut stream = super::broker_ipc::native::connect(
-            &dir.join("host-broker.sock"),
+            &xshell_core::local_ipc::host_broker_endpoint(&dir).map_err(|e| e.to_string())?,
             io_until
                 .checked_duration_since(Instant::now())
                 .filter(|left| !left.is_zero())
@@ -406,7 +409,7 @@ impl AdministrationClient {
         }
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for AdministrationClient {
     fn drop(&mut self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
