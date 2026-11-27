@@ -226,6 +226,16 @@ impl Desktop {
     }
 
     fn with_source(relay: &Relay, build: BuildId, source: Arc<dyn BinarySource>) -> Desktop {
+        Self::versioned(relay, VERSION, build, source)
+    }
+
+    /// A Desktop of another version than this build's (its own Daemon stays this build).
+    fn versioned(
+        relay: &Relay,
+        version: &str,
+        build: BuildId,
+        source: Arc<dyn BinarySource>,
+    ) -> Desktop {
         let home = TestHome::new();
         let mut cfg = Config::new(home.home(), home.paths());
         // Never the real release server.
@@ -238,7 +248,7 @@ impl Desktop {
         rc.backoff_unit = Duration::from_millis(10);
         let ring = DesktopRing::open(rc, Arc::new(Quiet));
         let events = Arc::new(Events::default());
-        let mut mc = ManagerConfig::new(VERSION, Arc::new(NoSsh), source, events.clone());
+        let mut mc = ManagerConfig::new(version, Arc::new(NoSsh), source, events.clone());
         mc.desktop_build = Some(build);
         mc.backoff_unit = Duration::from_millis(20);
         let manager = Arc::new(Manager::new(mc));
@@ -999,6 +1009,110 @@ fn capable_host_failed_download_keeps_running() {
         "server error",
         xshell_hostlink::handle::release_download_failed(&name),
     );
+}
+
+/// A Host that cannot get the release by itself (its release server is unreachable, or the
+/// release has no build for it) is sent this Desktop's build when that is newer than what it
+/// runs: it ends on the Desktop's version, with no error, and stays offered the release.
+#[test]
+fn host_that_cannot_get_the_release_takes_a_newer_desktop_build() {
+    for no_build in [false, true] {
+        let relay = Relay::start();
+        let stub = GetStub::start();
+        let (rel, rel_build, next) = released("0123456789ab");
+        if no_build {
+            // The release exists, without a build for this machine type.
+            stub.body("/latest", "99.0.0\n".to_string());
+        } else {
+            stub.set("/latest", common::get_stub::Route::Status(503));
+        }
+        let desktop = Desktop::versioned(
+            &relay,
+            &next,
+            rel_build.clone(),
+            Arc::new(Bytes(rel.clone())),
+        );
+        let url = stub.url();
+        let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+        let host = desktop.host(key);
+        let (t, _sink, old_terminal) = open_shell(&host, &m.h.project("p"));
+        desktop.manager.set_latest_release(ver("99.0.0"));
+        wait("release offered", || {
+            offer(&host.status()) == release_offer("99.0.0")
+        });
+        let pid = m.pid();
+        let before = host.status().link_generation;
+        reply(|w| host.upgrade(w)).unwrap_or_else(|e| panic!("{no_build}: {e:?}\n{}", m.log()));
+        let dir = install_dir_name(&next, Some(&rel_build));
+        wait("on the Desktop's build and connected again", || {
+            let s = host.status();
+            s.usable()
+                && s.phase.is_none()
+                && s.link_generation > before
+                && s.daemon_version.as_deref() == Some(next.as_str())
+                && s.daemon_build.as_ref() == Some(&rel_build)
+        });
+        let s = host.status();
+        assert_eq!(s.last_error, None, "{no_build}: {s:?}");
+        assert_eq!(s.error_hint, None, "{no_build}: {s:?}");
+        // The release is still newer than what the Host now runs.
+        assert_eq!(offer(&s), release_offer("99.0.0"), "{no_build}");
+        assert!(alive(pid));
+        assert_eq!(exe_of(pid), m.installed(&dir), "{}", m.log());
+        wait("Terminal back under its UUID", || {
+            host.terminals().is_some_and(|l| {
+                l.iter()
+                    .any(|i| i.terminal == t && i.pid.is_some() && i.pid != Some(old_terminal))
+            })
+        });
+        wait("trial accepted", || m.trial_closed());
+        let seen = phases(&desktop, host.id());
+        let at = |p| seen.iter().position(|x| *x == p);
+        assert!(
+            at(xshell_hostlink::Phase::Preparing) < at(xshell_hostlink::Phase::Installing)
+                && at(xshell_hostlink::Phase::Installing).is_some()
+                && seen.contains(&xshell_hostlink::Phase::Upgrading),
+            "{no_build}: asked the Host first, then sent the build: {seen:?}"
+        );
+        // Asking again: the Desktop has nothing newer left to send, so the failure is told.
+        let name = name_of(&desktop, host.id());
+        let e = reply(|w| host.upgrade(w)).unwrap_err();
+        let want = if no_build {
+            xshell_hostlink::handle::RING_NO_BUILD.to_string()
+        } else {
+            xshell_hostlink::handle::release_download_failed(&name)
+        };
+        assert_eq!(e.message, want, "{no_build}");
+        assert!(host.status().usable());
+    }
+}
+
+/// A build that failed its checks is never replaced by this Desktop's build behind the
+/// user's back, even when the Desktop is newer.
+#[test]
+fn unverified_release_is_not_replaced_by_the_desktop_build() {
+    let relay = Relay::start();
+    let stub = GetStub::start();
+    let (rel, rel_build, next) = released("0123456789ab");
+    stub.body("/latest", "99.0.0\n".to_string());
+    stub.release("99.0.0", triple(), &rel, Some(&"00".repeat(32)));
+    let desktop = Desktop::versioned(&relay, &next, rel_build, Arc::new(NoFetch));
+    let url = stub.url();
+    let (m, key) = Machine::start(&relay, &desktop, &[("XSHELL_GET_URL", &url)]);
+    let host = desktop.host(key);
+    let name = name_of(&desktop, host.id());
+    desktop.manager.set_latest_release(ver("99.0.0"));
+    wait("release offered", || {
+        offer(&host.status()) == release_offer("99.0.0")
+    });
+    let before = host.status().link_generation;
+    let e = reply(|w| host.upgrade(w)).unwrap_err();
+    assert_eq!(e.message, xshell_hostlink::handle::release_bad(&name));
+    let s = host.status();
+    assert!(s.usable() && s.phase.is_none(), "{s:?}");
+    assert_eq!(s.link_generation, before);
+    assert_eq!(s.daemon_version.as_deref(), Some(VERSION));
+    assert!(alive(m.pid()));
 }
 
 /// Sol 5: the release does not come up; the Host goes back to its build with its live

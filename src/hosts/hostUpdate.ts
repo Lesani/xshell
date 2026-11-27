@@ -57,9 +57,12 @@ type Confirmation = { host: Pick<HostConfig, "id" | "name">; action: UpdateActio
 
 // This operation succeeded: usable, settled, on the expected version over a new link. A
 // further update may already be offered (a newer release learned meanwhile): still success.
+// A Host that could not get the release itself was sent this Desktop's build instead, and
+// is then on this Desktop's version.
 function arrived(s: HostStatus, c: Confirmation): boolean {
   return ["connected", "upgrade-pending", "build-differs"].includes(s.status) && s.phase === null && !s.lastError && s.errorHint !== "update-failed"
-    && (s.linkGeneration ?? 0) > c.target.linkGeneration && s.daemonVersion === c.expectedVersion
+    && (s.linkGeneration ?? 0) > c.target.linkGeneration
+    && (s.daemonVersion === c.expectedVersion || (c.source === "release" && s.daemonVersion === s.desktopVersion))
     && (c.source !== "desktop" || sameBuild(s.daemonBuild, c.expectedBuild));
 }
 
@@ -198,7 +201,7 @@ export class HostUpdates {
       this.set({ invoking: { ...this.state.invoking, [id]: false } });
     }
     const r = await settled.promise;
-    return r === true ? { host: c.host, outcome: "ok", version: c.expectedVersion }
+    return r === true ? { host: c.host, outcome: "ok", version: this.statusOf(id)?.daemonVersion ?? c.expectedVersion }
       : r === false ? { host: c.host, outcome: "skipped", reason: "current" }
       : { host: c.host, outcome: "failed", error: r };
   }

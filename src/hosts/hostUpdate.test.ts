@@ -264,6 +264,15 @@ describe("Updates from the latest release", () => {
     expect((await run(f))[0]).toMatchObject({ host: a, outcome: "failed" });
   });
 
+  it("a Host that was sent this Desktop's build instead of the release succeeds on this Desktop's version", async () => {
+    // The Host could not get 1.6.0 itself; the Desktop (1.5.0) sent its own build. 1.6.0 stays offered.
+    const sent = status({ host: "r_a", status: "upgrade-pending", updateAction: "update", updateSource: "release", updateVersion: "1.6.0", daemonVersion: "1.5.0", daemonBuild: build, desktopBuild: build, linkGeneration: 4 });
+    expect(sent.desktopVersion).toBe("1.5.0");
+    const f = fixture({ r_a: { ...release("r_a"), daemonVersion: "1.4.0" } }, 60_000);
+    f.replies.set("r_a", async () => { setTimeout(() => f.push(sent), 5); return null; });
+    expect(await run(f)).toEqual([{ host: a, outcome: "ok", version: "1.5.0" }]);
+  });
+
   it("this Desktop's build still has to come back with the same build", async () => {
     const f = fixture({ r_a: status({ host: "r_a", desktopBuild: build }) }, 50);
     f.replies.set("r_a", async () => { setTimeout(() => f.push(healthy("r_a", 4, { daemonVersion: "1.5.0", daemonBuild: other })), 5); return null; });

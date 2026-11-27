@@ -117,7 +117,8 @@ describe("an update from the latest release", () => {
   });
   it("says the Host downloads while it prepares, then restarts", () => {
     expect(render({ ...release, phase: "preparing" })).toContain("Downloading update…");
-    expect(render({ ...release, phase: "installing" })).toContain("Downloading update…");
+// The Host could not get the release itself: this Desktop sends its own build instead.
+    expect(render({ ...release, phase: "installing" })).toContain("Sending update…");
     expect(render({ ...release, phase: "upgrading" })).toContain("Restarting…");
     expect(render({ ...release, phase: "preparing" })).not.toContain("Sending update…");
   });

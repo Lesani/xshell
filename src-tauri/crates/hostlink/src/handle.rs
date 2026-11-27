@@ -119,8 +119,27 @@ fn update_busy(e: &HostError) -> bool {
             || e.message.starts_with(xshell_protocol::msg::UPDATE_ON_TRIAL))
 }
 
+/// A failed update from the latest release.
+struct ReleaseFailure {
+    /// In approved words; the detail goes to the log only.
+    error: HostError,
+    /// The Host itself is fine and answered that it cannot get the release (it does not
+    /// reach the release server, or the release has no build for it): this Desktop may send
+    /// its own build instead. Never for a build that failed its checks.
+    desktop_may_send: bool,
+}
+
+impl ReleaseFailure {
+    fn plain(error: HostError) -> Self {
+        ReleaseFailure {
+            error,
+            desktop_may_send: false,
+        }
+    }
+}
+
 /// A failed `daemon.update-latest` in approved words; the detail goes to the log only.
-fn release_failure(name: &str, e: HostError) -> HostError {
+fn release_failure(name: &str, e: HostError) -> ReleaseFailure {
     use xshell_protocol::msg::{
         UPDATE_LATEST_BAD_BUILD, UPDATE_LATEST_NO_BUILD, UPDATE_LATEST_UNREACHABLE,
     };
@@ -130,17 +149,23 @@ fn release_failure(name: &str, e: HostError) -> HostError {
     );
     let remote = e.code == HostErrorCode::Remote;
     if remote && e.message.starts_with(UPDATE_LATEST_UNREACHABLE) {
-        HostError::offline(release_download_failed(name))
+        ReleaseFailure {
+            error: HostError::offline(release_download_failed(name)),
+            desktop_may_send: true,
+        }
     } else if remote && e.message.starts_with(UPDATE_LATEST_NO_BUILD) {
-        HostError::offline(RING_NO_BUILD)
+        ReleaseFailure {
+            error: HostError::offline(RING_NO_BUILD),
+            desktop_may_send: true,
+        }
     } else if remote && e.message.starts_with(UPDATE_LATEST_BAD_BUILD) {
-        HostError::offline(release_bad(name))
+        ReleaseFailure::plain(HostError::offline(release_bad(name)))
     } else if update_busy(&e) {
-        HostError::new(HostErrorCode::Busy, ring_busy(name))
+        ReleaseFailure::plain(HostError::new(HostErrorCode::Busy, ring_busy(name)))
     } else if matches!(e.code, HostErrorCode::Offline | HostErrorCode::Timeout) {
-        HostError::offline(ring_offline(name))
+        ReleaseFailure::plain(HostError::offline(ring_offline(name)))
     } else {
-        HostError::offline(release_download_failed(name))
+        ReleaseFailure::plain(HostError::offline(release_download_failed(name)))
     }
 }
 /// The hello capability of Daemons that run a [`LaunchSpec`]'s `launchPrefix`.
@@ -2573,13 +2598,32 @@ impl HostHandle {
             let spawned = std::thread::Builder::new()
                 .name("host-release-upgrade".into())
                 .spawn(move || {
-                    match upgrade_from_release(&sh, &link, op, gen, &name, &cancel, &o) {
+                    let failure =
+                        match upgrade_from_release(&sh, &link, op, gen, &name, &cancel, &o) {
+                            Ok(false) => return,
+                            Ok(true) => return wait_upgrade_completion(&sh, op, &cancel),
+                            Err(f) => f,
+                        };
+                    // The Host cannot get the release by itself: send it this Desktop's build
+                    // when that is newer than what it runs (never a downgrade, never another
+                    // build of the same version).
+                    let own = failure
+                        .desktop_may_send
+                        .then(|| desktop_build_for(&sh, op))
+                        .flatten();
+                    let result = match own {
+                        Some(build) => {
+                            eprintln!("xshell: host {name}: sending this Desktop's build instead");
+                            send_desktop_build(&sh, &link, op, gen, &name, &build, &cancel, &o)
+                        }
+                        None => Err(failure.error),
+                    };
+                    match result {
                         Err(e) => {
                             finish_upgrade(&sh, op, Some(&e));
                             o.call(Err(e));
                         }
-                        Ok(false) => {}
-                        Ok(true) => wait_upgrade_completion(&sh, op, &cancel),
+                        Ok(()) => wait_upgrade_completion(&sh, op, &cancel),
                     }
                 });
             if spawned.is_err() {
@@ -2592,53 +2636,7 @@ impl HostHandle {
         let spawned = std::thread::Builder::new()
             .name("host-ring-upgrade".into())
             .spawn(move || {
-                let result = (|| {
-                    check_upgrade(&sh, op, gen, &cancel)?;
-                    {
-                        let mut st = sh.lock();
-                        if st.upgrade_operation == Some(op) {
-                            st.status.phase = Some(Phase::Installing);
-                            sh.publish(&mut st);
-                        }
-                    }
-                    crate::stage::stage_over_link(
-                        &link,
-                        &*sh.mc.binaries,
-                        &sh.mc.desktop_version,
-                        &build,
-                        &cancel,
-                        &|| check_upgrade(&sh, op, gen, &cancel),
-                    )
-                    .map_err(|e| match e {
-                        crate::stage::StageError::NoBuild { target, detail } => {
-                            eprintln!("xshell: host {name}: no build for {target}: {detail}");
-                            HostError::offline(RING_NO_BUILD)
-                        }
-                        // The transfer itself was lost (the link or the Relay dropped it, or
-                        // it timed out): say so in approved words, never "hasn't reconnected".
-                        crate::stage::StageError::Failed(e)
-                            if matches!(
-                                e.code,
-                                crate::HostErrorCode::Offline | crate::HostErrorCode::Timeout
-                            ) =>
-                        {
-                            eprintln!("xshell: host {name}: update transfer failed: {}", e.message);
-                            HostError::offline(ring_offline(&name))
-                        }
-                        crate::stage::StageError::Failed(e) => e,
-                    })?;
-                    check_upgrade(&sh, op, gen, &cancel)?;
-                    {
-                        let mut st = sh.lock();
-                        if st.upgrade_operation == Some(op) {
-                            st.status.phase = Some(Phase::Preparing);
-                            sh.publish(&mut st);
-                        }
-                    }
-                    request_upgrade(&sh, &link, op, gen, true, None, o.clone());
-                    Ok(())
-                })();
-                match result {
+                match send_desktop_build(&sh, &link, op, gen, &name, &build, &cancel, &o) {
                     Err(e) => {
                         finish_upgrade(&sh, op, Some(&e));
                         o.call(Err(e));
@@ -2730,6 +2728,88 @@ fn check_upgrade(sh: &Shared, op: u64, gen: u64, cancel: &CancelToken) -> Result
     }
 }
 
+/// This Desktop's build, when the Host of the release update `op` runs an older version
+/// (semver precedence) and so may take it instead of the release it could not get. Records
+/// the build's install directory as the update the Host is expected back on.
+fn desktop_build_for(sh: &Shared, op: u64) -> Option<xshell_protocol::build::BuildId> {
+    let mut st = sh.lock();
+    if st.upgrade_operation != Some(op) {
+        return None;
+    }
+    let build = sh.mc.desktop_build.clone()?;
+    let daemon = semver::Version::parse(st.status.daemon_version.as_deref()?).ok()?;
+    let desktop = semver::Version::parse(&sh.mc.desktop_version).ok()?;
+    if daemon.cmp_precedence(&desktop) != std::cmp::Ordering::Less {
+        return None;
+    }
+    st.release_asked = None;
+    st.upgrade_identity = None;
+    st.ring_update = Some((
+        xshell_protocol::build::install_dir_name(&sh.mc.desktop_version, Some(&build)),
+        Instant::now(),
+    ));
+    Some(build)
+}
+
+/// Send this Desktop's build over the link (`daemon.stage-*`, phase `installing`), then ask
+/// the Host to restart into it (`daemon.upgrade-selected`).
+#[allow(clippy::too_many_arguments)]
+fn send_desktop_build(
+    sh: &Arc<Shared>,
+    link: &Arc<Link>,
+    op: u64,
+    gen: u64,
+    name: &str,
+    build: &xshell_protocol::build::BuildId,
+    cancel: &CancelToken,
+    once: &Arc<Once<Reply>>,
+) -> Result<(), HostError> {
+    check_upgrade(sh, op, gen, cancel)?;
+    {
+        let mut st = sh.lock();
+        if st.upgrade_operation == Some(op) {
+            st.status.phase = Some(Phase::Installing);
+            sh.publish(&mut st);
+        }
+    }
+    crate::stage::stage_over_link(
+        link,
+        &*sh.mc.binaries,
+        &sh.mc.desktop_version,
+        build,
+        cancel,
+        &|| check_upgrade(sh, op, gen, cancel),
+    )
+    .map_err(|e| match e {
+        crate::stage::StageError::NoBuild { target, detail } => {
+            eprintln!("xshell: host {name}: no build for {target}: {detail}");
+            HostError::offline(RING_NO_BUILD)
+        }
+        // The transfer itself was lost (the link or the Relay dropped it, or it timed
+        // out): say so in approved words, never "hasn't reconnected".
+        crate::stage::StageError::Failed(e)
+            if matches!(
+                e.code,
+                crate::HostErrorCode::Offline | crate::HostErrorCode::Timeout
+            ) =>
+        {
+            eprintln!("xshell: host {name}: update transfer failed: {}", e.message);
+            HostError::offline(ring_offline(name))
+        }
+        crate::stage::StageError::Failed(e) => e,
+    })?;
+    check_upgrade(sh, op, gen, cancel)?;
+    {
+        let mut st = sh.lock();
+        if st.upgrade_operation == Some(op) {
+            st.status.phase = Some(Phase::Preparing);
+            sh.publish(&mut st);
+        }
+    }
+    request_upgrade(sh, link, op, gen, true, None, once.clone());
+    Ok(())
+}
+
 /// D5: the Ring Host downloads and installs the latest release (`daemon.update-latest`,
 /// phase `preparing`), then restarts into it like any Ring update, expected back on the
 /// version and build it answered. `Ok(false)`: it was current already, and the operation is
@@ -2742,8 +2822,8 @@ fn upgrade_from_release(
     name: &str,
     cancel: &CancelToken,
     once: &Arc<Once<Reply>>,
-) -> Result<bool, HostError> {
-    check_upgrade(sh, op, gen, cancel)?;
+) -> Result<bool, ReleaseFailure> {
+    check_upgrade(sh, op, gen, cancel).map_err(ReleaseFailure::plain)?;
     let (tx, rx) = std::sync::mpsc::channel();
     link.request(
         ClientMsg::DaemonUpdateLatest,
@@ -2756,7 +2836,9 @@ fn upgrade_from_release(
     let answer = loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(r) => break r.map_err(|e| release_failure(name, e))?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => check_upgrade(sh, op, gen, cancel)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                check_upgrade(sh, op, gen, cancel).map_err(ReleaseFailure::plain)?
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(release_failure(
                     name,
@@ -2797,9 +2879,9 @@ fn upgrade_from_release(
         // Only the operation that asked restarts the Host, on the link it asked over.
         let mut st = sh.lock();
         if cancel.is_cancelled() || st.upgrade_operation != Some(op) || st.gen != gen {
-            return Err(HostError::offline(
+            return Err(ReleaseFailure::plain(HostError::offline(
                 "the Host update was cancelled or its connection changed",
-            ));
+            )));
         }
         st.upgrade_identity = Some((answer.version.clone(), build.clone()));
         // A reconnect of another build then asks whether this update was rolled back.
