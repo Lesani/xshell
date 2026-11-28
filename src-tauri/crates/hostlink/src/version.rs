@@ -120,6 +120,54 @@ pub fn offered_update(
     Some((action, desktop.to_string(), UpdateSource::Desktop))
 }
 
+/// Who supplies a Ring Host's update now, or `None` when there is nothing to offer.
+///
+/// A release-capable Host (`release_capable`) gets the latest release when it is newer than
+/// `daemon` and not withdrawn ([`release_withdrawn`]). Otherwise a Linux one gets nothing
+/// (release only, D4 of design-update-from-get), while one with `desktop_fallback` (a
+/// Windows machine, rjw.9 D5) gets this Desktop's build. A Host that is not release-capable
+/// always gets this Desktop's build. Whether that build is an update for it is
+/// [`update_eligible`]'s decision.
+pub fn ring_update_source(
+    release_capable: bool,
+    desktop_fallback: bool,
+    latest: Option<&semver::Version>,
+    withdrawn: bool,
+    daemon: &str,
+) -> Option<crate::status::UpdateSource> {
+    use crate::status::UpdateSource;
+    if !release_capable {
+        return Some(UpdateSource::Desktop);
+    }
+    if !withdrawn && release_outdated(latest, daemon) {
+        return Some(UpdateSource::Release);
+    }
+    desktop_fallback.then_some(UpdateSource::Desktop)
+}
+
+/// [`offered_update`] with the source [`ring_update_source`] chooses.
+#[allow(clippy::too_many_arguments)]
+pub fn offered_ring_update(
+    desktop: &str,
+    ours: Option<&BuildId>,
+    latest: Option<&semver::Version>,
+    release_capable: bool,
+    desktop_fallback: bool,
+    withdrawn: bool,
+    daemon: &str,
+    build: Option<&BuildId>,
+) -> Option<(
+    crate::status::UpdateAction,
+    String,
+    crate::status::UpdateSource,
+)> {
+    use crate::status::UpdateSource;
+    match ring_update_source(release_capable, desktop_fallback, latest, withdrawn, daemon)? {
+        UpdateSource::Release => offered_update(desktop, ours, latest, true, daemon, build),
+        UpdateSource::Desktop => offered_update(desktop, ours, None, false, daemon, build),
+    }
+}
+
 pub fn same_build(daemon: Option<&BuildId>, ours: &BuildId) -> bool {
     daemon.is_some_and(|d| d.same(ours))
 }
@@ -487,6 +535,94 @@ mod tests {
         assert_eq!(
             offered_update("1.5.0", None, None, false, "1.5.0", None),
             None
+        );
+    }
+
+    /// rjw.9 D5: a release-capable Windows machine gets the release when a newer one is
+    /// known, otherwise this Desktop's build; a Linux one stays release only.
+    #[test]
+    fn ring_source_windows_falls_back_to_the_desktop_build() {
+        use crate::status::{UpdateAction, UpdateSource};
+        let ours = b(A, None);
+        let newer = v("1.6.0-rjw.9");
+        let same = v("1.6.0-rjw.5");
+        // (latest, withdrawn) -> Windows offer, Linux offer; the Host runs 1.6.0-rjw.5,
+        // this Desktop is 1.6.0-rjw.8.
+        let desktop = Some((
+            UpdateAction::Update,
+            "1.6.0-rjw.8".to_string(),
+            UpdateSource::Desktop,
+        ));
+        let release = Some((
+            UpdateAction::Update,
+            "1.6.0-rjw.9".to_string(),
+            UpdateSource::Release,
+        ));
+        for (what, latest, withdrawn, windows, linux) in [
+            ("latest unknown", None, false, desktop.clone(), None),
+            (
+                "latest not newer",
+                Some(&same),
+                false,
+                desktop.clone(),
+                None,
+            ),
+            (
+                "latest newer",
+                Some(&newer),
+                false,
+                release.clone(),
+                release.clone(),
+            ),
+            (
+                "newer but withdrawn",
+                Some(&newer),
+                true,
+                desktop.clone(),
+                None,
+            ),
+        ] {
+            for (fallback, want) in [(true, &windows), (false, &linux)] {
+                assert_eq!(
+                    &offered_ring_update(
+                        "1.6.0-rjw.8",
+                        Some(&ours),
+                        latest,
+                        true,
+                        fallback,
+                        withdrawn,
+                        "1.6.0-rjw.5",
+                        None
+                    ),
+                    want,
+                    "{what} fallback={fallback}"
+                );
+                let source = ring_update_source(true, fallback, latest, withdrawn, "1.6.0-rjw.5");
+                assert_eq!(
+                    source,
+                    want.as_ref().map(|o| o.2),
+                    "{what} fallback={fallback}"
+                );
+            }
+        }
+        // The Desktop's build is offered only when it is an update for the Host.
+        assert_eq!(
+            offered_ring_update(
+                "1.6.0-rjw.8",
+                Some(&ours),
+                None,
+                true,
+                true,
+                false,
+                "1.6.0-rjw.8",
+                Some(&ours)
+            ),
+            None
+        );
+        // Not release-capable: unchanged (always this Desktop's build).
+        assert_eq!(
+            ring_update_source(false, false, Some(&newer), false, "1.6.0-rjw.5"),
+            Some(UpdateSource::Desktop)
         );
     }
 
