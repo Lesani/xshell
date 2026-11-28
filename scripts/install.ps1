@@ -11,7 +11,8 @@
 # It also adds %USERPROFILE%\.xshell\bin to this user's PATH (HKCU\Environment, the value's
 # type kept, no second entry): xshell writes the command `xshelld` there when it starts, so
 # `xshelld pair` in a terminal shows the words that add this computer to a Ring. An OpenSSH
-# session on Windows gets only the system PATH, so the last line also names the full path.
+# session on Windows gets only the system PATH, so the last line also gives the command with
+# its full path, quoted for PowerShell.
 #
 # Nothing is sent but the downloads (User-Agent "xshell-install").
 #
@@ -134,12 +135,17 @@
         if ($kind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString -and $kind -ne [Microsoft.Win32.RegistryValueKind]::String) {
           throw "the user PATH is not text"
         }
-        $entries = @($current -split ';' | Where-Object { $_ })
-        $present = @($entries | Where-Object {
-          [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ieq $bin
+        # The existing value is never rewritten: it is split only to look for the folder
+        # (as written or with its variables expanded, any case, with or without a trailing
+        # backslash), and the folder is appended to the value as it stands.
+        $present = @($current -split ';' | Where-Object {
+          $entry = $_.Trim()
+          $entry -and (($entry.TrimEnd('\') -ieq $bin) -or
+            ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $bin))
         })
         if ($present.Count -eq 0) {
-          $value = (@($entries) + $bin) -join ';'
+          $separator = if ($current -eq '' -or $current.EndsWith(';')) { '' } else { ';' }
+          $value = $current + $separator + $bin
           $key.SetValue('Path', $value, $kind)
           # Tells running programs (Explorer, so new terminals) that the environment changed.
           [Environment]::SetEnvironmentVariable('XSHELL_INSTALL_PATH_REFRESH', $null, 'User')
@@ -153,7 +159,7 @@
 
     if ($update) { Write-Host "Updated xshell to $version in $dir." } else { Write-Host "Installed xshell $version in $dir." }
     Write-Host "Start it from the Start menu: xshell."
-    Write-Host "To add this computer to a Ring from a terminal: start xshell once, then run xshelld pair in a new terminal (over SSH: $(Join-Path $env:USERPROFILE '.xshell\bin\xshelld') pair)."
+    Write-Host 'To pair this computer, keep xshell open and run xshelld pair in a new terminal. Over SSH, use & "$HOME\.xshell\bin\xshelld.cmd" pair.'
   } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }

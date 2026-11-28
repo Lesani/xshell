@@ -314,6 +314,10 @@ impl Administration {
     }
 }
 
+/// [`AdministrationClient::connect`]'s error when a broker answers the Hello with anything
+/// but its Welcome for this Store: something is there, and it is not this user's Desktop.
+pub const HELLO_REFUSED: &str = "administration broker hello refused";
+
 /// Blocking short-request facade over the existing protected broker, not a second election
 /// or a Host/Call tunnel. Connection loss discards this request origin and its pending work.
 #[cfg(any(unix, windows))]
@@ -365,7 +369,7 @@ impl AdministrationClient {
                 owner_epoch,
                 ..
             } if profile_id == profile => owner_epoch,
-            _ => return Err("administration broker hello refused".into()),
+            _ => return Err(HELLO_REFUSED.into()),
         };
         Ok(Self {
             stream,

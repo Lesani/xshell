@@ -9,12 +9,16 @@
 #[cfg(any(windows, test))]
 use std::path::{Path, PathBuf};
 
-/// The batch file's text for the Daemon at `daemon`, written into `<xshell_dir>\bin`: two
+/// The batch file's text for the Daemon at `daemon`, written into `<xshell_dir>\bin`: three
 /// lines (CRLF) that run it with the caller's arguments; the batch file ends with the
-/// Daemon's exit code. A Daemon under `xshell_dir` is named relative to the batch file, so a
-/// profile path (which may not be ASCII) never appears in it; any other path is written out.
-/// `%` is doubled: in a batch file a single one starts a variable. `None`: the path cannot
-/// be quoted in a batch file.
+/// Daemon's exit code (the call is its last command, and the implicit `endlocal` keeps the
+/// code). `setlocal DisableDelayedExpansion`: under `cmd /V:ON` a `!` in the path or in an
+/// argument would otherwise be eaten. A Daemon under `xshell_dir` is named relative to the
+/// batch file, so a profile path (which may not be ASCII) never appears in it; any other
+/// path is written out. `%` is doubled: in a batch file a single one starts a variable.
+/// `None`: the path cannot be written in a batch file: it has a quote or a line break, or
+/// what would be written is not ASCII (cmd reads a batch file in the console's code page,
+/// so other characters would name another file).
 #[cfg(any(windows, test))]
 pub fn content(xshell_dir: &str, daemon: &str) -> Option<String> {
     if daemon.contains(['"', '\r', '\n']) {
@@ -28,12 +32,19 @@ pub fn content(xshell_dir: &str, daemon: &str) -> Option<String> {
         Some(rest) => format!("%~dp0..{}", rest.replace('%', "%%")),
         None => daemon.replace('%', "%%"),
     };
-    Some(format!("@echo off\r\n\"{target}\" %*\r\n"))
+    if !target.is_ascii() {
+        return None;
+    }
+    Some(format!(
+        "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\"{target}\" %*\r\n"
+    ))
 }
 
 /// Write `<home>\.xshell\bin\xshelld.cmd` for `daemon`, replacing an existing one atomically
 /// (a temporary file beside it, then a rename). Nothing is written when the Daemon itself is
-/// in that folder: `xshelld.exe` there is already the command.
+/// in that folder: `xshelld.exe` there is already the command. When the path cannot be
+/// written in a batch file, an older `xshelld.cmd` is removed (it names a Daemon this
+/// Desktop does not use) and the reason is returned for the log.
 #[cfg(any(windows, test))]
 pub fn write(home: &Path, daemon: &Path) -> Result<Option<PathBuf>, String> {
     let xshell_dir = home.join(".xshell");
@@ -41,13 +52,19 @@ pub fn write(home: &Path, daemon: &Path) -> Result<Option<PathBuf>, String> {
     if daemon.parent() == Some(bin_dir.as_path()) {
         return Ok(None);
     }
-    let text = content(
-        xshell_dir.to_str().ok_or("the home path is not Unicode")?,
-        daemon.to_str().ok_or("the Daemon path is not Unicode")?,
-    )
-    .ok_or("the Daemon path cannot be written in a batch file")?;
-    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("{}: {e}", bin_dir.display()))?;
     let path = bin_dir.join("xshelld.cmd");
+    let text = xshell_dir
+        .to_str()
+        .zip(daemon.to_str())
+        .and_then(|(dir, daemon)| content(dir, daemon));
+    let Some(text) = text else {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "{} cannot be named in a batch file",
+            daemon.display()
+        ));
+    };
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("{}: {e}", bin_dir.display()))?;
     let tmp = bin_dir.join(format!("xshelld.cmd.tmp-{}", std::process::id()));
     let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(e) = written {
@@ -70,7 +87,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            "@echo off\r\n\"%~dp0..\\server\\1.6.0-rjw.6+abc123\\xshelld.exe\" %*\r\n"
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\"%~dp0..\\server\\1.6.0-rjw.6+abc123\\xshelld.exe\" %*\r\n"
         );
         assert!(text.is_ascii(), "the profile path must not appear");
         // A trailing separator on the directory changes nothing.
@@ -88,12 +105,12 @@ mod tests {
     fn another_path_is_written_out_with_percent_doubled() {
         assert_eq!(
             content(r"C:\Users\a\.xshell", r"D:\100% builds\xshelld.exe").unwrap(),
-            "@echo off\r\n\"D:\\100%% builds\\xshelld.exe\" %*\r\n"
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\"D:\\100%% builds\\xshelld.exe\" %*\r\n"
         );
         // A sibling directory that only shares the prefix is not "under" it.
         assert_eq!(
             content(r"C:\Users\a\.xshell", r"C:\Users\a\.xshell-old\xshelld.exe").unwrap(),
-            "@echo off\r\n\"C:\\Users\\a\\.xshell-old\\xshelld.exe\" %*\r\n"
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\"C:\\Users\\a\\.xshell-old\\xshelld.exe\" %*\r\n"
         );
     }
 
@@ -101,7 +118,7 @@ mod tests {
     fn percent_is_doubled_in_the_relative_form_too() {
         assert_eq!(
             content(r"C:\h\.xshell", r"C:\h\.xshell\server\50%\xshelld.exe").unwrap(),
-            "@echo off\r\n\"%~dp0..\\server\\50%%\\xshelld.exe\" %*\r\n"
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\n\"%~dp0..\\server\\50%%\\xshelld.exe\" %*\r\n"
         );
     }
 
@@ -109,6 +126,48 @@ mod tests {
     fn a_path_that_cannot_be_quoted_is_refused() {
         assert_eq!(content(r"C:\h\.xshell", "C:\\a\"b\\xshelld.exe"), None);
         assert_eq!(content(r"C:\h\.xshell", "C:\\a\r\nb\\xshelld.exe"), None);
+    }
+
+    #[test]
+    fn delayed_expansion_is_off_before_the_call_and_the_call_is_last() {
+        let text = content(r"C:\h\.xshell", r"C:\h\.xshell\server\wow!\xshelld.exe").unwrap();
+        let lines: Vec<&str> = text.split("\r\n").collect();
+        assert_eq!(
+            lines,
+            [
+                "@echo off",
+                "setlocal DisableDelayedExpansion",
+                "\"%~dp0..\\server\\wow!\\xshelld.exe\" %*",
+                ""
+            ],
+            "the Daemon call is the last command, so its exit code is the batch file's"
+        );
+    }
+
+    #[test]
+    fn a_literal_path_that_is_not_ascii_is_refused_and_a_stale_shim_removed() {
+        assert_eq!(
+            content(r"C:\Users\a\.xshell", "D:\\工具\\xshelld.exe"),
+            None
+        );
+        // The relative form stays ASCII whatever the profile is called.
+        assert!(content(
+            "C:\\Users\\工具\\.xshell",
+            "C:\\Users\\工具\\.xshell\\server\\1+a\\xshelld.exe"
+        )
+        .is_some());
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let path = write(home, &home.join("first-daemon").join("xshelld.exe"))
+            .unwrap()
+            .unwrap();
+        assert!(path.exists());
+        let error = write(home, &home.join("工具").join("xshelld.exe")).unwrap_err();
+        assert!(error.contains("cannot be named in a batch file"), "{error}");
+        assert!(
+            !path.exists(),
+            "the older shim names a Daemon no longer used"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn pair_main(daemon_args: Vec<std::ffi::OsString>) -> i32 {
     let bin = match hosts::local_daemon_bin_for_cli() {
         Ok(bin) => bin,
         Err(reason) => {
-            eprintln!("xshell: cannot run pair: {reason}");
+            eprintln!("xshell: cannot start pairing: {reason}");
             return 1;
         }
     };
@@ -65,13 +65,11 @@ fn pair_main(daemon_args: Vec<std::ffi::OsString>) -> i32 {
     let error = std::os::unix::process::CommandExt::exec(&mut cmd);
     #[cfg(not(unix))]
     let error = {
+        // Windows: this is a GUI program. The Daemon shares the caller's console when
+        // there is one (its output and Ctrl+C); otherwise it runs without a window on the
+        // inherited handles.
         #[cfg(windows)]
-        {
-            // This is a GUI program: without the flag the console Daemon would open a
-            // console window of its own.
-            use std::os::windows::process::CommandExt as _;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
+        xshell_core::parent_console::share_with_child(&mut cmd);
         match cmd.status() {
             Ok(status) => return status.code().unwrap_or(1),
             Err(error) => error,

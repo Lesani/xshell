@@ -96,11 +96,11 @@ const UNFINISHED_CANCELLED: &str = "Stopping does not undo approval; this machin
 const EARLIER_CHECKING: &str =
     "An earlier pairing of this machine is still being finished. Checking now; no new words yet.";
 const EARLIER_STOPPED: &str = "Pairing needs xshell running in the background here: start xshelld serve. Then check Settings > Ring on another device; no new words needed yet.";
-// DRAFT (#118), `cli.pair.computer.closed` and `cli.pair.computer.earlierStopped`: a machine
+// `cli.pair.computer.closed` and `cli.pair.computer.earlierStopped`: a machine
 // with the xshell app is told to open it, never to start `xshelld serve`.
 const DESKTOP_CLOSED: &str =
     "xshell isn't open on this computer. Open xshell, then run xshelld pair again.";
-const COMPUTER_EARLIER_STOPPED: &str = "Pairing needs xshell open on this computer: open xshell. Then check Settings > Ring on another device; no new words needed yet.";
+const COMPUTER_EARLIER_STOPPED: &str = "Open xshell on this computer to finish pairing. Then check Settings > Ring on another device. You do not need new words yet.";
 const BUSY: &str =
     "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
 // `cli.pair.rateLimited` (plans/plan-pairing-bc.md, COPY).
@@ -665,6 +665,15 @@ fn desktop_grace() -> Duration {
         .min(GRACE)
 }
 
+/// Whether the failed connection means "something is there and refuses" rather than "no
+/// xshell app is open": its Store is missing or unsafe, or a broker answered the Hello with
+/// a refusal. Everything else (no endpoint, nothing listening, no answer in time) reads as
+/// a closed app.
+fn endpoint_refuses(desktop: &str, error: &str) -> bool {
+    error == xshell_hostlink::ring::administration::HELLO_REFUSED
+        || xshell_core::local_ipc::canonical_store(Path::new(desktop)).is_err()
+}
+
 fn registered_computer_pair(
     store: &Store,
     relay: &str,
@@ -679,16 +688,28 @@ fn registered_computer_pair(
     let until = Instant::now() + duration;
     let monotonic_expires_at_ns = xshell_hostlink::ring::administration::monotonic::capture(until)
         .map_err(|_| Failure::ComputerExpired)?;
-    let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel.clone());
+    // One short budget for finding the open xshell app: the lookup of its Store (which
+    // waits for `ring.lock`) and the first connection to its endpoint. Past it, a closed or
+    // stuck app is reported instead of waited for while the words' lifetime runs out.
+    let closed_at = Instant::now() + desktop_grace();
+    let budget =
+        xshell_core::local_ipc::RequestBudget::for_operation(until.min(closed_at), cancel.clone());
     let desktop =
         crate::server::companion::registered_desktop(store, &budget).map_err(|error| {
-            if Instant::now() >= until {
+            if cancel.load(Ordering::Acquire) {
+                Failure::Cancelled
+            } else if Instant::now() >= until {
                 Failure::ComputerExpired
+            } else if Instant::now() >= closed_at {
+                // The Store's lock stayed taken: something of xshell here is busy with it.
+                Failure::Busy
             } else {
                 Failure::Other(format!("protected_counterpart_required: {error}"))
             }
         })?;
-    budget.check().map_err(|_| Failure::ComputerExpired)?;
+    if Instant::now() >= until {
+        return Err(Failure::ComputerExpired);
+    }
     let operation = uuid::Uuid::new_v4();
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -706,20 +727,32 @@ fn registered_computer_pair(
     writeln!(out, "{WAITING}")
         .and_then(|()| out.flush())
         .map_err(|_| "Pair origin output closed".to_string())?;
-    // Nothing answers at the Desktop's endpoint for this long: xshell is not open here.
+    // Nothing answers at the Desktop's endpoint within the budget: xshell is not open here.
     // Long enough for a Desktop that is just starting to bind it (it retries every 100 ms).
-    let closed_at = Instant::now() + desktop_grace();
+    // Once a connection exists this never applies again: the status path decides.
     let mut client = None;
     let mut printed = false;
     let mut started = false;
     let mut result = Err(Failure::ComputerExpired);
     while Instant::now() < until && !cancel.load(Ordering::Acquire) {
         if client.is_none() {
-            if let Ok(connected) = AdministrationClient::connect(Path::new(&desktop), until) {
-                client = Some(connected);
-            } else {
+            let refused = match AdministrationClient::connect(
+                Path::new(&desktop),
+                until.min(closed_at.max(Instant::now() + Duration::from_millis(200))),
+            ) {
+                Ok(connected) => {
+                    client = Some(connected);
+                    None
+                }
+                Err(error) => Some(error),
+            };
+            if let Some(error) = refused {
                 if Instant::now() >= closed_at {
-                    result = Err(Failure::DesktopClosed);
+                    result = Err(if endpoint_refuses(&desktop, &error) {
+                        Failure::Other(format!("protected_counterpart_required: {error}"))
+                    } else {
+                        Failure::DesktopClosed
+                    });
                     break;
                 }
                 std::thread::sleep(
