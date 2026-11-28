@@ -93,6 +93,36 @@ it("shows how to update a Ring machine whose xshell cannot take an update over t
   expect(html).not.toContain("Use this Desktop");
 });
 
+// rjw.9 D5: a Windows machine that cannot take the update over the Ring is told to update
+// xshell there with PowerShell, in the same copy box; never the `curl | sh` command.
+it("shows the PowerShell command, never curl | sh, for a Windows machine that cannot take the update", async () => {
+  vi.mocked(invoke).mockImplementation(async (command, args) => command !== "host_install_command" ? null
+    : (args as { os?: string } | undefined)?.os === "windows" ? "irm https://get.xshell.sh/install.ps1 | iex" : "curl -fsSL https://get.xshell.sh | sh");
+  const { fetchInstallCommand } = await import("./HostUpdateAction");
+  expect(await fetchInstallCommand(invoke, "windows")).toBe("irm https://get.xshell.sh/install.ps1 | iex");
+  expect(vi.mocked(invoke)).toHaveBeenCalledWith("host_install_command", { os: "windows" });
+  // A Windows machine on rjw.8 over the Ring: the Desktop-owned sentence, the command, no button.
+  const owned = render({ os: "windows", routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", updateAction: null, status: "upgrade-pending" });
+  expect(owned).toContain("xshell there manages terminals, so this update must be made on that machine.");
+  expect(owned).toContain("irm https://get.xshell.sh/install.ps1 | iex");
+  expect(owned).not.toContain("curl");
+  expect(owned).not.toContain(">Update</button>");
+  expect(owned).not.toContain("Use this Desktop");
+  // A Windows machine reported as too old: still PowerShell.
+  const old = render({ os: "windows", routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: null, updateAction: null, status: "upgrade-pending" });
+  expect(old).toContain("too old to update through your Ring");
+  expect(old).toContain("irm https://get.xshell.sh/install.ps1 | iex");
+  expect(old).not.toContain("curl");
+  // A Desktop-owned Linux machine keeps its sentence alone, as before.
+  const linux = render({ os: "linux", routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", updateAction: null, status: "upgrade-pending" });
+  expect(linux).toContain("xshell there manages terminals");
+  expect(linux).not.toContain("install.ps1");
+  // A Windows machine that takes the update over the Ring: the ordinary Update button.
+  const updatable = render({ os: "windows", routeUpdateUnavailable: null, updateUnavailable: null, updateAction: "update", status: "upgrade-pending", daemonVersion: "1.4.0" });
+  expect(updatable).toContain(">Update</button>");
+  expect(updatable).not.toContain("install.ps1");
+});
+
 it("offers Retry after a failed update and shows the backend's rollback text", () => {
   const html = render({ status: "upgrade-pending", updateAction: "update", daemonVersion: "1.4.0", lastError: "The update failed. Windows fixture is back on version 1.4.0. Try again.", errorHint: "update-failed" });
   expect(html).toContain("Retry");

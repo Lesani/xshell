@@ -8,30 +8,53 @@ import type { HostStatus } from "../hosts/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CodeCopy } from "./CodeCopy";
 
-// The command that installs this Desktop's version on a machine without a window
-// (`host_install_command`), fetched once per window.
-let installCommand: Promise<string> | null = null;
-export function fetchInstallCommand(call: typeof invoke = invoke): Promise<string> {
-  installCommand ??= call<string>("host_install_command").catch(e => { installCommand = null; throw e; });
-  return installCommand;
+// The command that updates xshell on a machine that cannot take an update over the Ring
+// (`host_install_command`), fetched once per window and kind of machine: PowerShell for a
+// machine known to be Windows (never `curl | sh` there), else the shell installer.
+type InstallKind = "windows" | "unix";
+const installKind = (os: string | null | undefined): InstallKind => os === "windows" ? "windows" : "unix";
+const installCommands = new Map<InstallKind, Promise<string>>();
+const installResolved = new Map<InstallKind, string>();
+export function fetchInstallCommand(call: typeof invoke = invoke, os?: string | null): Promise<string> {
+  const kind = installKind(os);
+  let p = installCommands.get(kind);
+  if (!p) {
+    p = (kind === "windows" ? call<string>("host_install_command", { os: "windows" }) : call<string>("host_install_command"))
+      .then(c => { installResolved.set(kind, c); return c; }, e => { installCommands.delete(kind); throw e; });
+    installCommands.set(kind, p);
+  }
+  return p;
 }
 
-function useInstallCommand(wanted: boolean): string | null {
-  const [command, setCommand] = useState<string | null>(null);
+function useInstallCommand(wanted: boolean, os: string | null | undefined): string | null {
+  const kind = installKind(os);
+  const [fetched, setFetched] = useState<{ kind: InstallKind; command: string } | null>(null);
+  const command = fetched?.kind === kind ? fetched.command : installResolved.get(kind) ?? null;
   useEffect(() => {
     if (!wanted || command) return;
     let live = true;
-    fetchInstallCommand().then(c => { if (live) setCommand(c); }, () => {});
+    fetchInstallCommand(invoke, kind).then(c => { if (live) setFetched({ kind, command: c }); }, () => {});
     return () => { live = false; };
-  }, [wanted, command]);
-  return command;
+  }, [wanted, command, kind]);
+  return wanted ? command : null;
 }
 
 /// A machine whose xshell cannot take an update over the Ring: how to update it there.
-export function RingUpdateUnsupported({ name }: { name: string }) {
-  const command = useInstallCommand(true);
+export function RingUpdateUnsupported({ name, os }: { name: string; os?: string | null }) {
+  const command = useInstallCommand(true, os);
   return <span className="host-update-unsupported">
     <span>{fmt("update.tooOld", { name })}</span>
+    {command && <CodeCopy text={command} />}
+  </span>;
+}
+
+/// A machine whose xshell manages its terminals and cannot take this update over the Ring:
+/// update xshell there. A Windows one from before Ring updates (rjw.9 D5) also gets the
+/// PowerShell command in the same copy box.
+function DesktopOwned({ name, os }: { name: string; os?: string | null }) {
+  const command = useInstallCommand(os === "windows", os);
+  return <span className="host-update-unsupported">
+    <span>{fmt("hosts.update.desktopOwned", { host: name })}</span>
     {command && <CodeCopy text={command} />}
   </span>;
 }
@@ -87,9 +110,9 @@ export function HostUpdateAction({ host, status, description = false, skippable 
     {/* Never a build hash: a different build is just "Update available". */}
     {description && !busy && status && (action || unavailable) && <span>{source === "release" ? fmt("update.release.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", version: status.updateVersion ?? "" })
       : replace ? `${host.name}: ${fmt("update.available")}` : fmt("hosts.update.older", { host: host.name, daemonVersion: status.daemonVersion ?? "", desktopVersion: status.desktopVersion })}</span>}
-    {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} />}
+    {route === "ring-update-unsupported" && !unavailable && <RingUpdateUnsupported name={host.name} os={status?.os} />}
     {route === "identity-bound-alias" && <span>This identity-bound alias cannot update the Daemon. Use its configured SSH route.</span>}
-    {unavailable ? <span>{fmt(unavailable === "desktop-owned" ? "hosts.update.desktopOwned" : "hosts.update.oldOwner", { host: host.name })}</span> : <>
+    {unavailable ? unavailable === "desktop-owned" ? <DesktopOwned name={host.name} os={status?.os} /> : <span>{fmt("hosts.update.oldOwner", { host: host.name })}</span> : <>
       {/* With a description (the bar, Hosts settings) the progress line names its machine: the bar may list several. */}
       {busy ? <span role="status">{description && `${host.name}: `}{fmt(status?.phase === "upgrading" ? "update.restarting" : source === "release" && status?.phase !== "installing" ? "update.downloading" : "update.sending")}</span>
         : action && <>

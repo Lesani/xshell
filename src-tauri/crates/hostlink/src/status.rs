@@ -77,10 +77,12 @@ impl UpdateUnavailable {
         relay: bool,
     ) -> Option<Self> {
         let has = |cap| hello.capabilities.iter().any(|c| c == cap);
-        // Over the Ring nothing restarts a Daemon its Desktop owns, on any system: that
-        // machine's xshell is updated there (not "too old", Windows included).
+        // Over the Ring a Daemon its Desktop owns is updated on that machine (not "too old",
+        // Windows included), unless it takes a staged build (rjw.9 D5: a Windows one whose
+        // Desktop restarts it into the selected build is updated like a Linux one).
+        // The Daemon says so itself: whether its OS is known yet does not matter.
         if relay && has(xshell_protocol::cap::DAEMON_DESKTOP_OWNED) {
-            return Some(Self::DesktopOwned);
+            return (!has(xshell_protocol::cap::DAEMON_STAGE)).then_some(Self::DesktopOwned);
         }
         if os == Some("windows") {
             // Selected restart is explicitly authorized by the owning Windows Desktop.
@@ -264,6 +266,129 @@ mod tests {
             UpdateUnavailable::from_hello(Some("linux"), &hello(&[]), true),
             None
         );
+    }
+
+    /// rjw.9 D5: a Desktop-owned Daemon that takes a staged build (a Windows one this build
+    /// or later, restarted by its Desktop) is updated over the Ring like any other, on every
+    /// route; without `daemon.stage` (rjw.8 and before) it stays Desktop-owned over the Ring.
+    #[test]
+    fn from_hello_matrix_with_stage() {
+        use xshell_protocol::cap::{
+            DAEMON_DESKTOP_OWNED as OWNED, DAEMON_STAGE as STAGE, DAEMON_UPDATE_LATEST as LATEST,
+            DAEMON_UPGRADE_SELECTED as SELECTED,
+        };
+        let hello = |caps: &[&str]| xshell_protocol::msg::Hello {
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ..serde_json::from_value(
+                serde_json::json!({"protocol":{"min":1,"max":1},"version":"1.6.0"}),
+            )
+            .unwrap()
+        };
+        let windows_now = hello(&[OWNED, SELECTED, STAGE, LATEST]);
+        let windows_rjw8 = hello(&[OWNED, SELECTED]);
+        let windows_no_restart = hello(&[OWNED]);
+        let linux_always_on = hello(&[SELECTED, STAGE, LATEST]);
+        let linux_gui = hello(&[OWNED]);
+        type Case<'a> = (
+            &'a str,
+            Option<&'a str>,
+            &'a xshell_protocol::msg::Hello,
+            bool,
+            Option<UpdateUnavailable>,
+        );
+        let cases: &[Case] = &[
+            (
+                "windows now, Ring",
+                Some("windows"),
+                &windows_now,
+                true,
+                None,
+            ),
+            (
+                "windows now, Ring, os unknown",
+                None,
+                &windows_now,
+                true,
+                None,
+            ),
+            (
+                "windows now, SSH",
+                Some("windows"),
+                &windows_now,
+                false,
+                None,
+            ),
+            (
+                "windows rjw.8, Ring",
+                Some("windows"),
+                &windows_rjw8,
+                true,
+                Some(UpdateUnavailable::DesktopOwned),
+            ),
+            (
+                "windows rjw.8, SSH",
+                Some("windows"),
+                &windows_rjw8,
+                false,
+                None,
+            ),
+            (
+                "windows without restart, SSH",
+                Some("windows"),
+                &windows_no_restart,
+                false,
+                Some(UpdateUnavailable::WindowsOwner),
+            ),
+            (
+                "windows without restart, Ring",
+                Some("windows"),
+                &windows_no_restart,
+                true,
+                Some(UpdateUnavailable::DesktopOwned),
+            ),
+            (
+                "linux always-on, Ring",
+                Some("linux"),
+                &linux_always_on,
+                true,
+                None,
+            ),
+            (
+                "linux always-on, SSH",
+                Some("linux"),
+                &linux_always_on,
+                false,
+                None,
+            ),
+            (
+                "linux GUI-bound, Ring",
+                Some("linux"),
+                &linux_gui,
+                true,
+                Some(UpdateUnavailable::DesktopOwned),
+            ),
+            (
+                "linux GUI-bound, SSH",
+                Some("linux"),
+                &linux_gui,
+                false,
+                Some(UpdateUnavailable::DesktopOwned),
+            ),
+            (
+                "macos GUI-bound, Ring",
+                Some("macos"),
+                &linux_gui,
+                true,
+                Some(UpdateUnavailable::DesktopOwned),
+            ),
+        ];
+        for (what, os, hello, relay, want) in cases {
+            assert_eq!(
+                UpdateUnavailable::from_hello(*os, hello, *relay),
+                *want,
+                "{what}"
+            );
+        }
     }
 
     #[test]

@@ -161,6 +161,10 @@ pub fn release_repo() -> &'static str {
 /// anything (design-update-from-get D6).
 pub const GET_INSTALL_COMMAND: &str = "curl -fsSL https://get.xshell.sh | sh";
 
+/// The same for a Windows machine (rjw.9 D5): the release's `install.ps1` in PowerShell,
+/// which installs or updates the xshell app there. Never the `curl | sh` command.
+pub const GET_INSTALL_COMMAND_WINDOWS: &str = "irm https://get.xshell.sh/install.ps1 | iex";
+
 pub fn release_base(repo: &str) -> String {
     format!("https://github.com/{repo}/releases/download")
 }
@@ -738,9 +742,21 @@ mod tests {
         // What a machine that cannot be updated over the Ring is told to run: the latest
         // release's installer from the release server (D6).
         assert_eq!(
-            super::super::commands::host_install_command(),
+            super::super::commands::host_install_command(None),
             "curl -fsSL https://get.xshell.sh | sh"
         );
+        // A machine known to be Windows gets PowerShell, never `curl | sh` (rjw.9 D5).
+        assert_eq!(
+            super::super::commands::host_install_command(Some("windows".into())),
+            "irm https://get.xshell.sh/install.ps1 | iex"
+        );
+        for os in ["linux", "macos", ""] {
+            assert_eq!(
+                super::super::commands::host_install_command(Some(os.into())),
+                "curl -fsSL https://get.xshell.sh | sh",
+                "{os}"
+            );
+        }
     }
 
     #[test]

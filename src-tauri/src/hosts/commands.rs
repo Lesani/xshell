@@ -388,10 +388,16 @@ pub async fn host_test(
 }
 
 /// The command that installs or updates xshell on a machine whose xshell cannot be updated
-/// over the Ring (S4): the release `install.sh` of this Desktop's version.
+/// over the Ring (S4): the latest release's `install.sh`, or for a machine whose `os` is
+/// `windows` its `install.ps1` (rjw.9 D5).
 #[tauri::command]
-pub fn host_install_command() -> String {
-    super::binaries::GET_INSTALL_COMMAND.to_string()
+pub fn host_install_command(os: Option<String>) -> String {
+    if os.as_deref() == Some("windows") {
+        super::binaries::GET_INSTALL_COMMAND_WINDOWS
+    } else {
+        super::binaries::GET_INSTALL_COMMAND
+    }
+    .to_string()
 }
 
 #[tauri::command]
