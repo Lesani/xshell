@@ -74,8 +74,14 @@ impl UpdateUnavailable {
     pub(crate) fn from_hello(
         os: Option<&str>,
         hello: &xshell_protocol::msg::Hello,
+        relay: bool,
     ) -> Option<Self> {
         let has = |cap| hello.capabilities.iter().any(|c| c == cap);
+        // Over the Ring nothing restarts a Daemon its Desktop owns, on any system: that
+        // machine's xshell is updated there (not "too old", Windows included).
+        if relay && has(xshell_protocol::cap::DAEMON_DESKTOP_OWNED) {
+            return Some(Self::DesktopOwned);
+        }
         if os == Some("windows") {
             // Selected restart is explicitly authorized by the owning Windows Desktop.
             return (!has(xshell_protocol::cap::DAEMON_UPGRADE_SELECTED))
@@ -220,6 +226,45 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Over the Ring a machine with the xshell app is updated there, on every system: a
+    /// Windows one is not reported as updatable (or "too old") because its Daemon offers a
+    /// selected restart to its own Desktop.
+    #[test]
+    fn desktop_owned_over_the_ring_on_every_system() {
+        let hello = |caps: &[&str]| xshell_protocol::msg::Hello {
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            ..serde_json::from_value(
+                serde_json::json!({"protocol":{"min":1,"max":1},"version":"1.6.0"}),
+            )
+            .unwrap()
+        };
+        let owned = hello(&[
+            xshell_protocol::cap::DAEMON_DESKTOP_OWNED,
+            xshell_protocol::cap::DAEMON_UPGRADE_SELECTED,
+        ]);
+        for os in [Some("windows"), Some("linux"), Some("macos"), None] {
+            assert_eq!(
+                UpdateUnavailable::from_hello(os, &owned, true),
+                Some(UpdateUnavailable::DesktopOwned),
+                "{os:?}"
+            );
+        }
+        // Over SSH nothing changes: the owning Windows Desktop authorizes a selected restart.
+        assert_eq!(
+            UpdateUnavailable::from_hello(Some("windows"), &owned, false),
+            None
+        );
+        assert_eq!(
+            UpdateUnavailable::from_hello(Some("linux"), &owned, false),
+            Some(UpdateUnavailable::DesktopOwned)
+        );
+        // An always-on Daemon is not Desktop-owned on either route.
+        assert_eq!(
+            UpdateUnavailable::from_hello(Some("linux"), &hello(&[]), true),
+            None
+        );
+    }
 
     #[test]
     fn status_json_shape() {

@@ -553,7 +553,7 @@ impl Sup {
                     let mut st = self.sh.lock();
                     st.release_updates = false;
                     st.status.update_unavailable =
-                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, self.relay);
                     if self.relay {
                         // No common protocol: not over the Ring either.
                         st.status.route_update_unavailable =
@@ -628,7 +628,7 @@ impl Sup {
                 StatusKind::Connected
             });
             st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
-            st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+            st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, relay);
             if relay {
                 st.status.route_update_unavailable =
                     ring_unsupported.then_some(RouteUpdateUnavailable::RingUpdateUnsupported);
@@ -764,7 +764,7 @@ impl Sup {
                 {
                     let mut st = self.sh.lock();
                     st.status.update_unavailable =
-                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, self.relay);
                     if self.relay {
                         st.status.route_update_unavailable =
                             Some(RouteUpdateUnavailable::RingUpdateUnsupported);

@@ -2496,6 +2496,12 @@ impl HostHandle {
         let reservation = (|| {
             let mut st = self.sh.lock();
             let name = st.cfg.name.clone();
+            // A machine with the xshell app is updated there: say that, not "too old".
+            if let Some(reason @ crate::status::UpdateUnavailable::DesktopOwned) =
+                st.status.update_unavailable
+            {
+                return Err(HostError::invalid(reason.message()));
+            }
             if st.status.route_update_unavailable.is_some()
                 || (!st.status.daemon_capabilities.is_empty()
                     && !st

@@ -79,7 +79,8 @@ type Invocation = { confirmation: Confirmation; succeeded: boolean };
 
 export type UpdateHost = Pick<HostConfig, "id" | "name">;
 /// Why "Update all" leaves a machine out.
-export type SkipReason = "current" | "offline" | "unsupported" | "busy";
+/// `desktop`: the machine has the xshell app, which is updated on that machine itself.
+export type SkipReason = "current" | "offline" | "unsupported" | "desktop" | "busy";
 export type AllResult =
   | { host: UpdateHost; outcome: "ok"; version: string }
   | { host: UpdateHost; outcome: "failed"; error: string }
@@ -101,6 +102,7 @@ type Snapshot = { confirmation: Confirmation | null; invoking: Record<string, bo
 /// Why `status` cannot be updated now; `null` when it can.
 export function skipReason(status: HostStatus | undefined): SkipReason | null {
   if (!status) return "offline";
+  if (status.updateUnavailable === "desktop-owned") return "desktop";
   if (status.routeUpdateUnavailable === "ring-update-unsupported" || status.updateUnavailable) return "unsupported";
   if (status.phase === "upgrading" || status.phase === "preparing" || status.phase === "installing") return "busy";
   if (!["connected", "upgrade-pending", "build-differs", "incompatible"].includes(status.status)) return "offline";

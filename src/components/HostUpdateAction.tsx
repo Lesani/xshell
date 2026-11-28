@@ -111,6 +111,7 @@ function resultText(r: AllResult): string {
         case "current": return `${r.host.name}: ${fmt("update.current")}`;
         case "offline": return fmt("update.offline", { name: r.host.name });
         case "unsupported": return fmt("update.tooOld", { name: r.host.name });
+        case "desktop": return fmt("hosts.update.desktopOwned", { host: r.host.name });
         case "busy": return fmt("update.busy", { name: r.host.name });
       }
   }
