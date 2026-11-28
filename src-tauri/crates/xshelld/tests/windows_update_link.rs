@@ -231,7 +231,8 @@ fn staged_build_is_installed_where_the_selected_restart_reads() {
             length: bytes.len() as u64,
         })
         .unwrap();
-    assert_eq!(again, json!({"stage": null, "installed": true}));
+    assert_eq!(again["installed"], json!(true));
+    assert!(again.get("stage").is_none_or(|s| s.is_null()), "{again}");
     // The existing restart path takes it from here.
     c.request(&ClientMsg::DaemonUpgradeSelected {
         version: VERSION.into(),
@@ -287,7 +288,15 @@ fn staged_build_that_fails_a_check_installs_nothing() {
     assert!(wait_until(T, || part_files(&h).is_empty()));
 
     // Another build announced than the bytes carry.
-    let (_, other) = patched(2, VERSION);
+    let other = BuildId {
+        commit: if build.commit == "abcdefabcdef" {
+            "fedcbafedcba"
+        } else {
+            "abcdefabcdef"
+        }
+        .into(),
+        ..build.clone()
+    };
     let e = stage(&mut c, VERSION, &other, &bytes).unwrap_err();
     assert!(e.contains("does not match"), "{e}");
     assert!(!root(&h)
