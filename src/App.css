@@ -1903,6 +1903,10 @@ input, textarea, [contenteditable="true"], .xterm, .xterm *, .selectable { user-
 @media (prefers-reduced-motion: reduce) {
   .host-spin, .host-chip-reconnecting .host-chip-dot, .ds-host-status-reconnecting { animation: none; }
 }
+/* A machine that just moved here from the SSH list (#119): marked for a moment. */
+.host-row-arrived { outline: 1px solid var(--accent-terracotta); outline-offset: 1px; animation: host-row-arrived 2s ease-out; }
+@keyframes host-row-arrived { from { background: var(--bg-active); } to { background: var(--bg-card); } }
+@media (prefers-reduced-motion: reduce) { .host-row-arrived { animation: none; } }
 .host-row-note { font-size: 11px; color: var(--text-secondary); }
 .host-row-warn { color: #d97757; }
 .host-row-error { font-size: 11px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }

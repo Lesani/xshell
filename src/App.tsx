@@ -45,6 +45,8 @@ import { adoptTab, applyFocusRemovals, dissolveSmallGroups, keepsFocusWhenListed
 import { localEdits, metaSync } from "./hosts/metaSync";
 import { refusal, planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
+import { moveProjectKey, moveSessionFolderId, moveTerminalKeys, ringMoveTarget, waitRingMoveTarget } from "./hosts/sshRing";
+import { skippedVersions } from "./hosts/skippedVersions";
 import { daemonHost, type LocalHostInfo } from "./hosts/localHost";
 import { isRemoteDataHost, listsForReconcile, restorableTabs, restoreGroups } from "./hosts/appTabs";
 import { remoteHosts, statusLabel, useHostsSnapshot } from "./hosts/useHosts";
@@ -972,16 +974,20 @@ export default function App() {
   // ── Settings → Hosts ──────────────────────────────────────────────
   // Persist the `hosts` key, then reconfigure the registry (starts it on the first Host).
   const hostsMutation = useRef(false);
-  const persistHosts = useCallback(async (list: HostConfig[]): Promise<boolean> => {
+  // `moved` (#119): saved Hosts that leave the list and continue under their Ring id. Their
+  // Terminals are rebound to that identity exactly as for a changed SSH target, and the list
+  // is saved before the registry forgets the SSH route: a failure leaves the Host saved.
+  const persistHosts = useCallback(async (list: HostConfig[], moved: { id: HostId; identity: HostId }[] = []): Promise<boolean> => {
     if (hostsMutation.current) { showNotice("Another Host configuration change is still being saved. Try again when it finishes."); return false; }
     const added = list.filter(h => !registry.isConfigured(h.id));
-    const retargeted = list.flatMap(h => {
+    const retargeted: { id: HostId; identity: HostId | undefined }[] = [...list.flatMap(h => {
       const old = registry.config(h.id);
       if (!old || (old.sshTarget === h.sshTarget && (old.daemonCommand ?? "") === (h.daemonCommand ?? ""))) return [];
       const available = registry.availableHost(h.id);
       const identity = available?.daemonKey ? available.aliases.find(alias => /^r_[0-9a-f]{64}$/.test(alias)) : undefined;
       return [{ id: h.id, identity }];
-    });
+    }), ...moved];
+    const isMoved = (id: HostId) => moved.some(m => m.id === id);
     if (retargeted.some(h => registry.isRetargeting(h.id))) { showNotice("This Host is already changing its connection."); return false; }
     hostsMutation.current = true;
     for (const h of retargeted) registry.beginRetarget(h.id);
@@ -1003,27 +1009,38 @@ export default function App() {
         }
         updateRightPanels(panels); updateCompletionSeen(seen);
       }
-      const failed = preparations.find((r): r is PromiseRejectedResult => r.status === "rejected");
-      if (failed) {
+      // Nothing was reconfigured: the Terminals recover under their identity, which the
+      // unchanged saved Host still answers for.
+      const abort = () => {
         for (const r of rebindings) {
           remoteTerminals.abortIdentityRebind(r.identity, r.uuids);
           setTabs(prev => prev.map(t => t.host === r.id && t.terminal && r.uuids.includes(t.terminal) ? { ...t, host: r.identity } : t));
         }
-        showNotice(`Cannot detach the original Host: ${String(failed.reason)}`);
+      };
+      const failed = preparations.find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (failed) {
+        abort();
+        // A move is not something the user asked to save: the Host just stays an SSH Host.
+        if (!moved.length) showNotice(`Cannot detach the original Host: ${String(failed.reason)}`);
         return false;
+      }
+      let saved = false;
+      if (moved.length) {
+        try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("hosts", list); saved = true; }
+        catch (_) { abort(); return false; }
       }
       for (const { id, identity } of retargeted) {
         // Preserve old positively associated Terminals under their stable identity, never
         // silently attach them to the new SSH target. Unknown old data stays only in cache.
         setProjectsByHost(prev => { const next = { ...prev }; if (identity && prev[id]) next[identity] = { ...prev[id], value: prev[id].value.map(p => ({ ...p, host: identity })) }; delete next[id]; return next; });
         setRecentByHost(prev => { const next = { ...prev }; if (identity && prev[id]) next[identity] = { ...prev[id], value: prev[id].value.map(s => ({ ...s, host: identity })) }; delete next[id]; return next; });
-        if (selectedProject?.host === id) { setProjectSessions([]); setProjectSessionsStale(false); }
+        if (selectedProject?.host === id && !isMoved(id)) { setProjectSessions([]); setProjectSessionsStale(false); }
       }
       configuredHostsRef.current = list;
       // The registry drops removed Hosts synchronously, so no late event re-adds their Tabs.
       const configured = registry.configure(list).catch(() => {});
       if (list.length > 0) cache.load().catch(() => {});
-      try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("hosts", list); } catch (_) {}
+      if (!saved) try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("hosts", list); } catch (_) {}
       await configured;
       for (const r of rebindings) {
         remoteTerminals.finishIdentityRebind(r.identity, r.uuids);
@@ -1067,6 +1084,81 @@ export default function App() {
     adoptedPanelsRef.current.delete(id);
     cache.dropHost(id);
   }, [sidebarLayout, persistSidebarLayout, selectedProject, persistHosts, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
+
+  // Add to Ring succeeded on a saved SSH Host (#119): the Host leaves the SSH list and
+  // continues as its Ring machine, reached through the Relay. Its Terminals keep running and
+  // their Tabs reattach; pinned Projects, their settings and the per-Terminal state follow
+  // under the Ring id. Not moved (the Host stays an SSH Host, labelled as a member) unless the
+  // Relay reports it online and its Daemon was made to start by itself: afterwards no SSH
+  // connection wakes it. True when the Host moved.
+  const movingHosts = useRef(new Set<HostId>());
+  const personalRef = useRef({ sidebarLayout, projectIcons, selectedProject });
+  personalRef.current = { sidebarLayout, projectIcons, selectedProject };
+  const [ringArrival, setRingArrival] = useState<{ daemonKey: string; token: number } | null>(null);
+  const moveHostToRing = useCallback(async (id: HostId): Promise<boolean> => {
+    if (movingHosts.current.has(id)) return false;
+    movingHosts.current.add(id);
+    try {
+      const before = registry.config(id);
+      if (!before || !(await waitRingMoveTarget(id))) return false;
+      try { await invoke("ring_ssh_host_keep_running", { host: id }); } catch (_) { return false; }
+      // Checked again after the waits: the same connection, still a member the Relay sees.
+      const config = registry.config(id), row = registry.availableHost(id);
+      const identity = ringMoveTarget(config, row);
+      if (!config || !row?.daemonKey || !identity || config.sshTarget !== before.sshTarget || (config.daemonCommand ?? "") !== (before.daemonCommand ?? "")) return false;
+      const daemonKey = row.daemonKey;
+      // The last list goes to the cache under the Daemon's identity, so the Tabs are there
+      // after a restart even before the Relay link has listed them.
+      const live = registry.getSnapshot().live[row.id];
+      if (live) cache.putTerminals(id, live);
+      if (!(await persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id), [{ id, identity }]))) return false;
+      // From here the Host is the Ring machine: everything keyed by the saved id follows.
+      setTabs(prev => prev.some(t => t.host === id) ? prev.map(t => t.host === id ? { ...t, host: identity } : t) : prev);
+      for (const p of pendingOpens.values()) if (p.host === id) p.host = identity;
+      if (rightPanelsLoaded) {
+        updateRightPanels(moveTerminalKeys(rightPanelsRef.current, id, identity));
+        updateCompletionSeen(moveTerminalKeys(completionSeenRef.current, id, identity));
+      }
+      delete appliedLiveRef.current[id];
+      const adopted = adoptedPanelsRef.current.get(id);
+      if (adopted) { adoptedPanelsRef.current.delete(id); adoptedPanelsRef.current.set(identity, adopted); }
+      skippedVersions.move(id, identity);
+      cache.dropHost(id); // what was cached before it had a Daemon identity
+      const { sidebarLayout: layout, projectIcons: icons, selectedProject: selected } = personalRef.current;
+      if (selected?.host === id) setSelectedProject({ ...selected, host: identity });
+      // A Project pinned under both ids is kept once.
+      const pinned = new Set<string>(flattenSidebarPaths(layout).filter(k => parseProjectKey(k).host !== id));
+      const rekey = (k: ProjectKey): ProjectKey[] => {
+        if (parseProjectKey(k).host !== id) return [k];
+        const next = asProjectKey(moveProjectKey(k, id, identity));
+        if (pinned.has(next)) return [];
+        pinned.add(next);
+        return [next];
+      };
+      const nextLayout = layout.flatMap((item): SidebarItem[] => {
+        if (item.kind === "project") return rekey(item.path).map(path => path === item.path ? item : { ...item, path });
+        if (!item.projectPaths.some(k => parseProjectKey(k).host === id)) return [item];
+        const projectPaths = item.projectPaths.flatMap(rekey);
+        return projectPaths.length ? [{ ...item, projectPaths }] : [];
+      });
+      if (nextLayout.length !== layout.length || nextLayout.some((item, i) => item !== layout[i])) await persistSidebarLayout(nextLayout);
+      const nextIcons: Record<string, ProjectSettings> = {};
+      let iconsChanged = false;
+      for (const [stored, value] of Object.entries(icons)) {
+        const folders = value.folders?.map(f => ({ ...f, sessionIds: f.sessionIds.map(s => moveSessionFolderId(s, id, identity)) }));
+        const foldersChanged = !!folders && folders.some((f, i) => f.sessionIds.some((s, j) => s !== value.folders![i].sessionIds[j]));
+        const target = moveProjectKey(stored, id, identity);
+        iconsChanged ||= foldersChanged || target !== stored;
+        if (target !== stored && target in icons) continue; // the Ring id's own entry stays
+        nextIcons[target] = foldersChanged ? { ...value, folders } : value;
+      }
+      if (iconsChanged) await persistIcons(nextIcons);
+      setRingArrival({ daemonKey, token: Date.now() });
+      return true;
+    } finally {
+      movingHosts.current.delete(id);
+    }
+  }, [persistHosts, persistSidebarLayout, persistIcons, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
 
   // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
   const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
@@ -1825,7 +1917,7 @@ export default function App() {
         <HostUpdateBanner host={activeUpdateHost(activeTabId, tabs, groups, activeLeafByGroup, selectedProject)} hidden={activeTabId === "settings"} />
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} onOpenRingSetup={openRingSetup} />
+          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} onHostAddedToRing={moveHostToRing} ringArrival={ringArrival} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} onOpenRingSetup={openRingSetup} />
         </div>
         {/* The Ring setup screen — mounted only while shown */}
         <div style={{ display: showRingSetup ? "flex" : "none", flex: 1, overflow: "auto" }}>

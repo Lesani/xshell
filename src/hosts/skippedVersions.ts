@@ -69,6 +69,16 @@ export class SkippedVersions {
     this.set({ ...this.state, skipped: { ...this.state.skipped, [host]: target } });
     this.writing = this.writing.then(() => this.load()).then(async () => { await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped); }).catch(() => {});
   }
+  /// A machine continues under another row id (#119: a saved SSH Host moved to the Ring
+  /// list): its skipped target goes with it. A target `to` already has stays.
+  move(from: HostId, to: HostId) {
+    this.writing = this.writing.then(() => this.load()).then(async () => {
+      const { [from]: target, ...rest } = this.state.skipped;
+      if (target === undefined) return;
+      this.set({ ...this.state, skipped: { ...rest, [to]: rest[to] ?? target } });
+      await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped);
+    }).catch(() => {});
+  }
 }
 
 export const skippedVersions = new SkippedVersions();

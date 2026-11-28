@@ -162,6 +162,57 @@ pub fn pair_invocation(binary: &PairBinary, relay: &str, name: &str) -> String {
     }
 }
 
+/// `xshelld service install --json` for `binary`, as one POSIX `sh` command (#119).
+pub fn service_invocation(binary: &PairBinary) -> String {
+    match binary {
+        PairBinary::Managed(dir) => {
+            format!("\"$HOME/.xshell/server/{dir}/xshelld\" service install --json")
+        }
+        PairBinary::Command(cmd) => format!("{cmd} service install --json"),
+    }
+}
+
+/// Whether the report of `service install --json` names a mechanism that starts the Daemon
+/// again by itself (`installed` is not empty).
+pub fn service_installed(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        serde_json::from_str::<Value>(line.trim())
+            .ok()
+            .and_then(|report| report.get("installed")?.as_array().map(|a| !a.is_empty()))
+            .unwrap_or(false)
+    })
+}
+
+/// How long `service install` on the Host may take.
+const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keeps the Host's Daemon running without an SSH session (#119): runs the existing
+/// `xshelld service install` there. A Host the Desktop installed over SSH has a Daemon that
+/// `connect` started; it outlives the session but not a restart of the machine. A Host that
+/// leaves the SSH list has no SSH route to start it again, so this must succeed first.
+pub fn keep_running(
+    transport: &dyn Transport,
+    binary: &PairBinary,
+    cancel: &CancelToken,
+) -> Result<(), AddError> {
+    let script = sh_wrap(&service_invocation(binary));
+    let out = process::run_script(transport, &script, None, SERVICE_TIMEOUT, cancel)
+        .map_err(|e| AddError::new(AddCode::Failed, format!("service install: {e}")))?;
+    if out.code != Some(0) {
+        return Err(AddError::new(
+            AddCode::Failed,
+            format!("service install ended with {:?}", out.code),
+        ));
+    }
+    if !service_installed(&out.stdout) {
+        return Err(AddError::new(
+            AddCode::Failed,
+            "the Host has no way to start its Daemon by itself",
+        ));
+    }
+    Ok(())
+}
+
 /// `cmd` wrapped so it ends, with every process it started, when the session's input closes
 /// (AM2, and Sol's diff review 1): the SSH input is kept on fd 3 for a watcher that ends `cmd`
 /// at its EOF; `cmd` itself reads `/dev/null`. With job control (`set -m`; a shell without a
@@ -1142,6 +1193,74 @@ mod tests {
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),
             "pair|--relay|ws://l|--name|n|"
+        );
+    }
+
+    #[test]
+    fn service_install_command_and_its_report() {
+        assert_eq!(
+            service_invocation(&PairBinary::Managed("1.6.0".into())),
+            r#""$HOME/.xshell/server/1.6.0/xshelld" service install --json"#
+        );
+        assert_eq!(
+            service_invocation(&PairBinary::Command("~/bin/xd".into())),
+            "~/bin/xd service install --json"
+        );
+        assert!(service_installed(
+            r#"{"mechanism":"profile","installed":["profile"],"active":false,"linger":null,"running":true,"launcher":"/h/.xshell/service/xshelld","changed":true,"warnings":[]}"#
+        ));
+        assert!(!service_installed(
+            r#"{"mechanism":"none","installed":[],"active":false,"linger":null,"running":true,"launcher":"l","warnings":[]}"#
+        ));
+        assert!(!service_installed("xshell is running."));
+        assert!(!service_installed(""));
+    }
+
+    /// Runs the remote command with a scratch HOME: never this user's own `~/.xshell`.
+    struct HomeSh(std::path::PathBuf);
+    impl Transport for HomeSh {
+        fn command(&self, remote_cmd: &str) -> crate::transport::CommandSpec {
+            crate::transport::CommandSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), remote_cmd.into()],
+                env: vec![("HOME".into(), self.0.clone().into())],
+            }
+        }
+        fn describe(&self) -> String {
+            "sh".into()
+        }
+    }
+
+    #[test]
+    fn keep_running_needs_exit_zero_and_an_installed_mechanism() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".xshell/server/9.9.9");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |body: &str| {
+            std::fs::write(dir.join("xshelld"), format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(dir.join("xshelld"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        };
+        let t = HomeSh(home.path().to_path_buf());
+        let bin = PairBinary::Managed("9.9.9".into());
+        let cancel = CancelToken::new();
+        fake(r#"[ "$1 $2 $3" = "service install --json" ] && echo '{"installed":["systemd"]}'"#);
+        assert_eq!(keep_running(&t, &bin, &cancel), Ok(()));
+        fake(r#"echo '{"installed":[]}'"#);
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
+        );
+        fake(r#"echo '{"installed":["systemd"]}'; exit 1"#);
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
+        );
+        std::fs::remove_file(dir.join("xshelld")).unwrap();
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
         );
     }
 
