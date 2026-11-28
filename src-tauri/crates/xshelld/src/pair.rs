@@ -317,7 +317,8 @@ fn pair_cancel(
 }
 
 /// Windows: the Computer route or nothing. This command never creates the Store (the
-/// Daemon the Desktop starts does) and validates it without repairing anything.
+/// Daemon the Desktop starts does) and checks its directory without repairing it; the
+/// files in it are read as the Daemon reads them.
 #[cfg(windows)]
 fn computer_only_pair(
     paths: &Paths,

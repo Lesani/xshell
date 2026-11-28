@@ -10,7 +10,8 @@
 #
 # It also adds %USERPROFILE%\.xshell\bin to this user's PATH (HKCU\Environment, the value's
 # type kept, no second entry): xshell writes the command `xshelld` there when it starts, so
-# `xshelld pair` in a terminal shows the words that add this computer to a Ring.
+# `xshelld pair` in a terminal shows the words that add this computer to a Ring. An OpenSSH
+# session on Windows gets only the system PATH, so the last line also names the full path.
 #
 # Nothing is sent but the downloads (User-Agent "xshell-install").
 #
@@ -152,7 +153,7 @@
 
     if ($update) { Write-Host "Updated xshell to $version in $dir." } else { Write-Host "Installed xshell $version in $dir." }
     Write-Host "Start it from the Start menu: xshell."
-    Write-Host "To add this computer to a Ring from a terminal: start xshell once, then run xshelld pair in a new terminal."
+    Write-Host "To add this computer to a Ring from a terminal: start xshell once, then run xshelld pair in a new terminal (over SSH: $(Join-Path $env:USERPROFILE '.xshell\bin\xshelld') pair)."
   } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
