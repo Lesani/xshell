@@ -15,7 +15,7 @@ import { phaseLabel, statusLabel, useHostsSnapshot } from "../hosts/useHosts";
 import type { HostConfig, HostStatus, HostTestResult } from "../hosts/types";
 import { useRingStatus } from "../ring/useRingStatus";
 import type { ApprovedComputer, RingStatus } from "../ring/types";
-import { addToRingErrorCode, addToRingErrorKey, sshRingView } from "../hosts/sshRing";
+import { addToRingErrorCode, addToRingErrorKey, sshRingView, RING_STAY_KEYS, type RingStayReason } from "../hosts/sshRing";
 
 // Settings → Hosts: this computer's Daemon, and SSH Hosts (add, edit, test, reconnect, upgrade,
 // remove, Add to Ring). The Ring's machines are in Settings → Ring; a Host added to the Ring
@@ -26,7 +26,9 @@ interface Props {
   onSave: (hosts: HostConfig[]) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
   // Add to Ring succeeded on this Host (#119): App moves it to the Ring list when it can.
-  onAddedToRing?: (id: string) => Promise<boolean>;
+  onAddedToRing?: (id: string) => Promise<void>;
+  // Why Hosts added to the Ring in this session are still SSH Hosts.
+  ringStays?: Record<string, RingStayReason>;
 }
 
 type TestState = { busy: boolean; text: string | null; ok: boolean };
@@ -160,7 +162,7 @@ type RingAddState = { adding: boolean; added: boolean; error: string | null };
 // error sentence. Not shown while this Desktop is in no Ring, or for a Windows Host. Keyed by
 // the Host's connection (ssh target, daemon command): an edit starts it afresh, and a result
 // that arrives for an earlier configuration, or after unmount, is ignored.
-function RingAction({ host, status, ring, onAdded }: { host: HostConfig; status: HostStatus | undefined; ring: RingStatus | null; onAdded?: (id: string) => Promise<boolean> }) {
+function RingAction({ host, status, ring, onAdded, stays }: { host: HostConfig; status: HostStatus | undefined; ring: RingStatus | null; onAdded?: (id: string) => Promise<void>; stays?: RingStayReason }) {
   const snap = useHostsSnapshot();
   const view = sshRingView(host, status, snap.available, ring);
   const [state, setState] = useState<RingAddState>({ adding: false, added: false, error: null });
@@ -191,13 +193,14 @@ function RingAction({ host, status, ring, onAdded }: { host: HostConfig; status:
         </button>
       )}
       {view === "offline" && !state.adding && <span className="host-row-note" data-ring-offline-hint>{fmt("hosts.ring.offlineHint", { name: host.name })}</span>}
+      {view === "member" && stays && <span className="host-row-note" data-ring-stays={stays}>{fmt(RING_STAY_KEYS[stays], { name: host.name })}</span>}
       {state.added && view !== "member" && <span className="host-row-note host-row-ring-added" data-ring-added>{fmt("hosts.ring.added", { name: host.name })}</span>}
       {state.error && !state.adding && view !== "member" && <span className="host-row-note host-row-warn" data-ring-error={state.error}>{fmt(addToRingErrorKey(state.error), { name: host.name })}</span>}
     </div>
   );
 }
 
-function HostRow({ host, onEdit, onRemove, now, ring, onAddedToRing }: { host: HostConfig; onEdit: () => void; onRemove: () => void; now: number; ring: RingStatus | null; onAddedToRing?: (id: string) => Promise<boolean> }) {
+function HostRow({ host, onEdit, onRemove, now, ring, onAddedToRing, stays }: { host: HostConfig; onEdit: () => void; onRemove: () => void; now: number; ring: RingStatus | null; onAddedToRing?: (id: string) => Promise<void>; stays?: RingStayReason }) {
   const snap = useHostsSnapshot();
   const status = snap.status[host.id];
   const live = snap.live[host.id];
@@ -256,7 +259,7 @@ function HostRow({ host, onEdit, onRemove, now, ring, onAddedToRing }: { host: H
 
       {test.text && <div className={`host-test-result ${test.ok ? "ok" : "failed"}`}>{test.text}</div>}
 
-      <RingAction key={`${host.sshTarget}\n${host.daemonCommand ?? ""}`} host={host} status={status} ring={ring} onAdded={onAddedToRing} />
+      <RingAction key={`${host.sshTarget}\n${host.daemonCommand ?? ""}`} host={host} status={status} ring={ring} onAdded={onAddedToRing} stays={stays} />
 
       <div className="host-row-actions">
         <button className="btn btn-ghost settings-action-btn" disabled={test.busy} onClick={testNow}><PlugZap size={11} /> {test.busy ? fmt("hosts.row.testing") : fmt("hosts.row.test")}</button>
@@ -273,12 +276,12 @@ function HostRow({ host, onEdit, onRemove, now, ring, onAddedToRing }: { host: H
 
 // The saved Hosts' rows. Only rendered when there is at least one: the Ring is asked whether
 // this Desktop is in one (for Add to Ring) only then.
-function HostRows({ hosts, now, onEdit, onRemove, onAddedToRing }: { hosts: HostConfig[]; now: number; onEdit: (h: HostConfig) => void; onRemove: (h: HostConfig) => void; onAddedToRing?: (id: string) => Promise<boolean> }) {
+function HostRows({ hosts, now, onEdit, onRemove, onAddedToRing, ringStays }: { hosts: HostConfig[]; now: number; onEdit: (h: HostConfig) => void; onRemove: (h: HostConfig) => void; onAddedToRing?: (id: string) => Promise<void>; ringStays?: Record<string, RingStayReason> }) {
   const { status: ring } = useRingStatus();
-  return <>{hosts.map(h => <HostRow key={h.id} host={h} now={now} ring={ring} onAddedToRing={onAddedToRing} onEdit={() => onEdit(h)} onRemove={() => onRemove(h)} />)}</>;
+  return <>{hosts.map(h => <HostRow key={h.id} host={h} now={now} ring={ring} onAddedToRing={onAddedToRing} stays={ringStays?.[h.id]} onEdit={() => onEdit(h)} onRemove={() => onRemove(h)} />)}</>;
 }
 
-export function HostsSettings({ onSave, onRemove, onAddedToRing }: Props) {
+export function HostsSettings({ onSave, onRemove, onAddedToRing, ringStays }: Props) {
   const snap = useHostsSnapshot();
   const hosts = snap.configs;
   const [editing, setEditing] = useState<HostConfig | "new" | null>(null);
@@ -309,7 +312,7 @@ export function HostsSettings({ onSave, onRemove, onAddedToRing }: Props) {
             <div className="host-empty-body">{fmt("hosts.empty.body")}</div>
           </div>
         ) : (
-          <HostRows hosts={hosts} now={now} onEdit={setEditing} onRemove={setRemoving} onAddedToRing={onAddedToRing} />
+          <HostRows hosts={hosts} now={now} onEdit={setEditing} onRemove={setRemoving} onAddedToRing={onAddedToRing} ringStays={ringStays} />
         )}
       </div>
       {editing && <HostForm initial={editing === "new" ? null : editing} onSave={save} onCancel={() => setEditing(null)} />}

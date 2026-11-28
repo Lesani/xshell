@@ -25,10 +25,12 @@ it("a machine that continues under another row id keeps its skipped target (#119
   const disk: Record<string, unknown> = { [SKIPPED_VERSIONS_SETTING]: { h_aaaaaaaa: "release:1.6.0", h_bbbbbbbb: "release:1.5.0", r_b: "release:1.7.0" } };
   const store = { get: async <T,>(k: string) => disk[k] as T | undefined, set: async (k: string, v: unknown) => { disk[k] = JSON.parse(JSON.stringify(v)); } };
   const skips = new SkippedVersions(async () => store);
-  skips.move("h_aaaaaaaa", "r_a");
-  skips.move("h_bbbbbbbb", "r_b"); // the Ring row's own skip stays
-  skips.move("h_cccccccc", "r_c"); // nothing skipped: nothing written for it
-  await new Promise(r => setTimeout(r, 10));
-  expect(disk[SKIPPED_VERSIONS_SETTING]).toEqual({ r_a: "release:1.6.0", r_b: "release:1.7.0" });
-  expect(skips.getSnapshot().skipped).toEqual({ r_a: "release:1.6.0", r_b: "release:1.7.0" });
+  expect(await skips.moved("h_aaaaaaaa", "r_a")).toEqual({ r_a: "release:1.6.0", h_bbbbbbbb: "release:1.5.0", r_b: "release:1.7.0" });
+  // The Ring row's own skip stays; a machine that skipped nothing changes nothing.
+  expect(await skips.moved("h_bbbbbbbb", "r_b")).toEqual({ h_aaaaaaaa: "release:1.6.0", r_b: "release:1.7.0" });
+  expect(await skips.moved("h_cccccccc", "r_c")).toBeNull();
+  // Computing writes nothing; the caller saves, then the bar follows.
+  expect(Object.keys(disk[SKIPPED_VERSIONS_SETTING] as object)).toHaveLength(3);
+  skips.adopt({ r_a: "release:1.6.0" });
+  expect(skips.getSnapshot().skipped).toEqual({ r_a: "release:1.6.0" });
 });

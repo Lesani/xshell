@@ -70,15 +70,17 @@ export class SkippedVersions {
     this.writing = this.writing.then(() => this.load()).then(async () => { await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped); }).catch(() => {});
   }
   /// A machine continues under another row id (#119: a saved SSH Host moved to the Ring
-  /// list): its skipped target goes with it. A target `to` already has stays.
-  move(from: HostId, to: HostId) {
-    this.writing = this.writing.then(() => this.load()).then(async () => {
-      const { [from]: target, ...rest } = this.state.skipped;
-      if (target === undefined) return;
-      this.set({ ...this.state, skipped: { ...rest, [to]: rest[to] ?? target } });
-      await (await this.open()).set(SKIPPED_VERSIONS_SETTING, this.state.skipped);
-    }).catch(() => {});
+  /// list): the map with its skipped target under `to` (a target `to` already has stays), or
+  /// null when it skipped nothing. The caller saves it with its own transaction, then calls
+  /// `adopt`.
+  async moved(from: HostId, to: HostId): Promise<SkippedTargets | null> {
+    await this.load();
+    await this.writing;
+    const { [from]: target, ...rest } = this.state.skipped;
+    return target === undefined ? null : { ...rest, [to]: rest[to] ?? target };
   }
+  /// The map as it was just saved elsewhere.
+  adopt(skipped: SkippedTargets) { this.set({ ...this.state, skipped }); }
 }
 
 export const skippedVersions = new SkippedVersions();

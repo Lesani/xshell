@@ -35,13 +35,14 @@ export interface RingMembersProps {
   refresh: () => Promise<RingStatus>;
   // This machine left the Ring by its own Remove.
   onSelfRemoved: () => void;
-  // Its row is scrolled into view and marked for a moment.
+  // Its row is scrolled into view and marked for a moment, once; then `onArrivalShown`.
   arrival?: RingArrival | null;
+  onArrivalShown?: () => void;
 }
 
 const chipClass = (key: CopyKey) => (key === "member.online" ? "connected" : "offline");
 
-export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved, arrival }: RingMembersProps) {
+export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved, arrival, onArrivalShown }: RingMembersProps) {
   const snap = useHostsSnapshot();
   const [removal, setRemoval] = useState<Removal>({ kind: "idle" });
   const mounted = useRef(true);
@@ -64,9 +65,13 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved, arriv
     setMarked(arrived);
     const row = [...(root.current?.querySelectorAll<HTMLElement>("[data-ring-member]") ?? [])].find(el => el.getAttribute("data-ring-member") === arrived);
     row?.scrollIntoView?.({ block: "nearest" });
+    onArrivalShown?.();
+  }, [arrival, arrived, onArrivalShown]);
+  useEffect(() => {
+    if (!marked) return;
     const t = window.setTimeout(() => setMarked(null), ARRIVAL_MARK_MS);
     return () => window.clearTimeout(t);
-  }, [arrival, arrived]);
+  }, [marked]);
 
   const run = async (m: MemberView) => {
     setRemoval({ kind: "removing", member: m });

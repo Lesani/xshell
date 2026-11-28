@@ -56,6 +56,8 @@ let container: HTMLDivElement;
 let seq = 1;
 let settings: Map<string, unknown>;
 let calls: string[];
+let sets: string[];
+let disk: Map<string, unknown>;
 // Per test: how the native side answers.
 let world: {
   config: HostConfig;
@@ -64,7 +66,8 @@ let world: {
   add: () => Promise<unknown>;
   keep: () => Promise<unknown>;
   detach: () => Promise<unknown>;
-  saveHosts: () => Promise<void>;
+  // `store.save()` of settings.json (the explicit save of the move).
+  save: () => Promise<void>;
   configure: (hosts: HostConfig[]) => Promise<void>;
 };
 
@@ -92,11 +95,11 @@ const clickText = async (selector: string, text: string) => {
 const count = (prefix: string) => calls.filter(c => c.startsWith(prefix)).length;
 
 async function mount(over: Partial<typeof world> = {}, waitMs = 5000) {
-  calls = [];
+  calls = []; sets = [];
   world = {
     config: CONFIG, start: savedRow(), members: [me],
     add: async () => ({ names: ["box"], version: 4 }),
-    keep: async () => null, detach: async () => null, saveHosts: async () => {},
+    keep: async () => null, detach: async () => null, save: async () => {},
     // The backend's answer to the saved Host leaving: the machine as a Ring row.
     configure: async hosts => {
       if (hosts.some(h => h.id === H)) return;
@@ -122,16 +125,20 @@ async function mount(over: Partial<typeof world> = {}, waitMs = 5000) {
     ["file_explorer_on_start", false], ["webgl_rendering_enabled", false], ["terminal_header_stats", false], ["eager_init_tabs", true],
     ["rate_limit_in_sidebar", false], ["rate_limit_in_sidebar_codex", false], ["context_tree_enabled", false],
   ]);
+  disk = new Map(settings);
   const stores = new Map<string, Map<string, unknown>>([["settings.json", settings]]);
   vi.mocked(load).mockImplementation(async file => {
     const data = stores.get(file) ?? new Map<string, unknown>(); stores.set(file, data);
     return {
       get: async (key: string) => data.get(key) ?? null,
       set: async (key: string, value: unknown) => {
-        if (file === "settings.json" && key === "hosts") { calls.push(`save-hosts:${(value as HostConfig[]).length}`); await world.saveHosts(); }
+        if (file === "settings.json" && key === "hosts") calls.push(`set-hosts:${(value as HostConfig[]).length}`);
+        if (file === "settings.json") sets.push(key);
         data.set(key, value);
       },
-      save: async () => {},
+      delete: async (key: string) => data.delete(key),
+      // What is on disk: the store's values at its last successful save.
+      save: async () => { if (file !== "settings.json") return; calls.push("save"); await world.save(); disk = new Map(data); },
     } as unknown as Awaited<ReturnType<typeof load>>;
   });
   vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -207,10 +214,18 @@ it("a successful Add to Ring moves the Host: SSH entry gone, everything under th
   await settle(20);
 
   // The service first, then the Terminal is detached (never closed), saved, reconfigured.
-  const order = ["add", `keep:${H}`, `detach:${H}`, "save-hosts:0", "configure:"];
+  const order = ["add", `keep:${H}`, `detach:${H}`, "set-hosts:0", "save", "configure:"];
   expect(order.map(step => calls.indexOf(step))).toEqual([...order.map(step => calls.indexOf(step))].sort((x, y) => x - y));
   expect(order.every(step => calls.includes(step))).toBe(true);
   expect(settings.get("hosts")).toEqual([]);
+  // One explicit save carried the list and every migrated key; the list was written last.
+  const first = sets.indexOf("sidebar_layout");
+  expect(sets.slice(first, sets.indexOf("hosts") + 1)).toEqual(["sidebar_layout", "project_paths", "project_icons", "terminal_right_panels", "terminal_completion_seen", "update_skipped_versions", "hosts"]);
+  expect(disk.get("hosts")).toEqual([]);
+  expect(disk.get("project_paths")).toEqual([`host:${R}:/p`, "/local", `host:${R}:/q`]);
+  expect(Object.keys(disk.get("project_icons") as object)).toEqual(["/local", `host:${R}:/p`]);
+  expect((disk.get("terminal_right_panels") as { entries: object }).entries).toEqual({ [JSON.stringify(["daemon", R, "box-uuid"])]: "git" });
+  expect(disk.get("update_skipped_versions")).toEqual({ [R]: "release:9.9.9" });
   expect(registry.getSnapshot().configs).toEqual([]);
   expect(registry.availableHost(R)?.activeRoute).toBe("relay");
 
@@ -227,6 +242,7 @@ it("a successful Add to Ring moves the Host: SSH entry gone, everything under th
   expect(settings.get("sidebar_layout")).toEqual([{ kind: "folder", id: "f1", name: "Work", collapsed: false, projectPaths: [`host:${R}:/p`, "/local"] }, { kind: "project", path: `host:${R}:/q` }]);
   expect(settings.get("project_paths")).toEqual([`host:${R}:/p`, "/local", `host:${R}:/q`]);
   expect(settings.get("project_icons")).toEqual({ [`host:${R}:/p`]: { customName: "Proj", icon: "PX", folders: [{ id: "sf", name: "Kept", sessionIds: ["raw-1", PI_ENTRY(R)] }] }, "/local": { customName: "Mine" } });
+  expect(q("[data-ring-stays]")).toBeNull();
   expect(container.querySelector(`[data-drop-path='host:${R}:/p']`)).not.toBeNull();
   expect(container.querySelector(`[data-drop-path='host:${H}:/p']`)).toBeNull();
   await settle(20);
@@ -257,38 +273,56 @@ it("the Relay does not report the new member online: not moved, the row says In 
   expectStillSaved();
   expect(q("[data-ring-host-member]")?.textContent).toContain("In your Ring");
   expect(q("[data-ring-add]")).toBeNull();
+  expect(q('[data-ring-stays="notOnline"]')?.textContent).toBe("box didn’t appear online in your Ring in time, so xshell keeps using SSH for it.");
+  expect(q('[data-ring-stays="notOnline"]')?.classList.contains("host-row-note")).toBe(true);
+  // The note is there for the session, also after another Settings page.
+  await clickText(".settings-nav-item", "Appearance");
+  await clickText(".settings-nav-item", "Hosts");
+  expect(q('[data-ring-stays="notOnline"]')).not.toBeNull();
   // Coming online later moves nothing by itself.
   await available([memberRow("online")]);
   await settle(120);
   expectStillSaved();
 });
 
-it("the Host's Daemon cannot be made to start by itself: not moved", async () => {
-  await mount({ keep: async () => { throw "failed: the Host has no way to start its Daemon by itself"; } });
+it("the Host's Daemon would need a login to start after a restart: not moved, and the row says so", async () => {
+  await mount({ keep: async () => { throw "failed: the Host's Daemon would not start after a restart without a login"; } });
   await addToRing();
   await settle(20);
   expect(count("keep:")).toBe(1);
   expect(count("detach:")).toBe(0);
   expectStillSaved();
   expect(q("[data-ring-host-member]")).not.toBeNull();
+  expect(q('[data-ring-stays="restart"]')?.textContent).toBe("After box restarts, xshell needs a login to start, so this Desktop keeps using SSH.");
 });
 
 it("a Host with a launch prefix stays an SSH Host", async () => {
   const config = { ...CONFIG, launchPrefixes: { claude: "nix develop -c" } };
-  await mount({ config }, 60);
+  await mount({ config });
   await addToRing();
-  await settle(120);
+  await settle(20);
   expect(count("keep:")).toBe(0);
   expectStillSaved();
   expect(q("[data-ring-host-member]")).not.toBeNull();
+  expect(q('[data-ring-stays="prefixes"]')?.textContent).toBe("xshell keeps using SSH for box because launch prefixes don’t work through your Ring.");
 });
 
 it.each(["detach", "save"])("the move fails midway (%s): the Host and its Tab stay on SSH", async step => {
-  await mount(step === "detach" ? { detach: async () => { throw new Error("controlled Detach failure"); } } : { saveHosts: async () => { throw new Error("controlled save failure"); } });
+  // `save`: the store takes every value (`set` only changes memory); writing the file fails.
+  await mount(step === "detach" ? { detach: async () => { throw new Error("controlled Detach failure"); } } : { save: async () => { throw new Error("controlled save failure: disk full"); } });
+  const before = new Map(settings);
   await addToRing();
   await settle(20);
   expect(count("detach:")).toBe(1);
+  expect(count("save")).toBe(step === "save" ? 1 : 0);
+  if (step === "save") expect(calls).toContain("set-hosts:0");
   expectStillSaved();
+  // Nothing of the new state is left in the store or on disk; no note either.
+  for (const key of ["hosts", "sidebar_layout", "project_paths", "project_icons", "update_skipped_versions"]) {
+    expect(settings.get(key), key).toEqual(before.get(key));
+    expect(disk.get(key), key).toEqual(before.get(key));
+  }
+  expect(q("[data-ring-stays]")).toBeNull();
   expect(q("[data-ring-host-member]")).not.toBeNull();
   // The Tab recovered through the unchanged saved Host and takes input.
   expect(calls.filter(c => c.startsWith("attach:"))).toEqual([`attach:${H}`, `attach:${R}`]);
@@ -340,4 +374,42 @@ it("a Host added to the Ring before this version stays in the SSH list", async (
   expect(count("keep:")).toBe(0);
   expect(count("detach:")).toBe(0);
   expectStillSaved();
+});
+
+it("the move finishes while Settings is hidden: no jump then, and none on the next visit", async () => {
+  let finishKeep!: (value: unknown) => void;
+  await mount({ keep: () => new Promise(resolve => { finishKeep = resolve; }) });
+  await addToRing();
+  await settle(5);
+  // The user goes to the Terminal Tab; the move ends there.
+  await act(async () => { (tabs()[0] as HTMLElement).click(); });
+  await act(async () => { finishKeep(null); });
+  await settle(20);
+  expect(settings.get("hosts")).toEqual([]);
+  expect(activeCategory()).toBe("Hosts");
+  expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  await act(async () => { q('[aria-label="Settings"]')!.click(); });
+  await settle(5);
+  expect(activeCategory()).toBe("Hosts");
+  expect(q(".host-empty")).not.toBeNull();
+  await clickText(".settings-nav-item", "Ring");
+  await settle(5);
+  expect(q(`[data-ring-member="${KEY}"]`)).not.toBeNull();
+  expect(q("[data-ring-arrived]")).toBeNull();
+  expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+});
+
+it("the arrival is shown once: a later visit to Ring neither marks nor scrolls again", async () => {
+  await mount();
+  await addToRing();
+  await settle(20);
+  expect(activeCategory()).toBe("Ring");
+  expect(q("[data-ring-arrived]")).not.toBeNull();
+  expect(Element.prototype.scrollIntoView).toHaveBeenCalledTimes(1);
+  await clickText(".settings-nav-item", "Appearance");
+  await clickText(".settings-nav-item", "Ring");
+  await settle(5);
+  expect(q(`[data-ring-member="${KEY}"]`)).not.toBeNull();
+  expect(q("[data-ring-arrived]")).toBeNull();
+  expect(Element.prototype.scrollIntoView).toHaveBeenCalledTimes(1);
 });

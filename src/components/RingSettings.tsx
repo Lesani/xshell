@@ -21,6 +21,7 @@ export interface RingSettingsProps {
   ring?: RingApi;
   // The machine that just moved here from the SSH list (#119).
   arrival?: RingArrival | null;
+  onArrivalShown?: () => void;
 }
 
 export function RingSettings(props: RingSettingsProps) {
@@ -56,7 +57,7 @@ function UnpairedRelay({ chosen, onSave, disabled }: { chosen: string | null; on
   );
 }
 
-export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r, arrival }: RingSettingsProps & { ring: RingApi }) {
+export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r, arrival, onArrivalShown }: RingSettingsProps & { ring: RingApi }) {
   const s = r.status;
   const { notAdded } = useNotAdded(s);
   // This machine removed itself: the line stays until the next Ring change here.
@@ -86,7 +87,7 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r, arr
           <>
             {conn && <div className="host-row-note" data-ring-connection>{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
-            <RingMembers s={s} readOnly={follower} remove={r.removeMember} refresh={r.refreshStatus} onSelfRemoved={() => setSelfRemoved(true)} arrival={arrival} />
+            <RingMembers s={s} readOnly={follower} remove={r.removeMember} refresh={r.refreshStatus} onSelfRemoved={() => setSelfRemoved(true)} arrival={arrival} onArrivalShown={onArrivalShown} />
             {follower ? <div className="host-row-note">{C["ring.follower"]}</div> : (
               <>
                 <AddMachinePanel approve={r.approveComputer} disabled={s.busy || pairingBlocked(s)} note={pairingLine(s)} />

@@ -171,7 +171,8 @@ fn keep(app: &AppHandle, host: &str) -> Result<(), AddError> {
 }
 
 /// Before a saved SSH Host that joined the Ring leaves the SSH list (#119): its Daemon must
-/// start again by itself, since no SSH connection will start it. Runs the existing
+/// start again after a restart of the machine without a login, since no SSH connection will
+/// start it. Runs the existing
 /// `xshelld service install` on the Host over its SSH route. Errors are `code: detail`.
 #[tauri::command]
 pub async fn ring_ssh_host_keep_running(app: AppHandle, host: String) -> Result<(), String> {

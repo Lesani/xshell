@@ -172,14 +172,29 @@ pub fn service_invocation(binary: &PairBinary) -> String {
     }
 }
 
-/// Whether the report of `service install --json` names a mechanism that starts the Daemon
-/// again by itself (`installed` is not empty).
-pub fn service_installed(stdout: &str) -> bool {
+/// Whether the report of `service install --json` says the Daemon starts again after the
+/// machine restarts, without anyone logging in: what `xshelld service status` words as
+/// "starts automatically" (`Report::status_line`). That is a systemd user unit that is
+/// active with linger on, or a cron `@reboot` line. The shell-profile block needs a login,
+/// systemd without linger ends at logout, and an unreadable report proves nothing.
+pub fn starts_at_boot(stdout: &str) -> bool {
     stdout.lines().any(|line| {
-        serde_json::from_str::<Value>(line.trim())
-            .ok()
-            .and_then(|report| report.get("installed")?.as_array().map(|a| !a.is_empty()))
-            .unwrap_or(false)
+        let Ok(report) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        let mechanism = report.get("mechanism").and_then(Value::as_str);
+        let installed = |m: &str| {
+            report
+                .get("installed")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(m)))
+        };
+        let flag = |k: &str| report.get(k).and_then(Value::as_bool) == Some(true);
+        match mechanism {
+            Some("systemd") => installed("systemd") && flag("active") && flag("linger"),
+            Some("cron") => installed("cron"),
+            _ => false,
+        }
     })
 }
 
@@ -189,7 +204,8 @@ const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Keeps the Host's Daemon running without an SSH session (#119): runs the existing
 /// `xshelld service install` there. A Host the Desktop installed over SSH has a Daemon that
 /// `connect` started; it outlives the session but not a restart of the machine. A Host that
-/// leaves the SSH list has no SSH route to start it again, so this must succeed first.
+/// leaves the SSH list has no SSH route to start it again, so this must succeed first, with
+/// a mechanism that works at boot ([`starts_at_boot`]).
 pub fn keep_running(
     transport: &dyn Transport,
     binary: &PairBinary,
@@ -204,10 +220,10 @@ pub fn keep_running(
             format!("service install ended with {:?}", out.code),
         ));
     }
-    if !service_installed(&out.stdout) {
+    if !starts_at_boot(&out.stdout) {
         return Err(AddError::new(
             AddCode::Failed,
-            "the Host has no way to start its Daemon by itself",
+            "the Host's Daemon would not start after a restart without a login",
         ));
     }
     Ok(())
@@ -1206,14 +1222,37 @@ mod tests {
             service_invocation(&PairBinary::Command("~/bin/xd".into())),
             "~/bin/xd service install --json"
         );
-        assert!(service_installed(
-            r#"{"mechanism":"profile","installed":["profile"],"active":false,"linger":null,"running":true,"launcher":"/h/.xshell/service/xshelld","changed":true,"warnings":[]}"#
-        ));
-        assert!(!service_installed(
-            r#"{"mechanism":"none","installed":[],"active":false,"linger":null,"running":true,"launcher":"l","warnings":[]}"#
-        ));
-        assert!(!service_installed("xshell is running."));
-        assert!(!service_installed(""));
+        let report = |mechanism: &str, installed: &str, active: bool, linger: &str| {
+            format!(
+                r#"{{"mechanism":"{mechanism}","installed":[{installed}],"active":{active},"linger":{linger},"running":true,"launcher":"/h/.xshell/service/xshelld","changed":true,"warnings":[]}}"#
+            )
+        };
+        // What starts at boot without a login.
+        assert!(starts_at_boot(&report(
+            "systemd",
+            r#""systemd""#,
+            true,
+            "true"
+        )));
+        assert!(starts_at_boot(&report("cron", r#""cron""#, true, "null")));
+        // What does not: linger off or unknown, the unit not active, the profile block,
+        // nothing installed, a mechanism named but not installed, no report.
+        for (m, i, active, linger) in [
+            ("systemd", r#""systemd""#, true, "false"),
+            ("systemd", r#""systemd""#, true, "null"),
+            ("systemd", r#""systemd""#, false, "true"),
+            ("systemd", "", true, "true"),
+            ("profile", r#""profile""#, true, "null"),
+            ("profile", r#""profile""#, false, "null"),
+            ("cron", "", false, "null"),
+            ("cron", r#""profile""#, true, "null"),
+            ("none", "", false, "null"),
+        ] {
+            assert!(!starts_at_boot(&report(m, i, active, linger)), "{m} {i}");
+        }
+        assert!(!starts_at_boot("xshell is running."));
+        assert!(!starts_at_boot(r#"{"installed":["systemd"]}"#));
+        assert!(!starts_at_boot(""));
     }
 
     /// Runs the remote command with a scratch HOME: never this user's own `~/.xshell`.
@@ -1245,14 +1284,16 @@ mod tests {
         let t = HomeSh(home.path().to_path_buf());
         let bin = PairBinary::Managed("9.9.9".into());
         let cancel = CancelToken::new();
-        fake(r#"[ "$1 $2 $3" = "service install --json" ] && echo '{"installed":["systemd"]}'"#);
+        fake(
+            r#"[ "$1 $2 $3" = "service install --json" ] && echo '{"mechanism":"cron","installed":["cron"]}'"#,
+        );
         assert_eq!(keep_running(&t, &bin, &cancel), Ok(()));
-        fake(r#"echo '{"installed":[]}'"#);
+        fake(r#"echo '{"mechanism":"profile","installed":["profile"],"active":true}'"#);
         assert_eq!(
             keep_running(&t, &bin, &cancel).unwrap_err().code,
             AddCode::Failed
         );
-        fake(r#"echo '{"installed":["systemd"]}'; exit 1"#);
+        fake(r#"echo '{"mechanism":"cron","installed":["cron"]}'; exit 1"#);
         assert_eq!(
             keep_running(&t, &bin, &cancel).unwrap_err().code,
             AddCode::Failed

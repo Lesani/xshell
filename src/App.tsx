@@ -45,8 +45,9 @@ import { adoptTab, applyFocusRemovals, dissolveSmallGroups, keepsFocusWhenListed
 import { localEdits, metaSync } from "./hosts/metaSync";
 import { refusal, planNewChat, planNewShell, planOpenSession, type OpenContext, type Plan } from "./hosts/sessionOps";
 import { markClosing, pendingOpens, pendingUuids, remoteTerminals } from "./hosts/terminalTransport";
-import { moveProjectKey, moveSessionFolderId, moveTerminalKeys, ringMoveTarget, waitRingMoveTarget } from "./hosts/sshRing";
-import { skippedVersions } from "./hosts/skippedVersions";
+import { hasLaunchPrefix, moveProjectSettings, moveSidebarLayout, moveTerminalKeys, ringMoveTarget, waitRingMoveTarget, type RingStayReason } from "./hosts/sshRing";
+import { skippedVersions, SKIPPED_VERSIONS_SETTING } from "./hosts/skippedVersions";
+import type { RingArrival } from "./components/RingMembers";
 import { daemonHost, type LocalHostInfo } from "./hosts/localHost";
 import { isRemoteDataHost, listsForReconcile, restorableTabs, restoreGroups } from "./hosts/appTabs";
 import { remoteHosts, statusLabel, useHostsSnapshot } from "./hosts/useHosts";
@@ -975,9 +976,12 @@ export default function App() {
   // Persist the `hosts` key, then reconfigure the registry (starts it on the first Host).
   const hostsMutation = useRef(false);
   // `moved` (#119): saved Hosts that leave the list and continue under their Ring id. Their
-  // Terminals are rebound to that identity exactly as for a changed SSH target, and the list
-  // is saved before the registry forgets the SSH route: a failure leaves the Host saved.
-  const persistHosts = useCallback(async (list: HostConfig[], moved: { id: HostId; identity: HostId }[] = []): Promise<boolean> => {
+  // Terminals are rebound to that identity exactly as for a changed SSH target. `durable`
+  // (asked for once the Terminals are detached) gives everything else that must be on disk
+  // with the new list: it is written with it and saved explicitly before the registry
+  // forgets the SSH route, and `applied` runs once that save succeeded. A failed save puts
+  // the old values back and leaves the Host saved.
+  const persistHosts = useCallback(async (list: HostConfig[], moved: { id: HostId; identity: HostId }[] = [], durable?: () => Promise<{ values: [string, unknown][]; applied: () => void }>): Promise<boolean> => {
     if (hostsMutation.current) { showNotice("Another Host configuration change is still being saved. Try again when it finishes."); return false; }
     const added = list.filter(h => !registry.isConfigured(h.id));
     const retargeted: { id: HostId; identity: HostId | undefined }[] = [...list.flatMap(h => {
@@ -1026,8 +1030,28 @@ export default function App() {
       }
       let saved = false;
       if (moved.length) {
-        try { const store = await load("settings.json", { defaults: {}, autoSave: true }); await store.set("hosts", list); saved = true; }
-        catch (_) { abort(); return false; }
+        // One file, one explicit save. The Ring-keyed values go first and the list last: the
+        // saved Host answers for its Ring id too, so whatever part an autosave writes in
+        // between is still the old, working state.
+        const old: [string, unknown][] = [];
+        let store: Awaited<ReturnType<typeof load>> | null = null;
+        try {
+          const next = await durable?.();
+          store = await load("settings.json", { defaults: {}, autoSave: true });
+          for (const [key, value] of [...(next?.values ?? []), ["hosts", list] as [string, unknown]]) {
+            old.push([key, await store.get(key)]);
+            await store.set(key, value);
+          }
+          await store.save();
+          saved = true;
+          next?.applied();
+        } catch (_) {
+          for (const [key, value] of old.reverse()) {
+            try { if (value === null || value === undefined) await store!.delete(key); else await store!.set(key, value); } catch (_) {}
+          }
+          abort();
+          return false;
+        }
       }
       for (const { id, identity } of retargeted) {
         // Preserve old positively associated Terminals under their stable identity, never
@@ -1088,77 +1112,75 @@ export default function App() {
   // Add to Ring succeeded on a saved SSH Host (#119): the Host leaves the SSH list and
   // continues as its Ring machine, reached through the Relay. Its Terminals keep running and
   // their Tabs reattach; pinned Projects, their settings and the per-Terminal state follow
-  // under the Ring id. Not moved (the Host stays an SSH Host, labelled as a member) unless the
-  // Relay reports it online and its Daemon was made to start by itself: afterwards no SSH
-  // connection wakes it. True when the Host moved.
+  // under the Ring id. Not moved (the Host stays an SSH Host, labelled as a member, with the
+  // reason noted on its row) unless the Relay reports it online and its Daemon starts by
+  // itself after a restart: afterwards no SSH connection wakes it.
   const movingHosts = useRef(new Set<HostId>());
   const personalRef = useRef({ sidebarLayout, projectIcons, selectedProject });
   personalRef.current = { sidebarLayout, projectIcons, selectedProject };
-  const [ringArrival, setRingArrival] = useState<{ daemonKey: string; token: number } | null>(null);
-  const moveHostToRing = useCallback(async (id: HostId): Promise<boolean> => {
-    if (movingHosts.current.has(id)) return false;
+  const [ringArrival, setRingArrival] = useState<RingArrival | null>(null);
+  const consumeRingArrival = useCallback(() => setRingArrival(null), []);
+  // This session's notes: why a Host added to the Ring is still an SSH Host.
+  const [ringStays, setRingStays] = useState<Record<HostId, RingStayReason>>({});
+  const moveHostToRing = useCallback(async (id: HostId): Promise<void> => {
+    if (movingHosts.current.has(id)) return;
     movingHosts.current.add(id);
+    const stays = (reason: RingStayReason) => setRingStays(prev => ({ ...prev, [id]: reason }));
     try {
       const before = registry.config(id);
-      if (!before || !(await waitRingMoveTarget(id))) return false;
-      try { await invoke("ring_ssh_host_keep_running", { host: id }); } catch (_) { return false; }
+      if (!before) return;
+      if (hasLaunchPrefix(before)) return stays("prefixes");
+      if (!(await waitRingMoveTarget(id))) { if (registry.isConfigured(id)) stays(hasLaunchPrefix(registry.config(id)) ? "prefixes" : "notOnline"); return; }
+      try { await invoke("ring_ssh_host_keep_running", { host: id }); } catch (_) { return stays("restart"); }
       // Checked again after the waits: the same connection, still a member the Relay sees.
       const config = registry.config(id), row = registry.availableHost(id);
       const identity = ringMoveTarget(config, row);
-      if (!config || !row?.daemonKey || !identity || config.sshTarget !== before.sshTarget || (config.daemonCommand ?? "") !== (before.daemonCommand ?? "")) return false;
+      if (!config || config.sshTarget !== before.sshTarget || (config.daemonCommand ?? "") !== (before.daemonCommand ?? "")) return;
+      if (!row?.daemonKey || !identity) return stays(hasLaunchPrefix(config) ? "prefixes" : "notOnline");
       const daemonKey = row.daemonKey;
       // The last list goes to the cache under the Daemon's identity, so the Tabs are there
       // after a restart even before the Relay link has listed them.
       const live = registry.getSnapshot().live[row.id];
       if (live) cache.putTerminals(id, live);
-      if (!(await persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id), [{ id, identity }]))) return false;
-      // From here the Host is the Ring machine: everything keyed by the saved id follows.
+      // Everything on disk that is keyed by the saved id, as it is once the Terminals are
+      // detached; saved with the new Host list, then shown.
+      const durable = async () => {
+        const { sidebarLayout: layout, projectIcons: icons } = personalRef.current;
+        const nextLayout = moveSidebarLayout(layout, id, identity), nextIcons = moveProjectSettings(icons, id, identity);
+        const panels = rightPanelsLoaded ? moveTerminalKeys(rightPanelsRef.current, id, identity) : null;
+        const seen = rightPanelsLoaded ? moveTerminalKeys(completionSeenRef.current, id, identity) : null;
+        const skipped = await skippedVersions.moved(id, identity);
+        const values: [string, unknown][] = [];
+        if (nextLayout !== layout) values.push(["sidebar_layout", nextLayout], ["project_paths", flattenSidebarPaths(nextLayout)]);
+        if (nextIcons !== icons) values.push(["project_icons", nextIcons]);
+        if (panels) values.push([RIGHT_PANELS_SETTING, { version: 1, entries: panels }]);
+        if (seen) values.push([COMPLETION_SEEN_SETTING, { version: 1, entries: persistedCompletionSeen(seen) }]);
+        if (skipped) values.push([SKIPPED_VERSIONS_SETTING, skipped]);
+        const applied = () => {
+          if (nextLayout !== layout) { setSidebarLayout(nextLayout); setSavedPaths(flattenSidebarPaths(nextLayout)); }
+          if (nextIcons !== icons) setProjectIcons(nextIcons);
+          if (panels) updateRightPanels(panels);
+          if (seen) updateCompletionSeen(seen);
+          if (skipped) skippedVersions.adopt(skipped);
+        };
+        return { values, applied };
+      };
+      if (!(await persistHosts(registry.getSnapshot().configs.filter(c => c.id !== id), [{ id, identity }], durable))) return;
+      // From here the Host is the Ring machine: what is only in memory follows.
       setTabs(prev => prev.some(t => t.host === id) ? prev.map(t => t.host === id ? { ...t, host: identity } : t) : prev);
       for (const p of pendingOpens.values()) if (p.host === id) p.host = identity;
-      if (rightPanelsLoaded) {
-        updateRightPanels(moveTerminalKeys(rightPanelsRef.current, id, identity));
-        updateCompletionSeen(moveTerminalKeys(completionSeenRef.current, id, identity));
-      }
       delete appliedLiveRef.current[id];
       const adopted = adoptedPanelsRef.current.get(id);
       if (adopted) { adoptedPanelsRef.current.delete(id); adoptedPanelsRef.current.set(identity, adopted); }
-      skippedVersions.move(id, identity);
       cache.dropHost(id); // what was cached before it had a Daemon identity
-      const { sidebarLayout: layout, projectIcons: icons, selectedProject: selected } = personalRef.current;
+      const selected = personalRef.current.selectedProject;
       if (selected?.host === id) setSelectedProject({ ...selected, host: identity });
-      // A Project pinned under both ids is kept once.
-      const pinned = new Set<string>(flattenSidebarPaths(layout).filter(k => parseProjectKey(k).host !== id));
-      const rekey = (k: ProjectKey): ProjectKey[] => {
-        if (parseProjectKey(k).host !== id) return [k];
-        const next = asProjectKey(moveProjectKey(k, id, identity));
-        if (pinned.has(next)) return [];
-        pinned.add(next);
-        return [next];
-      };
-      const nextLayout = layout.flatMap((item): SidebarItem[] => {
-        if (item.kind === "project") return rekey(item.path).map(path => path === item.path ? item : { ...item, path });
-        if (!item.projectPaths.some(k => parseProjectKey(k).host === id)) return [item];
-        const projectPaths = item.projectPaths.flatMap(rekey);
-        return projectPaths.length ? [{ ...item, projectPaths }] : [];
-      });
-      if (nextLayout.length !== layout.length || nextLayout.some((item, i) => item !== layout[i])) await persistSidebarLayout(nextLayout);
-      const nextIcons: Record<string, ProjectSettings> = {};
-      let iconsChanged = false;
-      for (const [stored, value] of Object.entries(icons)) {
-        const folders = value.folders?.map(f => ({ ...f, sessionIds: f.sessionIds.map(s => moveSessionFolderId(s, id, identity)) }));
-        const foldersChanged = !!folders && folders.some((f, i) => f.sessionIds.some((s, j) => s !== value.folders![i].sessionIds[j]));
-        const target = moveProjectKey(stored, id, identity);
-        iconsChanged ||= foldersChanged || target !== stored;
-        if (target !== stored && target in icons) continue; // the Ring id's own entry stays
-        nextIcons[target] = foldersChanged ? { ...value, folders } : value;
-      }
-      if (iconsChanged) await persistIcons(nextIcons);
+      setRingStays(prev => { if (!(id in prev)) return prev; const next = { ...prev }; delete next[id]; return next; });
       setRingArrival({ daemonKey, token: Date.now() });
-      return true;
     } finally {
       movingHosts.current.delete(id);
     }
-  }, [persistHosts, persistSidebarLayout, persistIcons, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
+  }, [persistHosts, rightPanelsLoaded, updateRightPanels, updateCompletionSeen]);
 
   // Pin a folder on a Remote Host by path; validated on the Host with list_dir.
   const handleAddRemotePath = useCallback(async (host: HostId, path: string): Promise<"ok" | "notFound" | "offline"> => {
@@ -1917,7 +1939,7 @@ export default function App() {
         <HostUpdateBanner host={activeUpdateHost(activeTabId, tabs, groups, activeLeafByGroup, selectedProject)} hidden={activeTabId === "settings"} />
         {/* Settings view — hidden unless activeTabId === 'settings' */}
         <div style={{ display: showSettings ? "flex" : "none", flex: 1, overflow: "hidden" }}>
-          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} onHostAddedToRing={moveHostToRing} ringArrival={ringArrival} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} onOpenRingSetup={openRingSetup} />
+          <SettingsView groupTabsByProject={groupTabsByProject} onSetGroupTabsByProject={persistGroupTabsByProject} onSaveHosts={async list => { await persistHosts(list); }} onRemoveHost={handleRemoveHost} onHostAddedToRing={moveHostToRing} ringStays={ringStays} ringArrival={ringArrival} onRingArrivalConsumed={consumeRingArrival} theme={theme} onSetTheme={persistTheme} defaultAgent={defaultAgent} onSetDefaultAgent={persistDefaultAgent} gitLazyPolling={gitLazyPolling} onSetGitLazyPolling={persistGitLazyPolling} gitChangesTree={gitChangesTree} onSetGitChangesTree={persistGitChangesTree} fileExplorerOnStart={fileExplorerOnStart} onSetFileExplorerOnStart={persistFileExplorerOnStart} contextTreeEnabled={contextTreeEnabled} onSetContextTreeEnabled={persistContextTreeEnabled} terminalBgColor={terminalBgColor} onSetTerminalBgColor={persistTerminalBgColor} defaultTerminalFontSize={defaultTerminalFontSize} onSetDefaultTerminalFontSize={persistDefaultTerminalFontSize} alwaysOnTop={alwaysOnTop} onSetAlwaysOnTop={persistAlwaysOnTop} defaultShell={defaultShell} onSetDefaultShell={persistDefaultShell} fullscreenRendering={fullscreenRendering} onSetFullscreenRendering={persistFullscreenRendering} forceSyncOutput={forceSyncOutput} onSetForceSyncOutput={persistForceSyncOutput} webglRendering={webglRendering} onSetWebglRendering={persistWebglRendering} terminalFontWeight={terminalFontWeight} onSetTerminalFontWeight={persistTerminalFontWeight} eagerInitTabs={eagerInitTabs} onSetEagerInitTabs={persistEagerInitTabs} showRateLimitInSidebar={showRateLimitInSidebar} onSetShowRateLimitInSidebar={persistShowRateLimitInSidebar} showSessionRowMetrics={showSessionRowMetrics} onSetShowSessionRowMetrics={persistShowSessionRowMetrics} showSessionRowMetricsCodex={showSessionRowMetricsCodex} onSetShowSessionRowMetricsCodex={persistShowSessionRowMetricsCodex} showSessionRowMetricsOpencode={showSessionRowMetricsOpencode} onSetShowSessionRowMetricsOpencode={persistShowSessionRowMetricsOpencode} showRateLimitInSidebarCodex={showRateLimitInSidebarCodex} onSetShowRateLimitInSidebarCodex={persistShowRateLimitInSidebarCodex} showTerminalHeaderStats={showTerminalHeaderStats} onSetShowTerminalHeaderStats={persistShowTerminalHeaderStats} showProjectStatsChart={showProjectStatsChart} onSetShowProjectStatsChart={persistShowProjectStatsChart} updateInfo={updateInfo} visible={showSettings} onOpenRingSetup={openRingSetup} />
         </div>
         {/* The Ring setup screen — mounted only while shown */}
         <div style={{ display: showRingSetup ? "flex" : "none", flex: 1, overflow: "auto" }}>

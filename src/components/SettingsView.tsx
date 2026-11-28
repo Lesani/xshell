@@ -6,6 +6,7 @@ import type { HostConfig } from "../hosts/types";
 import { HostsSettings } from "./HostsSettings";
 import { RingSettings } from "./RingSettings";
 import type { RingArrival } from "./RingMembers";
+import type { RingStayReason } from "../hosts/sshRing";
 import { C, fmtc } from "../ring/copy";
 import { Paintbrush, Terminal as TerminalIcon, Settings as SettingsIcon, RotateCcw, Sparkles, Info, ExternalLink, RefreshCw, CheckCircle2, ChevronRight, Download, AlertTriangle, Loader2, Bot, Server, Network } from "lucide-react";
 import { getAvailableShells } from "../shells";
@@ -26,9 +27,14 @@ interface SettingsViewProps {
   onSaveHosts: (hosts: HostConfig[]) => Promise<void>;
   onRemoveHost: (id: string) => Promise<void>;
   // Add to Ring succeeded on a saved Host (#119): App moves it to the Ring list when it can.
-  onHostAddedToRing?: (id: string) => Promise<boolean>;
-  // A saved Host just moved to the Ring list: Hosts gives way to Ring, with its row shown.
+  onHostAddedToRing?: (id: string) => Promise<void>;
+  // Why Hosts added to the Ring in this session are still SSH Hosts (the rows' notes).
+  ringStays?: Record<string, RingStayReason>;
+  // A saved Host just moved to the Ring list. Taken once (`onRingArrivalConsumed`): seen
+  // while Settings shows Hosts, Hosts gives way to Ring with its row marked; otherwise
+  // nothing happens, now or later.
   ringArrival?: RingArrival | null;
+  onRingArrivalConsumed?: () => void;
   theme: ThemeMode;
   onSetTheme: (theme: ThemeMode) => void;
   defaultAgent: "ask" | AgentId;
@@ -194,11 +200,20 @@ function Section({ title, description, children }: { title: string; description?
   );
 }
 
-export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, onHostAddedToRing, ringArrival = null, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo, visible: settingsVisible = true, onOpenRingSetup = () => {} }: SettingsViewProps) {
+export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSaveHosts, onRemoveHost, onHostAddedToRing, ringStays, ringArrival = null, onRingArrivalConsumed, theme, onSetTheme, defaultAgent, onSetDefaultAgent, gitLazyPolling, onSetGitLazyPolling, gitChangesTree, onSetGitChangesTree, fileExplorerOnStart, onSetFileExplorerOnStart, contextTreeEnabled, onSetContextTreeEnabled, terminalBgColor, onSetTerminalBgColor, defaultTerminalFontSize, onSetDefaultTerminalFontSize, alwaysOnTop, onSetAlwaysOnTop, defaultShell, onSetDefaultShell, fullscreenRendering, onSetFullscreenRendering, forceSyncOutput, onSetForceSyncOutput, webglRendering, onSetWebglRendering, terminalFontWeight, onSetTerminalFontWeight, eagerInitTabs, onSetEagerInitTabs, showRateLimitInSidebar, onSetShowRateLimitInSidebar, showSessionRowMetrics, onSetShowSessionRowMetrics, showSessionRowMetricsCodex, onSetShowSessionRowMetricsCodex, showSessionRowMetricsOpencode, onSetShowSessionRowMetricsOpencode, showRateLimitInSidebarCodex, onSetShowRateLimitInSidebarCodex, showTerminalHeaderStats, onSetShowTerminalHeaderStats, showProjectStatsChart, onSetShowProjectStatsChart, updateInfo, visible: settingsVisible = true, onOpenRingSetup = () => {} }: SettingsViewProps) {
   const [active, setActive] = useState<Category>("appearance");
-  // Only from Hosts, where Add to Ring was clicked: someone who went elsewhere stays there.
-  const arrivalToken = ringArrival?.token;
-  useEffect(() => { if (arrivalToken !== undefined) setActive(a => (a === "hosts" ? "ring" : a)); }, [arrivalToken]);
+  // The arrival being presented on Ring; gone once shown, or when Ring is left or hidden.
+  const [arrival, setArrival] = useState<RingArrival | null>(null);
+  const shownArrival = useCallback(() => setArrival(null), []);
+  useEffect(() => {
+    if (!ringArrival) return;
+    onRingArrivalConsumed?.();
+    // Only from Hosts, on screen, where Add to Ring was clicked.
+    if (!settingsVisible || active !== "hosts") return;
+    setArrival(ringArrival);
+    setActive("ring");
+  }, [ringArrival]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!settingsVisible || active !== "ring") setArrival(null); }, [settingsVisible, active]);
   const ringVisible = settingsVisible && active === "ring";
   const [wizardOpen, setWizardOpen] = useState(false);
   // Has the user run the wizard? Drives the disabled-state of the rate-limit + session-row
@@ -286,9 +301,9 @@ export function SettingsView({ groupTabsByProject, onSetGroupTabsByProject, onSa
             </>
           )}
 
-          {active === "ring" && <RingSettings visible={ringVisible} onOpenRingSetup={onOpenRingSetup} arrival={ringArrival} />}
+          {active === "ring" && <RingSettings visible={ringVisible} onOpenRingSetup={onOpenRingSetup} arrival={arrival} onArrivalShown={shownArrival} />}
 
-          {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} onAddedToRing={onHostAddedToRing} />}
+          {active === "hosts" && <HostsSettings onSave={onSaveHosts} onRemove={onRemoveHost} onAddedToRing={onHostAddedToRing} ringStays={ringStays} />}
 
           {active === "agents" && (
             <>
