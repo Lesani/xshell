@@ -13,9 +13,13 @@
 //! [`STAGE_MAX_CHUNK`] decoded bytes and never past the announced length (refused before
 //! any write); a write or sync error aborts the stage and removes its part file. A stage that
 //! gets nothing for the idle time, or whose connection closes, is removed too.
-// Staging over the link is Linux/macOS only: Windows never offers `daemon.stage`, so its
-// machinery is compiled there but unused.
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+//!
+//! Windows (rjw.9 D3): the same steps into the directory the selected restart reads
+//! (`%USERPROFILE%\.xshell\server\<dir>\xshelld.exe`, `core::server::windows_install`). The
+//! directories and the part file are private (`core::private_fs`, never through a reparse
+//! point), the part file ends in `.exe` so it can run for its identity check, and
+//! publication is a hard link (exclusive: it never replaces a file) after which the part
+//! file goes. Windows has no trial, and directories are not synced (NTFS journals them).
 
 use super::registry::Daemon;
 use super::{ConnId, TestPoint};
@@ -110,30 +114,10 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
-    /// `daemon.stage-begin`. Linux and macOS only: Windows does not offer `daemon.stage`
-    /// (the link refuses it before this is reached) and keeps its own update path.
+    /// `daemon.stage-begin`. Reached only where the link offers `daemon.stage`
+    /// (`conn::refuse_frozen`): an always-on Linux Daemon, a GUI-bound Windows one with
+    /// selected restart.
     pub fn begin(
-        &self,
-        d: &Arc<Daemon>,
-        who: Requester,
-        version: &str,
-        build: &BuildId,
-        sha256: &str,
-        length: u64,
-    ) -> Result<Value, String> {
-        #[cfg(unix)]
-        {
-            self.begin_unix(d, who, version, build, sha256, length)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (d, who, version, build, sha256, length);
-            Err("this xshelld cannot be updated over its link".into())
-        }
-    }
-
-    #[cfg(unix)]
-    fn begin_unix(
         &self,
         d: &Arc<Daemon>,
         who: Requester,
@@ -157,7 +141,7 @@ impl Staging {
         }
         let home = &d.cfg.home;
         let root = xshell_core::server::server_root(home);
-        if let Some(file) = xshell_core::server::valid_install(&root, &dir) {
+        if let Some(file) = installed_daemon(home, &dir) {
             if same_bytes(&file, sha256, length) {
                 return Ok(json!(StageBegun {
                     stage: None,
@@ -210,7 +194,6 @@ impl Staging {
     /// `holds_slot`: the worker releases the reservation when it finishes (a stage); a
     /// fetch keeps it until its own cleanup is done. Also says whether this call created
     /// the install directory; `Err` carries that too, so a fetch can clean up.
-    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     fn open_worker(
         &self,
@@ -225,9 +208,9 @@ impl Staging {
     ) -> Result<(Worker, bool), (String, bool)> {
         let home = &d.cfg.home;
         sweep_parts(&xshell_core::server::server_root(home));
-        let (dir_path, created) = xshell_hostlink::install::ensure_server_dir_created(home, &dir)
-            .map_err(|e| (e.to_string(), false))?;
-        let part = dir_path.join(format!(".xshelld.stage-{}.part", id.simple()));
+        let (dir_path, created) =
+            server_dir_created(home, &dir).map_err(|e| (e.to_string(), false))?;
+        let part = dir_path.join(format!(".xshelld.stage-{}{PART_SUFFIX}", id.simple()));
         let file = create_part(&part).map_err(|e| (e.to_string(), created))?;
         let worker = Worker {
             d: Arc::downgrade(d),
@@ -262,24 +245,12 @@ impl Staging {
     /// Failures of the checksum, length, build stamp and reported identity answer with the
     /// [`UPDATE_LATEST_BAD_BUILD`] prefix; saving and authorization failures pass through.
     pub fn update_latest(&self, d: &Arc<Daemon>, who: Requester, reply: Reply) {
-        #[cfg(unix)]
-        {
-            self.update_latest_unix(d, who, reply)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (d, who);
-            reply(Err("this xshelld cannot be updated over its link".into()))
-        }
-    }
-
-    #[cfg(unix)]
-    fn update_latest_unix(&self, d: &Arc<Daemon>, who: Requester, reply: Reply) {
         if let Err(e) = authorized(d, who) {
             return reply(Err(e));
         }
         // Nothing is downloaded while the previous update is on trial: it could not be
-        // selected anyway.
+        // selected anyway. (Windows has no trial.)
+        #[cfg(unix)]
         if xshell_hostlink::trial::open(&d.cfg.home) {
             return reply(Err(xshell_protocol::msg::UPDATE_ON_TRIAL.into()));
         }
@@ -336,7 +307,6 @@ impl Staging {
         }
     }
 
-    #[cfg(unix)]
     fn fetch_and_install(
         &self,
         d: &Weak<Daemon>,
@@ -385,18 +355,18 @@ impl Staging {
         // An install directory of this release that exists already is reused only when it
         // holds exactly these bytes and they report the release's identity; anything else
         // there is never overwritten (amendment 6).
-        if let Some(file) = xshell_core::server::valid_install(&root, &dir) {
+        if let Some(file) = installed_daemon(&d.cfg.home, &dir) {
             if !same_bytes(&file, &sha256, length) {
                 return Err(bad(&format!("{dir} holds another build")));
             }
-            let (v, b) = crate::stage::native_identity(&file).map_err(|e| bad(&e.to_string()))?;
+            let (v, b) = native_identity(&file).map_err(|e| bad(&e.to_string()))?;
             if v != version || !b.is_some_and(|b| b.same(&stamp)) {
                 return Err(bad("the build reports another version or build"));
             }
             authorized(&d, who)?;
             return Ok(installed);
         }
-        if fs::symlink_metadata(root.join(&dir).join("xshelld")).is_ok() {
+        if fs::symlink_metadata(root.join(&dir).join(DAEMON_FILE)).is_ok() {
             return Err(bad(&format!("{dir} holds another file")));
         }
         // A directory this fetch created (as its creation call says) goes again when nothing
@@ -611,10 +581,9 @@ fn create_part(path: &Path) -> io::Result<fs::File> {
             .mode(0o700)
             .open(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = path;
-        Err(io::Error::other("staging over a link is Unix only"))
+        xshell_core::private_fs::create_new(path)
     }
 }
 
@@ -631,7 +600,7 @@ fn sweep_parts(root: &Path) {
         for f in files.flatten() {
             let name = f.file_name();
             let name = name.to_string_lossy();
-            if !(name.starts_with(".xshelld.stage-") && name.ends_with(".part")) {
+            if !(name.starts_with(".xshelld.stage-") && name.ends_with(PART_SUFFIX)) {
                 continue;
             }
             let old = f
@@ -768,26 +737,22 @@ impl Worker {
         d.test_point(self.id, TestPoint::StageBeforeVerify);
         authorized(&d, self.who).map_err(Other)?;
         drop(d);
-        #[cfg(unix)]
-        {
-            let (version, build) =
-                crate::stage::native_identity(&self.part).map_err(|e| Bad(e.to_string()))?;
-            if version != self.version || !build.is_some_and(|b| b.same(&self.build)) {
-                return Err(Bad("the build reports another version or build".into()));
-            }
+        let (version, build) = native_identity(&self.part).map_err(|e| Bad(e.to_string()))?;
+        if version != self.version || !build.is_some_and(|b| b.same(&self.build)) {
+            return Err(Bad("the build reports another version or build".into()));
         }
         let d = self
             .d
             .upgrade()
             .ok_or_else(|| Other("xshelld is exiting".into()))?;
         d.test_point(self.id, TestPoint::StageBeforePublish);
-        let dest = self.dir_path.join("xshelld");
+        let dest = self.dir_path.join(DAEMON_FILE);
         {
             // Publication with the registry locked: a disconnect waits for it, or wins
             // before it (P1-6).
             let reg = d.reg.lock().unwrap();
             authorized_locked(&d, &reg, self.who).map_err(Other)?;
-            fs::rename(&self.part, &dest).map_err(|e| Other(e.to_string()))?;
+            publish(&self.part, &dest).map_err(|e| Other(e.to_string()))?;
             self.published = true;
             let synced =
                 sync(&self.dir_path).and_then(|()| self.dir_path.parent().map_or(Ok(()), sync));
@@ -839,8 +804,105 @@ impl Drop for Reservation {
     }
 }
 
+#[cfg(unix)]
 fn sync(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+/// A directory cannot be opened as a file on Windows; NTFS journals its entries.
+#[cfg(windows)]
+fn sync(dir: &Path) -> io::Result<()> {
+    let _ = dir;
+    Ok(())
+}
+
+/// The Daemon's file name in an install directory.
+#[cfg(unix)]
+const DAEMON_FILE: &str = "xshelld";
+#[cfg(windows)]
+const DAEMON_FILE: &str = "xshelld.exe";
+
+/// The end of a part file's name: on Windows it must run for its identity check.
+#[cfg(unix)]
+const PART_SUFFIX: &str = ".part";
+#[cfg(windows)]
+const PART_SUFFIX: &str = ".part.exe";
+
+/// The installed Daemon of directory `dir`, if there is one.
+#[cfg(unix)]
+fn installed_daemon(home: &Path, dir: &str) -> Option<PathBuf> {
+    xshell_core::server::valid_install(&xshell_core::server::server_root(home), dir)
+}
+
+/// The installed Daemon of directory `dir`, if there is one: a private file of this user in
+/// private directories, reached through no reparse point (its identity is checked by the
+/// caller).
+#[cfg(windows)]
+fn installed_daemon(home: &Path, dir: &str) -> Option<PathBuf> {
+    if !xshell_core::server::valid_dir_name(dir) {
+        return None;
+    }
+    let file = xshell_core::server::windows_server_root(home)
+        .ok()?
+        .join(dir)
+        .join(DAEMON_FILE);
+    xshell_core::server::no_reparse(&file).ok()?;
+    xshell_core::private_fs::open_read(&file).ok()??;
+    Some(file)
+}
+
+/// The install directory `dir` (created private when missing), and whether this call
+/// created it.
+#[cfg(unix)]
+fn server_dir_created(home: &Path, dir: &str) -> io::Result<(PathBuf, bool)> {
+    xshell_hostlink::install::ensure_server_dir_created(home, dir)
+}
+
+#[cfg(windows)]
+fn server_dir_created(home: &Path, dir: &str) -> io::Result<(PathBuf, bool)> {
+    if !xshell_core::server::valid_dir_name(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid install directory {dir:?}"),
+        ));
+    }
+    let path = xshell_core::server::windows_server_root(home)?.join(dir);
+    let created = match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+        Err(e) => return Err(e),
+        Ok(_) => false,
+    };
+    xshell_core::private_fs::ensure_dir(&path)?;
+    xshell_core::server::no_reparse(&path)?;
+    Ok((path, created))
+}
+
+/// The version and build the Daemon file `bin` reports when it runs.
+#[cfg(unix)]
+fn native_identity(bin: &Path) -> io::Result<(String, Option<BuildId>)> {
+    crate::stage::native_identity(bin)
+}
+
+/// The version and build the Daemon file `bin` reports when it runs (a Windows x86_64
+/// `xshelld` whose build stamp agrees, `core::server::native_identity`).
+#[cfg(windows)]
+fn native_identity(bin: &Path) -> io::Result<(String, Option<BuildId>)> {
+    xshell_core::server::native_identity(bin).map(|i| (i.version, Some(i.build)))
+}
+
+/// Publish the verified part file as the install directory's Daemon.
+#[cfg(unix)]
+fn publish(part: &Path, dest: &Path) -> io::Result<()> {
+    fs::rename(part, dest)
+}
+
+/// A hard link never replaces an existing file (a running image or a competing install);
+/// the part file's name goes afterwards (a leftover is swept as old).
+#[cfg(windows)]
+fn publish(part: &Path, dest: &Path) -> io::Result<()> {
+    fs::hard_link(part, dest)?;
+    let _ = fs::remove_file(part);
+    Ok(())
 }
 
 impl Worker {

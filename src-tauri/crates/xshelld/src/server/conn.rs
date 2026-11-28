@@ -37,16 +37,20 @@ pub(crate) fn reply(ob: &Outbox, id: Option<u64>, r: Result<Value, String>) {
     }
 }
 
+/// Whether this Daemon takes an update over its link (a staged build and a restart into it):
+/// an always-on Linux Daemon updates itself in place (S4); a GUI-bound Windows one is
+/// restarted into the selected build by its owning Desktop, when that Desktop says it can
+/// (`--supports-selected-restart`, #102; rjw.9 D2). Nowhere else.
+fn updates_over_link(cfg: &super::Config) -> bool {
+    (cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
+        || (cfg!(target_os = "linux") && cfg.gui_bound.is_none())
+}
+
 /// Whether `hello` offers capability `c`: not hidden by a test, and Chat View replies
 /// (with files) only where this Host takes them.
 pub(super) fn offered(cfg: &super::Config, c: &str) -> bool {
     let off = match c {
-        "daemon.upgrade-selected" => {
-            !((cfg!(windows) && cfg.gui_bound.is_some() && cfg.supports_selected_restart)
-                || (cfg!(target_os = "linux") && cfg.gui_bound.is_none()))
-        }
-        // An always-on Linux Daemon updates itself in place (S4).
-        xshell_protocol::cap::DAEMON_STAGE => !cfg!(target_os = "linux") || cfg.gui_bound.is_some(),
+        "daemon.upgrade-selected" | xshell_protocol::cap::DAEMON_STAGE => !updates_over_link(cfg),
         xshell_protocol::cap::DAEMON_DESKTOP_OWNED => cfg.gui_bound.is_none(),
         // Offered exactly where staging is: hiding `daemon.stage` hides both.
         xshell_protocol::cap::DAEMON_UPDATE_LATEST => {
@@ -732,6 +736,10 @@ impl Conn {
                     }
                     #[cfg(windows)]
                     {
+                        // As on Linux (C8): a Relay requester must still be a Desktop of
+                        // this Ring, before the installed build runs and again at commit.
+                        let who = self.requester();
+                        super::staging::authorized(&d, who)?;
                         // Validate outside the registry; recheck exiting/frozen at commit.
                         let dir = xshell_protocol::build::install_dir_name(&version, Some(&build));
                         let file = xshell_core::server::windows_install(&d.cfg.home, &dir)
@@ -752,6 +760,7 @@ impl Conn {
                         {
                             return Err("target is older or already running".into());
                         }
+                        super::staging::authorized(&d, who)?;
                         let mut reg = d.reg.lock().unwrap();
                         if reg.frozen || d.exiting.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err("daemon update busy".into());
@@ -1062,4 +1071,47 @@ fn selected_linux(
     crate::upgrade::begin(&d.cfg.home, &dir, ring)?;
     reg.frozen = true;
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offered;
+    use xshell_protocol::cap::{
+        DAEMON_DESKTOP_OWNED, DAEMON_STAGE, DAEMON_UPDATE_LATEST, DAEMON_UPGRADE_SELECTED,
+    };
+
+    fn cfg(gui_bound: bool, selected_restart: bool) -> super::super::Config {
+        let home = std::path::PathBuf::from("/nonexistent-xshell-test-home");
+        let paths = crate::paths::resolve(&home, None, Some(std::path::Path::new("/nonexistent")));
+        let mut c = super::super::Config::new(home, paths);
+        c.gui_bound = gui_bound.then_some(super::super::GuiBound { parent_pid: 1 });
+        c.supports_selected_restart = selected_restart;
+        c
+    }
+
+    /// The update capabilities per platform and mode (rjw.9 D2): an always-on Linux Daemon
+    /// and a GUI-bound Windows one with selected restart take updates over the link (stage,
+    /// update-latest, upgrade-selected); nothing else does. Desktop-owned follows the mode
+    /// only. Hiding `daemon.stage` hides `daemon.update-latest` too.
+    #[test]
+    fn update_capabilities_per_platform_and_mode() {
+        let linux = cfg!(target_os = "linux");
+        let windows = cfg!(windows);
+        // (gui-bound, selected restart) -> whether it updates over the link
+        for (gui, sr, updates) in [
+            (false, false, linux),
+            (true, false, false),
+            (true, true, windows),
+        ] {
+            let c = cfg(gui, sr);
+            for cap in [DAEMON_STAGE, DAEMON_UPDATE_LATEST, DAEMON_UPGRADE_SELECTED] {
+                assert_eq!(offered(&c, cap), updates, "{cap} gui={gui} sr={sr}");
+            }
+            assert_eq!(offered(&c, DAEMON_DESKTOP_OWNED), gui, "gui={gui} sr={sr}");
+        }
+        let mut c = cfg(!linux, windows);
+        c.hide_capabilities = vec![DAEMON_STAGE.into()];
+        assert!(!offered(&c, DAEMON_STAGE));
+        assert!(!offered(&c, DAEMON_UPDATE_LATEST));
+    }
 }

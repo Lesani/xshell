@@ -9,7 +9,6 @@ pub mod connect;
 pub mod console_mode;
 pub mod env;
 pub mod job_exec;
-#[cfg(unix)]
 mod latest;
 pub mod log;
 pub mod maintenance;
