@@ -76,7 +76,7 @@ pub(crate) fn fetch(base: &str, own: &semver::Version, triple: &str) -> Result<L
         return Ok(Latest::Current);
     }
 
-    let asset = format!("{base}/release/v{version}/xshelld-{triple}");
+    let asset = format!("{base}/release/v{version}/{}", asset_name(triple));
     let no_build = || format!("{UPDATE_LATEST_NO_BUILD}: {triple} for {version}");
     let bad = |e: &str| format!("{UPDATE_LATEST_BAD_BUILD}: {e}");
     let sums = get(&agent, &format!("{asset}.sha256"), SHA_MAX, until).map_err(|e| match e {
@@ -99,6 +99,16 @@ pub(crate) fn fetch(base: &str, own: &semver::Version, triple: &str) -> Result<L
         sha256: sha256.to_ascii_lowercase(),
         bytes,
     })
+}
+
+/// The release asset of the Daemon for `triple`: `xshelld-<triple>`, with `.exe` for a
+/// Windows target (as `scripts/publish-release.sh` publishes it, rjw.9 D3/D7).
+pub(crate) fn asset_name(triple: &str) -> String {
+    if triple.contains("-windows") {
+        format!("xshelld-{triple}.exe")
+    } else {
+        format!("xshelld-{triple}")
+    }
 }
 
 enum Fail {
@@ -141,6 +151,27 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The Windows Daemon is published with `.exe`; every other name is unchanged.
+    #[test]
+    fn asset_names_per_triple() {
+        assert_eq!(
+            asset_name("x86_64-pc-windows-msvc"),
+            "xshelld-x86_64-pc-windows-msvc.exe"
+        );
+        for t in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+        ] {
+            assert_eq!(asset_name(t), format!("xshelld-{t}"));
+        }
+        assert_eq!(
+            asset_name(xshell_protocol::build::host_triple("windows", "x86_64").unwrap()),
+            "xshelld-x86_64-pc-windows-msvc.exe"
+        );
+    }
 
     /// The default rule (https only) refuses a plain http URL before connecting: proven
     /// against a local listener that counts connections, never against production.

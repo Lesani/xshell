@@ -89,16 +89,28 @@ fn patched(commit: &str) -> (Vec<u8>, BuildId) {
     )
 }
 
-/// The next version after this build's (its last digit plus one): same length, so it can
-/// replace this build's version in the binary.
+/// A version newer than this build's and of the same length, so it can replace this build's
+/// version in the binary: its last digit plus one, or, when that digit is 9, the patch number
+/// plus one (`1.6.0-rjw.9` -> `1.6.1-rjw.9`).
 fn next_version() -> String {
     let last = VERSION.chars().last().unwrap();
     let d = last.to_digit(10).expect("the version ends in a digit");
-    assert!(
-        d < 9,
-        "next_version: {VERSION} ends in 9; pick another way to make a newer version"
+    if d < 9 {
+        return format!("{}{}", &VERSION[..VERSION.len() - 1], d + 1);
+    }
+    let core_end = VERSION.find(['-', '+']).unwrap_or(VERSION.len());
+    let patch_at = VERSION[..core_end].rfind('.').expect("major.minor.patch") + 1;
+    let patch = &VERSION[patch_at..core_end];
+    let p: u32 = patch.parse().expect("a numeric patch");
+    let next = (p + 1).to_string();
+    assert_eq!(
+        next.len(),
+        patch.len(),
+        "next_version: {VERSION}: no newer version of the same length"
     );
-    format!("{}{}", &VERSION[..VERSION.len() - 1], d + 1)
+    let v = format!("{}{}{}", &VERSION[..patch_at], next, &VERSION[core_end..]);
+    assert!(semver::Version::parse(&v).unwrap() > semver::Version::parse(VERSION).unwrap());
+    v
 }
 
 /// The release a Ring Host downloads: [`patched`] with every occurrence of this build's

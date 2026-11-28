@@ -792,6 +792,14 @@ impl Server {
         transport::remove_endpoint(&paths.socket)?;
         let listener = transport::bind(&paths.socket)?;
         starting.socket = true;
+        // Test hook (rjw.9 D4): a build that listens, then fails before it answers anyone.
+        match crate::serve_failure_for_tests() {
+            Some("exit-after-bind") => std::process::exit(1),
+            Some("stall-after-bind") => loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            },
+            _ => {}
+        }
         // Every client of this home finds this socket, whatever its XDG_RUNTIME_DIR (A2): the
         // owner lock first (blocking: clients only probe it with a momentary shared lock),
         // then the record, so a record is trusted only while its owner holds the lock.

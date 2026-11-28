@@ -537,26 +537,26 @@ impl Shared {
                 latest.as_ref(),
                 st.status.daemon_version.as_deref().unwrap_or(""),
             );
-        let offered = st
-            .status
-            .daemon_version
-            .as_deref()
-            .filter(|_| !withdrawn)
-            .and_then(|v| {
-                crate::version::offered_update(
-                    &self.mc.desktop_version,
-                    self.mc.desktop_build.as_ref(),
-                    latest.as_ref(),
-                    release_capable,
-                    v,
-                    st.status.daemon_build.as_ref(),
-                )
-            });
+        // A Windows one is offered this Desktop's build when no newer release is known
+        // (rjw.9 D5); with its OS unknown it stays release only.
+        let desktop_fallback = release_capable && st.status.os.as_deref() == Some("windows");
+        let offered = st.status.daemon_version.as_deref().and_then(|v| {
+            crate::version::offered_ring_update(
+                &self.mc.desktop_version,
+                self.mc.desktop_build.as_ref(),
+                latest.as_ref(),
+                release_capable,
+                desktop_fallback,
+                withdrawn,
+                v,
+                st.status.daemon_build.as_ref(),
+            )
+        });
         if release_capable && st.status.usable() {
-            st.status.set_kind(if offered.is_some() {
-                StatusKind::UpgradePending
-            } else {
-                StatusKind::Connected
+            st.status.set_kind(match &offered {
+                Some((crate::status::UpdateAction::Replace, _, _)) => StatusKind::BuildDiffers,
+                Some(_) => StatusKind::UpgradePending,
+                None => StatusKind::Connected,
             });
         }
         let (action, version, source) = match offered {
@@ -2496,6 +2496,12 @@ impl HostHandle {
         let reservation = (|| {
             let mut st = self.sh.lock();
             let name = st.cfg.name.clone();
+            // A machine with the xshell app is updated there: say that, not "too old".
+            if let Some(reason @ crate::status::UpdateUnavailable::DesktopOwned) =
+                st.status.update_unavailable
+            {
+                return Err(HostError::invalid(reason.message()));
+            }
             if st.status.route_update_unavailable.is_some()
                 || (!st.status.daemon_capabilities.is_empty()
                     && !st
@@ -2534,22 +2540,30 @@ impl HostHandle {
                 return Err(HostError::invalid(ring_update_unsupported(&name)));
             }
             let daemon_version = st.status.daemon_version.clone().unwrap_or_default();
+            let latest = self.sh.mc.latest();
+            // The source the offer named (`Shared::publish`): the release when it is
+            // newer and not withdrawn (the Host already answered "current" for this latest
+            // value); otherwise nothing for a Linux Host, this Desktop's build for a
+            // Windows one (rjw.9 D5).
+            let source = crate::version::ring_update_source(
+                st.release_updates,
+                st.release_updates && st.status.os.as_deref() == Some("windows"),
+                latest.as_ref(),
+                st.release_updates
+                    && crate::version::release_withdrawn(
+                        st.release_current.as_ref(),
+                        latest.as_ref(),
+                        &daemon_version,
+                    ),
+                &daemon_version,
+            );
             let build =
-                if st.release_updates {
-                    let latest = self.sh.mc.latest();
-                    // Not newer, or the Host already answered "current" for this latest value.
-                    if !crate::version::release_outdated(latest.as_ref(), &daemon_version)
-                        || crate::version::release_withdrawn(
-                            st.release_current.as_ref(),
-                            latest.as_ref(),
-                            &daemon_version,
-                        )
-                    {
-                        return Err(HostError::new(
-                            crate::HostErrorCode::Invalid,
-                            "this Host does not need an update",
-                        ));
-                    }
+                if source.is_none() {
+                    return Err(HostError::new(
+                        crate::HostErrorCode::Invalid,
+                        "this Host does not need an update",
+                    ));
+                } else if source == Some(crate::status::UpdateSource::Release) {
                     st.release_asked = latest.zip(Some(daemon_version.clone()));
                     None
                 } else {
@@ -2614,7 +2628,16 @@ impl HostHandle {
                     let result = match own {
                         Some(build) => {
                             eprintln!("xshell: host {name}: sending this Desktop's build instead");
+                            // This Desktop has no build for that machine: the release
+                            // failure is the news, not "cannot update this type of machine".
                             send_desktop_build(&sh, &link, op, gen, &name, &build, &cancel, &o)
+                                .map_err(|e| {
+                                    if e.message == RING_NO_BUILD {
+                                        failure.error.clone()
+                                    } else {
+                                        e
+                                    }
+                                })
                         }
                         None => Err(failure.error),
                     };

@@ -20,9 +20,12 @@
 # xshelld-<triple>, xshelld-<triple>.sha256 and install.sh.
 #
 # Windows (optional): when $XSHELL_PUBLISH_WINDOWS_DIR (default src-tauri/target/windows-release)
-# holds the output of xshell-meta/bin/windows-build (xshell-windows-x86_64.zip, its .sha256 and
-# BUILD), the zip, the .sha256 and scripts/install.ps1 are published too. Checked first: the
-# BUILD receipt names exactly this commit, the zip matches its .sha256 and holds xshell.exe, and
+# holds the output of xshell-meta/bin/windows-build (xshell-windows-x86_64.zip, its .sha256,
+# xshelld.exe and BUILD), the zip, the .sha256, scripts/install.ps1 and the bare Daemon as
+# xshelld-x86_64-pc-windows-msvc.exe with its .sha256 (what a Windows Daemon downloads for
+# daemon.update-latest, rjw.9 D7) are published too. Checked first: the BUILD receipt names
+# exactly this commit, the zip matches its .sha256 and holds xshell.exe, xshelld.exe is there,
+# its BUILD receipt lists it as the Daemon embedded in xshell.exe (the same bytes), and
 # install.ps1 is pinned to v<version>.
 #
 # Environment (tests): XSHELL_PUBLISH_REPO (default Lesani/xshell), XSHELL_PUBLISH_ROOT (the
@@ -120,12 +123,22 @@ if [ -f "$windir/$winzip" ]; then
   [ -n "$want" ] && [ "$want" = "$got" ] || fail "$windir/$winzip does not match its .sha256"
   python3 -c 'import sys, zipfile; sys.exit("xshell.exe" not in zipfile.ZipFile(sys.argv[1]).namelist())' "$windir/$winzip" \
     || fail "$windir/$winzip has no xshell.exe"
+  windaemon="$windir/xshelld.exe"
+  wintriple=x86_64-pc-windows-msvc
+  [ -f "$windaemon" ] || fail "$windir has no xshelld.exe (the Windows Daemon of this build)"
+  dsha=$(sha256sum "$windaemon" | cut -d' ' -f1)
+  # bin/windows-build lists every Daemon it embedded, by SHA-256, after checking that
+  # xshell.exe contains it.
+  grep -q "^embeds=.*XSHELL_\(WINDOWS_\)\{0,1\}DAEMON_ASSET=$dsha\( \|$\)" "$windir/BUILD" \
+    || fail "$windaemon is not the Daemon embedded in this build's xshell.exe (BUILD embeds=)"
   winpinned=$(sed -n 's/^ *\$TAG = "\(.*\)"$/\1/p' scripts/install.ps1 | head -n 1)
   [ "$winpinned" = "$tag" ] || fail "scripts/install.ps1 is pinned to $winpinned, not $tag"
   cp "$windir/$winzip" "$out/$winzip"
   (cd "$out" && sha256sum "$winzip" > "$winzip.sha256")
   cp scripts/install.ps1 "$out/install.ps1"
-  files="$files $out/$winzip $out/$winzip.sha256 $out/install.ps1"
+  cp "$windaemon" "$out/xshelld-$wintriple.exe"
+  (cd "$out" && sha256sum "xshelld-$wintriple.exe" > "xshelld-$wintriple.exe.sha256")
+  files="$files $out/$winzip $out/$winzip.sha256 $out/install.ps1 $out/xshelld-$wintriple.exe $out/xshelld-$wintriple.exe.sha256"
   windows=1
 else
   echo "publish-release: no Windows build in $windir, not published" >&2

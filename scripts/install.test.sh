@@ -299,12 +299,24 @@ mkdir -p "$win"
 printf 'MZ fake' > "$win/xshell.exe"
 (cd "$win" && python3 -c 'import zipfile; zipfile.ZipFile("xshell-windows-x86_64.zip", "w").write("xshell.exe")' \
   && sha256sum xshell-windows-x86_64.zip > xshell-windows-x86_64.zip.sha256)
-printf 'version=x\ncommit=%s\n' "$sha" > "$win/BUILD"
+printf 'MZ fake daemon' > "$win/xshelld.exe"
+dsha=$(sha256sum "$win/xshelld.exe" | cut -d' ' -f1)
+printf 'version=x\ncommit=%s\nembeds=XSHELL_LINUX_MUSL_DAEMON_ASSET=%s XSHELL_WINDOWS_DAEMON_ASSET=%s\n' "$sha" "$(printf x | sha256sum | cut -d' ' -f1)" "$dsha" > "$win/BUILD"
 out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) || fail "publish with a Windows build failed" "$out"
-for f in xshell-windows-x86_64.zip xshell-windows-x86_64.zip.sha256 install.ps1 install.sh; do
+for f in xshell-windows-x86_64.zip xshell-windows-x86_64.zip.sha256 install.ps1 install.sh xshelld-x86_64-pc-windows-msvc.exe xshelld-x86_64-pc-windows-msvc.exe.sha256; do
   grep -q "/$f\( \|$\)" "$pub/gh.log" || fail "release lacks $f" "$(cat "$pub/gh.log")"
 done
-printf 'commit=0000000000000000000000000000000000000000\n' > "$win/BUILD.other"
+ok "publish: the Windows Daemon as xshelld-x86_64-pc-windows-msvc.exe with its .sha256"
+# No bare Daemon, or one that is not the embedded one: refused, nothing created.
+mv "$win/xshelld.exe" "$win/xshelld.exe.ok"
+out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) && fail "published a Windows build without xshelld.exe" "$out"
+created && fail "created a release without the Windows Daemon"
+printf 'MZ another daemon' > "$win/xshelld.exe"
+out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) && fail "published a Windows Daemon that is not the embedded one" "$out"
+created && fail "created a release with a foreign Windows Daemon"
+mv "$win/xshelld.exe.ok" "$win/xshelld.exe"
+ok "publish refuses a Windows build whose xshelld.exe is missing or not the embedded Daemon"
+printf 'commit=0000000000000000000000000000000000000000\nembeds=XSHELL_WINDOWS_DAEMON_ASSET=%s\n' "$dsha" > "$win/BUILD.other"
 mv "$win/BUILD" "$win/BUILD.ok"; mv "$win/BUILD.other" "$win/BUILD"
 out=$(publish env XSHELL_PUBLISH_WINDOWS_DIR="$win" 2>&1) && fail "published a Windows build of another commit" "$out"
 created && fail "created a release with a foreign Windows build"

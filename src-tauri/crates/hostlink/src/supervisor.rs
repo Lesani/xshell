@@ -553,7 +553,7 @@ impl Sup {
                     let mut st = self.sh.lock();
                     st.release_updates = false;
                     st.status.update_unavailable =
-                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, self.relay);
                     if self.relay {
                         // No common protocol: not over the Ring either.
                         st.status.route_update_unavailable =
@@ -628,7 +628,7 @@ impl Sup {
                 StatusKind::Connected
             });
             st.status.phase = if st.upgrading && !expect { Some(Phase::Preparing) } else { None };
-            st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+            st.status.update_unavailable = UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, relay);
             if relay {
                 st.status.route_update_unavailable =
                     ring_unsupported.then_some(RouteUpdateUnavailable::RingUpdateUnsupported);
@@ -639,7 +639,18 @@ impl Sup {
             st.status.daemon_capabilities = hello.capabilities.clone();
             let previous_update_error = (st.status.error_hint == Some(HostErrorHint::UpdateFailed) && (upgrade_pending || build_differs))
                 .then(|| st.status.last_error.clone()).flatten();
-            st.status.last_error = if ver_mismatch {
+            // A Ring Host back on an older version than its update: the update failed and
+            // it runs that one (a Windows Desktop started its own build again, rjw.9 D4; a
+            // Linux trial's rollback is reported in the same words by `check_rolled_back`).
+            let back_on_older = relay
+                && ver_mismatch
+                && matches!(
+                    (semver::Version::parse(&hello.version), semver::Version::parse(&want_v)),
+                    (Ok(have), Ok(want)) if have.cmp_precedence(&want).is_lt()
+                );
+            st.status.last_error = if back_on_older {
+                Some(crate::handle::ring_rolled_back(&st.cfg.name, &hello.version))
+            } else if ver_mismatch {
                 Some(format!(
                     "xshelld {} is still running after the upgrade to {want_v}",
                     hello.version
@@ -764,7 +775,7 @@ impl Sup {
                 {
                     let mut st = self.sh.lock();
                     st.status.update_unavailable =
-                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello);
+                        UpdateUnavailable::from_hello(st.status.os.as_deref(), &hello, self.relay);
                     if self.relay {
                         st.status.route_update_unavailable =
                             Some(RouteUpdateUnavailable::RingUpdateUnsupported);

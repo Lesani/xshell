@@ -139,6 +139,8 @@ describe("Update all", () => {
     expect(skipReason(status({ status: "offline" }))).toBe("offline");
     expect(skipReason(undefined)).toBe("offline");
     expect(skipReason(status({ routeUpdateUnavailable: "ring-update-unsupported", updateAction: null }))).toBe("unsupported");
+    // A machine with the xshell app (Windows included) is not "too old": it is updated there.
+    expect(skipReason(status({ routeUpdateUnavailable: "ring-update-unsupported", updateUnavailable: "desktop-owned", updateAction: null }))).toBe("desktop");
     expect(skipReason(status({ phase: "upgrading" }))).toBe("busy");
   });
 

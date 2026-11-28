@@ -34,11 +34,13 @@ zeroize = "=1.8.2"
 portable-pty = { workspace = true }
 semver = { workspace = true }
 
+# daemon.update-latest (Linux and Windows): blocking HTTPS, rustls+ring, bundled web PKI
+# roots (same rustls and webpki-roots as the Relay client). 3.4.3 and later need
+# webpki-roots 1.0.10.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-# daemon.update-latest: blocking HTTPS, rustls+ring, bundled web PKI roots (same rustls and
-# webpki-roots as the Relay client). 3.4.3 and later need webpki-roots 1.0.10.
-ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

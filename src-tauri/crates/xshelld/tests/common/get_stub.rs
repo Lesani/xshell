@@ -144,9 +144,14 @@ impl GetStub {
         self.body(&asset, bytes.to_vec());
     }
 
-    /// The path of `version`'s build for `triple`.
+    /// The path of `version`'s build for `triple` (with `.exe` for a Windows target).
     pub fn asset(version: &str, triple: &str) -> String {
-        format!("/release/v{version}/xshelld-{triple}")
+        let exe = if triple.contains("-windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        format!("/release/v{version}/xshelld-{triple}{exe}")
     }
 }
 
