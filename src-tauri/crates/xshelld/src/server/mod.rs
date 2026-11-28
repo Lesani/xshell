@@ -49,7 +49,6 @@ mod role;
 mod session_stream;
 pub use role::Role;
 mod signals;
-#[cfg(unix)]
 pub(crate) use signals::watch_pair_signals;
 pub use signals::{block_exit_signals, watch_exit_signals};
 mod size;

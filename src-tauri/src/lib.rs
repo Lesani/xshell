@@ -40,12 +40,54 @@ fn cli_args(args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
     (args.get(1)? == "event").then(|| &args[2..])
 }
 
-/// Handle `pairing-access` or the local agent hook (`event`) before Tauri starts. Public
-/// Pairing-access descriptors and redacted outcomes use the helper's inherited streams.
+/// `xshell pair [--name N] [--relay URL]` (#118): the arguments the Local Host's Daemon is
+/// run with, `pair` and everything after it unchanged. `None`: not this command.
+fn pair_cli_args(args: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+    (args.get(1)? == "pair").then(|| args[1..].to_vec())
+}
+
+/// Run `<the Local Host's Daemon> pair …` with this process's streams and return its exit
+/// code. The Daemon binary is the one the running Desktop uses; the command itself starts
+/// no window, takes no single-instance lock and never opens the Ring store: `xshelld pair`
+/// asks the open xshell app (or says to open it).
+fn pair_main(daemon_args: Vec<std::ffi::OsString>) -> i32 {
+    let bin = match hosts::local_daemon_bin_for_cli() {
+        Ok(bin) => bin,
+        Err(reason) => {
+            eprintln!("xshell: cannot start pairing: {reason}");
+            return 1;
+        }
+    };
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(daemon_args);
+    // Unix: become the Daemon command, so Ctrl-C and its exit code are its own.
+    #[cfg(unix)]
+    let error = std::os::unix::process::CommandExt::exec(&mut cmd);
+    #[cfg(not(unix))]
+    let error = {
+        // Windows: this is a GUI program. The Daemon shares the caller's console when
+        // there is one (its output and Ctrl+C); otherwise it runs without a window on the
+        // inherited handles.
+        #[cfg(windows)]
+        xshell_core::parent_console::share_with_child(&mut cmd);
+        match cmd.status() {
+            Ok(status) => return status.code().unwrap_or(1),
+            Err(error) => error,
+        }
+    };
+    eprintln!("xshell: cannot run {}: {error}", bin.display());
+    1
+}
+
+/// Handle `pairing-access`, `pair` or the local agent hook (`event`) before Tauri starts.
+/// Public Pairing-access descriptors and redacted outcomes use the helper's inherited streams.
 pub fn run_cli() -> Option<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.get(1).is_some_and(|arg| arg == "pairing-access") {
         return Some(xshell_pairing_access::cli_main(&args[2..]));
+    }
+    if let Some(daemon_args) = pair_cli_args(&args) {
+        return Some(pair_main(daemon_args));
     }
     let rest = cli_args(&args)?;
     Some(xshell_core::agent_status::event_main(
@@ -1001,6 +1043,38 @@ mod tests {
         assert_eq!(cli_args(&ev), Some(&ev[2..]));
         assert_eq!(cli_args(&a(&["xshell"])), None);
         assert_eq!(cli_args(&a(&["xshell", "--flag"])), None);
+    }
+
+    #[test]
+    fn pair_passes_its_arguments_to_the_daemon_unchanged() {
+        let a = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(pair_cli_args(&a(&["xshell", "pair"])), Some(a(&["pair"])));
+        assert_eq!(
+            pair_cli_args(&a(&[
+                "xshell",
+                "pair",
+                "--name",
+                "my laptop",
+                "--relay",
+                "ws://127.0.0.1:8787"
+            ])),
+            Some(a(&[
+                "pair",
+                "--name",
+                "my laptop",
+                "--relay",
+                "ws://127.0.0.1:8787"
+            ]))
+        );
+        // Options the Daemon refuses are its to refuse, with its own message.
+        assert_eq!(
+            pair_cli_args(&a(&["xshell", "pair", "--bogus=1"])),
+            Some(a(&["pair", "--bogus=1"]))
+        );
+        assert_eq!(pair_cli_args(&a(&["xshell"])), None);
+        assert_eq!(pair_cli_args(&a(&["xshell", "--pair"])), None);
+        assert_eq!(pair_cli_args(&a(&["xshell", "event", "pair"])), None);
+        assert_eq!(cli_args(&a(&["xshell", "pair"])), None);
     }
 
     #[test]

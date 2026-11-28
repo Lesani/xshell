@@ -241,9 +241,7 @@ pub fn setup(app: &AppHandle) {
                 if ring.is_quitting() {
                     break;
                 }
-                // Offers `xshelld pair` started on this computer are shown in the Ring page
-                // (no `xshelld pair` on Windows).
-                #[cfg(unix)]
+                // Offers `xshelld pair` started on this computer are shown in the Ring page.
                 join::track_cli_joins(&focus_app, &ring);
                 tick = tick.wrapping_add(1);
                 if tick.is_multiple_of(10) {

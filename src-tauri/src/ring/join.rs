@@ -393,7 +393,6 @@ impl JoinRegistry {
 
     /// The CLI offers seen for the first time: tracked, and returned to watch. Forgets the
     /// tombstones of offers no longer listed.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn track_cli(&self, listed: Vec<(Uuid, Arc<JoinOffer>)>) -> Vec<(Uuid, Arc<JoinEntry>)> {
         let mut inner = self.lock();
         let ids: HashSet<Uuid> = listed.iter().map(|(op, _)| *op).collect();
@@ -462,7 +461,6 @@ fn watch<R: tauri::Runtime>(
 }
 
 /// From the 100 ms owner thread: tracks Joins that `xshelld pair` started on this computer.
-#[cfg(unix)]
 pub fn track_cli_joins(app: &AppHandle, ring: &xshell_hostlink::ring::DesktopRing) {
     let Some(state) = app.try_state::<RingState>() else {
         return;

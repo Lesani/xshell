@@ -192,6 +192,51 @@ fn expired_pending(f: &Fixture) {
         .any(|line| line == "These words have expired. Run xshelld pair again for new words."));
     assert_no_membership(f);
 }
+/// #118: with the words still good for minutes, a registered Computer whose xshell app is
+/// closed is told to open it (stderr, exit 1) after a short wait: no words, no Relay dial,
+/// no membership.
+fn closed_desktop_says_to_open_xshell(f: &Fixture) {
+    let relay_sentinel = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    relay_sentinel.set_nonblocking(true).unwrap();
+    let mut child = Command::new(bin())
+        .arg("pair")
+        .args([
+            "--relay",
+            &format!("ws://{}", relay_sentinel.local_addr().unwrap()),
+        ])
+        .arg("--home")
+        .arg(&f.home)
+        .arg("--socket")
+        .arg(&f.socket)
+        .env("XSHELLD_PAIR_DESKTOP_WAIT_MS", "300")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait(|| child.try_wait().unwrap().is_some());
+    let output = child.wait_with_output().unwrap();
+    let (out, err) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.status.code(), Some(1), "{out}{err}");
+    assert_eq!(
+        err.trim(),
+        "xshell isn't open on this computer. Open xshell, then run xshelld pair again."
+    );
+    assert!(!err.contains("xshelld serve"), "{err}");
+    assert!(
+        !out.lines()
+            .any(|line| line.starts_with("Added this machine")
+                || xshell_protocol::ring::device_code::DeviceCode::parse(line).is_ok()),
+        "no words without the open app"
+    );
+    assert!(
+        matches!(relay_sentinel.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "a Computer whose app is closed must not dial the Relay"
+    );
+    assert_no_membership(f);
+}
 #[test]
 fn fresh_unpaired_startup_registers_then_gui_close_actual_cli_stays_computer_pending() {
     let f = Fixture::new();
@@ -220,6 +265,7 @@ fn fresh_unpaired_startup_registers_then_gui_close_actual_cli_stays_computer_pen
     ring.quit();
     drop(ring);
     expired_pending(&f);
+    closed_desktop_says_to_open_xshell(&f);
     let (mut cancel, rx) = f.pair(5_000);
     assert!(
         rx.recv_timeout(Duration::from_secs(3)).unwrap()
