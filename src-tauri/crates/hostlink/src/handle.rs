@@ -2628,7 +2628,16 @@ impl HostHandle {
                     let result = match own {
                         Some(build) => {
                             eprintln!("xshell: host {name}: sending this Desktop's build instead");
+                            // This Desktop has no build for that machine: the release
+                            // failure is the news, not "cannot update this type of machine".
                             send_desktop_build(&sh, &link, op, gen, &name, &build, &cancel, &o)
+                                .map_err(|e| {
+                                    if e.message == RING_NO_BUILD {
+                                        failure.error.clone()
+                                    } else {
+                                        e
+                                    }
+                                })
                         }
                         None => Err(failure.error),
                     };
