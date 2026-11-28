@@ -56,6 +56,7 @@ export const S = {
   "update.noBuild": "This xshell cannot update this type of machine. Update xshell directly on that machine.",
   "update.current": "Up to date",
   "update.retry": "Retry",
+  "update.skip": "Skip this version",
   // Hosts that update themselves from the latest release (design-update-from-get D6, binding).
   "update.release.older": "{host} is running xshell {daemonVersion}. The latest release is {version}.",
   "update.downloading": "Downloading update…",
