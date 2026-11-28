@@ -1,4 +1,4 @@
-//! Ephemeral same-host Unix deadline, never a network proposal or durable journal field.
+//! Ephemeral same-host deadline on the machine's shared monotonic clock, never a network proposal or durable journal field.
 use std::time::{Duration, Instant};
 const MAX: Duration = Duration::from_secs(600);
 #[cfg(unix)]
@@ -17,9 +17,26 @@ pub(super) fn now_ns() -> Result<u64, String> {
         .and_then(|s| s.checked_add(nanos))
         .ok_or_else(|| "monotonic clock overflow".into())
 }
-#[cfg(not(unix))]
+/// Windows: the unbiased interrupt time, one system-wide count of 100 ns units since boot
+/// (suspended time excluded) that every process on the machine reads alike, as
+/// `CLOCK_MONOTONIC` is on Unix.
+#[cfg(windows)]
 pub(super) fn now_ns() -> Result<u64, String> {
-    Err("Unix monotonic adapter unavailable".into())
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryUnbiasedInterruptTime(unbiased_time: *mut u64) -> i32;
+    }
+    let mut ticks = 0u64;
+    if unsafe { QueryUnbiasedInterruptTime(&mut ticks) } == 0 {
+        return Err("Windows monotonic clock unavailable".into());
+    }
+    ticks
+        .checked_mul(100)
+        .ok_or_else(|| "monotonic clock overflow".into())
+}
+#[cfg(not(any(unix, windows)))]
+pub(super) fn now_ns() -> Result<u64, String> {
+    Err("monotonic adapter unavailable".into())
 }
 fn capture_from_samples(tick: u64, remaining: Duration) -> Result<u64, String> {
     if remaining.is_zero() || remaining > MAX {

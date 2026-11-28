@@ -65,6 +65,30 @@ fn wait_exit_signal() -> i32 {
     }
 }
 
+/// Windows: Ctrl+C, Ctrl+Break or a console close cancels the `pair` command, which then
+/// withdraws its offer and exits by itself. Without a console (a redirected ssh command)
+/// there is nothing to watch: ending the process drops the connection, and the Desktop
+/// discards that origin.
+#[cfg(windows)]
+pub fn watch_pair_signals(cancel: Arc<std::sync::atomic::AtomicBool>) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    static CANCEL: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    unsafe extern "system" fn on_ctrl(_kind: u32) -> windows_sys::core::BOOL {
+        if let Some(cancel) = CANCEL.get() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+            // A console close ends the process when this returns: give the command a
+            // moment to withdraw the offer first.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+        1
+    }
+    let _ = CANCEL.set(cancel);
+    // Best effort: it fails without a console, where no such event can arrive.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+    Ok(())
+}
+
 /// Nothing to block on Windows.
 #[cfg(windows)]
 pub fn block_exit_signals() {}

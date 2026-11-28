@@ -147,9 +147,9 @@ commands:
   service     install|uninstall|status [--json] [--mechanism systemd|cron|profile|none]
               Linux and macOS: keep the Daemon running (systemd user unit, else crontab
               @reboot, else the shell profile); env XSHELL_SERVICE_MECHANISM forces one
-  pair        Unix: request Computer pairing in the registered xshell window,
-              or pair an unregistered standalone Host with eight Device Code words
-              (Settings → Hosts → Ring). Windows Pair is not supported.
+  pair        print eight Device Code words to add this computer to a Ring; with xshell
+              installed, keep the app open (required on Windows); without it, Unix pairs
+              the standalone Host
   self-install [--select] [--switch] [--home DIR]
               Linux and macOS: install this binary as the selected build (--select) and
               move a running Daemon onto it (--switch); what install.sh runs

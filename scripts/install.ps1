@@ -8,6 +8,12 @@
 # installed system-wide. If xshell is running from that folder, it says so and closes it first
 # (that ends the sessions running on this computer).
 #
+# It also adds %USERPROFILE%\.xshell\bin to this user's PATH (HKCU\Environment, the value's
+# type kept, no second entry): xshell writes the command `xshelld` there when it starts, so
+# `xshelld pair` in a terminal shows the words that add this computer to a Ring. An OpenSSH
+# session on Windows gets only the system PATH, so the last line also gives the command with
+# its full path, quoted for PowerShell.
+#
 # Nothing is sent but the downloads (User-Agent "xshell-install").
 #
 # Environment (also for tests): XSHELL_TAG (another release), XSHELL_INSTALL_BASE (download
@@ -113,8 +119,47 @@
     $link.Description = 'xshell'
     $link.Save()
 
+    # The folder of the `xshelld` command on this user's PATH. Never fatal: xshell works
+    # without it.
+    try {
+      $bin = Join-Path $env:USERPROFILE '.xshell\bin'
+      $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+      if (-not $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }
+      try {
+        $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        $current = ''
+        if ($key.GetValueNames() -contains 'Path') {
+          $kind = $key.GetValueKind('Path')
+          $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        if ($kind -ne [Microsoft.Win32.RegistryValueKind]::ExpandString -and $kind -ne [Microsoft.Win32.RegistryValueKind]::String) {
+          throw "the user PATH is not text"
+        }
+        # The existing value is never rewritten: it is split only to look for the folder
+        # (as written or with its variables expanded, any case, with or without a trailing
+        # backslash), and the folder is appended to the value as it stands.
+        $present = @($current -split ';' | Where-Object {
+          $entry = $_.Trim()
+          $entry -and (($entry.TrimEnd('\') -ieq $bin) -or
+            ([Environment]::ExpandEnvironmentVariables($entry).TrimEnd('\') -ieq $bin))
+        })
+        if ($present.Count -eq 0) {
+          $separator = if ($current -eq '' -or $current.EndsWith(';')) { '' } else { ';' }
+          $value = $current + $separator + $bin
+          $key.SetValue('Path', $value, $kind)
+          # Tells running programs (Explorer, so new terminals) that the environment changed.
+          [Environment]::SetEnvironmentVariable('XSHELL_INSTALL_PATH_REFRESH', $null, 'User')
+        }
+      } finally {
+        $key.Close()
+      }
+    } catch {
+      Write-Host "Could not add $bin to your PATH: $($_.Exception.Message)"
+    }
+
     if ($update) { Write-Host "Updated xshell to $version in $dir." } else { Write-Host "Installed xshell $version in $dir." }
     Write-Host "Start it from the Start menu: xshell."
+    Write-Host 'To pair this computer, keep xshell open and run xshelld pair in a new terminal. Over SSH, use & "$HOME\.xshell\bin\xshelld.cmd" pair.'
   } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }

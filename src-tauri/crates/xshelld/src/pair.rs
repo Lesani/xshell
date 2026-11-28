@@ -1,7 +1,14 @@
-//! Explicit Unix Device Code command. Registered Computers forward one ephemeral offer
+//! Explicit Device Code command. Registered Computers forward one ephemeral offer
 //! to their elected Desktop; only owner-local backend consent can complete it. Truly
 //! unregistered Hosts use the standalone v2 transaction, never a Desktop signer.
 //! Zero requires accepted membership and the required durable installation receipts.
+//!
+//! Windows (#118) has the Computer route only: a Windows machine is in a Ring through its
+//! Desktop (W1), so without a registered, open xshell the command says to open it. The
+//! standalone route, its journal and its "earlier attempt" handling stay Unix-only.
+// The standalone half is compiled out on Windows; what it shares with the Computer route
+// (failures, copy) stays in one place.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use crate::cli::Opts;
 use crate::paths::Paths;
@@ -56,6 +63,11 @@ enum Failure {
     Busy,
     /// Too many pairing attempts from this network in the Relay's last minute.
     RateLimited,
+    /// A Computer whose xshell app is not open (or, on Windows, has never run): only the
+    /// open app can join a Ring for it, so no words are shown.
+    DesktopClosed,
+    /// A Computer with an earlier unresolved attempt and nothing running to finish it.
+    ComputerEarlierStopped,
     Other(String),
 }
 
@@ -84,6 +96,11 @@ const UNFINISHED_CANCELLED: &str = "Stopping does not undo approval; this machin
 const EARLIER_CHECKING: &str =
     "An earlier pairing of this machine is still being finished. Checking now; no new words yet.";
 const EARLIER_STOPPED: &str = "Pairing needs xshell running in the background here: start xshelld serve. Then check Settings > Ring on another device; no new words needed yet.";
+// `cli.pair.computer.closed` and `cli.pair.computer.earlierStopped`: a machine
+// with the xshell app is told to open it, never to start `xshelld serve`.
+const DESKTOP_CLOSED: &str =
+    "xshell isn't open on this computer. Open xshell, then run xshelld pair again.";
+const COMPUTER_EARLIER_STOPPED: &str = "Open xshell on this computer to finish pairing. Then check Settings > Ring on another device. You do not need new words yet.";
 const BUSY: &str =
     "xshell on this machine is starting or stopping and hasn't answered. Try again in a moment.";
 // `cli.pair.rateLimited` (plans/plan-pairing-bc.md, COPY).
@@ -229,6 +246,8 @@ fn failure_report(failure: Failure) -> (i32, Vec<String>) {
             (UNFINISHED_EXIT, vec![UNFINISHED_RUNNING.into()])
         }
         Failure::EarlierStopped => (UNFINISHED_EXIT, vec![EARLIER_STOPPED.into()]),
+        Failure::ComputerEarlierStopped => (UNFINISHED_EXIT, vec![COMPUTER_EARLIER_STOPPED.into()]),
+        Failure::DesktopClosed => (1, vec![DESKTOP_CLOSED.into()]),
         Failure::AlreadyRunning => (1, vec![ALREADY_RUNNING.into()]),
         Failure::Busy => (1, vec![BUSY.into()]),
         Failure::RateLimited => (RATE_LIMITED_EXIT, vec![RATE_LIMITED.into()]),
@@ -238,6 +257,7 @@ fn failure_report(failure: Failure) -> (i32, Vec<String>) {
 
 /// A standalone command's end as a [`Failure`]. Retained post-consent work is checked
 /// before cancellation, so Ctrl-C after approval never reads as "the words were cancelled".
+#[cfg(unix)]
 fn standalone_failure(
     error: crate::server::adoption::StandaloneCommandError,
     cancelled: bool,
@@ -274,13 +294,61 @@ fn ttl() -> Duration {
         .min(Duration::from_secs(PAIR_TTL_SECS))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn pair(opts: &Opts, paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
     pair_cancel(opts, paths, out, &Arc::new(AtomicBool::new(false)))
 }
 fn pair_cancel(
     opts: &Opts,
     paths: &Paths,
+    out: &mut dyn Write,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), Failure> {
+    let relay = opts
+        .relay
+        .clone()
+        .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
+    #[cfg(windows)]
+    {
+        computer_only_pair(paths, &relay, out, cancel)
+    }
+    #[cfg(unix)]
+    pair_unix(opts, paths, &relay, out, cancel)
+}
+
+/// Windows: the Computer route or nothing. This command never creates the Store (the
+/// Daemon the Desktop starts does) and checks its directory without repairing it; the
+/// files in it are read as the Daemon reads them.
+#[cfg(windows)]
+fn computer_only_pair(
+    paths: &Paths,
+    relay: &str,
+    out: &mut dyn Write,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), Failure> {
+    if !paths.ring_dir.is_dir() {
+        return Err(Failure::DesktopClosed);
+    }
+    let dir = xshell_core::local_ipc::canonical_store(&paths.ring_dir)
+        .map_err(|e| format!("protected_counterpart_required: unsafe local Store: {e}"))?;
+    let store = Store::new(dir);
+    RelayUrl::parse(relay).map_err(|_| "invalid Pair Relay".to_string())?;
+    if let Some(chain) = current_ring(&store) {
+        return writeln!(out, "{}", already_line(machines(&chain)))
+            .and_then(|()| out.flush())
+            .map_err(|e| Failure::Other(e.to_string()));
+    }
+    if !crate::server::ring::companion_registered(&store.dir) {
+        return Err(Failure::DesktopClosed);
+    }
+    registered_computer_pair(&store, relay, out, cancel)
+}
+
+#[cfg(unix)]
+fn pair_unix(
+    opts: &Opts,
+    paths: &Paths,
+    relay: &str,
     out: &mut dyn Write,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), Failure> {
@@ -291,11 +359,7 @@ fn pair_cancel(
     let store = Store::new(paths.ring_dir.clone());
     xshell_core::companion_reservation::validate_daemon_store(&paths.ring_dir)
         .map_err(|e| format!("protected_counterpart_required: unsafe local Store: {e}"))?;
-    let relay = opts
-        .relay
-        .clone()
-        .unwrap_or_else(|| HOSTED_RELAY_URL.to_string());
-    RelayUrl::parse(&relay).map_err(|_| "invalid Pair Relay".to_string())?;
+    RelayUrl::parse(relay).map_err(|_| "invalid Pair Relay".to_string())?;
     // "Already in your Ring" needs the durable receipt too: a Roster installed without it
     // (an earlier attempt whose consent may have left) is not yet a membership. The Roster
     // is read first and the journal after it: a standalone attempt writes its journal
@@ -315,7 +379,19 @@ fn pair_cancel(
                     });
                 }
                 waited = true;
-                if let Earlier::Added(chain) = wait_for_earlier(&store, out, cancel, expires_at)? {
+                let earlier =
+                    wait_for_earlier(&store, out, cancel, expires_at).map_err(|failure| {
+                        match failure {
+                            // A machine with the xshell app: opening it is what finishes it.
+                            Failure::EarlierStopped
+                                if crate::server::ring::companion_registered(&store.dir) =>
+                            {
+                                Failure::ComputerEarlierStopped
+                            }
+                            other => other,
+                        }
+                    })?;
+                if let Earlier::Added(chain) = earlier {
                     return writeln!(out, "{}", done_line(machines(&chain)))
                         .and_then(|()| out.flush())
                         .map_err(|e| Failure::Other(e.to_string()));
@@ -340,7 +416,7 @@ fn pair_cancel(
         }
     }
     if crate::server::ring::companion_registered(&paths.ring_dir) {
-        return registered_computer_pair(&store, &relay, out, cancel);
+        return registered_computer_pair(&store, relay, out, cancel);
     }
     let lifetime = ttl();
     let pending = format!(
@@ -365,7 +441,7 @@ fn pair_cancel(
         }
         match crate::server::adoption::adopt_standalone_command(
             paths,
-            &relay,
+            relay,
             opts.name.as_deref(),
             lifetime,
             cancel,
@@ -396,6 +472,7 @@ fn pair_cancel(
     Ok(())
 }
 
+#[cfg(unix)]
 use crate::server::standalone_journal::{earlier_pairing, EarlierPairing};
 
 /// How a wait for an earlier attempt ended without a failure.
@@ -486,6 +563,7 @@ fn minutes_left(expires_at: u64) -> Option<u64> {
 /// and asks the Daemon whether it runs: never takes the offer lock or the Store ownership
 /// lease, never opens a pairing slot. Success needs the installed journal with its durable
 /// membership validation, not merely a readable Roster.
+#[cfg(unix)]
 fn wait_for_earlier(
     store: &Store,
     out: &mut dyn Write,
@@ -533,6 +611,7 @@ fn wait_for_earlier(
 
 /// Another `xshelld pair` holds the offer lock. The Daemon also takes it briefly while it
 /// finishes or sets aside an earlier attempt, so a held lock is rechecked for up to 1 s.
+#[cfg(unix)]
 fn offer_held_by_another(store: &Store) -> bool {
     let until = Instant::now() + Duration::from_secs(1);
     loop {
@@ -574,6 +653,27 @@ fn print_words(out: &mut dyn Write, code: &DeviceCode, waiting: bool) -> Result<
         .and_then(|()| out.flush())
         .map_err(|_| "Pair origin output closed".into())
 }
+/// How long the Computer route waits for the open xshell app to answer before it says
+/// that xshell is not open: 5 s (`XSHELLD_PAIR_DESKTOP_WAIT_MS`, test only, shortens it).
+fn desktop_grace() -> Duration {
+    const GRACE: Duration = Duration::from_secs(5);
+    std::env::var("XSHELLD_PAIR_DESKTOP_WAIT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(GRACE)
+        .min(GRACE)
+}
+
+/// Whether the failed connection means "something is there and refuses" rather than "no
+/// xshell app is open": its Store is missing or unsafe, or a broker answered the Hello with
+/// a refusal. Everything else (no endpoint, nothing listening, no answer in time) reads as
+/// a closed app.
+fn endpoint_refuses(desktop: &str, error: &str) -> bool {
+    error == xshell_hostlink::ring::administration::HELLO_REFUSED
+        || xshell_core::local_ipc::canonical_store(Path::new(desktop)).is_err()
+}
+
 fn registered_computer_pair(
     store: &Store,
     relay: &str,
@@ -588,16 +688,28 @@ fn registered_computer_pair(
     let until = Instant::now() + duration;
     let monotonic_expires_at_ns = xshell_hostlink::ring::administration::monotonic::capture(until)
         .map_err(|_| Failure::ComputerExpired)?;
-    let budget = xshell_core::local_ipc::RequestBudget::for_operation(until, cancel.clone());
+    // One short budget for finding the open xshell app: the lookup of its Store (which
+    // waits for `ring.lock`) and the first connection to its endpoint. Past it, a closed or
+    // stuck app is reported instead of waited for while the words' lifetime runs out.
+    let closed_at = Instant::now() + desktop_grace();
+    let budget =
+        xshell_core::local_ipc::RequestBudget::for_operation(until.min(closed_at), cancel.clone());
     let desktop =
         crate::server::companion::registered_desktop(store, &budget).map_err(|error| {
-            if Instant::now() >= until {
+            if cancel.load(Ordering::Acquire) {
+                Failure::Cancelled
+            } else if Instant::now() >= until {
                 Failure::ComputerExpired
+            } else if Instant::now() >= closed_at {
+                // The Store's lock stayed taken: something of xshell here is busy with it.
+                Failure::Busy
             } else {
                 Failure::Other(format!("protected_counterpart_required: {error}"))
             }
         })?;
-    budget.check().map_err(|_| Failure::ComputerExpired)?;
+    if Instant::now() >= until {
+        return Err(Failure::ComputerExpired);
+    }
     let operation = uuid::Uuid::new_v4();
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -615,15 +727,34 @@ fn registered_computer_pair(
     writeln!(out, "{WAITING}")
         .and_then(|()| out.flush())
         .map_err(|_| "Pair origin output closed".to_string())?;
+    // Nothing answers at the Desktop's endpoint within the budget: xshell is not open here.
+    // Long enough for a Desktop that is just starting to bind it (it retries every 100 ms).
+    // Once a connection exists this never applies again: the status path decides.
     let mut client = None;
     let mut printed = false;
     let mut started = false;
     let mut result = Err(Failure::ComputerExpired);
     while Instant::now() < until && !cancel.load(Ordering::Acquire) {
         if client.is_none() {
-            if let Ok(connected) = AdministrationClient::connect(Path::new(&desktop), until) {
-                client = Some(connected);
-            } else {
+            let refused = match AdministrationClient::connect(
+                Path::new(&desktop),
+                until.min(closed_at.max(Instant::now() + Duration::from_millis(200))),
+            ) {
+                Ok(connected) => {
+                    client = Some(connected);
+                    None
+                }
+                Err(error) => Some(error),
+            };
+            if let Some(error) = refused {
+                if Instant::now() >= closed_at {
+                    result = Err(if endpoint_refuses(&desktop, &error) {
+                        Failure::Other(format!("protected_counterpart_required: {error}"))
+                    } else {
+                        Failure::DesktopClosed
+                    });
+                    break;
+                }
                 std::thread::sleep(
                     Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())),
                 );
@@ -716,21 +847,21 @@ fn registered_computer_pair(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn legacy_outcome_uncertain(store: &Store) -> bool {
     xshell_core::companion_reservation::read_reservation(&store.dir)
         .ok()
         .flatten()
         .is_some_and(|reservation| reservation.legacy_outcome_uncertain)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn uncertain_legacy_failure(message: String) -> Failure {
     Failure::Other(format!("reconciliation_required: legacy pairing remote outcome is uncertain; startup denial does not revoke a transmitted proof or establish nonmembership ({message})"))
 }
 
 /// Stores only an initial membership or an authorized extension of the retained Ring.
 /// Foreign/terminal membership is never a force-replacement or a new enrollment attempt.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn adopt(
     store: &Store,
     fetched: RosterChain,
@@ -775,7 +906,7 @@ fn adopt(
     Ok(next)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use xshell_protocol::ring::{DeviceKeys, Member, Role, SignedRoster};

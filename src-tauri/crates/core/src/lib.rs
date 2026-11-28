@@ -22,6 +22,8 @@ pub mod launch;
 pub mod local_ipc;
 pub mod memories;
 pub mod opencode;
+#[cfg(windows)]
+pub mod parent_console;
 pub mod past;
 pub mod paths;
 pub mod pi;
