@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { fanOutSourced, freshestRateLimits, mergeCodexUsage, type Sourced } from "../hosts/aggregate";
+import { fanOutDue, fanOutSourced, freshestRateLimits, mergeCodexUsage, type Sourced } from "../hosts/aggregate";
 import { registry } from "../hosts/registry";
 import { startPoll } from "../hosts/poll";
 import { useHostsSnapshot, usableHosts } from "../hosts/useHosts";
@@ -140,14 +140,13 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   useEffect(() => {
     let cancelled = false;
     if (!showClaude) { setClaude(null); return; }
-    const poll = { n: 0, last: new Map<string, GlobalRateLimits>() };
-    const fetch = (n = 0) => fanOutSourced<GlobalRateLimits>("get_global_rate_limits", { ...poll, n }).then(r => {
+    const fetch = () => fanOutSourced<GlobalRateLimits>("get_global_rate_limits").then(r => {
       if (cancelled || r.length === 0) return;
       const best = freshestRateLimits(r.map(x => x.value));
       setClaude(r.find(x => x.value === best) ?? null);
     }).catch(() => {});
     fetch();
-    const stop = startPoll(fetch, 8000);
+    const stop = startPoll(n => { if (fanOutDue(n)) fetch(); }, 8000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
     return () => { cancelled = true; stop(); window.removeEventListener("focus", onFocus); };
@@ -156,8 +155,7 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
   useEffect(() => {
     let cancelled = false;
     if (!showCodex) { setCodex(null); return; }
-    const poll = { n: 0, last: new Map<string, CodexUsage>() };
-    const fetch = (n = 0) => fanOutSourced<CodexUsage>("get_codex_usage", { ...poll, n }).then(r => {
+    const fetch = () => fanOutSourced<CodexUsage>("get_codex_usage").then(r => {
       if (cancelled || r.length === 0) return;
       const merged = mergeCodexUsage(r.map(x => x.value));
       // Source = the Host whose windows won the merge (freshest update).
@@ -165,7 +163,7 @@ export function RateLimitIndicator({ showClaude, showCodex }: { showClaude: bool
       setCodex({ host: src.host, value: merged });
     }).catch(() => {});
     fetch();
-    const stop = startPoll(fetch, 30000);
+    const stop = startPoll(n => { if (fanOutDue(n)) fetch(); }, 30000);
     const onFocus = () => fetch();
     window.addEventListener("focus", onFocus);
     return () => { cancelled = true; stop(); window.removeEventListener("focus", onFocus); };

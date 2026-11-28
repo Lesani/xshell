@@ -583,6 +583,10 @@ impl Conn {
                 rows,
             } => {
                 self.touched.insert(terminal);
+                // A Desktop over the Relay is paced: the redraw its resize causes comes fast.
+                if self.role != Role::Mobile {
+                    self.ob.note_input();
+                }
                 let r = self
                     .with_listed(&terminal, |t| {
                         t.resize(self.id, cols, rows, self.role == Role::Mobile)

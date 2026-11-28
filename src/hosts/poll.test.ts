@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fanOutDue } from "./aggregate";
 import { pollDue, RELAY_POLL_EVERY, startPoll, viaRelay } from "./poll";
+import { registry } from "./registry";
 import type { RegistrySnapshot } from "./registry";
 import type { AvailableHost } from "./types";
 
@@ -69,5 +71,23 @@ describe("polls that read from a Host", () => {
     show("visible");
     expect(seen).toEqual([]);
     stop();
+  });
+});
+
+describe("a fan-out poll asks all its Hosts or none", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  const withHosts = (rows: AvailableHost[], usable: string[]) => vi.spyOn(registry, "getSnapshot").mockReturnValue({
+    configs: [], available: rows, live: {}, agents: {},
+    status: Object.fromEntries(usable.map(h => [h, { host: h, status: "connected" }])),
+  } as unknown as RegistrySnapshot);
+
+  it("without a usable Relay Host every tick is due", () => {
+    withHosts([row("h_ssh00000", "ssh"), row("r_relay", "relay")], ["h_ssh00000"]);
+    expect([1, 2, 3, 4].filter(fanOutDue)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("with one, only its due ticks are, and nothing is combined in between", () => {
+    withHosts([row("h_ssh00000", "ssh"), row("r_relay", "relay")], ["h_ssh00000", "r_relay"]);
+    expect([0, 1, 2, 3, 4, 5, 8].filter(fanOutDue)).toEqual([0, 4, 8]);
   });
 });

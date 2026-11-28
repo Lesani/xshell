@@ -584,6 +584,27 @@ fn write_output<W: Write>(w: &mut W, terminal: &Uuid, chunks: &[Arc<[u8]>]) -> s
     Ok(())
 }
 
+/// [`write_output`] in frames of at most `MERGE_MAX` (a larger single chunk is its own frame),
+/// so the peer's decoder never waits for megabytes before it shows anything.
+fn write_output_bounded<W: Write>(
+    w: &mut W,
+    terminal: &Uuid,
+    chunks: &[Arc<[u8]>],
+) -> std::io::Result<()> {
+    let (mut from, mut size) = (0, 0);
+    for (i, c) in chunks.iter().enumerate() {
+        if i > from && size + c.len() > MERGE_MAX {
+            write_output(w, terminal, &chunks[from..i])?;
+            (from, size) = (i, 0);
+        }
+        size += c.len();
+    }
+    if from < chunks.len() {
+        write_output(w, terminal, &chunks[from..])?;
+    }
+    Ok(())
+}
+
 /// Output chunks of one Terminal waiting to be merged into one frame: id, chunks, total.
 type Run = (Uuid, Vec<Arc<[u8]>>, usize);
 
@@ -619,7 +640,7 @@ fn write_batch<W: Write>(w: &mut W, batch: Vec<Out>) -> std::io::Result<()> {
     w.flush()
 }
 
-/// A paced flush: one output frame per Terminal, in the order the Terminals first appear,
+/// A paced flush: one output frame per Terminal (more past `MERGE_MAX`), in the order the Terminals first appear,
 /// cut only by a barrier or size of that Terminal (its output so far is written first).
 /// Other control frames go first.
 fn write_paced<W: Write>(w: &mut W, batch: Vec<Out>) -> std::io::Result<()> {
@@ -635,7 +656,7 @@ fn write_paced<W: Write>(w: &mut W, batch: Vec<Out>) -> std::io::Result<()> {
             Out::About { terminal, frame } | Out::Size { terminal, frame } => {
                 if let Some(i) = runs.iter().position(|(t, _)| *t == terminal) {
                     let (t, chunks) = runs.remove(i);
-                    write_output(w, &t, &chunks)?;
+                    write_output_bounded(w, &t, &chunks)?;
                 }
                 w.write_all(&frame)?;
             }
@@ -643,7 +664,7 @@ fn write_paced<W: Write>(w: &mut W, batch: Vec<Out>) -> std::io::Result<()> {
         }
     }
     for (t, chunks) in runs {
-        write_output(w, &t, &chunks)?;
+        write_output_bounded(w, &t, &chunks)?;
     }
     w.flush()
 }
@@ -814,6 +835,24 @@ mod tests {
         let burst: Vec<u64> = flushes.iter().copied().filter(|&t| t >= 1000).collect();
         assert_eq!(burst, (20..40).map(|i| i * 50).collect::<Vec<_>>());
         assert!(!Outbox::with_pace(1 << 20, 1 << 21, None, None, false).is_mobile());
+    }
+
+    /// A paced flush of several megabytes: frames of at most `MERGE_MAX`, bytes in order.
+    #[test]
+    fn paced_flush_bounds_its_frames() {
+        let ob = Outbox::with_pace(16 << 20, 32 << 20, None, Some(PACE), false);
+        let t0 = Instant::now();
+        let mut want = Vec::new();
+        for i in 0..40u8 {
+            let chunk = vec![i; 100 * 1024];
+            want.extend_from_slice(&chunk);
+            ob.push_output(tid(1), bytes(&chunk), false);
+        }
+        let frames = flush(&ob, t0);
+        assert!(frames.len() >= 4, "{} frames", frames.len());
+        assert!(frames.iter().all(|(k, b)| k.starts_with("o:") && b.len() <= MERGE_MAX));
+        let got: Vec<u8> = frames.into_iter().flat_map(|(_, b)| b).collect();
+        assert_eq!(got, want);
     }
 
     /// With an injected clock: a Terminal printing every 20 ms gets one frame per second
