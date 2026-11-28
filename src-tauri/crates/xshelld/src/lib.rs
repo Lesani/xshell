@@ -130,9 +130,15 @@ pub fn main_entry() -> i32 {
         if let Some(code) = refuse_on_this_platform(&opts) {
             return code;
         }
-        if serve_fails_for_tests() {
-            eprintln!("xshelld: cannot start: test hook");
-            return 1;
+        match serve_failure_for_tests() {
+            Some("exit") => {
+                eprintln!("xshelld: cannot start: test hook");
+                return 1;
+            }
+            Some("stall") => loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            },
+            _ => {}
         }
         // Windows: before anything else, so every process this one starts is in the app's job.
         #[cfg(windows)]
@@ -418,15 +424,30 @@ fn refuse_on_this_platform(opts: &cli::Opts) -> Option<i32> {
 }
 
 /// Test hook (debug builds): with `XSHELLD_TEST_SERVE_FAIL_BUILD=<build>` a `serve` of that
-/// build (its display, `<commit>[-dirty…]`) exits 1 at once, as a selected build that cannot
-/// start (rjw.9 D4); other builds of the same test binary start normally.
-fn serve_fails_for_tests() -> bool {
-    cfg!(debug_assertions)
-        && std::env::var("XSHELLD_TEST_SERVE_FAIL_BUILD").is_ok_and(|b| {
-            crate::build_id::BUILD
-                .as_ref()
-                .is_some_and(|own| own.display() == b)
-        })
+/// build (its display, `<commit>[-dirty…]`) fails as a selected build that cannot start
+/// (rjw.9 D4) in the way `XSHELLD_TEST_SERVE_FAIL_MODE` says: `exit` (the default) exits 1
+/// at once, `stall` never listens, `exit-after-bind` and `stall-after-bind` bind the socket
+/// and then exit 1 or hang before any connection is answered. Other builds of the same test
+/// binary start normally.
+pub(crate) fn serve_failure_for_tests() -> Option<&'static str> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let build = std::env::var("XSHELLD_TEST_SERVE_FAIL_BUILD").ok()?;
+    if !crate::build_id::BUILD
+        .as_ref()
+        .is_some_and(|own| own.display() == build)
+    {
+        return None;
+    }
+    Some(
+        match std::env::var("XSHELLD_TEST_SERVE_FAIL_MODE").as_deref() {
+            Ok("stall") => "stall",
+            Ok("exit-after-bind") => "exit-after-bind",
+            Ok("stall-after-bind") => "stall-after-bind",
+            _ => "exit",
+        },
+    )
 }
 
 /// Test hook (Windows): with `XSHELLD_TEST_NO_PARENT_WATCH=1` a GUI-bound Daemon does not

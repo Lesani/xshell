@@ -37,6 +37,12 @@ pub const SPAWN_WAIT: Duration = Duration::from_secs(15);
 /// `serve` exits with this when another `serve` holds the lock: that one will listen.
 const LOST_LOCK_EXIT: i32 = 3;
 
+/// Windows: how long a selected build that listens may take to answer a Hello with its
+/// Terminals list before it counts as one that cannot start (rjw.9 D4). Restoring many
+/// Terminals takes a while; a build that hangs must not keep the machine without a Daemon.
+#[cfg(windows)]
+const SELECTED_READY_WAIT: Duration = Duration::from_secs(60);
+
 /// A Daemon's orderly shutdown ends its Terminals within about 8 s.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
@@ -348,6 +354,12 @@ pub struct LocalDaemon {
     /// starts instead (rjw.9 D4). A newly selected build is tried.
     #[cfg(windows)]
     failed_selected: Mutex<Option<PathBuf>>,
+    /// Windows: [`SELECTED_READY_WAIT`], shorter in tests.
+    #[cfg(windows)]
+    selected_ready_wait: Mutex<Duration>,
+    /// Windows test seam: starting this executable fails as a refused process start would.
+    #[cfg(windows)]
+    refuse_spawn: Mutex<Option<PathBuf>>,
     /// Test hook: runs in `stop_verified` between the verification and the signal.
     #[cfg(all(test, unix))]
     before_signal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -397,6 +409,10 @@ impl LocalDaemon {
             spawned_selected: Mutex::new(None),
             #[cfg(windows)]
             failed_selected: Mutex::new(None),
+            #[cfg(windows)]
+            selected_ready_wait: Mutex::new(SELECTED_READY_WAIT),
+            #[cfg(windows)]
+            refuse_spawn: Mutex::new(None),
             #[cfg(all(test, unix))]
             before_signal: Mutex::new(None),
         })
@@ -515,7 +531,23 @@ impl LocalDaemon {
         if self.persistent() {
             self.rewrite_stale_gui_bound_marker();
         }
-        self.ensure_spawned().map_err(|e| {
+        // Set again by this start when it runs a selected build.
+        #[cfg(windows)]
+        {
+            *self.spawned_selected.lock().unwrap() = None;
+        }
+        let spawned = self.ensure_spawned();
+        // A selected build that cannot even be started: this app's own build instead, once;
+        // the original error stays when that fails too (D4).
+        #[cfg(windows)]
+        let spawned = spawned.or_else(|e| {
+            if self.selected_failed(&format!("it could not be started: {e}")) {
+                Ok(0)
+            } else {
+                Err(e)
+            }
+        });
+        spawned.map_err(|e| {
             self.fail_start(self.see_log(format!("cannot start {}: {e}", self.bin.display())))
         })?;
         // Windows starts again from the app's own build when a selected one fails (D4).
@@ -535,11 +567,34 @@ impl LocalDaemon {
                 left.max(Duration::from_millis(1)),
             ) {
                 Ok(s) => {
+                    // A selected build is ready only once it answers (D4): it binds its pipe
+                    // before it restores Terminals, and may fail or hang after that.
+                    #[cfg(windows)]
+                    if let Err(why) = self.selected_ready(cancel) {
+                        drop(s);
+                        if cancel.is_cancelled() {
+                            return Err(DialError::Cancelled);
+                        }
+                        if self.selected_failed(&why) {
+                            deadline = Instant::now() + SPAWN_WAIT;
+                            lost_lock = false;
+                            continue;
+                        }
+                        return Err(self.fail_start(self.see_log(format!("xshelld {why}"))));
+                    }
                     self.listening_now();
                     return self.accept(s);
                 }
                 Err(e) if e.no_listener() => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    #[cfg(windows)]
+                    if self.selected_failed(&format!("it did not accept a connection: {e:?}")) {
+                        deadline = Instant::now() + SPAWN_WAIT;
+                        lost_lock = false;
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
             if !lost_lock {
                 match self.take_exit() {
@@ -929,6 +984,74 @@ impl LocalDaemon {
         }
     }
 
+    /// Windows (D4): when the start in progress runs a selected build, whether it answers a
+    /// Hello with its Terminals list within [`SELECTED_READY_WAIT`], on a connection of its
+    /// own. `Ok` also when the start runs this app's own build (nothing to check).
+    #[cfg(windows)]
+    fn selected_ready(&self, cancel: &CancelToken) -> Result<(), String> {
+        use std::io::Write;
+        use xshell_protocol::frame::{read_frame, Frame, MAX_FRAME_LEN};
+        use xshell_protocol::msg::{decode_server, encode_msg, ClientMsg, Hello, ServerMsg};
+        if self.spawned_selected.lock().unwrap().is_none() {
+            return Ok(());
+        }
+        let wait = *self.selected_ready_wait.lock().unwrap();
+        let until = Instant::now() + wait;
+        let what = format!("did not answer within {wait:?}");
+        let mut probe = connect_local(&self.live_socket(), cancel, wait)
+            .map_err(|e| format!("did not accept a connection: {e:?}"))?;
+        let hello = encode_msg(
+            &ClientMsg::Hello(Hello {
+                protocol: xshell_protocol::PROTOCOL,
+                version: self.version.clone(),
+                capabilities: Vec::new(),
+                build: self.build.clone(),
+            }),
+            None,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        probe
+            .set_write_timeout(Some(wait))
+            .and_then(|()| probe.write_all(&hello))
+            .map_err(|e| format!("{what} ({e})"))?;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() || cancel.is_cancelled() {
+                return Err(what);
+            }
+            probe
+                .set_read_timeout(Some(left))
+                .map_err(|e| format!("{what} ({e})"))?;
+            match read_frame(&mut probe, MAX_FRAME_LEN) {
+                Ok(Some(Frame::Json(j))) => match decode_server(&j) {
+                    Ok(ServerMsg::Terminals { .. }) => return Ok(()),
+                    Ok(ServerMsg::Error { code, .. }) => {
+                        return Err(format!("refused the connection ({code})"))
+                    }
+                    _ => {}
+                },
+                Ok(Some(_)) => {}
+                Ok(None) => return Err("closed the connection before it answered".into()),
+                Err(e) => return Err(format!("{what} ({e:?})")),
+            }
+        }
+    }
+
+    /// Test seam (Windows): starting `exe` fails as a refused process start would, at the
+    /// point the Desktop starts a GUI-bound Daemon.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn refuse_spawn_for_tests(&self, exe: Option<PathBuf>) {
+        *self.refuse_spawn.lock().unwrap() = exe;
+    }
+
+    /// Test seam (Windows): a shorter [`SELECTED_READY_WAIT`].
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn set_selected_ready_wait_for_tests(&self, wait: Duration) {
+        *self.selected_ready_wait.lock().unwrap() = wait;
+    }
+
     /// Windows: the build a GUI-bound start runs. The `selected` record's build when it is
     /// honoured (`core::server::windows_spawn_target`), unless that build failed to start
     /// before; the app's own build otherwise, also when the record cannot be used (rjw.9 D4:
@@ -956,6 +1079,13 @@ impl LocalDaemon {
         let exe = self.gui_bound_target();
         #[cfg(not(windows))]
         let exe = &self.bin;
+        #[cfg(windows)]
+        if self.refuse_spawn.lock().unwrap().as_deref() == Some(exe.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the process start was refused (test seam)",
+            ));
+        }
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
             .arg("--gui-bound")

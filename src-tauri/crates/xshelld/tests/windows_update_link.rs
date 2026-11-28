@@ -484,3 +484,113 @@ fn selected_build_that_cannot_start_falls_back_to_the_apps_own() {
     drop(c);
     daemon.terminate(std::time::Duration::from_secs(15));
 }
+
+/// A home whose `selected` record names another build of this version (this test's
+/// `xshelld.exe`, restamped), and the build the Desktop then dials, started by a
+/// [`xshell_hostlink::LocalDaemon`] whose Daemons fail as `mode` says
+/// (`XSHELLD_TEST_SERVE_FAIL_MODE`; `None`: they do not fail). `seam` adjusts the
+/// `LocalDaemon` before it dials (given the staged file). Returns the build that answered,
+/// the selected build, and how long the dial took.
+fn dial_after_selected(
+    mode: Option<&str>,
+    seam: impl FnOnce(&xshell_hostlink::LocalDaemon, &Path),
+) -> (Option<BuildId>, BuildId, std::time::Duration) {
+    use xshell_hostlink::{CancelToken, Dialer, LocalDaemon, LocalDaemonConfig, LocalDialer};
+    let h = TestHome::new_private_home();
+    let (bytes, build) = patched(1, VERSION);
+    let dir = install_dir_name(VERSION, Some(&build));
+    xshelld::stage::stage(
+        &h.home(),
+        &dir,
+        &sha(&bytes),
+        bytes.len() as u64,
+        &mut base64::engine::general_purpose::STANDARD
+            .encode(&bytes)
+            .as_bytes(),
+    )
+    .unwrap();
+    xshell_core::server::write_windows_selected(&h.home(), &dir).unwrap();
+    let staged = root(&h).join(&dir).join("xshelld.exe");
+    let mut env = h.daemon_env();
+    if let Some(mode) = mode {
+        env.push((
+            "XSHELLD_TEST_SERVE_FAIL_BUILD".into(),
+            build.display().into(),
+        ));
+        env.push(("XSHELLD_TEST_SERVE_FAIL_MODE".into(), mode.into()));
+    }
+    let daemon = std::sync::Arc::new(
+        LocalDaemon::new(LocalDaemonConfig {
+            bin: bin().into(),
+            env,
+            home: h.home(),
+            socket: h.pipe.clone(),
+            version: VERSION.into(),
+            build: None,
+        })
+        .unwrap(),
+    );
+    seam(&daemon, &staged);
+    let began = std::time::Instant::now();
+    let dialed = LocalDialer {
+        daemon: daemon.clone(),
+    }
+    .dial(&CancelToken::new())
+    .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
+    let took = began.elapsed();
+    let _conn = dialed.conn;
+    let mut c = Client::from_io(dialed.io.read, dialed.io.write);
+    let (hello, _) = c.hello();
+    assert!(daemon.start_error().is_none(), "{mode:?}");
+    drop(c);
+    daemon.terminate(std::time::Duration::from_secs(15));
+    (hello.build, build, took)
+}
+
+fn own_build() -> BuildId {
+    scan_stamp(&fs::read(bin()).unwrap()).unwrap().unwrap()
+}
+
+/// A healthy selected build passes the readiness check and is the one that serves.
+#[test]
+fn healthy_selected_build_serves() {
+    let (served, selected, _) = dial_after_selected(None, |_, _| {});
+    assert!(served.is_some_and(|b| b.same(&selected)));
+}
+
+/// D4 (Sol P2-1): a selected build that binds its pipe and then exits before it answers
+/// falls back to the app's own build.
+#[test]
+fn selected_build_that_binds_then_exits_falls_back() {
+    let (served, _, _) = dial_after_selected(Some("exit-after-bind"), |_, _| {});
+    assert!(served.is_some_and(|b| b.same(&own_build())));
+}
+
+/// D4 (Sol P2-1): a selected build that binds its pipe and then hangs falls back once the
+/// readiness wait is over.
+#[test]
+fn selected_build_that_binds_then_stalls_falls_back() {
+    let (served, _, took) = dial_after_selected(Some("stall-after-bind"), |d, _| {
+        d.set_selected_ready_wait_for_tests(std::time::Duration::from_secs(3))
+    });
+    assert!(served.is_some_and(|b| b.same(&own_build())));
+    assert!(took >= std::time::Duration::from_secs(3), "{took:?}");
+}
+
+/// D4 (Sol P2-2): a selected build whose process cannot be started at all (refused at the
+/// point the Desktop starts it) falls back to the app's own build.
+#[test]
+fn selected_build_whose_start_is_refused_falls_back() {
+    let (served, _, _) = dial_after_selected(None, |d, staged| {
+        d.refuse_spawn_for_tests(Some(staged.to_path_buf()))
+    });
+    assert!(served.is_some_and(|b| b.same(&own_build())));
+}
+
+/// D4: a selected build that never listens falls back after the 15 s start wait.
+#[test]
+fn selected_build_that_never_listens_falls_back_after_the_spawn_wait() {
+    let (served, _, took) = dial_after_selected(Some("stall"), |_, _| {});
+    assert!(served.is_some_and(|b| b.same(&own_build())));
+    assert!(took >= xshell_hostlink::local::SPAWN_WAIT, "{took:?}");
+}
