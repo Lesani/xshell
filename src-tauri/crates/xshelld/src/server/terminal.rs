@@ -3743,13 +3743,13 @@ mod status_tests {
             (s.cols, s.rows)
         };
         assert_eq!(pty_size(&next), (80, 24));
-        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None);
+        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None, false);
         let pace = PaceCfg {
             idle: Duration::from_secs(1),
             burst: Duration::from_millis(100),
             window: Duration::from_secs(3),
         };
-        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace));
+        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace), true);
         {
             let mut o = prev.out.lock().unwrap();
             o.subs.insert(1, desk.clone());
@@ -3812,13 +3812,13 @@ mod status_tests {
                 prompt_id_floor: None,
             },
         );
-        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None);
+        let desk = Outbox::with_pace(1 << 20, 1 << 21, None, None, false);
         let pace = PaceCfg {
             idle: Duration::from_secs(1),
             burst: Duration::from_millis(100),
             window: Duration::from_secs(3),
         };
-        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace));
+        let mob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(pace), true);
         {
             let mut o = t.out.lock().unwrap();
             o.subs.insert(1, desk.clone());

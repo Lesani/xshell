@@ -115,17 +115,29 @@ pub(crate) fn handle(
         (Ok(w), Ok(a)) => (w, a),
         _ => return,
     };
-    // A Mobile's output is paced: it travels the Relay, envelope by envelope.
-    let pace = (role == Role::Mobile).then_some(PaceCfg {
-        idle: d.cfg.mobile_frame_idle,
-        burst: d.cfg.mobile_frame_burst,
-        window: d.cfg.mobile_burst_window,
-    });
+    // Output that travels the Relay is paced: there every write is a message the Relay counts
+    // (and Cloudflare bills). A Mobile gets it slower than a Desktop. Local and SSH: unpaced.
+    let pace = if role == Role::Mobile {
+        Some(PaceCfg {
+            idle: d.cfg.mobile_frame_idle,
+            burst: d.cfg.mobile_frame_burst,
+            window: d.cfg.mobile_burst_window,
+        })
+    } else if ingress == Ingress::Relay {
+        Some(PaceCfg {
+            idle: d.cfg.relay_frame_idle,
+            burst: d.cfg.relay_frame_burst,
+            window: d.cfg.relay_burst_window,
+        })
+    } else {
+        None
+    };
     let ob = Outbox::with_pace(
         d.cfg.conn_output_cap,
         d.cfg.conn_total_cap,
         Some(asock),
         pace,
+        role == Role::Mobile,
     );
     let (obw, stall) = (ob.clone(), d.cfg.write_stall_timeout);
     if std::thread::Builder::new()

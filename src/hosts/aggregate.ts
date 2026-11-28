@@ -1,6 +1,7 @@
 import type { ClaudeCostSummary, CodexUsage, GlobalRateLimits, SessionInfo } from "../types";
 import { hostInvokeLive } from "./hostInvoke";
 import type { HostMethod } from "./methods";
+import { pollDue } from "./poll";
 import { registry } from "./registry";
 import { usableHosts } from "./useHosts";
 import type { HostId } from "./types";
@@ -12,11 +13,27 @@ import type { HostId } from "./types";
 
 export interface Sourced<T> { host?: HostId; value: T }
 
-// Local + every usable Remote Host; failures are skipped.
-export async function fanOutSourced<T>(method: HostMethod): Promise<Sourced<T>[]> {
-  const hosts: (HostId | undefined)[] = [undefined, ...usableHosts(registry.getSnapshot())];
+/** A repeating fan-out: its tick number and the live answers of its earlier ticks. */
+export interface FanOutPoll<T> { n: number; last: Map<HostId, T> }
+
+// Local + every usable Remote Host; failures are skipped. As a poll, a Host reached over the
+// Relay is asked only on its due ticks (`pollDue`); between them its last live answer stands,
+// for as long as the Host stays usable.
+export async function fanOutSourced<T>(method: HostMethod, poll?: FanOutPoll<T>): Promise<Sourced<T>[]> {
+  const snap = registry.getSnapshot();
+  const usable = usableHosts(snap);
+  const hosts: (HostId | undefined)[] = [undefined, ...usable];
+  if (poll) for (const h of [...poll.last.keys()]) if (!usable.includes(h)) poll.last.delete(h);
   const results = await Promise.all(hosts.map(async (host): Promise<Sourced<T> | null> => {
-    try { return { host, value: await hostInvokeLive<T>(host, method) }; } catch (_) { return null; }
+    if (poll && host && poll.last.has(host) && !pollDue(host, poll.n, snap)) return { host, value: poll.last.get(host) as T };
+    try {
+      const value = await hostInvokeLive<T>(host, method);
+      if (poll && host) poll.last.set(host, value);
+      return { host, value };
+    } catch (_) {
+      if (poll && host) poll.last.delete(host);
+      return null;
+    }
   }));
   return results.filter((r): r is Sourced<T> => r !== null);
 }

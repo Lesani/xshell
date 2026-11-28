@@ -4,6 +4,7 @@ import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialo
 import { fmt, type StringKey } from "../hosts/strings";
 import { hostInvoke } from "../hosts/hostInvoke";
 import { registry } from "../hosts/registry";
+import { startPoll } from "../hosts/poll";
 import type { HostId } from "../hosts/types";
 import { ChevronRight, RefreshCw, Folder, ArrowUp, Search, X as XIcon, FolderOpen, Terminal as TerminalIcon, ExternalLink, Download, GripVertical } from "lucide-react";
 import { baseName, isTransferPart, parentOf, styleOfOs } from "../files/paths";
@@ -274,9 +275,8 @@ export function FileExplorerPanel({ rootPath, host, onWritePath, visible, showTt
   useEffect(() => {
     if (!visible || searchOpen) return;
     setTick(t => t + 1); // refresh right away on (re)show, then keep polling
-    const id = window.setInterval(() => setTick(t => t + 1), 2500);
-    return () => window.clearInterval(id);
-  }, [visible, searchOpen]);
+    return startPoll(() => setTick(t => t + 1), 2500, () => host);
+  }, [visible, searchOpen, host]);
   const loadRef = useRef(load);
   loadRef.current = load;
   useEffect(() => { if (tick > 0) loadRef.current(true); }, [tick]);

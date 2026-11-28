@@ -5,6 +5,7 @@ import { useEffect, useRef, useState, useCallback, useLayoutEffect, useMemo } fr
 import hljs from "highlight.js/lib/common";
 import { invoke } from "@tauri-apps/api/core";
 import { hostInvoke } from "../hosts/hostInvoke";
+import { startPoll } from "../hosts/poll";
 import type { HostId } from "../hosts/types";
 import { captureTerminalInput, writeTerminalInput, remoteTerminals, type TerminalInputAction, localShellOptions, mountTerminal, relaunchTerminal, resizeTerminal, startWithRetry, writeTerminal, type MountedTerminal, type StartOptions } from "../hosts/terminalTransport";
 import { usesClaudeBranchDetection } from "../tabs/sessionBranch";
@@ -1020,8 +1021,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     const shouldPoll = gitLazyPolling ? showGitPanel : true;
     if (!shouldPoll) return;
     fetchGitStatus();
-    const interval = setInterval(fetchGitStatus, 3000);
-    return () => clearInterval(interval);
+    return startPoll(() => { fetchGitStatus(); }, 3000, () => tab.host);
   }, [isActive, tab.projectPath, gitLazyPolling, showGitPanel, isClaudeSession, fetchGitStatus]);
 
   // Drop stale stats whenever the underlying session changes (raw shell / no sessionId /
@@ -1047,8 +1047,8 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
       } catch (_) {}
     };
     fetchStats();
-    const interval = setInterval(fetchStats, 4000);
-    return () => { cancelled = true; clearInterval(interval); };
+    const stop = startPoll(() => { void fetchStats(); }, 4000, () => tab.host);
+    return () => { cancelled = true; stop(); };
   }, [isActive, isClaudeSession, tab.sessionId, tab.agent, tab.projectPath, tab.host, projectEncodedName]);
 
   // Poll every 5s, but only while this tab is the active (focused) one. Background tabs
@@ -1060,8 +1060,7 @@ export function TerminalTab({ tab, observedCompletionId, isActive, gitLazyPollin
     if (!tab.projectPath || !tab.sessionId) return;
     if (!usesClaudeBranchDetection(tab)) return;
     checkBranch();
-    const interval = window.setInterval(checkBranch, 5000);
-    return () => window.clearInterval(interval);
+    return startPoll(() => { checkBranch(); }, 5000, () => tab.host);
   }, [isActive, tab.projectPath, tab.sessionId, tab.shellMode, checkBranch]);
 
   // Refresh commit history whenever the History tab is shown, and when `ahead` changes

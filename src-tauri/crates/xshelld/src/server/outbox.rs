@@ -6,7 +6,9 @@
 //! Control frames are never dropped; if they alone exceed the total cap, the peer is
 //! disconnected. A peer that makes no write progress for `write_stall_timeout` is dropped.
 //!
-//! Pacing (a Mobile's connection, [`PaceCfg`]): Terminal output is held and written at most
+//! Pacing (a connection that arrived over the Relay, [`PaceCfg`]; a Mobile's is slower than a
+//! Desktop's): every message a client sends to the Relay is counted and, on Cloudflare,
+//! billed, and unpaced output is one message per PTY read. Terminal output is held and written at most
 //! once per interval, one frame per Terminal; everything else goes at once. Output held still
 //! counts against the caps. A message about a Terminal (`term.exit`, an attach's `res`) and
 //! an attach's replay are barriers: the output of that Terminal queued before them goes with
@@ -236,21 +238,24 @@ pub(crate) struct Outbox {
     /// A handle on the connection's socket, to cut a writer stuck on a dead peer.
     sock: Option<Stream>,
     paced: bool,
+    mobile: bool,
 }
 
 impl Outbox {
     /// An unpaced outbox (tests; connections are made by [`Outbox::with_pace`]).
     #[cfg(test)]
     pub fn new(output_cap: usize, total_cap: usize, sock: Option<Stream>) -> Arc<Self> {
-        Self::with_pace(output_cap, total_cap, sock, None)
+        Self::with_pace(output_cap, total_cap, sock, None, false)
     }
 
-    /// An outbox whose Terminal output is paced by `pace` (a Mobile's connection).
+    /// An outbox whose Terminal output is paced by `pace` (a connection over the Relay);
+    /// `mobile`: the peer is a Mobile ([`Outbox::is_mobile`]).
     pub fn with_pace(
         output_cap: usize,
         total_cap: usize,
         sock: Option<Stream>,
         pace: Option<PaceCfg>,
+        mobile: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
@@ -266,13 +271,14 @@ impl Outbox {
             total_cap,
             sock,
             paced: pace.is_some(),
+            mobile,
         })
     }
 
-    /// Whether this is a Mobile's connection (exactly the paced ones): it gets `term.size`,
-    /// a shorter replay, and its attach nudges only when nobody else is attached.
+    /// Whether this is a Mobile's connection: it gets `term.size`, a shorter replay, and its
+    /// attach nudges only when nobody else is attached.
     pub fn is_mobile(&self) -> bool {
-        self.paced
+        self.mobile
     }
 
     /// The peer typed: a paced connection gets output faster for a while.
@@ -700,7 +706,7 @@ mod tests {
     };
 
     fn paced() -> Arc<Outbox> {
-        Outbox::with_pace(1 << 20, 1 << 21, None, Some(PACE))
+        Outbox::with_pace(1 << 20, 1 << 21, None, Some(PACE), true)
     }
 
     fn ms(n: u64) -> Duration {
@@ -778,6 +784,36 @@ mod tests {
         p.flushed(t0 + ms(4000));
         assert!(!p.due(t0 + ms(4100)));
         assert!(p.due(t0 + ms(5000)));
+    }
+
+    /// A Desktop over the Relay: paced like a Mobile (its own intervals), but not a Mobile.
+    #[test]
+    fn relay_desktop_is_paced_and_not_mobile() {
+        let cfg = PaceCfg {
+            idle: ms(500),
+            burst: ms(50),
+            window: Duration::from_secs(5),
+        };
+        let ob = Outbox::with_pace(1 << 20, 1 << 21, None, Some(cfg), false);
+        assert!(!ob.is_mobile());
+        let t0 = Instant::now();
+        let mut flushes = Vec::new();
+        for step in 0..200u64 {
+            let now = t0 + ms(step * 10);
+            if step == 100 {
+                ob.note_input_at(now);
+            }
+            ob.push_output(tid(1), bytes(b"x"), false);
+            if !flush(&ob, now).is_empty() {
+                flushes.push(step * 10);
+            }
+        }
+        let idle: Vec<u64> = flushes.iter().copied().filter(|&t| t < 1000).collect();
+        assert_eq!(idle, vec![0, 500]);
+        // Typing: the echo leaves at once, then at most every 50 ms.
+        let burst: Vec<u64> = flushes.iter().copied().filter(|&t| t >= 1000).collect();
+        assert_eq!(burst, (20..40).map(|i| i * 50).collect::<Vec<_>>());
+        assert!(!Outbox::with_pace(1 << 20, 1 << 21, None, None, false).is_mobile());
     }
 
     /// With an injected clock: a Terminal printing every 20 ms gets one frame per second
@@ -1024,7 +1060,7 @@ mod tests {
 
     #[test]
     fn paced_overflow_still_drops_with_notice() {
-        let ob = Outbox::with_pace(100, 10_000, None, Some(PACE));
+        let ob = Outbox::with_pace(100, 10_000, None, Some(PACE), true);
         let t0 = Instant::now();
         ob.push_output(tid(1), bytes(b"first"), false);
         flush(&ob, t0);

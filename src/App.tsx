@@ -40,6 +40,7 @@ import { loadProjectSessions } from "./hosts/projectSessions";
 import { lookupProjectValueKey, lookupProjectValue, asProjectKey, toProjectKey, encodedNameFor, keyOf, keyOfTab, lookupKey, parseProjectKey, sameKey, sessionKeyOf, sessionKeyOfTab, type ProjectKey } from "./hosts/projectKey";
 import { latestGate } from "./hosts/requestGate";
 import { registry } from "./hosts/registry";
+import { pollDue, startPoll } from "./hosts/poll";
 import { cache } from "./hosts/cache";
 import { adoptTab, applyFocusRemovals, dissolveSmallGroups, keepsFocusWhenListed, applyGroupRemovals, applyTabDeltas, focusOf, reconcileHosts, remoteTabId, type Focus } from "./hosts/reconcile";
 import { localEdits, metaSync } from "./hosts/metaSync";
@@ -641,7 +642,7 @@ export default function App() {
   useEffect(() => {
     if (tabs.length === 0) return;
 
-    const syncTitles = async () => {
+    const syncTitles = async (n: number) => {
       // Keep Unix case-distinct Projects separate, including when choosing a Shell cwd.
       const projectsByKey = titlePollProjects(tabs);
       const projectMap = new Map<string, ProjectInfo>();
@@ -651,7 +652,7 @@ export default function App() {
         // Prefer Claude's recorded encoded name; otherwise mirror the Rust encoding so the
         // poll also reaches Codex/Cursor-only projects (which carry no Claude encoded_name).
         const encodedName = encodedNameFor({ encoded_name: projectMap.get(pp)?.encoded_name, path: origPath });
-        if (!encodedName) continue;
+        if (!encodedName || !pollDue(host, n)) continue;
         try {
           const sessions = await hostInvoke<SessionInfo[]>(host, "get_sessions", { encodedName, projectPath: origPath });
           setTabs(prev => {
@@ -688,8 +689,7 @@ export default function App() {
       }
     };
 
-    const interval = setInterval(syncTitles, 5000);
-    return () => clearInterval(interval);
+    return startPoll(syncTitles, 5000);
   }, [tabs.length, allProjects]); // Only re-setup when tab count or projects change
 
   // ── Persistence ───────────────────────────────────────────────────

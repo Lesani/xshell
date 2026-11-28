@@ -101,6 +101,10 @@ pub struct Config {
     /// …and at most once per this one for `mobile_burst_window` after it typed.
     pub mobile_frame_burst: Duration,
     pub mobile_burst_window: Duration,
+    /// The same three for a Desktop that arrived over the Relay (Local and SSH are unpaced).
+    pub relay_frame_idle: Duration,
+    pub relay_frame_burst: Duration,
+    pub relay_burst_window: Duration,
     /// The most of a Terminal's replay buffer a Mobile is sent when it attaches.
     pub mobile_replay_cap: usize,
     pub max_calls_per_conn: usize,
@@ -609,6 +613,9 @@ impl Config {
             mobile_frame_idle: Duration::from_secs(1),
             mobile_frame_burst: Duration::from_millis(100),
             mobile_burst_window: Duration::from_secs(3),
+            relay_frame_idle: Duration::from_millis(500),
+            relay_frame_burst: Duration::from_millis(50),
+            relay_burst_window: Duration::from_secs(5),
             mobile_replay_cap: 256 * 1024,
             max_calls_per_conn: 32,
             resize_persist_delay: Duration::from_secs(1),
