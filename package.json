@@ -1,7 +1,7 @@
 {
   "name": "xshell",
   "private": true,
-  "version": "1.6.0-rjw.7",
+  "version": "1.6.0-rjw.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
