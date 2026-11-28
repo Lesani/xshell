@@ -850,7 +850,9 @@ mod tests {
         }
         let frames = flush(&ob, t0);
         assert!(frames.len() >= 4, "{} frames", frames.len());
-        assert!(frames.iter().all(|(k, b)| k.starts_with("o:") && b.len() <= MERGE_MAX));
+        assert!(frames
+            .iter()
+            .all(|(k, b)| k.starts_with("o:") && b.len() <= MERGE_MAX));
         let got: Vec<u8> = frames.into_iter().flat_map(|(_, b)| b).collect();
         assert_eq!(got, want);
     }
