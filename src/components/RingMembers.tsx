@@ -20,6 +20,12 @@ type Removal =
   | { kind: "failed"; member: MemberView; key: CopyKey }
   | { kind: "done"; name: string };
 
+// A machine that just came here from the SSH list (#119), by its Daemon's key. `token`
+// changes per arrival.
+export interface RingArrival { daemonKey: string; token: number }
+// How long the arrived row stays marked.
+export const ARRIVAL_MARK_MS = 2000;
+
 export interface RingMembersProps {
   s: RingStatus;
   // Another xshell window runs the connection: removing is refused here.
@@ -29,11 +35,14 @@ export interface RingMembersProps {
   refresh: () => Promise<RingStatus>;
   // This machine left the Ring by its own Remove.
   onSelfRemoved: () => void;
+  // Its row is scrolled into view and marked for a moment, once; then `onArrivalShown`.
+  arrival?: RingArrival | null;
+  onArrivalShown?: () => void;
 }
 
 const chipClass = (key: CopyKey) => (key === "member.online" ? "connected" : "offline");
 
-export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: RingMembersProps) {
+export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved, arrival, onArrivalShown }: RingMembersProps) {
   const snap = useHostsSnapshot();
   const [removal, setRemoval] = useState<Removal>({ kind: "idle" });
   const mounted = useRef(true);
@@ -44,6 +53,25 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: Rin
     const t = window.setTimeout(() => setRemoval(r => (r.kind === "done" ? { kind: "idle" } : r)), outcomeMs());
     return () => window.clearTimeout(t);
   }, [removal]);
+
+  // The arrived machine's row: shown once per arrival, as soon as the Roster lists it.
+  const arrived = arrival ? s.members.find(m => (m.daemonKey ?? m.signKey) === arrival.daemonKey)?.signKey ?? null : null;
+  const [marked, setMarked] = useState<string | null>(null);
+  const shownArrival = useRef<number | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!arrival || !arrived || shownArrival.current === arrival.token) return;
+    shownArrival.current = arrival.token;
+    setMarked(arrived);
+    const row = [...(root.current?.querySelectorAll<HTMLElement>("[data-ring-member]") ?? [])].find(el => el.getAttribute("data-ring-member") === arrived);
+    row?.scrollIntoView?.({ block: "nearest" });
+    onArrivalShown?.();
+  }, [arrival, arrived, onArrivalShown]);
+  useEffect(() => {
+    if (!marked) return;
+    const t = window.setTimeout(() => setMarked(null), ARRIVAL_MARK_MS);
+    return () => window.clearTimeout(t);
+  }, [marked]);
 
   const run = async (m: MemberView) => {
     setRemoval({ kind: "removing", member: m });
@@ -70,7 +98,7 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: Rin
 
   const dialog = removal.kind === "confirming" ? removeDialog(removal.member, s.members) : null;
   return (
-    <div className="edit-field" data-ring-members>
+    <div className="edit-field" data-ring-members ref={root}>
       <label className="edit-label">{C["ring.members"]}</label>
       <UpdateAllSlot hosts={s.members.flatMap(m => {
         const id = isMachine(m) && !isThisMachine(m) ? hostOf(m, snap.available) : null;
@@ -84,7 +112,7 @@ export function RingMembers({ s, readOnly, remove, refresh, onSelfRemoved }: Rin
         const version = versionLine(m, status);
         const removing = removal.kind === "removing" && removal.member.signKey === m.signKey;
         return (
-          <div key={m.signKey} className="host-row" data-ring-member={m.signKey}>
+          <div key={m.signKey} className={`host-row${marked === m.signKey ? " host-row-arrived" : ""}`} data-ring-member={m.signKey} {...(marked === m.signKey ? { "data-ring-arrived": "" } : {})}>
             <div className="host-row-head">
               <div className="host-row-title">
                 <span className="host-row-name">{m.name}</span>

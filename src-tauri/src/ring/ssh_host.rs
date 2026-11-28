@@ -8,13 +8,16 @@
 //! a log line. Errors are `code: detail` (`not-ready`, `offline`, `unsupported`, `windows`,
 //! `own-desktop`, `other-ring`, `rate-limited`, `unfinished`, `expired`, `service`, `busy`,
 //! `failed`); the frontend shows one sentence per code.
+//!
+//! `ring_ssh_host_keep_running` (#119) makes the Host's Daemon start by itself before the
+//! Desktop takes the Host out of its SSH list.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use tauri::{AppHandle, Manager as _};
 use xshell_hostlink::ring::ssh_host::{
-    add_ssh_host, check_host, resolve_binary, AddCode, AddError, AddRequest, Timeouts,
+    add_ssh_host, check_host, keep_running, resolve_binary, AddCode, AddError, AddRequest, Timeouts,
 };
 use xshell_hostlink::{CancelToken, LOCAL_HOST_ID};
 
@@ -139,6 +142,43 @@ pub async fn ring_add_ssh_host(app: AppHandle, host: String) -> Result<ApprovedC
         result.map_err(|e| {
             // `e` never holds the words (the module docs of `ssh_host`).
             eprintln!("xshell: Add to Ring on {host}: {e}");
+            e.to_string()
+        })
+    })
+    .await
+}
+
+fn keep(app: &AppHandle, host: &str) -> Result<(), AddError> {
+    saved_ssh_id(host)?;
+    let manager = app
+        .try_state::<crate::hosts::Hosts>()
+        .map(|h| h.manager.clone())
+        .ok_or_else(|| AddError::new(AddCode::NotReady, "Hosts are not set up"))?;
+    let route = manager
+        .ssh_route(host)
+        .ok_or_else(|| AddError::new(AddCode::Failed, "not a saved SSH Host"))?;
+    let status = route.handle.status();
+    check_host(&status)?;
+    let cancel = CancelToken::new();
+    let binary = resolve_binary(
+        &*route.transport,
+        route.config.daemon_override(),
+        &route.install_dir,
+        status.os.as_deref(),
+        &cancel,
+    );
+    keep_running(&*route.transport, &binary, &cancel)
+}
+
+/// Before a saved SSH Host that joined the Ring leaves the SSH list (#119): its Daemon must
+/// start again after a restart of the machine without a login, since no SSH connection will
+/// start it. Runs the existing
+/// `xshelld service install` on the Host over its SSH route. Errors are `code: detail`.
+#[tauri::command]
+pub async fn ring_ssh_host_keep_running(app: AppHandle, host: String) -> Result<(), String> {
+    run(move || {
+        keep(&app, &host).map_err(|e| {
+            eprintln!("xshell: keep the Daemon running on {host}: {e}");
             e.to_string()
         })
     })

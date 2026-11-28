@@ -6,7 +6,7 @@ import { useRing, type RingApi } from "../ring/useRing";
 import { useNotAdded } from "../ring/notAdded";
 import { AddMachinePanel } from "./AddMachinePanel";
 import { PhonePanel, type Pairing } from "./PhonePanel";
-import { RingMembers } from "./RingMembers";
+import { RingMembers, type RingArrival } from "./RingMembers";
 import type { RingStatus } from "../ring/types";
 
 // Settings → Ring: set up the Ring (the setup screen), or, as a member, its devices with Remove
@@ -19,6 +19,9 @@ export interface RingSettingsProps {
   // Opens the setup screen; `join` starts the eight words at once.
   onOpenRingSetup: (initial?: "join") => void;
   ring?: RingApi;
+  // The machine that just moved here from the SSH list (#119).
+  arrival?: RingArrival | null;
+  onArrivalShown?: () => void;
 }
 
 export function RingSettings(props: RingSettingsProps) {
@@ -54,7 +57,7 @@ function UnpairedRelay({ chosen, onSave, disabled }: { chosen: string | null; on
   );
 }
 
-export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: RingSettingsProps & { ring: RingApi }) {
+export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r, arrival, onArrivalShown }: RingSettingsProps & { ring: RingApi }) {
   const s = r.status;
   const { notAdded } = useNotAdded(s);
   // This machine removed itself: the line stays until the next Ring change here.
@@ -84,7 +87,7 @@ export function RingSettingsView({ visible = true, onOpenRingSetup, ring: r }: R
           <>
             {conn && <div className="host-row-note" data-ring-connection>{conn}</div>}
             {quota && <div className="host-row-note host-row-warn">{quota}</div>}
-            <RingMembers s={s} readOnly={follower} remove={r.removeMember} refresh={r.refreshStatus} onSelfRemoved={() => setSelfRemoved(true)} />
+            <RingMembers s={s} readOnly={follower} remove={r.removeMember} refresh={r.refreshStatus} onSelfRemoved={() => setSelfRemoved(true)} arrival={arrival} onArrivalShown={onArrivalShown} />
             {follower ? <div className="host-row-note">{C["ring.follower"]}</div> : (
               <>
                 <AddMachinePanel approve={r.approveComputer} disabled={s.busy || pairingBlocked(s)} note={pairingLine(s)} />

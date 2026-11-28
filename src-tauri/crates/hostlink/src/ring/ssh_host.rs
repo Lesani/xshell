@@ -162,6 +162,73 @@ pub fn pair_invocation(binary: &PairBinary, relay: &str, name: &str) -> String {
     }
 }
 
+/// `xshelld service install --json` for `binary`, as one POSIX `sh` command (#119).
+pub fn service_invocation(binary: &PairBinary) -> String {
+    match binary {
+        PairBinary::Managed(dir) => {
+            format!("\"$HOME/.xshell/server/{dir}/xshelld\" service install --json")
+        }
+        PairBinary::Command(cmd) => format!("{cmd} service install --json"),
+    }
+}
+
+/// Whether the report of `service install --json` says the Daemon starts again after the
+/// machine restarts, without anyone logging in: what `xshelld service status` words as
+/// "starts automatically" (`Report::status_line`). That is a systemd user unit that is
+/// active with linger on, or a cron `@reboot` line. The shell-profile block needs a login,
+/// systemd without linger ends at logout, and an unreadable report proves nothing.
+pub fn starts_at_boot(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let Ok(report) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        let mechanism = report.get("mechanism").and_then(Value::as_str);
+        let installed = |m: &str| {
+            report
+                .get("installed")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(m)))
+        };
+        let flag = |k: &str| report.get(k).and_then(Value::as_bool) == Some(true);
+        match mechanism {
+            Some("systemd") => installed("systemd") && flag("active") && flag("linger"),
+            Some("cron") => installed("cron"),
+            _ => false,
+        }
+    })
+}
+
+/// How long `service install` on the Host may take.
+const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keeps the Host's Daemon running without an SSH session (#119): runs the existing
+/// `xshelld service install` there. A Host the Desktop installed over SSH has a Daemon that
+/// `connect` started; it outlives the session but not a restart of the machine. A Host that
+/// leaves the SSH list has no SSH route to start it again, so this must succeed first, with
+/// a mechanism that works at boot ([`starts_at_boot`]).
+pub fn keep_running(
+    transport: &dyn Transport,
+    binary: &PairBinary,
+    cancel: &CancelToken,
+) -> Result<(), AddError> {
+    let script = sh_wrap(&service_invocation(binary));
+    let out = process::run_script(transport, &script, None, SERVICE_TIMEOUT, cancel)
+        .map_err(|e| AddError::new(AddCode::Failed, format!("service install: {e}")))?;
+    if out.code != Some(0) {
+        return Err(AddError::new(
+            AddCode::Failed,
+            format!("service install ended with {:?}", out.code),
+        ));
+    }
+    if !starts_at_boot(&out.stdout) {
+        return Err(AddError::new(
+            AddCode::Failed,
+            "the Host's Daemon would not start after a restart without a login",
+        ));
+    }
+    Ok(())
+}
+
 /// `cmd` wrapped so it ends, with every process it started, when the session's input closes
 /// (AM2, and Sol's diff review 1): the SSH input is kept on fd 3 for a watcher that ends `cmd`
 /// at its EOF; `cmd` itself reads `/dev/null`. With job control (`set -m`; a shell without a
@@ -1142,6 +1209,99 @@ mod tests {
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),
             "pair|--relay|ws://l|--name|n|"
+        );
+    }
+
+    #[test]
+    fn service_install_command_and_its_report() {
+        assert_eq!(
+            service_invocation(&PairBinary::Managed("1.6.0".into())),
+            r#""$HOME/.xshell/server/1.6.0/xshelld" service install --json"#
+        );
+        assert_eq!(
+            service_invocation(&PairBinary::Command("~/bin/xd".into())),
+            "~/bin/xd service install --json"
+        );
+        let report = |mechanism: &str, installed: &str, active: bool, linger: &str| {
+            format!(
+                r#"{{"mechanism":"{mechanism}","installed":[{installed}],"active":{active},"linger":{linger},"running":true,"launcher":"/h/.xshell/service/xshelld","changed":true,"warnings":[]}}"#
+            )
+        };
+        // What starts at boot without a login.
+        assert!(starts_at_boot(&report(
+            "systemd",
+            r#""systemd""#,
+            true,
+            "true"
+        )));
+        assert!(starts_at_boot(&report("cron", r#""cron""#, true, "null")));
+        // What does not: linger off or unknown, the unit not active, the profile block,
+        // nothing installed, a mechanism named but not installed, no report.
+        for (m, i, active, linger) in [
+            ("systemd", r#""systemd""#, true, "false"),
+            ("systemd", r#""systemd""#, true, "null"),
+            ("systemd", r#""systemd""#, false, "true"),
+            ("systemd", "", true, "true"),
+            ("profile", r#""profile""#, true, "null"),
+            ("profile", r#""profile""#, false, "null"),
+            ("cron", "", false, "null"),
+            ("cron", r#""profile""#, true, "null"),
+            ("none", "", false, "null"),
+        ] {
+            assert!(!starts_at_boot(&report(m, i, active, linger)), "{m} {i}");
+        }
+        assert!(!starts_at_boot("xshell is running."));
+        assert!(!starts_at_boot(r#"{"installed":["systemd"]}"#));
+        assert!(!starts_at_boot(""));
+    }
+
+    /// Runs the remote command with a scratch HOME: never this user's own `~/.xshell`.
+    struct HomeSh(std::path::PathBuf);
+    impl Transport for HomeSh {
+        fn command(&self, remote_cmd: &str) -> crate::transport::CommandSpec {
+            crate::transport::CommandSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), remote_cmd.into()],
+                env: vec![("HOME".into(), self.0.clone().into())],
+            }
+        }
+        fn describe(&self) -> String {
+            "sh".into()
+        }
+    }
+
+    #[test]
+    fn keep_running_needs_exit_zero_and_an_installed_mechanism() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".xshell/server/9.9.9");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |body: &str| {
+            std::fs::write(dir.join("xshelld"), format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(dir.join("xshelld"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        };
+        let t = HomeSh(home.path().to_path_buf());
+        let bin = PairBinary::Managed("9.9.9".into());
+        let cancel = CancelToken::new();
+        fake(
+            r#"[ "$1 $2 $3" = "service install --json" ] && echo '{"mechanism":"cron","installed":["cron"]}'"#,
+        );
+        assert_eq!(keep_running(&t, &bin, &cancel), Ok(()));
+        fake(r#"echo '{"mechanism":"profile","installed":["profile"],"active":true}'"#);
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
+        );
+        fake(r#"echo '{"mechanism":"cron","installed":["cron"]}'; exit 1"#);
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
+        );
+        std::fs::remove_file(dir.join("xshelld")).unwrap();
+        assert_eq!(
+            keep_running(&t, &bin, &cancel).unwrap_err().code,
+            AddCode::Failed
         );
     }
 
