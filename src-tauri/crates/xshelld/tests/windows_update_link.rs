@@ -391,3 +391,87 @@ fn update_latest_failures_install_nothing() {
     assert!(!srv.stage_active());
     srv.shutdown();
 }
+
+/// D4: the owning Desktop starts the selected build after a Ring update; when that build
+/// cannot start (here it exits at once, `XSHELLD_TEST_SERVE_FAIL_BUILD`) the Desktop starts
+/// its own build instead, so the machine is back on a working Daemon (of the old version)
+/// with nobody at it. A `selected` record that cannot be used at all does the same.
+#[test]
+fn selected_build_that_cannot_start_falls_back_to_the_apps_own() {
+    use xshell_hostlink::{CancelToken, Dialer, LocalDaemon, LocalDaemonConfig, LocalDialer};
+    let h = TestHome::new_private_home();
+    let (bytes, build) = patched(1, VERSION);
+    let dir = install_dir_name(VERSION, Some(&build));
+    xshelld::stage::stage(
+        &h.home(),
+        &dir,
+        &sha(&bytes),
+        bytes.len() as u64,
+        &mut base64::engine::general_purpose::STANDARD
+            .encode(&bytes)
+            .as_bytes(),
+    )
+    .unwrap();
+    xshell_core::server::write_windows_selected(&h.home(), &dir).unwrap();
+    let staged = root(&h).join(&dir).join("xshelld.exe");
+    assert_eq!(
+        xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).unwrap(),
+        staged,
+        "the selected build is the one the Desktop would start"
+    );
+    let own = scan_stamp(&fs::read(bin()).unwrap()).unwrap().unwrap();
+    let mut env = h.daemon_env();
+    env.push((
+        "XSHELLD_TEST_SERVE_FAIL_BUILD".into(),
+        build.display().into(),
+    ));
+    let start = |env: Vec<(std::ffi::OsString, std::ffi::OsString)>| {
+        std::sync::Arc::new(
+            LocalDaemon::new(LocalDaemonConfig {
+                bin: bin().into(),
+                env,
+                home: h.home(),
+                socket: h.pipe.clone(),
+                version: VERSION.into(),
+                build: None,
+            })
+            .unwrap(),
+        )
+    };
+    let daemon = start(env);
+    let cancel = CancelToken::new();
+    let dialed = LocalDialer {
+        daemon: daemon.clone(),
+    }
+    .dial(&cancel)
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let _conn = dialed.conn;
+    let mut c = Client::from_io(dialed.io.read, dialed.io.write);
+    let (hello, _) = c.hello();
+    assert!(
+        hello.build.as_ref().is_some_and(|b| b.same(&own)),
+        "the app's own build serves: {:?}",
+        hello.build
+    );
+    assert!(daemon.start_error().is_none());
+    // The selected record is left for the next update to replace.
+    assert_eq!(selected(&h).as_deref(), Some(dir.as_str()));
+    drop(c);
+    daemon.terminate(std::time::Duration::from_secs(15));
+
+    // A record that cannot be used at all: the app's own build too.
+    fs::write(root(&h).join("selected"), "../unsafe\n").unwrap();
+    assert!(xshell_core::server::windows_spawn_target(&h.home(), Path::new(bin())).is_err());
+    let daemon = start(h.daemon_env());
+    let dialed = LocalDialer {
+        daemon: daemon.clone(),
+    }
+    .dial(&cancel)
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let _conn = dialed.conn;
+    let mut c = Client::from_io(dialed.io.read, dialed.io.write);
+    let (hello, _) = c.hello();
+    assert!(hello.build.as_ref().is_some_and(|b| b.same(&own)));
+    drop(c);
+    daemon.terminate(std::time::Duration::from_secs(15));
+}

@@ -339,6 +339,15 @@ pub struct LocalDaemon {
     /// value's life: when the Desktop ends, the OS ends the Daemon and its Terminals.
     #[cfg(windows)]
     job: (xshell_core::job::Job, String),
+    /// Windows: the selected build (another than the app's own) the last GUI-bound start
+    /// used; `None` when it started the app's own.
+    #[cfg(windows)]
+    spawned_selected: Mutex<Option<PathBuf>>,
+    /// Windows: a selected build that could not start (it exited before it listened, or
+    /// did not listen in time). Never started again by this Desktop; the app's own build
+    /// starts instead (rjw.9 D4). A newly selected build is tried.
+    #[cfg(windows)]
+    failed_selected: Mutex<Option<PathBuf>>,
     /// Test hook: runs in `stop_verified` between the verification and the signal.
     #[cfg(all(test, unix))]
     before_signal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -384,6 +393,10 @@ impl LocalDaemon {
             start_error: Mutex::new(None),
             #[cfg(windows)]
             job,
+            #[cfg(windows)]
+            spawned_selected: Mutex::new(None),
+            #[cfg(windows)]
+            failed_selected: Mutex::new(None),
             #[cfg(all(test, unix))]
             before_signal: Mutex::new(None),
         })
@@ -505,7 +518,9 @@ impl LocalDaemon {
         self.ensure_spawned().map_err(|e| {
             self.fail_start(self.see_log(format!("cannot start {}: {e}", self.bin.display())))
         })?;
-        let deadline = Instant::now() + SPAWN_WAIT;
+        // Windows starts again from the app's own build when a selected one fails (D4).
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut deadline = Instant::now() + SPAWN_WAIT;
         let mut delay = Duration::from_millis(10);
         let mut lost_lock = false;
         loop {
@@ -532,6 +547,11 @@ impl LocalDaemon {
                     Some(Some(LOST_LOCK_EXIT)) => lost_lock = true,
                     Some(code) => {
                         let how = code.map_or("by a signal".to_string(), |c| format!("with {c}"));
+                        #[cfg(windows)]
+                        if self.selected_failed(&format!("it exited {how}")) {
+                            deadline = Instant::now() + SPAWN_WAIT;
+                            continue;
+                        }
                         return Err(
                             self.fail_start(self.see_log(format!("xshelld serve exited {how}")))
                         );
@@ -540,6 +560,12 @@ impl LocalDaemon {
                 }
             }
             if Instant::now() >= deadline {
+                #[cfg(windows)]
+                if self.selected_failed(&format!("it did not listen within {SPAWN_WAIT:?}")) {
+                    deadline = Instant::now() + SPAWN_WAIT;
+                    lost_lock = false;
+                    continue;
+                }
                 return Err(self.fail_start(self.see_log(format!(
                     "xshelld serve did not start listening within {SPAWN_WAIT:?}"
                 ))));
@@ -877,9 +903,57 @@ impl LocalDaemon {
         Ok(pid)
     }
 
+    /// Windows (rjw.9 D4): the GUI-bound start that just began ran a selected build and it
+    /// could not start (`why`). That build is remembered as failed, its process (if it still
+    /// runs) is stopped, and the app's own build is started in its place, so the machine is
+    /// back on a working Daemon with nobody at it: `true`. `false`: the start used the app's
+    /// own build, or the fallback could not be started either; nothing changed.
+    #[cfg(windows)]
+    fn selected_failed(&self, why: &str) -> bool {
+        let Some(failed) = self.spawned_selected.lock().unwrap().take() else {
+            return false;
+        };
+        eprintln!(
+            "xshell: the selected xshelld {} could not start ({why}); starting this app's own",
+            failed.display()
+        );
+        *self.failed_selected.lock().unwrap() = Some(failed);
+        // A child that never listened: its Terminals were never restored to anyone.
+        self.stop_gui_child(STOP_WAIT);
+        match self.ensure_spawned() {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("xshell: cannot start {}: {e}", self.bin.display());
+                false
+            }
+        }
+    }
+
+    /// Windows: the build a GUI-bound start runs. The `selected` record's build when it is
+    /// honoured (`core::server::windows_spawn_target`), unless that build failed to start
+    /// before; the app's own build otherwise, also when the record cannot be used (rjw.9 D4:
+    /// a broken or removed selected build never leaves the machine without a Daemon).
+    #[cfg(windows)]
+    fn gui_bound_target(&self) -> PathBuf {
+        let target = match xshell_core::server::windows_spawn_target(&self.home, &self.bin) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "xshell: the selected xshelld cannot be used ({e}); starting this app's own"
+                );
+                self.bin.clone()
+            }
+        };
+        let selected = (target != self.bin).then_some(target);
+        let failed = selected.is_some() && *self.failed_selected.lock().unwrap() == selected;
+        let selected = selected.filter(|_| !failed);
+        *self.spawned_selected.lock().unwrap() = selected.clone();
+        selected.unwrap_or_else(|| self.bin.clone())
+    }
+
     fn spawn_gui_bound(&self) -> io::Result<Child> {
         #[cfg(windows)]
-        let exe = xshell_core::server::windows_spawn_target(&self.home, &self.bin)?;
+        let exe = self.gui_bound_target();
         #[cfg(not(windows))]
         let exe = &self.bin;
         let mut cmd = Command::new(exe);

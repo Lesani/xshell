@@ -130,6 +130,10 @@ pub fn main_entry() -> i32 {
         if let Some(code) = refuse_on_this_platform(&opts) {
             return code;
         }
+        if serve_fails_for_tests() {
+            eprintln!("xshelld: cannot start: test hook");
+            return 1;
+        }
         // Windows: before anything else, so every process this one starts is in the app's job.
         #[cfg(windows)]
         if let Some(job) = &opts.job {
@@ -411,6 +415,18 @@ fn refuse_on_this_platform(opts: &cli::Opts) -> Option<i32> {
         return Some(2);
     }
     None
+}
+
+/// Test hook (debug builds): with `XSHELLD_TEST_SERVE_FAIL_BUILD=<build>` a `serve` of that
+/// build (its display, `<commit>[-dirty…]`) exits 1 at once, as a selected build that cannot
+/// start (rjw.9 D4); other builds of the same test binary start normally.
+fn serve_fails_for_tests() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("XSHELLD_TEST_SERVE_FAIL_BUILD").is_ok_and(|b| {
+            crate::build_id::BUILD
+                .as_ref()
+                .is_some_and(|own| own.display() == b)
+        })
 }
 
 /// Test hook (Windows): with `XSHELLD_TEST_NO_PARENT_WATCH=1` a GUI-bound Daemon does not
