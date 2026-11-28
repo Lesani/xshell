@@ -699,6 +699,48 @@ fn mobile_terminal_view_over_relay() {
     );
 }
 
+/// A Desktop through the Relay bridge is paced too (every write there is a message the Relay
+/// counts): about two output frames per second idle, many more right after it typed.
+#[test]
+fn desktop_output_over_relay_is_paced() {
+    let s = setup();
+    let project = s.h.project("p");
+    std::fs::write(
+        project.join("agent.sh"),
+        "echo ready\nwhile :; do echo tick; sleep 0.02; done\n",
+    )
+    .unwrap();
+    let fake = Fake::in_dir(&project);
+    let _reaper = FakeReaper(fake.pids_log.clone());
+    let mut d = Client::in_process(&s.srv, Role::Desktop);
+    let term = Uuid::new_v4();
+    d.open(term, claude_spec(&project, None));
+    d.attach(term);
+    d.output_until(term, "ready");
+
+    let desk = Peer::new(&s.r, &s.ring.chain, &s.desk2);
+    let mut c = desk.client(&s.daemon);
+    c.attach(term);
+    c.output_until(term, "tick");
+    let frames = |c: &Client| {
+        c.log
+            .iter()
+            .filter(|e| matches!(e, Ev::Out(t, _) if *t == term))
+            .count()
+    };
+    let c0 = frames(&c);
+    c.drain_for(Duration::from_millis(2500));
+    let idle = frames(&c) - c0;
+    // Unpaced, a write every 20 ms is over a hundred frames.
+    assert!((3..=8).contains(&idle), "{idle} frames in 2.5 s");
+    // Typing: output comes at the burst interval.
+    c.input(term, "x");
+    let c1 = frames(&c);
+    c.drain_for(Duration::from_millis(1000));
+    let burst = frames(&c) - c1;
+    assert!(burst >= 8, "{burst} frames in 1 s after input");
+}
+
 /// A Permission Prompt through the Relay bridge: the phone is told the prompt in its list and
 /// answers it; the key reaches the agent.
 #[test]
