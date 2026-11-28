@@ -20,7 +20,7 @@ set -eu
 umask 077
 
 # Pinned by publish-release.sh: the release this script belongs to.
-TAG="v1.6.0-rjw.8"
+TAG="v1.6.0-rjw.9"
 REPO_BASE="https://github.com/Lesani/xshell/releases/download"
 
 tag="${XSHELL_TAG:-$TAG}"
